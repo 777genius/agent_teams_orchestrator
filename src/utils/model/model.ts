@@ -7,13 +7,21 @@
  */
 import { getMainLoopModelOverride } from '../../bootstrap/state.js'
 import {
+  DEFAULT_GEMINI_FAST_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_SMALL_MODEL,
+  getDefaultGeminiMainModel,
+  getGeminiDisplayName,
+  isGeminiModel,
+  mapModelAliasToGemini,
+} from './gemini.js'
+import {
   getSubscriptionType,
   isClaudeAISubscriber,
   isCodexSubscriber,
   isMaxSubscriber,
   isProSubscriber,
   isTeamPremiumSubscriber,
-  isCodexSubscriber,
 } from '../auth.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
 import {
@@ -37,6 +45,9 @@ export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
 
 export function getSmallFastModel(): ModelName {
+  if (getAPIProvider() === 'gemini') {
+    return DEFAULT_GEMINI_FAST_MODEL
+  }
   return process.env.ANTHROPIC_SMALL_FAST_MODEL || getDefaultHaikuModel()
 }
 
@@ -106,6 +117,9 @@ export function getBestModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
 export function getDefaultOpusModel(): ModelName {
+  if (getAPIProvider() === 'gemini') {
+    return DEFAULT_GEMINI_MODEL
+  }
   if (process.env.ANTHROPIC_DEFAULT_OPUS_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
   }
@@ -120,6 +134,9 @@ export function getDefaultOpusModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
 export function getDefaultSonnetModel(): ModelName {
+  if (getAPIProvider() === 'gemini') {
+    return DEFAULT_GEMINI_FAST_MODEL
+  }
   if (process.env.ANTHROPIC_DEFAULT_SONNET_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   }
@@ -132,6 +149,9 @@ export function getDefaultSonnetModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
 export function getDefaultHaikuModel(): ModelName {
+  if (getAPIProvider() === 'gemini') {
+    return DEFAULT_GEMINI_SMALL_MODEL
+  }
   if (process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
   }
@@ -179,6 +199,9 @@ export function getRuntimeMainLoopModel(params: {
  * @returns The default model setting to use
  */
 export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
+  if (getAPIProvider() === 'gemini') {
+    return getDefaultGeminiMainModel()
+  }
   if (isCodexSubscriber()) {
     return getModelStrings().gpt53codex
   }
@@ -278,6 +301,15 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   if (name.includes('gpt-5.3-codex')) {
     return 'gpt-5.3-codex'
   }
+  if (name.includes('gemini-2.5-flash-lite')) {
+    return 'gemini-2.5-flash-lite'
+  }
+  if (name.includes('gemini-2.5-flash')) {
+    return 'gemini-2.5-flash'
+  }
+  if (name.includes('gemini-2.5-pro')) {
+    return 'gemini-2.5-pro'
+  }
   const match = name.match(/(claude-(\d+-\d+-)?\w+)/)
   if (match && match[1]) {
     return match[1]
@@ -303,6 +335,9 @@ export function getCanonicalName(fullModelName: ModelName): ModelShortName {
 export function getClaudeAiUserDefaultModelDescription(
   fastMode = false,
 ): string {
+  if (getAPIProvider() === 'gemini') {
+    return 'Gemini 2.5 Pro · Most capable Gemini model for complex coding work'
+  }
   if (isCodexSubscriber()) {
     return 'GPT-5.3 Codex · Optimized for code generation and understanding'
   }
@@ -367,6 +402,10 @@ export function renderModelSetting(setting: ModelName | ModelAlias): string {
  * if the model is not recognized as a public model.
  */
 export function getPublicModelDisplayName(model: ModelName): string | null {
+  const geminiDisplayName = getGeminiDisplayName(model)
+  if (geminiDisplayName) {
+    return geminiDisplayName
+  }
   if (model.includes('gpt-') || model.includes('codex')) {
     if (model === 'gpt-5.2-codex') return 'Codex 5.2'
     if (model === 'gpt-5.1-codex') return 'Codex 5.1'
@@ -461,7 +500,11 @@ export function renderModelName(model: ModelName): string {
 export function getPublicModelName(model: ModelName): string {
   const publicName = getPublicModelDisplayName(model)
   if (publicName) {
-    if (model.includes('gpt-') || model.includes('codex')) {
+    if (
+      model.includes('gpt-') ||
+      model.includes('codex') ||
+      model.includes('gemini-')
+    ) {
       return publicName
     }
     return `Claude ${publicName}`
@@ -493,6 +536,9 @@ export function parseUserSpecifiedModel(
     : normalizedModel
 
   if (isModelAlias(modelString)) {
+    if (getAPIProvider() === 'gemini') {
+      return mapModelAliasToGemini(modelString)
+    }
     switch (modelString) {
       case 'opusplan':
         return getDefaultSonnetModel() + (has1mTag ? '[1m]' : '') // Sonnet is default, Opus in plan mode
@@ -538,6 +584,9 @@ export function parseUserSpecifiedModel(
 
   // Preserve original case for custom model names (e.g., Azure Foundry deployment IDs)
   // Only strip [1m] suffix if present, maintaining case of the base model
+  if (getAPIProvider() === 'gemini' && isGeminiModel(modelInputTrimmed)) {
+    return modelInputTrimmed
+  }
   if (has1mTag) {
     return modelInputTrimmed.replace(/\[1m\]$/i, '').trim() + '[1m]'
   }
@@ -594,6 +643,9 @@ export function isLegacyModelRemapEnabled(): boolean {
 
 export function modelDisplayString(model: ModelSetting): string {
   if (model === null) {
+    if (getAPIProvider() === 'gemini') {
+      return `Default (${renderModelName(DEFAULT_GEMINI_MODEL)})`
+    }
     if (process.env.USER_TYPE === 'ant') {
       return `Default for Ants (${renderDefaultModelSetting(getDefaultMainLoopModelSetting())})`
     } else if (isClaudeAISubscriber()) {
@@ -607,6 +659,10 @@ export function modelDisplayString(model: ModelSetting): string {
 
 // @[MODEL LAUNCH]: Add a marketing name mapping for the new model below.
 export function getMarketingNameForModel(modelId: string): string | undefined {
+  const geminiDisplayName = getGeminiDisplayName(normalizeModelStringForAPI(modelId))
+  if (geminiDisplayName) {
+    return geminiDisplayName
+  }
   if (getAPIProvider() === 'foundry') {
     // deployment ID is user-defined in Foundry, so it may have no relation to the actual model
     return undefined

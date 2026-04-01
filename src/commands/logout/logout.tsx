@@ -10,12 +10,23 @@ import { getClaudeAIOAuthTokens, removeApiKey } from '../../utils/auth.js';
 import { clearBetasCaches } from '../../utils/betas.js';
 import { saveGlobalConfig } from '../../utils/config.js';
 import { gracefulShutdownSync } from '../../utils/gracefulShutdown.js';
+import { getAPIProvider } from '../../utils/model/providers.js';
 import { getSecureStorage } from '../../utils/secureStorage/index.js';
 import { clearToolSchemaCache } from '../../utils/toolSchemaCache.js';
 import { resetUserCache } from '../../utils/user.js';
 export async function performLogout({
   clearOnboarding = false
 }): Promise<void> {
+  if (getAPIProvider() === 'gemini') {
+    await clearAuthRelatedCaches();
+    saveGlobalConfig(current => ({
+      ...current,
+      geminiResolvedBackend: undefined,
+      geminiLastAuthMethod: undefined,
+      geminiProjectId: undefined
+    }));
+    return;
+  }
   // Flush telemetry BEFORE clearing credentials to prevent org data leakage
   const {
     flushTelemetry
@@ -73,7 +84,7 @@ export async function call(): Promise<React.ReactNode> {
   await performLogout({
     clearOnboarding: true
   });
-  const message = <Text>Successfully logged out from your Anthropic account.</Text>;
+  const message = getAPIProvider() === 'gemini' ? <Text>Cleared local Gemini setup metadata. External Gemini CLI, Google ADC, and API key credentials were left untouched.</Text> : <Text>Successfully logged out from your Anthropic account.</Text>;
   setTimeout(() => {
     gracefulShutdownSync(0, 'logout');
   }, 200);

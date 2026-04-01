@@ -8,6 +8,10 @@ import {
 } from '../auth.js'
 import { getModelStrings } from './modelStrings.js'
 import {
+  getDefaultGeminiMainModelDescription,
+  getGeminiModelOptions,
+} from './gemini.js'
+import {
   COST_TIER_3_15,
   COST_HAIKU_35,
   COST_HAIKU_45,
@@ -31,6 +35,7 @@ import {
   renderDefaultModelSetting,
   type ModelSetting,
 } from './model.js'
+import { getAntModels } from './antModels.js'
 import { has1mContext } from '../context.js'
 import { getGlobalConfig } from '../config.js'
 
@@ -44,6 +49,13 @@ export type ModelOption = {
 }
 
 export function getDefaultOptionForUser(fastMode = false): ModelOption {
+  if (getAPIProvider() === 'gemini') {
+    return {
+      value: null,
+      label: 'Default (recommended)',
+      description: getDefaultGeminiMainModelDescription(),
+    }
+  }
   if (process.env.USER_TYPE === 'ant') {
     const currentModel = renderDefaultModelSetting(
       getDefaultMainLoopModelSetting(),
@@ -298,6 +310,9 @@ function getOpusPlanOption(): ModelOption {
 // @[MODEL LAUNCH]: Update the model picker lists below to include/reorder options for the new model.
 // Each user tier (ant, Max/Team Premium, Pro/Team Standard/Enterprise, PAYG 1P, PAYG 3P) has its own list.
 function getModelOptionsBase(fastMode = false): ModelOption[] {
+  if (getAPIProvider() === 'gemini') {
+    return getGeminiModelOptions()
+  }
   if (process.env.USER_TYPE === 'ant') {
     // Build options from antModels config
     const antModelOptions: ModelOption[] = getAntModels().map(m => ({

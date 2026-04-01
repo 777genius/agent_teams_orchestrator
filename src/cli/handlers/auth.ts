@@ -22,6 +22,7 @@ import { OAuthService } from '../../services/oauth/index.js'
 import type { OAuthTokens } from '../../services/oauth/types.js'
 import {
   clearOAuthTokenCache,
+  getGeminiAuthMethod,
   getAnthropicApiKeyWithSource,
   getAuthTokenSource,
   getOauthAccountInfo,
@@ -43,6 +44,10 @@ import {
   buildAccountProperties,
   buildAPIProviderProperties,
 } from '../../utils/status.js'
+import {
+  getGeminiBackendPreference,
+  resolveGeminiBackend,
+} from '../../services/gemini/backendResolver.js'
 
 /**
  * Returns true if the token carries any Anthropic-issued scope (user:* or org:*).
@@ -141,6 +146,36 @@ export async function authLogin({
   console?: boolean
   claudeai?: boolean
 }): Promise<void> {
+  if (getAPIProvider() === 'gemini') {
+    const resolution = await resolveGeminiBackend()
+    if (resolution.backend) {
+      process.stdout.write(
+        `Gemini authentication is configured correctly.\nBackend: gemini-${resolution.backend.kind}\n`,
+      )
+      process.exit(0)
+    }
+    process.stderr.write(
+      `Gemini setup required: ${resolution.status.message ?? 'Gemini is not configured correctly.'}\n`,
+    )
+    if (resolution.status.hint) {
+      process.stderr.write(`${resolution.status.hint}\n`)
+    }
+    if (getGeminiBackendPreference() !== 'cli') {
+      process.stderr.write(
+        "For OAuth/ADC, run: gcloud auth application-default login --client-id-file=client_secret.json --scopes='https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/generative-language.retriever'\n",
+      )
+      process.stderr.write(
+        'Then set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_PROJECT_ID, or GCLOUD_PROJECT to your billed Google Cloud project.\n',
+      )
+    }
+    if (getGeminiBackendPreference() !== 'api') {
+      process.stderr.write(
+        'For Gemini CLI backend, sign in with the installed `gemini` CLI first or force CLAUDE_CODE_GEMINI_BACKEND=api.\n',
+      )
+    }
+    process.exit(1)
+  }
+
   if (useConsole && claudeai) {
     process.stderr.write(
       'Error: --console and --claudeai cannot be used together.\n',
@@ -254,6 +289,55 @@ export async function authStatus(opts: {
   json?: boolean
   text?: boolean
 }): Promise<void> {
+  if (getAPIProvider() === 'gemini') {
+    const resolution = await resolveGeminiBackend()
+    const loggedIn = Boolean(resolution.backend)
+    const authMethod = loggedIn ? await getGeminiAuthMethod() : 'none'
+    const output: Record<string, string | boolean | null> = {
+      loggedIn,
+      authMethod,
+      apiProvider: 'gemini',
+      backend: resolution.backend ? `gemini-${resolution.backend.kind}` : null,
+      apiKeySource: process.env.GEMINI_API_KEY ? 'GEMINI_API_KEY' : null,
+      projectId: resolution.status.projectId ?? null,
+      endpoint: resolution.status.endpointLabel,
+      baseURL:
+        resolution.backend?.kind === 'cli'
+          ? null
+          : process.env.GEMINI_BASE_URL ?? 'https://generativelanguage.googleapis.com',
+      apiVersion:
+        resolution.backend?.kind === 'cli'
+          ? null
+          : process.env.GEMINI_API_VERSION ?? 'v1',
+    }
+    if (opts.text) {
+      process.stdout.write('API provider: Google Gemini\n')
+      if (output.backend) {
+        process.stdout.write(`Backend: ${output.backend}\n`)
+      }
+      process.stdout.write(`Auth method: ${authMethod}\n`)
+      if (output.projectId) {
+        process.stdout.write(`Project ID: ${output.projectId}\n`)
+      }
+      process.stdout.write(`Endpoint: ${output.endpoint}\n`)
+      if (resolution.backend?.kind !== 'cli') {
+        process.stdout.write(`Base URL: ${output.baseURL}\n`)
+        process.stdout.write(`API version: ${output.apiVersion}\n`)
+      }
+      if (!loggedIn) {
+        process.stdout.write(
+          `Not logged in. ${resolution.status.message ?? 'Configure Gemini auth.'}\n`,
+        )
+        if (resolution.status.hint) {
+          process.stdout.write(`${resolution.status.hint}\n`)
+        }
+      }
+    } else {
+      process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    }
+    process.exit(loggedIn ? 0 : 1)
+  }
+
   const { source: authTokenSource, hasToken } = getAuthTokenSource()
   const { source: apiKeySource } = getAnthropicApiKeyWithSource()
   const hasApiKeyEnvVar =
@@ -341,6 +425,18 @@ export async function authStatus(opts: {
 
 export async function authLogout(): Promise<void> {
   try {
+    if (getAPIProvider() === 'gemini') {
+      saveGlobalConfig(current => ({
+        ...current,
+        geminiResolvedBackend: undefined,
+        geminiLastAuthMethod: undefined,
+        geminiProjectId: undefined,
+      }))
+      process.stdout.write(
+        'Cleared local Gemini setup metadata. External Gemini CLI, Google ADC, and API key credentials were left untouched.\n',
+      )
+      process.exit(0)
+    }
     await performLogout({ clearOnboarding: false })
   } catch {
     process.stderr.write('Failed to log out.\n')

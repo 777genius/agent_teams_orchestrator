@@ -31,6 +31,7 @@ import {
   isEnvTruthy,
 } from '../../utils/envUtils.js'
 import { createCodexFetch } from './codex-fetch-adapter.js'
+import { createGeminiFetch } from './gemini-fetch-adapter.js'
 
 /**
  * Environment variables for different client types:
@@ -298,6 +299,17 @@ export async function getAnthropicClient({
     }
     // we have always been lying about the return type - this doesn't support batching or models
     return new AnthropicVertex(vertexArgs) as unknown as Anthropic
+  }
+
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
+    const geminiFetch = createGeminiFetch()
+    const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
+      apiKey: 'gemini-placeholder',
+      ...ARGS,
+      fetch: geminiFetch as unknown as typeof globalThis.fetch,
+      ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+    }
+    return new Anthropic(clientConfig)
   }
 
   // ── Codex (OpenAI) provider via fetch adapter ─────────────────────

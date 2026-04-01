@@ -1086,8 +1086,12 @@ export const AccountInfoSchema = lazySchema(() =>
       subscriptionType: z.string().optional(),
       tokenSource: z.string().optional(),
       apiKeySource: z.string().optional(),
+      backend: z.string().optional(),
+      projectId: z.string().optional(),
+      baseUrl: z.string().optional(),
+      apiVersion: z.string().optional(),
       apiProvider: z
-        .enum(['firstParty', 'bedrock', 'vertex', 'foundry'])
+        .enum(['firstParty', 'bedrock', 'vertex', 'foundry', 'gemini'])
         .optional()
         .describe(
           'Active API backend. Anthropic OAuth login only applies when "firstParty"; for 3P providers the other fields are absent and auth is external (AWS creds, gcloud ADC, etc.).',

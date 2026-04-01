@@ -16,6 +16,11 @@ import {
   preferThirdPartyAuthentication,
 } from '../bootstrap/state.js'
 import {
+  getGeminiApiVersion,
+  getGeminiBaseUrl,
+  getGeminiProjectId,
+} from './geminiAuth.js'
+import {
   getMockSubscriptionType,
   shouldUseMockSubscription,
 } from '../services/mockRateLimits.js'
@@ -116,7 +121,8 @@ export function isAnthropicAuthEnabled(): boolean {
   const is3P =
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
 
   // Check if user has configured an external API key source
   // This allows externally-provided API keys to work (without requiring proxy configuration)
@@ -208,6 +214,7 @@ export function getAuthTokenSource() {
 
 export type ApiKeySource =
   | 'ANTHROPIC_API_KEY'
+  | 'GEMINI_API_KEY'
   | 'apiKeyHelper'
   | '/login managed key'
   | 'none'
@@ -1632,7 +1639,12 @@ export function isCodexSubscriber(): boolean {
     return true
   }
 
-  // Check if we have OpenAI OAuth tokens
+  const tokens = getCodexOAuthTokens()
+  if (tokens?.accessToken) {
+    return true
+  }
+
+  // Legacy config fallback
   const config = getGlobalConfig()
   const openaiTokens = config?.openaiOauthTokens
   if (openaiTokens?.access_token && openaiTokens?.scopes?.includes('codex')) {
@@ -1640,15 +1652,6 @@ export function isCodexSubscriber(): boolean {
   }
 
   return false
-}
-
-/**
- * Check if the user is authenticated via OpenAI Codex OAuth.
- * Returns true when a valid Codex access token is present in the config.
- */
-export function isCodexSubscriber(): boolean {
-  const tokens = getCodexOAuthTokens()
-  return !!tokens?.accessToken
 }
 
 /**
@@ -1815,7 +1818,8 @@ export function isUsing3PServices(): boolean {
   return !!(
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
   )
 }
 
@@ -1940,11 +1944,42 @@ export type UserAccountInfo = {
   apiKeySource?: ApiKeySource
   organization?: string
   email?: string
+  apiProvider?: string
+  projectId?: string
+  baseUrl?: string
+  apiVersion?: string
+  backend?: string
 }
 
 export function getAccountInformation() {
   const apiProvider = getAPIProvider()
-  // Only provide account info for first-party Anthropic API
+  if (apiProvider === 'gemini') {
+    const geminiBackend =
+      process.env.CLAUDE_CODE_GEMINI_BACKEND ??
+      getGlobalConfig().geminiResolvedBackend ??
+      getGlobalConfig().geminiBackendPreference ??
+      'auto'
+    const accountInfo: UserAccountInfo = {
+      apiProvider: 'Google Gemini',
+      projectId: getGeminiProjectId(),
+      backend: geminiBackend,
+    }
+    if (geminiBackend !== 'cli') {
+      accountInfo.baseUrl = getGeminiBaseUrl()
+      accountInfo.apiVersion = getGeminiApiVersion()
+    }
+    if (process.env.GEMINI_API_KEY) {
+      accountInfo.apiKeySource = 'GEMINI_API_KEY'
+      accountInfo.tokenSource = 'gemini_api_key'
+      return accountInfo
+    }
+    const method = getGlobalConfig().geminiLastAuthMethod
+    if (method) {
+      accountInfo.tokenSource = `gemini_${method}`
+      return accountInfo
+    }
+    return undefined
+  }
   if (apiProvider !== 'firstParty') {
     return undefined
   }
@@ -1985,6 +2020,14 @@ export function getAccountInformation() {
     accountInfo.email = email
   }
   return accountInfo
+}
+
+export async function getGeminiAuthMethod(): Promise<string> {
+  const method = getGlobalConfig().geminiLastAuthMethod
+  if (!method) {
+    return 'none'
+  }
+  return `gemini_${method}`
 }
 
 /**
