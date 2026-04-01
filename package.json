@@ -1,5 +1,5 @@
 {
-  "name": "claude-code-source-snapshot",
+  "name": "claude-multimodel",
   "version": "2.1.87",
   "private": true,
   "description": "Reconstructed Bun CLI workspace for the Claude Code source snapshot.",
@@ -7,7 +7,7 @@
   "packageManager": "bun@1.3.11",
   "bin": {
     "claude": "./cli",
-    "claude-source": "./cli"
+    "claude-multimodel": "./cli"
   },
   "engines": {
     "bun": ">=1.3.11"
