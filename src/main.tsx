@@ -4098,16 +4098,18 @@ async function run(): Promise<CommanderCommand> {
   // claude auth
 
   const auth = program.command('auth').description('Manage authentication').configureHelp(createSortedHelpConfig());
-  auth.command('login').description('Sign in to your Anthropic account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
+  auth.command('login').description('Sign in to a configured provider account').addOption(new Option('--provider <provider>', 'Provider to authenticate').choices(['anthropic', 'codex'])).option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
     email,
     sso,
     console: useConsole,
-    claudeai
+    claudeai,
+    provider
   }: {
     email?: string;
     sso?: boolean;
     console?: boolean;
     claudeai?: boolean;
+    provider?: 'anthropic' | 'codex';
   }) => {
     const {
       authLogin
@@ -4116,23 +4118,41 @@ async function run(): Promise<CommanderCommand> {
       email,
       sso,
       console: useConsole,
-      claudeai
+      claudeai,
+      provider
     });
   });
-  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  auth.command('status').description('Show authentication status').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'all';
   }) => {
     const {
       authStatus
     } = await import('./cli/handlers/auth.js');
     await authStatus(opts);
   });
-  auth.command('logout').description('Log out from your Anthropic account').action(async () => {
+  auth.command('logout').description('Log out from a configured provider account').addOption(new Option('--provider <provider>', 'Provider to log out').choices(['anthropic', 'codex', 'all'])).action(async ({
+    provider
+  }: {
+    provider?: 'anthropic' | 'codex' | 'all';
+  }) => {
     const {
-      authLogout
+      authLogoutByProvider
     } = await import('./cli/handlers/auth.js');
-    await authLogout();
+    await authLogoutByProvider(provider);
+  });
+
+  const model = program.command('model').description('Inspect model availability').configureHelp(createSortedHelpConfig());
+  model.command('list').description('List available models by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'all';
+  }) => {
+    const {
+      modelList
+    } = await import('./cli/handlers/model.js');
+    await modelList(opts);
   });
 
   /**
