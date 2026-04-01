@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
@@ -120,6 +120,34 @@ const buildTime = new Date().toISOString()
 const version = dev ? getDevVersion(pkg.version) : pkg.version
 
 mkdirSync(dirname(outfile), { recursive: true })
+
+function patchGeminiCliCoreWasmImports(): void {
+  const shellUtilsPath =
+    './node_modules/@google/gemini-cli-core/dist/src/utils/shell-utils.js'
+
+  if (!existsSync(shellUtilsPath)) {
+    return
+  }
+
+  const original = readFileSync(shellUtilsPath, 'utf8')
+  const patched = original
+    .replaceAll(
+      "import('web-tree-sitter/tree-sitter.wasm?binary')",
+      "import('web-tree-sitter/tree-sitter.wasm')",
+    )
+    .replaceAll(
+      "import('tree-sitter-bash/tree-sitter-bash.wasm?binary')",
+      "import('tree-sitter-bash/tree-sitter-bash.wasm')",
+    )
+
+  if (patched !== original) {
+    // Bun resolves the package-exported .wasm specifiers, but currently fails
+    // on the ?binary suffix that gemini-cli-core expects from esbuild's wasm plugin.
+    writeFileSync(shellUtilsPath, patched)
+  }
+}
+
+patchGeminiCliCoreWasmImports()
 
 const externals = [
   '@ant/*',

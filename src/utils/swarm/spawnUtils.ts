@@ -4,10 +4,12 @@
 
 import {
   getChromeFlagOverride,
+  getFlagMcpConfig,
   getFlagSettingsPath,
   getInlinePlugins,
   getMainLoopModelOverride,
   getSessionBypassPermissionsMode,
+  getStrictMcpConfig,
 } from '../../bootstrap/state.js'
 import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
@@ -65,6 +67,16 @@ export function buildInheritedCliFlags(options?: {
   const settingsPath = getFlagSettingsPath()
   if (settingsPath) {
     flags.push(`--settings ${quote([settingsPath])}`)
+  }
+
+  // Propagate explicit --mcp-config / --strict-mcp-config so pane-based
+  // teammates inherit dynamic MCP servers from the leader session.
+  const mcpConfigs = getFlagMcpConfig()
+  for (const mcpConfig of mcpConfigs) {
+    flags.push(`--mcp-config ${quote([mcpConfig])}`)
+  }
+  if (getStrictMcpConfig()) {
+    flags.push('--strict-mcp-config')
   }
 
   // Propagate --plugin-dir for each inline plugin

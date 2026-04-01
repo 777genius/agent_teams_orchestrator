@@ -84,7 +84,7 @@ import { isAnalyticsDisabled } from 'src/services/analytics/config.js';
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js';
 import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from 'src/services/analytics/index.js';
 import { initializeAnalyticsGates } from 'src/services/analytics/sink.js';
-import { getOriginalCwd, setAdditionalDirectoriesForClaudeMd, setIsRemoteMode, setMainLoopModelOverride, setMainThreadAgentType, setTeleportedSessionInfo } from './bootstrap/state.js';
+import { getOriginalCwd, setAdditionalDirectoriesForClaudeMd, setFlagMcpConfig, setIsRemoteMode, setMainLoopModelOverride, setMainThreadAgentType, setTeleportedSessionInfo } from './bootstrap/state.js';
 import { filterCommandsForRemoteMode, getCommands } from './commands.js';
 import type { StatsStore } from './context/stats.js';
 import { launchAssistantInstallWizard, launchAssistantSessionChooser, launchInvalidSettingsDialog, launchResumeChooser, launchSnapshotUpdateDialog, launchTeleportRepoMismatchDialog, launchTeleportResumeWrapper } from './dialogLaunchers.js';
@@ -165,7 +165,7 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
-import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
+import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('./utils/permissions/autoModeState.js') as typeof import('./utils/permissions/autoModeState.js') : null;
@@ -1412,12 +1412,14 @@ async function run(): Promise<CommanderCommand> {
 
     // Parse the MCP config files/strings if provided
     let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = {};
+    const processedMcpConfigs = (mcpConfig || [])
+      .map(config => config.trim())
+      .filter(config => config.length > 0);
+    setFlagMcpConfig(processedMcpConfigs);
     if (mcpConfig && mcpConfig.length > 0) {
-      // Process mcpConfig array
-      const processedConfigs = mcpConfig.map(config => config.trim()).filter(config => config.length > 0);
       let allConfigs: Record<string, McpServerConfig> = {};
       const allErrors: ValidationError[] = [];
-      for (const configItem of processedConfigs) {
+      for (const configItem of processedMcpConfigs) {
         let configs: Record<string, McpServerConfig> | null = null;
         let errors: ValidationError[] = [];
 
@@ -1578,6 +1580,7 @@ async function run(): Promise<CommanderCommand> {
 
     // Extract strict MCP config flag
     const strictMcpConfig = options.strictMcpConfig || false;
+    setStrictMcpConfig(strictMcpConfig);
 
     // Check if enterprise MCP configuration exists. When it does, only allow dynamic MCP
     // configs that contain special server types (sdk)

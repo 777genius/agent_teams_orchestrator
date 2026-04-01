@@ -25,6 +25,7 @@ import { OAuthService } from '../../services/oauth/index.js'
 import type { OAuthTokens } from '../../services/oauth/types.js'
 import {
   clearCodexOAuthTokens,
+  clearOfficialCodexCliOAuthTokens,
   clearOAuthTokenCache,
   getGeminiAuthMethod,
   getAnthropicApiKeyWithSource,
@@ -611,6 +612,7 @@ export async function authLogoutByProvider(
   if (provider === 'codex') {
     clearCodexOAuthTokens()
     clearLegacyOpenAIOAuthTokens()
+    await clearOfficialCodexCliOAuthTokens()
     process.stdout.write('Successfully logged out from Codex.\n')
     process.exit(0)
   }
@@ -618,6 +620,7 @@ export async function authLogoutByProvider(
   if (provider === 'all') {
     clearCodexOAuthTokens()
     clearLegacyOpenAIOAuthTokens()
+    await clearOfficialCodexCliOAuthTokens()
   }
 
   try {

@@ -82,6 +82,8 @@ type State = {
   questionPreviewFormat: 'markdown' | 'html' | undefined
   flagSettingsPath: string | undefined
   flagSettingsInline: Record<string, unknown> | null
+  flagMcpConfig: string[]
+  strictMcpConfig: boolean
   allowedSettingSources: SettingSource[]
   sessionIngressToken: string | null | undefined
   oauthTokenFromFd: string | null | undefined
@@ -310,6 +312,8 @@ function getInitialState(): State {
     apiKeyFromFd: undefined,
     flagSettingsPath: undefined,
     flagSettingsInline: null,
+    flagMcpConfig: [],
+    strictMcpConfig: false,
     allowedSettingSources: [
       'userSettings',
       'projectSettings',
@@ -1147,6 +1151,22 @@ export function setFlagSettingsInline(
   STATE.flagSettingsInline = settings
 }
 
+export function getFlagMcpConfig(): string[] {
+  return STATE.flagMcpConfig
+}
+
+export function setFlagMcpConfig(configs: string[] | undefined): void {
+  STATE.flagMcpConfig = configs ?? []
+}
+
+export function getStrictMcpConfig(): boolean {
+  return STATE.strictMcpConfig
+}
+
+export function setStrictMcpConfig(value: boolean): void {
+  STATE.strictMcpConfig = value
+}
+
 export function getSessionIngressToken(): string | null | undefined {
   return STATE.sessionIngressToken
 }
@@ -1755,4 +1775,3 @@ export function getPromptId(): string | null {
 export function setPromptId(id: string | null): void {
   STATE.promptId = id
 }
-

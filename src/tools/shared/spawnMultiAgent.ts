@@ -6,11 +6,13 @@
 import React from 'react'
 import {
   getChromeFlagOverride,
+  getFlagMcpConfig,
   getFlagSettingsPath,
   getInlinePlugins,
   getMainLoopModelOverride,
   getSessionBypassPermissionsMode,
   getSessionId,
+  getStrictMcpConfig,
 } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
 import { createTaskStateBase, generateTaskId } from '../../Task.js'
@@ -240,6 +242,14 @@ function buildInheritedCliFlags(options?: {
   const settingsPath = getFlagSettingsPath()
   if (settingsPath) {
     flags.push(`--settings ${quote([settingsPath])}`)
+  }
+
+  const mcpConfigs = getFlagMcpConfig()
+  for (const mcpConfig of mcpConfigs) {
+    flags.push(`--mcp-config ${quote([mcpConfig])}`)
+  }
+  if (getStrictMcpConfig()) {
+    flags.push('--strict-mcp-config')
   }
 
   // Propagate --plugin-dir for each inline plugin

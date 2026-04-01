@@ -160,6 +160,15 @@ function parseToolName(name: string): {
   }
 }
 
+function getMcpLeafToolName(name: string): string | null {
+  if (!name.startsWith('mcp__')) {
+    return null
+  }
+
+  const segments = name.toLowerCase().split('__')
+  return segments[segments.length - 1] || null
+}
+
 /**
  * Pre-compile word-boundary regexes for all search terms.
  * Called once per search instead of tools×terms×2 times.
@@ -203,6 +212,13 @@ async function searchToolsWithKeywords(
     return [exactMatch.name]
   }
 
+  const mcpLeafMatch =
+    deferredTools.find(tool => getMcpLeafToolName(tool.name) === queryLower) ??
+    tools.find(tool => getMcpLeafToolName(tool.name) === queryLower)
+  if (mcpLeafMatch) {
+    return [mcpLeafMatch.name]
+  }
+
   // If query looks like an MCP tool prefix (mcp__server), find matching tools.
   // Handles models searching by server name with mcp__ prefix.
   if (queryLower.startsWith('mcp__') && queryLower.length > 5) {
@@ -215,7 +231,9 @@ async function searchToolsWithKeywords(
     }
   }
 
-  const queryTerms = queryLower.split(/\s+/).filter(term => term.length > 0)
+  const queryTerms = queryLower
+    .split(/[\s_]+/)
+    .filter(term => term.length > 0)
 
   // Partition into required (+prefixed) and optional terms
   const requiredTerms: string[] = []

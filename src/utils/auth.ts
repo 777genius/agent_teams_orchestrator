@@ -1,8 +1,10 @@
 import chalk from 'chalk'
 import { exec } from 'child_process'
 import { execa } from 'execa'
+import { readFileSync } from 'fs'
 import { mkdir, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
+import { homedir } from 'os'
 import { join } from 'path'
 import { CLAUDE_AI_PROFILE_SCOPE } from 'src/constants/oauth.js'
 import {
@@ -29,7 +31,10 @@ import {
   refreshOAuthToken,
   shouldUseClaudeAIAuth,
 } from '../services/oauth/client.js'
-import type { CodexTokens } from '../services/oauth/codex-client.js'
+import {
+  extractCodexAccountId,
+  type CodexTokens,
+} from '../services/oauth/codex-client.js'
 import { getOauthProfileFromOauthToken } from '../services/oauth/getOauthProfile.js'
 import type { OAuthTokens, SubscriptionType } from '../services/oauth/types.js'
 import {
@@ -1340,6 +1345,67 @@ export function saveCodexOAuthTokens(tokens: CodexTokens): void {
   }))
 }
 
+type OfficialCodexCliAuthFile = {
+  auth_mode?: string
+  tokens?: {
+    access_token?: string
+    refresh_token?: string
+    account_id?: string
+  }
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const payload = parts[1] ?? ''
+    const decoded = Buffer.from(payload, 'base64url').toString('utf8')
+    return JSON.parse(decoded) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function extractCodexAccessTokenExpiry(accessToken: string): number | null {
+  const payload = decodeJwtPayload(accessToken)
+  const exp = payload?.exp
+  return typeof exp === 'number' ? exp * 1000 : null
+}
+
+function getOfficialCodexCliAuthPath(): string {
+  return join(homedir(), '.codex', 'auth.json')
+}
+
+function getOfficialCodexCliOAuthTokens(): CodexTokens | null {
+  try {
+    const raw = readFileSync(getOfficialCodexCliAuthPath(), 'utf8')
+    const parsed = jsonParse(raw) as OfficialCodexCliAuthFile | null
+    const accessToken = parsed?.tokens?.access_token
+    const refreshToken = parsed?.tokens?.refresh_token
+
+    if (!accessToken || !refreshToken) {
+      return null
+    }
+
+    const expiresAt = extractCodexAccessTokenExpiry(accessToken)
+    const accountId =
+      parsed?.tokens?.account_id ?? extractCodexAccountId(accessToken)
+
+    if (!expiresAt || !accountId) {
+      return null
+    }
+
+    return {
+      accessToken,
+      refreshToken,
+      expiresAt,
+      accountId,
+    }
+  } catch {
+    return null
+  }
+}
+
 /**
  * Retrieves the stored Codex OAuth tokens from GlobalConfig.
  * Returns null if no Codex tokens are stored.
@@ -1353,7 +1419,7 @@ export function getCodexOAuthTokens(): CodexTokens | null {
     !stored.expiresAt ||
     !stored.accountId
   ) {
-    return null
+    return getOfficialCodexCliOAuthTokens()
   }
   return {
     accessToken: stored.accessToken,
@@ -1371,6 +1437,20 @@ export function clearCodexOAuthTokens(): void {
     const { codexOAuth: _removed, ...rest } = cfg
     return rest as typeof cfg
   })
+}
+
+export async function clearOfficialCodexCliOAuthTokens(): Promise<void> {
+  try {
+    await execa('codex', ['logout'], {
+      reject: false,
+      stdin: 'ignore',
+      stdout: 'ignore',
+      stderr: 'ignore',
+    })
+  } catch {
+    // Best-effort only. If the official CLI is unavailable, we still clear the
+    // local mirrored Codex session metadata.
+  }
 }
 
 
