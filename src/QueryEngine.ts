@@ -941,6 +941,10 @@ export class QueryEngine {
             }
           }
           if (message.subtype === 'api_error') {
+            const errorMessage =
+              typeof message.error?.message === 'string'
+                ? message.error.message
+                : undefined
             yield {
               type: 'system',
               subtype: 'api_retry' as const,
@@ -949,6 +953,7 @@ export class QueryEngine {
               retry_delay_ms: message.retryInMs,
               error_status: message.error.status ?? null,
               error: categorizeRetryableAPIError(message.error),
+              ...(errorMessage ? { error_message: errorMessage } : {}),
               session_id: getSessionId(),
               uuid: message.uuid,
             }

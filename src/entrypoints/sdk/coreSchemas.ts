@@ -1583,6 +1583,7 @@ export const SDKAPIRetryMessageSchema = lazySchema(() =>
       retry_delay_ms: z.number(),
       error_status: z.number().nullable(),
       error: SDKAssistantMessageErrorSchema(),
+      error_message: z.string().optional(),
       uuid: UUIDPlaceholder(),
       session_id: z.string(),
     })

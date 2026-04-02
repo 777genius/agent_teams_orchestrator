@@ -15,6 +15,7 @@ import {
   isGeminiModel,
   mapModelAliasToGemini,
 } from './gemini.js'
+import { getCodexDisplayName, mapClaudeModelToCodex } from './codex.js'
 import {
   getSubscriptionType,
   isClaudeAISubscriber,
@@ -298,8 +299,23 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   if (name.includes('gpt-5.4')) {
     return 'gpt-5.4'
   }
+  if (name.includes('gpt-5.3-codex-spark')) {
+    return 'gpt-5.3-codex-spark'
+  }
   if (name.includes('gpt-5.3-codex')) {
     return 'gpt-5.3-codex'
+  }
+  if (name.includes('gpt-5.2-codex')) {
+    return 'gpt-5.2-codex'
+  }
+  if (name.includes('gpt-5.2')) {
+    return 'gpt-5.2'
+  }
+  if (name.includes('gpt-5.1-codex-max')) {
+    return 'gpt-5.1-codex-max'
+  }
+  if (name.includes('gpt-5.1-codex-mini')) {
+    return 'gpt-5.1-codex-mini'
   }
   if (name.includes('gemini-2.5-flash-lite')) {
     return 'gemini-2.5-flash-lite'
@@ -406,13 +422,11 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
   if (geminiDisplayName) {
     return geminiDisplayName
   }
+  const codexDisplayName = getCodexDisplayName(model)
+  if (codexDisplayName) {
+    return codexDisplayName
+  }
   if (model.includes('gpt-') || model.includes('codex')) {
-    if (model === 'gpt-5.2-codex') return 'Codex 5.2'
-    if (model === 'gpt-5.1-codex') return 'Codex 5.1'
-    if (model === 'gpt-5.1-codex-mini') return 'Codex 5.1 Mini'
-    if (model === 'gpt-5.1-codex-max') return 'Codex 5.1 Max'
-    if (model === 'gpt-5.4') return 'GPT 5.4'
-    if (model === 'gpt-5.2') return 'GPT 5.2'
     return model
   }
 
@@ -538,6 +552,16 @@ export function parseUserSpecifiedModel(
   if (isModelAlias(modelString)) {
     if (getAPIProvider() === 'gemini') {
       return mapModelAliasToGemini(modelString)
+    }
+    if (getAPIProvider() === 'openai') {
+      switch (modelString) {
+        case 'opusplan':
+          return mapClaudeModelToCodex('sonnet')
+        case 'best':
+          return mapClaudeModelToCodex('opus')
+        default:
+          return mapClaudeModelToCodex(modelString)
+      }
     }
     switch (modelString) {
       case 'opusplan':
@@ -711,8 +735,23 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   if (canonical.includes('gpt-5.4')) {
     return 'GPT-5.4'
   }
+  if (canonical.includes('gpt-5.3-codex-spark')) {
+    return 'GPT-5.3 Codex Spark'
+  }
   if (canonical.includes('gpt-5.3-codex')) {
     return 'GPT-5.3 Codex'
+  }
+  if (canonical.includes('gpt-5.2-codex')) {
+    return 'GPT-5.2 Codex'
+  }
+  if (canonical.includes('gpt-5.2')) {
+    return 'GPT-5.2'
+  }
+  if (canonical.includes('gpt-5.1-codex-max')) {
+    return 'GPT-5.1 Codex Max'
+  }
+  if (canonical.includes('gpt-5.1-codex-mini')) {
+    return 'GPT-5.1 Codex Mini'
   }
 
   return undefined

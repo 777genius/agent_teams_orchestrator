@@ -1,4 +1,5 @@
 import { resolveGeminiBackend } from '../gemini/backendResolver.js'
+import { GeminiBackendError } from '../gemini/errors.js'
 import {
   translateAnthropicBody,
   translateGeminiChunksToAnthropic,
@@ -89,10 +90,15 @@ export function createGeminiFetch(): (
       const chunks = await resolution.backend.stream(request)
       return translateGeminiChunksToAnthropic(chunks, request.model)
     } catch (error) {
+      const status =
+        error instanceof GeminiBackendError && typeof error.status === 'number'
+          ? error.status
+          : 500
       return apiError(
         `Gemini ${resolution.backend.kind} backend error: ${
           error instanceof Error ? error.message : String(error)
         }`,
+        status,
       )
     }
   }

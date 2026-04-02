@@ -14,6 +14,7 @@ import {
 import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
+import type { TeammateProvider } from './backends/types.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
 import { TEAMMATE_COMMAND_ENV_VAR } from './constants.js'
 
@@ -40,9 +41,10 @@ export function getTeammateCommand(): string {
 export function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
+  effortValue?: string
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode } = options || {}
+  const { planModeRequired, permissionMode, effortValue } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -61,6 +63,10 @@ export function buildInheritedCliFlags(options?: {
   const modelOverride = getMainLoopModelOverride()
   if (modelOverride) {
     flags.push(`--model ${quote([modelOverride])}`)
+  }
+
+  if (effortValue) {
+    flags.push(`--effort ${quote([effortValue])}`)
   }
 
   // Propagate --settings if set via CLI
@@ -108,6 +114,7 @@ export function buildInheritedCliFlags(options?: {
 const TEAMMATE_ENV_VARS = [
   // API provider selection — without these, teammates default to firstParty
   // and send requests to the wrong endpoint (GitHub issue #23561)
+  'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
@@ -148,18 +155,43 @@ const TEAMMATE_ENV_VARS = [
   'CURL_CA_BUNDLE',
 ] as const
 
+const PROVIDER_SELECTION_ENV_VARS = [
+  'CLAUDE_CODE_USE_OPENAI',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_GEMINI',
+] as const
+
 /**
  * Builds the `env KEY=VALUE ...` string for teammate spawn commands.
  * Always includes CLAUDECODE=1 and CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1,
  * plus any provider/config env vars that are set in the current process.
  */
-export function buildInheritedEnvVars(): string {
+export function buildInheritedEnvVars(options?: {
+  provider?: TeammateProvider
+}): string {
   const envVars = ['CLAUDECODE=1', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1']
+  const provider = options?.provider
 
   for (const key of TEAMMATE_ENV_VARS) {
+    if (provider && PROVIDER_SELECTION_ENV_VARS.includes(key)) {
+      continue
+    }
     const value = process.env[key]
     if (value !== undefined && value !== '') {
       envVars.push(`${key}=${quote([value])}`)
+    }
+  }
+
+  if (provider) {
+    for (const key of PROVIDER_SELECTION_ENV_VARS) {
+      envVars.push(`${key}=''`)
+    }
+    if (provider === 'codex') {
+      envVars.push('CLAUDE_CODE_USE_OPENAI=1')
+    } else if (provider === 'gemini') {
+      envVars.push('CLAUDE_CODE_USE_GEMINI=1')
     }
   }
 

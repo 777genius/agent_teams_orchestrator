@@ -10,6 +10,7 @@ import {
   AuthenticationError,
 } from '@anthropic-ai/sdk'
 import { getModelStrings } from './modelStrings.js'
+import { isCodexModel } from './codex.js'
 import { isGeminiModel } from './gemini.js'
 import { resolveGeminiBackend } from '../../services/gemini/backendResolver.js'
 
@@ -45,7 +46,6 @@ export async function validateModel(
 
   // Check if it's a known Codex/OpenAI model (skip Anthropic API validation)
   const { isCodexSubscriber } = await import('../auth.js')
-  const { isCodexModel } = await import('../../services/api/codex-fetch-adapter.js')
   if (isCodexSubscriber() && isCodexModel(normalizedModel)) {
     validModelCache.set(normalizedModel, true)
     return { valid: true }

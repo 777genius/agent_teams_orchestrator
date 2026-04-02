@@ -4,6 +4,8 @@ import { getInitialSettings } from './settings/settings.js'
 import { isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
 import { resolveAntModel } from './model/antModels.js'
+import { isCodexModel } from './model/codex.js'
+import { isGeminiModel } from './model/gemini.js'
 import { getAPIProvider } from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -22,8 +24,11 @@ export type EffortValue = EffortLevel | number
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
-  if (getAPIProvider() === 'gemini') {
-    return false
+  if (isGeminiModel(model)) {
+    return true
+  }
+  if (isCodexModel(model)) {
+    return true
   }
   const m = model.toLowerCase()
   if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
@@ -55,7 +60,7 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6 only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
-  if (getAPIProvider() === 'gemini') {
+  if (isGeminiModel(model) || isCodexModel(model)) {
     return false
   }
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')

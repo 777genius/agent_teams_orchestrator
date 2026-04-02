@@ -2,8 +2,9 @@ import { feature } from 'bun:bundle'
 import { chmod, open, rename, stat, unlink } from 'fs/promises'
 import mapValues from 'lodash-es/mapValues.js'
 import memoize from 'lodash-es/memoize.js'
-import { dirname, join, parse } from 'path'
+import { dirname, join, parse, resolve } from 'path'
 import { getPlatform } from 'src/utils/platform.js'
+import { getFlagMcpConfig } from '../../bootstrap/state.js'
 import type { PluginError } from '../../types/plugin.js'
 import { getPluginErrorMessage } from '../../types/plugin.js'
 import { isClaudeInChromeMCPServer } from '../../utils/claudeInChrome/common.js'
@@ -78,6 +79,85 @@ function addScopeToServers(
     scopedServers[name] = { ...config, scope }
   }
   return scopedServers
+}
+
+function getDynamicMcpConfigsFromFlags(): Record<string, ScopedMcpServerConfig> {
+  const dynamicConfigsFromState = getFlagMcpConfig()
+    .map(config => config.trim())
+    .filter(config => config.length > 0)
+
+  const dynamicConfigsFromArgv =
+    dynamicConfigsFromState.length > 0
+      ? []
+      : (() => {
+          const argv = process.argv.slice(2)
+          const flagIndex = argv.findIndex(
+            token => token === '--mcp-config' || token === '-mcp-config',
+          )
+          if (flagIndex < 0) {
+            return []
+          }
+
+          const collected: string[] = []
+          for (let i = flagIndex + 1; i < argv.length; i += 1) {
+            const token = argv[i]
+            if (!token || token === '--') {
+              break
+            }
+            if (token.startsWith('-')) {
+              break
+            }
+            collected.push(token)
+          }
+          return collected
+        })()
+
+  const processedMcpConfigs = [
+    ...dynamicConfigsFromState,
+    ...dynamicConfigsFromArgv,
+  ]
+
+  if (processedMcpConfigs.length === 0) {
+    return {}
+  }
+
+  let mergedConfigs: Record<string, ScopedMcpServerConfig> = {}
+  for (const configItem of processedMcpConfigs) {
+    let parsedConfigs: Record<string, McpServerConfig> | null = null
+
+    const parsedJson = safeParseJSON(configItem)
+    if (parsedJson) {
+      const result = parseMcpConfig({
+        configObject: parsedJson,
+        filePath: 'command line',
+        expandVars: true,
+        scope: 'dynamic',
+      })
+      if (result.config) {
+        parsedConfigs = result.config.mcpServers
+      }
+    } else {
+      const result = parseMcpConfigFromFilePath({
+        filePath: resolve(configItem),
+        expandVars: true,
+        scope: 'dynamic',
+      })
+      if (result.config) {
+        parsedConfigs = result.config.mcpServers
+      }
+    }
+
+    if (!parsedConfigs) {
+      continue
+    }
+
+    mergedConfigs = {
+      ...mergedConfigs,
+      ...addScopeToServers(parsedConfigs, 'dynamic'),
+    }
+  }
+
+  return filterMcpServersByPolicy(mergedConfigs).allowed
 }
 
 /**
@@ -1042,9 +1122,13 @@ export function getMcpConfigByName(name: string): ScopedMcpServerConfig | null {
   const { servers: userServers } = getMcpConfigsByScope('user')
   const { servers: projectServers } = getMcpConfigsByScope('project')
   const { servers: localServers } = getMcpConfigsByScope('local')
+  const dynamicServers = getDynamicMcpConfigsFromFlags()
 
   if (enterpriseServers[name]) {
     return enterpriseServers[name]
+  }
+  if (dynamicServers[name]) {
+    return dynamicServers[name]
   }
   if (localServers[name]) {
     return localServers[name]
@@ -1235,6 +1319,7 @@ export async function getClaudeCodeMcpConfigs(
     userServers,
     approvedProjectServers,
     localServers,
+    dynamicServers,
   )
 
   // Apply policy filtering to merged configs
@@ -1268,7 +1353,7 @@ export async function getAllMcpConfigs(): Promise<{
   // with loadAllPluginsCacheOnly() inside. Memoized — the awaited call below is a cache hit.
   const claudeaiPromise = fetchClaudeAIMcpConfigsIfEligible()
   const { servers: claudeCodeServers, errors } = await getClaudeCodeMcpConfigs(
-    {},
+    getDynamicMcpConfigsFromFlags(),
     claudeaiPromise,
   )
   const { allowed: claudeaiMcpServers } = filterMcpServersByPolicy(

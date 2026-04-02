@@ -4,10 +4,11 @@ import {
   CLAUDE_HAIKU_4_5_CONFIG,
   CLAUDE_OPUS_4_6_CONFIG,
   CLAUDE_SONNET_4_6_CONFIG,
-  GPT_5_3_CODEX_CONFIG,
-  GPT_5_4_CONFIG,
-  GPT_5_4_MINI_CONFIG,
 } from '../../utils/model/configs.js'
+import {
+  CODEX_MODELS,
+  DEFAULT_CODEX_MODEL,
+} from '../../utils/model/codex.js'
 import {
   DEFAULT_GEMINI_MODEL,
   GEMINI_MODELS,
@@ -43,25 +44,13 @@ function getProviderModels(provider: InternalModelProvider): {
   switch (provider) {
     case 'codex':
       return {
-        defaultModel: GPT_5_3_CODEX_CONFIG.openai,
+        defaultModel: DEFAULT_CODEX_MODEL,
         displayName: 'Codex',
-        models: [
-          {
-            id: GPT_5_4_CONFIG.openai,
-            label: 'GPT-5.4',
-            description: 'Advanced reasoning and code generation',
-          },
-          {
-            id: GPT_5_3_CODEX_CONFIG.openai,
-            label: 'GPT-5.3 Codex',
-            description: 'Optimized for code generation and understanding',
-          },
-          {
-            id: GPT_5_4_MINI_CONFIG.openai,
-            label: 'GPT-5.4 Mini',
-            description: 'Fast and efficient for simple tasks',
-          },
-        ],
+        models: CODEX_MODELS.map(model => ({
+          id: model.id,
+          label: model.label,
+          description: model.description,
+        })),
       }
     case 'gemini':
       return {

@@ -1,5 +1,9 @@
 import { getMainLoopModel } from '../../utils/model/model.js'
 import { isGeminiModel, mapModelAliasToGemini } from '../../utils/model/gemini.js'
+import {
+  getAnthropicRequestedEffortLevel,
+  mapEffortToGeminiThinkingConfig,
+} from '../../utils/providerEffort.js'
 import type {
   GeminiNormalizedChunk,
   GeminiNormalizedPart,
@@ -272,6 +276,13 @@ export function translateAnthropicBody(
   }
   if (Array.isArray(anthropicBody.stop_sequences)) {
     generationConfig.stopSequences = anthropicBody.stop_sequences as string[]
+  }
+  const thinkingConfig = mapEffortToGeminiThinkingConfig(
+    model,
+    getAnthropicRequestedEffortLevel(anthropicBody),
+  )
+  if (thinkingConfig) {
+    generationConfig.thinkingConfig = thinkingConfig
   }
 
   const systemInstruction = stripAnthropicSystemHeaders(

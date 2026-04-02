@@ -4,6 +4,7 @@ import { formatAgentId, parseAgentId } from '../../../utils/agentId.js'
 import { quote } from '../../../utils/bash/shellQuote.js'
 import { registerCleanup } from '../../../utils/cleanupRegistry.js'
 import { logForDebugging } from '../../../utils/debug.js'
+import { getAPIProvider } from '../../../utils/model/providers.js'
 import { jsonStringify } from '../../../utils/slowOperations.js'
 import { writeToMailbox } from '../../../utils/teammateMailbox.js'
 import {
@@ -21,6 +22,13 @@ import type {
   TeammateSpawnConfig,
   TeammateSpawnResult,
 } from './types.js'
+
+function getCurrentProvider(): 'anthropic' | 'codex' | 'gemini' {
+  const provider = getAPIProvider()
+  if (provider === 'openai') return 'codex'
+  if (provider === 'gemini') return 'gemini'
+  return 'anthropic'
+}
 
 /**
  * PaneBackendExecutor adapts a PaneBackend to the TeammateExecutor interface.
@@ -130,7 +138,17 @@ export class PaneBackendExecutor implements TeammateExecutor {
       let inheritedFlags = buildInheritedCliFlags({
         planModeRequired: config.planModeRequired,
         permissionMode: appState.toolPermissionContext.mode,
+        effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
       })
+
+      if (config.provider && config.provider !== getCurrentProvider()) {
+        inheritedFlags = inheritedFlags
+          .split(' ')
+          .filter(
+            (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
+          )
+          .join(' ')
+      }
 
       // If teammate has a custom model, add --model flag (or replace inherited one)
       if (config.model) {
@@ -145,11 +163,23 @@ export class PaneBackendExecutor implements TeammateExecutor {
           : `--model ${quote([config.model])}`
       }
 
+      if (config.effort) {
+        inheritedFlags = inheritedFlags
+          .split(' ')
+          .filter(
+            (flag, i, arr) => flag !== '--effort' && arr[i - 1] !== '--effort',
+          )
+          .join(' ')
+        inheritedFlags = inheritedFlags
+          ? `${inheritedFlags} --effort ${quote([config.effort])}`
+          : `--effort ${quote([config.effort])}`
+      }
+
       const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
       const workingDir = config.cwd
 
       // Build environment variables to forward to teammate
-      const envStr = buildInheritedEnvVars()
+      const envStr = buildInheritedEnvVars({ provider: config.provider })
 
       const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
 

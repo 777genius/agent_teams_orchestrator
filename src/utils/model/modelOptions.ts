@@ -7,6 +7,7 @@ import {
   isTeamPremiumSubscriber,
 } from '../auth.js'
 import { getModelStrings } from './modelStrings.js'
+import { CODEX_MODELS } from './codex.js'
 import {
   getDefaultGeminiMainModelDescription,
   getGeminiModelOptions,
@@ -222,31 +223,13 @@ function getHaikuOption(): ModelOption {
 }
 
 // OpenAI Codex model options
-function getGpt54Option(): ModelOption {
-  return {
-    value: 'gpt-5.4',
-    label: 'GPT-5.4',
-    description: 'GPT-5.4 · Advanced reasoning and code generation',
-    descriptionForModel: 'GPT-5.4 - advanced reasoning and code generation capabilities',
-  }
-}
-
-function getGpt53CodexOption(): ModelOption {
-  return {
-    value: 'gpt-5.3-codex',
-    label: 'GPT-5.3 Codex',
-    description: 'GPT-5.3 Codex · Optimized for code generation and understanding',
-    descriptionForModel: 'GPT-5.3 Codex - specialized for code generation and understanding',
-  }
-}
-
-function getGpt54MiniOption(): ModelOption {
-  return {
-    value: 'gpt-5.4-mini',
-    label: 'GPT-5.4 Mini',
-    description: 'GPT-5.4 Mini · Fast and efficient for simple tasks',
-    descriptionForModel: 'GPT-5.4 Mini - fast and efficient for simple coding tasks',
-  }
+function getCodexModelOptions(): ModelOption[] {
+  return CODEX_MODELS.map(model => ({
+    value: model.id,
+    label: model.label,
+    description: `${model.label} · ${model.description}`,
+    descriptionForModel: `${model.label} - ${model.description}`,
+  }))
 }
 
 function getMaxOpusOption(fastMode = false): ModelOption {
@@ -335,9 +318,7 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
   if (isCodexSubscriber()) {
     return [
       getDefaultOptionForUser(),
-      getGpt54Option(),
-      getGpt53CodexOption(),
-      getGpt54MiniOption(),
+      ...getCodexModelOptions(),
     ]
   }
 

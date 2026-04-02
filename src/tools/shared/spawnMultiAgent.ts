@@ -26,6 +26,8 @@ import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
+import type { EffortLevel } from '../../utils/effort.js'
+import { getAPIProvider } from '../../utils/model/providers.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { isTmuxAvailable } from '../../utils/swarm/backends/detection.js'
@@ -37,7 +39,10 @@ import {
   resetBackendDetection,
 } from '../../utils/swarm/backends/registry.js'
 import { getTeammateModeFromSnapshot } from '../../utils/swarm/backends/teammateModeSnapshot.js'
-import type { BackendType } from '../../utils/swarm/backends/types.js'
+import type {
+  BackendType,
+  TeammateProvider,
+} from '../../utils/swarm/backends/types.js'
 import { isPaneBackend } from '../../utils/swarm/backends/types.js'
 import {
   SWARM_SESSION_NAME,
@@ -102,6 +107,61 @@ export function resolveTeammateModel(
   return inputModel ?? getDefaultTeammateModel(leaderModel)
 }
 
+function getCurrentTeammateProvider(): TeammateProvider {
+  const provider = getAPIProvider()
+  if (provider === 'openai') {
+    return 'codex'
+  }
+  if (provider === 'gemini') {
+    return 'gemini'
+  }
+  return 'anthropic'
+}
+
+function resolveTeammateProvider(
+  inputProvider: TeammateProvider | undefined,
+): TeammateProvider {
+  return inputProvider ?? getCurrentTeammateProvider()
+}
+
+function requiresSeparateProcessForProvider(
+  inputProvider: TeammateProvider | undefined,
+): boolean {
+  return (
+    inputProvider !== undefined && inputProvider !== getCurrentTeammateProvider()
+  )
+}
+
+function resolveSpawnModel(
+  inputModel: string | undefined,
+  leaderModel: string | null,
+  inputProvider: TeammateProvider | undefined,
+): string | undefined {
+  if (requiresSeparateProcessForProvider(inputProvider)) {
+    // Do not inherit the leader's model across provider boundaries.
+    // Let the spawned process pick its provider-native default unless a
+    // teammate-specific model was explicitly requested.
+    if (inputModel === undefined || inputModel === 'inherit') {
+      return undefined
+    }
+  }
+  return resolveTeammateModel(inputModel, leaderModel)
+}
+
+function stripInheritedModelFlag(flags: string): string {
+  return flags
+    .split(' ')
+    .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
+    .join(' ')
+}
+
+function stripInheritedEffortFlag(flags: string): string {
+  return flags
+    .split(' ')
+    .filter((flag, i, arr) => flag !== '--effort' && arr[i - 1] !== '--effort')
+    .join(' ')
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -111,6 +171,8 @@ export type SpawnOutput = {
   agent_id: string
   agent_type?: string
   model?: string
+  provider?: TeammateProvider
+  effort?: EffortLevel
   name: string
   color?: string
   tmux_session_name: string
@@ -129,6 +191,8 @@ export type SpawnTeammateConfig = {
   use_splitpane?: boolean
   plan_mode_required?: boolean
   model?: string
+  provider?: TeammateProvider
+  effort?: EffortLevel
   agent_type?: string
   description?: string
   /** request_id of the API call whose response contained the tool_use that
@@ -146,6 +210,8 @@ type SpawnInput = {
   use_splitpane?: boolean
   plan_mode_required?: boolean
   model?: string
+  provider?: TeammateProvider
+  effort?: EffortLevel
   agent_type?: string
   description?: string
   invokingRequestId?: string
@@ -210,9 +276,10 @@ function getTeammateCommand(): string {
 function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
+  effortValue?: string
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode } = options || {}
+  const { planModeRequired, permissionMode, effortValue } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -236,6 +303,10 @@ function buildInheritedCliFlags(options?: {
   const modelOverride = getMainLoopModelOverride()
   if (modelOverride) {
     flags.push(`--model ${quote([modelOverride])}`)
+  }
+
+  if (effortValue) {
+    flags.push(`--effort ${quote([effortValue])}`)
   }
 
   // Propagate --settings if set via CLI
@@ -318,9 +389,15 @@ async function handleSpawnSplitPane(
 ): Promise<{ data: SpawnOutput }> {
   const { setAppState, getAppState } = context
   const { name, prompt, agent_type, cwd, plan_mode_required } = input
+  const provider = resolveTeammateProvider(input.provider)
+  const effort = input.effort
 
   // Resolve model: 'inherit' → leader's model; undefined → default Opus
-  const model = resolveTeammateModel(input.model, getAppState().mainLoopModel)
+  const model = resolveSpawnModel(
+    input.model,
+    getAppState().mainLoopModel,
+    input.provider,
+  )
 
   if (!name || !prompt) {
     throw new Error('name and prompt are required for spawn operation')
@@ -428,25 +505,34 @@ async function handleSpawnSplitPane(
   let inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
+    effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
   })
+
+  if (requiresSeparateProcessForProvider(input.provider)) {
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+  }
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
   if (model) {
     // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
-      .join(' ')
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
     // Add the teammate's model
     inheritedFlags = inheritedFlags
       ? `${inheritedFlags} --model ${quote([model])}`
       : `--model ${quote([model])}`
   }
 
+  if (effort) {
+    inheritedFlags = stripInheritedEffortFlag(inheritedFlags)
+    inheritedFlags = inheritedFlags
+      ? `${inheritedFlags} --effort ${quote([effort])}`
+      : `--effort ${quote([effort])}`
+  }
+
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
   // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
-  const envStr = buildInheritedEnvVars()
+  const envStr = buildInheritedEnvVars({ provider })
   const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
 
   // Send the command to the new pane
@@ -507,6 +593,8 @@ async function handleSpawnSplitPane(
     name: sanitizedName,
     agentType: agent_type,
     model,
+    provider,
+    effort,
     prompt,
     color: teammateColor,
     planModeRequired: plan_mode_required,
@@ -536,6 +624,8 @@ async function handleSpawnSplitPane(
       agent_id: teammateId,
       agent_type,
       model,
+      provider,
+      effort,
       name: sanitizedName,
       color: teammateColor,
       tmux_session_name: sessionName,
@@ -558,9 +648,15 @@ async function handleSpawnSeparateWindow(
 ): Promise<{ data: SpawnOutput }> {
   const { setAppState, getAppState } = context
   const { name, prompt, agent_type, cwd, plan_mode_required } = input
+  const provider = resolveTeammateProvider(input.provider)
+  const effort = input.effort
 
   // Resolve model: 'inherit' → leader's model; undefined → default Opus
-  const model = resolveTeammateModel(input.model, getAppState().mainLoopModel)
+  const model = resolveSpawnModel(
+    input.model,
+    getAppState().mainLoopModel,
+    input.provider,
+  )
 
   if (!name || !prompt) {
     throw new Error('name and prompt are required for spawn operation')
@@ -635,25 +731,34 @@ async function handleSpawnSeparateWindow(
   let inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
+    effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
   })
+
+  if (requiresSeparateProcessForProvider(input.provider)) {
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+  }
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
   if (model) {
     // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
-      .join(' ')
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
     // Add the teammate's model
     inheritedFlags = inheritedFlags
       ? `${inheritedFlags} --model ${quote([model])}`
       : `--model ${quote([model])}`
   }
 
+  if (effort) {
+    inheritedFlags = stripInheritedEffortFlag(inheritedFlags)
+    inheritedFlags = inheritedFlags
+      ? `${inheritedFlags} --effort ${quote([effort])}`
+      : `--effort ${quote([effort])}`
+  }
+
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
   // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
-  const envStr = buildInheritedEnvVars()
+  const envStr = buildInheritedEnvVars({ provider })
   const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
 
   // Send the command to the new window
@@ -721,6 +826,8 @@ async function handleSpawnSeparateWindow(
     name: sanitizedName,
     agentType: agent_type,
     model,
+    provider,
+    effort,
     prompt,
     color: teammateColor,
     planModeRequired: plan_mode_required,
@@ -750,6 +857,8 @@ async function handleSpawnSeparateWindow(
       agent_id: teammateId,
       agent_type,
       model,
+      provider,
+      effort,
       name: sanitizedName,
       color: teammateColor,
       tmux_session_name: SWARM_SESSION_NAME,
@@ -853,9 +962,21 @@ async function handleSpawnInProcess(
 ): Promise<{ data: SpawnOutput }> {
   const { setAppState, getAppState } = context
   const { name, prompt, agent_type, plan_mode_required } = input
+  const provider = resolveTeammateProvider(input.provider)
+  const effort = input.effort
+
+  if (requiresSeparateProcessForProvider(input.provider)) {
+    throw new Error(
+      `Teammate "${name}" requests provider "${provider}" which differs from the leader provider "${getCurrentTeammateProvider()}". Mixed-provider teammates must run in a separate process.`,
+    )
+  }
 
   // Resolve model: 'inherit' → leader's model; undefined → default Opus
-  const model = resolveTeammateModel(input.model, getAppState().mainLoopModel)
+  const model = resolveSpawnModel(
+    input.model,
+    getAppState().mainLoopModel,
+    input.provider,
+  )
 
   if (!name || !prompt) {
     throw new Error('name and prompt are required for spawn operation')
@@ -904,6 +1025,7 @@ async function handleSpawnInProcess(
     color: teammateColor,
     planModeRequired: plan_mode_required ?? false,
     model,
+    effort,
   }
 
   const result = await spawnInProcessTeammate(config, context)
@@ -932,6 +1054,7 @@ async function handleSpawnInProcess(
       prompt,
       description: input.description,
       model,
+      effort,
       agentDefinition,
       teammateContext: result.teammateContext,
       // Strip messages: the teammate never reads toolUseContext.messages
@@ -1007,6 +1130,8 @@ async function handleSpawnInProcess(
     name: sanitizedName,
     agentType: agent_type,
     model,
+    provider,
+    effort,
     prompt,
     color: teammateColor,
     planModeRequired: plan_mode_required,
@@ -1029,6 +1154,8 @@ async function handleSpawnInProcess(
       agent_id: teammateId,
       agent_type,
       model,
+      provider,
+      effort,
       name: sanitizedName,
       color: teammateColor,
       tmux_session_name: 'in-process',
@@ -1051,8 +1178,11 @@ async function handleSpawn(
   input: SpawnInput,
   context: ToolUseContext,
 ): Promise<{ data: SpawnOutput }> {
+  const requestedProvider = resolveTeammateProvider(input.provider)
+  const forceSeparateProcess = requiresSeparateProcessForProvider(input.provider)
+
   // Check if in-process mode is enabled via feature flag
-  if (isInProcessEnabled()) {
+  if (isInProcessEnabled() && !forceSeparateProcess) {
     return handleSpawnInProcess(input, context)
   }
 
@@ -1063,6 +1193,11 @@ async function handleSpawn(
   try {
     await detectAndGetBackend()
   } catch (error) {
+    if (forceSeparateProcess) {
+      throw new Error(
+        `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". A pane-based backend is required for mixed-provider teammates, but none is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
+      )
+    }
     // Only fall back silently in auto mode. If the user explicitly configured
     // teammateMode: 'tmux', let the error propagate so they see the actionable
     // install instructions from getTmuxInstallInstructions().

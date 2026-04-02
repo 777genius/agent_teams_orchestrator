@@ -3,6 +3,7 @@ import {
   getGeminiBaseUrl,
   resolveGeminiAuth,
 } from '../../../utils/geminiAuth.js'
+import { GeminiBackendError } from '../errors.js'
 import type {
   GeminiBackend,
   GeminiBackendStatus,
@@ -176,8 +177,9 @@ export const geminiApiBackend: GeminiBackend = {
       }),
     })
     if (!response.ok) {
-      throw new Error(
+      throw new GeminiBackendError(
         `Gemini API error (${response.status}): ${await response.text()}`,
+        response.status,
       )
     }
     return (await response.json()) as GeminiNormalizedResponseEnvelope
@@ -198,8 +200,9 @@ export const geminiApiBackend: GeminiBackend = {
       }),
     })
     if (!response.ok) {
-      throw new Error(
+      throw new GeminiBackendError(
         `Gemini API error (${response.status}): ${await response.text()}`,
+        response.status,
       )
     }
     return parseApiStream(response)

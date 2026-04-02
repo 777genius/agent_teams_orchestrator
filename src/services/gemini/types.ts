@@ -50,6 +50,11 @@ export type GeminiNormalizedRequest = {
     maxOutputTokens?: number
     temperature?: number
     stopSequences?: string[]
+    thinkingConfig?: {
+      includeThoughts?: boolean
+      thinkingBudget?: number
+      thinkingLevel?: 'LOW' | 'HIGH'
+    }
   }
 }
 

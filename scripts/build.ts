@@ -1,5 +1,12 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { dirname } from 'path'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs'
+import { dirname, relative, resolve } from 'path'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -116,6 +123,8 @@ const outfile = compile
   : dev
     ? './cli-dev'
     : './cli'
+const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
+const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
 const version = dev ? getDevVersion(pkg.version) : pkg.version
 
@@ -183,50 +192,99 @@ const defines = {
   ),
 } as const
 
-const cmd = [
-  'bun',
-  'build',
-  './src/entrypoints/cli.tsx',
-  '--compile',
-  '--target',
-  'bun',
-  '--format',
-  'esm',
-  '--outfile',
-  outfile,
-  '--minify',
-  '--bytecode',
-  '--packages',
-  'bundle',
-  '--conditions',
-  'bun',
-]
+function extendBuildArgs(cmd: string[]): string[] {
+  for (const external of externals) {
+    cmd.push('--external', external)
+  }
 
-for (const external of externals) {
-  cmd.push('--external', external)
+  for (const feature of features) {
+    cmd.push(`--feature=${feature}`)
+  }
+
+  for (const [key, value] of Object.entries(defines)) {
+    cmd.push('--define', `${key}=${value}`)
+  }
+
+  return cmd
 }
 
-for (const feature of features) {
-  cmd.push(`--feature=${feature}`)
+function runBuild(cmd: string[]): void {
+  const proc = Bun.spawnSync({
+    cmd,
+    cwd: process.cwd(),
+    stdout: 'inherit',
+    stderr: 'inherit',
+  })
+
+  if (proc.exitCode !== 0) {
+    process.exit(proc.exitCode ?? 1)
+  }
 }
 
-for (const [key, value] of Object.entries(defines)) {
-  cmd.push('--define', `${key}=${value}`)
+function writeLauncher(launcherPath: string, targetPath: string): void {
+  const launcherDir = dirname(resolve(launcherPath))
+  const targetRelativePath = relative(launcherDir, resolve(targetPath))
+  const launcher = `#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+exec bun "$SCRIPT_DIR/${targetRelativePath}" "$@"
+`
+
+  writeFileSync(launcherPath, launcher)
+  chmodSync(launcherPath, 0o755)
 }
 
-const proc = Bun.spawnSync({
-  cmd,
-  cwd: process.cwd(),
-  stdout: 'inherit',
-  stderr: 'inherit',
-})
+if (compile) {
+  const cmd = extendBuildArgs([
+    'bun',
+    'build',
+    './src/entrypoints/cli.tsx',
+    '--compile',
+    '--target',
+    'bun',
+    '--format',
+    'esm',
+    '--outfile',
+    outfile,
+    '--minify',
+    '--bytecode',
+    '--packages',
+    'bundle',
+    '--conditions',
+    'bun',
+  ])
 
-if (proc.exitCode !== 0) {
-  process.exit(proc.exitCode ?? 1)
+  runBuild(cmd)
+
+  if (existsSync(outfile)) {
+    chmodSync(outfile, 0o755)
+  }
+
+  console.log(`Built ${outfile}`)
+} else {
+  rmSync(bundleOutdir, { recursive: true, force: true })
+  mkdirSync(bundleOutdir, { recursive: true })
+
+  const cmd = extendBuildArgs([
+    'bun',
+    'build',
+    './src/entrypoints/cli.tsx',
+    '--target',
+    'bun',
+    '--format',
+    'esm',
+    '--outdir',
+    bundleOutdir,
+    '--minify',
+    '--packages',
+    'bundle',
+    '--conditions',
+    'bun',
+  ])
+
+  runBuild(cmd)
+  writeLauncher(outfile, bundleEntrypoint)
+
+  console.log(`Built ${outfile} -> ${bundleEntrypoint}`)
 }
-
-if (existsSync(outfile)) {
-  chmodSync(outfile, 0o755)
-}
-
-console.log(`Built ${outfile}`)

@@ -74,6 +74,8 @@ export type TeamFile = {
     name: string
     agentType?: string
     model?: string
+    provider?: 'anthropic' | 'codex' | 'gemini'
+    effort?: 'low' | 'medium' | 'high' | 'max'
     prompt?: string
     color?: string
     planModeRequired?: boolean
