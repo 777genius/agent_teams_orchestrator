@@ -13,21 +13,31 @@ import {
 } from '../../bootstrap/state.js'
 import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
+import { execFileNoThrow } from '../execFileNoThrow.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
+import { sleep } from '../sleep.js'
 import type { TeammateProvider } from './backends/types.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
-import { TEAMMATE_COMMAND_ENV_VAR } from './constants.js'
+import {
+  getSwarmSocketName,
+  TEAMMATE_COMMAND_ENV_VAR,
+  TMUX_COMMAND,
+} from './constants.js'
 
 /**
- * Gets the command to use for spawning teammate processes.
- * Uses TEAMMATE_COMMAND_ENV_VAR if set, otherwise falls back to the
- * current process executable path.
+ * Gets the shell command prefix to use for spawning teammate processes.
+ * Uses TEAMMATE_COMMAND_ENV_VAR if set, otherwise:
+ * - bundled/native mode: execute the compiled binary directly
+ * - script mode (bun/node): execute the current script via process.execPath
  */
 export function getTeammateCommand(): string {
   if (process.env[TEAMMATE_COMMAND_ENV_VAR]) {
     return process.env[TEAMMATE_COMMAND_ENV_VAR]
   }
-  return isInBundledMode() ? process.execPath : process.argv[1]!
+  if (isInBundledMode()) {
+    return quote([process.execPath])
+  }
+  return `${quote([process.execPath])} ${quote([process.argv[1]!])}`
 }
 
 /**
@@ -42,9 +52,10 @@ export function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
   effortValue?: string
+  strictMcpConfig?: boolean
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -81,7 +92,7 @@ export function buildInheritedCliFlags(options?: {
   for (const mcpConfig of mcpConfigs) {
     flags.push(`--mcp-config ${quote([mcpConfig])}`)
   }
-  if (getStrictMcpConfig()) {
+  if (strictMcpConfig || getStrictMcpConfig()) {
     flags.push('--strict-mcp-config')
   }
 
@@ -119,7 +130,9 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
   'CLAUDE_CODE_USE_GEMINI',
+  'CLAUDE_CODE_ENTRY_PROVIDER',
   'CLAUDE_CODE_GEMINI_BACKEND',
+  'CLAUDE_CODE_CODEX_BACKEND',
   // Custom API endpoint
   'ANTHROPIC_BASE_URL',
   'GEMINI_BASE_URL',
@@ -161,7 +174,12 @@ const PROVIDER_SELECTION_ENV_VARS = [
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
   'CLAUDE_CODE_USE_GEMINI',
+  'CLAUDE_CODE_ENTRY_PROVIDER',
 ] as const
+
+const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
+  PROVIDER_SELECTION_ENV_VARS,
+)
 
 /**
  * Builds the `env KEY=VALUE ...` string for teammate spawn commands.
@@ -175,7 +193,7 @@ export function buildInheritedEnvVars(options?: {
   const provider = options?.provider
 
   for (const key of TEAMMATE_ENV_VARS) {
-    if (provider && PROVIDER_SELECTION_ENV_VARS.includes(key)) {
+    if (provider && PROVIDER_SELECTION_ENV_VAR_SET.has(key)) {
       continue
     }
     const value = process.env[key]
@@ -189,11 +207,146 @@ export function buildInheritedEnvVars(options?: {
       envVars.push(`${key}=''`)
     }
     if (provider === 'codex') {
-      envVars.push('CLAUDE_CODE_USE_OPENAI=1')
+      envVars.push('CLAUDE_CODE_ENTRY_PROVIDER=codex')
     } else if (provider === 'gemini') {
-      envVars.push('CLAUDE_CODE_USE_GEMINI=1')
+      envVars.push('CLAUDE_CODE_ENTRY_PROVIDER=gemini')
     }
   }
 
   return envVars.join(' ')
+}
+
+const TMUX_SPAWN_SMOKE_DELAY_MS = 800
+const TMUX_TEAMMATE_EXIT_SENTINEL = '__CLAUDE_TEAMMATE_EXIT__:'
+
+const TMUX_SPAWN_FAILURE_PATTERNS: Array<{
+  pattern: RegExp
+  message: string
+}> = [
+  {
+    pattern: /permission denied/i,
+    message: 'Teammate runtime failed to start: permission denied.',
+  },
+  {
+    pattern: /command not found/i,
+    message: 'Teammate runtime failed to start: command not found.',
+  },
+  {
+    pattern: /no such file or directory/i,
+    message: 'Teammate runtime failed to start: file not found.',
+  },
+  {
+    pattern: /bad interpreter/i,
+    message: 'Teammate runtime failed to start: bad interpreter.',
+  },
+  {
+    pattern: /exec format error/i,
+    message: 'Teammate runtime failed to start: exec format error.',
+  },
+  {
+    pattern: /cannot execute/i,
+    message: 'Teammate runtime failed to start: shell could not execute the command.',
+  },
+  {
+    pattern: /is not executable/i,
+    message: 'Teammate runtime failed to start: file is not executable.',
+  },
+  {
+    pattern: /operation not permitted/i,
+    message: 'Teammate runtime failed to start: operation not permitted.',
+  },
+]
+
+function extractRelevantSpawnFailureLine(output: string): string | null {
+  const lines = output
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  for (const line of lines.slice().reverse()) {
+    for (const { pattern, message } of TMUX_SPAWN_FAILURE_PATTERNS) {
+      if (pattern.test(line)) {
+        return `${message} (${line})`
+      }
+    }
+  }
+
+  return null
+}
+
+export function wrapTeammateSpawnCommand(command: string): string {
+  return `${command}; __claude_teammate_exit=$?; printf '\\n${TMUX_TEAMMATE_EXIT_SENTINEL}%s\\n' "$__claude_teammate_exit"`
+}
+
+function extractExitSentinelCode(output: string): number | null {
+  const match = output.match(
+    /__CLAUDE_TEAMMATE_EXIT__:(\d+)(?![\s\S]*__CLAUDE_TEAMMATE_EXIT__:)/,
+  )
+  if (!match) {
+    return null
+  }
+  const parsed = Number.parseInt(match[1] ?? '', 10)
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+/**
+ * Checks whether a tmux-spawned teammate command crashed immediately after
+ * launch. This is intentionally conservative: we only fail on clear shell
+ * startup errors or when the pane disappears right away.
+ */
+export async function probeTmuxTeammateSpawn(
+  paneId: string,
+  useExternalSession = false,
+): Promise<string | null> {
+  await sleep(TMUX_SPAWN_SMOKE_DELAY_MS)
+
+  const socketArgs = useExternalSession ? ['-L', getSwarmSocketName()] : []
+  const status = await execFileNoThrow(TMUX_COMMAND, [
+    ...socketArgs,
+    'display-message',
+    '-p',
+    '-t',
+    paneId,
+    '#{pane_dead}|#{pane_current_command}|#{pane_pid}',
+  ])
+
+  if (status.code !== 0) {
+    return `Teammate pane ${paneId} exited immediately after launch.`
+  }
+
+  const [paneDeadRaw = '0', currentCommand = '', panePid = ''] = status.stdout
+    .trim()
+    .split('|')
+
+  const capture = await execFileNoThrow(TMUX_COMMAND, [
+    ...socketArgs,
+    'capture-pane',
+    '-p',
+    '-t',
+    paneId,
+    '-S',
+    '-60',
+  ])
+
+  const capturedOutput = capture.code === 0 ? capture.stdout.trim() : ''
+  const failureLine = extractRelevantSpawnFailureLine(capturedOutput)
+  if (failureLine) {
+    return failureLine
+  }
+
+  const exitCode = extractExitSentinelCode(capturedOutput)
+  if (exitCode !== null) {
+    if (exitCode === 0) {
+      return 'Teammate runtime exited immediately after launch.'
+    }
+    return `Teammate runtime exited immediately after launch with code ${exitCode}.`
+  }
+
+  if (paneDeadRaw === '1') {
+    const commandSuffix = currentCommand ? ` (${currentCommand})` : ''
+    const pidSuffix = panePid ? ` pid=${panePid}` : ''
+    return `Teammate pane ${paneId} exited immediately after launch${commandSuffix}${pidSuffix}.`
+  }
+
+  return null
 }

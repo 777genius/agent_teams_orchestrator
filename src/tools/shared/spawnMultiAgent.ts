@@ -56,7 +56,11 @@ import {
   type InProcessSpawnConfig,
   spawnInProcessTeammate,
 } from '../../utils/swarm/spawnInProcess.js'
-import { buildInheritedEnvVars } from '../../utils/swarm/spawnUtils.js'
+import {
+  buildInheritedEnvVars,
+  probeTmuxTeammateSpawn,
+  wrapTeammateSpawnCommand,
+} from '../../utils/swarm/spawnUtils.js'
 import {
   readTeamFileAsync,
   sanitizeAgentName,
@@ -162,6 +166,26 @@ function stripInheritedEffortFlag(flags: string): string {
     .join(' ')
 }
 
+function summarizePromptSize(prompt: string): string {
+  const chars = prompt.length.toLocaleString('en-US')
+  const lines = prompt.length === 0 ? 0 : prompt.split(/\r?\n/g).length
+  return `${chars} chars/${lines} lines`
+}
+
+function logTeammateSpawnSnapshot(params: {
+  teamName: string
+  teammateName: string
+  provider: TeammateProvider
+  model: string | undefined
+  effort: EffortLevel | undefined
+  prompt: string
+  strictMcpConfig: boolean
+}): void {
+  logForDebugging(
+    `[teammate-spawn] team=${params.teamName} teammate=${params.teammateName} provider=${params.provider} model=${params.model ?? 'default'} effort=${params.effort ?? 'default'} prompt=${summarizePromptSize(params.prompt)} strictMcpConfig=${params.strictMcpConfig} env.entryProvider=${process.env.CLAUDE_CODE_ENTRY_PROVIDER ?? 'unset'} env.geminiBackend=${process.env.CLAUDE_CODE_GEMINI_BACKEND ?? 'unset'} env.codexBackend=${process.env.CLAUDE_CODE_CODEX_BACKEND ?? 'unset'}`,
+  )
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -254,15 +278,19 @@ async function ensureSession(sessionName: string): Promise<void> {
 }
 
 /**
- * Gets the command to spawn a teammate.
- * For native builds (compiled binaries), use process.execPath.
- * For non-native (node/bun running a script), use process.argv[1].
+ * Gets the shell command prefix to spawn a teammate.
+ * For native builds (compiled binaries), execute process.execPath directly.
+ * For non-native (bun/node running a script), execute the current script via
+ * process.execPath plus process.argv[1].
  */
 function getTeammateCommand(): string {
   if (process.env[TEAMMATE_COMMAND_ENV_VAR]) {
     return process.env[TEAMMATE_COMMAND_ENV_VAR]
   }
-  return isInBundledMode() ? process.execPath : process.argv[1]!
+  if (isInBundledMode()) {
+    return quote([process.execPath])
+  }
+  return `${quote([process.execPath])} ${quote([process.argv[1]!])}`
 }
 
 /**
@@ -277,9 +305,10 @@ function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
   effortValue?: string
+  strictMcpConfig?: boolean
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -319,7 +348,7 @@ function buildInheritedCliFlags(options?: {
   for (const mcpConfig of mcpConfigs) {
     flags.push(`--mcp-config ${quote([mcpConfig])}`)
   }
-  if (getStrictMcpConfig()) {
+  if (strictMcpConfig || getStrictMcpConfig()) {
     flags.push('--strict-mcp-config')
   }
 
@@ -506,6 +535,7 @@ async function handleSpawnSplitPane(
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
+    strictMcpConfig: Boolean(teamName),
   })
 
   if (requiresSeparateProcessForProvider(input.provider)) {
@@ -532,12 +562,31 @@ async function handleSpawnSplitPane(
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
   // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
+  logTeammateSpawnSnapshot({
+    teamName,
+    teammateName: sanitizedName,
+    provider,
+    model,
+    effort,
+    prompt,
+    strictMcpConfig: Boolean(teamName),
+  })
   const envStr = buildInheritedEnvVars({ provider })
-  const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+  const spawnCommand = wrapTeammateSpawnCommand(
+    `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
+  )
 
   // Send the command to the new pane
   // Use swarm socket when running outside tmux (external swarm session)
   await sendCommandToPane(paneId, spawnCommand, !insideTmux)
+
+  if (detectionResult.backend.type === 'tmux') {
+    const spawnFailure = await probeTmuxTeammateSpawn(paneId, !insideTmux)
+    if (spawnFailure) {
+      await detectionResult.backend.killPane(paneId, !insideTmux)
+      throw new Error(spawnFailure)
+    }
+  }
 
   // Determine session/window names for output
   const sessionName = insideTmux ? 'current' : SWARM_SESSION_NAME
@@ -732,6 +781,7 @@ async function handleSpawnSeparateWindow(
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
+    strictMcpConfig: Boolean(teamName),
   })
 
   if (requiresSeparateProcessForProvider(input.provider)) {
@@ -758,8 +808,19 @@ async function handleSpawnSeparateWindow(
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
   // Includes CLAUDECODE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, and API provider vars.
+  logTeammateSpawnSnapshot({
+    teamName,
+    teammateName: sanitizedName,
+    provider,
+    model,
+    effort,
+    prompt,
+    strictMcpConfig: Boolean(teamName),
+  })
   const envStr = buildInheritedEnvVars({ provider })
-  const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+  const spawnCommand = wrapTeammateSpawnCommand(
+    `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
+  )
 
   // Send the command to the new window
   const sendKeysResult = await execFileNoThrow(TMUX_COMMAND, [
@@ -774,6 +835,12 @@ async function handleSpawnSeparateWindow(
     throw new Error(
       `Failed to send command to tmux window: ${sendKeysResult.stderr}`,
     )
+  }
+
+  const spawnFailure = await probeTmuxTeammateSpawn(paneId, true)
+  if (spawnFailure) {
+    await getBackendByType('tmux').killPane(paneId, true)
+    throw new Error(spawnFailure)
   }
 
   // Track the teammate in AppState's teamContext
@@ -1027,6 +1094,16 @@ async function handleSpawnInProcess(
     model,
     effort,
   }
+
+  logTeammateSpawnSnapshot({
+    teamName,
+    teammateName: sanitizedName,
+    provider,
+    model,
+    effort,
+    prompt,
+    strictMcpConfig: false,
+  })
 
   const result = await spawnInProcessTeammate(config, context)
 

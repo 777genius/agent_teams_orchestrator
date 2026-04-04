@@ -58,7 +58,7 @@ import { runCodexOAuthFlow } from '../../services/oauth/codex-client.js'
 
 type AuthProviderTarget = 'anthropic' | 'codex' | 'all'
 
-type ProviderStatusPayload = {
+export type ProviderStatusPayload = {
   supported: boolean
   authenticated: boolean
   authMethod: string | null
@@ -71,7 +71,7 @@ type ProviderStatusPayload = {
   statusMessage?: string | null
 }
 
-function getAnthropicProviderStatus(): ProviderStatusPayload {
+export function getAnthropicProviderStatus(): ProviderStatusPayload {
   const { source: authTokenSource, hasToken } = getAuthTokenSource()
   const { source: apiKeySource } = getAnthropicApiKeyWithSource()
   const hasApiKeyEnvVar =
@@ -105,7 +105,7 @@ function getAnthropicProviderStatus(): ProviderStatusPayload {
   }
 }
 
-function getCodexProviderStatus(): ProviderStatusPayload {
+export function getCodexProviderStatus(): ProviderStatusPayload {
   const cfg = getGlobalConfig()
   const legacyOpenAiTokens = cfg?.openaiOauthTokens
   const codexTokens = getCodexOAuthTokens()
@@ -132,7 +132,7 @@ function getCodexProviderStatus(): ProviderStatusPayload {
   }
 }
 
-function getAllProviderStatuses(): Record<'anthropic' | 'codex', ProviderStatusPayload> {
+export function getAllProviderStatuses(): Record<'anthropic' | 'codex', ProviderStatusPayload> {
   return {
     anthropic: getAnthropicProviderStatus(),
     codex: getCodexProviderStatus(),

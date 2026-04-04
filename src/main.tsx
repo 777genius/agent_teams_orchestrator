@@ -4158,6 +4158,18 @@ async function run(): Promise<CommanderCommand> {
     await modelList(opts);
   });
 
+  const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
+  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'gemini' | 'all';
+  }) => {
+    const {
+      runtimeStatus
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeStatus(opts);
+  });
+
   /**
    * Helper function to handle marketplace command errors consistently.
    * Logs the error and exits the process with status 1.

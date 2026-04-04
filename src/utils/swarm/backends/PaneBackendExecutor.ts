@@ -11,6 +11,8 @@ import {
   buildInheritedCliFlags,
   buildInheritedEnvVars,
   getTeammateCommand,
+  probeTmuxTeammateSpawn,
+  wrapTeammateSpawnCommand,
 } from '../spawnUtils.js'
 import { assignTeammateColor } from '../teammateLayoutManager.js'
 import { isInsideTmux } from './detection.js'
@@ -139,6 +141,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
         planModeRequired: config.planModeRequired,
         permissionMode: appState.toolPermissionContext.mode,
         effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
+        strictMcpConfig: Boolean(config.teamName),
       })
 
       if (config.provider && config.provider !== getCurrentProvider()) {
@@ -181,11 +184,28 @@ export class PaneBackendExecutor implements TeammateExecutor {
       // Build environment variables to forward to teammate
       const envStr = buildInheritedEnvVars({ provider: config.provider })
 
-      const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+      const spawnCommand = wrapTeammateSpawnCommand(
+        `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
+      )
 
       // Send the command to the new pane
       // Use swarm socket when running outside tmux (external swarm session)
       await this.backend.sendCommandToPane(paneId, spawnCommand, !insideTmux)
+
+      if (this.backend.type === 'tmux') {
+        const spawnFailure = await probeTmuxTeammateSpawn(
+          paneId,
+          !insideTmux,
+        )
+        if (spawnFailure) {
+          await this.backend.killPane(paneId, !insideTmux)
+          return {
+            success: false,
+            agentId,
+            error: spawnFailure,
+          }
+        }
+      }
 
       // Track the spawned teammate
       this.spawnedTeammates.set(agentId, { paneId, insideTmux })

@@ -301,7 +301,7 @@ export async function getAnthropicClient({
     return new AnthropicVertex(vertexArgs) as unknown as Anthropic
   }
 
-  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)) {
+  if (getAPIProvider() === 'gemini') {
     const geminiFetch = createGeminiFetch()
     const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
       apiKey: 'gemini-placeholder',

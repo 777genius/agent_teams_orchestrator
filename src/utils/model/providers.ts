@@ -9,7 +9,40 @@ export type APIProvider =
   | 'openai'
   | 'gemini'
 
+function getEntryProviderOverride():
+  | 'firstParty'
+  | 'bedrock'
+  | 'vertex'
+  | 'foundry'
+  | 'openai'
+  | 'gemini'
+  | null {
+  const raw = process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase()
+  switch (raw) {
+    case 'anthropic':
+      return 'firstParty'
+    case 'codex':
+    case 'openai':
+      return 'openai'
+    case 'gemini':
+      return 'gemini'
+    case 'bedrock':
+      return 'bedrock'
+    case 'vertex':
+      return 'vertex'
+    case 'foundry':
+      return 'foundry'
+    default:
+      return null
+  }
+}
+
 export function getAPIProvider(): APIProvider {
+  const entryProviderOverride = getEntryProviderOverride()
+  if (entryProviderOverride) {
+    return entryProviderOverride
+  }
+
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
     ? 'bedrock'
     : isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)

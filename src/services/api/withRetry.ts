@@ -53,6 +53,8 @@ const DEFAULT_MAX_RETRIES = 10
 const FLOOR_OUTPUT_TOKENS = 3000
 const MAX_529_RETRIES = 3
 export const BASE_DELAY_MS = 500
+const GEMINI_CAPACITY_RESET_PADDING_MS = 1500
+const GEMINI_CAPACITY_RESET_CAP_MS = 2 * 60 * 1000
 
 // Foreground query sources where the user IS blocking on the result — these
 // retry on 529. Everything else (summaries, titles, suggestions, classifiers)
@@ -459,7 +461,10 @@ export async function* withRetry<T>(
           PERSISTENT_RESET_CAP_MS,
         )
       } else {
-        delayMs = getRetryDelay(attempt, retryAfter)
+        const resetDelay = getGeminiCapacityResetDelayMs(error)
+        delayMs = resetDelay
+          ? Math.max(getRetryDelay(attempt, retryAfter), resetDelay)
+          : getRetryDelay(attempt, retryAfter)
       }
 
       // In persistent mode the for-loop `attempt` is clamped at maxRetries+1;
@@ -819,4 +824,35 @@ function getRateLimitResetDelayMs(error: APIError): number | null {
   const delayMs = resetUnixSec * 1000 - Date.now()
   if (delayMs <= 0) return null
   return Math.min(delayMs, PERSISTENT_RESET_CAP_MS)
+}
+
+export function getGeminiCapacityResetDelayMs(error: unknown): number | null {
+  if (!(error instanceof APIError)) {
+    return null
+  }
+
+  const lowerMessage = error.message?.toLowerCase() ?? ''
+  if (
+    !lowerMessage.includes('quota will reset after') &&
+    !lowerMessage.includes('exhausted your capacity on this model')
+  ) {
+    return null
+  }
+
+  const match = lowerMessage.match(
+    /quota will reset after\s+(\d+(?:\.\d+)?)s\b/,
+  )
+  if (!match?.[1]) {
+    return null
+  }
+
+  const seconds = Number(match[1])
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return null
+  }
+
+  return Math.min(
+    Math.ceil(seconds * 1000) + GEMINI_CAPACITY_RESET_PADDING_MS,
+    GEMINI_CAPACITY_RESET_CAP_MS,
+  )
 }

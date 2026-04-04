@@ -118,10 +118,32 @@ function sanitizeGeminiSchema(
       continue
     }
 
-    const child = sanitizeGeminiSchema(
-      rawChild,
-      isRoot && mappedKey === 'defs',
-    )
+    const child =
+      mappedKey === 'properties' && typeof rawChild === 'object' && rawChild !== null
+        ? Object.fromEntries(
+            Object.entries(rawChild).flatMap(([propertyName, propertySchema]) => {
+              const sanitizedPropertySchema = sanitizeGeminiSchema(propertySchema)
+              return sanitizedPropertySchema === undefined
+                ? []
+                : [[propertyName, sanitizedPropertySchema]]
+            }),
+          )
+        : mappedKey === 'defs' && typeof rawChild === 'object' && rawChild !== null
+          ? Object.fromEntries(
+              Object.entries(rawChild).flatMap(([definitionName, definitionSchema]) => {
+                const sanitizedDefinitionSchema = sanitizeGeminiSchema(
+                  definitionSchema,
+                  isRoot,
+                )
+                return sanitizedDefinitionSchema === undefined
+                  ? []
+                  : [[definitionName, sanitizedDefinitionSchema]]
+              }),
+            )
+          : sanitizeGeminiSchema(
+              rawChild,
+              isRoot && mappedKey === 'defs',
+            )
     if (child !== undefined) {
       output[mappedKey] = child
     }
@@ -136,6 +158,19 @@ function sanitizeGeminiSchema(
     output.propertyOrdering = Object.keys(
       output.properties as Record<string, unknown>,
     )
+  }
+
+  if (Array.isArray(output.required)) {
+    if (output.properties && typeof output.properties === 'object') {
+      const propertyNames = new Set(
+        Object.keys(output.properties as Record<string, unknown>),
+      )
+      output.required = output.required.filter(
+        field => typeof field === 'string' && propertyNames.has(field),
+      )
+    } else {
+      delete output.required
+    }
   }
 
   if (!isRoot && 'defs' in output) {

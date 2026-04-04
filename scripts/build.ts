@@ -228,7 +228,34 @@ function writeLauncher(launcherPath: string, targetPath: string): void {
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
-exec bun "$SCRIPT_DIR/${targetRelativePath}" "$@"
+TARGET="$SCRIPT_DIR/${targetRelativePath}"
+
+if [[ "\${1-}" == "runtime" && "\${2-}" == "status" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == "--json" ]]; then
+      RAW_OUTPUT="$(
+        bun "$TARGET" "$@" 2> >(cat >&2)
+      )"
+      RAW_OUTPUT="$RAW_OUTPUT" node <<'EOF'
+const raw = process.env.RAW_OUTPUT ?? ''
+const start = raw.indexOf('{')
+const end = raw.lastIndexOf('}')
+if (start < 0 || end <= start) {
+  process.stderr.write(raw)
+  process.exit(1)
+}
+const prefix = raw.slice(0, start).trim()
+if (prefix.length > 0) {
+  process.stderr.write(prefix + '\\n')
+}
+process.stdout.write(raw.slice(start, end + 1) + '\\n')
+EOF
+      exit $?
+    fi
+  done
+fi
+
+exec bun "$TARGET" "$@"
 `
 
   writeFileSync(launcherPath, launcher)

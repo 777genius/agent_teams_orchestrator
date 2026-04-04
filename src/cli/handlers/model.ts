@@ -17,7 +17,7 @@ import { getAPIProvider } from '../../utils/model/providers.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 type ModelProviderTarget = 'anthropic' | 'codex' | 'all'
-type InternalModelProvider = Exclude<ModelProviderTarget, 'all'> | 'gemini'
+export type InternalModelProvider = Exclude<ModelProviderTarget, 'all'> | 'gemini'
 
 type ModelSummary = {
   id: string
@@ -36,7 +36,7 @@ function getDefaultProvider(): InternalModelProvider {
   return 'anthropic'
 }
 
-function getProviderModels(provider: InternalModelProvider): {
+export function getProviderModels(provider: InternalModelProvider): {
   defaultModel: string
   displayName: string
   models: ModelSummary[]

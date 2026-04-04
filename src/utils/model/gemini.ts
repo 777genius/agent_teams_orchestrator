@@ -34,7 +34,7 @@ function hasGeminiApiCredentialsConfigured(): boolean {
 
 export function getDefaultGeminiMainModel(): string {
   const backendPreference = process.env.CLAUDE_CODE_GEMINI_BACKEND
-  if (backendPreference === 'cli') {
+  if (backendPreference === 'cli' || backendPreference === 'cli-sdk') {
     return DEFAULT_GEMINI_FAST_MODEL
   }
   if (backendPreference === 'api') {

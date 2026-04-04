@@ -344,7 +344,7 @@ export function buildAPIProviderProperties(): Property[] {
       label: 'Gemini backend',
       value: geminiBackend
     });
-    if (geminiBackend === 'cli') {
+    if (geminiBackend === 'cli' || geminiBackend === 'cli-sdk') {
       properties.push({
         label: 'Gemini endpoint',
         value: 'Code Assist (cloudcode-pa.googleapis.com/v1internal)'

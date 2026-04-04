@@ -123,11 +123,12 @@ export function isAnthropicAuthEnabled(): boolean {
     return !!process.env.CLAUDE_CODE_OAUTH_TOKEN
   }
 
+  const provider = getAPIProvider()
   const is3P =
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
+    provider === 'bedrock' ||
+    provider === 'vertex' ||
+    provider === 'foundry' ||
+    provider === 'gemini'
 
   // Check if user has configured an external API key source
   // This allows externally-provided API keys to work (without requiring proxy configuration)
@@ -1895,11 +1896,12 @@ export function getSubscriptionName(): string {
 
 /** Check if using third-party services (Bedrock or Vertex or Foundry) */
 export function isUsing3PServices(): boolean {
-  return !!(
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
+  const provider = getAPIProvider()
+  return (
+    provider === 'bedrock' ||
+    provider === 'vertex' ||
+    provider === 'foundry' ||
+    provider === 'gemini'
   )
 }
 
@@ -2044,7 +2046,7 @@ export function getAccountInformation() {
       projectId: getGeminiProjectId(),
       backend: geminiBackend,
     }
-    if (geminiBackend !== 'cli') {
+    if (geminiBackend !== 'cli' && geminiBackend !== 'cli-sdk') {
       accountInfo.baseUrl = getGeminiBaseUrl()
       accountInfo.apiVersion = getGeminiApiVersion()
     }

@@ -2,6 +2,10 @@ import { getGlobalConfig, saveGlobalConfig } from '../../utils/config.js'
 import { resolveGeminiAuth } from '../../utils/geminiAuth.js'
 import { geminiApiBackend } from './backends/apiBackend.js'
 import { geminiCliBackend } from './backends/cliBackend.js'
+import {
+  normalizeGeminiBackendPreference,
+  normalizeGeminiBackendStorageValue,
+} from '../runtimeBackends/registry.js'
 import type {
   GeminiBackend,
   GeminiBackendKind,
@@ -10,22 +14,23 @@ import type {
 
 export type GeminiBackendPreference = 'auto' | 'api' | 'cli'
 
-export function getGeminiBackendPreference(): GeminiBackendPreference {
-  const envPreference = process.env.CLAUDE_CODE_GEMINI_BACKEND
-  if (envPreference === 'api' || envPreference === 'cli' || envPreference === 'auto') {
-    return envPreference
-  }
-  const savedPreference = getGlobalConfig().geminiBackendPreference
-  return savedPreference ?? 'auto'
-}
-
-export function saveGeminiResolvedBackend(
-  backend: GeminiBackendKind | undefined,
-): void {
+function saveGeminiResolvedRuntimeBackend(backend: 'auto' | 'api' | 'cli-sdk' | undefined): void {
   saveGlobalConfig(current => ({
     ...current,
-    geminiResolvedBackend: backend,
+    geminiResolvedBackend:
+      backend && backend !== 'auto' ? normalizeGeminiBackendStorageValue(backend) : undefined,
   }))
+}
+
+export function getGeminiBackendPreference(): GeminiBackendPreference {
+  const envPreference = normalizeGeminiBackendPreference(
+    process.env.CLAUDE_CODE_GEMINI_BACKEND,
+  )
+  if (envPreference === 'api' || envPreference === 'cli-sdk' || envPreference === 'auto') {
+    return envPreference === 'cli-sdk' ? 'cli' : envPreference
+  }
+  const savedPreference = getGlobalConfig().geminiBackendPreference
+  return normalizeGeminiBackendStorageValue(savedPreference) ?? 'auto'
 }
 
 function getBackend(kind: GeminiBackendKind): GeminiBackend {
@@ -58,7 +63,7 @@ export async function resolveGeminiBackend(): Promise<{
   if (preference === 'api' || preference === 'cli') {
     const backend = getBackend(preference)
     const status = withForcedMessage(await backend.validate(), preference)
-    saveGeminiResolvedBackend(status.ok ? preference : undefined)
+    saveGeminiResolvedRuntimeBackend(status.ok ? normalizeGeminiBackendPreference(preference) : undefined)
     return {
       backend: status.ok ? backend : null,
       status,
@@ -78,7 +83,7 @@ export async function resolveGeminiBackend(): Promise<{
       } satisfies GeminiBackendStatus)
 
   if (apiStatus.ok) {
-    saveGeminiResolvedBackend('api')
+    saveGeminiResolvedRuntimeBackend('api')
     return {
       backend: geminiApiBackend,
       status: apiStatus,
@@ -87,7 +92,7 @@ export async function resolveGeminiBackend(): Promise<{
   }
 
   if (process.env.GEMINI_API_KEY) {
-    saveGeminiResolvedBackend(undefined)
+    saveGeminiResolvedRuntimeBackend(undefined)
     return {
       backend: null,
       status: apiStatus,
@@ -98,7 +103,7 @@ export async function resolveGeminiBackend(): Promise<{
   const cliStatus = await geminiCliBackend.validate()
 
   if (cliStatus.ok) {
-    saveGeminiResolvedBackend('cli')
+    saveGeminiResolvedRuntimeBackend('cli-sdk')
     return {
       backend: geminiCliBackend,
       status: cliStatus,
@@ -106,7 +111,7 @@ export async function resolveGeminiBackend(): Promise<{
     }
   }
 
-  saveGeminiResolvedBackend(undefined)
+  saveGeminiResolvedRuntimeBackend(undefined)
   return {
     backend: null,
     status: apiStatus.message ? apiStatus : cliStatus,

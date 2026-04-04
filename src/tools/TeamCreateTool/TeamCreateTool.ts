@@ -1,5 +1,9 @@
 import { z } from 'zod/v4'
-import { getSessionId } from '../../bootstrap/state.js'
+import {
+  getInitialMainLoopModel,
+  getMainLoopModelOverride,
+  getSessionId,
+} from '../../bootstrap/state.js'
 import { logEvent } from '../../services/analytics/index.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/metadata.js'
 import type { Tool } from '../../Tool.js'
@@ -145,9 +149,13 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
     // Generate a deterministic agent ID for the team lead
     const leadAgentId = formatAgentId(TEAM_LEAD_NAME, finalTeamName)
     const leadAgentType = agent_type || TEAM_LEAD_NAME
-    // Get the team lead's current model from AppState (handles session model, settings, CLI override)
+    // Get the team lead's current model from launch/bootstrap state first.
+    // TeamCreate can run before AppState fully reflects a new --model selection,
+    // so relying on appState alone can incorrectly persist the previous model.
     const leadModel = parseUserSpecifiedModel(
-      appState.mainLoopModelForSession ??
+      getMainLoopModelOverride() ??
+        getInitialMainLoopModel() ??
+        appState.mainLoopModelForSession ??
         appState.mainLoopModel ??
         getDefaultMainLoopModel(),
     )
