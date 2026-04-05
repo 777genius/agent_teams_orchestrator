@@ -679,7 +679,10 @@ export function renderGroupedAgentToolUse(toolUses: Array<{
 
     // teammate_spawned is not part of the exported Output type (cast through unknown
     // for dead code elimination), so check via string comparison on the raw value
-    const isTeammateSpawn = result?.output?.status as string === 'teammate_spawned';
+    const rawStatus = result?.output?.status as string | undefined;
+    const isTeammateSpawn =
+      rawStatus === 'teammate_spawned' ||
+      rawStatus === 'teammate_duplicate_skipped';
 
     // For teammate spawns, show @name with type in parens and description as status
     let agentType: string;

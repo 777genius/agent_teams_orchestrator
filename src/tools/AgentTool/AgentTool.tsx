@@ -44,7 +44,10 @@ import { createAgentWorktree, hasWorktreeChanges, removeAgentWorktree } from '..
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js';
 import { BackgroundHint } from '../BashTool/UI.js';
 import { FILE_READ_TOOL_NAME } from '../FileReadTool/prompt.js';
-import { spawnTeammate } from '../shared/spawnMultiAgent.js';
+import {
+  spawnTeammate,
+  type DuplicateSkippedOutput,
+} from '../shared/spawnMultiAgent.js';
 import { setAgentColor } from './agentColorManager.js';
 import { agentToolResultSchema, classifyHandoffIfNeeded, emitTaskProgress, extractPartialResult, finalizeAgentTool, getLastToolUseName, runAsyncAgentLifecycle } from './agentToolUtils.js';
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js';
@@ -180,6 +183,11 @@ type TeammateSpawnedOutput = {
   plan_mode_required?: boolean;
 };
 
+type TeammateDuplicateSkippedOutput = DuplicateSkippedOutput & {
+  status: 'teammate_duplicate_skipped';
+  prompt: string;
+};
+
 // Combined output type including both public and internal types
 // Note: TeammateSpawnedOutput type is fine - TypeScript types are erased at compile time
 // Private type for remote-launched results — excluded from exported schema
@@ -193,7 +201,11 @@ export type RemoteLaunchedOutput = {
   prompt: string;
   outputFile: string;
 };
-type InternalOutput = Output | TeammateSpawnedOutput | RemoteLaunchedOutput;
+type InternalOutput =
+  | Output
+  | TeammateSpawnedOutput
+  | TeammateDuplicateSkippedOutput
+  | RemoteLaunchedOutput;
 import type { AgentToolProgress, ShellProgress } from '../../types/tools.js';
 // AgentTool forwards both its own progress events and shell progress
 // events from the sub-agent so the SDK receives tool_progress updates during bash/powershell runs.
@@ -315,11 +327,18 @@ export const AgentTool = buildTool({
       // This type is excluded from the exported outputSchema for dead code elimination.
       // Cast through unknown because TeammateSpawnedOutput is intentionally
       // not part of the exported Output union (for dead code elimination purposes).
-      const spawnResult: TeammateSpawnedOutput = {
-        status: 'teammate_spawned' as const,
-        prompt,
-        ...result.data
-      };
+      const spawnResult: TeammateSpawnedOutput | TeammateDuplicateSkippedOutput =
+        result.data.status === 'duplicate_skipped'
+          ? {
+              status: 'teammate_duplicate_skipped' as const,
+              prompt,
+              ...result.data,
+            }
+          : {
+              status: 'teammate_spawned' as const,
+              prompt,
+              ...result.data,
+            };
       return {
         data: spawnResult
       } as unknown as {
@@ -1322,6 +1341,32 @@ agent_id: ${spawnData.teammate_id}
 name: ${spawnData.name}
 team_name: ${spawnData.team_name}
 The agent is now running and will receive instructions via mailbox.`
+        }]
+      };
+    }
+    if (
+      typeof internalData === 'object' &&
+      internalData !== null &&
+      'status' in internalData &&
+      internalData.status === 'teammate_duplicate_skipped'
+    ) {
+      const duplicateData = internalData as TeammateDuplicateSkippedOutput;
+      const detail =
+        duplicateData.reason === 'already_running'
+          ? 'The teammate is already running.'
+          : 'The teammate is already starting and bootstrap is still pending.';
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: [{
+          type: 'text',
+          text: `Duplicate spawn skipped.
+status: duplicate_skipped
+reason: ${duplicateData.reason}
+agent_id: ${duplicateData.teammate_id}
+name: ${duplicateData.name}
+team_name: ${duplicateData.team_name}
+${detail}`
         }]
       };
     }

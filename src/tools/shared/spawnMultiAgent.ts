@@ -17,7 +17,10 @@ import {
 import type { AppState } from '../../state/AppState.js'
 import { createTaskStateBase, generateTaskId } from '../../Task.js'
 import type { ToolUseContext } from '../../Tool.js'
-import type { InProcessTeammateTaskState } from '../../tasks/InProcessTeammateTask/types.js'
+import {
+  isInProcessTeammateTask,
+  type InProcessTeammateTaskState,
+} from '../../tasks/InProcessTeammateTask/types.js'
 import { formatAgentId } from '../../utils/agentId.js'
 import { quote } from '../../utils/bash/shellQuote.js'
 import { isInBundledMode } from '../../utils/bundledMode.js'
@@ -30,7 +33,10 @@ import type { EffortLevel } from '../../utils/effort.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
-import { isTmuxAvailable } from '../../utils/swarm/backends/detection.js'
+import {
+  IT2_COMMAND,
+  isTmuxAvailable,
+} from '../../utils/swarm/backends/detection.js'
 import {
   detectAndGetBackend,
   getBackendByType,
@@ -45,6 +51,7 @@ import type {
 } from '../../utils/swarm/backends/types.js'
 import { isPaneBackend } from '../../utils/swarm/backends/types.js'
 import {
+  getSwarmSocketName,
   SWARM_SESSION_NAME,
   TEAM_LEAD_NAME,
   TEAMMATE_COMMAND_ENV_VAR,
@@ -76,7 +83,11 @@ import {
 } from '../../utils/swarm/teammateLayoutManager.js'
 import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js'
 import { registerTask } from '../../utils/task/framework.js'
-import { writeToMailbox } from '../../utils/teammateMailbox.js'
+import {
+  isIdleNotification,
+  readMailbox,
+  writeToMailbox,
+} from '../../utils/teammateMailbox.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import { isCustomAgent } from '../AgentTool/loadAgentsDir.js'
 
@@ -186,6 +197,52 @@ function logTeammateSpawnSnapshot(params: {
   )
 }
 
+function normalizeTeammateIdentity(name: string): string {
+  return sanitizeAgentName(name).trim().toLowerCase()
+}
+
+function buildTeammateSpawnReservationKey(
+  teamName: string,
+  name: string,
+): string {
+  return `${teamName.toLowerCase()}::${normalizeTeammateIdentity(name)}`
+}
+
+async function isTmuxPaneAlive(
+  paneId: string,
+  useExternalSession: boolean,
+): Promise<boolean> {
+  const socketArgs = useExternalSession ? ['-L', getSwarmSocketName()] : []
+  const result = await execFileNoThrow(TMUX_COMMAND, [
+    ...socketArgs,
+    'display-message',
+    '-p',
+    '-t',
+    paneId,
+    '#{pane_id}',
+  ])
+  return result.code === 0 && result.stdout.trim() === paneId
+}
+
+async function isItermPaneAlive(paneId: string): Promise<boolean> {
+  const result = await execFileNoThrow(IT2_COMMAND, ['session', 'list'])
+  if (result.code !== 0) {
+    return false
+  }
+  return result.stdout.includes(paneId)
+}
+
+async function hasBootstrapConfirmation(
+  teamName: string,
+  teammateId: string,
+): Promise<boolean> {
+  const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
+  return leaderMessages.some(message => {
+    const idleNotification = isIdleNotification(message.text)
+    return idleNotification?.from === teammateId
+  })
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -204,6 +261,23 @@ export type SpawnOutput = {
   tmux_pane_id: string
   team_name?: string
   is_splitpane?: boolean
+  plan_mode_required?: boolean
+}
+
+export type DuplicateSkippedReason = 'already_running' | 'bootstrap_pending'
+
+export type DuplicateSkippedOutput = {
+  status: 'duplicate_skipped'
+  reason: DuplicateSkippedReason
+  spawned: false
+  teammate_id: string
+  agent_id: string
+  agent_type?: string
+  model?: string
+  provider?: TeammateProvider
+  effort?: EffortLevel
+  name: string
+  team_name: string
   plan_mode_required?: boolean
 }
 
@@ -239,6 +313,162 @@ type SpawnInput = {
   agent_type?: string
   description?: string
   invokingRequestId?: string
+}
+
+type SpawnResult = {
+  data: SpawnOutput | DuplicateSkippedOutput
+}
+
+type ExistingTeammateDecision =
+  | { decision: 'allow_spawn' | 'allow_respawn_after_terminal_failure' }
+  | {
+      decision: 'duplicate_already_running' | 'duplicate_bootstrap_pending'
+      reason: DuplicateSkippedReason
+    }
+
+const pendingTeammateSpawnReservations = new Set<string>()
+
+async function resolveExistingTeammateState(
+  input: SpawnInput,
+  context: ToolUseContext,
+  teamName: string,
+): Promise<ExistingTeammateDecision> {
+  const appState = context.getAppState()
+  const normalizedTargetName = normalizeTeammateIdentity(input.name)
+  const canonicalName = sanitizeAgentName(input.name).trim()
+  const canonicalAgentId = formatAgentId(canonicalName, teamName)
+
+  const inProcessTask = Object.values(appState.tasks).find(task => {
+    if (!isInProcessTeammateTask(task) || task.status !== 'running') {
+      return false
+    }
+    return (
+      task.identity.teamName === teamName &&
+      normalizeTeammateIdentity(task.identity.agentName) === normalizedTargetName
+    )
+  })
+  if (inProcessTask) {
+    const bootstrapConfirmed = await hasBootstrapConfirmation(
+      teamName,
+      inProcessTask.identity.agentId,
+    )
+    return {
+      decision: bootstrapConfirmed
+        ? 'duplicate_already_running'
+        : 'duplicate_bootstrap_pending',
+      reason: bootstrapConfirmed ? 'already_running' : 'bootstrap_pending',
+    }
+  }
+
+  const inMemoryTeammate = Object.entries(appState.teamContext?.teammates || {}).find(
+    ([, teammate]) =>
+      normalizeTeammateIdentity(teammate.name) === normalizedTargetName,
+  )
+  if (inMemoryTeammate) {
+    const [teammateId, teammate] = inMemoryTeammate
+    let runtimeAlive = false
+    const paneId = teammate.tmuxPaneId?.trim()
+    if (paneId && paneId !== 'in-process') {
+      runtimeAlive =
+        (await isTmuxPaneAlive(paneId, false)) ||
+        (await isTmuxPaneAlive(paneId, true)) ||
+        (await isItermPaneAlive(paneId))
+    }
+    if (runtimeAlive) {
+      const bootstrapConfirmed = await hasBootstrapConfirmation(teamName, teammateId)
+      return {
+        decision: bootstrapConfirmed
+          ? 'duplicate_already_running'
+          : 'duplicate_bootstrap_pending',
+        reason: bootstrapConfirmed ? 'already_running' : 'bootstrap_pending',
+      }
+    }
+  }
+
+  const teamFile = await readTeamFileAsync(teamName)
+  const existingMember = teamFile?.members.find(
+    member => normalizeTeammateIdentity(member.name) === normalizedTargetName,
+  )
+  if (!existingMember) {
+    return { decision: 'allow_spawn' }
+  }
+
+  let runtimeAlive = false
+  const paneId = existingMember.tmuxPaneId?.trim()
+  if (existingMember.backendType === 'in-process') {
+    runtimeAlive = Boolean(
+      Object.values(appState.tasks).find(task => {
+        if (!isInProcessTeammateTask(task) || task.status !== 'running') {
+          return false
+        }
+        return task.identity.agentId === existingMember.agentId
+      }),
+    )
+  } else if (paneId && existingMember.backendType === 'tmux') {
+    runtimeAlive =
+      (await isTmuxPaneAlive(paneId, false)) ||
+      (await isTmuxPaneAlive(paneId, true))
+  } else if (paneId && existingMember.backendType === 'iterm2') {
+    runtimeAlive = await isItermPaneAlive(paneId)
+  } else if (paneId) {
+    runtimeAlive =
+      (await isTmuxPaneAlive(paneId, false)) ||
+      (await isTmuxPaneAlive(paneId, true)) ||
+      (await isItermPaneAlive(paneId))
+  }
+
+  if (!runtimeAlive) {
+    return { decision: 'allow_respawn_after_terminal_failure' }
+  }
+
+  const bootstrapConfirmed = await hasBootstrapConfirmation(
+    teamName,
+    existingMember.agentId || canonicalAgentId,
+  )
+  return {
+    decision: bootstrapConfirmed
+      ? 'duplicate_already_running'
+      : 'duplicate_bootstrap_pending',
+    reason: bootstrapConfirmed ? 'already_running' : 'bootstrap_pending',
+  }
+}
+
+function buildDuplicateSkippedResult(
+  input: SpawnInput,
+  teamName: string,
+  reason: DuplicateSkippedReason,
+  context: ToolUseContext,
+): { data: DuplicateSkippedOutput } {
+  const appState = context.getAppState()
+  const provider = resolveTeammateProvider(input.provider)
+  const model = resolveSpawnModel(
+    input.model,
+    appState.mainLoopModel,
+    input.provider,
+  )
+  const canonicalName = sanitizeAgentName(input.name).trim()
+  const teammateId = formatAgentId(canonicalName, teamName)
+
+  logForDebugging(
+    `[teammate-spawn] duplicate spawn skipped: team=${teamName} teammate=${canonicalName} reason=${reason}`,
+  )
+
+  return {
+    data: {
+      status: 'duplicate_skipped',
+      reason,
+      spawned: false,
+      teammate_id: teammateId,
+      agent_id: teammateId,
+      agent_type: input.agent_type,
+      model,
+      provider,
+      effort: input.effort,
+      name: canonicalName,
+      team_name: teamName,
+      plan_mode_required: input.plan_mode_required,
+    },
+  }
 }
 
 // ============================================================================
@@ -442,11 +672,10 @@ async function handleSpawnSplitPane(
     )
   }
 
-  // Generate unique name if duplicate exists in team
-  const uniqueName = await generateUniqueTeammateName(name, teamName)
-
-  // Sanitize the name to prevent @ in agent IDs (would break agentName@teamName format)
-  const sanitizedName = sanitizeAgentName(uniqueName)
+  // Persistent team teammates must keep their canonical identity. Duplicate
+  // requests are handled before we get here; a legitimate respawn must reuse
+  // the same teammate name instead of drifting into alice-2/bob-2.
+  const sanitizedName = sanitizeAgentName(name)
 
   // Generate deterministic agent ID from name and team
   const teammateId = formatAgentId(sanitizedName, teamName)
@@ -721,11 +950,10 @@ async function handleSpawnSeparateWindow(
     )
   }
 
-  // Generate unique name if duplicate exists in team
-  const uniqueName = await generateUniqueTeammateName(name, teamName)
-
-  // Sanitize the name to prevent @ in agent IDs (would break agentName@teamName format)
-  const sanitizedName = sanitizeAgentName(uniqueName)
+  // Persistent team teammates must keep their canonical identity. Duplicate
+  // requests are handled before we get here; a legitimate respawn must reuse
+  // the same teammate name instead of drifting into alice-2/bob-2.
+  const sanitizedName = sanitizeAgentName(name)
 
   // Generate deterministic agent ID from name and team
   const teammateId = formatAgentId(sanitizedName, teamName)
@@ -1059,11 +1287,10 @@ async function handleSpawnInProcess(
     )
   }
 
-  // Generate unique name if duplicate exists in team
-  const uniqueName = await generateUniqueTeammateName(name, teamName)
-
-  // Sanitize the name to prevent @ in agent IDs
-  const sanitizedName = sanitizeAgentName(uniqueName)
+  // Persistent team teammates must keep their canonical identity. Duplicate
+  // requests are handled before we get here; a legitimate respawn must reuse
+  // the same teammate name instead of drifting into alice-2/bob-2.
+  const sanitizedName = sanitizeAgentName(name)
 
   // Generate deterministic agent ID from name and team
   const teammateId = formatAgentId(sanitizedName, teamName)
@@ -1310,6 +1537,50 @@ async function handleSpawn(
 export async function spawnTeammate(
   config: SpawnTeammateConfig,
   context: ToolUseContext,
-): Promise<{ data: SpawnOutput }> {
-  return handleSpawn(config, context)
+): Promise<SpawnResult> {
+  const appState = context.getAppState()
+  const teamName = config.team_name || appState.teamContext?.teamName
+  const teammateName = config.name?.trim()
+
+  if (!teamName || !teammateName) {
+    return handleSpawn(config, context)
+  }
+
+  const reservationKey = buildTeammateSpawnReservationKey(teamName, teammateName)
+  if (pendingTeammateSpawnReservations.has(reservationKey)) {
+    return buildDuplicateSkippedResult(
+      config,
+      teamName,
+      'bootstrap_pending',
+      context,
+    )
+  }
+
+  pendingTeammateSpawnReservations.add(reservationKey)
+  try {
+    const existingState = await resolveExistingTeammateState(
+      config,
+      context,
+      teamName,
+    )
+    if (existingState.decision === 'duplicate_already_running') {
+      return buildDuplicateSkippedResult(
+        config,
+        teamName,
+        existingState.reason,
+        context,
+      )
+    }
+    if (existingState.decision === 'duplicate_bootstrap_pending') {
+      return buildDuplicateSkippedResult(
+        config,
+        teamName,
+        existingState.reason,
+        context,
+      )
+    }
+    return handleSpawn(config, context)
+  } finally {
+    pendingTeammateSpawnReservations.delete(reservationKey)
+  }
 }
