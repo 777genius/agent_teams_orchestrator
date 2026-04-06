@@ -1,9 +1,22 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import * as fs from 'fs/promises'
+import * as os from 'os'
+import * as path from 'path'
 
 import {
+  assertBootstrapRuntimeWorkspace,
   deriveBootstrapTerminalStatus,
   shouldCreateTeamForBootstrap,
 } from './teamBootstrapRunner.js'
+
+let tempDirs: string[] = []
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirs.map(dir => fs.rm(dir, { recursive: true, force: true })),
+  )
+  tempDirs = []
+})
 
 describe('team bootstrap partial-failure policy', () => {
   test('returns completed when no members failed', () => {
@@ -64,6 +77,31 @@ describe('team bootstrap create-vs-launch policy', () => {
       }),
     ).toThrow(
       'Deterministic bootstrap cannot launch team "atlas-hq" because the team config does not exist.',
+    )
+  })
+})
+
+describe('team bootstrap workspace safety', () => {
+  test('accepts the current runtime workspace when it matches the request', async () => {
+    const cwd = process.cwd()
+    await expect(
+      assertBootstrapRuntimeWorkspace({
+        teamName: 'atlas-hq',
+        cwd,
+      }),
+    ).resolves.toBeUndefined()
+  })
+
+  test('rejects bootstrap when requested workspace differs from runtime cwd', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-cwd-'))
+    tempDirs.push(tempDir)
+    await expect(
+      assertBootstrapRuntimeWorkspace({
+        teamName: 'atlas-hq',
+        cwd: tempDir,
+      }),
+    ).rejects.toThrow(
+      `Deterministic bootstrap cannot start team "atlas-hq" because the runtime workspace "${process.cwd()}" does not match the requested workspace "${tempDir}".`,
     )
   })
 })

@@ -1,3 +1,4 @@
+import * as fs from 'fs/promises'
 import { getSessionId } from 'src/bootstrap/state.js'
 import type { ToolUseContext } from 'src/Tool.js'
 import { TeamCreateTool } from 'src/tools/TeamCreateTool/TeamCreateTool.js'
@@ -37,6 +38,24 @@ export function shouldCreateTeamForBootstrap(params: {
     )
   }
   return true
+}
+
+export async function assertBootstrapRuntimeWorkspace(
+  request: Pick<TeamBootstrapRequest, 'teamName' | 'cwd'>,
+): Promise<void> {
+  let runtimeCwd: string
+  try {
+    runtimeCwd = await fs.realpath(getCwd())
+  } catch (error) {
+    throw new Error(
+      `Deterministic bootstrap cannot start team "${request.teamName}" because the lead runtime workspace is unavailable: ${errorMessage(error)}`,
+    )
+  }
+  if (runtimeCwd !== request.cwd) {
+    throw new Error(
+      `Deterministic bootstrap cannot start team "${request.teamName}" because the runtime workspace "${runtimeCwd}" does not match the requested workspace "${request.cwd}".`,
+    )
+  }
 }
 
 export function deriveBootstrapTerminalStatus(params: {
@@ -181,6 +200,7 @@ export async function runTeamBootstrap(params: {
   try {
     await stateStore.transitionTo('loading_existing_state', now)
     await params.emit.phaseChanged('loading_existing_state')
+    await assertBootstrapRuntimeWorkspace(params.request)
     await stateStore.transitionTo('acquiring_bootstrap_lock', now)
     await params.emit.phaseChanged('acquiring_bootstrap_lock')
 
