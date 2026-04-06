@@ -3,6 +3,8 @@ import { TeamBootstrapTool } from './TeamBootstrapTool.js'
 
 const originalDisableDeterministicBootstrap =
   process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP
+const originalEnableDeterministicBootstrap =
+  process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP
 const originalEnableTeamBootstrapTool =
   process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL
 
@@ -12,6 +14,13 @@ afterEach(() => {
   } else {
     process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP =
       originalDisableDeterministicBootstrap
+  }
+
+  if (originalEnableDeterministicBootstrap === undefined) {
+    delete process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP
+  } else {
+    process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP =
+      originalEnableDeterministicBootstrap
   }
 
   if (originalEnableTeamBootstrapTool === undefined) {
@@ -25,7 +34,16 @@ afterEach(() => {
 describe('TeamBootstrapTool.validateInput', () => {
   test('disables the hidden tool when deterministic bootstrap kill switch is active', () => {
     process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL = '1'
+    process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
     process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
+
+    expect(TeamBootstrapTool.isEnabled()).toBe(false)
+  })
+
+  test('disables the hidden tool when deterministic bootstrap rollout flag is off', () => {
+    process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL = '1'
+    delete process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP
+    delete process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP
 
     expect(TeamBootstrapTool.isEnabled()).toBe(false)
   })
@@ -50,7 +68,31 @@ describe('TeamBootstrapTool.validateInput', () => {
     }
   })
 
+  test('rejects invocation when deterministic bootstrap rollout flag is off', async () => {
+    delete process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP
+    delete process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP
+
+    const result = await TeamBootstrapTool.validateInput(
+      {
+        mode: 'create',
+        team_name: 'atlas-hq',
+        members: [{ name: 'alice' }],
+      },
+      {
+        getAppState: () => ({}),
+      } as never,
+    )
+
+    expect(result.result).toBe(false)
+    if (result.result === false) {
+      expect(result.message).toContain(
+        'requires CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP=1',
+      )
+    }
+  })
+
   test('rejects teammate or nested-agent invocation', async () => {
+    process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
     const result = await TeamBootstrapTool.validateInput(
       {
         mode: 'create',
@@ -70,6 +112,7 @@ describe('TeamBootstrapTool.validateInput', () => {
   })
 
   test('rejects switching an active lead session to another team', async () => {
+    process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
     const result = await TeamBootstrapTool.validateInput(
       {
         mode: 'launch',
@@ -92,6 +135,7 @@ describe('TeamBootstrapTool.validateInput', () => {
   })
 
   test('allows bootstrap in a fresh session', async () => {
+    process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
     const result = await TeamBootstrapTool.validateInput(
       {
         mode: 'create',

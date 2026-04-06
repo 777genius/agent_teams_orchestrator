@@ -7,7 +7,7 @@ import { isEnvTruthy } from '../../utils/envUtils.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { NoopTeamBootstrapProgressSink } from '../../services/teamBootstrap/teamBootstrapEvents.js'
-import { getDeterministicBootstrapKillSwitchReason } from '../../services/teamBootstrap/teamBootstrapFeatureGate.js'
+import { getDeterministicBootstrapAvailabilityReason } from '../../services/teamBootstrap/teamBootstrapFeatureGate.js'
 import { runTeamBootstrap } from '../../services/teamBootstrap/teamBootstrapRunner.js'
 import { buildTeamBootstrapRequestFromSpec } from '../../services/teamBootstrap/teamBootstrapSpec.js'
 import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstrapTypes.js'
@@ -132,7 +132,7 @@ export const TeamBootstrapTool = buildTool({
   isEnabled() {
     return (
       isAgentSwarmsEnabled() &&
-      !getDeterministicBootstrapKillSwitchReason() &&
+      !getDeterministicBootstrapAvailabilityReason() &&
       isEnvTruthy(process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL)
     )
   },
@@ -143,11 +143,11 @@ export const TeamBootstrapTool = buildTool({
     return getPrompt()
   },
   async validateInput(input, context) {
-    const killSwitchReason = getDeterministicBootstrapKillSwitchReason()
-    if (killSwitchReason) {
+    const unavailableReason = getDeterministicBootstrapAvailabilityReason()
+    if (unavailableReason) {
       return {
         result: false,
-        message: `${killSwitchReason}.`,
+        message: `${unavailableReason}.`,
         errorCode: 9,
       }
     }
@@ -175,9 +175,9 @@ export const TeamBootstrapTool = buildTool({
     return null
   },
   async call(input, context) {
-    const killSwitchReason = getDeterministicBootstrapKillSwitchReason()
-    if (killSwitchReason) {
-      throw new Error(killSwitchReason)
+    const unavailableReason = getDeterministicBootstrapAvailabilityReason()
+    if (unavailableReason) {
+      throw new Error(unavailableReason)
     }
     const request = await buildTeamBootstrapRequestFromSpec(
       buildToolBootstrapSpec(input),

@@ -45,11 +45,6 @@ async function readBootstrapUserPromptFile(promptFilePath: string): Promise<stri
 
 function assertBootstrapFeatureEnabled(): void {
   assertDeterministicBootstrapNotDisabled()
-  if (process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP !== '1') {
-    throw new Error(
-      'deterministic team bootstrap requires CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP=1',
-    )
-  }
 }
 
 export async function runStartupTeamBootstrap(params: {
