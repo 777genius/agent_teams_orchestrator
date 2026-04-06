@@ -7,8 +7,8 @@ export type TeamBootstrapSpec = {
   runId: string
   mode: 'create' | 'launch'
   initiator: {
-    kind: 'app'
-    source: 'claude_team_freecode'
+    kind: 'app' | 'tool'
+    source: 'claude_team_freecode' | 'TeamBootstrap'
   }
   team: {
     name: string
@@ -21,13 +21,14 @@ export type TeamBootstrapSpec = {
     providerId?: BootstrapProvider
     model?: string
     effort?: string
+    agentLanguage?: string
     skipPermissions?: boolean
     worktree?: string | null
     extraCliArgs?: string[]
   }
   members: Array<{
     name: string
-    prompt: string
+    prompt?: string
     role?: string
     workflow?: string
     agentType?: string
@@ -68,8 +69,8 @@ export type TeamBootstrapRequest = {
     writeConversationSummaryMessage: false
   }
   initiator: {
-    kind: 'app'
-    source: 'claude_team_freecode'
+    kind: 'app' | 'tool'
+    source: 'claude_team_freecode' | 'TeamBootstrap'
   }
 }
 

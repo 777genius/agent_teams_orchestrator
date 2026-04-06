@@ -14,7 +14,7 @@ import {
   unregisterTeamForSessionCleanup,
   updateTeamFileAsync,
 } from 'src/utils/swarm/teamHelpers.js'
-import type { TeamBootstrapProgressEmitter } from './teamBootstrapEvents.js'
+import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
 import type {
@@ -165,7 +165,7 @@ function buildSummary(params: {
 export async function runTeamBootstrap(params: {
   request: TeamBootstrapRequest
   context: ToolUseContext
-  emit: TeamBootstrapProgressEmitter
+  emit: TeamBootstrapProgressSink
   now?: () => number
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())

@@ -7,10 +7,15 @@ import type {
   TeamBootstrapRequest,
   TeamBootstrapSpec,
 } from './teamBootstrapTypes.js'
+import {
+  buildDeterministicBootstrapMemberPrompt,
+  getMembersWithAssignedBoardWork,
+  resolveBootstrapLeadName,
+} from './teamBootstrapPromptBuilder.js'
 
 const bootstrapMemberSchema = z.strictObject({
   name: z.string().trim().min(1),
-  prompt: z.string().trim().min(1),
+  prompt: z.string().trim().min(1).optional(),
   role: z.string().trim().min(1).optional(),
   workflow: z.string().trim().min(1).optional(),
   cwd: z.string().trim().min(1).optional(),
@@ -42,6 +47,7 @@ const bootstrapSpecSchema = z.strictObject({
     providerId: z.enum(['anthropic', 'codex', 'gemini']).optional(),
     model: z.string().trim().min(1).optional(),
     effort: z.string().trim().min(1).optional(),
+    agentLanguage: z.string().trim().min(1).optional(),
     skipPermissions: z.boolean().optional(),
     worktree: z.string().trim().min(1).nullable().optional(),
     extraCliArgs: z.array(z.string()).optional(),
@@ -101,7 +107,7 @@ function normalizeMember(
     originalName: member.name,
     displayName: member.name,
     normalizedName: sanitizeName(member.name),
-    prompt: member.prompt,
+    prompt: member.prompt ?? '',
     ...(member.role ? { role: member.role } : {}),
     ...(member.workflow ? { workflow: member.workflow } : {}),
     ...(member.agentType ? { agentType: member.agentType } : {}),
@@ -117,7 +123,7 @@ function normalizeMember(
   }
 }
 
-function buildRequestHash(
+export function buildRequestHash(
   request: Omit<TeamBootstrapRequest, 'requestHash'>,
 ): string {
   const stableMembers = [...request.members]
@@ -157,19 +163,15 @@ function buildRequestHash(
     .digest('hex')
 }
 
-export async function readTeamBootstrapSpec(
-  specPath: string,
+export async function buildTeamBootstrapRequestFromSpec(
+  parsed: TeamBootstrapSpec,
 ): Promise<TeamBootstrapRequest> {
-  const stat = await fs.lstat(specPath)
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new Error(
-      'team bootstrap spec must be a regular file and must not be a symlink',
-    )
-  }
-
-  const raw = await fs.readFile(specPath, 'utf8')
-  const parsed = bootstrapSpecSchema.parse(JSON.parse(raw))
   const cwd = await fs.realpath(parsed.team.cwd)
+  const leadName = await resolveBootstrapLeadName(parsed)
+  const assignedWorkMembers =
+    parsed.mode === 'launch'
+      ? await getMembersWithAssignedBoardWork(parsed.team.name)
+      : new Set<string>()
 
   const members = await Promise.all(
     parsed.members.map(async member => {
@@ -177,6 +179,14 @@ export async function readTeamBootstrapSpec(
       if (normalized.cwd) {
         normalized.cwd = await fs.realpath(normalized.cwd)
       }
+      normalized.prompt =
+        member.prompt?.trim() ||
+        (await buildDeterministicBootstrapMemberPrompt({
+          spec: parsed,
+          member,
+          leadName,
+          assignedWorkMembers,
+        }))
       return normalized
     }),
   )
@@ -208,4 +218,19 @@ export async function readTeamBootstrapSpec(
     ...requestBase,
     requestHash: buildRequestHash(requestBase),
   }
+}
+
+export async function readTeamBootstrapSpec(
+  specPath: string,
+): Promise<TeamBootstrapRequest> {
+  const stat = await fs.lstat(specPath)
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(
+      'team bootstrap spec must be a regular file and must not be a symlink',
+    )
+  }
+
+  const raw = await fs.readFile(specPath, 'utf8')
+  const parsed = bootstrapSpecSchema.parse(JSON.parse(raw))
+  return buildTeamBootstrapRequestFromSpec(parsed)
 }

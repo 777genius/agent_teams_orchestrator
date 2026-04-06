@@ -5,7 +5,29 @@ import type { TeamBootstrapPhase } from './teamBootstrapStateMachine.js'
 
 type EmitPayload = Record<string, unknown>
 
-export class TeamBootstrapProgressEmitter {
+export type TeamBootstrapProgressSink = {
+  started(expectedMembers: string[]): Promise<void>
+  phaseChanged(phase: TeamBootstrapPhase): Promise<void>
+  teamCreated(reusedExistingTeam: boolean): Promise<void>
+  memberSpawnStarted(memberName: string): Promise<void>
+  memberSpawnResult(payload: {
+    memberName: string
+    outcome: 'spawned' | 'duplicate_pending' | 'already_running' | 'failed'
+    agentId?: string
+    teammateId?: string
+    backendType?: string
+    reason?: string
+  }): Promise<void>
+  completed(payload: {
+    status: 'completed' | 'partial_success'
+    expectedMembers: string[]
+    registeredMembers: string[]
+    failedMembers: Array<{ name: string; reason: string }>
+  }): Promise<void>
+  failed(reason: string): Promise<void>
+}
+
+export class TeamBootstrapProgressEmitter implements TeamBootstrapProgressSink {
   private sequence = 0
 
   constructor(
@@ -84,4 +106,14 @@ export class TeamBootstrapProgressEmitter {
   async failed(reason: string): Promise<void> {
     await this.emit({ event: 'failed', reason })
   }
+}
+
+export const NoopTeamBootstrapProgressSink: TeamBootstrapProgressSink = {
+  async started() {},
+  async phaseChanged() {},
+  async teamCreated() {},
+  async memberSpawnStarted() {},
+  async memberSpawnResult() {},
+  async completed() {},
+  async failed() {},
 }

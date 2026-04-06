@@ -69,6 +69,9 @@ const getTeamDeleteTool = () =>
 const getSendMessageTool = () =>
   require('./tools/SendMessageTool/SendMessageTool.js')
     .SendMessageTool as typeof import('./tools/SendMessageTool/SendMessageTool.js').SendMessageTool
+const getTeamBootstrapTool = () =>
+  require('./tools/TeamBootstrapTool/TeamBootstrapTool.js')
+    .TeamBootstrapTool as typeof import('./tools/TeamBootstrapTool/TeamBootstrapTool.js').TeamBootstrapTool
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { AskUserQuestionTool } from './tools/AskUserQuestionTool/AskUserQuestionTool.js'
 import { LSPTool } from './tools/LSPTool/LSPTool.js'
@@ -226,7 +229,13 @@ export function getAllBaseTools(): Tools {
     getSendMessageTool(),
     ...(ListPeersTool ? [ListPeersTool] : []),
     ...(isAgentSwarmsEnabled()
-      ? [getTeamCreateTool(), getTeamDeleteTool()]
+      ? [
+          getTeamCreateTool(),
+          getTeamDeleteTool(),
+          ...(isEnvTruthy(process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL)
+            ? [getTeamBootstrapTool()]
+            : []),
+        ]
       : []),
     ...(VerifyPlanExecutionTool ? [VerifyPlanExecutionTool] : []),
     ...(process.env.USER_TYPE === 'ant' && REPLTool ? [REPLTool] : []),
