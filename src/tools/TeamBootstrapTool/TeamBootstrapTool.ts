@@ -86,6 +86,7 @@ function buildToolBootstrapSpec(input: z.infer<InputSchema>): TeamBootstrapSpec 
     },
     lead: {
       ...(input.agent_language ? { agentLanguage: input.agent_language } : {}),
+      permissionSeedTools: ['Edit', 'Write', 'NotebookEdit'],
     },
     members: input.members.map(member => ({
       name: member.name,

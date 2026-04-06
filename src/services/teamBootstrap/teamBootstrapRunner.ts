@@ -6,6 +6,7 @@ import type { DuplicateSkippedOutput } from 'src/tools/shared/spawnMultiAgent.js
 import { spawnTeammate } from 'src/tools/shared/spawnMultiAgent.js'
 import { getCwd } from 'src/utils/cwd.js'
 import { errorMessage } from 'src/utils/errors.js'
+import { addPermissionRulesToSettings } from 'src/utils/permissions/permissionsLoader.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { setLeaderTeamName } from 'src/utils/tasks.js'
 import { assignTeammateColor } from 'src/utils/swarm/teammateLayoutManager.js'
@@ -103,6 +104,36 @@ function buildStrictPartialFailureReason(params: {
   return preview.length > 0
     ? `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false. ${preview}${suffix}`
     : `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false.`
+}
+
+function seedBootstrapPermissionRules(params: {
+  teamName: string
+  permissionSeedTools: string[]
+}): void {
+  if (params.permissionSeedTools.length === 0) {
+    return
+  }
+
+  try {
+    const applied = addPermissionRulesToSettings(
+      {
+        ruleValues: params.permissionSeedTools.map(toolName => ({ toolName })),
+        ruleBehavior: 'allow',
+      },
+      'localSettings',
+    )
+    if (!applied) {
+      logForDebugging(
+        `[team-bootstrap] ${params.teamName}: local permission seeding skipped by settings policy`,
+        { level: 'warn' },
+      )
+    }
+  } catch (error) {
+    logForDebugging(
+      `[team-bootstrap] ${params.teamName}: failed to seed teammate operational permission rules: ${errorMessage(error)}`,
+      { level: 'warn' },
+    )
+  }
 }
 
 async function ensureLeaderAttachedToTeam(
@@ -241,6 +272,10 @@ export async function runTeamBootstrap(params: {
       ownerStartedAt: stateStore.getState().ownerStartedAt ?? now(),
       fn: async () => {
         await validateWorkspace('after acquiring bootstrap ownership lock')
+        seedBootstrapPermissionRules({
+          teamName: params.request.teamName,
+          permissionSeedTools: params.request.permissionSeedTools,
+        })
         const attachState = await ensureLeaderAttachedToTeam(
           params.request,
           params.context,

@@ -22,6 +22,7 @@ export type TeamBootstrapSpec = {
     model?: string
     effort?: string
     agentLanguage?: string
+    permissionSeedTools?: string[]
     skipPermissions?: boolean
     worktree?: string | null
     extraCliArgs?: string[]
@@ -63,6 +64,7 @@ export type TeamBootstrapRequest = {
   members: NormalizedBootstrapMember[]
   bootstrapTimeoutMs: number
   continueOnPartialFailure: boolean
+  permissionSeedTools: string[]
   policy: {
     persistentTeam: true
     registerForSessionCleanup: false

@@ -89,6 +89,31 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toBe('custom bootstrap prompt')
   })
 
+  test('normalizes permission seed tools deterministically', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-perms',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+      team: {
+        name: 'atlas-hq',
+        cwd: workspaceDir,
+      },
+      lead: {
+        permissionSeedTools: ['Write', 'Edit', 'Write', 'NotebookEdit', 'Edit'],
+      },
+      members: [{ name: 'alice' }],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.permissionSeedTools).toEqual(['Edit', 'NotebookEdit', 'Write'])
+  })
+
   test('builds launch prompts using assigned board work when prompts are omitted', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     const tasksDir = join(tempRoot, 'tasks', 'signal-ops')
@@ -200,6 +225,7 @@ describe('team bootstrap spec normalization', () => {
       ],
       bootstrapTimeoutMs: 30_000,
       continueOnPartialFailure: true,
+      permissionSeedTools: ['Edit', 'Write'],
       policy: {
         persistentTeam: true,
         registerForSessionCleanup: false,

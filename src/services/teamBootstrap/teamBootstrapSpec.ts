@@ -51,6 +51,10 @@ const bootstrapSpecSchema = z.strictObject({
     model: z.string().trim().min(1).optional(),
     effort: z.string().trim().min(1).optional(),
     agentLanguage: z.string().trim().min(1).optional(),
+    permissionSeedTools: z
+      .array(z.string().trim().min(1))
+      .max(64)
+      .optional(),
     skipPermissions: z.boolean().optional(),
     worktree: z.string().trim().min(1).nullable().optional(),
     extraCliArgs: z.array(z.string()).optional(),
@@ -126,6 +130,16 @@ function normalizeMember(
   }
 }
 
+function normalizePermissionSeedTools(tools: string[] | undefined): string[] {
+  if (!tools || tools.length === 0) {
+    return []
+  }
+
+  return [...new Set(tools.map(tool => tool.trim()).filter(tool => tool.length > 0))].sort(
+    (a, b) => a.localeCompare(b),
+  )
+}
+
 export function buildRequestHash(
   request: Omit<TeamBootstrapRequest, 'requestHash'>,
 ): string {
@@ -156,6 +170,9 @@ export function buildRequestHash(
     cwd: request.cwd,
     bootstrapTimeoutMs: request.bootstrapTimeoutMs,
     continueOnPartialFailure: request.continueOnPartialFailure,
+    permissionSeedTools: [...request.permissionSeedTools].sort((a, b) =>
+      a.localeCompare(b),
+    ),
     policy: request.policy,
     members: stableMembers,
   }
@@ -208,6 +225,9 @@ export async function buildTeamBootstrapRequestFromSpec(
     bootstrapTimeoutMs: parsed.launch?.bootstrapTimeoutMs ?? 120_000,
     continueOnPartialFailure:
       parsed.launch?.continueOnPartialFailure !== false,
+    permissionSeedTools: normalizePermissionSeedTools(
+      parsed.lead.permissionSeedTools,
+    ),
     policy: {
       persistentTeam: true,
       registerForSessionCleanup: false,
