@@ -6,6 +6,7 @@ import type { DuplicateSkippedOutput } from 'src/tools/shared/spawnMultiAgent.js
 import { spawnTeammate } from 'src/tools/shared/spawnMultiAgent.js'
 import { getCwd } from 'src/utils/cwd.js'
 import { errorMessage } from 'src/utils/errors.js'
+import { logForDebugging } from 'src/utils/debug.js'
 import { setLeaderTeamName } from 'src/utils/tasks.js'
 import { assignTeammateColor } from 'src/utils/swarm/teammateLayoutManager.js'
 import {
@@ -54,6 +55,20 @@ export async function assertBootstrapRuntimeWorkspace(
   if (runtimeCwd !== request.cwd) {
     throw new Error(
       `Deterministic bootstrap cannot start team "${request.teamName}" because the runtime workspace "${runtimeCwd}" does not match the requested workspace "${request.cwd}".`,
+    )
+  }
+}
+
+export async function emitBootstrapProgressSafely(
+  label: string,
+  emit: () => Promise<void>,
+): Promise<void> {
+  try {
+    await emit()
+  } catch (error) {
+    logForDebugging(
+      `[team-bootstrap] progress emission failed for ${label}: ${errorMessage(error)}`,
+      { level: 'warn' },
     )
   }
 }
@@ -194,15 +209,21 @@ export async function runTeamBootstrap(params: {
 
   try {
     await params.onInitialized?.()
-    await params.emit.started(
-      params.request.members.map(member => member.displayName),
+    await emitBootstrapProgressSafely('started', () =>
+      params.emit.started(params.request.members.map(member => member.displayName)),
     )
-    await params.emit.phaseChanged('validating_spec')
+    await emitBootstrapProgressSafely('phase_changed:validating_spec', () =>
+      params.emit.phaseChanged('validating_spec'),
+    )
     await stateStore.transitionTo('loading_existing_state', now)
-    await params.emit.phaseChanged('loading_existing_state')
+    await emitBootstrapProgressSafely('phase_changed:loading_existing_state', () =>
+      params.emit.phaseChanged('loading_existing_state'),
+    )
     await assertBootstrapRuntimeWorkspace(params.request)
     await stateStore.transitionTo('acquiring_bootstrap_lock', now)
-    await params.emit.phaseChanged('acquiring_bootstrap_lock')
+    await emitBootstrapProgressSafely('phase_changed:acquiring_bootstrap_lock', () =>
+      params.emit.phaseChanged('acquiring_bootstrap_lock'),
+    )
 
     const summary = await withBootstrapOwnershipLock({
       teamName: params.request.teamName,
@@ -222,7 +243,9 @@ export async function runTeamBootstrap(params: {
         const reusedExistingTeam = !shouldCreateTeam
         if (shouldCreateTeam) {
           await stateStore.transitionTo('creating_team', now)
-          await params.emit.phaseChanged('creating_team')
+          await emitBootstrapProgressSafely('phase_changed:creating_team', () =>
+            params.emit.phaseChanged('creating_team'),
+          )
           await TeamCreateTool.call(
             {
               team_name: params.request.teamName,
@@ -234,15 +257,22 @@ export async function runTeamBootstrap(params: {
           )
         }
         unregisterTeamForSessionCleanup(params.request.teamName)
-        await params.emit.teamCreated(reusedExistingTeam)
+        await emitBootstrapProgressSafely('team_created', () =>
+          params.emit.teamCreated(reusedExistingTeam),
+        )
 
         await stateStore.transitionTo('spawning_members', now)
-        await params.emit.phaseChanged('spawning_members')
+        await emitBootstrapProgressSafely('phase_changed:spawning_members', () =>
+          params.emit.phaseChanged('spawning_members'),
+        )
         const failedMembers: Array<{ name: string; reason: string }> = []
 
         for (const member of params.request.members) {
           await stateStore.markMemberSpawnStarted(member.displayName, now)
-          await params.emit.memberSpawnStarted(member.displayName)
+          await emitBootstrapProgressSafely(
+            `member_spawn_started:${member.displayName}`,
+            () => params.emit.memberSpawnStarted(member.displayName),
+          )
           try {
             const result = await spawnTeammate(
               {
@@ -280,13 +310,17 @@ export async function runTeamBootstrap(params: {
                 },
                 now,
               )
-              await params.emit.memberSpawnResult({
-                memberName: member.displayName,
-                outcome: duplicateOutcome,
-                agentId: duplicate.agent_id,
-                teammateId: duplicate.teammate_id,
-                reason: duplicate.reason,
-              })
+              await emitBootstrapProgressSafely(
+                `member_spawn_result:${member.displayName}:${duplicateOutcome}`,
+                () =>
+                  params.emit.memberSpawnResult({
+                    memberName: member.displayName,
+                    outcome: duplicateOutcome,
+                    agentId: duplicate.agent_id,
+                    teammateId: duplicate.teammate_id,
+                    reason: duplicate.reason,
+                  }),
+              )
               continue
             }
 
@@ -303,17 +337,21 @@ export async function runTeamBootstrap(params: {
               },
               now,
             )
-            await params.emit.memberSpawnResult({
-              memberName: member.displayName,
-              outcome: 'spawned',
-              agentId: result.data.agent_id,
-              teammateId: result.data.teammate_id,
-              backendType:
-                'backend_type' in result.data &&
-                typeof result.data.backend_type === 'string'
-                  ? result.data.backend_type
-                  : undefined,
-            })
+            await emitBootstrapProgressSafely(
+              `member_spawn_result:${member.displayName}:spawned`,
+              () =>
+                params.emit.memberSpawnResult({
+                  memberName: member.displayName,
+                  outcome: 'spawned',
+                  agentId: result.data.agent_id,
+                  teammateId: result.data.teammate_id,
+                  backendType:
+                    'backend_type' in result.data &&
+                    typeof result.data.backend_type === 'string'
+                      ? result.data.backend_type
+                      : undefined,
+                }),
+            )
           } catch (error) {
             const reason = errorMessage(error)
             failedMembers.push({ name: member.displayName, reason })
@@ -325,16 +363,22 @@ export async function runTeamBootstrap(params: {
               },
               now,
             )
-            await params.emit.memberSpawnResult({
-              memberName: member.displayName,
-              outcome: 'failed',
-              reason,
-            })
+            await emitBootstrapProgressSafely(
+              `member_spawn_result:${member.displayName}:failed`,
+              () =>
+                params.emit.memberSpawnResult({
+                  memberName: member.displayName,
+                  outcome: 'failed',
+                  reason,
+                }),
+            )
           }
         }
 
         await stateStore.transitionTo('auditing_truth', now)
-        await params.emit.phaseChanged('auditing_truth')
+        await emitBootstrapProgressSafely('phase_changed:auditing_truth', () =>
+          params.emit.phaseChanged('auditing_truth'),
+        )
         const teamFile = await readTeamFileAsync(params.request.teamName)
         const registeredMemberNames = new Set(
           (teamFile?.members ?? [])
@@ -385,7 +429,7 @@ export async function runTeamBootstrap(params: {
         },
         now,
       )
-      await params.emit.failed(reason)
+      await emitBootstrapProgressSafely('failed', () => params.emit.failed(reason))
       return {
         ok: false,
         fatal: true,
@@ -401,12 +445,14 @@ export async function runTeamBootstrap(params: {
       },
       now,
     )
-    await params.emit.completed({
-      status: summary.terminalStatus,
-      expectedMembers: summary.expectedMembers,
-      registeredMembers: summary.registeredMembers,
-      failedMembers: summary.failedMembers,
-    })
+    await emitBootstrapProgressSafely('completed', () =>
+      params.emit.completed({
+        status: summary.terminalStatus,
+        expectedMembers: summary.expectedMembers,
+        registeredMembers: summary.registeredMembers,
+        failedMembers: summary.failedMembers,
+      }),
+    )
     return {
       ok: true,
       fatal: false,
@@ -422,7 +468,7 @@ export async function runTeamBootstrap(params: {
       },
       now,
     )
-    await params.emit.failed(reason)
+    await emitBootstrapProgressSafely('failed', () => params.emit.failed(reason))
     return {
       ok: false,
       fatal: true,

@@ -6,6 +6,7 @@ import * as path from 'path'
 import {
   assertBootstrapRuntimeWorkspace,
   deriveBootstrapTerminalStatus,
+  emitBootstrapProgressSafely,
   runTeamBootstrap,
   shouldCreateTeamForBootstrap,
 } from './teamBootstrapRunner.js'
@@ -188,5 +189,15 @@ describe('team bootstrap early-failure durability', () => {
     expect(rawState.phase).toBe('failed')
     expect(rawState.terminal?.status).toBe('failed')
     expect(rawState.terminal?.reason).toContain('boom')
+  })
+})
+
+describe('team bootstrap progress emission safety', () => {
+  test('swallows progress sink failures', async () => {
+    await expect(
+      emitBootstrapProgressSafely('phase_changed:creating_team', async () => {
+        throw new Error('consumer disconnected')
+      }),
+    ).resolves.toBeUndefined()
   })
 })
