@@ -68,7 +68,9 @@ const outputSchema = lazySchema(() =>
 type OutputSchema = ReturnType<typeof outputSchema>
 type Output = z.infer<OutputSchema>
 
-function buildToolBootstrapSpec(input: z.infer<InputSchema>): TeamBootstrapSpec {
+export function buildToolBootstrapSpec(
+  input: z.infer<InputSchema>,
+): TeamBootstrapSpec {
   return {
     version: 1,
     runId: randomUUID(),
@@ -112,6 +114,9 @@ function buildToolBootstrapSpec(input: z.infer<InputSchema>): TeamBootstrapSpec 
       ...(input.continue_on_partial_failure !== undefined
         ? { continueOnPartialFailure: input.continue_on_partial_failure }
         : {}),
+    },
+    ui: {
+      emitStructuredEvents: false,
     },
   }
 }

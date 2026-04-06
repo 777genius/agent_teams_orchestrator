@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { TeamBootstrapTool } from './TeamBootstrapTool.js'
+import { TeamBootstrapTool, buildToolBootstrapSpec } from './TeamBootstrapTool.js'
 
 const originalDisableDeterministicBootstrap =
   process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP
@@ -32,6 +32,16 @@ afterEach(() => {
 })
 
 describe('TeamBootstrapTool.validateInput', () => {
+  test('builds hidden tool bootstrap specs with structured events disabled', () => {
+    const spec = buildToolBootstrapSpec({
+      mode: 'create',
+      team_name: 'atlas-hq',
+      members: [{ name: 'alice' }],
+    })
+
+    expect(spec.ui?.emitStructuredEvents).toBe(false)
+  })
+
   test('disables the hidden tool when deterministic bootstrap kill switch is active', () => {
     process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL = '1'
     process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
