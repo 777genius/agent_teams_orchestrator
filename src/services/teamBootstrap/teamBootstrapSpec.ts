@@ -233,6 +233,7 @@ export async function buildTeamBootstrapRequestFromSpec(
     permissionSeedTools: normalizePermissionSeedTools(
       parsed.lead.permissionSeedTools,
     ),
+    emitStructuredEvents: parsed.ui?.emitStructuredEvents !== false,
     policy: {
       persistentTeam: true,
       registerForSessionCleanup: false,

@@ -7,7 +7,10 @@ import type { AgentDefinition } from 'src/tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from 'src/Tool.js'
 import type { ThinkingConfig } from 'src/utils/thinking.js'
 import { buildTeamBootstrapContext } from './teamBootstrapContext.js'
-import { TeamBootstrapProgressEmitter } from './teamBootstrapEvents.js'
+import {
+  NoopTeamBootstrapProgressSink,
+  TeamBootstrapProgressEmitter,
+} from './teamBootstrapEvents.js'
 import { assertDeterministicBootstrapNotDisabled } from './teamBootstrapFeatureGate.js'
 import { runTeamBootstrap } from './teamBootstrapRunner.js'
 import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
@@ -75,11 +78,13 @@ export async function runStartupTeamBootstrap(params: {
     thinkingConfig: params.thinkingConfig,
     structuredIO: params.structuredIO,
   })
-  const emitter = new TeamBootstrapProgressEmitter(
-    params.structuredIO,
-    request.runId,
-    request.teamName,
-  )
+  const emitter = request.emitStructuredEvents
+    ? new TeamBootstrapProgressEmitter(
+        params.structuredIO,
+        request.runId,
+        request.teamName,
+      )
+    : NoopTeamBootstrapProgressSink
   const result = await runTeamBootstrap({
     request,
     context,

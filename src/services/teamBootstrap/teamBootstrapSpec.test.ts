@@ -114,6 +114,55 @@ describe('team bootstrap spec normalization', () => {
     expect(request.permissionSeedTools).toEqual(['Edit', 'NotebookEdit', 'Write'])
   })
 
+  test('defaults structured bootstrap events to enabled', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-events-default',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+      team: {
+        name: 'atlas-hq',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [{ name: 'alice' }],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.emitStructuredEvents).toBe(true)
+  })
+
+  test('allows startup bootstrap specs to disable structured bootstrap events', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-events-off',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+      team: {
+        name: 'atlas-hq',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [{ name: 'alice' }],
+      ui: {
+        emitStructuredEvents: false,
+      },
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.emitStructuredEvents).toBe(false)
+  })
+
   test('builds launch prompts using assigned board work when prompts are omitted', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     const tasksDir = join(tempRoot, 'tasks', 'signal-ops')
@@ -226,6 +275,7 @@ describe('team bootstrap spec normalization', () => {
       bootstrapTimeoutMs: 30_000,
       continueOnPartialFailure: true,
       permissionSeedTools: ['Edit', 'Write'],
+      emitStructuredEvents: true,
       policy: {
         persistentTeam: true,
         registerForSessionCleanup: false,
@@ -273,6 +323,7 @@ describe('team bootstrap spec normalization', () => {
       bootstrapTimeoutMs: 30_000,
       continueOnPartialFailure: true,
       permissionSeedTools: ['Write', 'Edit', 'NotebookEdit'],
+      emitStructuredEvents: true,
       policy: {
         persistentTeam: true,
         registerForSessionCleanup: false,

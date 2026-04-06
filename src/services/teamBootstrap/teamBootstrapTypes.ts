@@ -65,6 +65,7 @@ export type TeamBootstrapRequest = {
   bootstrapTimeoutMs: number
   continueOnPartialFailure: boolean
   permissionSeedTools: string[]
+  emitStructuredEvents: boolean
   policy: {
     persistentTeam: true
     registerForSessionCleanup: false

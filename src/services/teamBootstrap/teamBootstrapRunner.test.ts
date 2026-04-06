@@ -156,6 +156,7 @@ describe('team bootstrap early-failure durability', () => {
         bootstrapTimeoutMs: 1_000,
         continueOnPartialFailure: true,
         permissionSeedTools: [],
+        emitStructuredEvents: true,
         policy: {
           persistentTeam: true,
           registerForSessionCleanup: false,
