@@ -2,8 +2,12 @@
  * Shared utilities for spawning teammates across different backends.
  */
 
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   getChromeFlagOverride,
+  getFlagDisallowedTools,
   getFlagMcpConfig,
   getFlagSettingsPath,
   getInlinePlugins,
@@ -84,6 +88,11 @@ export function buildInheritedCliFlags(options?: {
   const settingsPath = getFlagSettingsPath()
   if (settingsPath) {
     flags.push(`--settings ${quote([settingsPath])}`)
+  }
+
+  const disallowedTools = getFlagDisallowedTools()
+  for (const disallowedTool of disallowedTools) {
+    flags.push(`--disallowedTools ${quote([disallowedTool])}`)
   }
 
   // Propagate explicit --mcp-config / --strict-mcp-config so pane-based
@@ -276,6 +285,37 @@ function extractRelevantSpawnFailureLine(output: string): string | null {
 
 export function wrapTeammateSpawnCommand(command: string): string {
   return `${command}; __claude_teammate_exit=$?; printf '\\n${TMUX_TEAMMATE_EXIT_SENTINEL}%s\\n' "$__claude_teammate_exit"`
+}
+
+/**
+ * Writes the long teammate spawn command into a short-lived shell script and
+ * returns a compact launcher command for pane-based backends.
+ *
+ * Long commands sent directly via tmux send-keys can land in the shell as a
+ * broken multiline continuation prompt. Launching through a temp script keeps
+ * the pane command short and avoids fragile interactive quoting.
+ */
+export async function buildPaneLauncherCommand(
+  command: string,
+): Promise<string> {
+  const scriptDir = await mkdtemp(join(tmpdir(), 'claude-teammate-spawn-'))
+  const scriptPath = join(scriptDir, 'launch.zsh')
+  const script = [
+    '#!/bin/zsh',
+    `SCRIPT_PATH=${quote([scriptPath])}`,
+    `SCRIPT_DIR=${quote([scriptDir])}`,
+    'cleanup_spawn_script() {',
+    '  rm -f "$SCRIPT_PATH"',
+    '  rmdir "$SCRIPT_DIR" 2>/dev/null || true',
+    '}',
+    'trap cleanup_spawn_script EXIT',
+    command,
+    '',
+  ].join('\n')
+
+  await writeFile(scriptPath, script, { mode: 0o700 })
+
+  return `zsh ${quote([scriptPath])}`
 }
 
 function extractExitSentinelCode(output: string): number | null {

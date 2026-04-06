@@ -82,6 +82,7 @@ type State = {
   questionPreviewFormat: 'markdown' | 'html' | undefined
   flagSettingsPath: string | undefined
   flagSettingsInline: Record<string, unknown> | null
+  flagDisallowedTools: string[]
   flagMcpConfig: string[]
   strictMcpConfig: boolean
   allowedSettingSources: SettingSource[]
@@ -312,6 +313,7 @@ function getInitialState(): State {
     apiKeyFromFd: undefined,
     flagSettingsPath: undefined,
     flagSettingsInline: null,
+    flagDisallowedTools: [],
     flagMcpConfig: [],
     strictMcpConfig: false,
     allowedSettingSources: [
@@ -1149,6 +1151,14 @@ export function setFlagSettingsInline(
   settings: Record<string, unknown> | null,
 ): void {
   STATE.flagSettingsInline = settings
+}
+
+export function getFlagDisallowedTools(): string[] {
+  return STATE.flagDisallowedTools
+}
+
+export function setFlagDisallowedTools(tools: string[] | undefined): void {
+  STATE.flagDisallowedTools = tools ?? []
 }
 
 export function getFlagMcpConfig(): string[] {

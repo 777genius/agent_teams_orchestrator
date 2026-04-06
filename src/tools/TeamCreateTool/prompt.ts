@@ -37,16 +37,16 @@ This creates:
 ## Team Workflow
 
 1. **Create a team** with TeamCreate - this creates both the team and its task list
-2. **Create tasks** using the Task tools (TaskCreate, TaskList, etc.) - they automatically use the team's task list
+2. **Create and manage tasks** using the task-management tools available in your environment. If your environment provides dedicated team/task-board tools, prefer those for shared team work. Use built-in tools such as TaskCreate/TaskUpdate only when they are actually available and appropriate for that environment
 3. **Spawn teammates** using the Agent tool with \`team_name\` and \`name\` parameters to create teammates that join the team
-4. **Assign tasks** using TaskUpdate with \`owner\` to give tasks to idle teammates
-5. **Teammates work on assigned tasks** and mark them completed via TaskUpdate
+4. **Assign tasks** using the available task-management/status tools in your environment (for example TaskUpdate with \`owner\`, or environment-specific board tools) to give tasks to idle teammates
+5. **Teammates work on assigned tasks** and mark them completed using the corresponding status/update tools available in that environment
 6. **Teammates go idle between turns** - after each turn, teammates automatically go idle and send a notification. IMPORTANT: Be patient with idle teammates! Don't comment on their idleness until it actually impacts your work.
 7. **Shutdown your team** - when the task is completed, gracefully shut down your teammates via SendMessage with \`message: {type: "shutdown_request"}\`.
 
 ## Task Ownership
 
-Tasks are assigned using TaskUpdate with the \`owner\` parameter. Any agent can set or change task ownership via TaskUpdate.
+Tasks are assigned using the ownership/status tools available in your environment. When TaskUpdate exists, it can set or change task ownership via the \`owner\` parameter.
 
 ## Automatic Message Delivery
 
@@ -96,9 +96,9 @@ Teams share a task list that all teammates can access at \`~/.claude/tasks/{team
 
 Teammates should:
 1. Check TaskList periodically, **especially after completing each task**, to find available work or see newly unblocked tasks
-2. Claim unassigned, unblocked tasks with TaskUpdate (set \`owner\` to your name). **Prefer tasks in ID order** (lowest ID first) when multiple tasks are available, as earlier tasks often set up context for later ones
-3. Create new tasks with \`TaskCreate\` when identifying additional work
-4. Mark tasks as completed with \`TaskUpdate\` when done, then check TaskList for next work
+2. Claim unassigned, unblocked tasks using the ownership/status tools available in your environment (for example TaskUpdate with \`owner\`, or environment-specific board tools). **Prefer tasks in ID order** (lowest ID first) when multiple tasks are available, as earlier tasks often set up context for later ones
+3. Create new tasks using the task-creation tool available in your environment when identifying additional work
+4. Mark tasks as completed with the completion/status tools available in your environment when done, then check TaskList for next work
 5. Coordinate with other teammates by reading the task list status
 6. If all available tasks are blocked, notify the team lead or help resolve blocking tasks
 
@@ -106,7 +106,7 @@ Teammates should:
 - Do not use terminal tools to view your team's activity; always send a message to your teammates (and remember, refer to them by name).
 - Your team cannot hear you if you do not use the SendMessage tool. Always send a message to your teammates if you are responding to them.
 - Do NOT send structured JSON status messages like \`{"type":"idle",...}\` or \`{"type":"task_completed",...}\`. Just communicate in plain text when you need to message teammates.
-- Use TaskUpdate to mark tasks completed.
+- Use the task status/completion tools available in your environment to mark tasks completed.
 - If you are an agent in the team, the system will automatically send idle notifications to the team lead when you stop.
 
 `.trim()
