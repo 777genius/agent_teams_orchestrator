@@ -5,7 +5,7 @@ export type BootstrapProvider = 'anthropic' | 'codex' | 'gemini'
 export type TeamBootstrapSpec = {
   version: 1
   runId: string
-  mode: 'create'
+  mode: 'create' | 'launch'
   initiator: {
     kind: 'app'
     source: 'claude_team_freecode'
@@ -53,7 +53,7 @@ export type TeamBootstrapRequest = {
   version: 1
   runId: string
   requestHash: string
-  mode: 'create'
+  mode: 'create' | 'launch'
   teamName: string
   teamDisplayName?: string
   description?: string
@@ -115,7 +115,7 @@ export type TeamBootstrapSummary = {
   runId: string
   requestHash: string
   teamName: string
-  mode: 'create'
+  mode: 'create' | 'launch'
   createdTeam: boolean
   reusedExistingTeam: boolean
   expectedMembers: string[]
@@ -133,7 +133,7 @@ export type PersistedBootstrapState = {
   runId: string
   requestHash: string
   teamName: string
-  mode: 'create'
+  mode: 'create' | 'launch'
   ownerPid?: number
   ownerStartedAt?: number
   phase: TeamBootstrapPhase

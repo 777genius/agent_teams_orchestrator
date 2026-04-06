@@ -23,6 +23,22 @@ import type {
   TeamBootstrapSummary,
 } from './teamBootstrapTypes.js'
 
+export function shouldCreateTeamForBootstrap(params: {
+  mode: TeamBootstrapRequest['mode']
+  attachState: 'already_attached' | 'attached_existing' | 'missing'
+  teamName: string
+}): boolean {
+  if (params.attachState !== 'missing') {
+    return false
+  }
+  if (params.mode === 'launch') {
+    throw new Error(
+      `Deterministic bootstrap cannot launch team "${params.teamName}" because the team config does not exist.`,
+    )
+  }
+  return true
+}
+
 export function deriveBootstrapTerminalStatus(params: {
   continueOnPartialFailure: boolean
   failedMembersCount: number
@@ -176,8 +192,13 @@ export async function runTeamBootstrap(params: {
           params.request,
           params.context,
         )
-        const reusedExistingTeam = attachState !== 'missing'
-        if (attachState === 'missing') {
+        const shouldCreateTeam = shouldCreateTeamForBootstrap({
+          mode: params.request.mode,
+          attachState,
+          teamName: params.request.teamName,
+        })
+        const reusedExistingTeam = !shouldCreateTeam
+        if (shouldCreateTeam) {
           await stateStore.transitionTo('creating_team', now)
           await params.emit.phaseChanged('creating_team')
           await TeamCreateTool.call(

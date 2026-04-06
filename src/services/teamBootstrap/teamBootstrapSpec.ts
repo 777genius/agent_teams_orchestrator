@@ -26,7 +26,7 @@ const bootstrapMemberSchema = z.strictObject({
 const bootstrapSpecSchema = z.strictObject({
   version: z.literal(1),
   runId: z.string().trim().min(1),
-  mode: z.literal('create'),
+  mode: z.enum(['create', 'launch']),
   initiator: z.strictObject({
     kind: z.literal('app'),
     source: z.literal('claude_team_freecode'),
@@ -184,7 +184,7 @@ export async function readTeamBootstrapSpec(
   const requestBase: Omit<TeamBootstrapRequest, 'requestHash'> = {
     version: 1,
     runId: parsed.runId,
-    mode: 'create',
+    mode: parsed.mode,
     teamName: parsed.team.name,
     ...(parsed.team.displayName
       ? { teamDisplayName: parsed.team.displayName }
