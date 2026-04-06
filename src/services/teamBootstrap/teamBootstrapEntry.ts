@@ -1,0 +1,120 @@
+import { lstat, readFile, rm } from 'fs/promises'
+import type { StructuredIO } from 'src/cli/structuredIO.js'
+import type { Command } from 'src/commands.js'
+import type { AppState } from 'src/state/AppState.js'
+import type { MCPServerConnection } from 'src/services/mcp/types.js'
+import type { AgentDefinition } from 'src/tools/AgentTool/loadAgentsDir.js'
+import type { Tools } from 'src/Tool.js'
+import type { ThinkingConfig } from 'src/utils/thinking.js'
+import { buildTeamBootstrapContext } from './teamBootstrapContext.js'
+import { TeamBootstrapProgressEmitter } from './teamBootstrapEvents.js'
+import { runTeamBootstrap } from './teamBootstrapRunner.js'
+import { readTeamBootstrapSpec } from './teamBootstrapSpec.js'
+import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
+
+const MAX_BOOTSTRAP_USER_PROMPT_BYTES = 256 * 1024
+
+async function consumeBootstrapSpecFile(specPath: string): Promise<void> {
+  await rm(specPath, { force: true }).catch(() => {})
+}
+
+async function readBootstrapUserPromptFile(promptFilePath: string): Promise<string> {
+  const stat = await lstat(promptFilePath)
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(
+      'team bootstrap user prompt file must be a regular file and must not be a symlink',
+    )
+  }
+  if (stat.size > MAX_BOOTSTRAP_USER_PROMPT_BYTES) {
+    throw new Error('team bootstrap user prompt file is too large')
+  }
+  return readFile(promptFilePath, 'utf8')
+}
+
+function assertBootstrapFeatureEnabled(): void {
+  if (process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP === '1') {
+    throw new Error(
+      'deterministic team bootstrap is disabled by kill switch',
+    )
+  }
+  if (process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP !== '1') {
+    throw new Error(
+      'deterministic team bootstrap requires CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP=1',
+    )
+  }
+}
+
+export async function runStartupTeamBootstrap(params: {
+  specPath: string
+  userPromptFilePath?: string
+  structuredIO: StructuredIO
+  commands: Command[]
+  tools: Tools
+  mcpClients: MCPServerConnection[]
+  agents: AgentDefinition[]
+  getAppState: () => AppState
+  setAppState: (f: (prev: AppState) => AppState) => void
+  customSystemPrompt?: string
+  appendSystemPrompt?: string
+  thinkingConfig?: ThinkingConfig
+}): Promise<void> {
+  assertBootstrapFeatureEnabled()
+  const request = await readTeamBootstrapSpec(params.specPath)
+  await consumeBootstrapSpecFile(params.specPath)
+  const context = buildTeamBootstrapContext({
+    commands: params.commands,
+    tools: params.tools,
+    mcpClients: params.mcpClients,
+    agents: params.agents,
+    getAppState: params.getAppState,
+    setAppState: params.setAppState,
+    customSystemPrompt: params.customSystemPrompt,
+    appendSystemPrompt: params.appendSystemPrompt,
+    thinkingConfig: params.thinkingConfig,
+    structuredIO: params.structuredIO,
+  })
+  const emitter = new TeamBootstrapProgressEmitter(
+    params.structuredIO,
+    request.runId,
+    request.teamName,
+  )
+  const result = await runTeamBootstrap({
+    request,
+    context,
+    emit: emitter,
+  })
+  if (!result.ok && result.fatal) {
+    throw new Error(result.error)
+  }
+  if (params.userPromptFilePath) {
+    const prompt = await readBootstrapUserPromptFile(params.userPromptFilePath)
+    if (prompt.trim().length > 0) {
+      const markedUnknown =
+        await TeamBootstrapStateStore.updateRealTaskSubmissionState({
+          teamName: request.teamName,
+          runId: request.runId,
+          state: 'unknown',
+          detail: 'runtime is preparing the first real user task',
+        })
+      if (!markedUnknown) {
+        throw new Error(
+          'deterministic bootstrap could not persist pre-submission state for the first real task',
+        )
+      }
+      params.structuredIO.prependUserMessage(prompt)
+      const markedSubmitted =
+        await TeamBootstrapStateStore.updateRealTaskSubmissionState({
+          teamName: request.teamName,
+          runId: request.runId,
+          state: 'submitted',
+          detail: 'runtime queued the first real user task',
+        })
+      if (!markedSubmitted) {
+        throw new Error(
+          'deterministic bootstrap could not persist first-task submission state',
+        )
+      }
+    }
+    await rm(params.userPromptFilePath, { force: true }).catch(() => {})
+  }
+}

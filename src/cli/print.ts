@@ -150,6 +150,7 @@ import { createAbortController } from 'src/utils/abortController.js'
 import { createCombinedAbortSignal } from 'src/utils/combinedAbortSignal.js'
 import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
+import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -486,6 +487,8 @@ export async function runHeadless(
     enableAuthStatus: boolean | undefined
     agent: string | undefined
     workload: string | undefined
+    teamBootstrapSpecPath?: string | undefined
+    teamBootstrapUserPromptFile?: string | undefined
     setupTrigger?: 'init' | 'maintenance' | undefined
     sessionStartHooksPromise?: ReturnType<typeof processSessionStartHooks>
     setSDKStatus?: (status: SDKStatus) => void
@@ -776,9 +779,23 @@ export async function runHeadless(
     (Boolean(validateUuid(options.resume)) || options.resume.endsWith('.jsonl'))
   const isUsingSdkUrl = Boolean(options.sdkUrl)
 
-  if (!inputPrompt && !hasValidResumeSessionId && !isUsingSdkUrl) {
+  if (
+    !inputPrompt &&
+    !hasValidResumeSessionId &&
+    !isUsingSdkUrl &&
+    !options.teamBootstrapSpecPath &&
+    !options.teamBootstrapUserPromptFile
+  ) {
     process.stderr.write(
       `Error: Input must be provided either through stdin or as a prompt argument when using --print\n`,
+    )
+    gracefulShutdownSync(1)
+    return
+  }
+
+  if (options.teamBootstrapUserPromptFile && !options.teamBootstrapSpecPath) {
+    process.stderr.write(
+      'Error: --team-bootstrap-user-prompt-file requires --team-bootstrap-spec\n',
     )
     gracefulShutdownSync(1)
     return
@@ -840,6 +857,25 @@ export async function runHeadless(
   // For Bedrock users, this waits for the profile fetch to get correct region strings.
   await ensureModelStringsInitialized()
   headlessProfilerCheckpoint('after_modelStrings')
+
+  if (options.teamBootstrapSpecPath) {
+    const bootstrapAppState = getAppState()
+    await runStartupTeamBootstrap({
+      specPath: options.teamBootstrapSpecPath,
+      userPromptFilePath: options.teamBootstrapUserPromptFile,
+      structuredIO,
+      commands: [...commands, ...bootstrapAppState.mcp.commands],
+      tools: filteredTools,
+      mcpClients: bootstrapAppState.mcp.clients,
+      agents,
+      getAppState,
+      setAppState,
+      customSystemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
+      thinkingConfig: options.thinkingConfig,
+    })
+    headlessProfilerCheckpoint('after_teamBootstrap')
+  }
 
   // UDS inbox store registration is deferred until after `run` is defined
   // so we can pass `run` as the onEnqueue callback (see below).
