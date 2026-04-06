@@ -442,4 +442,47 @@ describe('team bootstrap spec normalization', () => {
 
     expect(hashA).toBe(hashB)
   })
+
+  test('request hash ignores UI-only team metadata that runtime bootstrap does not use', () => {
+    const baseRequest: Omit<TeamBootstrapRequest, 'requestHash'> = {
+      version: 1,
+      runId: 'run-6',
+      mode: 'create',
+      teamName: 'atlas-hq',
+      teamDisplayName: 'Atlas HQ',
+      description: 'Create the team',
+      color: '#123456',
+      cwd: '/tmp/workspace',
+      members: [
+        {
+          originalName: 'alice',
+          displayName: 'alice',
+          normalizedName: 'alice',
+          prompt: 'Prompt A',
+        },
+      ],
+      bootstrapTimeoutMs: 30_000,
+      continueOnPartialFailure: true,
+      permissionSeedTools: ['Edit', 'Write'],
+      emitStructuredEvents: true,
+      policy: {
+        persistentTeam: true,
+        registerForSessionCleanup: false,
+        writeConversationSummaryMessage: false,
+      },
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+    }
+
+    const hashA = buildRequestHash(baseRequest)
+    const hashB = buildRequestHash({
+      ...baseRequest,
+      teamDisplayName: 'Atlas HQ Renamed',
+      color: '#abcdef',
+    })
+
+    expect(hashA).toBe(hashB)
+  })
 })
