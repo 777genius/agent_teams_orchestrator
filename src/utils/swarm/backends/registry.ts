@@ -357,10 +357,19 @@ export function isInProcessEnabled(): boolean {
   // This avoids changing broader SDK/auth semantics just to prefer pane-based
   // teammates for persistent desktop teams.
   if (getIsNonInteractiveSession()) {
-    if (
-      isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES) &&
-      mode === 'tmux'
-    ) {
+    if (mode === 'in-process') {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, explicit in-process mode)',
+      )
+      return true
+    }
+    if (inProcessFallbackActive) {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, fallback after pane backend unavailable)',
+      )
+      return true
+    }
+    if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: false (forced process teammates for non-interactive session)',
       )
