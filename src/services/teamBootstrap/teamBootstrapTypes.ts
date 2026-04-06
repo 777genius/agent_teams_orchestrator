@@ -23,7 +23,6 @@ export type TeamBootstrapSpec = {
     effort?: string
     agentLanguage?: string
     permissionSeedTools?: string[]
-    skipPermissions?: boolean
     worktree?: string | null
     extraCliArgs?: string[]
   }

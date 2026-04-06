@@ -55,7 +55,6 @@ const bootstrapSpecSchema = z.strictObject({
       .array(z.string().trim().min(1))
       .max(64)
       .optional(),
-    skipPermissions: z.boolean().optional(),
     worktree: z.string().trim().min(1).nullable().optional(),
     extraCliArgs: z.array(z.string()).optional(),
   }),

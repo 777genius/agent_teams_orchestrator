@@ -278,6 +278,37 @@ describe('team bootstrap spec normalization', () => {
     )
   })
 
+  test('rejects embedding legacy skipPermissions into the bootstrap spec', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-invalid-skip-perms.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-invalid-skip-perms',
+        mode: 'create',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_freecode',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {
+          skipPermissions: false,
+        },
+        members: [{ name: 'alice' }],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /skipPermissions/i,
+    )
+  })
+
   test('request hash stays stable across app and hidden-tool entrypoints', () => {
     const requestBase: Omit<TeamBootstrapRequest, 'requestHash'> = {
       version: 1,
