@@ -246,6 +246,38 @@ describe('team bootstrap spec normalization', () => {
     )
   })
 
+  test('rejects embedding the first real user prompt into the bootstrap spec', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-invalid-prompt.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-invalid-prompt',
+        mode: 'create',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_freecode',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [{ name: 'alice' }],
+        launch: {
+          initialUserPrompt: 'do the real task now',
+        },
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /initialUserPrompt/i,
+    )
+  })
+
   test('request hash stays stable across app and hidden-tool entrypoints', () => {
     const requestBase: Omit<TeamBootstrapRequest, 'requestHash'> = {
       version: 1,

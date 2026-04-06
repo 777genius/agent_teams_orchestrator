@@ -62,7 +62,6 @@ const bootstrapSpecSchema = z.strictObject({
   members: z.array(bootstrapMemberSchema).min(1).max(8),
   launch: z
     .strictObject({
-      initialUserPrompt: z.string().nullable().optional(),
       bootstrapTimeoutMs: z.number().int().positive().max(120_000).optional(),
       continueOnPartialFailure: z.boolean().optional(),
     })

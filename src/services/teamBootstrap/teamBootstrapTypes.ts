@@ -42,7 +42,6 @@ export type TeamBootstrapSpec = {
     description?: string
   }>
   launch?: {
-    initialUserPrompt?: string | null
     bootstrapTimeoutMs?: number
     continueOnPartialFailure?: boolean
   }
