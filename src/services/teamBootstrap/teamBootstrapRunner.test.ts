@@ -4,6 +4,7 @@ import * as os from 'os'
 import * as path from 'path'
 
 import {
+  assertBootstrapTimeoutBudget,
   assertBootstrapRuntimeWorkspace,
   deriveBootstrapTerminalStatus,
   emitBootstrapProgressSafely,
@@ -216,5 +217,32 @@ describe('team bootstrap progress emission safety', () => {
         throw new Error('consumer disconnected')
       }),
     ).resolves.toBeUndefined()
+  })
+})
+
+describe('team bootstrap timeout budget', () => {
+  test('allows execution while still within the monotonic timeout budget', () => {
+    expect(() =>
+      assertBootstrapTimeoutBudget({
+        teamName: 'atlas-hq',
+        startedAtMs: 100,
+        timeoutMs: 1_000,
+        monotonicNowMs: 1_050,
+      }),
+    ).not.toThrow()
+  })
+
+  test('fails explicitly when the monotonic timeout budget is exhausted', () => {
+    expect(() =>
+      assertBootstrapTimeoutBudget({
+        teamName: 'atlas-hq',
+        startedAtMs: 100,
+        timeoutMs: 1_000,
+        monotonicNowMs: 1_250,
+        stage: 'before spawning teammate "alice"',
+      }),
+    ).toThrow(
+      'Deterministic bootstrap for "atlas-hq" timed out before spawning teammate "alice" after 1150ms (budget 1000ms).',
+    )
   })
 })

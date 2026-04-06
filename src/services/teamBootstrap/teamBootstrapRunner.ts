@@ -79,6 +79,23 @@ export async function emitBootstrapProgressSafely(
   }
 }
 
+export function assertBootstrapTimeoutBudget(params: {
+  teamName: string
+  startedAtMs: number
+  timeoutMs: number
+  monotonicNowMs?: number
+  stage?: string
+}): void {
+  const elapsedMs = (params.monotonicNowMs ?? performance.now()) - params.startedAtMs
+  if (elapsedMs <= params.timeoutMs) {
+    return
+  }
+  const roundedElapsedMs = Math.max(0, Math.round(elapsedMs))
+  throw new Error(
+    `Deterministic bootstrap for "${params.teamName}" timed out${params.stage ? ` ${params.stage}` : ''} after ${roundedElapsedMs}ms (budget ${params.timeoutMs}ms).`,
+  )
+}
+
 export function deriveBootstrapTerminalStatus(params: {
   continueOnPartialFailure: boolean
   failedMembersCount: number
@@ -238,16 +255,29 @@ export async function runTeamBootstrap(params: {
   emit: TeamBootstrapProgressSink
   onInitialized?: () => Promise<void> | void
   now?: () => number
+  monotonicNow?: () => number
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())
+  const monotonicNow = params.monotonicNow ?? (() => performance.now())
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   const runtimeIdentity = getCurrentTeamBootstrapRuntimeIdentity()
+  const timeoutStartedAt = monotonicNow()
+  const assertTimeoutBudget = (stage?: string): void => {
+    assertBootstrapTimeoutBudget({
+      teamName: params.request.teamName,
+      startedAtMs: timeoutStartedAt,
+      timeoutMs: params.request.bootstrapTimeoutMs,
+      monotonicNowMs: monotonicNow(),
+      ...(stage ? { stage } : {}),
+    })
+  }
   const validateWorkspace = async (stage?: string): Promise<void> => {
     await assertBootstrapRuntimeWorkspace(params.request, stage)
   }
   await stateStore.initialize()
 
   try {
+    assertTimeoutBudget('before initializing deterministic bootstrap')
     await params.onInitialized?.()
     await emitBootstrapProgressSafely('started', () =>
       params.emit.started(params.request.members.map(member => member.displayName)),
@@ -260,6 +290,7 @@ export async function runTeamBootstrap(params: {
       params.emit.phaseChanged('loading_existing_state'),
     )
     await validateWorkspace('before acquiring bootstrap ownership lock')
+    assertTimeoutBudget('before acquiring bootstrap ownership lock')
     await stateStore.transitionTo('acquiring_bootstrap_lock', now)
     await emitBootstrapProgressSafely('phase_changed:acquiring_bootstrap_lock', () =>
       params.emit.phaseChanged('acquiring_bootstrap_lock'),
@@ -270,7 +301,9 @@ export async function runTeamBootstrap(params: {
       runId: params.request.runId,
       requestHash: params.request.requestHash,
       ownerStartedAt: stateStore.getState().ownerStartedAt ?? now(),
+      timeoutMs: params.request.bootstrapTimeoutMs,
       fn: async () => {
+        assertTimeoutBudget('after acquiring bootstrap ownership lock')
         await validateWorkspace('after acquiring bootstrap ownership lock')
         seedBootstrapPermissionRules({
           teamName: params.request.teamName,
@@ -287,6 +320,7 @@ export async function runTeamBootstrap(params: {
         })
         const reusedExistingTeam = !shouldCreateTeam
         if (shouldCreateTeam) {
+          assertTimeoutBudget('before creating team config')
           await validateWorkspace('before creating team config')
           await stateStore.transitionTo('creating_team', now)
           await emitBootstrapProgressSafely('phase_changed:creating_team', () =>
@@ -314,6 +348,7 @@ export async function runTeamBootstrap(params: {
         const failedMembers: Array<{ name: string; reason: string }> = []
 
         for (const member of params.request.members) {
+          assertTimeoutBudget(`before spawning teammate "${member.displayName}"`)
           await validateWorkspace(
             `before spawning teammate "${member.displayName}"`,
           )
@@ -432,6 +467,7 @@ export async function runTeamBootstrap(params: {
         await emitBootstrapProgressSafely('phase_changed:auditing_truth', () =>
           params.emit.phaseChanged('auditing_truth'),
         )
+        assertTimeoutBudget('before auditing bootstrap truth')
         await validateWorkspace('before auditing bootstrap truth')
         const teamFile = await readTeamFileAsync(params.request.teamName)
         const registeredMemberNames = new Set(

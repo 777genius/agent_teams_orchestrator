@@ -202,6 +202,7 @@ export async function withBootstrapOwnershipLock<T>(params: {
   runId: string
   requestHash: string
   ownerStartedAt: number
+  timeoutMs?: number
   fn: () => Promise<T>
 }): Promise<T> {
   const teamDir = getTeamDir(params.teamName)
@@ -259,9 +260,10 @@ export async function withBootstrapOwnershipLock<T>(params: {
         continue
       }
 
-      if (Date.now() - start >= BOOTSTRAP_LOCK_TIMEOUT_MS) {
+      const timeoutMs = params.timeoutMs ?? BOOTSTRAP_LOCK_TIMEOUT_MS
+      if (Date.now() - start >= timeoutMs) {
         throw new Error(
-          `Timed out waiting for bootstrap ownership lock for "${params.teamName}" after ${BOOTSTRAP_LOCK_TIMEOUT_MS}ms`,
+          `Timed out waiting for bootstrap ownership lock for "${params.teamName}" after ${timeoutMs}ms`,
         )
       }
 
