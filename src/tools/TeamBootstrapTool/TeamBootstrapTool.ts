@@ -140,12 +140,22 @@ export const TeamBootstrapTool = buildTool({
   async prompt() {
     return getPrompt()
   },
-  async validateInput(_input, context) {
+  async validateInput(input, context) {
     if (context.agentId) {
       return {
         result: false,
         message:
           'TeamBootstrap can only run from the main lead session, not from a teammate or nested agent.',
+        errorCode: 9,
+      }
+    }
+    const currentTeamName = context.getAppState().teamContext?.teamName
+    if (currentTeamName && currentTeamName !== input.team_name) {
+      return {
+        result: false,
+        message:
+          `TeamBootstrap cannot switch this lead session from team "${currentTeamName}" to "${input.team_name}". ` +
+          'Finish or delete the current team first, or start a fresh lead session.',
         errorCode: 9,
       }
     }
