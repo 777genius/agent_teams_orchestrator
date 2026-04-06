@@ -151,6 +151,7 @@ import { createCombinedAbortSignal } from 'src/utils/combinedAbortSignal.js'
 import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
 import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
+import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -797,6 +798,24 @@ export async function runHeadless(
     process.stderr.write(
       'Error: --team-bootstrap-user-prompt-file requires --team-bootstrap-spec\n',
     )
+    gracefulShutdownSync(1)
+    return
+  }
+
+  const bootstrapStartupValidationError = validateTeamBootstrapStartupOptions({
+    options: {
+      continue: options.continue,
+      resume: options.resume,
+      resumeSessionAt: options.resumeSessionAt,
+      forkSession: options.forkSession,
+      rewindFiles: options.rewindFiles,
+      teamBootstrapSpecPath: options.teamBootstrapSpecPath,
+      teamBootstrapUserPromptFile: options.teamBootstrapUserPromptFile,
+    },
+    inputPrompt,
+  })
+  if (bootstrapStartupValidationError) {
+    process.stderr.write(bootstrapStartupValidationError)
     gracefulShutdownSync(1)
     return
   }
