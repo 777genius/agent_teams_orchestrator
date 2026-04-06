@@ -248,4 +248,49 @@ describe('team bootstrap spec normalization', () => {
 
     expect(appHash).toBe(toolHash)
   })
+
+  test('request hash stays stable across member and permission-seed ordering', () => {
+    const baseRequest: Omit<TeamBootstrapRequest, 'requestHash'> = {
+      version: 1,
+      runId: 'run-5',
+      mode: 'launch',
+      teamName: 'atlas-hq',
+      cwd: '/tmp/workspace',
+      members: [
+        {
+          originalName: 'bob',
+          displayName: 'bob',
+          normalizedName: 'bob',
+          prompt: 'Prompt B',
+        },
+        {
+          originalName: 'alice',
+          displayName: 'alice',
+          normalizedName: 'alice',
+          prompt: 'Prompt A',
+        },
+      ],
+      bootstrapTimeoutMs: 30_000,
+      continueOnPartialFailure: true,
+      permissionSeedTools: ['Write', 'Edit', 'NotebookEdit'],
+      policy: {
+        persistentTeam: true,
+        registerForSessionCleanup: false,
+        writeConversationSummaryMessage: false,
+      },
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+    }
+
+    const hashA = buildRequestHash(baseRequest)
+    const hashB = buildRequestHash({
+      ...baseRequest,
+      members: [...baseRequest.members].reverse(),
+      permissionSeedTools: [...baseRequest.permissionSeedTools].reverse(),
+    })
+
+    expect(hashA).toBe(hashB)
+  })
 })

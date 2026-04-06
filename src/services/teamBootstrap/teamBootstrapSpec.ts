@@ -130,13 +130,20 @@ function normalizeMember(
   }
 }
 
+function compareStableStrings(a: string, b: string): number {
+  if (a === b) {
+    return 0
+  }
+  return a < b ? -1 : 1
+}
+
 function normalizePermissionSeedTools(tools: string[] | undefined): string[] {
   if (!tools || tools.length === 0) {
     return []
   }
 
   return [...new Set(tools.map(tool => tool.trim()).filter(tool => tool.length > 0))].sort(
-    (a, b) => a.localeCompare(b),
+    compareStableStrings,
   )
 }
 
@@ -158,7 +165,7 @@ export function buildRequestHash(
       planModeRequired: member.planModeRequired ?? false,
       description: member.description ?? null,
     }))
-    .sort((a, b) => a.normalizedName.localeCompare(b.normalizedName))
+    .sort((a, b) => compareStableStrings(a.normalizedName, b.normalizedName))
 
   const stableIntent = {
     version: request.version,
@@ -170,9 +177,7 @@ export function buildRequestHash(
     cwd: request.cwd,
     bootstrapTimeoutMs: request.bootstrapTimeoutMs,
     continueOnPartialFailure: request.continueOnPartialFailure,
-    permissionSeedTools: [...request.permissionSeedTools].sort((a, b) =>
-      a.localeCompare(b),
-    ),
+    permissionSeedTools: [...request.permissionSeedTools].sort(compareStableStrings),
     policy: request.policy,
     members: stableMembers,
   }
