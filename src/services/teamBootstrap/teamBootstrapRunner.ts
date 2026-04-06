@@ -191,13 +191,13 @@ export async function runTeamBootstrap(params: {
   const now = params.now ?? (() => Date.now())
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   await stateStore.initialize()
-  await params.onInitialized?.()
-  await params.emit.started(
-    params.request.members.map(member => member.displayName),
-  )
-  await params.emit.phaseChanged('validating_spec')
 
   try {
+    await params.onInitialized?.()
+    await params.emit.started(
+      params.request.members.map(member => member.displayName),
+    )
+    await params.emit.phaseChanged('validating_spec')
     await stateStore.transitionTo('loading_existing_state', now)
     await params.emit.phaseChanged('loading_existing_state')
     await assertBootstrapRuntimeWorkspace(params.request)
