@@ -1,5 +1,6 @@
-import { getClientType, getIsNonInteractiveSession } from '../../../bootstrap/state.js'
+import { getIsNonInteractiveSession } from '../../../bootstrap/state.js'
 import { logForDebugging } from '../../../utils/debug.js'
+import { isEnvTruthy } from '../../../utils/envUtils.js'
 import { getPlatform } from '../../../utils/platform.js'
 import {
   isInITerm2,
@@ -352,13 +353,16 @@ export function isInProcessEnabled(): boolean {
   const mode = getTeammateMode()
 
   // Force in-process mode for non-interactive sessions (-p mode), except for
-  // Claude Desktop managed team runtimes that explicitly request tmux-backed
-  // teammates. Those sessions are headless at the leader transport layer but
-  // still need stable process-backed teammates.
+  // app-managed team runtimes that explicitly set a narrow backend override.
+  // This avoids changing broader SDK/auth semantics just to prefer pane-based
+  // teammates for persistent desktop teams.
   if (getIsNonInteractiveSession()) {
-    if (getClientType() === 'claude-desktop' && mode === 'tmux') {
+    if (
+      isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES) &&
+      mode === 'tmux'
+    ) {
       logForDebugging(
-        '[BackendRegistry] isInProcessEnabled: false (claude-desktop explicit tmux mode)',
+        '[BackendRegistry] isInProcessEnabled: false (forced process teammates for non-interactive session)',
       )
       return false
     }
