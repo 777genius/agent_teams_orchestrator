@@ -309,6 +309,41 @@ describe('team bootstrap spec normalization', () => {
     )
   })
 
+  test('rejects embedding lead runtime launch settings into the bootstrap spec', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-invalid-lead-runtime.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-invalid-lead-runtime',
+        mode: 'create',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_freecode',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {
+          providerId: 'gemini',
+          model: 'gemini-2.5-flash',
+          effort: 'medium',
+          worktree: '/tmp/worktree',
+          extraCliArgs: ['--foo'],
+        },
+        members: [{ name: 'alice' }],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /providerId|model|effort|worktree|extraCliArgs/i,
+    )
+  })
+
   test('request hash stays stable across app and hidden-tool entrypoints', () => {
     const requestBase: Omit<TeamBootstrapRequest, 'requestHash'> = {
       version: 1,

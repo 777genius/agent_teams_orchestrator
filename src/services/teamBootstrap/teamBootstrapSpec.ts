@@ -47,16 +47,11 @@ const bootstrapSpecSchema = z.strictObject({
     cwd: z.string().trim().min(1),
   }),
   lead: z.strictObject({
-    providerId: z.enum(['anthropic', 'codex', 'gemini']).optional(),
-    model: z.string().trim().min(1).optional(),
-    effort: z.string().trim().min(1).optional(),
     agentLanguage: z.string().trim().min(1).optional(),
     permissionSeedTools: z
       .array(z.string().trim().min(1))
       .max(64)
       .optional(),
-    worktree: z.string().trim().min(1).nullable().optional(),
-    extraCliArgs: z.array(z.string()).optional(),
   }),
   members: z.array(bootstrapMemberSchema).min(1).max(8),
   launch: z

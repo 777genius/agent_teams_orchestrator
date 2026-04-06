@@ -18,13 +18,8 @@ export type TeamBootstrapSpec = {
     cwd: string
   }
   lead: {
-    providerId?: BootstrapProvider
-    model?: string
-    effort?: string
     agentLanguage?: string
     permissionSeedTools?: string[]
-    worktree?: string | null
-    extraCliArgs?: string[]
   }
   members: Array<{
     name: string
