@@ -47,18 +47,19 @@ export function shouldCreateTeamForBootstrap(params: {
 
 export async function assertBootstrapRuntimeWorkspace(
   request: Pick<TeamBootstrapRequest, 'teamName' | 'cwd'>,
+  stage?: string,
 ): Promise<void> {
   let runtimeCwd: string
   try {
     runtimeCwd = await fs.realpath(getCwd())
   } catch (error) {
     throw new Error(
-      `Deterministic bootstrap cannot start team "${request.teamName}" because the lead runtime workspace is unavailable: ${errorMessage(error)}`,
+      `Deterministic bootstrap cannot start team "${request.teamName}"${stage ? ` ${stage}` : ''} because the lead runtime workspace is unavailable: ${errorMessage(error)}`,
     )
   }
   if (runtimeCwd !== request.cwd) {
     throw new Error(
-      `Deterministic bootstrap cannot start team "${request.teamName}" because the runtime workspace "${runtimeCwd}" does not match the requested workspace "${request.cwd}".`,
+      `Deterministic bootstrap cannot start team "${request.teamName}"${stage ? ` ${stage}` : ''} because the runtime workspace "${runtimeCwd}" does not match the requested workspace "${request.cwd}".`,
     )
   }
 }
@@ -210,6 +211,9 @@ export async function runTeamBootstrap(params: {
   const now = params.now ?? (() => Date.now())
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   const runtimeIdentity = getCurrentTeamBootstrapRuntimeIdentity()
+  const validateWorkspace = async (stage?: string): Promise<void> => {
+    await assertBootstrapRuntimeWorkspace(params.request, stage)
+  }
   await stateStore.initialize()
 
   try {
@@ -224,7 +228,7 @@ export async function runTeamBootstrap(params: {
     await emitBootstrapProgressSafely('phase_changed:loading_existing_state', () =>
       params.emit.phaseChanged('loading_existing_state'),
     )
-    await assertBootstrapRuntimeWorkspace(params.request)
+    await validateWorkspace('before acquiring bootstrap ownership lock')
     await stateStore.transitionTo('acquiring_bootstrap_lock', now)
     await emitBootstrapProgressSafely('phase_changed:acquiring_bootstrap_lock', () =>
       params.emit.phaseChanged('acquiring_bootstrap_lock'),
@@ -236,6 +240,7 @@ export async function runTeamBootstrap(params: {
       requestHash: params.request.requestHash,
       ownerStartedAt: stateStore.getState().ownerStartedAt ?? now(),
       fn: async () => {
+        await validateWorkspace('after acquiring bootstrap ownership lock')
         const attachState = await ensureLeaderAttachedToTeam(
           params.request,
           params.context,
@@ -247,6 +252,7 @@ export async function runTeamBootstrap(params: {
         })
         const reusedExistingTeam = !shouldCreateTeam
         if (shouldCreateTeam) {
+          await validateWorkspace('before creating team config')
           await stateStore.transitionTo('creating_team', now)
           await emitBootstrapProgressSafely('phase_changed:creating_team', () =>
             params.emit.phaseChanged('creating_team'),
@@ -273,6 +279,9 @@ export async function runTeamBootstrap(params: {
         const failedMembers: Array<{ name: string; reason: string }> = []
 
         for (const member of params.request.members) {
+          await validateWorkspace(
+            `before spawning teammate "${member.displayName}"`,
+          )
           assertStableTeamBootstrapRuntimeIdentity({
             teamName: params.request.teamName,
             expected: runtimeIdentity,
@@ -388,6 +397,7 @@ export async function runTeamBootstrap(params: {
         await emitBootstrapProgressSafely('phase_changed:auditing_truth', () =>
           params.emit.phaseChanged('auditing_truth'),
         )
+        await validateWorkspace('before auditing bootstrap truth')
         const teamFile = await readTeamFileAsync(params.request.teamName)
         const registeredMemberNames = new Set(
           (teamFile?.members ?? [])

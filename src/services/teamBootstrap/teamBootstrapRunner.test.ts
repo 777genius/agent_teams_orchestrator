@@ -112,6 +112,22 @@ describe('team bootstrap workspace safety', () => {
       `Deterministic bootstrap cannot start team "atlas-hq" because the runtime workspace "${process.cwd()}" does not match the requested workspace "${tempDir}".`,
     )
   })
+
+  test('includes stage context when workspace drift is detected mid-bootstrap', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-cwd-'))
+    tempDirs.push(tempDir)
+    await expect(
+      assertBootstrapRuntimeWorkspace(
+        {
+          teamName: 'atlas-hq',
+          cwd: tempDir,
+        },
+        'before spawning teammate "alice"',
+      ),
+    ).rejects.toThrow(
+      `Deterministic bootstrap cannot start team "atlas-hq" before spawning teammate "alice" because the runtime workspace "${process.cwd()}" does not match the requested workspace "${tempDir}".`,
+    )
+  })
 })
 
 describe('team bootstrap early-failure durability', () => {
