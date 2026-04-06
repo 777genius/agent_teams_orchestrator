@@ -19,6 +19,10 @@ import {
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
+import {
+  assertStableTeamBootstrapRuntimeIdentity,
+  getCurrentTeamBootstrapRuntimeIdentity,
+} from './teamBootstrapRuntimeIdentity.js'
 import type {
   TeamBootstrapRequest,
   TeamBootstrapResult,
@@ -205,6 +209,7 @@ export async function runTeamBootstrap(params: {
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())
   const stateStore = new TeamBootstrapStateStore(params.request, now)
+  const runtimeIdentity = getCurrentTeamBootstrapRuntimeIdentity()
   await stateStore.initialize()
 
   try {
@@ -268,6 +273,10 @@ export async function runTeamBootstrap(params: {
         const failedMembers: Array<{ name: string; reason: string }> = []
 
         for (const member of params.request.members) {
+          assertStableTeamBootstrapRuntimeIdentity({
+            teamName: params.request.teamName,
+            expected: runtimeIdentity,
+          })
           await stateStore.markMemberSpawnStarted(member.displayName, now)
           await emitBootstrapProgressSafely(
             `member_spawn_started:${member.displayName}`,
