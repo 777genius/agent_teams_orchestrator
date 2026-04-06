@@ -23,8 +23,10 @@ import type { TeamFile } from '../../utils/swarm/teamHelpers.js'
 import {
   getTeamFilePath,
   readTeamFile,
+  readTeamFileAsync,
   registerTeamForSessionCleanup,
   sanitizeName,
+  withTeamFileLock,
   writeTeamFileAsync,
 } from '../../utils/swarm/teamHelpers.js'
 import { assignTeammateColor } from '../../utils/swarm/teammateLayoutManager.js'
@@ -144,10 +146,6 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
     }
 
     // If team already exists, generate a unique name instead of failing
-    const finalTeamName = generateUniqueTeamName(team_name)
-
-    // Generate a deterministic agent ID for the team lead
-    const leadAgentId = formatAgentId(TEAM_LEAD_NAME, finalTeamName)
     const leadAgentType = agent_type || TEAM_LEAD_NAME
     // Get the team lead's current model from launch/bootstrap state first.
     // TeamCreate can run before AppState fully reflects a new --model selection,
@@ -160,29 +158,51 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
         getDefaultMainLoopModel(),
     )
 
-    const teamFilePath = getTeamFilePath(finalTeamName)
+    let finalTeamName = generateUniqueTeamName(team_name)
+    let leadAgentId = formatAgentId(TEAM_LEAD_NAME, finalTeamName)
+    let teamFilePath = getTeamFilePath(finalTeamName)
 
-    const teamFile: TeamFile = {
-      name: finalTeamName,
-      description: _description,
-      createdAt: Date.now(),
-      leadAgentId,
-      leadSessionId: getSessionId(), // Store actual session ID for team discovery
-      members: [
-        {
-          agentId: leadAgentId,
-          name: TEAM_LEAD_NAME,
-          agentType: leadAgentType,
-          model: leadModel,
-          joinedAt: Date.now(),
-          tmuxPaneId: '',
-          cwd: getCwd(),
-          subscriptions: [],
-        },
-      ],
+    while (true) {
+      const candidateTeamName = finalTeamName
+      const candidateLeadAgentId = formatAgentId(TEAM_LEAD_NAME, candidateTeamName)
+      const candidateTeamFile: TeamFile = {
+        name: candidateTeamName,
+        description: _description,
+        createdAt: Date.now(),
+        leadAgentId: candidateLeadAgentId,
+        leadSessionId: getSessionId(), // Store actual session ID for team discovery
+        members: [
+          {
+            agentId: candidateLeadAgentId,
+            name: TEAM_LEAD_NAME,
+            agentType: leadAgentType,
+            model: leadModel,
+            joinedAt: Date.now(),
+            tmuxPaneId: '',
+            cwd: getCwd(),
+            subscriptions: [],
+          },
+        ],
+      }
+
+      const created = await withTeamFileLock(candidateTeamName, async () => {
+        const existingTeam = await readTeamFileAsync(candidateTeamName)
+        if (existingTeam) {
+          return false
+        }
+        await writeTeamFileAsync(candidateTeamName, candidateTeamFile)
+        return true
+      })
+
+      if (created) {
+        finalTeamName = candidateTeamName
+        leadAgentId = candidateLeadAgentId
+        teamFilePath = getTeamFilePath(candidateTeamName)
+        break
+      }
+
+      finalTeamName = generateWordSlug()
     }
-
-    await writeTeamFileAsync(finalTeamName, teamFile)
     // Track for session-end cleanup — teams were left on disk forever
     // unless explicitly TeamDelete'd (gh-32730).
     registerTeamForSessionCleanup(finalTeamName)

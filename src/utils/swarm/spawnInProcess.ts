@@ -227,10 +227,10 @@ export async function spawnInProcessTeammate(
  * @param setAppState - AppState setter
  * @returns true if killed successfully
  */
-export function killInProcessTeammate(
+export async function killInProcessTeammate(
   taskId: string,
   setAppState: SetAppStateFn,
-): boolean {
+): Promise<boolean> {
   let killed = false
   let teamName: string | null = null
   let agentId: string | null = null
@@ -301,9 +301,17 @@ export function killInProcessTeammate(
     }
   })
 
-  // Remove from team file (outside state updater to avoid file I/O in callback)
+  // Remove from team file (outside state updater to avoid file I/O in callback).
+  // This cleanup is best-effort: a transient lock/write failure must not block
+  // task eviction, SDK termination, or registry cleanup for the killed teammate.
   if (teamName && agentId) {
-    removeMemberByAgentId(teamName, agentId)
+    try {
+      await removeMemberByAgentId(teamName, agentId)
+    } catch (error) {
+      logForDebugging(
+        `[killInProcessTeammate] Failed to remove ${agentId} from team file ${teamName}: ${error}`,
+      )
+    }
   }
 
   if (killed) {

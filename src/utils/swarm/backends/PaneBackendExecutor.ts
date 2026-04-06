@@ -8,6 +8,7 @@ import { getAPIProvider } from '../../../utils/model/providers.js'
 import { jsonStringify } from '../../../utils/slowOperations.js'
 import { writeToMailbox } from '../../../utils/teammateMailbox.js'
 import {
+  buildPaneLauncherCommand,
   buildInheritedCliFlags,
   buildInheritedEnvVars,
   getTeammateCommand,
@@ -187,10 +188,11 @@ export class PaneBackendExecutor implements TeammateExecutor {
       const spawnCommand = wrapTeammateSpawnCommand(
         `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
       )
+      const paneCommand = await buildPaneLauncherCommand(spawnCommand)
 
       // Send the command to the new pane
       // Use swarm socket when running outside tmux (external swarm session)
-      await this.backend.sendCommandToPane(paneId, spawnCommand, !insideTmux)
+      await this.backend.sendCommandToPane(paneId, paneCommand, !insideTmux)
 
       if (this.backend.type === 'tmux') {
         const spawnFailure = await probeTmuxTeammateSpawn(
