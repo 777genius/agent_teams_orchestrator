@@ -3,10 +3,11 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
+  buildRequestHash,
   buildTeamBootstrapRequestFromSpec,
   readTeamBootstrapSpec,
 } from './teamBootstrapSpec.js'
-import type { TeamBootstrapSpec } from './teamBootstrapTypes.js'
+import type { TeamBootstrapRequest, TeamBootstrapSpec } from './teamBootstrapTypes.js'
 
 describe('team bootstrap spec normalization', () => {
   let tempRoot: string
@@ -169,5 +170,56 @@ describe('team bootstrap spec normalization', () => {
     await expect(readTeamBootstrapSpec(oversizedSpecPath)).rejects.toThrow(
       'team bootstrap spec is too large',
     )
+  })
+
+  test('request hash stays stable across app and hidden-tool entrypoints', () => {
+    const requestBase: Omit<TeamBootstrapRequest, 'requestHash'> = {
+      version: 1,
+      runId: 'run-4',
+      mode: 'launch',
+      teamName: 'atlas-hq',
+      teamDisplayName: 'Atlas HQ',
+      description: 'Example team',
+      color: '#123456',
+      cwd: '/tmp/workspace',
+      members: [
+        {
+          originalName: 'alice',
+          displayName: 'alice',
+          normalizedName: 'alice',
+          prompt: 'Prompt A',
+          role: 'reviewer',
+        },
+        {
+          originalName: 'bob',
+          displayName: 'bob',
+          normalizedName: 'bob',
+          prompt: 'Prompt B',
+          role: 'developer',
+        },
+      ],
+      bootstrapTimeoutMs: 30_000,
+      continueOnPartialFailure: true,
+      policy: {
+        persistentTeam: true,
+        registerForSessionCleanup: false,
+        writeConversationSummaryMessage: false,
+      },
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_freecode',
+      },
+    }
+
+    const appHash = buildRequestHash(requestBase)
+    const toolHash = buildRequestHash({
+      ...requestBase,
+      initiator: {
+        kind: 'tool',
+        source: 'TeamBootstrap',
+      },
+    })
+
+    expect(appHash).toBe(toolHash)
   })
 })

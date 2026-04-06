@@ -157,7 +157,6 @@ export function buildRequestHash(
     bootstrapTimeoutMs: request.bootstrapTimeoutMs,
     continueOnPartialFailure: request.continueOnPartialFailure,
     policy: request.policy,
-    initiator: request.initiator,
     members: stableMembers,
   }
 
