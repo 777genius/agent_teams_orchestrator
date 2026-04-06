@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { buildTeamBootstrapRequestFromSpec } from './teamBootstrapSpec.js'
+import {
+  buildTeamBootstrapRequestFromSpec,
+  readTeamBootstrapSpec,
+} from './teamBootstrapSpec.js'
 import type { TeamBootstrapSpec } from './teamBootstrapTypes.js'
 
 describe('team bootstrap spec normalization', () => {
@@ -126,5 +129,45 @@ describe('team bootstrap spec normalization', () => {
     } satisfies TeamBootstrapSpec)
 
     expect(request.members[0]?.prompt).toContain('resume your queue normally')
+  })
+
+  test('rejects symlink bootstrap spec paths', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const realSpecPath = join(tempRoot, 'bootstrap-real.json')
+    const linkSpecPath = join(tempRoot, 'bootstrap-link.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      realSpecPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-link',
+        mode: 'create',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_freecode',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [{ name: 'alice' }],
+      } satisfies TeamBootstrapSpec),
+      'utf8',
+    )
+    await symlink(realSpecPath, linkSpecPath)
+
+    await expect(readTeamBootstrapSpec(linkSpecPath)).rejects.toThrow(
+      'team bootstrap spec must be a regular file and must not be a symlink',
+    )
+  })
+
+  test('rejects oversized bootstrap specs before parsing', async () => {
+    const oversizedSpecPath = join(tempRoot, 'bootstrap-oversized.json')
+    await writeFile(oversizedSpecPath, 'x'.repeat(256 * 1024 + 1), 'utf8')
+
+    await expect(readTeamBootstrapSpec(oversizedSpecPath)).rejects.toThrow(
+      'team bootstrap spec is too large',
+    )
   })
 })

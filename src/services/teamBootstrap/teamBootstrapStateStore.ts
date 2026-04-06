@@ -6,12 +6,15 @@ import {
   isTerminalBootstrapPhase,
   type TeamBootstrapPhase,
 } from './teamBootstrapStateMachine.js'
+import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { TeamBootstrapJournal } from './teamBootstrapJournal.js'
 import type {
   BootstrapMemberState,
   PersistedBootstrapState,
   TeamBootstrapRequest,
 } from './teamBootstrapTypes.js'
+
+const MAX_BOOTSTRAP_STATE_BYTES = 256 * 1024
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(dirname(filePath), { recursive: true })
@@ -32,7 +35,17 @@ async function readPersistedBootstrapState(
 ): Promise<PersistedBootstrapState | null> {
   try {
     const raw = JSON.parse(
-      await fs.readFile(getBootstrapStatePath(teamName), 'utf8'),
+      await readBoundRegularUtf8File({
+        filePath: getBootstrapStatePath(teamName),
+        maxBytes: MAX_BOOTSTRAP_STATE_BYTES,
+        messages: {
+          notRegular:
+            'persisted deterministic bootstrap state must be a regular file and must not be a symlink',
+          oversized: 'persisted deterministic bootstrap state is too large',
+          invalid:
+            'persisted deterministic bootstrap state changed while being validated or could not be read safely',
+        },
+      }),
     ) as PersistedBootstrapState
     return raw.version === 1 ? raw : null
   } catch {

@@ -1,4 +1,4 @@
-import { lstat, readFile, rm } from 'fs/promises'
+import { rm } from 'fs/promises'
 import type { StructuredIO } from 'src/cli/structuredIO.js'
 import type { Command } from 'src/commands.js'
 import type { AppState } from 'src/state/AppState.js'
@@ -9,6 +9,7 @@ import type { ThinkingConfig } from 'src/utils/thinking.js'
 import { buildTeamBootstrapContext } from './teamBootstrapContext.js'
 import { TeamBootstrapProgressEmitter } from './teamBootstrapEvents.js'
 import { runTeamBootstrap } from './teamBootstrapRunner.js'
+import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { readTeamBootstrapSpec } from './teamBootstrapSpec.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
 
@@ -28,16 +29,17 @@ async function consumeBootstrapSpecFile(specPath: string): Promise<void> {
 }
 
 async function readBootstrapUserPromptFile(promptFilePath: string): Promise<string> {
-  const stat = await lstat(promptFilePath)
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new Error(
-      'team bootstrap user prompt file must be a regular file and must not be a symlink',
-    )
-  }
-  if (stat.size > MAX_BOOTSTRAP_USER_PROMPT_BYTES) {
-    throw new Error('team bootstrap user prompt file is too large')
-  }
-  return readFile(promptFilePath, 'utf8')
+  return readBoundRegularUtf8File({
+    filePath: promptFilePath,
+    maxBytes: MAX_BOOTSTRAP_USER_PROMPT_BYTES,
+    messages: {
+      notRegular:
+        'team bootstrap user prompt file must be a regular file and must not be a symlink',
+      oversized: 'team bootstrap user prompt file is too large',
+      invalid:
+        'team bootstrap user prompt file changed while being validated or could not be read safely',
+    },
+  })
 }
 
 function assertBootstrapFeatureEnabled(): void {

@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import * as fs from 'fs/promises'
 import { z } from 'zod/v4'
 import { sanitizeName } from 'src/utils/swarm/teamHelpers.js'
+import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import type {
   NormalizedBootstrapMember,
   TeamBootstrapRequest,
@@ -12,6 +13,8 @@ import {
   getMembersWithAssignedBoardWork,
   resolveBootstrapLeadName,
 } from './teamBootstrapPromptBuilder.js'
+
+const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
 
 const bootstrapMemberSchema = z.strictObject({
   name: z.string().trim().min(1),
@@ -223,14 +226,17 @@ export async function buildTeamBootstrapRequestFromSpec(
 export async function readTeamBootstrapSpec(
   specPath: string,
 ): Promise<TeamBootstrapRequest> {
-  const stat = await fs.lstat(specPath)
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new Error(
-      'team bootstrap spec must be a regular file and must not be a symlink',
-    )
-  }
-
-  const raw = await fs.readFile(specPath, 'utf8')
+  const raw = await readBoundRegularUtf8File({
+    filePath: specPath,
+    maxBytes: MAX_BOOTSTRAP_SPEC_BYTES,
+    messages: {
+      notRegular:
+        'team bootstrap spec must be a regular file and must not be a symlink',
+      oversized: 'team bootstrap spec is too large',
+      invalid:
+        'team bootstrap spec changed while being validated or could not be read safely',
+    },
+  })
   const parsed = bootstrapSpecSchema.parse(JSON.parse(raw))
   return buildTeamBootstrapRequestFromSpec(parsed)
 }

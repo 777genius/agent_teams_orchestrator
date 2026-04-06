@@ -1,14 +1,17 @@
 import { randomUUID } from 'crypto'
-import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises'
+import { mkdir, rm, stat, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { errorMessage, getErrnoCode } from 'src/utils/errors.js'
 import { getTeamDir } from 'src/utils/swarm/teamHelpers.js'
+import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { TeamBootstrapJournal } from './teamBootstrapJournal.js'
 
 const BOOTSTRAP_LOCK_TIMEOUT_MS = 10_000
 const BOOTSTRAP_LOCK_STALE_MS = 5 * 60_000
 const BOOTSTRAP_LOCK_RETRY_BASE_MS = 25
 const BOOTSTRAP_LOCK_SLOW_WAIT_MS = 100
+const MAX_BOOTSTRAP_LOCK_METADATA_BYTES = 64 * 1024
+const MAX_BOOTSTRAP_STATE_BYTES = 256 * 1024
 
 type BootstrapLockMetadata = {
   pid: number
@@ -61,7 +64,17 @@ async function readLockMetadata(
 ): Promise<BootstrapLockMetadata | null> {
   try {
     const raw = JSON.parse(
-      await readFile(getBootstrapLockMetadataPath(teamName), 'utf8'),
+      await readBoundRegularUtf8File({
+        filePath: getBootstrapLockMetadataPath(teamName),
+        maxBytes: MAX_BOOTSTRAP_LOCK_METADATA_BYTES,
+        messages: {
+          notRegular:
+            'deterministic bootstrap lock metadata must be a regular file and must not be a symlink',
+          oversized: 'deterministic bootstrap lock metadata is too large',
+          invalid:
+            'deterministic bootstrap lock metadata changed while being validated or could not be read safely',
+        },
+      }),
     ) as Partial<BootstrapLockMetadata>
     if (
       typeof raw.pid !== 'number' ||
@@ -84,7 +97,17 @@ async function readBootstrapOwnership(
 ): Promise<PersistedBootstrapOwnership | null> {
   try {
     return JSON.parse(
-      await readFile(getBootstrapStatePath(teamName), 'utf8'),
+      await readBoundRegularUtf8File({
+        filePath: getBootstrapStatePath(teamName),
+        maxBytes: MAX_BOOTSTRAP_STATE_BYTES,
+        messages: {
+          notRegular:
+            'persisted deterministic bootstrap state must be a regular file and must not be a symlink',
+          oversized: 'persisted deterministic bootstrap state is too large',
+          invalid:
+            'persisted deterministic bootstrap state changed while being validated or could not be read safely',
+        },
+      }),
     ) as PersistedBootstrapOwnership
   } catch {
     return null
