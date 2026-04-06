@@ -166,11 +166,13 @@ export async function runTeamBootstrap(params: {
   request: TeamBootstrapRequest
   context: ToolUseContext
   emit: TeamBootstrapProgressSink
+  onInitialized?: () => Promise<void> | void
   now?: () => number
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   await stateStore.initialize()
+  await params.onInitialized?.()
   await params.emit.started(
     params.request.members.map(member => member.displayName),
   )
