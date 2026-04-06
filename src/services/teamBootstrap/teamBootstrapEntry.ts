@@ -8,6 +8,7 @@ import type { Tools } from 'src/Tool.js'
 import type { ThinkingConfig } from 'src/utils/thinking.js'
 import { buildTeamBootstrapContext } from './teamBootstrapContext.js'
 import { TeamBootstrapProgressEmitter } from './teamBootstrapEvents.js'
+import { assertDeterministicBootstrapNotDisabled } from './teamBootstrapFeatureGate.js'
 import { runTeamBootstrap } from './teamBootstrapRunner.js'
 import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { readTeamBootstrapSpec } from './teamBootstrapSpec.js'
@@ -43,11 +44,7 @@ async function readBootstrapUserPromptFile(promptFilePath: string): Promise<stri
 }
 
 function assertBootstrapFeatureEnabled(): void {
-  if (process.env.CLAUDE_DISABLE_DETERMINISTIC_TEAM_BOOTSTRAP === '1') {
-    throw new Error(
-      'deterministic team bootstrap is disabled by kill switch',
-    )
-  }
+  assertDeterministicBootstrapNotDisabled()
   if (process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP !== '1') {
     throw new Error(
       'deterministic team bootstrap requires CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP=1',

@@ -7,6 +7,7 @@ import { isEnvTruthy } from '../../utils/envUtils.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { NoopTeamBootstrapProgressSink } from '../../services/teamBootstrap/teamBootstrapEvents.js'
+import { getDeterministicBootstrapKillSwitchReason } from '../../services/teamBootstrap/teamBootstrapFeatureGate.js'
 import { runTeamBootstrap } from '../../services/teamBootstrap/teamBootstrapRunner.js'
 import { buildTeamBootstrapRequestFromSpec } from '../../services/teamBootstrap/teamBootstrapSpec.js'
 import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstrapTypes.js'
@@ -131,6 +132,7 @@ export const TeamBootstrapTool = buildTool({
   isEnabled() {
     return (
       isAgentSwarmsEnabled() &&
+      !getDeterministicBootstrapKillSwitchReason() &&
       isEnvTruthy(process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL)
     )
   },
@@ -141,6 +143,14 @@ export const TeamBootstrapTool = buildTool({
     return getPrompt()
   },
   async validateInput(input, context) {
+    const killSwitchReason = getDeterministicBootstrapKillSwitchReason()
+    if (killSwitchReason) {
+      return {
+        result: false,
+        message: `${killSwitchReason}.`,
+        errorCode: 9,
+      }
+    }
     if (context.agentId) {
       return {
         result: false,
@@ -165,6 +175,10 @@ export const TeamBootstrapTool = buildTool({
     return null
   },
   async call(input, context) {
+    const killSwitchReason = getDeterministicBootstrapKillSwitchReason()
+    if (killSwitchReason) {
+      throw new Error(killSwitchReason)
+    }
     const request = await buildTeamBootstrapRequestFromSpec(
       buildToolBootstrapSpec(input),
     )
