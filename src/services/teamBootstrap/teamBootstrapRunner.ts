@@ -23,6 +23,33 @@ import type {
   TeamBootstrapSummary,
 } from './teamBootstrapTypes.js'
 
+export function deriveBootstrapTerminalStatus(params: {
+  continueOnPartialFailure: boolean
+  failedMembersCount: number
+}): TeamBootstrapSummary['terminalStatus'] {
+  if (params.failedMembersCount <= 0) {
+    return 'completed'
+  }
+  return params.continueOnPartialFailure ? 'partial_success' : 'failed'
+}
+
+function buildStrictPartialFailureReason(params: {
+  teamName: string
+  failedMembers: Array<{ name: string; reason: string }>
+}): string {
+  const preview = params.failedMembers
+    .slice(0, 3)
+    .map(member => `${member.name}: ${member.reason}`)
+    .join('; ')
+  const suffix =
+    params.failedMembers.length > 3
+      ? ` (+${params.failedMembers.length - 3} more)`
+      : ''
+  return preview.length > 0
+    ? `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false. ${preview}${suffix}`
+    : `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false.`
+}
+
 async function ensureLeaderAttachedToTeam(
   request: TeamBootstrapRequest,
   context: ToolUseContext,
@@ -112,8 +139,10 @@ function buildSummary(params: {
     expectedMembers: params.request.members.map(member => member.displayName),
     registeredMembers: params.registeredMembers,
     failedMembers: params.failedMembers,
-    terminalStatus:
-      params.failedMembers.length > 0 ? 'partial_success' : 'completed',
+    terminalStatus: deriveBootstrapTerminalStatus({
+      continueOnPartialFailure: params.request.continueOnPartialFailure,
+      failedMembersCount: params.failedMembers.length,
+    }),
   }
 }
 
@@ -300,6 +329,28 @@ export async function runTeamBootstrap(params: {
         })
       },
     })
+    if (summary.terminalStatus === 'failed') {
+      const reason = buildStrictPartialFailureReason({
+        teamName: params.request.teamName,
+        failedMembers: summary.failedMembers,
+      })
+      await stateStore.setTerminal(
+        {
+          status: 'failed',
+          reason,
+          finishedAt: now(),
+        },
+        now,
+      )
+      await params.emit.failed(reason)
+      return {
+        ok: false,
+        fatal: true,
+        error: reason,
+        summary,
+      }
+    }
+
     await stateStore.setTerminal(
       {
         status: summary.terminalStatus,
