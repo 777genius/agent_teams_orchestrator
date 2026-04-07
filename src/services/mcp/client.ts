@@ -109,7 +109,7 @@ import {
   runElicitationHooks,
   runElicitationResultHooks,
 } from './elicitationHandler.js'
-import { buildMcpToolName } from './mcpStringUtils.js'
+import { buildMcpToolAliases, buildMcpToolName } from './mcpStringUtils.js'
 import { normalizeNameForMCP } from './normalization.js'
 import { getLoggingSafeMcpBaseUrl } from './utils.js'
 
@@ -1768,11 +1768,15 @@ export const fetchToolsForClient = memoizeWithLRU(
       return toolsToProcess
         .map((tool): Tool => {
           const fullyQualifiedName = buildMcpToolName(client.name, tool.name)
+          const aliases = skipPrefix
+            ? undefined
+            : buildMcpToolAliases(client.name, tool.name)
           return {
             ...MCPTool,
             // In skip-prefix mode, use the original name for model invocation so MCP tools
             // can override builtins by name. mcpInfo is used for permission checking.
             name: skipPrefix ? tool.name : fullyQualifiedName,
+            aliases,
             mcpInfo: { serverName: client.name, toolName: tool.name },
             isMcp: true,
             // Collapse whitespace: _meta is open to external MCP servers, and
