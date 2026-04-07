@@ -7,6 +7,7 @@ import { spawnTeammate } from 'src/tools/shared/spawnMultiAgent.js'
 import { getCwd } from 'src/utils/cwd.js'
 import { errorMessage } from 'src/utils/errors.js'
 import { addPermissionRulesToSettings } from 'src/utils/permissions/permissionsLoader.js'
+import { sleep } from 'src/utils/sleep.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { setLeaderTeamName } from 'src/utils/tasks.js'
 import { assignTeammateColor } from 'src/utils/swarm/teammateLayoutManager.js'
@@ -19,6 +20,7 @@ import {
 } from 'src/utils/swarm/teamHelpers.js'
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
+import { getBootstrapSpawnDelayMs } from './teamBootstrapSpawnSchedule.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
 import {
   assertStableTeamBootstrapRuntimeIdentity,
@@ -347,7 +349,7 @@ export async function runTeamBootstrap(params: {
         )
         const failedMembers: Array<{ name: string; reason: string }> = []
 
-        for (const member of params.request.members) {
+        for (const [memberIndex, member] of params.request.members.entries()) {
           assertTimeoutBudget(`before spawning teammate "${member.displayName}"`)
           await validateWorkspace(
             `before spawning teammate "${member.displayName}"`,
@@ -356,6 +358,22 @@ export async function runTeamBootstrap(params: {
             teamName: params.request.teamName,
             expected: runtimeIdentity,
           })
+          const spawnDelayMs = getBootstrapSpawnDelayMs(
+            params.request.members,
+            memberIndex,
+          )
+          if (spawnDelayMs > 0) {
+            assertTimeoutBudget(
+              `before staggered spawn delay for teammate "${member.displayName}"`,
+            )
+            await sleep(spawnDelayMs, undefined, { unref: true })
+            assertTimeoutBudget(
+              `after staggered spawn delay for teammate "${member.displayName}"`,
+            )
+            await validateWorkspace(
+              `after staggered spawn delay for teammate "${member.displayName}"`,
+            )
+          }
           await stateStore.markMemberSpawnStarted(member.displayName, now)
           await emitBootstrapProgressSafely(
             `member_spawn_started:${member.displayName}`,
