@@ -51,35 +51,6 @@ export function buildMcpToolName(serverName: string, toolName: string): string {
   return `${getMcpPrefix(serverName)}${normalizeNameForMCP(toolName)}`
 }
 
-/**
- * Builds alternate fully-qualified MCP tool names for providers/models that
- * rewrite the server namespace separator differently (for example `-` to `_`).
- *
- * We keep the primary tool name stable and expose only exact alternate names
- * as aliases, so lookup remains deterministic without broad fuzzy matching.
- */
-export function buildMcpToolAliases(
-  serverName: string,
-  toolName: string,
-): string[] {
-  const normalizedToolName = normalizeNameForMCP(toolName)
-  const normalizedServerName = normalizeNameForMCP(serverName)
-  const aliases = new Set<string>()
-
-  if (normalizedServerName.includes('-')) {
-    aliases.add(
-      `mcp__${normalizedServerName.replace(/-/g, '_')}__${normalizedToolName}`,
-    )
-  }
-  if (normalizedServerName.includes('_')) {
-    aliases.add(
-      `mcp__${normalizedServerName.replace(/_/g, '-')}__${normalizedToolName}`,
-    )
-  }
-
-  aliases.delete(`mcp__${normalizedServerName}__${normalizedToolName}`)
-  return [...aliases]
-}
 
 /**
  * Returns the name to use for permission rule matching.
