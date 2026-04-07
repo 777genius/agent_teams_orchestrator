@@ -490,11 +490,20 @@ export async function runHeadless(
     workload: string | undefined
     teamBootstrapSpecPath?: string | undefined
     teamBootstrapUserPromptFile?: string | undefined
+    bootstrapContext?: {
+      commands: Command[]
+      tools: Tools
+      mcpClients: MCPServerConnection[]
+    }
+    prepareConversationContext?: (() => Promise<void>) | undefined
     setupTrigger?: 'init' | 'maintenance' | undefined
     sessionStartHooksPromise?: ReturnType<typeof processSessionStartHooks>
     setSDKStatus?: (status: SDKStatus) => void
   },
 ): Promise<void> {
+  logForDebugging(
+    `[team-bootstrap] runHeadless entered spec=${Boolean(options.teamBootstrapSpecPath)} resume=${Boolean(options.resume)} continue=${Boolean(options.continue)}`,
+  )
   if (
     process.env.USER_TYPE === 'ant' &&
     isEnvTruthy(process.env.CLAUDE_CODE_EXIT_AFTER_FIRST_RENDER)
@@ -828,13 +837,6 @@ export async function runHeadless(
     return
   }
 
-  // Filter out MCP tools that are in the deny list
-  const allowedMcpTools = filterToolsByDenyRules(
-    appState.mcp.tools,
-    appState.toolPermissionContext,
-  )
-  let filteredTools = [...tools, ...allowedMcpTools]
-
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
   const effectivePermissionPromptToolName = options.sdkUrl
     ? 'stdio'
@@ -854,38 +856,46 @@ export async function runHeadless(
     notifySessionStateChanged('requires_action', details)
   }
 
-  const canUseTool = getCanUseToolFn(
-    effectivePermissionPromptToolName,
-    structuredIO,
-    () => getAppState().mcp.tools,
-    onPermissionPrompt,
-  )
-  if (options.permissionPromptToolName) {
-    // Remove the permission prompt tool from the list of available tools.
-    filteredTools = filteredTools.filter(
-      tool => !toolMatchesName(tool, options.permissionPromptToolName!),
-    )
-  }
-
   // Install errors handlers to gracefully handle broken pipes (e.g., when parent process dies)
   registerProcessOutputErrorHandlers()
 
   headlessProfilerCheckpoint('after_loadInitialMessages')
 
-  // Ensure model strings are initialized before generating model options.
-  // For Bedrock users, this waits for the profile fetch to get correct region strings.
-  await ensureModelStringsInitialized()
-  headlessProfilerCheckpoint('after_modelStrings')
+  const shouldDeferModelStringInit = Boolean(options.teamBootstrapSpecPath)
+  if (!shouldDeferModelStringInit) {
+    // Ensure model strings are initialized before generating model options.
+    // For Bedrock users, this waits for the profile fetch to get correct region strings.
+    await ensureModelStringsInitialized()
+    logForDebugging(
+      '[team-bootstrap] runHeadless after ensureModelStringsInitialized',
+    )
+    headlessProfilerCheckpoint('after_modelStrings')
+  }
 
   if (options.teamBootstrapSpecPath) {
+    logForDebugging(
+      `[team-bootstrap] runHeadless starting deterministic bootstrap from spec ${options.teamBootstrapSpecPath}`,
+    )
     const bootstrapAppState = getAppState()
+    const bootstrapAllowedMcpTools = filterToolsByDenyRules(
+      bootstrapAppState.mcp.tools,
+      bootstrapAppState.toolPermissionContext,
+    )
     await runStartupTeamBootstrap({
       specPath: options.teamBootstrapSpecPath,
       userPromptFilePath: options.teamBootstrapUserPromptFile,
       structuredIO,
-      commands: [...commands, ...bootstrapAppState.mcp.commands],
-      tools: filteredTools,
-      mcpClients: bootstrapAppState.mcp.clients,
+      commands: options.bootstrapContext?.commands ?? [
+        ...commands,
+        ...bootstrapAppState.mcp.commands,
+      ],
+      tools:
+        options.bootstrapContext?.tools ?? [
+          ...tools,
+          ...bootstrapAllowedMcpTools,
+        ],
+      mcpClients:
+        options.bootstrapContext?.mcpClients ?? bootstrapAppState.mcp.clients,
       agents,
       getAppState,
       setAppState,
@@ -894,6 +904,42 @@ export async function runHeadless(
       thinkingConfig: options.thinkingConfig,
     })
     headlessProfilerCheckpoint('after_teamBootstrap')
+  }
+
+  if (options.prepareConversationContext) {
+    logForDebugging(
+      '[team-bootstrap] runHeadless preparing conversation context after deterministic bootstrap',
+    )
+    await options.prepareConversationContext()
+    headlessProfilerCheckpoint('after_prepareConversationContext')
+  }
+
+  if (shouldDeferModelStringInit) {
+    logForDebugging(
+      '[team-bootstrap] runHeadless initializing model strings after deterministic bootstrap',
+    )
+    await ensureModelStringsInitialized()
+    logForDebugging(
+      '[team-bootstrap] runHeadless after deferred ensureModelStringsInitialized',
+    )
+    headlessProfilerCheckpoint('after_modelStrings')
+  }
+
+  const allowedMcpTools = filterToolsByDenyRules(
+    getAppState().mcp.tools,
+    getAppState().toolPermissionContext,
+  )
+  let filteredTools = [...tools, ...allowedMcpTools]
+  const canUseTool = getCanUseToolFn(
+    effectivePermissionPromptToolName,
+    structuredIO,
+    () => getAppState().mcp.tools,
+    onPermissionPrompt,
+  )
+  if (options.permissionPromptToolName) {
+    filteredTools = filteredTools.filter(
+      tool => !toolMatchesName(tool, options.permissionPromptToolName!),
+    )
   }
 
   // UDS inbox store registration is deferred until after `run` is defined

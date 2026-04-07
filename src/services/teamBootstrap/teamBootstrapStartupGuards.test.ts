@@ -60,4 +60,19 @@ describe('team bootstrap startup guards', () => {
       }),
     ).toContain('inline prompt')
   })
+
+  test('allows stream input objects when bootstrap spec is present', () => {
+    async function* streamInput(): AsyncIterable<string> {
+      yield '{"type":"user"}'
+    }
+
+    expect(
+      validateTeamBootstrapStartupOptions({
+        options: {
+          teamBootstrapSpecPath: '/tmp/spec.json',
+        },
+        inputPrompt: streamInput(),
+      }),
+    ).toBeNull()
+  })
 })
