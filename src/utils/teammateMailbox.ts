@@ -7,6 +7,7 @@
  * Note: Inboxes are keyed by agent name within a team.
  */
 
+import { createHash } from 'crypto'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
@@ -41,12 +42,47 @@ const LOCK_OPTIONS = {
 }
 
 export type TeammateMessage = {
+  messageId: string
   from: string
   text: string
   timestamp: string
   read: boolean
+  claimedBySessionId?: string
+  claimedAt?: string
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
+}
+
+type RawTeammateMessage = Omit<TeammateMessage, 'messageId'> & {
+  messageId?: string
+}
+
+export const MAILBOX_STALE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000
+
+export function createCompatibilityInboxMessageId(parts: {
+  from: string
+  text: string
+  timestamp: string
+}): string {
+  return `inbox-${createHash('sha256').update(`${parts.from}\n${parts.timestamp}\n${parts.text}`).digest('hex').slice(0, 16)}`
+}
+
+export function resolveTeammateMessageId(
+  message: Pick<RawTeammateMessage, 'from' | 'text' | 'timestamp' | 'messageId'>,
+): string {
+  if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
+    return message.messageId
+  }
+  return createCompatibilityInboxMessageId(message)
+}
+
+function normalizeTeammateMessage(
+  message: RawTeammateMessage,
+): TeammateMessage {
+  return {
+    ...message,
+    messageId: resolveTeammateMessageId(message),
+  }
 }
 
 /**
@@ -90,7 +126,19 @@ export async function readMailbox(
 
   try {
     const content = await readFile(inboxPath, 'utf-8')
-    const messages = jsonParse(content) as TeammateMessage[]
+    const parsed = jsonParse(content)
+    const messages = Array.isArray(parsed)
+      ? parsed
+          .filter(
+            (value): value is RawTeammateMessage =>
+              !!value &&
+              typeof value === 'object' &&
+              typeof value.from === 'string' &&
+              typeof value.text === 'string' &&
+              typeof value.timestamp === 'string',
+          )
+          .map(normalizeTeammateMessage)
+      : []
     logForDebugging(
       `[TeammateMailbox] readMailbox: read ${messages.length} message(s)`,
     )
@@ -133,7 +181,7 @@ export async function readUnreadMessages(
  */
 export async function writeToMailbox(
   recipientName: string,
-  message: Omit<TeammateMessage, 'read'>,
+  message: Omit<RawTeammateMessage, 'read'>,
   teamName?: string,
 ): Promise<void> {
   await ensureInboxDir(teamName)
@@ -170,10 +218,10 @@ export async function writeToMailbox(
     // Re-read messages after acquiring lock to get the latest state
     const messages = await readMailbox(recipientName, teamName)
 
-    const newMessage: TeammateMessage = {
+    const newMessage = normalizeTeammateMessage({
       ...message,
       read: false,
-    }
+    })
 
     messages.push(newMessage)
 
@@ -404,6 +452,27 @@ export type IdleNotificationMessage = {
   failureReason?: string
 }
 
+export type IdleNotificationPrimaryKind =
+  | 'heartbeat'
+  | 'interrupted'
+  | 'task_terminal'
+  | 'failure'
+
+export type ClassifiedIdleNotification = {
+  payload: IdleNotificationMessage
+  primaryKind: IdleNotificationPrimaryKind
+  hasPeerSummary: boolean
+  peerSummary: string | null
+  countsAsBootstrapConfirmation: boolean
+  liveDelivery: 'silent_finalize' | 'passive_activity' | 'visible_actionable'
+  uiPresentation:
+    | 'heartbeat'
+    | 'peer_summary'
+    | 'interrupted'
+    | 'task_terminal'
+    | 'failure'
+}
+
 /**
  * Creates an idle notification message to send to the team leader
  */
@@ -444,6 +513,104 @@ export function isIdleNotification(
     // Not JSON or not a valid idle notification
   }
   return null
+}
+
+function getTrimmedOptionalString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function normalizeIdleNotificationInput(
+  value:
+    | string
+    | Pick<TeammateMessage, 'text'>
+    | IdleNotificationMessage,
+): IdleNotificationMessage | null {
+  if (typeof value === 'string') {
+    return isIdleNotification(value)
+  }
+  if ('type' in value) {
+    return value.type === 'idle_notification' ? value : null
+  }
+  return isIdleNotification(value.text)
+}
+
+export function classifyIdleNotification(
+  value:
+    | string
+    | Pick<TeammateMessage, 'text'>
+    | IdleNotificationMessage,
+): ClassifiedIdleNotification | null {
+  const payload = normalizeIdleNotificationInput(value)
+  if (!payload) {
+    return null
+  }
+
+  const peerSummary = getTrimmedOptionalString(payload.summary)
+  const hasPeerSummary = peerSummary !== null
+  const failureReason = getTrimmedOptionalString(payload.failureReason)
+  const completedTaskId = getTrimmedOptionalString(payload.completedTaskId)
+
+  let primaryKind: IdleNotificationPrimaryKind
+  if (
+    payload.idleReason === 'failed' ||
+    failureReason !== null ||
+    payload.completedStatus === 'failed'
+  ) {
+    primaryKind = 'failure'
+  } else if (
+    completedTaskId !== null ||
+    payload.completedStatus === 'resolved' ||
+    payload.completedStatus === 'blocked'
+  ) {
+    primaryKind = 'task_terminal'
+  } else if (payload.idleReason === 'interrupted') {
+    primaryKind = 'interrupted'
+  } else {
+    primaryKind = 'heartbeat'
+  }
+
+  const liveDelivery =
+    primaryKind === 'heartbeat'
+      ? hasPeerSummary
+        ? 'passive_activity'
+        : 'silent_finalize'
+      : 'visible_actionable'
+
+  const uiPresentation =
+    primaryKind === 'heartbeat'
+      ? hasPeerSummary
+        ? 'peer_summary'
+        : 'heartbeat'
+      : primaryKind
+
+  return {
+    payload,
+    primaryKind,
+    hasPeerSummary,
+    peerSummary,
+    countsAsBootstrapConfirmation: primaryKind !== 'failure',
+    liveDelivery,
+    uiPresentation,
+  }
+}
+
+/**
+ * Regular teammate mailbox rows that should be finalized silently in the live
+ * interactive owner path instead of being exposed to the model as actionable
+ * teammate context. This includes passive activity rows like heartbeat + peer
+ * summary, which should be surfaced via a dedicated UI sink rather than the
+ * live model-facing teammate attachment.
+ *
+ * Failure, interrupted, and task-terminal idle notifications must remain
+ * visible so the leader can react.
+ */
+export function isSilentRegularMailboxMessageForLiveContext(
+  message: Pick<TeammateMessage, 'text'>,
+): boolean {
+  const classified = classifyIdleNotification(message)
+  return (
+    classified !== null && classified.liveDelivery !== 'visible_actionable'
+  )
 }
 
 /**
@@ -1091,6 +1258,293 @@ export function isStructuredProtocolMessage(messageText: string): boolean {
     )
   } catch {
     return false
+  }
+}
+
+export function isRegularInteractiveMailboxMessage(
+  message: Pick<TeammateMessage, 'text'>,
+): boolean {
+  return !isStructuredProtocolMessage(message.text)
+}
+
+export function isLiveInboxMirrorMessageOwnedBySession(
+  message: {
+    text: string
+    mailboxClaimedBySessionId?: string
+  },
+  sessionId: string,
+): boolean {
+  if (!isRegularInteractiveMailboxMessage({ text: message.text })) {
+    return true
+  }
+
+  return message.mailboxClaimedBySessionId === sessionId
+}
+
+type ClaimUnreadRegularMessagesOptions = {
+  excludeMessageIds?: readonly string[]
+  staleClaimTimeoutMs?: number
+  now?: string
+}
+
+export type InteractivePollMailboxSnapshot = {
+  regularClaimed: TeammateMessage[]
+  protocolUnread: TeammateMessage[]
+}
+
+async function readAndClaimInteractiveMailboxSnapshotUnderLock(
+  agentName: string,
+  sessionId: string,
+  teamName: string | undefined,
+  options: ClaimUnreadRegularMessagesOptions = {},
+): Promise<InteractivePollMailboxSnapshot> {
+  const inboxPath = getInboxPath(agentName, teamName)
+  const lockFilePath = `${inboxPath}.lock`
+  const nowIso = options.now ?? new Date().toISOString()
+  const nowMs = Date.parse(nowIso)
+  const staleClaimTimeoutMs =
+    options.staleClaimTimeoutMs ?? MAILBOX_STALE_CLAIM_TIMEOUT_MS
+  const excludedMessageIds = new Set(options.excludeMessageIds ?? [])
+  let release: (() => Promise<void>) | undefined
+
+  try {
+    release = await lockfile.lock(inboxPath, {
+      lockfilePath: lockFilePath,
+      ...LOCK_OPTIONS,
+    })
+
+    const messages = await readMailbox(agentName, teamName)
+    if (messages.length === 0) {
+      return { regularClaimed: [], protocolUnread: [] }
+    }
+
+    const regularClaimed: TeammateMessage[] = []
+    const protocolUnread: TeammateMessage[] = []
+    let didMutateClaims = false
+
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]
+      if (!message || message.read) {
+        continue
+      }
+
+      if (!isRegularInteractiveMailboxMessage(message)) {
+        protocolUnread.push(message)
+        continue
+      }
+
+      if (excludedMessageIds.has(message.messageId)) {
+        continue
+      }
+
+      const claimedBySessionId = message.claimedBySessionId?.trim()
+      const claimedAtMs = Date.parse(message.claimedAt ?? '')
+      const claimIsStale =
+        !!claimedBySessionId &&
+        (!message.claimedAt ||
+          Number.isNaN(claimedAtMs) ||
+          nowMs - claimedAtMs >= staleClaimTimeoutMs)
+
+      if (!claimedBySessionId || claimedBySessionId === sessionId || claimIsStale) {
+        const nextMessage =
+          !claimedBySessionId || claimedBySessionId !== sessionId || claimIsStale
+            ? {
+                ...message,
+                claimedBySessionId: sessionId,
+                claimedAt: nowIso,
+              }
+            : message
+
+        if (nextMessage !== message) {
+          messages[index] = nextMessage
+          didMutateClaims = true
+        }
+        regularClaimed.push(nextMessage)
+      }
+    }
+
+    if (didMutateClaims) {
+      await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+    }
+
+    return {
+      regularClaimed,
+      protocolUnread,
+    }
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') {
+      return { regularClaimed: [], protocolUnread: [] }
+    }
+    logError(error)
+    return { regularClaimed: [], protocolUnread: [] }
+  } finally {
+    if (release) {
+      try {
+        await release()
+      } catch {
+        // Lock may have already been released
+      }
+    }
+  }
+}
+
+export async function readAndClaimInteractiveMailboxSnapshot(
+  agentName: string,
+  sessionId: string,
+  teamName?: string,
+  options: ClaimUnreadRegularMessagesOptions = {},
+): Promise<InteractivePollMailboxSnapshot> {
+  return readAndClaimInteractiveMailboxSnapshotUnderLock(
+    agentName,
+    sessionId,
+    teamName,
+    options,
+  )
+}
+
+export async function claimUnreadRegularMessages(
+  agentName: string,
+  sessionId: string,
+  teamName?: string,
+  options: ClaimUnreadRegularMessagesOptions = {},
+): Promise<TeammateMessage[]> {
+  const snapshot = await readAndClaimInteractiveMailboxSnapshotUnderLock(
+    agentName,
+    sessionId,
+    teamName,
+    options,
+  )
+  return snapshot.regularClaimed
+}
+
+export async function markMessagesAsReadByIds(
+  agentName: string,
+  messageIds: readonly string[],
+  teamName?: string,
+): Promise<void> {
+  if (messageIds.length === 0) {
+    return
+  }
+
+  const inboxPath = getInboxPath(agentName, teamName)
+  const lockFilePath = `${inboxPath}.lock`
+  const pendingIds = new Set(messageIds)
+  let release: (() => Promise<void>) | undefined
+
+  try {
+    release = await lockfile.lock(inboxPath, {
+      lockfilePath: lockFilePath,
+      ...LOCK_OPTIONS,
+    })
+
+    const messages = await readMailbox(agentName, teamName)
+    if (messages.length === 0) {
+      return
+    }
+
+    let didMutate = false
+    const updatedMessages = messages.map(message => {
+      if (message.read || !pendingIds.has(message.messageId)) {
+        return message
+      }
+      didMutate = true
+      return {
+        ...message,
+        read: true,
+      }
+    })
+
+    if (didMutate) {
+      await writeFile(
+        inboxPath,
+        jsonStringify(updatedMessages, null, 2),
+        'utf-8',
+      )
+    }
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') {
+      return
+    }
+    logError(error)
+  } finally {
+    if (release) {
+      try {
+        await release()
+      } catch {
+        // Lock may have already been released
+      }
+    }
+  }
+}
+
+export async function finalizeClaimedMessagesAsRead(
+  agentName: string,
+  messageIds: readonly string[],
+  sessionId: string,
+  teamName?: string,
+): Promise<void> {
+  if (messageIds.length === 0) {
+    return
+  }
+
+  const inboxPath = getInboxPath(agentName, teamName)
+  const lockFilePath = `${inboxPath}.lock`
+  const targetIds = new Set(messageIds)
+  let release: (() => Promise<void>) | undefined
+
+  try {
+    release = await lockfile.lock(inboxPath, {
+      lockfilePath: lockFilePath,
+      ...LOCK_OPTIONS,
+    })
+
+    const messages = await readMailbox(agentName, teamName)
+    if (messages.length === 0) {
+      return
+    }
+
+    let didMutate = false
+    const updatedMessages = messages.map(message => {
+      if (
+        message.read ||
+        !targetIds.has(message.messageId) ||
+        message.claimedBySessionId !== sessionId
+      ) {
+        return message
+      }
+
+      didMutate = true
+      return {
+        ...message,
+        read: true,
+        claimedBySessionId: undefined,
+        claimedAt: undefined,
+      }
+    })
+
+    if (didMutate) {
+      await writeFile(
+        inboxPath,
+        jsonStringify(updatedMessages, null, 2),
+        'utf-8',
+      )
+    }
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') {
+      return
+    }
+    logError(error)
+  } finally {
+    if (release) {
+      try {
+        await release()
+      } catch {
+        // Lock may have already been released
+      }
+    }
   }
 }
 

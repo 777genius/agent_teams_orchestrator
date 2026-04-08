@@ -80,6 +80,7 @@ export type TeamFile = {
     color?: string
     planModeRequired?: boolean
     joinedAt: number
+    bootstrapExpectedAfter?: string
     tmuxPaneId: string
     cwd: string
     worktreePath?: string
@@ -154,6 +155,17 @@ const TEAM_FILE_LOCK_RETRY_BASE_MS = 25
 const TEAM_FILE_LOCK_SLOW_WAIT_MS = 100
 
 const memberActiveSyncByKey = new Map<string, MemberActiveSyncEntry>()
+
+export function getTrackedMemberActiveState(
+  teamName: string,
+  memberName: string,
+): boolean | undefined {
+  const entry = memberActiveSyncByKey.get(`${teamName}\u0000${memberName}`)
+  if (!entry) {
+    return undefined
+  }
+  return entry.queuedState ?? entry.inflightState ?? entry.syncedState
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -338,6 +350,7 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.color === b.color &&
     a.planModeRequired === b.planModeRequired &&
     a.joinedAt === b.joinedAt &&
+    a.bootstrapExpectedAfter === b.bootstrapExpectedAfter &&
     a.tmuxPaneId === b.tmuxPaneId &&
     a.cwd === b.cwd &&
     a.worktreePath === b.worktreePath &&

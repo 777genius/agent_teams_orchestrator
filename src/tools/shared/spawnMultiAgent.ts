@@ -62,6 +62,7 @@ import { It2SetupPrompt } from '../../utils/swarm/It2SetupPrompt.js'
 import { startInProcessTeammate } from '../../utils/swarm/inProcessRunner.js'
 import {
   type InProcessSpawnConfig,
+  killInProcessTeammate,
   spawnInProcessTeammate,
 } from '../../utils/swarm/spawnInProcess.js'
 import {
@@ -87,8 +88,9 @@ import {
 import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js'
 import { registerTask } from '../../utils/task/framework.js'
 import {
-  isIdleNotification,
+  classifyIdleNotification,
   readMailbox,
+  type TeammateMessage,
   writeToMailbox,
 } from '../../utils/teammateMailbox.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
@@ -235,15 +237,86 @@ async function isItermPaneAlive(paneId: string): Promise<boolean> {
   return result.stdout.includes(paneId)
 }
 
+export function isBootstrapConfirmationMailboxMessage(
+  message: Pick<TeammateMessage, 'text' | 'timestamp'>,
+  teammateId: string,
+  bootstrapExpectedAfter?: string | null,
+): boolean {
+  const classified = classifyIdleNotification(message.text)
+  if (!classified) {
+    return false
+  }
+
+  if (bootstrapExpectedAfter) {
+    const boundaryMs = Date.parse(bootstrapExpectedAfter)
+    if (!Number.isFinite(boundaryMs)) {
+      logForDebugging(
+        `[teammate-spawn] invalid bootstrapExpectedAfter for ${teammateId}: ${bootstrapExpectedAfter}`,
+      )
+      return false
+    }
+
+    const messageTsMs = Date.parse(message.timestamp)
+    if (!Number.isFinite(messageTsMs)) {
+      logForDebugging(
+        `[teammate-spawn] invalid bootstrap confirmation mailbox timestamp for ${teammateId}: ${message.timestamp}`,
+      )
+      return false
+    }
+
+    if (messageTsMs < boundaryMs) {
+      return false
+    }
+  }
+
+  return (
+    classified.payload.from === teammateId &&
+    classified.countsAsBootstrapConfirmation
+  )
+}
+
+function getBootstrapExpectedAfterForTeammate(
+  teamFile: Awaited<ReturnType<typeof readTeamFileAsync>>,
+  teammateId: string,
+  teammateName: string,
+): string | null {
+  if (!teamFile) {
+    logForDebugging(
+      `[teammate-spawn] bootstrap boundary unavailable for ${teammateId}: team file missing`,
+    )
+    return null
+  }
+
+  const normalizedTargetName = normalizeTeammateIdentity(teammateName)
+  const byAgentId = teamFile.members.find(member => member.agentId === teammateId)
+  if (byAgentId?.bootstrapExpectedAfter) {
+    return byAgentId.bootstrapExpectedAfter
+  }
+
+  const byName = teamFile.members.find(
+    member => normalizeTeammateIdentity(member.name) === normalizedTargetName,
+  )
+  if (byAgentId || byName) {
+    logForDebugging(
+      `[teammate-spawn] bootstrap boundary unavailable for ${teammateId}: member has no bootstrapExpectedAfter`,
+    )
+  }
+  return byName?.bootstrapExpectedAfter ?? null
+}
+
 async function hasBootstrapConfirmation(
   teamName: string,
   teammateId: string,
+  bootstrapExpectedAfter?: string | null,
 ): Promise<boolean> {
   const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
-  return leaderMessages.some(message => {
-    const idleNotification = isIdleNotification(message.text)
-    return idleNotification?.from === teammateId
-  })
+  return leaderMessages.some(message =>
+    isBootstrapConfirmationMailboxMessage(
+      message,
+      teammateId,
+      bootstrapExpectedAfter,
+    ),
+  )
 }
 
 // ============================================================================
@@ -340,6 +413,7 @@ async function resolveExistingTeammateState(
   const normalizedTargetName = normalizeTeammateIdentity(input.name)
   const canonicalName = sanitizeAgentName(input.name).trim()
   const canonicalAgentId = formatAgentId(canonicalName, teamName)
+  const teamFile = await readTeamFileAsync(teamName)
 
   const inProcessTask = Object.values(appState.tasks).find(task => {
     if (!isInProcessTeammateTask(task) || task.status !== 'running') {
@@ -351,9 +425,15 @@ async function resolveExistingTeammateState(
     )
   })
   if (inProcessTask) {
+    const bootstrapExpectedAfter = getBootstrapExpectedAfterForTeammate(
+      teamFile,
+      inProcessTask.identity.agentId,
+      canonicalName,
+    )
     const bootstrapConfirmed = await hasBootstrapConfirmation(
       teamName,
       inProcessTask.identity.agentId,
+      bootstrapExpectedAfter,
     )
     return {
       decision: bootstrapConfirmed
@@ -378,7 +458,16 @@ async function resolveExistingTeammateState(
         (await isItermPaneAlive(paneId))
     }
     if (runtimeAlive) {
-      const bootstrapConfirmed = await hasBootstrapConfirmation(teamName, teammateId)
+      const bootstrapExpectedAfter = getBootstrapExpectedAfterForTeammate(
+        teamFile,
+        teammateId,
+        canonicalName,
+      )
+      const bootstrapConfirmed = await hasBootstrapConfirmation(
+        teamName,
+        teammateId,
+        bootstrapExpectedAfter,
+      )
       return {
         decision: bootstrapConfirmed
           ? 'duplicate_already_running'
@@ -388,10 +477,11 @@ async function resolveExistingTeammateState(
     }
   }
 
-  const teamFile = await readTeamFileAsync(teamName)
-  const existingMember = teamFile?.members.find(
-    member => normalizeTeammateIdentity(member.name) === normalizedTargetName,
-  )
+  const existingMember =
+    teamFile?.members.find(member => member.agentId === canonicalAgentId) ??
+    teamFile?.members.find(
+      member => normalizeTeammateIdentity(member.name) === normalizedTargetName,
+    )
   if (!existingMember) {
     return { decision: 'allow_spawn' }
   }
@@ -427,6 +517,7 @@ async function resolveExistingTeammateState(
   const bootstrapConfirmed = await hasBootstrapConfirmation(
     teamName,
     existingMember.agentId || canonicalAgentId,
+    existingMember.bootstrapExpectedAfter ?? null,
   )
   return {
     decision: bootstrapConfirmed
@@ -809,6 +900,7 @@ async function handleSpawnSplitPane(
     strictMcpConfig: Boolean(teamName),
   })
   const envStr = buildInheritedEnvVars({ provider })
+  const launchBoundaryIso = new Date().toISOString()
   const spawnCommand = wrapTeammateSpawnCommand(
     `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
   )
@@ -881,6 +973,7 @@ async function handleSpawnSplitPane(
       color: teammateColor,
       planModeRequired: plan_mode_required,
       joinedAt: Date.now(),
+      bootstrapExpectedAfter: launchBoundaryIso,
       tmuxPaneId: paneId,
       cwd: workingDir,
       subscriptions: [],
@@ -1055,6 +1148,7 @@ async function handleSpawnSeparateWindow(
     strictMcpConfig: Boolean(teamName),
   })
   const envStr = buildInheritedEnvVars({ provider })
+  const launchBoundaryIso = new Date().toISOString()
   const spawnCommand = wrapTeammateSpawnCommand(
     `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
   )
@@ -1132,6 +1226,7 @@ async function handleSpawnSeparateWindow(
       color: teammateColor,
       planModeRequired: plan_mode_required,
       joinedAt: Date.now(),
+      bootstrapExpectedAfter: launchBoundaryIso,
       tmuxPaneId: paneId,
       cwd: workingDir,
       subscriptions: [],
@@ -1342,119 +1437,134 @@ async function handleSpawnInProcess(
     strictMcpConfig: false,
   })
 
+  const launchBoundaryIso = new Date().toISOString()
   const result = await spawnInProcessTeammate(config, context)
 
   if (!result.success) {
     throw new Error(result.error ?? 'Failed to spawn in-process teammate')
   }
 
-  // Debug: log what spawn returned
-  logForDebugging(
-    `[handleSpawnInProcess] spawn result: taskId=${result.taskId}, hasContext=${!!result.teammateContext}, hasAbort=${!!result.abortController}`,
-  )
+  try {
+    // Track the teammate in AppState's teamContext
+    // Auto-register leader if spawning without prior spawnTeam call
+    setAppState(prev => {
+      const needsLeaderSetup = !prev.teamContext?.leadAgentId
+      const leadAgentId = needsLeaderSetup
+        ? formatAgentId(TEAM_LEAD_NAME, teamName)
+        : prev.teamContext!.leadAgentId
 
-  // Start the agent execution loop (fire-and-forget)
-  if (result.taskId && result.teammateContext && result.abortController) {
-    startInProcessTeammate({
-      identity: {
-        agentId: teammateId,
-        agentName: sanitizedName,
-        teamName,
-        color: teammateColor,
-        planModeRequired: plan_mode_required ?? false,
-        parentSessionId: result.teammateContext.parentSessionId,
-      },
-      taskId: result.taskId,
-      prompt,
-      description: input.description,
-      model,
-      effort,
-      agentDefinition,
-      teammateContext: result.teammateContext,
-      // Strip messages: the teammate never reads toolUseContext.messages
-      // (it builds its own history via allMessages in inProcessRunner).
-      // Passing the parent's full conversation here would pin it for the
-      // teammate's lifetime, surviving /clear and auto-compact.
-      toolUseContext: { ...context, messages: [] },
-      abortController: result.abortController,
-      invokingRequestId: input.invokingRequestId,
-    })
-    logForDebugging(
-      `[handleSpawnInProcess] Started agent execution for ${teammateId}`,
-    )
-  }
+      // Build teammates map, including leader if needed for inbox polling
+      const existingTeammates = prev.teamContext?.teammates || {}
+      const leadEntry = needsLeaderSetup
+        ? {
+            [leadAgentId]: {
+              name: TEAM_LEAD_NAME,
+              agentType: TEAM_LEAD_NAME,
+              color: assignTeammateColor(leadAgentId),
+              tmuxSessionName: 'in-process',
+              tmuxPaneId: 'leader',
+              cwd: getCwd(),
+              spawnedAt: Date.now(),
+            },
+          }
+        : {}
 
-  // Track the teammate in AppState's teamContext
-  // Auto-register leader if spawning without prior spawnTeam call
-  setAppState(prev => {
-    const needsLeaderSetup = !prev.teamContext?.leadAgentId
-    const leadAgentId = needsLeaderSetup
-      ? formatAgentId(TEAM_LEAD_NAME, teamName)
-      : prev.teamContext!.leadAgentId
-
-    // Build teammates map, including leader if needed for inbox polling
-    const existingTeammates = prev.teamContext?.teammates || {}
-    const leadEntry = needsLeaderSetup
-      ? {
-          [leadAgentId]: {
-            name: TEAM_LEAD_NAME,
-            agentType: TEAM_LEAD_NAME,
-            color: assignTeammateColor(leadAgentId),
-            tmuxSessionName: 'in-process',
-            tmuxPaneId: 'leader',
-            cwd: getCwd(),
-            spawnedAt: Date.now(),
-          },
-        }
-      : {}
-
-    return {
-      ...prev,
-      teamContext: {
-        ...prev.teamContext,
-        teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
-        teamFilePath: prev.teamContext?.teamFilePath ?? '',
-        leadAgentId,
-        teammates: {
-          ...existingTeammates,
-          ...leadEntry,
-          [teammateId]: {
-            name: sanitizedName,
-            agentType: agent_type,
-            color: teammateColor,
-            tmuxSessionName: 'in-process',
-            tmuxPaneId: 'in-process',
-            cwd: getCwd(),
-            spawnedAt: Date.now(),
+      return {
+        ...prev,
+        teamContext: {
+          ...prev.teamContext,
+          teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
+          teamFilePath: prev.teamContext?.teamFilePath ?? '',
+          leadAgentId,
+          teammates: {
+            ...existingTeammates,
+            ...leadEntry,
+            [teammateId]: {
+              name: sanitizedName,
+              agentType: agent_type,
+              color: teammateColor,
+              tmuxSessionName: 'in-process',
+              tmuxPaneId: 'in-process',
+              cwd: getCwd(),
+              spawnedAt: Date.now(),
+            },
           },
         },
-      },
-    }
-  })
+      }
+    })
 
-  // Register agent in the team file
-  const updateResult = await updateTeamFileAsync(teamName, teamFile =>
-    upsertTeamMember(teamFile, {
-      agentId: teammateId,
-      name: sanitizedName,
-      agentType: agent_type,
-      model,
-      provider,
-      effort,
-      prompt,
-      color: teammateColor,
-      planModeRequired: plan_mode_required,
-      joinedAt: Date.now(),
-      tmuxPaneId: 'in-process',
-      cwd: getCwd(),
-      subscriptions: [],
-      backendType: 'in-process',
-    }),
-  )
-  if (updateResult.status === 'missing') {
-    throw new Error(
-      `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+    // Register agent in the team file
+    const updateResult = await updateTeamFileAsync(teamName, teamFile =>
+      upsertTeamMember(teamFile, {
+        agentId: teammateId,
+        name: sanitizedName,
+        agentType: agent_type,
+        model,
+        provider,
+        effort,
+        prompt,
+        color: teammateColor,
+        planModeRequired: plan_mode_required,
+        joinedAt: Date.now(),
+        bootstrapExpectedAfter: launchBoundaryIso,
+        tmuxPaneId: 'in-process',
+        cwd: getCwd(),
+        subscriptions: [],
+        backendType: 'in-process',
+      }),
     )
+    if (updateResult.status === 'missing') {
+      throw new Error(
+        `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+      )
+    }
+
+    // Debug: log what spawn returned
+    logForDebugging(
+      `[handleSpawnInProcess] spawn result: taskId=${result.taskId}, hasContext=${!!result.teammateContext}, hasAbort=${!!result.abortController}`,
+    )
+
+    // Start the agent execution loop (fire-and-forget) only after durable
+    // teammate registration stores the current launch boundary.
+    if (result.taskId && result.teammateContext && result.abortController) {
+      startInProcessTeammate({
+        identity: {
+          agentId: teammateId,
+          agentName: sanitizedName,
+          teamName,
+          color: teammateColor,
+          planModeRequired: plan_mode_required ?? false,
+          parentSessionId: result.teammateContext.parentSessionId,
+        },
+        taskId: result.taskId,
+        prompt,
+        description: input.description,
+        model,
+        effort,
+        agentDefinition,
+        teammateContext: result.teammateContext,
+        // Strip messages: the teammate never reads toolUseContext.messages
+        // (it builds its own history via allMessages in inProcessRunner).
+        // Passing the parent's full conversation here would pin it for the
+        // teammate's lifetime, surviving /clear and auto-compact.
+        toolUseContext: { ...context, messages: [] },
+        abortController: result.abortController,
+        invokingRequestId: input.invokingRequestId,
+      })
+      logForDebugging(
+        `[handleSpawnInProcess] Started agent execution for ${teammateId}`,
+      )
+    }
+  } catch (error) {
+    if (result.taskId) {
+      logForDebugging(
+        `[handleSpawnInProcess] Cleaning up partial in-process spawn for ${teammateId}: ${errorMessage(error)}`,
+      )
+      await killInProcessTeammate(result.taskId, setAppState)
+    } else {
+      result.abortController?.abort()
+    }
+    throw error
   }
 
   // Note: Do NOT send the prompt via mailbox for in-process teammates.
