@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useInterval } from 'usehooks-ts'
 import { getSessionId } from '../bootstrap/state.js'
 import type { ToolUseConfirm } from '../components/permissions/PermissionRequest.js'
@@ -12,8 +12,11 @@ import {
   useSetAppState,
 } from '../state/AppState.js'
 import { findToolByName } from '../Tool.js'
+import type { Tool } from '../Tool.js'
 import { isInProcessTeammateTask } from '../tasks/InProcessTeammateTask/types.js'
-import { getAllBaseTools } from '../tools.js'
+import { assembleToolPool, getAllBaseTools } from '../tools.js'
+import { SEND_MESSAGE_TOOL_NAME } from '../tools/SendMessageTool/constants.js'
+import { isDeferredTool } from '../tools/ToolSearchTool/prompt.js'
 import type { PermissionUpdate } from '../types/permissions.js'
 import { logForDebugging } from '../utils/debug.js'
 import {
@@ -27,6 +30,7 @@ import {
 } from '../utils/permissions/PermissionMode.js'
 import { applyPermissionUpdate } from '../utils/permissions/PermissionUpdate.js'
 import { jsonStringify } from '../utils/slowOperations.js'
+import { isToolSearchEnabledOptimistic } from '../utils/toolSearch.js'
 import { isInsideTmux } from '../utils/swarm/backends/detection.js'
 import {
   ensureBackendsRegistered,
@@ -109,17 +113,426 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 }
 
 const INBOX_POLL_INTERVAL_MS = 1000
+const BOOTSTRAP_RETRY_COOLDOWN_MS = 5000
+const BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS = 15000
+const MEMBER_BRIEFING_TOOL_NAME = 'member_briefing'
+const PREFIXED_MEMBER_BRIEFING_TOOL_NAME = 'mcp__agent-teams__member_briefing'
+
+export function isMemberBriefingToolName(name: string): boolean {
+  return (
+    name === MEMBER_BRIEFING_TOOL_NAME ||
+    name === PREFIXED_MEMBER_BRIEFING_TOOL_NAME
+  )
+}
+
+export type InboxPromptSubmitResult = {
+  accepted: boolean
+  userMessageUuid?: string
+}
 
 type Props = {
   enabled: boolean
   isLoading: boolean
   focusedInputDialog: string | undefined
+  getMessages: () => AppState['messages']
+  transcriptActivitySignature: string
   // Returns true if submission succeeded, false if rejected (e.g., query already running)
   // Dead code elimination: parameter named onSubmitMessage to avoid "teammate" string in external builds
   onSubmitMessage: (
     formatted: string,
     options?: { isMeta?: boolean },
-  ) => boolean
+  ) => InboxPromptSubmitResult
+}
+
+type PendingInboxMirrorMessage = Pick<
+  AppState['inbox']['messages'][number],
+  | 'id'
+  | 'messageId'
+  | 'mailboxClaimedBySessionId'
+  | 'from'
+  | 'text'
+  | 'timestamp'
+  | 'status'
+>
+
+type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
+
+const GENERIC_QUEUED_MAILBOX_META_PROMPT =
+  'Process the queued teammate mailbox attachment for this turn.'
+
+const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
+  'Your FIRST action: call MCP tool member_briefing with:'
+const BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER =
+  'The team has already been created and you are being attached as a persistent teammate.'
+
+export function isBootstrapMailboxInstructionText(text: string): boolean {
+  const normalized = text.trim()
+  if (!normalized) {
+    return false
+  }
+  if (normalized.includes(BOOTSTRAP_MEMBER_BRIEFING_MARKER)) {
+    return true
+  }
+  return (
+    normalized.includes(BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER) &&
+    normalized.includes('member_briefing')
+  )
+}
+
+export function getQueuedMailboxMetaPrompt({
+  pendingMessages,
+  isTeammateSession,
+}: {
+  pendingMessages: readonly QueuedMailboxPromptMessage[]
+  isTeammateSession: boolean
+}): string {
+  const hasBootstrapInstruction =
+    isTeammateSession &&
+    pendingMessages.some(
+      message =>
+        message.from === TEAM_LEAD_NAME &&
+        isBootstrapMailboxInstructionText(message.text),
+    )
+
+  if (!hasBootstrapInstruction) {
+    return GENERIC_QUEUED_MAILBOX_META_PROMPT
+  }
+
+  return [
+    'Process the queued teammate mailbox attachment now.',
+    'It contains your onboarding/bootstrap instructions from the team lead.',
+    'Follow the attachment immediately.',
+    'If it instructs member_briefing, call member_briefing now.',
+    'Do not ask for clarification if the attachment is present and readable.',
+    'After bootstrap completes, continue with normal team mailbox and task behavior.',
+  ].join(' ')
+}
+
+export function getBootstrapPendingMessage({
+  pendingMessages,
+  isTeammateSession,
+}: {
+  pendingMessages: readonly PendingInboxMirrorMessage[]
+  isTeammateSession: boolean
+}): PendingInboxMirrorMessage | undefined {
+  if (!isTeammateSession) {
+    return undefined
+  }
+
+  return pendingMessages.find(
+    message =>
+      message.from === TEAM_LEAD_NAME &&
+      isBootstrapMailboxInstructionText(message.text),
+  )
+}
+
+export function getOrdinaryPendingMessage({
+  pendingMessages,
+}: {
+  pendingMessages: readonly PendingInboxMirrorMessage[]
+}): PendingInboxMirrorMessage | undefined {
+  return pendingMessages.find(
+    message =>
+      !!message.messageId &&
+      isRegularInteractiveMailboxMessage({ text: message.text }) &&
+      !(
+        message.from === TEAM_LEAD_NAME &&
+        isBootstrapMailboxInstructionText(message.text)
+      ),
+  )
+}
+
+export function getBootstrapInlineHandoffPrompt({
+  bootstrapInstructionText,
+  teamName,
+  memberName,
+}: {
+  bootstrapInstructionText: string
+  teamName?: string
+  memberName?: string
+}): string | null {
+  if (!teamName || !memberName) {
+    return null
+  }
+
+  return [
+    `You are bootstrapping into team "${teamName}" as member "${memberName}".`,
+    `Your first action is to call member_briefing with teamName="${teamName}" and memberName="${memberName}".`,
+    'Call member_briefing directly yourself. Do not use Agent, any subagent, or a delegated helper for this bootstrap step.',
+    'Do not explore files, inbox paths, or team config before the first member_briefing attempt.',
+    'If member_briefing fails, send one short natural-language message to "team-lead" with the exact error text.',
+    'Bootstrap instructions from team-lead:',
+    '<bootstrap_instructions>',
+    bootstrapInstructionText,
+    '</bootstrap_instructions>',
+  ].join('\n')
+}
+
+export function getOrdinaryInlineHandoffPrompt({
+  from,
+  text,
+  timestamp,
+}: {
+  from: string
+  text: string
+  timestamp: string
+}): string {
+  return [
+    'Process this queued mailbox message now.',
+    `Sender: "${from}".`,
+    `Timestamp: "${timestamp}".`,
+    '',
+    '<queued_mailbox_message>',
+    text,
+    '</queued_mailbox_message>',
+  ].join('\n')
+}
+
+type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
+type BootstrapToolDescriptor = Pick<
+  Tool,
+  'alwaysLoad' | 'isMcp' | 'name' | 'shouldDefer'
+>
+type BootstrapReadinessDecision =
+  | { type: 'wait'; remainingMs: number }
+  | { type: 'proceed' }
+
+function findBootstrapMemberBriefingTool(
+  tools: readonly BootstrapToolDescriptor[],
+): BootstrapToolDescriptor | undefined {
+  return tools.find(tool => isMemberBriefingToolName(tool.name))
+}
+
+export function isBootstrapMemberBriefingCallableNow({
+  toolSearchEnabledOptimistic,
+  tools,
+}: {
+  toolSearchEnabledOptimistic: boolean
+  tools: readonly BootstrapToolDescriptor[]
+}): boolean {
+  const tool = findBootstrapMemberBriefingTool(tools)
+  if (!tool) {
+    return false
+  }
+
+  if (!toolSearchEnabledOptimistic) {
+    return true
+  }
+
+  return !isDeferredTool(tool)
+}
+
+export function getBootstrapReadinessDecision({
+  now,
+  toolCallableNow,
+  graceMs = BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS,
+  waitStartedAt,
+}: {
+  now: number
+  toolCallableNow: boolean
+  graceMs?: number
+  waitStartedAt?: number
+}): BootstrapReadinessDecision {
+  if (toolCallableNow) {
+    return { type: 'proceed' }
+  }
+
+  const startedAt = waitStartedAt ?? now
+  const elapsedMs = now - startedAt
+  if (elapsedMs >= graceMs) {
+    return { type: 'proceed' }
+  }
+
+  return {
+    type: 'wait',
+    remainingMs: Math.max(1, graceMs - elapsedMs),
+  }
+}
+
+export function getBootstrapTranscriptActivitySignature(
+  messages: AppState['messages'],
+): string {
+  const lastMessage = messages.at(-1)
+  return `${messages.length}:${lastMessage?.uuid ?? ''}:${lastMessage?.type ?? ''}`
+}
+
+function isToolResultUserMessage(message: AppState['messages'][number]): boolean {
+  return (
+    message.type === 'user' &&
+    Array.isArray(message.message.content) &&
+    message.message.content.some(block => block.type === 'tool_result')
+  )
+}
+
+function hasBootstrapAttemptObservedPostSubmitActivity({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): boolean {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return false
+  }
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        return true
+      }
+      break
+    }
+
+    return true
+  }
+
+  return false
+}
+
+export function findBootstrapAttemptOutcome({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): BootstrapAttemptOutcome {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return 'none'
+  }
+
+  const pendingMemberBriefingToolUseIds = new Set<string>()
+  const pendingTeamLeadFallbackToolUseIds = new Set<string>()
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        for (const block of message.message.content) {
+          if (
+            block.type === 'tool_result' &&
+            pendingMemberBriefingToolUseIds.has(block.tool_use_id) &&
+            block.is_error !== true
+          ) {
+            return 'member_briefing'
+          }
+          if (
+            block.type === 'tool_result' &&
+            pendingTeamLeadFallbackToolUseIds.has(block.tool_use_id) &&
+            block.is_error !== true
+          ) {
+            return 'team_lead_fallback'
+          }
+        }
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    for (const block of message.message.content) {
+      if (block.type !== 'tool_use') {
+        continue
+      }
+      if (isMemberBriefingToolName(block.name)) {
+        pendingMemberBriefingToolUseIds.add(block.id)
+        continue
+      }
+      if (
+        block.name === SEND_MESSAGE_TOOL_NAME &&
+        typeof block.input === 'object' &&
+        block.input !== null &&
+        'to' in block.input &&
+        typeof block.input.to === 'string' &&
+        block.input.to.toLowerCase() === TEAM_LEAD_NAME.toLowerCase()
+      ) {
+        pendingTeamLeadFallbackToolUseIds.add(block.id)
+      }
+    }
+  }
+
+  return 'none'
+}
+
+type BootstrapAttemptState = {
+  submitUserMessageUuid: string
+  submittedAt: number
+  cooldownUntil: number
+  status: 'in_flight' | 'cooling_down'
+  timer: ReturnType<typeof setTimeout> | null
+}
+type BootstrapReadinessWaitState = {
+  startedAt: number
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+type BootstrapProcessingAction =
+  | { type: 'noop' }
+  | { type: 'reset_to_pending' }
+  | { type: 'finalize' }
+  | { type: 'schedule_cooldown' }
+
+export function getBootstrapProcessingAction({
+  attempt,
+  messages,
+  processingBootstrapMessage,
+}: {
+  attempt?: BootstrapAttemptState
+  messages: AppState['messages']
+  processingBootstrapMessage?: PendingInboxMirrorMessage
+}): BootstrapProcessingAction {
+  if (!processingBootstrapMessage?.messageId) {
+    return { type: 'noop' }
+  }
+
+  if (!attempt) {
+    return { type: 'reset_to_pending' }
+  }
+
+  const outcome = findBootstrapAttemptOutcome({
+    messages,
+    submitUserMessageUuid: attempt.submitUserMessageUuid,
+  })
+
+  if (outcome !== 'none') {
+    return { type: 'finalize' }
+  }
+
+  if (attempt.status === 'in_flight') {
+    // A newly submitted bootstrap row enters "processing" immediately after
+    // handleIncomingPrompt() accepts it. Do not start the retry cooldown until
+    // the submitted turn has produced some post-submit transcript activity,
+    // otherwise we can race ahead of the first member_briefing response and
+    // strand the row in processing.
+    if (
+      !hasBootstrapAttemptObservedPostSubmitActivity({
+        messages,
+        submitUserMessageUuid: attempt.submitUserMessageUuid,
+      })
+    ) {
+      return { type: 'noop' }
+    }
+    return { type: 'schedule_cooldown' }
+  }
+
+  return { type: 'noop' }
 }
 
 /**
@@ -134,15 +547,51 @@ export function useInboxPoller({
   enabled,
   isLoading,
   focusedInputDialog,
+  getMessages,
+  transcriptActivitySignature,
   onSubmitMessage,
 }: Props): void {
   // Assign to original name for clarity within the function
   const onSubmitTeammateMessage = onSubmitMessage
   const store = useAppStateStore()
   const setAppState = useSetAppState()
-  const inboxMessageCount = useAppState(s => s.inbox.messages.length)
+  const inboxStateSignature = useAppState(s =>
+    s.inbox.messages.map(message => `${message.id}:${message.status}`).join('|'),
+  )
+  const mcpToolSignature = useAppState(s =>
+    s.mcp.tools
+      .map(tool => `${tool.name}:${tool.alwaysLoad === true ? '1' : '0'}`)
+      .sort()
+      .join('|'),
+  )
   const terminal = useTerminalNotification()
   const pollInFlightRef = useRef(false)
+  const bootstrapAttemptsRef = useRef<Map<string, BootstrapAttemptState>>(
+    new Map(),
+  )
+  const ordinaryFinalizationInFlightRef = useRef<Set<string>>(new Set())
+  const bootstrapReadinessWaitsRef = useRef<
+    Map<string, BootstrapReadinessWaitState>
+  >(new Map())
+  const [bootstrapReadinessTick, setBootstrapReadinessTick] = useState(0)
+
+  useEffect(() => {
+    return () => {
+      for (const attempt of bootstrapAttemptsRef.current.values()) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+      }
+      bootstrapAttemptsRef.current.clear()
+      for (const waitState of bootstrapReadinessWaitsRef.current.values()) {
+        if (waitState.timer) {
+          clearTimeout(waitState.timer)
+        }
+      }
+      bootstrapReadinessWaitsRef.current.clear()
+      ordinaryFinalizationInFlightRef.current.clear()
+    }
+  }, [])
 
   const poll = useCallback(async () => {
     if (!enabled) return
@@ -895,6 +1344,8 @@ export function useInboxPoller({
     const agentName = getAgentNameToPoll(currentAppState)
     if (!agentName) return
     const sessionId = getSessionId()
+    const teamName = currentAppState.teamContext?.teamName
+    const now = Date.now()
 
     const staleMirroredMessageIds = new Set(
       currentAppState.inbox.messages
@@ -912,6 +1363,206 @@ export function useInboxPoller({
           ),
         },
       }))
+    }
+
+    const liveOwnedMessages = currentAppState.inbox.messages.filter(message =>
+      isLiveInboxMirrorMessageOwnedBySession(message, sessionId),
+    )
+    const activeBootstrapMessages = liveOwnedMessages.filter(
+      message =>
+        isBootstrapMailboxInstructionText(message.text) &&
+        message.from === TEAM_LEAD_NAME,
+    )
+    const activeBootstrapMessageIds = new Set(
+      activeBootstrapMessages
+        .map(message => message.messageId)
+        .filter((messageId): messageId is string => !!messageId),
+    )
+    const activeOrdinaryMessages = liveOwnedMessages.filter(
+      message =>
+        isRegularInteractiveMailboxMessage({ text: message.text }) &&
+        !(
+          message.from === TEAM_LEAD_NAME &&
+          isBootstrapMailboxInstructionText(message.text)
+        ),
+    )
+    const processingOrdinaryMessage = activeOrdinaryMessages.find(
+      message => message.status === 'processing' && !!message.messageId,
+    )
+
+    for (const [messageId, attempt] of bootstrapAttemptsRef.current.entries()) {
+      if (!activeBootstrapMessageIds.has(messageId)) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        bootstrapAttemptsRef.current.delete(messageId)
+      }
+    }
+    for (const [messageId, waitState] of bootstrapReadinessWaitsRef.current) {
+      if (!activeBootstrapMessageIds.has(messageId)) {
+        if (waitState.timer) {
+          clearTimeout(waitState.timer)
+        }
+        bootstrapReadinessWaitsRef.current.delete(messageId)
+      }
+    }
+
+    if (processingOrdinaryMessage?.messageId) {
+      if (
+        !ordinaryFinalizationInFlightRef.current.has(
+          processingOrdinaryMessage.messageId,
+        )
+      ) {
+        // Ordinary direct mailbox rows are already delivered once the submit is
+        // accepted into the transcript. If file finalization is flaky, retry
+        // only the mark-read side effect and never re-submit the same row.
+        ordinaryFinalizationInFlightRef.current.add(
+          processingOrdinaryMessage.messageId,
+        )
+
+        void (async () => {
+          try {
+            await finalizeClaimedMessagesAsRead(
+              agentName,
+              [processingOrdinaryMessage.messageId!],
+              sessionId,
+              teamName,
+            )
+
+            const processingRowId = processingOrdinaryMessage.id
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingRowId
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } catch (error) {
+            logForDebugging(
+              `[InboxPoller] Failed to finalize ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+            )
+          } finally {
+            ordinaryFinalizationInFlightRef.current.delete(
+              processingOrdinaryMessage.messageId!,
+            )
+          }
+        })()
+      }
+      return
+    }
+
+    const processingBootstrapMessage = activeBootstrapMessages.find(
+      message => message.status === 'processing' && !!message.messageId,
+    )
+
+    if (processingBootstrapMessage?.messageId) {
+      const attempt = bootstrapAttemptsRef.current.get(
+        processingBootstrapMessage.messageId,
+      )
+      const processingAction = getBootstrapProcessingAction({
+        attempt,
+        // Bootstrap outcome lives in the live REPL transcript. AppState.inbox
+        // is store-backed, but the conversation transcript itself is local REPL
+        // state, so use the current transcript getter here rather than a stale
+        // store snapshot.
+        messages: getMessages(),
+        processingBootstrapMessage,
+      })
+
+      if (processingAction.type === 'finalize' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId)
+
+        void (async () => {
+          try {
+            await finalizeClaimedMessagesAsRead(
+              agentName,
+              [processingBootstrapMessage.messageId!],
+              sessionId,
+              teamName,
+            )
+
+            const processingRowId = processingBootstrapMessage.id
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingRowId
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } catch (error) {
+            logForDebugging(
+              `[InboxPoller] Failed to finalize bootstrap row ${processingBootstrapMessage.messageId}: ${String(error)}`,
+            )
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingBootstrapMessage.id &&
+                  message.status === 'processing'
+                    ? { ...message, status: 'pending' as const }
+                    : message,
+                ),
+              },
+            }))
+          }
+        })()
+        return
+      }
+
+      if (processingAction.type === 'schedule_cooldown' && attempt) {
+        // Leave the row in the existing "processing" state during cooldown so
+        // the idle delivery path does not immediately resubmit the same
+        // bootstrap prompt in a tight loop when the model fails to comply.
+        const timer = setTimeout(() => {
+          bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId!)
+          setAppState(prev => ({
+            ...prev,
+            inbox: {
+              messages: prev.inbox.messages.map(message =>
+                message.messageId === processingBootstrapMessage.messageId &&
+                message.status === 'processing'
+                  ? { ...message, status: 'pending' as const }
+                  : message,
+              ),
+            },
+          }))
+        }, BOOTSTRAP_RETRY_COOLDOWN_MS)
+
+        bootstrapAttemptsRef.current.set(processingBootstrapMessage.messageId, {
+          ...attempt,
+          timer,
+          cooldownUntil: now + BOOTSTRAP_RETRY_COOLDOWN_MS,
+          status: 'cooling_down',
+        })
+        return
+      }
+
+      if (processingAction.type === 'reset_to_pending') {
+        setAppState(prev => ({
+          ...prev,
+          inbox: {
+            messages: prev.inbox.messages.map(message =>
+              message.id === processingBootstrapMessage.id
+                ? { ...message, status: 'pending' as const }
+                : message,
+            ),
+          },
+        }))
+        return
+      }
+
+      if (processingAction.type === 'noop') {
+        return
+      }
     }
 
     const pendingMessages = currentAppState.inbox.messages.filter(
@@ -939,29 +1590,156 @@ export function useInboxPoller({
 
     if (pendingMessages.length === 0) return
 
+    const bootstrapPendingMessage = getBootstrapPendingMessage({
+      pendingMessages,
+      isTeammateSession: isTeammate(),
+    })
+    const ordinaryPendingMessage =
+      bootstrapPendingMessage == null
+        ? getOrdinaryPendingMessage({ pendingMessages })
+        : undefined
+
     void (async () => {
       logForDebugging(
         `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
       )
 
-      const submitted = onSubmitTeammateMessage(
-        'Process the queued teammate mailbox attachment for this turn.',
-        { isMeta: true },
-      )
-      if (!submitted) {
+      if (bootstrapPendingMessage?.messageId) {
+        const effectiveTools = assembleToolPool(
+          currentAppState.toolPermissionContext,
+          currentAppState.mcp.tools,
+        )
+        const memberBriefingCallableNow =
+          isBootstrapMemberBriefingCallableNow({
+            toolSearchEnabledOptimistic: isToolSearchEnabledOptimistic(),
+            tools: effectiveTools,
+          })
+        const readinessWait = bootstrapReadinessWaitsRef.current.get(
+          bootstrapPendingMessage.messageId,
+        )
+        const readinessDecision = getBootstrapReadinessDecision({
+          now,
+          toolCallableNow: memberBriefingCallableNow,
+          waitStartedAt: readinessWait?.startedAt,
+        })
+
+        if (readinessDecision.type === 'wait') {
+          if (!readinessWait) {
+            const timer = setTimeout(() => {
+              setBootstrapReadinessTick(value => value + 1)
+            }, readinessDecision.remainingMs)
+            bootstrapReadinessWaitsRef.current.set(
+              bootstrapPendingMessage.messageId,
+              {
+                startedAt: now,
+                timer,
+              },
+            )
+            logForDebugging(
+              `[InboxPoller] Waiting up to ${BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS}ms for member_briefing to appear before first bootstrap turn`,
+            )
+          }
+          return
+        }
+
+        if (readinessWait) {
+          if (readinessWait.timer) {
+            clearTimeout(readinessWait.timer)
+          }
+          bootstrapReadinessWaitsRef.current.delete(
+            bootstrapPendingMessage.messageId,
+          )
+          if (!memberBriefingCallableNow) {
+            logForDebugging(
+              '[InboxPoller] member_briefing still not callable after bootstrap readiness grace period; falling back to current bootstrap handoff behavior',
+            )
+          }
+        }
+      }
+
+      const bootstrapPrompt =
+        bootstrapPendingMessage != null
+          ? getBootstrapInlineHandoffPrompt({
+              bootstrapInstructionText: bootstrapPendingMessage.text,
+              memberName: currentAppState.teamContext?.selfAgentName,
+              teamName: currentAppState.teamContext?.teamName,
+            })
+          : null
+      const ordinaryPrompt =
+        ordinaryPendingMessage != null
+          ? getOrdinaryInlineHandoffPrompt({
+              from: ordinaryPendingMessage.from,
+              text: ordinaryPendingMessage.text,
+              timestamp: ordinaryPendingMessage.timestamp,
+            })
+          : null
+      // The bootstrap turn is submitted through handleIncomingPrompt(), which
+      // bypasses processUserInput/getAttachmentMessages. Inline the claimed
+      // bootstrap text here so teammate bootstrap never depends on hidden
+      // teammate_mailbox attachment delivery.
+      const prompt =
+        bootstrapPrompt ??
+        ordinaryPrompt ??
+        getQueuedMailboxMetaPrompt({
+          pendingMessages: bootstrapPendingMessage
+            ? [bootstrapPendingMessage]
+            : pendingMessages,
+          isTeammateSession: isTeammate(),
+        })
+
+      const submitted = onSubmitTeammateMessage(prompt, { isMeta: true })
+      if (!submitted.accepted) {
         logForDebugging(
           `[InboxPoller] Submission rejected, keeping messages queued`,
         )
         return
       }
+
+      if (bootstrapPendingMessage?.messageId && submitted.userMessageUuid) {
+        bootstrapAttemptsRef.current.set(bootstrapPendingMessage.messageId, {
+          submitUserMessageUuid: submitted.userMessageUuid,
+          submittedAt: Date.now(),
+          cooldownUntil: 0,
+          status: 'in_flight',
+          timer: null,
+        })
+
+        const bootstrapRowId = bootstrapPendingMessage.id
+        setAppState(prev => ({
+          ...prev,
+          inbox: {
+            messages: prev.inbox.messages.map(message =>
+              message.id === bootstrapRowId
+                ? { ...message, status: 'processing' as const }
+                : message,
+            ),
+          },
+        }))
+      } else if (ordinaryPendingMessage?.messageId) {
+        const ordinaryRowId = ordinaryPendingMessage.id
+        setAppState(prev => ({
+          ...prev,
+          inbox: {
+            messages: prev.inbox.messages.map(message =>
+              message.id === ordinaryRowId
+                ? { ...message, status: 'processing' as const }
+                : message,
+            ),
+          },
+        }))
+      }
     })()
   }, [
+    bootstrapReadinessTick,
+    transcriptActivitySignature,
+    mcpToolSignature,
     enabled,
     isLoading,
     focusedInputDialog,
+    getMessages,
     onSubmitTeammateMessage,
     setAppState,
-    inboxMessageCount,
+    inboxStateSignature,
     store,
   ])
 

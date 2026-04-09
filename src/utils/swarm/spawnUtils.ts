@@ -15,8 +15,12 @@ import {
   getSessionBypassPermissionsMode,
   getStrictMcpConfig,
 } from '../../bootstrap/state.js'
+import { normalizeApiKeyForConfig } from '../authPortable.js'
 import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
+import { getCustomApiKeyStatus } from '../config.js'
+import { logForDebugging } from '../debug.js'
+import { isRunningOnHomespace } from '../envUtils.js'
 import { execFileNoThrow } from '../execFileNoThrow.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { sleep } from '../sleep.js'
@@ -27,6 +31,7 @@ import {
   TEAMMATE_COMMAND_ENV_VAR,
   TMUX_COMMAND,
 } from './constants.js'
+import { tryReadStartupReadySentinel } from './startupReadySentinel.js'
 
 /**
  * Gets the shell command prefix to use for spawning teammate processes.
@@ -132,6 +137,9 @@ export function buildInheritedCliFlags(options?: {
  * parent's env, so we forward any that are set in the current process.
  */
 const TEAMMATE_ENV_VARS = [
+  // Host-managed routing guard. When present, settings-sourced env must not
+  // override the provider/env choice that the launcher made for this child.
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
   // API provider selection — without these, teammates default to firstParty
   // and send requests to the wrong endpoint (GitHub issue #23561)
   'CLAUDE_CODE_USE_OPENAI',
@@ -186,9 +194,36 @@ const PROVIDER_SELECTION_ENV_VARS = [
   'CLAUDE_CODE_ENTRY_PROVIDER',
 ] as const
 
+function getExplicitEntryProvider(provider: TeammateProvider): string {
+  return provider === 'codex' || provider === 'gemini' ? provider : 'anthropic'
+}
+
 const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
   PROVIDER_SELECTION_ENV_VARS,
 )
+
+export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
+  anthropicApiKey: string | undefined
+  customApiKeyStatus: 'approved' | 'rejected' | 'new'
+  isHomespace: boolean
+}): boolean {
+  const { anthropicApiKey, customApiKeyStatus, isHomespace } = params
+
+  if (!anthropicApiKey || isHomespace) {
+    return false
+  }
+
+  // Pane-spawned teammates inherit the caller's shell env in addition to the
+  // explicit env KEY=VALUE prefix we build below. If ANTHROPIC_API_KEY is still
+  // "new" for this machine, the child can stall on the ApproveApiKey startup
+  // dialog before the REPL loop starts. When that happens, the teammate
+  // process is alive but never reaches the first inbox poll/claim.
+  //
+  // We only clear keys that are still unapproved ("new"). Approved custom keys
+  // keep flowing to spawned teammates so we do not silently change the user's
+  // chosen auth route.
+  return customApiKeyStatus === 'new'
+}
 
 /**
  * Builds the `env KEY=VALUE ...` string for teammate spawn commands.
@@ -197,9 +232,27 @@ const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
  */
 export function buildInheritedEnvVars(options?: {
   provider?: TeammateProvider
+  extraEnv?: Record<string, string | undefined>
 }): string {
   const envVars = ['CLAUDECODE=1', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1']
   const provider = options?.provider
+
+  if (
+    shouldClearAnthropicApiKeyForTeammateSpawn({
+      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+      customApiKeyStatus: process.env.ANTHROPIC_API_KEY
+        ? getCustomApiKeyStatus(
+            normalizeApiKeyForConfig(process.env.ANTHROPIC_API_KEY),
+          )
+        : 'rejected',
+      isHomespace: isRunningOnHomespace(),
+    })
+  ) {
+    // Explicitly blank the inherited shell env for pane-based teammates. Not
+    // forwarding the key is insufficient because tmux/login shells can still
+    // inherit ANTHROPIC_API_KEY from the parent environment.
+    envVars.push("ANTHROPIC_API_KEY=''")
+  }
 
   for (const key of TEAMMATE_ENV_VARS) {
     if (provider && PROVIDER_SELECTION_ENV_VAR_SET.has(key)) {
@@ -211,15 +264,28 @@ export function buildInheritedEnvVars(options?: {
     }
   }
 
+  if (options?.extraEnv) {
+    for (const [key, value] of Object.entries(options.extraEnv)) {
+      if (value !== undefined) {
+        envVars.push(`${key}=${quote([value])}`)
+      }
+    }
+  }
+
   if (provider) {
     for (const key of PROVIDER_SELECTION_ENV_VARS) {
       envVars.push(`${key}=''`)
     }
-    if (provider === 'codex') {
-      envVars.push('CLAUDE_CODE_ENTRY_PROVIDER=codex')
-    } else if (provider === 'gemini') {
-      envVars.push('CLAUDE_CODE_ENTRY_PROVIDER=gemini')
-    }
+    // Teammate provider overrides must be positive pins, not "unset and hope
+    // firstParty wins". The desktop/dev host can already be running with a
+    // different routed provider (for example codex), and settings.env is
+    // applied again after trust inside the child. Mark the child as
+    // host-managed and set an explicit entry provider for all override cases,
+    // including anthropic, so model alias resolution cannot drift.
+    envVars.push('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1')
+    envVars.push(
+      `CLAUDE_CODE_ENTRY_PROVIDER=${getExplicitEntryProvider(provider)}`,
+    )
   }
 
   return envVars.join(' ')
@@ -336,12 +402,135 @@ function extractExitSentinelCode(output: string): number | null {
  */
 export async function probeTmuxTeammateSpawn(
   paneId: string,
-  useExternalSession = false,
+  useExternalSessionOrOptions:
+    | boolean
+    | {
+        useExternalSession?: boolean
+        readySentinelPath?: string
+        readyTimeoutMs?: number
+        pollIntervalMs?: number
+      } = false,
 ): Promise<string | null> {
-  await sleep(TMUX_SPAWN_SMOKE_DELAY_MS)
+  return probeTmuxTeammateSpawnWithDeps(
+    paneId,
+    useExternalSessionOrOptions,
+    {
+      execFileNoThrowFn: execFileNoThrow,
+      sleepFn: sleep,
+    },
+  )
+}
+
+export async function probeTmuxTeammateSpawnWithDeps(
+  paneId: string,
+  useExternalSessionOrOptions:
+    | boolean
+    | {
+        useExternalSession?: boolean
+        readySentinelPath?: string
+        readyTimeoutMs?: number
+        pollIntervalMs?: number
+      } = false,
+  deps: {
+    execFileNoThrowFn: typeof execFileNoThrow
+    sleepFn: typeof sleep
+  },
+): Promise<string | null> {
+  const useExternalSession =
+    typeof useExternalSessionOrOptions === 'boolean'
+      ? useExternalSessionOrOptions
+      : Boolean(useExternalSessionOrOptions.useExternalSession)
+  const readySentinelPath =
+    typeof useExternalSessionOrOptions === 'boolean'
+      ? undefined
+      : useExternalSessionOrOptions.readySentinelPath
+  const readyTimeoutMs =
+    typeof useExternalSessionOrOptions === 'boolean'
+      ? 1500
+      : useExternalSessionOrOptions.readyTimeoutMs ?? 1500
+  const pollIntervalMs =
+    typeof useExternalSessionOrOptions === 'boolean'
+      ? 100
+      : useExternalSessionOrOptions.pollIntervalMs ?? 100
+
+  await deps.sleepFn(TMUX_SPAWN_SMOKE_DELAY_MS)
 
   const socketArgs = useExternalSession ? ['-L', getSwarmSocketName()] : []
-  const status = await execFileNoThrow(TMUX_COMMAND, [
+  const deadline = Date.now() + readyTimeoutMs
+  const initialPaneFailure = await readPaneStartupFailure({
+    paneId,
+    socketArgs,
+    execFileNoThrowFn: deps.execFileNoThrowFn,
+  })
+  if (initialPaneFailure) {
+    return initialPaneFailure
+  }
+
+  if (!readySentinelPath) {
+    return null
+  }
+
+  while (true) {
+    if (readySentinelPath) {
+      const ready = await tryReadStartupReadySentinel(readySentinelPath)
+      if (ready) {
+        // Stronger positive proof that startup gates were passed. This remains
+        // probe-only and must not be treated as bootstrap/contact truth.
+        return null
+      }
+    }
+
+    const paneStatus = await readPaneLiveness({
+      paneId,
+      socketArgs,
+      execFileNoThrowFn: deps.execFileNoThrowFn,
+    })
+    if (paneStatus.failure) {
+      return paneStatus.failure
+    }
+
+    if (!readySentinelPath || Date.now() >= deadline) {
+      break
+    }
+
+    await deps.sleepFn(pollIntervalMs)
+  }
+
+  const paneFailure = await readPaneStartupFailure({
+    paneId,
+    socketArgs,
+    execFileNoThrowFn: deps.execFileNoThrowFn,
+  })
+  if (paneFailure) {
+    return paneFailure
+  }
+
+  if (readySentinelPath) {
+    const ready = await tryReadStartupReadySentinel(readySentinelPath)
+    if (ready) {
+      return null
+    }
+
+    logForDebugging(
+      `[SpawnProbe] startup-ready sentinel not observed before timeout for ${paneId}`,
+    )
+  }
+
+  return null
+}
+
+async function readPaneLiveness(params: {
+  paneId: string
+  socketArgs: string[]
+  execFileNoThrowFn: typeof execFileNoThrow
+}): Promise<{
+  failure: string | null
+  paneDeadRaw: string
+  currentCommand: string
+  panePid: string
+}> {
+  const { paneId, socketArgs, execFileNoThrowFn } = params
+  const status = await execFileNoThrowFn(TMUX_COMMAND, [
     ...socketArgs,
     'display-message',
     '-p',
@@ -351,14 +540,53 @@ export async function probeTmuxTeammateSpawn(
   ])
 
   if (status.code !== 0) {
-    return `Teammate pane ${paneId} exited immediately after launch.`
+    return {
+      failure: `Teammate pane ${paneId} exited immediately after launch.`,
+      paneDeadRaw: '1',
+      currentCommand: '',
+      panePid: '',
+    }
   }
 
   const [paneDeadRaw = '0', currentCommand = '', panePid = ''] = status.stdout
     .trim()
     .split('|')
 
-  const capture = await execFileNoThrow(TMUX_COMMAND, [
+  if (paneDeadRaw === '1') {
+    const commandSuffix = currentCommand ? ` (${currentCommand})` : ''
+    const pidSuffix = panePid ? ` pid=${panePid}` : ''
+    return {
+      failure: `Teammate pane ${paneId} exited immediately after launch${commandSuffix}${pidSuffix}.`,
+      paneDeadRaw,
+      currentCommand,
+      panePid,
+    }
+  }
+
+  return {
+    failure: null,
+    paneDeadRaw,
+    currentCommand,
+    panePid,
+  }
+}
+
+async function readPaneStartupFailure(params: {
+  paneId: string
+  socketArgs: string[]
+  execFileNoThrowFn: typeof execFileNoThrow
+}): Promise<string | null> {
+  const { paneId, socketArgs, execFileNoThrowFn } = params
+  const paneStatus = await readPaneLiveness({
+    paneId,
+    socketArgs,
+    execFileNoThrowFn,
+  })
+  if (paneStatus.failure) {
+    return paneStatus.failure
+  }
+
+  const capture = await execFileNoThrowFn(TMUX_COMMAND, [
     ...socketArgs,
     'capture-pane',
     '-p',
@@ -380,12 +608,6 @@ export async function probeTmuxTeammateSpawn(
       return 'Teammate runtime exited immediately after launch.'
     }
     return `Teammate runtime exited immediately after launch with code ${exitCode}.`
-  }
-
-  if (paneDeadRaw === '1') {
-    const commandSuffix = currentCommand ? ` (${currentCommand})` : ''
-    const pidSuffix = panePid ? ` pid=${panePid}` : ''
-    return `Teammate pane ${paneId} exited immediately after launch${commandSuffix}${pidSuffix}.`
   }
 
   return null

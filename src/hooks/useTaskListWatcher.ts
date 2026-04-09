@@ -1,5 +1,6 @@
 import { type FSWatcher, watch } from 'fs'
 import { useEffect, useRef } from 'react'
+import type { InboxPromptSubmitResult } from './useInboxPoller.js'
 import { logForDebugging } from '../utils/debug.js'
 import {
   claimTask,
@@ -21,7 +22,7 @@ type Props = {
    * Called when a task is ready to be worked on.
    * Returns true if submission succeeded, false if rejected.
    */
-  onSubmitTask: (prompt: string) => boolean
+  onSubmitTask: (prompt: string) => InboxPromptSubmitResult
 }
 
 /**
@@ -114,7 +115,7 @@ export function useTaskListWatcher({
     )
 
     const submitted = onSubmitTaskRef.current(prompt)
-    if (!submitted) {
+    if (!submitted.accepted) {
       logForDebugging(
         `[TaskListWatcher] Failed to submit task #${availableTask.id}, releasing claim`,
       )

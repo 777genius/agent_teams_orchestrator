@@ -72,6 +72,11 @@ import {
   wrapTeammateSpawnCommand,
 } from '../../utils/swarm/spawnUtils.js'
 import {
+  cleanupSpawnReadySentinelDir,
+  createSpawnReadySentinel,
+  TEAMMATE_STARTUP_READY_SENTINEL_ENV,
+} from '../../utils/swarm/startupReadySentinel.js'
+import {
   readTeamFileAsync,
   sanitizeAgentName,
   sanitizeName,
@@ -899,23 +904,42 @@ async function handleSpawnSplitPane(
     prompt,
     strictMcpConfig: Boolean(teamName),
   })
-  const envStr = buildInheritedEnvVars({ provider })
+  const startupReadySentinel =
+    detectionResult.backend.type === 'tmux'
+      ? await createSpawnReadySentinel()
+      : undefined
   const launchBoundaryIso = new Date().toISOString()
-  const spawnCommand = wrapTeammateSpawnCommand(
-    `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
-  )
-  const paneCommand = await buildPaneLauncherCommand(spawnCommand)
+  try {
+    const envStr = buildInheritedEnvVars({
+      provider,
+      extraEnv: startupReadySentinel
+        ? {
+            [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
+              startupReadySentinel.filePath,
+          }
+        : undefined,
+    })
+    const spawnCommand = wrapTeammateSpawnCommand(
+      `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
+    )
+    const paneCommand = await buildPaneLauncherCommand(spawnCommand)
 
-  // Send the command to the new pane
-  // Use swarm socket when running outside tmux (external swarm session)
-  await sendCommandToPane(paneId, paneCommand, !insideTmux)
+    // Send the command to the new pane
+    // Use swarm socket when running outside tmux (external swarm session)
+    await sendCommandToPane(paneId, paneCommand, !insideTmux)
 
-  if (detectionResult.backend.type === 'tmux') {
-    const spawnFailure = await probeTmuxTeammateSpawn(paneId, !insideTmux)
-    if (spawnFailure) {
-      await detectionResult.backend.killPane(paneId, !insideTmux)
-      throw new Error(spawnFailure)
+    if (detectionResult.backend.type === 'tmux') {
+      const spawnFailure = await probeTmuxTeammateSpawn(paneId, {
+        useExternalSession: !insideTmux,
+        readySentinelPath: startupReadySentinel?.filePath,
+      })
+      if (spawnFailure) {
+        await detectionResult.backend.killPane(paneId, !insideTmux)
+        throw new Error(spawnFailure)
+      }
     }
+  } finally {
+    await cleanupSpawnReadySentinelDir(startupReadySentinel?.dir)
   }
 
   // Determine session/window names for output
@@ -1147,32 +1171,45 @@ async function handleSpawnSeparateWindow(
     prompt,
     strictMcpConfig: Boolean(teamName),
   })
-  const envStr = buildInheritedEnvVars({ provider })
+  const startupReadySentinel = await createSpawnReadySentinel()
   const launchBoundaryIso = new Date().toISOString()
-  const spawnCommand = wrapTeammateSpawnCommand(
-    `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
-  )
-  const paneCommand = await buildPaneLauncherCommand(spawnCommand)
-
-  // Send the command to the new window
-  const sendKeysResult = await execFileNoThrow(TMUX_COMMAND, [
-    'send-keys',
-    '-t',
-    `${SWARM_SESSION_NAME}:${windowName}`,
-    paneCommand,
-    'Enter',
-  ])
-
-  if (sendKeysResult.code !== 0) {
-    throw new Error(
-      `Failed to send command to tmux window: ${sendKeysResult.stderr}`,
+  try {
+    const envStr = buildInheritedEnvVars({
+      provider,
+      extraEnv: {
+        [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
+      },
+    })
+    const spawnCommand = wrapTeammateSpawnCommand(
+      `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
     )
-  }
+    const paneCommand = await buildPaneLauncherCommand(spawnCommand)
 
-  const spawnFailure = await probeTmuxTeammateSpawn(paneId, true)
-  if (spawnFailure) {
-    await getBackendByType('tmux').killPane(paneId, true)
-    throw new Error(spawnFailure)
+    // Send the command to the new window
+    const sendKeysResult = await execFileNoThrow(TMUX_COMMAND, [
+      'send-keys',
+      '-t',
+      `${SWARM_SESSION_NAME}:${windowName}`,
+      paneCommand,
+      'Enter',
+    ])
+
+    if (sendKeysResult.code !== 0) {
+      throw new Error(
+        `Failed to send command to tmux window: ${sendKeysResult.stderr}`,
+      )
+    }
+
+    const spawnFailure = await probeTmuxTeammateSpawn(paneId, {
+      useExternalSession: true,
+      readySentinelPath: startupReadySentinel.filePath,
+    })
+    if (spawnFailure) {
+      await getBackendByType('tmux').killPane(paneId, true)
+      throw new Error(spawnFailure)
+    }
+  } finally {
+    await cleanupSpawnReadySentinelDir(startupReadySentinel.dir)
   }
 
   // Track the teammate in AppState's teamContext

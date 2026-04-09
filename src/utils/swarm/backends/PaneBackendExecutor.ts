@@ -15,6 +15,12 @@ import {
   probeTmuxTeammateSpawn,
   wrapTeammateSpawnCommand,
 } from '../spawnUtils.js'
+import {
+  cleanupSpawnReadySentinelDir,
+  createSpawnReadySentinel,
+  type SpawnReadySentinel,
+  TEAMMATE_STARTUP_READY_SENTINEL_ENV,
+} from '../startupReadySentinel.js'
 import { assignTeammateColor } from '../teammateLayoutManager.js'
 import { isInsideTmux } from './detection.js'
 import type {
@@ -89,6 +95,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
    */
   async spawn(config: TeammateSpawnConfig): Promise<TeammateSpawnResult> {
     const agentId = formatAgentId(config.name, config.teamName)
+    let startupReadySentinel: SpawnReadySentinel | undefined
 
     if (!this.context) {
       logForDebugging(
@@ -181,9 +188,20 @@ export class PaneBackendExecutor implements TeammateExecutor {
 
       const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
       const workingDir = config.cwd
+      if (this.backend.type === 'tmux') {
+        startupReadySentinel = await createSpawnReadySentinel()
+      }
 
       // Build environment variables to forward to teammate
-      const envStr = buildInheritedEnvVars({ provider: config.provider })
+      const envStr = buildInheritedEnvVars({
+        provider: config.provider,
+        extraEnv: startupReadySentinel
+          ? {
+              [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
+                startupReadySentinel.filePath,
+            }
+          : undefined,
+      })
 
       const spawnCommand = wrapTeammateSpawnCommand(
         `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
@@ -195,10 +213,11 @@ export class PaneBackendExecutor implements TeammateExecutor {
       await this.backend.sendCommandToPane(paneId, paneCommand, !insideTmux)
 
       if (this.backend.type === 'tmux') {
-        const spawnFailure = await probeTmuxTeammateSpawn(
-          paneId,
-          !insideTmux,
-        )
+        const spawnFailure = await probeTmuxTeammateSpawn(paneId, {
+          useExternalSession: !insideTmux,
+          readySentinelPath: startupReadySentinel?.filePath,
+        })
+        await cleanupSpawnReadySentinelDir(startupReadySentinel?.dir)
         if (spawnFailure) {
           await this.backend.killPane(paneId, !insideTmux)
           return {
@@ -249,6 +268,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error)
+      await cleanupSpawnReadySentinelDir(startupReadySentinel?.dir)
       logForDebugging(
         `[PaneBackendExecutor] Failed to spawn ${agentId}: ${errorMessage}`,
       )
