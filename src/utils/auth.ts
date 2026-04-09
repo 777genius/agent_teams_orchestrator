@@ -12,7 +12,10 @@ import {
   logEvent,
 } from 'src/services/analytics/index.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
+import {
+  getAPIProvider,
+  type APIProvider,
+} from 'src/utils/model/providers.js'
 import {
   getIsNonInteractiveSession,
   preferThirdPartyAuthentication,
@@ -1733,6 +1736,50 @@ export function isCodexSubscriber(): boolean {
   }
 
   return false
+}
+
+export function hasExplicitHostManagedProviderSelection(): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    Boolean(process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim())
+  )
+}
+
+export function shouldUseCodexProviderRouting(params: {
+  apiProvider: APIProvider
+  hasCodexCapability: boolean
+  hasExplicitHostManagedProviderSelection: boolean
+}): boolean {
+  if (params.apiProvider === 'openai') {
+    return params.hasCodexCapability
+  }
+
+  if (params.apiProvider !== 'firstParty') {
+    return false
+  }
+
+  // Codex capability and Codex selection are different things.
+  // Team/runtime child sessions can run inside a host environment that has
+  // Codex OAuth available, while the host explicitly pins this child to a
+  // different provider. In that case the explicit host-managed selection must
+  // win, or the child silently drifts onto Codex routing.
+  // Host-managed runtime sessions pin a provider on purpose. In those cases,
+  // Codex availability must not silently override the provider selected by the
+  // launcher for this child process.
+  if (params.hasExplicitHostManagedProviderSelection) {
+    return false
+  }
+
+  return params.hasCodexCapability
+}
+
+export function shouldUseCodexProviderRoutingForCurrentProcess(): boolean {
+  return shouldUseCodexProviderRouting({
+    apiProvider: getAPIProvider(),
+    hasCodexCapability: isCodexSubscriber(),
+    hasExplicitHostManagedProviderSelection:
+      hasExplicitHostManagedProviderSelection(),
+  })
 }
 
 /**

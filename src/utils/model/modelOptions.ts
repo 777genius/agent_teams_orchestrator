@@ -2,8 +2,8 @@
 import { getInitialMainLoopModel } from '../../bootstrap/state.js'
 import {
   isClaudeAISubscriber,
-  isCodexSubscriber,
   isMaxSubscriber,
+  shouldUseCodexProviderRoutingForCurrentProcess,
   isTeamPremiumSubscriber,
 } from '../auth.js'
 import { getModelStrings } from './modelStrings.js'
@@ -315,7 +315,7 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
   }
 
   // Codex subscribers get OpenAI model options
-  if (isCodexSubscriber()) {
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     return [
       getDefaultOptionForUser(),
       ...getCodexModelOptions(),

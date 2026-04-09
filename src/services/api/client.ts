@@ -8,9 +8,9 @@ import {
   getClaudeAIOAuthTokens,
   getCodexOAuthTokens,
   isClaudeAISubscriber,
-  isCodexSubscriber,
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
+  shouldUseCodexProviderRoutingForCurrentProcess,
 } from 'src/utils/auth.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
@@ -313,7 +313,11 @@ export async function getAnthropicClient({
   }
 
   // ── Codex (OpenAI) provider via fetch adapter ─────────────────────
-  if (isCodexSubscriber()) {
+  // This branch follows the effective provider routing decision, not just raw
+  // Codex capability. A host-managed child may have Codex tokens available in
+  // the ambient environment while still being explicitly pinned to Anthropic,
+  // Gemini, or another provider for this session.
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     const codexTokens = getCodexOAuthTokens()
     if (codexTokens?.accessToken) {
       const codexFetch = createCodexFetch(codexTokens.accessToken)

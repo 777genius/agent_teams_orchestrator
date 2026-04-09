@@ -19,9 +19,9 @@ import { getCodexDisplayName, mapClaudeModelToCodex } from './codex.js'
 import {
   getSubscriptionType,
   isClaudeAISubscriber,
-  isCodexSubscriber,
   isMaxSubscriber,
   isProSubscriber,
+  shouldUseCodexProviderRoutingForCurrentProcess,
   isTeamPremiumSubscriber,
 } from '../auth.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
@@ -203,7 +203,10 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   if (getAPIProvider() === 'gemini') {
     return getDefaultGeminiMainModel()
   }
-  if (isCodexSubscriber()) {
+  // Keep derived defaults aligned with the effective provider routing decision.
+  // Otherwise the runtime client can be pinned to one provider while defaults
+  // and UX copy silently describe a different one.
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     return getModelStrings().gpt53codex
   }
 
@@ -354,7 +357,7 @@ export function getClaudeAiUserDefaultModelDescription(
   if (getAPIProvider() === 'gemini') {
     return 'Gemini 2.5 Pro · Most capable Gemini model for complex coding work'
   }
-  if (isCodexSubscriber()) {
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     return 'GPT-5.3 Codex · Optimized for code generation and understanding'
   }
   if (isMaxSubscriber() || isTeamPremiumSubscriber()) {

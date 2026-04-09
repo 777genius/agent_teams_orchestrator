@@ -1,7 +1,11 @@
 import { getDirectConnectServerUrl, getSessionId } from '../bootstrap/state.js'
 import { stringWidth } from '../ink/stringWidth.js'
 import type { LogOption } from '../types/logs.js'
-import { getSubscriptionName, isClaudeAISubscriber, isCodexSubscriber } from './auth.js'
+import {
+  getSubscriptionName,
+  isClaudeAISubscriber,
+  shouldUseCodexProviderRoutingForCurrentProcess,
+} from './auth.js'
 import { getCwd } from './cwd.js'
 import { getDisplayPath } from './file.js'
 import {
@@ -258,7 +262,9 @@ export function getLogoDisplayData(): {
     : displayPath
   const billingType = isClaudeAISubscriber()
     ? getSubscriptionName()
-    : isCodexSubscriber()
+    // Billing copy needs to follow the same effective provider routing that
+    // the runtime client uses, not just the presence of Codex auth capability.
+    : shouldUseCodexProviderRoutingForCurrentProcess()
       ? 'Codex API Billing'
       : 'API Usage Billing'
   const agentName = getInitialSettings().agent
