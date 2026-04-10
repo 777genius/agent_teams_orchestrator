@@ -1,0 +1,218 @@
+name: Release Runtime
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag to publish, for example v2.1.87
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            archive_name: agent-teams-runtime-linux-x64.tar.gz
+            binary_name: claude-multimodel
+            archive_kind: tar.gz
+          - runner: windows-latest
+            platform: win32-x64
+            archive_name: agent-teams-runtime-win32-x64.zip
+            binary_name: claude-multimodel.exe
+            archive_kind: zip
+          - runner: macos-14
+            platform: darwin-arm64
+            archive_name: agent-teams-runtime-darwin-arm64.tar.gz
+            binary_name: claude-multimodel
+            archive_kind: tar.gz
+          - runner: macos-15-intel
+            platform: darwin-x64
+            archive_name: agent-teams-runtime-darwin-x64.tar.gz
+            binary_name: claude-multimodel
+            archive_kind: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile runtime
+        run: bun run compile
+
+      - name: Package runtime archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=""
+          for candidate in dist/cli dist/cli.exe; do
+            if [[ -f "$candidate" ]]; then
+              SRC="$candidate"
+              break
+            fi
+          done
+          [[ -n "$SRC" ]] || { echo "Compiled runtime binary not found"; exit 1; }
+
+          rm -rf release
+          mkdir -p release/runtime
+          cp "$SRC" "release/runtime/${{ matrix.binary_name }}"
+          chmod +x "release/runtime/${{ matrix.binary_name }}"
+          printf '%s\n' "${{ github.event.inputs.release_tag || github.ref_name }}" > release/runtime/VERSION
+          printf '%s\n' "${{ github.sha }}" > release/runtime/COMMIT_SHA
+          tar -czf "release/${{ matrix.archive_name }}" -C release runtime
+
+      - name: Package runtime archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = @("dist/cli.exe", "dist/cli") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $source) {
+            throw "Compiled runtime binary not found"
+          }
+
+          Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
+          Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
+          Set-Content -Path release/runtime/VERSION -Value "${{ github.event.inputs.release_tag || github.ref_name }}"
+          Set-Content -Path release/runtime/COMMIT_SHA -Value "${{ github.sha }}"
+          Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
+
+      - name: Upload packaged runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: release/${{ matrix.archive_name }}
+          retention-days: 3
+
+  publish:
+    name: Publish runtime assets
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download packaged runtimes
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-flat
+          find release-assets -type f -maxdepth 2 -print -exec cp {} release-flat/ \;
+
+      - name: Generate manifest and checksums
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'EOF'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const releaseDir = path.join(process.cwd(), 'release-flat');
+          const releaseTag = process.env.RELEASE_TAG;
+          const version = releaseTag.startsWith('v') ? releaseTag.slice(1) : releaseTag;
+          const assets = [
+            {
+              platform: 'darwin-arm64',
+              file: 'agent-teams-runtime-darwin-arm64.tar.gz',
+              archiveKind: 'tar.gz',
+              binaryName: 'claude-multimodel',
+            },
+            {
+              platform: 'darwin-x64',
+              file: 'agent-teams-runtime-darwin-x64.tar.gz',
+              archiveKind: 'tar.gz',
+              binaryName: 'claude-multimodel',
+            },
+            {
+              platform: 'linux-x64',
+              file: 'agent-teams-runtime-linux-x64.tar.gz',
+              archiveKind: 'tar.gz',
+              binaryName: 'claude-multimodel',
+            },
+            {
+              platform: 'win32-x64',
+              file: 'agent-teams-runtime-win32-x64.zip',
+              archiveKind: 'zip',
+              binaryName: 'claude-multimodel.exe',
+            },
+          ];
+
+          const manifest = {
+            version,
+            releaseTag,
+            generatedAt: new Date().toISOString(),
+            sourceRepository: process.env.GITHUB_REPOSITORY,
+            sourceCommit: process.env.GITHUB_SHA,
+            assets: {},
+          };
+
+          let sums = '';
+          for (const asset of assets) {
+            const assetPath = path.join(releaseDir, asset.file);
+            const file = fs.readFileSync(assetPath);
+            const sha256 = crypto.createHash('sha256').update(file).digest('hex');
+            manifest.assets[asset.platform] = {
+              file: asset.file,
+              archiveKind: asset.archiveKind,
+              binaryName: asset.binaryName,
+              sha256,
+            };
+            sums += `${sha256}  ${asset.file}\n`;
+          }
+
+          fs.writeFileSync(path.join(releaseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+          fs.writeFileSync(path.join(releaseDir, 'SHA256SUMS'), sums);
+          EOF
+
+      - name: Create public binaries release
+        env:
+          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --repo "$TARGET_RELEASE_REPO" \
+              --title "$RELEASE_TAG" \
+              --notes "Runtime binaries published from $GITHUB_REPOSITORY@$GITHUB_SHA"
+
+      - name: Upload public binaries assets
+        env:
+          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" release-flat/* --repo "$TARGET_RELEASE_REPO" --clobber
