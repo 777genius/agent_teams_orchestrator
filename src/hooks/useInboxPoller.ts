@@ -5,6 +5,8 @@ import { getSessionId } from '../bootstrap/state.js'
 import type { ToolUseConfirm } from '../components/permissions/PermissionRequest.js'
 import { useTerminalNotification } from '../ink/useTerminalNotification.js'
 import { sendNotification } from '../services/notifier.js'
+export { isBootstrapMailboxInstructionText } from '../services/teamBootstrap/teamBootstrapMemberBriefingGuard.js'
+import { isBootstrapMailboxInstructionText } from '../services/teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 import {
   type AppState,
   useAppState,
@@ -159,25 +161,6 @@ type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text
 
 const GENERIC_QUEUED_MAILBOX_META_PROMPT =
   'Process the queued teammate mailbox attachment for this turn.'
-
-const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
-  'Your FIRST action: call MCP tool member_briefing with:'
-const BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER =
-  'The team has already been created and you are being attached as a persistent teammate.'
-
-export function isBootstrapMailboxInstructionText(text: string): boolean {
-  const normalized = text.trim()
-  if (!normalized) {
-    return false
-  }
-  if (normalized.includes(BOOTSTRAP_MEMBER_BRIEFING_MARKER)) {
-    return true
-  }
-  return (
-    normalized.includes(BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER) &&
-    normalized.includes('member_briefing')
-  )
-}
 
 export function getQueuedMailboxMetaPrompt({
   pendingMessages,

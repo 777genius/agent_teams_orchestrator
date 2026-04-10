@@ -251,8 +251,17 @@ const isComputerUseMCPServer = feature('CHICAGO_MCP')
 import { mkdir, readFile, unlink, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
+import {
+  getAgentName,
+  getTeamName,
+  isTeammate,
+} from '../../utils/teammate.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
+import {
+  clearBootstrapMemberBriefingLoopState,
+  prepareBootstrapMemberBriefingCall,
+} from '../teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 
 const MCP_AUTH_CACHE_TTL_MS = 15 * 60 * 1000 // 15 min
 
@@ -1858,6 +1867,25 @@ export const fetchToolsForClient = memoizeWithLRU(
               }
 
               const startTime = Date.now()
+              const appState = context.getAppState()
+              const bootstrapCall = prepareBootstrapMemberBriefingCall({
+                serverName: client.name,
+                toolName: tool.name,
+                args,
+                appState,
+                currentSessionId: getSessionId(),
+                isTeammateSession: isTeammate(),
+                teamName: getTeamName(appState.teamContext),
+                memberName: getAgentName(),
+                nowMs: Date.now(),
+              })
+
+              if (bootstrapCall.repairedFields.length > 0) {
+                logForDebugging(
+                  `[MCP] Auto-repaired bootstrap member_briefing args for ${bootstrapCall.bootstrapContext?.memberName ?? 'unknown'} in ${bootstrapCall.bootstrapContext?.teamName ?? 'unknown'}: ${bootstrapCall.repairedFields.join(', ')}`,
+                )
+              }
+
               const MAX_SESSION_RETRIES = 1
               for (let attempt = 0; ; attempt++) {
                 try {
@@ -1866,7 +1894,7 @@ export const fetchToolsForClient = memoizeWithLRU(
                     client: connectedClient,
                     clientConnection: client,
                     tool: tool.name,
-                    args,
+                    args: bootstrapCall.args,
                     meta,
                     signal: context.abortController.signal,
                     setAppState: context.setAppState,
@@ -1881,6 +1909,12 @@ export const fetchToolsForClient = memoizeWithLRU(
                         : undefined,
                     handleElicitation: context.handleElicitation,
                   })
+
+                  if (bootstrapCall.bootstrapContext) {
+                    clearBootstrapMemberBriefingLoopState(
+                      bootstrapCall.bootstrapContext,
+                    )
+                  }
 
                   // Emit progress when tool completes successfully
                   if (onProgress && toolUseId) {
