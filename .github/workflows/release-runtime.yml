@@ -135,6 +135,9 @@ jobs:
       contents: read
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Resolve publish metadata
         id: meta
         shell: bash
