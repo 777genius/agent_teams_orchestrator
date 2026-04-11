@@ -10,6 +10,9 @@ import {
   AuthenticationError,
 } from '@anthropic-ai/sdk'
 import { getModelStrings } from './modelStrings.js'
+import { isCodexModel } from './codex.js'
+import { isGeminiModel } from './gemini.js'
+import { resolveGeminiBackend } from '../../services/gemini/backendResolver.js'
 
 // Cache valid models to avoid repeated API calls
 const validModelCache = new Map<string, boolean>()
@@ -42,9 +45,32 @@ export async function validateModel(
   }
 
   // Check if it's a known Codex/OpenAI model (skip Anthropic API validation)
-  const { isCodexSubscriber } = await import('../auth.js')
-  const { isCodexModel } = await import('../../services/api/codex-fetch-adapter.js')
-  if (isCodexSubscriber() && isCodexModel(normalizedModel)) {
+  const { shouldUseCodexProviderRoutingForCurrentProcess } = await import(
+    '../auth.js'
+  )
+  if (
+    shouldUseCodexProviderRoutingForCurrentProcess() &&
+    isCodexModel(normalizedModel)
+  ) {
+    validModelCache.set(normalizedModel, true)
+    return { valid: true }
+  }
+
+  if (getAPIProvider() === 'gemini') {
+    if (!isGeminiModel(normalizedModel)) {
+      return {
+        valid: false,
+        error: `Model '${normalizedModel}' is not a supported Gemini model`,
+      }
+    }
+    const resolution = await resolveGeminiBackend()
+    if (!resolution.backend) {
+      return {
+        valid: false,
+        error:
+          resolution.status.message ?? 'Gemini auth is not configured correctly',
+      }
+    }
     validModelCache.set(normalizedModel, true)
     return { valid: true }
   }

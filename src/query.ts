@@ -96,6 +96,7 @@ import { createDumpPromptsFetch } from './services/api/dumpPrompts.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
+import { isBootstrapMemberBriefingLoopAbortReason } from './services/teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 import { applyToolResultBudget } from './utils/toolResultStorage.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
@@ -162,6 +163,10 @@ function* yieldMissingToolResultBlocks(
  * rules, ye will be punished with an entire day of debugging and hair pulling.
  */
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
+
+function shouldSuppressAbortInterruptionMessage(reason: unknown): boolean {
+  return reason === 'interrupt' || isBootstrapMemberBriefingLoopAbortReason(reason)
+}
 
 /**
  * Is this a max_output_tokens error message? If so, the streaming loop should
@@ -1043,7 +1048,11 @@ async function* queryLoop(
 
       // Skip the interruption message for submit-interrupts — the queued
       // user message that follows provides sufficient context.
-      if (toolUseContext.abortController.signal.reason !== 'interrupt') {
+      if (
+        !shouldSuppressAbortInterruptionMessage(
+          toolUseContext.abortController.signal.reason,
+        )
+      ) {
         yield createUserInterruptionMessage({
           toolUse: false,
         })
@@ -1498,7 +1507,11 @@ async function* queryLoop(
       }
       // Skip the interruption message for submit-interrupts — the queued
       // user message that follows provides sufficient context.
-      if (toolUseContext.abortController.signal.reason !== 'interrupt') {
+      if (
+        !shouldSuppressAbortInterruptionMessage(
+          toolUseContext.abortController.signal.reason,
+        )
+      ) {
         yield createUserInterruptionMessage({
           toolUse: true,
         })

@@ -4,13 +4,23 @@ import { formatAgentId, parseAgentId } from '../../../utils/agentId.js'
 import { quote } from '../../../utils/bash/shellQuote.js'
 import { registerCleanup } from '../../../utils/cleanupRegistry.js'
 import { logForDebugging } from '../../../utils/debug.js'
+import { getAPIProvider } from '../../../utils/model/providers.js'
 import { jsonStringify } from '../../../utils/slowOperations.js'
 import { writeToMailbox } from '../../../utils/teammateMailbox.js'
 import {
+  buildPaneLauncherCommand,
   buildInheritedCliFlags,
   buildInheritedEnvVars,
   getTeammateCommand,
+  probeTmuxTeammateSpawn,
+  wrapTeammateSpawnCommand,
 } from '../spawnUtils.js'
+import {
+  cleanupSpawnReadySentinelDir,
+  createSpawnReadySentinel,
+  type SpawnReadySentinel,
+  TEAMMATE_STARTUP_READY_SENTINEL_ENV,
+} from '../startupReadySentinel.js'
 import { assignTeammateColor } from '../teammateLayoutManager.js'
 import { isInsideTmux } from './detection.js'
 import type {
@@ -21,6 +31,13 @@ import type {
   TeammateSpawnConfig,
   TeammateSpawnResult,
 } from './types.js'
+
+function getCurrentProvider(): 'anthropic' | 'codex' | 'gemini' {
+  const provider = getAPIProvider()
+  if (provider === 'openai') return 'codex'
+  if (provider === 'gemini') return 'gemini'
+  return 'anthropic'
+}
 
 /**
  * PaneBackendExecutor adapts a PaneBackend to the TeammateExecutor interface.
@@ -78,6 +95,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
    */
   async spawn(config: TeammateSpawnConfig): Promise<TeammateSpawnResult> {
     const agentId = formatAgentId(config.name, config.teamName)
+    let startupReadySentinel: SpawnReadySentinel | undefined
 
     if (!this.context) {
       logForDebugging(
@@ -130,7 +148,18 @@ export class PaneBackendExecutor implements TeammateExecutor {
       let inheritedFlags = buildInheritedCliFlags({
         planModeRequired: config.planModeRequired,
         permissionMode: appState.toolPermissionContext.mode,
+        effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
+        strictMcpConfig: Boolean(config.teamName),
       })
+
+      if (config.provider && config.provider !== getCurrentProvider()) {
+        inheritedFlags = inheritedFlags
+          .split(' ')
+          .filter(
+            (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
+          )
+          .join(' ')
+      }
 
       // If teammate has a custom model, add --model flag (or replace inherited one)
       if (config.model) {
@@ -145,17 +174,59 @@ export class PaneBackendExecutor implements TeammateExecutor {
           : `--model ${quote([config.model])}`
       }
 
+      if (config.effort) {
+        inheritedFlags = inheritedFlags
+          .split(' ')
+          .filter(
+            (flag, i, arr) => flag !== '--effort' && arr[i - 1] !== '--effort',
+          )
+          .join(' ')
+        inheritedFlags = inheritedFlags
+          ? `${inheritedFlags} --effort ${quote([config.effort])}`
+          : `--effort ${quote([config.effort])}`
+      }
+
       const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
       const workingDir = config.cwd
+      if (this.backend.type === 'tmux') {
+        startupReadySentinel = await createSpawnReadySentinel()
+      }
 
       // Build environment variables to forward to teammate
-      const envStr = buildInheritedEnvVars()
+      const envStr = buildInheritedEnvVars({
+        provider: config.provider,
+        extraEnv: startupReadySentinel
+          ? {
+              [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
+                startupReadySentinel.filePath,
+            }
+          : undefined,
+      })
 
-      const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+      const spawnCommand = wrapTeammateSpawnCommand(
+        `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
+      )
+      const paneCommand = await buildPaneLauncherCommand(spawnCommand)
 
       // Send the command to the new pane
       // Use swarm socket when running outside tmux (external swarm session)
-      await this.backend.sendCommandToPane(paneId, spawnCommand, !insideTmux)
+      await this.backend.sendCommandToPane(paneId, paneCommand, !insideTmux)
+
+      if (this.backend.type === 'tmux') {
+        const spawnFailure = await probeTmuxTeammateSpawn(paneId, {
+          useExternalSession: !insideTmux,
+          readySentinelPath: startupReadySentinel?.filePath,
+        })
+        await cleanupSpawnReadySentinelDir(startupReadySentinel?.dir)
+        if (spawnFailure) {
+          await this.backend.killPane(paneId, !insideTmux)
+          return {
+            success: false,
+            agentId,
+            error: spawnFailure,
+          }
+        }
+      }
 
       // Track the spawned teammate
       this.spawnedTeammates.set(agentId, { paneId, insideTmux })
@@ -197,6 +268,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error)
+      await cleanupSpawnReadySentinelDir(startupReadySentinel?.dir)
       logForDebugging(
         `[PaneBackendExecutor] Failed to spawn ${agentId}: ${errorMessage}`,
       )

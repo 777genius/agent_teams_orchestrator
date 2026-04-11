@@ -1,4 +1,5 @@
 import type { AgentColorName } from '../../../tools/AgentTool/agentColorManager.js'
+import type { EffortLevel } from '../../effort.js'
 
 /**
  * Types of backends available for teammate execution.
@@ -20,6 +21,7 @@ export type PaneBackendType = 'tmux' | 'iterm2'
  * For iTerm2, this is the session ID returned by it2.
  */
 export type PaneId = string
+export type TeammateProvider = 'anthropic' | 'codex' | 'gemini'
 
 /**
  * Result of creating a new teammate pane.
@@ -209,6 +211,10 @@ export type TeammateSpawnConfig = TeammateIdentity & {
   cwd: string
   /** Model to use for this teammate */
   model?: string
+  /** API provider to use for this teammate */
+  provider?: TeammateProvider
+  /** Effort level to use for this teammate */
+  effort?: EffortLevel
   /** System prompt for this teammate (resolved from workflow config) */
   systemPrompt?: string
   /** How to apply the system prompt: 'replace' or 'append' to default */

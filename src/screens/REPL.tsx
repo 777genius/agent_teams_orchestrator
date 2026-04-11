@@ -188,7 +188,11 @@ import { computeStandaloneAgentContext, restoreAgentFromSession, restoreSessionS
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
-import { useInboxPoller } from '../hooks/useInboxPoller.js';
+import {
+  getBootstrapTranscriptActivitySignature,
+  useInboxPoller,
+} from '../hooks/useInboxPoller.js';
+import type { InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
@@ -258,6 +262,7 @@ import { performStartupChecks } from 'src/utils/plugins/performStartupChecks.js'
 import { UserTextMessage } from 'src/components/messages/UserTextMessage.js';
 import { AwsAuthStatusBox } from '../components/AwsAuthStatusBox.js';
 import { useRateLimitWarningNotification } from 'src/hooks/notifs/useRateLimitWarningNotification.js';
+import { useTeammateStartupReadySentinel } from '../hooks/useTeammateStartupReadySentinel.js';
 import { useDeprecationWarningNotification } from 'src/hooks/notifs/useDeprecationWarningNotification.js';
 import { useNpmDeprecationNotification } from 'src/hooks/notifs/useNpmDeprecationNotification.js';
 import { useIDEStatusIndicator } from 'src/hooks/notifs/useIDEStatusIndicator.js';
@@ -3994,12 +3999,15 @@ export function REPL({
     };
   }, [lastQueryCompletionTime, isLoading, addNotification, removeNotification]);
 
-  // Submits incoming prompts from teammate messages or tasks mode as new turns
-  // Returns true if submission succeeded, false if a query is already running
+  // Submits incoming prompts from teammate messages or tasks mode as new turns.
+  // Returns acceptance plus the created user-message UUID so bootstrap delivery
+  // can correlate the submitted meta turn with the later transcript outcome.
   const handleIncomingPrompt = useCallback((content: string, options?: {
     isMeta?: boolean;
-  }): boolean => {
-    if (queryGuard.isActive) return false;
+  }): InboxPromptSubmitResult => {
+    if (queryGuard.isActive) return {
+      accepted: false
+    };
 
     // Defer to user-queued commands — user input always takes priority
     // over system messages (teammate messages, task list items, etc.)
@@ -4007,7 +4015,9 @@ export function REPL({
     // snapshot) to avoid a stale closure — this callback's deps don't
     // include the queue.
     if (getCommandQueue().some(cmd => cmd.mode === 'prompt' || cmd.mode === 'bash')) {
-      return false;
+      return {
+        accepted: false
+      };
     }
     const newAbortController = createAbortController();
     setAbortController(newAbortController);
@@ -4018,7 +4028,10 @@ export function REPL({
       isMeta: options?.isMeta ? true : undefined
     });
     void onQuery([userMessage], newAbortController, true, [], mainLoopModel);
-    return true;
+    return {
+      accepted: true,
+      userMessageUuid: userMessage.uuid
+    };
   }, [onQuery, mainLoopModel, store]);
 
   // Voice input integration (VOICE_MODE builds only)
@@ -4038,7 +4051,14 @@ export function REPL({
     enabled: isAgentSwarmsEnabled(),
     isLoading,
     focusedInputDialog,
-    onSubmitMessage: handleIncomingPrompt
+    getMessages: () => messagesRef.current,
+    onSubmitMessage: handleIncomingPrompt,
+    transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
+  });
+  useTeammateStartupReadySentinel({
+    enabled: !isRemoteSession && isAgentSwarmsEnabled(),
+    teamContext,
+    sessionId: getSessionId()
   });
   useMailboxBridge({
     isLoading,
@@ -4089,7 +4109,7 @@ export function REPL({
       isInPlanMode: toolPermissionContext.mode === 'plan',
       onSubmitTick: (prompt: string) => handleIncomingPrompt(prompt, {
         isMeta: true
-      }),
+      }).accepted,
       onQueueTick: (prompt: string) => enqueue({
         mode: 'prompt',
         value: prompt,

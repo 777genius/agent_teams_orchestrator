@@ -5,10 +5,12 @@ import { color, Text } from '../ink.js';
 import type { MCPServerConnection } from '../services/mcp/types.js';
 import { getAccountInformation, isClaudeAISubscriber } from './auth.js';
 import { getLargeMemoryFiles, getMemoryFiles, MAX_MEMORY_CHARACTER_COUNT } from './claudemd.js';
+import { getGlobalConfig } from './config.js';
 import { getDoctorDiagnostic } from './doctorDiagnostic.js';
 import { getAWSRegion, getDefaultVertexRegion, isEnvTruthy } from './envUtils.js';
 import { getDisplayPath } from './file.js';
 import { formatNumber } from './format.js';
+import { getGeminiApiVersion, getGeminiBaseUrl, getGeminiProjectId } from './geminiAuth.js';
 import { getIdeClientName, type IDEExtensionInstallationStatus, isJetBrainsIde, toIDEDisplayName } from './ide.js';
 import { getClaudeAiUserDefaultModelDescription, modelDisplayString } from './model/model.js';
 import { getAPIProvider } from './model/providers.js';
@@ -211,7 +213,10 @@ export function buildAccountProperties(): Property[] {
   }
   if (accountInfo.tokenSource) {
     properties.push({
-      label: 'Auth token',
+      label:
+        accountInfo.apiProvider === 'Google Gemini'
+          ? 'Auth method'
+          : 'Auth token',
       value: accountInfo.tokenSource
     });
   }
@@ -235,6 +240,18 @@ export function buildAccountProperties(): Property[] {
       value: accountInfo.email
     });
   }
+  if (accountInfo.projectId) {
+    properties.push({
+      label: 'Project ID',
+      value: accountInfo.projectId
+    });
+  }
+  if (accountInfo.backend) {
+    properties.push({
+      label: 'Backend',
+      value: accountInfo.backend
+    });
+  }
   return properties;
 }
 export function buildAPIProviderProperties(): Property[] {
@@ -244,7 +261,8 @@ export function buildAPIProviderProperties(): Property[] {
     const providerLabel = {
       bedrock: 'AWS Bedrock',
       vertex: 'Google Vertex AI',
-      foundry: 'Microsoft Foundry'
+      foundry: 'Microsoft Foundry',
+      gemini: 'Google Gemini'
     }[apiProvider];
     properties.push({
       label: 'API provider',
@@ -318,6 +336,34 @@ export function buildAPIProviderProperties(): Property[] {
     if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_FOUNDRY_AUTH)) {
       properties.push({
         value: 'Microsoft Foundry auth skipped'
+      });
+    }
+  } else if (apiProvider === 'gemini') {
+    const geminiBackend = process.env.CLAUDE_CODE_GEMINI_BACKEND ?? getGlobalConfig().geminiResolvedBackend ?? getGlobalConfig().geminiBackendPreference ?? 'auto';
+    properties.push({
+      label: 'Gemini backend',
+      value: geminiBackend
+    });
+    if (geminiBackend === 'cli' || geminiBackend === 'cli-sdk') {
+      properties.push({
+        label: 'Gemini endpoint',
+        value: 'Code Assist (cloudcode-pa.googleapis.com/v1internal)'
+      });
+    } else {
+      properties.push({
+        label: 'Gemini base URL',
+        value: getGeminiBaseUrl()
+      });
+      properties.push({
+        label: 'Gemini API version',
+        value: getGeminiApiVersion()
+      });
+    }
+    const geminiProject = getGeminiProjectId();
+    if (geminiProject) {
+      properties.push({
+        label: 'Google Cloud project',
+        value: geminiProject
       });
     }
   }

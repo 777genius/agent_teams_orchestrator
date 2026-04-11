@@ -342,6 +342,20 @@ export type ToolCallProgress<P extends ToolProgressData = ToolProgressData> = (
 // Type for any schema that outputs an object with string keys
 export type AnyObject = z.ZodType<{ [key: string]: unknown }>
 
+function normalizeMcpServerSegment(serverName: string): string {
+  return serverName.replace(/[-_]+/g, '_')
+}
+
+function canonicalizeMcpLookupName(name: string): string | null {
+  if (!name.startsWith('mcp__')) return null
+  const parts = name.split('__')
+  const [prefix, serverName, ...toolNameParts] = parts
+  if (prefix !== 'mcp' || !serverName || toolNameParts.length === 0) {
+    return null
+  }
+  return `mcp__${normalizeMcpServerSegment(serverName)}__${toolNameParts.join('__')}`
+}
+
 /**
  * Checks if a tool matches the given name (primary name or alias).
  */
@@ -349,7 +363,24 @@ export function toolMatchesName(
   tool: { name: string; aliases?: string[] },
   name: string,
 ): boolean {
-  return tool.name === name || (tool.aliases?.includes(name) ?? false)
+  if (tool.name === name || (tool.aliases?.includes(name) ?? false)) {
+    return true
+  }
+
+  const canonicalCandidate = canonicalizeMcpLookupName(name)
+  if (!canonicalCandidate) {
+    return false
+  }
+
+  if (canonicalizeMcpLookupName(tool.name) === canonicalCandidate) {
+    return true
+  }
+
+  return (
+    tool.aliases?.some(
+      alias => canonicalizeMcpLookupName(alias) === canonicalCandidate,
+    ) ?? false
+  )
 }
 
 /**

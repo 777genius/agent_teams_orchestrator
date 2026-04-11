@@ -51,6 +51,7 @@ export function buildMcpToolName(serverName: string, toolName: string): string {
   return `${getMcpPrefix(serverName)}${normalizeNameForMCP(toolName)}`
 }
 
+
 /**
  * Returns the name to use for permission rule matching.
  * For MCP tools, uses the fully qualified mcp__server__tool name so that

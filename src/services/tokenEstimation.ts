@@ -143,6 +143,9 @@ export async function countMessagesTokensWithAPI(
 ): Promise<number | null> {
   return withTokenCountVCR(messages, tools, async () => {
     try {
+      if (getAPIProvider() === 'gemini') {
+        return roughTokenCountEstimation(jsonStringify({ messages, tools }))
+      }
       const model = getMainLoopModel()
       const betas = getModelBetas(model)
       const containsThinking = hasThinkingBlocks(messages)

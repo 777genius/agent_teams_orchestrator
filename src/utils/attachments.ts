@@ -148,6 +148,7 @@ import {
   getTotalOutputTokens,
   getCurrentTurnTokenBudget,
   getTurnOutputTokens,
+  getIsNonInteractiveSession,
   hasExitedPlanModeInSession,
   setHasExitedPlanMode,
   needsPlanModeExitAttachment,
@@ -234,9 +235,20 @@ import { memoryAge, memoryFreshnessText } from '../memdir/memoryAge.js'
 import { getAutoMemPath, isAutoMemoryEnabled } from '../memdir/paths.js'
 import { getAgentMemoryDir } from '../tools/AgentTool/agentMemory.js'
 import {
+  shouldFinalizeFileBackedProtocolMessages as shouldFinalizeFileBackedProtocolMessagesForScope,
+  shouldFinalizeFileBackedRegularMessages as shouldFinalizeFileBackedRegularMessagesForScope,
+  shouldReadProtocolMailboxMessagesFromFile as shouldReadProtocolMailboxMessagesFromFileForScope,
+  shouldReadRegularMailboxMessagesFromFile as shouldReadRegularMailboxMessagesFromFileForScope,
+  shouldUseLiveInboxOwnerPath as shouldUseLiveInboxOwnerPathForScope,
+} from './mailboxDeliveryScope.js'
+import {
+  finalizeClaimedMessagesAsRead,
+  isLiveInboxMirrorMessageOwnedBySession,
+  isRegularInteractiveMailboxMessage,
   readUnreadMessages,
-  markMessagesAsReadByPredicate,
+  markMessagesAsReadByIds,
   isShutdownApproved,
+  isSilentRegularMailboxMessageForLiveContext,
   isStructuredProtocolMessage,
   isIdleNotification,
 } from './teammateMailbox.js'
@@ -3529,7 +3541,7 @@ async function getAsyncHookResponseAttachments(): Promise<Attachment[]> {
  * Messages from AppState.inbox are delivered mid-turn as attachments,
  * allowing teammates to receive messages without waiting for the turn to end.
  */
-async function getTeammateMailboxAttachments(
+export async function getTeammateMailboxAttachments(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
   if (!isAgentSwarmsEnabled()) {
@@ -3580,19 +3592,32 @@ async function getTeammateMailboxAttachments(
     `[SwarmMailbox] Checking inbox for agent="${agentName}" team="${teamName || 'default'}"`,
   )
 
-  // Check mailbox for unread messages (routes to in-process or file-based)
-  // Filter out structured protocol messages (permission requests/responses, shutdown
-  // messages, etc.) — these must be left unread for useInboxPoller to route to their
-  // proper handlers (workerPermissions queue, sandbox queue, etc.). Without filtering,
-  // attachment generation races with InboxPoller: whichever reads first marks all
-  // messages as read, and if attachments wins, protocol messages get bundled as raw
-  // LLM context text instead of being routed to their UI handlers.
+  const mailboxDeliveryScope = {
+    viewedTeammate: viewedTeammate != null,
+    inProcessTeammate: isInProcessTeammate(),
+    nonInteractiveSession: getIsNonInteractiveSession(),
+  }
+  const shouldReadRegularMailboxMessagesFromFile =
+    shouldReadRegularMailboxMessagesFromFileForScope(mailboxDeliveryScope)
+  const shouldReadProtocolMailboxMessagesFromFile =
+    shouldReadProtocolMailboxMessagesFromFileForScope(mailboxDeliveryScope)
+  const shouldFinalizeFileBackedRegularMessages =
+    shouldFinalizeFileBackedRegularMessagesForScope(mailboxDeliveryScope)
+  const shouldFinalizeFileBackedProtocolMessages =
+    shouldFinalizeFileBackedProtocolMessagesForScope(mailboxDeliveryScope)
+  const shouldUseLiveInboxOwnerPath =
+    shouldUseLiveInboxOwnerPathForScope(mailboxDeliveryScope)
+  const currentSessionId = getSessionId()
+
   const allUnreadMessages = await readUnreadMessages(agentName, teamName)
-  const unreadMessages = allUnreadMessages.filter(
-    m => !isStructuredProtocolMessage(m.text),
-  )
+  const fileBackedRegularMessages = shouldReadRegularMailboxMessagesFromFile
+    ? allUnreadMessages.filter(m => isRegularInteractiveMailboxMessage(m))
+    : []
+  const fileBackedProtocolMessages = shouldReadProtocolMailboxMessagesFromFile
+    ? allUnreadMessages.filter(m => isStructuredProtocolMessage(m.text))
+    : []
   logForDebugging(
-    `[MailboxBridge] Found ${allUnreadMessages.length} unread message(s) for "${agentName}" (${allUnreadMessages.length - unreadMessages.length} structured protocol messages filtered out)`,
+    `[MailboxBridge] Found ${allUnreadMessages.length} unread message(s) for "${agentName}" (${fileBackedRegularMessages.length} regular and ${fileBackedProtocolMessages.length} protocol message(s) eligible for file-backed attachment delivery)`,
   )
 
   // Also check AppState.inbox for pending messages (queued mid-turn by useInboxPoller)
@@ -3604,22 +3629,34 @@ async function getTeammateMailboxAttachments(
   // (including self-echo from broadcasts). Teammates receive messages exclusively
   // through their file-based mailbox + waitForNextPromptOrShutdown.
   // Note: viewedTeammate was already computed above for agentName resolution
-  const pendingInboxMessages =
-    viewedTeammate || isInProcessTeammate()
-      ? [] // Viewing teammate or running as in-process teammate - don't show leader's inbox
-      : appState.inbox.messages.filter(m => m.status === 'pending')
+  const liveOwnedPendingInboxMessages =
+    shouldUseLiveInboxOwnerPath
+      ? appState.inbox.messages.filter(
+          m =>
+            (m.status === 'pending' || m.status === 'processing') &&
+            isLiveInboxMirrorMessageOwnedBySession(m, currentSessionId),
+        )
+      : [] // Viewer, in-process, and non-interactive paths are read-only w.r.t. live ownership
+  const silentPendingInboxMessages = shouldUseLiveInboxOwnerPath
+    ? liveOwnedPendingInboxMessages.filter(message =>
+        isSilentRegularMailboxMessageForLiveContext(message),
+      )
+    : []
+  const pendingInboxMessages = shouldUseLiveInboxOwnerPath
+    ? liveOwnedPendingInboxMessages.filter(
+        message => !isSilentRegularMailboxMessageForLiveContext(message),
+      )
+    : []
   logForDebugging(
-    `[SwarmMailbox] Found ${pendingInboxMessages.length} pending message(s) in AppState.inbox`,
+    `[SwarmMailbox] Found ${pendingInboxMessages.length} deliverable pending message(s) and ${silentPendingInboxMessages.length} silent pending message(s) in AppState.inbox`,
   )
 
-  // Combine both sources of messages WITH DEDUPLICATION
-  // The same message could exist in both file mailbox and AppState.inbox due to race conditions:
-  // 1. getTeammateMailboxAttachments reads file -> finds message M
-  // 2. InboxPoller reads same file -> queues M in AppState.inbox
-  // 3. getTeammateMailboxAttachments reads AppState -> finds M again
-  // We deduplicate using from+timestamp+text prefix as the key
+  // Combine both sources of messages. Interactive regular teammate delivery now
+  // prefers the live AppState owner path; file-backed regular reads remain only
+  // for viewer, in-process, and non-interactive scenarios.
   const seen = new Set<string>()
   let allMessages: Array<{
+    messageId?: string
     from: string
     text: string
     timestamp: string
@@ -3627,11 +3664,19 @@ async function getTeammateMailboxAttachments(
     summary?: string
   }> = []
 
-  for (const m of [...unreadMessages, ...pendingInboxMessages]) {
-    const key = `${m.from}|${m.timestamp}|${m.text.slice(0, 100)}`
+  for (const m of [
+    ...fileBackedRegularMessages,
+    ...fileBackedProtocolMessages,
+    ...pendingInboxMessages,
+  ]) {
+    const key =
+      typeof m.messageId === 'string' && m.messageId.length > 0
+        ? m.messageId
+        : `${m.from}|${m.timestamp}|${m.text.slice(0, 100)}`
     if (!seen.has(key)) {
       seen.add(key)
       allMessages.push({
+        messageId: m.messageId,
         from: m.from,
         text: m.text,
         timestamp: m.timestamp,
@@ -3664,17 +3709,63 @@ async function getTeammateMailboxAttachments(
     )
   }
 
+  if (silentPendingInboxMessages.length > 0) {
+    const silentClaimedMessageIds = silentPendingInboxMessages
+      .filter(message => !!message.messageId)
+      .map(message => message.messageId as string)
+    if (silentClaimedMessageIds.length > 0) {
+      await finalizeClaimedMessagesAsRead(
+        agentName,
+        silentClaimedMessageIds,
+        currentSessionId,
+        teamName,
+      )
+    }
+
+    const silentPendingIds = new Set(silentPendingInboxMessages.map(m => m.id))
+    toolUseContext.setAppState(prev => ({
+      ...prev,
+      inbox: {
+        messages: prev.inbox.messages.map(message =>
+          silentPendingIds.has(message.id)
+            ? { ...message, status: 'processed' as const }
+            : message,
+        ),
+      },
+    }))
+  }
+
   if (allMessages.length === 0) {
     logForDebugging(`[SwarmMailbox] No messages to deliver, returning empty`)
     return []
   }
 
   logForDebugging(
-    `[SwarmMailbox] Returning ${allMessages.length} message(s) as attachment for "${agentName}" (${unreadMessages.length} from file, ${pendingInboxMessages.length} from AppState, after dedup)`,
+    `[SwarmMailbox] Returning ${allMessages.length} message(s) as attachment for "${agentName}" (${fileBackedRegularMessages.length + fileBackedProtocolMessages.length} from file, ${pendingInboxMessages.length} from AppState, after dedup)`,
   )
 
   // Build the attachment BEFORE marking messages as processed
   // This prevents message loss if any operation below fails
+  if (pendingInboxMessages.length > 0) {
+    const pendingIds = new Set(
+      pendingInboxMessages
+        .filter(message => message.status === 'pending')
+        .map(message => message.id),
+    )
+    if (pendingIds.size > 0) {
+      toolUseContext.setAppState(prev => ({
+        ...prev,
+        inbox: {
+          messages: prev.inbox.messages.map(message =>
+            pendingIds.has(message.id)
+              ? { ...message, status: 'processing' as const }
+              : message,
+          ),
+        },
+      }))
+    }
+  }
+
   const attachment: Attachment[] = [
     {
       type: 'teammate_mailbox',
@@ -3682,16 +3773,33 @@ async function getTeammateMailboxAttachments(
     },
   ]
 
-  // Mark only non-structured mailbox messages as read after attachment is built.
-  // Structured protocol messages stay unread for useInboxPoller to handle.
-  if (unreadMessages.length > 0) {
-    await markMessagesAsReadByPredicate(
+  // File-backed regular messages are delivered only in observer/non-interactive
+  // paths; exact mark-read keeps this path narrow without mutating structured rows.
+  if (
+    fileBackedRegularMessages.length > 0 &&
+    shouldFinalizeFileBackedRegularMessages
+  ) {
+    await markMessagesAsReadByIds(
       agentName,
-      m => !isStructuredProtocolMessage(m.text),
+      fileBackedRegularMessages.map(message => message.messageId),
       teamName,
     )
     logForDebugging(
-      `[MailboxBridge] marked ${unreadMessages.length} non-structured message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
+      `[MailboxBridge] marked ${fileBackedRegularMessages.length} file-backed regular message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
+    )
+  }
+
+  if (
+    fileBackedProtocolMessages.length > 0 &&
+    shouldFinalizeFileBackedProtocolMessages
+  ) {
+    await markMessagesAsReadByIds(
+      agentName,
+      fileBackedProtocolMessages.map(message => message.messageId),
+      teamName,
+    )
+    logForDebugging(
+      `[MailboxBridge] marked ${fileBackedProtocolMessages.length} file-backed protocol message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
     )
   }
 
@@ -3716,7 +3824,7 @@ async function getTeammateMailboxAttachments(
 
         if (teammateId) {
           // Remove from team file
-          removeTeammateFromTeamFile(teamName, {
+          await removeTeammateFromTeamFile(teamName, {
             agentId: teammateId,
             name: teammateToRemove,
           })
@@ -3754,12 +3862,37 @@ async function getTeammateMailboxAttachments(
   // Mark AppState inbox messages as processed LAST, after attachment is built
   // This ensures messages aren't lost if earlier operations fail
   if (pendingInboxMessages.length > 0) {
+    const claimedMessageIds = pendingInboxMessages
+      .filter(
+        message =>
+          !!message.messageId &&
+          message.mailboxClaimedBySessionId === currentSessionId,
+      )
+      .map(message => message.messageId as string)
+    const unclaimedMessageIds = pendingInboxMessages
+      .filter(
+        message =>
+          !!message.messageId &&
+          message.mailboxClaimedBySessionId !== currentSessionId,
+      )
+      .map(message => message.messageId as string)
+
+    await finalizeClaimedMessagesAsRead(
+      agentName,
+      claimedMessageIds,
+      currentSessionId,
+      teamName,
+    )
+    await markMessagesAsReadByIds(agentName, unclaimedMessageIds, teamName)
+
     const pendingIds = new Set(pendingInboxMessages.map(m => m.id))
     toolUseContext.setAppState(prev => ({
       ...prev,
       inbox: {
         messages: prev.inbox.messages.map(m =>
-          pendingIds.has(m.id) ? { ...m, status: 'processed' as const } : m,
+          pendingIds.has(m.id)
+            ? { ...m, status: 'processed' as const }
+            : m,
         ),
       },
     }))

@@ -1163,6 +1163,7 @@ export function classifyAPIError(error: unknown): string {
 export function categorizeRetryableAPIError(
   error: APIError,
 ): SDKAssistantMessageError {
+  const lowerMessage = error.message?.toLowerCase() ?? ''
   if (
     error.status === 529 ||
     error.message?.includes('"type":"overloaded_error"')
@@ -1170,6 +1171,15 @@ export function categorizeRetryableAPIError(
     return 'rate_limit'
   }
   if (error.status === 429) {
+    return 'rate_limit'
+  }
+  if (
+    lowerMessage.includes('quota will reset after') ||
+    lowerMessage.includes('exhausted your capacity on this model') ||
+    lowerMessage.includes('rate limit') ||
+    lowerMessage.includes('rate_limit') ||
+    lowerMessage.includes('resource exhausted')
+  ) {
     return 'rate_limit'
   }
   if (error.status === 401 || error.status === 403) {

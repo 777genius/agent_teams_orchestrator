@@ -1,9 +1,10 @@
+import type { InboxPromptSubmitResult } from './useInboxPoller.js'
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react'
 import { useMailbox } from '../context/mailbox.js'
 
 type Props = {
   isLoading: boolean
-  onSubmitMessage: (content: string) => boolean
+  onSubmitMessage: (content: string) => InboxPromptSubmitResult
 }
 
 export function useMailboxBridge({ isLoading, onSubmitMessage }: Props): void {

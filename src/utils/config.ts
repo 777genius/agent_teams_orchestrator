@@ -239,6 +239,16 @@ export type GlobalConfig = {
     expiresAt: number
     accountId: string
   }
+  geminiBackendPreference?: 'auto' | 'api' | 'cli' | 'cli-sdk'
+  geminiResolvedBackend?: 'api' | 'cli' | 'cli-sdk'
+  codexBackendPreference?: 'auto' | 'adapter'
+  codexResolvedBackend?: 'adapter'
+  geminiProjectId?: string
+  geminiLastAuthMethod?:
+    | 'api_key'
+    | 'adc_authorized_user'
+    | 'adc_service_account'
+    | 'cli_oauth_personal'
   iterm2KeyBindingInstalled?: boolean // Legacy - keeping for backward compatibility
   editorMode?: EditorMode
   bypassPermissionsModeAccepted?: boolean

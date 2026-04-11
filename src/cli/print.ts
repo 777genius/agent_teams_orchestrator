@@ -150,6 +150,8 @@ import { createAbortController } from 'src/utils/abortController.js'
 import { createCombinedAbortSignal } from 'src/utils/combinedAbortSignal.js'
 import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
+import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
+import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -486,11 +488,22 @@ export async function runHeadless(
     enableAuthStatus: boolean | undefined
     agent: string | undefined
     workload: string | undefined
+    teamBootstrapSpecPath?: string | undefined
+    teamBootstrapUserPromptFile?: string | undefined
+    bootstrapContext?: {
+      commands: Command[]
+      tools: Tools
+      mcpClients: MCPServerConnection[]
+    }
+    prepareConversationContext?: (() => Promise<void>) | undefined
     setupTrigger?: 'init' | 'maintenance' | undefined
     sessionStartHooksPromise?: ReturnType<typeof processSessionStartHooks>
     setSDKStatus?: (status: SDKStatus) => void
   },
 ): Promise<void> {
+  logForDebugging(
+    `[team-bootstrap] runHeadless entered spec=${Boolean(options.teamBootstrapSpecPath)} resume=${Boolean(options.resume)} continue=${Boolean(options.continue)}`,
+  )
   if (
     process.env.USER_TYPE === 'ant' &&
     isEnvTruthy(process.env.CLAUDE_CODE_EXIT_AFTER_FIRST_RENDER)
@@ -776,10 +789,42 @@ export async function runHeadless(
     (Boolean(validateUuid(options.resume)) || options.resume.endsWith('.jsonl'))
   const isUsingSdkUrl = Boolean(options.sdkUrl)
 
-  if (!inputPrompt && !hasValidResumeSessionId && !isUsingSdkUrl) {
+  if (
+    !inputPrompt &&
+    !hasValidResumeSessionId &&
+    !isUsingSdkUrl &&
+    !options.teamBootstrapSpecPath &&
+    !options.teamBootstrapUserPromptFile
+  ) {
     process.stderr.write(
       `Error: Input must be provided either through stdin or as a prompt argument when using --print\n`,
     )
+    gracefulShutdownSync(1)
+    return
+  }
+
+  if (options.teamBootstrapUserPromptFile && !options.teamBootstrapSpecPath) {
+    process.stderr.write(
+      'Error: --team-bootstrap-user-prompt-file requires --team-bootstrap-spec\n',
+    )
+    gracefulShutdownSync(1)
+    return
+  }
+
+  const bootstrapStartupValidationError = validateTeamBootstrapStartupOptions({
+    options: {
+      continue: options.continue,
+      resume: options.resume,
+      resumeSessionAt: options.resumeSessionAt,
+      forkSession: options.forkSession,
+      rewindFiles: options.rewindFiles,
+      teamBootstrapSpecPath: options.teamBootstrapSpecPath,
+      teamBootstrapUserPromptFile: options.teamBootstrapUserPromptFile,
+    },
+    inputPrompt,
+  })
+  if (bootstrapStartupValidationError) {
+    process.stderr.write(bootstrapStartupValidationError)
     gracefulShutdownSync(1)
     return
   }
@@ -791,13 +836,6 @@ export async function runHeadless(
     gracefulShutdownSync(1)
     return
   }
-
-  // Filter out MCP tools that are in the deny list
-  const allowedMcpTools = filterToolsByDenyRules(
-    appState.mcp.tools,
-    appState.toolPermissionContext,
-  )
-  let filteredTools = [...tools, ...allowedMcpTools]
 
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
   const effectivePermissionPromptToolName = options.sdkUrl
@@ -818,6 +856,80 @@ export async function runHeadless(
     notifySessionStateChanged('requires_action', details)
   }
 
+  // Install errors handlers to gracefully handle broken pipes (e.g., when parent process dies)
+  registerProcessOutputErrorHandlers()
+
+  headlessProfilerCheckpoint('after_loadInitialMessages')
+
+  const shouldDeferModelStringInit = Boolean(options.teamBootstrapSpecPath)
+  if (!shouldDeferModelStringInit) {
+    // Ensure model strings are initialized before generating model options.
+    // For Bedrock users, this waits for the profile fetch to get correct region strings.
+    await ensureModelStringsInitialized()
+    logForDebugging(
+      '[team-bootstrap] runHeadless after ensureModelStringsInitialized',
+    )
+    headlessProfilerCheckpoint('after_modelStrings')
+  }
+
+  if (options.teamBootstrapSpecPath) {
+    logForDebugging(
+      `[team-bootstrap] runHeadless starting deterministic bootstrap from spec ${options.teamBootstrapSpecPath}`,
+    )
+    const bootstrapAppState = getAppState()
+    const bootstrapAllowedMcpTools = filterToolsByDenyRules(
+      bootstrapAppState.mcp.tools,
+      bootstrapAppState.toolPermissionContext,
+    )
+    await runStartupTeamBootstrap({
+      specPath: options.teamBootstrapSpecPath,
+      userPromptFilePath: options.teamBootstrapUserPromptFile,
+      structuredIO,
+      commands: options.bootstrapContext?.commands ?? [
+        ...commands,
+        ...bootstrapAppState.mcp.commands,
+      ],
+      tools:
+        options.bootstrapContext?.tools ?? [
+          ...tools,
+          ...bootstrapAllowedMcpTools,
+        ],
+      mcpClients:
+        options.bootstrapContext?.mcpClients ?? bootstrapAppState.mcp.clients,
+      agents,
+      getAppState,
+      setAppState,
+      customSystemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
+      thinkingConfig: options.thinkingConfig,
+    })
+    headlessProfilerCheckpoint('after_teamBootstrap')
+  }
+
+  if (options.prepareConversationContext) {
+    logForDebugging(
+      '[team-bootstrap] runHeadless preparing conversation context after deterministic bootstrap',
+    )
+    await options.prepareConversationContext()
+    headlessProfilerCheckpoint('after_prepareConversationContext')
+  }
+
+  if (shouldDeferModelStringInit) {
+    logForDebugging(
+      '[team-bootstrap] runHeadless initializing model strings after deterministic bootstrap',
+    )
+    await ensureModelStringsInitialized()
+    logForDebugging(
+      '[team-bootstrap] runHeadless after deferred ensureModelStringsInitialized',
+    )
+    headlessProfilerCheckpoint('after_modelStrings')
+  }
+
+  const allowedMcpTools = filterToolsByDenyRules(
+    getAppState().mcp.tools,
+    getAppState().toolPermissionContext,
+  )
+  let filteredTools = [...tools, ...allowedMcpTools]
   const canUseTool = getCanUseToolFn(
     effectivePermissionPromptToolName,
     structuredIO,
@@ -825,21 +937,10 @@ export async function runHeadless(
     onPermissionPrompt,
   )
   if (options.permissionPromptToolName) {
-    // Remove the permission prompt tool from the list of available tools.
     filteredTools = filteredTools.filter(
       tool => !toolMatchesName(tool, options.permissionPromptToolName!),
     )
   }
-
-  // Install errors handlers to gracefully handle broken pipes (e.g., when parent process dies)
-  registerProcessOutputErrorHandlers()
-
-  headlessProfilerCheckpoint('after_loadInitialMessages')
-
-  // Ensure model strings are initialized before generating model options.
-  // For Bedrock users, this waits for the profile fetch to get correct region strings.
-  await ensureModelStringsInitialized()
-  headlessProfilerCheckpoint('after_modelStrings')
 
   // UDS inbox store registration is deferred until after `run` is defined
   // so we can pass `run` as the onEnqueue callback (see below).

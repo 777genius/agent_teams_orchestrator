@@ -25,6 +25,7 @@ import type { CacheSafeParams } from '../../utils/forkedAgent.js';
 import { lazySchema } from '../../utils/lazySchema.js';
 import { createUserMessage, extractTextContent, isSyntheticMessage, normalizeMessages } from '../../utils/messages.js';
 import { getAgentModel } from '../../utils/model/agent.js';
+import { EFFORT_LEVELS } from '../../utils/effort.js';
 import { permissionModeSchema } from '../../utils/permissions/PermissionMode.js';
 import type { PermissionResult } from '../../utils/permissions/PermissionResult.js';
 import { filterDeniedAgents, getDenyRuleForAgent } from '../../utils/permissions/permissions.js';
@@ -43,7 +44,10 @@ import { createAgentWorktree, hasWorktreeChanges, removeAgentWorktree } from '..
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js';
 import { BackgroundHint } from '../BashTool/UI.js';
 import { FILE_READ_TOOL_NAME } from '../FileReadTool/prompt.js';
-import { spawnTeammate } from '../shared/spawnMultiAgent.js';
+import {
+  spawnTeammate,
+  type DuplicateSkippedOutput,
+} from '../shared/spawnMultiAgent.js';
 import { setAgentColor } from './agentColorManager.js';
 import { agentToolResultSchema, classifyHandoffIfNeeded, emitTaskProgress, extractPartialResult, finalizeAgentTool, getLastToolUseName, runAsyncAgentLifecycle } from './agentToolUtils.js';
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js';
@@ -83,7 +87,9 @@ const baseInputSchema = lazySchema(() => z.object({
   description: z.string().describe('A short (3-5 word) description of the task'),
   prompt: z.string().describe('The task for the agent to perform'),
   subagent_type: z.string().optional().describe('The type of specialized agent to use for this task'),
-  model: z.enum(['sonnet', 'opus', 'haiku']).optional().describe("Optional model override for this agent. Takes precedence over the agent definition's model frontmatter. If omitted, uses the agent definition's model, or inherits from the parent."),
+  model: z.string().optional().describe("Optional model override for this agent. Takes precedence over the agent definition's model frontmatter. If omitted, uses the agent definition's model, or inherits from the parent."),
+  provider: z.enum(['anthropic', 'codex', 'gemini']).optional().describe('Optional provider override for this agent. When it differs from the leader provider, the teammate is spawned in a separate process.'),
+  effort: z.enum(EFFORT_LEVELS).optional().describe('Optional effort override for this agent. When omitted, inherits the session effort.'),
   run_in_background: z.boolean().optional().describe('Set to true to run this agent in the background. You will be notified when it completes.')
 }));
 
@@ -91,7 +97,7 @@ const baseInputSchema = lazySchema(() => z.object({
 const fullInputSchema = lazySchema(() => {
   // Multi-agent parameters
   const multiAgentInputSchema = z.object({
-    name: z.string().optional().describe('Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running.'),
+    name: z.string().optional().describe('Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running. REQUIRED when team_name is provided to create a persistent teammate.'),
     team_name: z.string().optional().describe('Team name for spawning. Uses current team context if omitted.'),
     mode: permissionModeSchema().optional().describe('Permission mode for spawned teammate (e.g., "plan" to require plan approval).')
   });
@@ -165,6 +171,8 @@ type TeammateSpawnedOutput = {
   agent_id: string;
   agent_type?: string;
   model?: string;
+  provider?: 'anthropic' | 'codex' | 'gemini';
+  effort?: 'low' | 'medium' | 'high' | 'max';
   name: string;
   color?: string;
   tmux_session_name: string;
@@ -173,6 +181,11 @@ type TeammateSpawnedOutput = {
   team_name?: string;
   is_splitpane?: boolean;
   plan_mode_required?: boolean;
+};
+
+type TeammateDuplicateSkippedOutput = DuplicateSkippedOutput & {
+  status: 'teammate_duplicate_skipped';
+  prompt: string;
 };
 
 // Combined output type including both public and internal types
@@ -188,7 +201,11 @@ export type RemoteLaunchedOutput = {
   prompt: string;
   outputFile: string;
 };
-type InternalOutput = Output | TeammateSpawnedOutput | RemoteLaunchedOutput;
+type InternalOutput =
+  | Output
+  | TeammateSpawnedOutput
+  | TeammateDuplicateSkippedOutput
+  | RemoteLaunchedOutput;
 import type { AgentToolProgress, ShellProgress } from '../../types/tools.js';
 // AgentTool forwards both its own progress events and shell progress
 // events from the sub-agent so the SDK receives tool_progress updates during bash/powershell runs.
@@ -241,6 +258,7 @@ export const AgentTool = buildTool({
     subagent_type,
     description,
     model: modelParam,
+    provider,
     run_in_background,
     name,
     team_name,
@@ -269,6 +287,11 @@ export const AgentTool = buildTool({
     const teamName = resolveTeamName({
       team_name
     }, appState);
+    if (teamName && !name) {
+      throw new Error(
+        'Agent calls that include team_name must also include name. Provide name to spawn a persistent teammate, or omit team_name to spawn a regular subagent.',
+      );
+    }
     if (isTeammate() && teamName && name) {
       throw new Error('Teammates cannot spawn other teammates — the team roster is flat. To spawn a subagent instead, omit the `name` parameter.');
     }
@@ -295,6 +318,7 @@ export const AgentTool = buildTool({
         use_splitpane: true,
         plan_mode_required: spawnMode === 'plan',
         model: model ?? agentDef?.model,
+        provider,
         agent_type: subagent_type,
         invokingRequestId: assistantMessage?.requestId
       }, toolUseContext);
@@ -303,11 +327,18 @@ export const AgentTool = buildTool({
       // This type is excluded from the exported outputSchema for dead code elimination.
       // Cast through unknown because TeammateSpawnedOutput is intentionally
       // not part of the exported Output union (for dead code elimination purposes).
-      const spawnResult: TeammateSpawnedOutput = {
-        status: 'teammate_spawned' as const,
-        prompt,
-        ...result.data
-      };
+      const spawnResult: TeammateSpawnedOutput | TeammateDuplicateSkippedOutput =
+        result.data.status === 'duplicate_skipped'
+          ? {
+              status: 'teammate_duplicate_skipped' as const,
+              prompt,
+              ...result.data,
+            }
+          : {
+              status: 'teammate_spawned' as const,
+              prompt,
+              ...result.data,
+            };
       return {
         data: spawnResult
       } as unknown as {
@@ -1310,6 +1341,32 @@ agent_id: ${spawnData.teammate_id}
 name: ${spawnData.name}
 team_name: ${spawnData.team_name}
 The agent is now running and will receive instructions via mailbox.`
+        }]
+      };
+    }
+    if (
+      typeof internalData === 'object' &&
+      internalData !== null &&
+      'status' in internalData &&
+      internalData.status === 'teammate_duplicate_skipped'
+    ) {
+      const duplicateData = internalData as TeammateDuplicateSkippedOutput;
+      const detail =
+        duplicateData.reason === 'already_running'
+          ? 'The teammate is already running.'
+          : 'The teammate is already starting and bootstrap is still pending.';
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: [{
+          type: 'text',
+          text: `Duplicate spawn skipped.
+status: duplicate_skipped
+reason: ${duplicateData.reason}
+agent_id: ${duplicateData.teammate_id}
+name: ${duplicateData.name}
+team_name: ${duplicateData.team_name}
+${detail}`
         }]
       };
     }

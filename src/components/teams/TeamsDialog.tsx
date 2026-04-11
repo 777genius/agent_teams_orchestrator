@@ -564,8 +564,14 @@ async function killTeammate(paneId: string, backendType: PaneBackendType | undef
     // teammates have no pane to kill, so this is correct for them.
     logForDebugging(`[TeamsDialog] Skipping pane kill for ${paneId}: no backendType recorded`);
   }
-  // Remove from team config file
-  removeMemberFromTeam(teamName, paneId);
+  // Remove from team config file, but never let a lock/write issue abort the
+  // rest of teammate teardown. Task unassignment and leader notification must
+  // still happen even if persisted roster cleanup is temporarily unavailable.
+  try {
+    await removeMemberFromTeam(teamName, paneId);
+  } catch (error) {
+    logForDebugging(`[TeamsDialog] Failed to remove teammate ${teammateId} from team file: ${error}`);
+  }
 
   // Unassign tasks and build notification message
   const {
@@ -644,7 +650,7 @@ async function showTeammate(teammate: TeammateStatus, teamName: string): Promise
  */
 function sendModeChangeToTeammate(teammateName: string, teamName: string, targetMode: PermissionMode): void {
   // Update config.json directly so UI shows the change immediately
-  setMemberMode(teamName, teammateName, targetMode);
+  void setMemberMode(teamName, teammateName, targetMode);
 
   // Also send message so teammate updates their local permission context
   const message = createModeSetRequestMessage({
@@ -696,7 +702,7 @@ function cycleAllTeammateModes(teammates: TeammateStatus[], teamName: string, is
     memberName: t.name,
     mode: targetMode
   }));
-  setMultipleMemberModes(teamName, modeUpdates);
+  void setMultipleMemberModes(teamName, modeUpdates);
 
   // Send mailbox messages to each teammate
   for (const teammate of teammates) {

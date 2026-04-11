@@ -1,5 +1,8 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
+import { stdin as input, stdout as output } from 'process'
+import { createInterface } from 'readline/promises'
+
 import {
   clearAuthRelatedCaches,
   performLogout,
@@ -21,9 +24,13 @@ import { getOauthProfileFromOauthToken } from '../../services/oauth/getOauthProf
 import { OAuthService } from '../../services/oauth/index.js'
 import type { OAuthTokens } from '../../services/oauth/types.js'
 import {
+  clearCodexOAuthTokens,
+  clearOfficialCodexCliOAuthTokens,
   clearOAuthTokenCache,
+  getGeminiAuthMethod,
   getAnthropicApiKeyWithSource,
   getAuthTokenSource,
+  getCodexOAuthTokens,
   getOauthAccountInfo,
   getSubscriptionType,
   isUsing3PServices,
@@ -31,7 +38,7 @@ import {
   saveOAuthTokensIfNeeded,
   validateForceLoginOrg,
 } from '../../utils/auth.js'
-import { saveGlobalConfig } from '../../utils/config.js'
+import { getGlobalConfig, saveGlobalConfig } from '../../utils/config.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isRunningOnHomespace } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
@@ -43,6 +50,131 @@ import {
   buildAccountProperties,
   buildAPIProviderProperties,
 } from '../../utils/status.js'
+import {
+  getGeminiBackendPreference,
+  resolveGeminiBackend,
+} from '../../services/gemini/backendResolver.js'
+import { runCodexOAuthFlow } from '../../services/oauth/codex-client.js'
+
+type AuthProviderTarget = 'anthropic' | 'codex' | 'all'
+
+export type ProviderStatusPayload = {
+  supported: boolean
+  authenticated: boolean
+  authMethod: string | null
+  verificationState: 'verified' | 'unknown' | 'offline' | 'error'
+  canLoginFromUi: boolean
+  capabilities: {
+    teamLaunch: boolean
+    oneShot: boolean
+  }
+  statusMessage?: string | null
+}
+
+export function getAnthropicProviderStatus(): ProviderStatusPayload {
+  const { source: authTokenSource, hasToken } = getAuthTokenSource()
+  const { source: apiKeySource } = getAnthropicApiKeyWithSource()
+  const hasApiKeyEnvVar =
+    !!process.env.ANTHROPIC_API_KEY && !isRunningOnHomespace()
+
+  const authenticated = hasToken || apiKeySource !== 'none' || hasApiKeyEnvVar
+  let authMethod: string | null = null
+
+  if (authTokenSource === 'claude.ai') {
+    authMethod = 'claude.ai'
+  } else if (authTokenSource === 'apiKeyHelper') {
+    authMethod = 'api_key_helper'
+  } else if (authTokenSource !== 'none') {
+    authMethod = 'oauth_token'
+  } else if (apiKeySource === 'ANTHROPIC_API_KEY' || hasApiKeyEnvVar) {
+    authMethod = 'api_key'
+  } else if (apiKeySource === '/login managed key') {
+    authMethod = 'claude.ai'
+  }
+
+  return {
+    supported: true,
+    authenticated,
+    authMethod,
+    verificationState: 'verified',
+    canLoginFromUi: true,
+    capabilities: {
+      teamLaunch: true,
+      oneShot: true,
+    },
+  }
+}
+
+export function getCodexProviderStatus(): ProviderStatusPayload {
+  const cfg = getGlobalConfig()
+  const legacyOpenAiTokens = cfg?.openaiOauthTokens
+  const codexTokens = getCodexOAuthTokens()
+  const authenticated = Boolean(
+    codexTokens?.accessToken ||
+      (legacyOpenAiTokens?.access_token &&
+        legacyOpenAiTokens?.scopes?.includes('codex')),
+  )
+
+  return {
+    supported: true,
+    authenticated,
+    authMethod: authenticated ? 'oauth_token' : null,
+    verificationState: 'verified',
+    canLoginFromUi: true,
+    capabilities: {
+      teamLaunch: true,
+      oneShot: true,
+    },
+    statusMessage:
+      !authenticated && getAPIProvider() === 'openai'
+        ? 'OpenAI provider is enabled but no Codex OAuth session is stored.'
+        : null,
+  }
+}
+
+export function getAllProviderStatuses(): Record<'anthropic' | 'codex', ProviderStatusPayload> {
+  return {
+    anthropic: getAnthropicProviderStatus(),
+    codex: getCodexProviderStatus(),
+  }
+}
+
+async function promptForCodexManualInput(): Promise<string> {
+  const rl = createInterface({ input, output })
+  try {
+    return await rl.question(
+      'Paste the full redirect URL (or just the authorization code) if the browser callback does not complete automatically:\n',
+    )
+  } finally {
+    rl.close()
+  }
+}
+
+async function authLoginCodex(): Promise<void> {
+  try {
+    const codexTokens = await runCodexOAuthFlow(
+      async url => {
+        process.stdout.write('Opening browser to sign in to Codex...\n')
+        process.stdout.write(`If the browser did not open, visit: ${url}\n`)
+      },
+      async () => promptForCodexManualInput(),
+    )
+    saveCodexOAuthTokens(codexTokens)
+    process.stdout.write('Codex login successful.\n')
+    process.exit(0)
+  } catch (err) {
+    logError(err)
+    process.stderr.write(`Codex login failed: ${errorMessage(err)}\n`)
+    process.exit(1)
+  }
+}
+
+function clearLegacyOpenAIOAuthTokens(): void {
+  saveGlobalConfig(cfg => {
+    const { openaiOauthTokens: _legacyTokens, ...rest } = cfg
+    return rest as typeof cfg
+  })
+}
 
 /**
  * Returns true if the token carries any Anthropic-issued scope (user:* or org:*).
@@ -135,12 +267,54 @@ export async function authLogin({
   sso,
   console: useConsole,
   claudeai,
+  provider,
 }: {
   email?: string
   sso?: boolean
   console?: boolean
   claudeai?: boolean
+  provider?: AuthProviderTarget
 }): Promise<void> {
+  if (provider === 'codex') {
+    await authLoginCodex()
+    return
+  }
+
+  if (provider === 'all') {
+    process.stderr.write("Error: '--provider all' is not valid for auth login.\n")
+    process.exit(1)
+  }
+
+  if (provider !== 'anthropic' && getAPIProvider() === 'gemini') {
+    const resolution = await resolveGeminiBackend()
+    if (resolution.backend) {
+      process.stdout.write(
+        `Gemini authentication is configured correctly.\nBackend: gemini-${resolution.backend.kind}\n`,
+      )
+      process.exit(0)
+    }
+    process.stderr.write(
+      `Gemini setup required: ${resolution.status.message ?? 'Gemini is not configured correctly.'}\n`,
+    )
+    if (resolution.status.hint) {
+      process.stderr.write(`${resolution.status.hint}\n`)
+    }
+    if (getGeminiBackendPreference() !== 'cli') {
+      process.stderr.write(
+        "For OAuth/ADC, run: gcloud auth application-default login --client-id-file=client_secret.json --scopes='https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/generative-language.retriever'\n",
+      )
+      process.stderr.write(
+        'Then set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_PROJECT_ID, or GCLOUD_PROJECT to your billed Google Cloud project.\n',
+      )
+    }
+    if (getGeminiBackendPreference() !== 'api') {
+      process.stderr.write(
+        'For Gemini CLI backend, sign in with the installed `gemini` CLI first or force CLAUDE_CODE_GEMINI_BACKEND=api.\n',
+      )
+    }
+    process.exit(1)
+  }
+
   if (useConsole && claudeai) {
     process.stderr.write(
       'Error: --console and --claudeai cannot be used together.\n',
@@ -253,7 +427,96 @@ export async function authLogin({
 export async function authStatus(opts: {
   json?: boolean
   text?: boolean
+  provider?: AuthProviderTarget
 }): Promise<void> {
+  if (opts.provider === 'all') {
+    const output = {
+      schemaVersion: 1,
+      providers: getAllProviderStatuses(),
+    }
+    if (opts.text) {
+      for (const [providerId, status] of Object.entries(output.providers)) {
+        process.stdout.write(
+          `${providerId}: ${status.authenticated ? 'authenticated' : 'not_authenticated'}\n`,
+        )
+      }
+    } else {
+      process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    }
+    process.exit(0)
+  }
+
+  if (opts.provider === 'anthropic') {
+    const status = getAnthropicProviderStatus()
+    const output = {
+      schemaVersion: 1,
+      provider: 'anthropic',
+      status,
+    }
+    process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    process.exit(0)
+  }
+
+  if (opts.provider === 'codex') {
+    const status = getCodexProviderStatus()
+    const output = {
+      schemaVersion: 1,
+      provider: 'codex',
+      status,
+    }
+    process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    process.exit(0)
+  }
+
+  if (getAPIProvider() === 'gemini') {
+    const resolution = await resolveGeminiBackend()
+    const loggedIn = Boolean(resolution.backend)
+    const authMethod = loggedIn ? await getGeminiAuthMethod() : 'none'
+    const output: Record<string, string | boolean | null> = {
+      loggedIn,
+      authMethod,
+      apiProvider: 'gemini',
+      backend: resolution.backend ? `gemini-${resolution.backend.kind}` : null,
+      apiKeySource: process.env.GEMINI_API_KEY ? 'GEMINI_API_KEY' : null,
+      projectId: resolution.status.projectId ?? null,
+      endpoint: resolution.status.endpointLabel,
+      baseURL:
+        resolution.backend?.kind === 'cli'
+          ? null
+          : process.env.GEMINI_BASE_URL ?? 'https://generativelanguage.googleapis.com',
+      apiVersion:
+        resolution.backend?.kind === 'cli'
+          ? null
+          : process.env.GEMINI_API_VERSION ?? 'v1',
+    }
+    if (opts.text) {
+      process.stdout.write('API provider: Google Gemini\n')
+      if (output.backend) {
+        process.stdout.write(`Backend: ${output.backend}\n`)
+      }
+      process.stdout.write(`Auth method: ${authMethod}\n`)
+      if (output.projectId) {
+        process.stdout.write(`Project ID: ${output.projectId}\n`)
+      }
+      process.stdout.write(`Endpoint: ${output.endpoint}\n`)
+      if (resolution.backend?.kind !== 'cli') {
+        process.stdout.write(`Base URL: ${output.baseURL}\n`)
+        process.stdout.write(`API version: ${output.apiVersion}\n`)
+      }
+      if (!loggedIn) {
+        process.stdout.write(
+          `Not logged in. ${resolution.status.message ?? 'Configure Gemini auth.'}\n`,
+        )
+        if (resolution.status.hint) {
+          process.stdout.write(`${resolution.status.hint}\n`)
+        }
+      }
+    } else {
+      process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    }
+    process.exit(loggedIn ? 0 : 1)
+  }
+
   const { source: authTokenSource, hasToken } = getAuthTokenSource()
   const { source: apiKeySource } = getAnthropicApiKeyWithSource()
   const hasApiKeyEnvVar =
@@ -340,12 +603,48 @@ export async function authStatus(opts: {
 }
 
 export async function authLogout(): Promise<void> {
+  await authLogoutByProvider()
+}
+
+export async function authLogoutByProvider(
+  provider?: AuthProviderTarget,
+): Promise<void> {
+  if (provider === 'codex') {
+    clearCodexOAuthTokens()
+    clearLegacyOpenAIOAuthTokens()
+    await clearOfficialCodexCliOAuthTokens()
+    process.stdout.write('Successfully logged out from Codex.\n')
+    process.exit(0)
+  }
+
+  if (provider === 'all') {
+    clearCodexOAuthTokens()
+    clearLegacyOpenAIOAuthTokens()
+    await clearOfficialCodexCliOAuthTokens()
+  }
+
   try {
+    if (!provider && getAPIProvider() === 'gemini') {
+      saveGlobalConfig(current => ({
+        ...current,
+        geminiResolvedBackend: undefined,
+        geminiLastAuthMethod: undefined,
+        geminiProjectId: undefined,
+      }))
+      process.stdout.write(
+        'Cleared local Gemini setup metadata. External Gemini CLI, Google ADC, and API key credentials were left untouched.\n',
+      )
+      process.exit(0)
+    }
     await performLogout({ clearOnboarding: false })
   } catch {
     process.stderr.write('Failed to log out.\n')
     process.exit(1)
   }
-  process.stdout.write('Successfully logged out from your Anthropic account.\n')
+  process.stdout.write(
+    provider === 'all'
+      ? 'Successfully logged out from Anthropic and Codex.\n'
+      : 'Successfully logged out from your Anthropic account.\n',
+  )
   process.exit(0)
 }

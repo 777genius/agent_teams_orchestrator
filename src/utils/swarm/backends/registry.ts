@@ -1,5 +1,6 @@
 import { getIsNonInteractiveSession } from '../../../bootstrap/state.js'
 import { logForDebugging } from '../../../utils/debug.js'
+import { isEnvTruthy } from '../../../utils/envUtils.js'
 import { getPlatform } from '../../../utils/platform.js'
 import {
   isInITerm2,
@@ -349,16 +350,36 @@ function getTeammateMode(): 'auto' | 'tmux' | 'in-process' {
  *   - Otherwise, use in-process (return true)
  */
 export function isInProcessEnabled(): boolean {
-  // Force in-process mode for non-interactive sessions (-p mode)
-  // since tmux-based teammates don't make sense without a terminal UI
+  const mode = getTeammateMode()
+
+  // Force in-process mode for non-interactive sessions (-p mode), except for
+  // app-managed team runtimes that explicitly set a narrow backend override.
+  // This avoids changing broader SDK/auth semantics just to prefer pane-based
+  // teammates for persistent desktop teams.
   if (getIsNonInteractiveSession()) {
+    if (mode === 'in-process') {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, explicit in-process mode)',
+      )
+      return true
+    }
+    if (inProcessFallbackActive) {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, fallback after pane backend unavailable)',
+      )
+      return true
+    }
+    if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: false (forced process teammates for non-interactive session)',
+      )
+      return false
+    }
     logForDebugging(
       '[BackendRegistry] isInProcessEnabled: true (non-interactive session)',
     )
     return true
   }
-
-  const mode = getTeammateMode()
 
   let enabled: boolean
   if (mode === 'in-process') {

@@ -82,6 +82,12 @@ export class InProcessBackend implements TeammateExecutor {
       }
     }
 
+    if (config.provider) {
+      logForDebugging(
+        `[InProcessBackend] ignoring provider override for ${config.name}; provider selection is process-scoped`,
+      )
+    }
+
     logForDebugging(`[InProcessBackend] spawn() called for ${config.name}`)
 
     const result = await spawnInProcessTeammate(
@@ -91,6 +97,8 @@ export class InProcessBackend implements TeammateExecutor {
         prompt: config.prompt,
         color: config.color,
         planModeRequired: config.planModeRequired ?? false,
+        model: config.model,
+        effort: config.effort,
       },
       this.context,
     )
@@ -122,6 +130,7 @@ export class InProcessBackend implements TeammateExecutor {
         toolUseContext: { ...this.context, messages: [] },
         abortController: result.abortController,
         model: config.model,
+        effort: config.effort,
         systemPrompt: config.systemPrompt,
         systemPromptMode: config.systemPromptMode,
         allowedTools: config.permissions,
@@ -280,7 +289,10 @@ export class InProcessBackend implements TeammateExecutor {
     }
 
     // Kill the teammate via the existing helper function
-    const killed = killInProcessTeammate(task.id, this.context.setAppState)
+    const killed = await killInProcessTeammate(
+      task.id,
+      this.context.setAppState,
+    )
 
     logForDebugging(
       `[InProcessBackend] kill() ${killed ? 'succeeded' : 'failed'} for ${agentId}`,

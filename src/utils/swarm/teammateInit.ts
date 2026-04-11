@@ -16,7 +16,24 @@ import {
   getLastPeerDmSummary,
   writeToMailbox,
 } from '../teammateMailbox.js'
-import { readTeamFile, setMemberActive } from './teamHelpers.js'
+import type { TeamFile } from './teamHelpers.js'
+import {
+  getTrackedMemberActiveState,
+  readTeamFile,
+  setMemberActive,
+} from './teamHelpers.js'
+
+export function shouldEmitProcessBackedIdleNotification(
+  teamFile: TeamFile | null,
+  agentName: string,
+  trackedActiveState?: boolean,
+): boolean {
+  if (trackedActiveState !== undefined) {
+    return trackedActiveState !== false
+  }
+  const member = teamFile?.members.find(candidate => candidate.name === agentName)
+  return member?.isActive !== false
+}
 
 /**
  * Initializes hooks for a teammate running in a swarm.
@@ -101,8 +118,23 @@ export function initializeTeammateHooks(
     'Stop',
     '', // No matcher - applies to all Stop events
     async (messages, _signal) => {
+      const trackedActiveState = getTrackedMemberActiveState(teamName, agentName)
+      const latestTeamFile = readTeamFile(teamName)
+      const shouldEmitIdle = shouldEmitProcessBackedIdleNotification(
+        latestTeamFile,
+        agentName,
+        trackedActiveState,
+      )
+
       // Mark this teammate as idle in the team config (fire and forget)
       void setMemberActive(teamName, agentName, false)
+
+      if (!shouldEmitIdle) {
+        logForDebugging(
+          `[TeammateInit] Skipping duplicate idle notification for ${agentName}`,
+        )
+        return true
+      }
 
       // Send idle notification to the team leader using agent name (not UUID)
       // Must await to ensure the write completes before process shutdown

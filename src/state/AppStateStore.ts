@@ -351,6 +351,8 @@ export type AppState = DeepImmutable<{
   inbox: {
     messages: Array<{
       id: string
+      messageId?: string
+      mailboxClaimedBySessionId?: string
       from: string
       text: string
       timestamp: string

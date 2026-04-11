@@ -117,6 +117,11 @@ import {
 } from '../mcp/client.js'
 import { mcpInfoFromString } from '../mcp/mcpStringUtils.js'
 import { normalizeNameForMCP } from '../mcp/normalization.js'
+import {
+  BOOTSTRAP_MEMBER_BRIEFING_LOOP_ABORT_REASON,
+  BootstrapMemberBriefingLoopAbortError,
+  isBootstrapMemberBriefingLoopAbortReason,
+} from '../teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 import type { MCPServerConnection } from '../mcp/types.js'
 import {
   getLoggingSafeMcpBaseUrl,
@@ -1688,6 +1693,54 @@ async function checkPermissionsAndCallTool(
         ...(mcpServerScope && { mcp_server_scope: mcpServerScope }),
       })
     }
+
+    if (error instanceof BootstrapMemberBriefingLoopAbortError) {
+      const content = formatError(error)
+      const hookMessages: MessageUpdateLazy<
+        AttachmentMessage | ProgressMessage<HookProgress>
+      >[] = []
+      for await (const hookResult of runPostToolUseFailureHooks(
+        toolUseContext,
+        tool,
+        toolUseID,
+        messageId,
+        processedInput,
+        content,
+        false,
+        requestId,
+        mcpServerType,
+        mcpServerBaseUrl,
+      )) {
+        hookMessages.push(hookResult)
+      }
+      if (
+        !isBootstrapMemberBriefingLoopAbortReason(
+          toolUseContext.abortController.signal.reason,
+        )
+      ) {
+        toolUseContext.abortController.abort(
+          BOOTSTRAP_MEMBER_BRIEFING_LOOP_ABORT_REASON,
+        )
+      }
+      return [
+        {
+          message: createUserMessage({
+            content: [
+              {
+                type: 'tool_result',
+                content,
+                is_error: true,
+                tool_use_id: toolUseID,
+              },
+            ],
+            toolUseResult: `Error: ${content}`,
+            sourceToolAssistantUUID: assistantMessage.uuid,
+          }),
+        },
+        ...hookMessages,
+      ]
+    }
+
     const content = formatError(error)
 
     // Determine if this was a user interrupt

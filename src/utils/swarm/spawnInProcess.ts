@@ -69,6 +69,8 @@ export type InProcessSpawnConfig = {
   planModeRequired: boolean
   /** Optional model override for this teammate */
   model?: string
+  /** Optional effort override for this teammate */
+  effort?: 'low' | 'medium' | 'high' | 'max'
 }
 
 /**
@@ -105,7 +107,7 @@ export async function spawnInProcessTeammate(
   config: InProcessSpawnConfig,
   context: SpawnContext,
 ): Promise<InProcessSpawnOutput> {
-  const { name, teamName, prompt, color, planModeRequired, model } = config
+  const { name, teamName, prompt, color, planModeRequired, model, effort } = config
   const { setAppState } = context
 
   // Generate deterministic agent ID
@@ -166,6 +168,7 @@ export async function spawnInProcessTeammate(
       identity,
       prompt,
       model,
+      effort,
       abortController,
       awaitingPlanApproval: false,
       spinnerVerb: sample(getSpinnerVerbs()),
@@ -224,10 +227,10 @@ export async function spawnInProcessTeammate(
  * @param setAppState - AppState setter
  * @returns true if killed successfully
  */
-export function killInProcessTeammate(
+export async function killInProcessTeammate(
   taskId: string,
   setAppState: SetAppStateFn,
-): boolean {
+): Promise<boolean> {
   let killed = false
   let teamName: string | null = null
   let agentId: string | null = null
@@ -298,9 +301,17 @@ export function killInProcessTeammate(
     }
   })
 
-  // Remove from team file (outside state updater to avoid file I/O in callback)
+  // Remove from team file (outside state updater to avoid file I/O in callback).
+  // This cleanup is best-effort: a transient lock/write failure must not block
+  // task eviction, SDK termination, or registry cleanup for the killed teammate.
   if (teamName && agentId) {
-    removeMemberByAgentId(teamName, agentId)
+    try {
+      await removeMemberByAgentId(teamName, agentId)
+    } catch (error) {
+      logForDebugging(
+        `[killInProcessTeammate] Failed to remove ${agentId} from team file ${teamName}: ${error}`,
+      )
+    }
   }
 
   if (killed) {

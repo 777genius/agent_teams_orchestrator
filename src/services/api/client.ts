@@ -8,9 +8,9 @@ import {
   getClaudeAIOAuthTokens,
   getCodexOAuthTokens,
   isClaudeAISubscriber,
-  isCodexSubscriber,
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
+  shouldUseCodexProviderRoutingForCurrentProcess,
 } from 'src/utils/auth.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
@@ -31,6 +31,7 @@ import {
   isEnvTruthy,
 } from '../../utils/envUtils.js'
 import { createCodexFetch } from './codex-fetch-adapter.js'
+import { createGeminiFetch } from './gemini-fetch-adapter.js'
 
 /**
  * Environment variables for different client types:
@@ -300,8 +301,23 @@ export async function getAnthropicClient({
     return new AnthropicVertex(vertexArgs) as unknown as Anthropic
   }
 
+  if (getAPIProvider() === 'gemini') {
+    const geminiFetch = createGeminiFetch()
+    const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
+      apiKey: 'gemini-placeholder',
+      ...ARGS,
+      fetch: geminiFetch as unknown as typeof globalThis.fetch,
+      ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+    }
+    return new Anthropic(clientConfig)
+  }
+
   // ── Codex (OpenAI) provider via fetch adapter ─────────────────────
-  if (isCodexSubscriber()) {
+  // This branch follows the effective provider routing decision, not just raw
+  // Codex capability. A host-managed child may have Codex tokens available in
+  // the ambient environment while still being explicitly pinned to Anthropic,
+  // Gemini, or another provider for this session.
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     const codexTokens = getCodexOAuthTokens()
     if (codexTokens?.accessToken) {
       const codexFetch = createCodexFetch(codexTokens.accessToken)

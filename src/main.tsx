@@ -84,7 +84,7 @@ import { isAnalyticsDisabled } from 'src/services/analytics/config.js';
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js';
 import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from 'src/services/analytics/index.js';
 import { initializeAnalyticsGates } from 'src/services/analytics/sink.js';
-import { getOriginalCwd, setAdditionalDirectoriesForClaudeMd, setIsRemoteMode, setMainLoopModelOverride, setMainThreadAgentType, setTeleportedSessionInfo } from './bootstrap/state.js';
+import { getOriginalCwd, setAdditionalDirectoriesForClaudeMd, setFlagDisallowedTools, setFlagMcpConfig, setIsRemoteMode, setMainLoopModelOverride, setMainThreadAgentType, setTeleportedSessionInfo } from './bootstrap/state.js';
 import { filterCommandsForRemoteMode, getCommands } from './commands.js';
 import type { StatsStore } from './context/stats.js';
 import { launchAssistantInstallWizard, launchAssistantSessionChooser, launchInvalidSettingsDialog, launchResumeChooser, launchSnapshotUpdateDialog, launchTeleportRepoMismatchDialog, launchTeleportResumeWrapper } from './dialogLaunchers.js';
@@ -165,7 +165,7 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
-import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
+import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('./utils/permissions/autoModeState.js') as typeof import('./utils/permissions/autoModeState.js') : null;
@@ -988,7 +988,7 @@ async function run(): Promise<CommanderCommand> {
   }).hideHelp()).option('--replay-user-messages', 'Re-emit user messages from stdin back on stdout for acknowledgment (only works with --input-format=stream-json and --output-format=stream-json)', () => true).addOption(new Option('--enable-auth-status', 'Enable auth status messages in SDK mode').default(false).hideHelp()).option('--allowedTools, --allowed-tools <tools...>', 'Comma or space-separated list of tool names to allow (e.g. "Bash(git:*) Edit")').option('--tools <tools...>', 'Specify the list of available tools from the built-in set. Use "" to disable all tools, "default" to use all tools, or specify tool names (e.g. "Bash,Edit,Read").').option('--disallowedTools, --disallowed-tools <tools...>', 'Comma or space-separated list of tool names to deny (e.g. "Bash(git:*) Edit")').option('--mcp-config <configs...>', 'Load MCP servers from JSON files or strings (space-separated)').addOption(new Option('--permission-prompt-tool <tool>', 'MCP tool to use for permission prompts (only works with --print)').argParser(String).hideHelp()).addOption(new Option('--system-prompt <prompt>', 'System prompt to use for the session').argParser(String)).addOption(new Option('--system-prompt-file <file>', 'Read system prompt from a file').argParser(String).hideHelp()).addOption(new Option('--append-system-prompt <prompt>', 'Append a system prompt to the default system prompt').argParser(String)).addOption(new Option('--append-system-prompt-file <file>', 'Read system prompt from a file and append to the default system prompt').argParser(String).hideHelp()).addOption(new Option('--permission-mode <mode>', 'Permission mode to use for the session').argParser(String).choices(PERMISSION_MODES)).option('-c, --continue', 'Continue the most recent conversation in the current directory', () => true).option('-r, --resume [value]', 'Resume a conversation by session ID, or open interactive picker with optional search term', value => value || true).option('--fork-session', 'When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)', () => true).addOption(new Option('--prefill <text>', 'Pre-fill the prompt input with text without submitting it').hideHelp()).addOption(new Option('--deep-link-origin', 'Signal that this session was launched from a deep link').hideHelp()).addOption(new Option('--deep-link-repo <slug>', 'Repo slug the deep link ?repo= parameter resolved to the current cwd').hideHelp()).addOption(new Option('--deep-link-last-fetch <ms>', 'FETCH_HEAD mtime in epoch ms, precomputed by the deep link trampoline').argParser(v => {
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
-  }).hideHelp()).option('--from-pr [value]', 'Resume a session linked to a PR by PR number/URL, or open interactive picker with optional search term', value => value || true).option('--no-session-persistence', 'Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)').addOption(new Option('--resume-session-at <message id>', 'When resuming, only messages up to and including the assistant message with <message.id> (use with --resume in print mode)').argParser(String).hideHelp()).addOption(new Option('--rewind-files <user-message-id>', 'Restore files to state at the specified user message and exit (requires --resume)').hideHelp())
+  }).hideHelp()).option('--from-pr [value]', 'Resume a session linked to a PR by PR number/URL, or open interactive picker with optional search term', value => value || true).option('--no-session-persistence', 'Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)').addOption(new Option('--resume-session-at <message id>', 'When resuming, only messages up to and including the assistant message with <message.id> (use with --resume in print mode)').argParser(String).hideHelp()).addOption(new Option('--rewind-files <user-message-id>', 'Restore files to state at the specified user message and exit (requires --resume)').hideHelp()).addOption(new Option('--team-bootstrap-spec <file>', 'Run deterministic team bootstrap from a spec file before the first user turn').hideHelp()).addOption(new Option('--team-bootstrap-user-prompt-file <file>', 'Queue the first real user task from a file after deterministic bootstrap completes').hideHelp())
   // @[MODEL LAUNCH]: Update the example model ID in the --model help text.
   .option('--model <model>', `Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').`).addOption(new Option('--effort <level>', `Effort level for the current session (low, medium, high, max)`).argParser((rawValue: string) => {
     const value = rawValue.toLowerCase();
@@ -1412,12 +1412,15 @@ async function run(): Promise<CommanderCommand> {
 
     // Parse the MCP config files/strings if provided
     let dynamicMcpConfig: Record<string, ScopedMcpServerConfig> = {};
+    const processedMcpConfigs = (mcpConfig || [])
+      .map(config => config.trim())
+      .filter(config => config.length > 0);
+    setFlagMcpConfig(processedMcpConfigs);
+    setFlagDisallowedTools(disallowedTools);
     if (mcpConfig && mcpConfig.length > 0) {
-      // Process mcpConfig array
-      const processedConfigs = mcpConfig.map(config => config.trim()).filter(config => config.length > 0);
       let allConfigs: Record<string, McpServerConfig> = {};
       const allErrors: ValidationError[] = [];
-      for (const configItem of processedConfigs) {
+      for (const configItem of processedMcpConfigs) {
         let configs: Record<string, McpServerConfig> | null = null;
         let errors: ValidationError[] = [];
 
@@ -1578,6 +1581,7 @@ async function run(): Promise<CommanderCommand> {
 
     // Extract strict MCP config flag
     const strictMcpConfig = options.strictMcpConfig || false;
+    setStrictMcpConfig(strictMcpConfig);
 
     // Check if enterprise MCP configuration exists. When it does, only allow dynamic MCP
     // configs that contain special server types (sdk)
@@ -2717,110 +2721,87 @@ async function run(): Promise<CommanderCommand> {
           }));
         }, configs).catch(err => logForDebugging(`[MCP] ${label} connect error: ${err}`));
       };
-      // Await all MCP configs — print mode is often single-turn, so
-      // "late-connecting servers visible next turn" doesn't help. SDK init
-      // message and turn-1 tool list both need configured MCP tools present.
-      // Zero-server case is free via the early return in connectMcpBatch.
-      // Connectors parallelize inside getMcpToolsCommandsAndResources
-      // (processBatched with Promise.all). claude.ai is awaited too — its
-      // fetch was kicked off early (line ~2558) so only residual time blocks
-      // here. --bare skips claude.ai entirely for perf-sensitive scripts.
-      profileCheckpoint('before_connectMcp');
-      await connectMcpBatch(regularMcpConfigs, 'regular');
-      profileCheckpoint('after_connectMcp');
-      // Dedup: suppress plugin MCP servers that duplicate a claude.ai
-      // connector (connector wins), then connect claude.ai servers.
-      // Bounded wait — #23725 made this blocking so single-turn -p sees
-      // connectors, but with 40+ slow connectors tengu_startup_perf p99
-      // climbed to 76s. If fetch+connect doesn't finish in time, proceed;
-      // the promise keeps running and updates headlessStore in the
-      // background so turn 2+ still sees connectors.
-      const CLAUDE_AI_MCP_TIMEOUT_MS = 5_000;
-      const claudeaiConnect = claudeaiConfigPromise.then(claudeaiConfigs => {
-        if (Object.keys(claudeaiConfigs).length > 0) {
-          const claudeaiSigs = new Set<string>();
-          for (const config of Object.values(claudeaiConfigs)) {
-            const sig = getMcpServerSignature(config);
-            if (sig) claudeaiSigs.add(sig);
-          }
-          const suppressed = new Set<string>();
-          for (const [name, config] of Object.entries(regularMcpConfigs)) {
-            if (!name.startsWith('plugin:')) continue;
-            const sig = getMcpServerSignature(config);
-            if (sig && claudeaiSigs.has(sig)) suppressed.add(name);
-          }
-          if (suppressed.size > 0) {
-            logForDebugging(`[MCP] Lazy dedup: suppressing ${suppressed.size} plugin server(s) that duplicate claude.ai connectors: ${[...suppressed].join(', ')}`);
-            // Disconnect before filtering from state. Only connected
-            // servers need cleanup — clearServerCache on a never-connected
-            // server triggers a real connect just to kill it (memoize
-            // cache-miss path, see useManageMCPConnections.ts:870).
-            for (const c of headlessStore.getState().mcp.clients) {
-              if (!suppressed.has(c.name) || c.type !== 'connected') continue;
-              c.client.onclose = undefined;
-              void clearServerCache(c.name, c.config).catch(() => {});
+      const prepareHeadlessConversationContext = async (): Promise<void> => {
+        // Await all MCP configs before the first real user turn so tool
+        // surface stays stable, but deterministic bootstrap can already emit
+        // progress events before this slower preflight completes.
+        profileCheckpoint('before_connectMcp');
+        await connectMcpBatch(regularMcpConfigs, 'regular');
+        profileCheckpoint('after_connectMcp');
+        const CLAUDE_AI_MCP_TIMEOUT_MS = 5_000;
+        const claudeaiConnect = claudeaiConfigPromise.then(claudeaiConfigs => {
+          if (Object.keys(claudeaiConfigs).length > 0) {
+            const claudeaiSigs = new Set<string>();
+            for (const config of Object.values(claudeaiConfigs)) {
+              const sig = getMcpServerSignature(config);
+              if (sig) claudeaiSigs.add(sig);
             }
-            headlessStore.setState(prev => {
-              let {
-                clients,
-                tools,
-                commands,
-                resources
-              } = prev.mcp;
-              clients = clients.filter(c => !suppressed.has(c.name));
-              tools = tools.filter(t => !t.mcpInfo || !suppressed.has(t.mcpInfo.serverName));
-              for (const name of suppressed) {
-                commands = excludeCommandsByServer(commands, name);
-                resources = excludeResourcesByServer(resources, name);
+            const suppressed = new Set<string>();
+            for (const [name, config] of Object.entries(regularMcpConfigs)) {
+              if (!name.startsWith('plugin:')) continue;
+              const sig = getMcpServerSignature(config);
+              if (sig && claudeaiSigs.has(sig)) suppressed.add(name);
+            }
+            if (suppressed.size > 0) {
+              logForDebugging(`[MCP] Lazy dedup: suppressing ${suppressed.size} plugin server(s) that duplicate claude.ai connectors: ${[...suppressed].join(', ')}`);
+              for (const c of headlessStore.getState().mcp.clients) {
+                if (!suppressed.has(c.name) || c.type !== 'connected') continue;
+                c.client.onclose = undefined;
+                void clearServerCache(c.name, c.config).catch(() => {});
               }
-              return {
-                ...prev,
-                mcp: {
-                  ...prev.mcp,
+              headlessStore.setState(prev => {
+                let {
                   clients,
                   tools,
                   commands,
                   resources
+                } = prev.mcp;
+                clients = clients.filter(c => !suppressed.has(c.name));
+                tools = tools.filter(t => !t.mcpInfo || !suppressed.has(t.mcpInfo.serverName));
+                for (const name of suppressed) {
+                  commands = excludeCommandsByServer(commands, name);
+                  resources = excludeResourcesByServer(resources, name);
                 }
-              };
-            });
+                return {
+                  ...prev,
+                  mcp: {
+                    ...prev.mcp,
+                    clients,
+                    tools,
+                    commands,
+                    resources
+                  }
+                };
+              });
+            }
+          }
+          const nonPluginConfigs = pickBy(regularMcpConfigs, (_, n) => !n.startsWith('plugin:'));
+          const {
+            servers: dedupedClaudeAi
+          } = dedupClaudeAiMcpServers(claudeaiConfigs, nonPluginConfigs);
+          return connectMcpBatch(dedupedClaudeAi, 'claudeai');
+        });
+        let claudeaiTimer: ReturnType<typeof setTimeout> | undefined;
+        const claudeaiTimedOut = await Promise.race([claudeaiConnect.then(() => false), new Promise<boolean>(resolve => {
+          claudeaiTimer = setTimeout(r => r(true), CLAUDE_AI_MCP_TIMEOUT_MS, resolve);
+        })]);
+        if (claudeaiTimer) clearTimeout(claudeaiTimer);
+        if (claudeaiTimedOut) {
+          logForDebugging(`[MCP] claude.ai connectors not ready after ${CLAUDE_AI_MCP_TIMEOUT_MS}ms — proceeding; background connection continues`);
+        }
+        profileCheckpoint('after_connectMcp_claudeai');
+        if (!isBareMode()) {
+          startDeferredPrefetches();
+          void import('./utils/backgroundHousekeeping.js').then(m => m.startBackgroundHousekeeping());
+          if ("external" === 'ant') {
+            void import('./utils/sdkHeapDumpMonitor.js').then(m => m.startSdkMemoryMonitor());
           }
         }
-        // Suppress claude.ai connectors that duplicate an enabled
-        // manual server (URL-signature match). Plugin dedup above only
-        // handles `plugin:*` keys; this catches manual `.mcp.json` entries.
-        // plugin:* must be excluded here — step 1 already suppressed
-        // those (claude.ai wins); leaving them in suppresses the
-        // connector too, and neither survives (gh-39974).
-        const nonPluginConfigs = pickBy(regularMcpConfigs, (_, n) => !n.startsWith('plugin:'));
-        const {
-          servers: dedupedClaudeAi
-        } = dedupClaudeAiMcpServers(claudeaiConfigs, nonPluginConfigs);
-        return connectMcpBatch(dedupedClaudeAi, 'claudeai');
-      });
-      let claudeaiTimer: ReturnType<typeof setTimeout> | undefined;
-      const claudeaiTimedOut = await Promise.race([claudeaiConnect.then(() => false), new Promise<boolean>(resolve => {
-        claudeaiTimer = setTimeout(r => r(true), CLAUDE_AI_MCP_TIMEOUT_MS, resolve);
-      })]);
-      if (claudeaiTimer) clearTimeout(claudeaiTimer);
-      if (claudeaiTimedOut) {
-        logForDebugging(`[MCP] claude.ai connectors not ready after ${CLAUDE_AI_MCP_TIMEOUT_MS}ms — proceeding; background connection continues`);
+        logSessionTelemetry();
+      };
+      if (!options.teamBootstrapSpec) {
+        await prepareHeadlessConversationContext();
       }
-      profileCheckpoint('after_connectMcp_claudeai');
-
-      // In headless mode, start deferred prefetches immediately (no user typing delay)
-      // --bare / SIMPLE: startDeferredPrefetches early-returns internally.
-      // backgroundHousekeeping (initExtractMemories, pruneShellSnapshots,
-      // cleanupOldMessageFiles) and sdkHeapDumpMonitor are all bookkeeping
-      // that scripted calls don't need — the next interactive session reconciles.
-      if (!isBareMode()) {
-        startDeferredPrefetches();
-        void import('./utils/backgroundHousekeeping.js').then(m => m.startBackgroundHousekeeping());
-        if ("external" === 'ant') {
-          void import('./utils/sdkHeapDumpMonitor.js').then(m => m.startSdkMemoryMonitor());
-        }
-      }
-      logSessionTelemetry();
       profileCheckpoint('before_print_import');
       const {
         runHeadless
@@ -2854,8 +2835,21 @@ async function run(): Promise<CommanderCommand> {
         enableAuthStatus: options.enableAuthStatus,
         agent: agentCli,
         workload: options.workload,
+        teamBootstrapSpecPath: options.teamBootstrapSpec,
+        teamBootstrapUserPromptFile: options.teamBootstrapUserPromptFile,
+        ...(options.teamBootstrapSpec ? {
+          bootstrapContext: {
+            commands: commandsHeadless,
+            tools,
+            mcpClients: headlessStore.getState().mcp.clients
+          },
+          prepareConversationContext: prepareHeadlessConversationContext
+        } : {}),
         setupTrigger: setupTrigger ?? undefined,
         sessionStartHooksPromise
+      }).catch(error => {
+        logError(error);
+        gracefulShutdownSync(1);
       });
       return;
     }
@@ -4098,16 +4092,18 @@ async function run(): Promise<CommanderCommand> {
   // claude auth
 
   const auth = program.command('auth').description('Manage authentication').configureHelp(createSortedHelpConfig());
-  auth.command('login').description('Sign in to your Anthropic account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
+  auth.command('login').description('Sign in to a configured provider account').addOption(new Option('--provider <provider>', 'Provider to authenticate').choices(['anthropic', 'codex'])).option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
     email,
     sso,
     console: useConsole,
-    claudeai
+    claudeai,
+    provider
   }: {
     email?: string;
     sso?: boolean;
     console?: boolean;
     claudeai?: boolean;
+    provider?: 'anthropic' | 'codex';
   }) => {
     const {
       authLogin
@@ -4116,23 +4112,53 @@ async function run(): Promise<CommanderCommand> {
       email,
       sso,
       console: useConsole,
-      claudeai
+      claudeai,
+      provider
     });
   });
-  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  auth.command('status').description('Show authentication status').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'all';
   }) => {
     const {
       authStatus
     } = await import('./cli/handlers/auth.js');
     await authStatus(opts);
   });
-  auth.command('logout').description('Log out from your Anthropic account').action(async () => {
+  auth.command('logout').description('Log out from a configured provider account').addOption(new Option('--provider <provider>', 'Provider to log out').choices(['anthropic', 'codex', 'all'])).action(async ({
+    provider
+  }: {
+    provider?: 'anthropic' | 'codex' | 'all';
+  }) => {
     const {
-      authLogout
+      authLogoutByProvider
     } = await import('./cli/handlers/auth.js');
-    await authLogout();
+    await authLogoutByProvider(provider);
+  });
+
+  const model = program.command('model').description('Inspect model availability').configureHelp(createSortedHelpConfig());
+  model.command('list').description('List available models by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'all';
+  }) => {
+    const {
+      modelList
+    } = await import('./cli/handlers/model.js');
+    await modelList(opts);
+  });
+
+  const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
+  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'anthropic' | 'codex' | 'gemini' | 'all';
+  }) => {
+    const {
+      runtimeStatus
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeStatus(opts);
   });
 
   /**

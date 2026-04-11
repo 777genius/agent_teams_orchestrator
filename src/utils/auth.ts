@@ -1,8 +1,10 @@
 import chalk from 'chalk'
 import { exec } from 'child_process'
 import { execa } from 'execa'
+import { readFileSync } from 'fs'
 import { mkdir, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
+import { homedir } from 'os'
 import { join } from 'path'
 import { CLAUDE_AI_PROFILE_SCOPE } from 'src/constants/oauth.js'
 import {
@@ -10,11 +12,19 @@ import {
   logEvent,
 } from 'src/services/analytics/index.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
+import {
+  getAPIProvider,
+  type APIProvider,
+} from 'src/utils/model/providers.js'
 import {
   getIsNonInteractiveSession,
   preferThirdPartyAuthentication,
 } from '../bootstrap/state.js'
+import {
+  getGeminiApiVersion,
+  getGeminiBaseUrl,
+  getGeminiProjectId,
+} from './geminiAuth.js'
 import {
   getMockSubscriptionType,
   shouldUseMockSubscription,
@@ -24,7 +34,10 @@ import {
   refreshOAuthToken,
   shouldUseClaudeAIAuth,
 } from '../services/oauth/client.js'
-import type { CodexTokens } from '../services/oauth/codex-client.js'
+import {
+  extractCodexAccountId,
+  type CodexTokens,
+} from '../services/oauth/codex-client.js'
 import { getOauthProfileFromOauthToken } from '../services/oauth/getOauthProfile.js'
 import type { OAuthTokens, SubscriptionType } from '../services/oauth/types.js'
 import {
@@ -113,10 +126,12 @@ export function isAnthropicAuthEnabled(): boolean {
     return !!process.env.CLAUDE_CODE_OAUTH_TOKEN
   }
 
+  const provider = getAPIProvider()
   const is3P =
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    provider === 'bedrock' ||
+    provider === 'vertex' ||
+    provider === 'foundry' ||
+    provider === 'gemini'
 
   // Check if user has configured an external API key source
   // This allows externally-provided API keys to work (without requiring proxy configuration)
@@ -208,6 +223,7 @@ export function getAuthTokenSource() {
 
 export type ApiKeySource =
   | 'ANTHROPIC_API_KEY'
+  | 'GEMINI_API_KEY'
   | 'apiKeyHelper'
   | '/login managed key'
   | 'none'
@@ -1333,6 +1349,67 @@ export function saveCodexOAuthTokens(tokens: CodexTokens): void {
   }))
 }
 
+type OfficialCodexCliAuthFile = {
+  auth_mode?: string
+  tokens?: {
+    access_token?: string
+    refresh_token?: string
+    account_id?: string
+  }
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const payload = parts[1] ?? ''
+    const decoded = Buffer.from(payload, 'base64url').toString('utf8')
+    return JSON.parse(decoded) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function extractCodexAccessTokenExpiry(accessToken: string): number | null {
+  const payload = decodeJwtPayload(accessToken)
+  const exp = payload?.exp
+  return typeof exp === 'number' ? exp * 1000 : null
+}
+
+function getOfficialCodexCliAuthPath(): string {
+  return join(homedir(), '.codex', 'auth.json')
+}
+
+function getOfficialCodexCliOAuthTokens(): CodexTokens | null {
+  try {
+    const raw = readFileSync(getOfficialCodexCliAuthPath(), 'utf8')
+    const parsed = jsonParse(raw) as OfficialCodexCliAuthFile | null
+    const accessToken = parsed?.tokens?.access_token
+    const refreshToken = parsed?.tokens?.refresh_token
+
+    if (!accessToken || !refreshToken) {
+      return null
+    }
+
+    const expiresAt = extractCodexAccessTokenExpiry(accessToken)
+    const accountId =
+      parsed?.tokens?.account_id ?? extractCodexAccountId(accessToken)
+
+    if (!expiresAt || !accountId) {
+      return null
+    }
+
+    return {
+      accessToken,
+      refreshToken,
+      expiresAt,
+      accountId,
+    }
+  } catch {
+    return null
+  }
+}
+
 /**
  * Retrieves the stored Codex OAuth tokens from GlobalConfig.
  * Returns null if no Codex tokens are stored.
@@ -1346,7 +1423,7 @@ export function getCodexOAuthTokens(): CodexTokens | null {
     !stored.expiresAt ||
     !stored.accountId
   ) {
-    return null
+    return getOfficialCodexCliOAuthTokens()
   }
   return {
     accessToken: stored.accessToken,
@@ -1364,6 +1441,20 @@ export function clearCodexOAuthTokens(): void {
     const { codexOAuth: _removed, ...rest } = cfg
     return rest as typeof cfg
   })
+}
+
+export async function clearOfficialCodexCliOAuthTokens(): Promise<void> {
+  try {
+    await execa('codex', ['logout'], {
+      reject: false,
+      stdin: 'ignore',
+      stdout: 'ignore',
+      stderr: 'ignore',
+    })
+  } catch {
+    // Best-effort only. If the official CLI is unavailable, we still clear the
+    // local mirrored Codex session metadata.
+  }
 }
 
 
@@ -1632,7 +1723,12 @@ export function isCodexSubscriber(): boolean {
     return true
   }
 
-  // Check if we have OpenAI OAuth tokens
+  const tokens = getCodexOAuthTokens()
+  if (tokens?.accessToken) {
+    return true
+  }
+
+  // Legacy config fallback
   const config = getGlobalConfig()
   const openaiTokens = config?.openaiOauthTokens
   if (openaiTokens?.access_token && openaiTokens?.scopes?.includes('codex')) {
@@ -1642,13 +1738,48 @@ export function isCodexSubscriber(): boolean {
   return false
 }
 
-/**
- * Check if the user is authenticated via OpenAI Codex OAuth.
- * Returns true when a valid Codex access token is present in the config.
- */
-export function isCodexSubscriber(): boolean {
-  const tokens = getCodexOAuthTokens()
-  return !!tokens?.accessToken
+export function hasExplicitHostManagedProviderSelection(): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    Boolean(process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim())
+  )
+}
+
+export function shouldUseCodexProviderRouting(params: {
+  apiProvider: APIProvider
+  hasCodexCapability: boolean
+  hasExplicitHostManagedProviderSelection: boolean
+}): boolean {
+  if (params.apiProvider === 'openai') {
+    return params.hasCodexCapability
+  }
+
+  if (params.apiProvider !== 'firstParty') {
+    return false
+  }
+
+  // Codex capability and Codex selection are different things.
+  // Team/runtime child sessions can run inside a host environment that has
+  // Codex OAuth available, while the host explicitly pins this child to a
+  // different provider. In that case the explicit host-managed selection must
+  // win, or the child silently drifts onto Codex routing.
+  // Host-managed runtime sessions pin a provider on purpose. In those cases,
+  // Codex availability must not silently override the provider selected by the
+  // launcher for this child process.
+  if (params.hasExplicitHostManagedProviderSelection) {
+    return false
+  }
+
+  return params.hasCodexCapability
+}
+
+export function shouldUseCodexProviderRoutingForCurrentProcess(): boolean {
+  return shouldUseCodexProviderRouting({
+    apiProvider: getAPIProvider(),
+    hasCodexCapability: isCodexSubscriber(),
+    hasExplicitHostManagedProviderSelection:
+      hasExplicitHostManagedProviderSelection(),
+  })
 }
 
 /**
@@ -1812,10 +1943,12 @@ export function getSubscriptionName(): string {
 
 /** Check if using third-party services (Bedrock or Vertex or Foundry) */
 export function isUsing3PServices(): boolean {
-  return !!(
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+  const provider = getAPIProvider()
+  return (
+    provider === 'bedrock' ||
+    provider === 'vertex' ||
+    provider === 'foundry' ||
+    provider === 'gemini'
   )
 }
 
@@ -1940,11 +2073,42 @@ export type UserAccountInfo = {
   apiKeySource?: ApiKeySource
   organization?: string
   email?: string
+  apiProvider?: string
+  projectId?: string
+  baseUrl?: string
+  apiVersion?: string
+  backend?: string
 }
 
 export function getAccountInformation() {
   const apiProvider = getAPIProvider()
-  // Only provide account info for first-party Anthropic API
+  if (apiProvider === 'gemini') {
+    const geminiBackend =
+      process.env.CLAUDE_CODE_GEMINI_BACKEND ??
+      getGlobalConfig().geminiResolvedBackend ??
+      getGlobalConfig().geminiBackendPreference ??
+      'auto'
+    const accountInfo: UserAccountInfo = {
+      apiProvider: 'Google Gemini',
+      projectId: getGeminiProjectId(),
+      backend: geminiBackend,
+    }
+    if (geminiBackend !== 'cli' && geminiBackend !== 'cli-sdk') {
+      accountInfo.baseUrl = getGeminiBaseUrl()
+      accountInfo.apiVersion = getGeminiApiVersion()
+    }
+    if (process.env.GEMINI_API_KEY) {
+      accountInfo.apiKeySource = 'GEMINI_API_KEY'
+      accountInfo.tokenSource = 'gemini_api_key'
+      return accountInfo
+    }
+    const method = getGlobalConfig().geminiLastAuthMethod
+    if (method) {
+      accountInfo.tokenSource = `gemini_${method}`
+      return accountInfo
+    }
+    return undefined
+  }
   if (apiProvider !== 'firstParty') {
     return undefined
   }
@@ -1985,6 +2149,14 @@ export function getAccountInformation() {
     accountInfo.email = email
   }
   return accountInfo
+}
+
+export async function getGeminiAuthMethod(): Promise<string> {
+  const method = getGlobalConfig().geminiLastAuthMethod
+  if (!method) {
+    return 'none'
+  }
+  return `gemini_${method}`
 }
 
 /**
