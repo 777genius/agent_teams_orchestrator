@@ -36,8 +36,8 @@ const bootstrapSpecSchema = z.strictObject({
   runId: z.string().trim().min(1),
   mode: z.enum(['create', 'launch']),
   initiator: z.strictObject({
-    kind: z.literal('app'),
-    source: z.literal('claude_team_freecode'),
+    kind: z.enum(['app', 'tool']),
+    source: z.enum(['claude_team_agent_teams_orchestrator', 'TeamBootstrap']),
   }),
   team: z.strictObject({
     name: z.string().trim().min(1),

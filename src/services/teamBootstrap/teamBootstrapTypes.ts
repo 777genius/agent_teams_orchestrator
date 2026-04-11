@@ -8,7 +8,7 @@ export type TeamBootstrapSpec = {
   mode: 'create' | 'launch'
   initiator: {
     kind: 'app' | 'tool'
-    source: 'claude_team_freecode' | 'TeamBootstrap'
+    source: 'claude_team_agent_teams_orchestrator' | 'TeamBootstrap'
   }
   team: {
     name: string
@@ -66,7 +66,7 @@ export type TeamBootstrapRequest = {
   }
   initiator: {
     kind: 'app' | 'tool'
-    source: 'claude_team_freecode' | 'TeamBootstrap'
+    source: 'claude_team_agent_teams_orchestrator' | 'TeamBootstrap'
   }
 }
 

@@ -1,4 +1,4 @@
-import { getCodexOAuthTokens, getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
+import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
 import {
@@ -11,6 +11,9 @@ import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
+import {
+  resolveCodexRuntimeSelection,
+} from './codexBackendResolver.js'
 import type {
   CodexRuntimeBackendId,
   ExternalRuntimeDiagnostic,
@@ -36,11 +39,13 @@ const GEMINI_BACKEND_DESCRIPTIONS: Record<GeminiRuntimeBackendId, string> = {
 const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
   auto: 'Auto',
   adapter: 'Default adapter',
+  api: 'OpenAI API',
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Automatically use the default Codex runtime path',
+  auto: 'Automatically prefer the best available Codex runtime path',
   adapter: 'Use the built-in Codex fetch adapter',
+  api: 'Use OPENAI_API_KEY with the public OpenAI Responses API',
 }
 
 function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): ExternalRuntimeDiagnostic {
@@ -70,21 +75,9 @@ export function normalizeGeminiBackendStorageValue(
   return 'auto'
 }
 
-export function normalizeCodexBackendPreference(
-  value: string | null | undefined,
-): CodexRuntimeBackendId {
-  return value === 'adapter' ? 'adapter' : 'auto'
-}
-
 export function getGeminiRuntimeBackendPreference(): GeminiRuntimeBackendId {
   return normalizeGeminiBackendPreference(
     process.env.CLAUDE_CODE_GEMINI_BACKEND ?? getGlobalConfig().geminiBackendPreference,
-  )
-}
-
-export function getCodexRuntimeBackendPreference(): CodexRuntimeBackendId {
-  return normalizeCodexBackendPreference(
-    process.env.CLAUDE_CODE_CODEX_BACKEND ?? getGlobalConfig().codexBackendPreference,
   )
 }
 
@@ -327,53 +320,64 @@ function buildCodexStatuses(): {
   canLoginFromUi: boolean
   backend: RuntimeProviderStatus['backend']
 } {
-  const selectedBackendId = getCodexRuntimeBackendPreference()
-  const tokens = getCodexOAuthTokens()
-  const authenticated = Boolean(tokens?.accessToken)
-  const resolvedBackendId = authenticated ? 'adapter' : null
-  const detailMessage = authenticated
-    ? 'Codex adapter is ready'
-    : 'Codex OAuth session not found. Sign in to use the built-in adapter.'
+  const resolution = resolveCodexRuntimeSelection()
 
   return {
-    selectedBackendId,
-    resolvedBackendId:
-      selectedBackendId === 'auto'
-        ? resolvedBackendId
-        : selectedBackendId === 'adapter'
-          ? authenticated
-            ? 'adapter'
-            : null
-          : null,
+    selectedBackendId: resolution.selectedBackendId,
+    resolvedBackendId: resolution.resolvedBackendId,
     availableBackends: [
       buildCodexOptionStatus(
         'auto',
-        authenticated,
-        authenticated ? 'Resolved to Default adapter' : 'Unavailable',
-        detailMessage,
+        resolution.resolvedBackendId !== null,
+        resolution.resolvedBackendId
+          ? `Resolved to ${CODEX_BACKEND_LABELS[resolution.resolvedBackendId]}`
+          : 'Unavailable',
+        resolution.detailMessage,
         true,
       ),
       buildCodexOptionStatus(
         'adapter',
-        authenticated,
-        authenticated ? 'Ready' : 'Authentication required',
-        detailMessage,
+        resolution.oauthAuthenticated,
+        resolution.oauthAuthenticated ? 'Ready' : 'Authentication required',
+        resolution.oauthAuthenticated
+          ? 'Uses the local Codex OAuth session via the built-in adapter.'
+          : 'Sign in with Codex OAuth to use the built-in adapter.',
       ),
+      ...(resolution.featureFlagEnabled
+        ? [
+            buildCodexOptionStatus(
+              'api',
+              resolution.apiKeyConfigured,
+              resolution.apiKeyConfigured ? 'Ready' : 'Authentication required',
+              resolution.apiKeyConfigured
+                ? 'Uses OPENAI_API_KEY with api.openai.com/v1/responses.'
+                : 'Set OPENAI_API_KEY to use the public OpenAI Responses API.',
+            ),
+          ]
+        : []),
     ],
-    authenticated,
-    authMethod: authenticated ? 'oauth_token' : null,
-    verificationState: authenticated ? 'verified' : 'unknown',
-    statusMessage: authenticated ? 'Default adapter ready' : 'Codex adapter not ready',
-    detailMessage,
-    canLoginFromUi: true,
-    backend: authenticated
-      ? {
-          kind: 'adapter',
-          label: 'Default adapter',
-          endpointLabel: 'chatgpt.com/backend-api/codex/responses',
-          authMethodDetail: 'oauth_token',
-        }
-      : null,
+    authenticated: resolution.authenticated,
+    authMethod: resolution.authMethod,
+    verificationState: resolution.authenticated ? 'verified' : 'unknown',
+    statusMessage: resolution.statusMessage,
+    detailMessage: resolution.detailMessage,
+    canLoginFromUi: resolution.canLoginFromUi,
+    backend:
+      resolution.resolvedBackendId === 'adapter'
+        ? {
+            kind: 'adapter',
+            label: 'Default adapter',
+            endpointLabel: 'chatgpt.com/backend-api/codex/responses',
+            authMethodDetail: 'oauth_token',
+          }
+        : resolution.resolvedBackendId === 'api'
+          ? {
+              kind: 'api',
+              label: 'OpenAI API',
+              endpointLabel: 'api.openai.com/v1/responses',
+              authMethodDetail: 'api_key',
+            }
+          : null,
   }
 }
 

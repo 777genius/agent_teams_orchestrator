@@ -74,6 +74,15 @@ function buildWorkflowBlock(
     : []
 }
 
+function buildReviewFlowReminder(): string[] {
+  return [
+    'Review flow rule: review is a state transition on the SAME work task, not a separate task.',
+    'If task #X needs review and a reviewer exists or has been named, finish the work on #X, call task_complete on #X, then use review_request on #X for that reviewer. If no reviewer exists, leave #X completed. Do NOT create a separate "review task".',
+    'If you are reviewing task #X, call review_start on #X first, then review_approve or review_request_changes on #X itself.',
+    'If review requests changes, resume the SAME task #X, implement the fixes, call task_complete on #X again, and send #X back through review_request when ready.',
+  ]
+}
+
 export async function buildDeterministicBootstrapMemberPrompt(params: {
   spec: TeamBootstrapSpec
   member: TeamBootstrapSpec['members'][number]
@@ -111,6 +120,7 @@ export async function buildDeterministicBootstrapMemberPrompt(params: {
       ? 'After member_briefing succeeds, resume your queue normally and prioritize already-assigned board work before taking new blocking work.'
       : 'After member_briefing succeeds, wait for instructions from the lead and use team mailbox/task tools normally.',
     'Do NOT send acknowledgement-only messages such as "ready" or "online".',
+    ...buildReviewFlowReminder(),
   ].filter(Boolean)
 
   return lines.join('\n')

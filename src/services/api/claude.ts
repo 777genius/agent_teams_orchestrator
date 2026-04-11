@@ -261,6 +261,38 @@ type JsonValue = string | number | boolean | null | JsonObject | JsonArray
 type JsonObject = { [key: string]: JsonValue }
 type JsonArray = JsonValue[]
 
+function getStructuredAPIErrorType(error: APIError): string | null {
+  const payload =
+    (error.error as Record<string, unknown> | undefined) ?? undefined
+  const nestedError =
+    (payload?.error as Record<string, unknown> | undefined) ?? undefined
+
+  if (typeof nestedError?.type === 'string') {
+    return nestedError.type
+  }
+  if (typeof payload?.type === 'string' && payload.type !== 'error') {
+    return payload.type
+  }
+  return null
+}
+
+export function shouldSkipStreamingToNonStreamingFallback(
+  error: unknown,
+): boolean {
+  if (!(error instanceof APIError)) {
+    return false
+  }
+
+  const apiErrorType = getStructuredAPIErrorType(error)
+  return (
+    apiErrorType === 'authentication_error' ||
+    apiErrorType === 'billing_error' ||
+    apiErrorType === 'invalid_request_error' ||
+    apiErrorType === 'not_found_error' ||
+    apiErrorType === 'permission_error'
+  )
+}
+
 /**
  * Assemble the extra body parameters for the API request, based on the
  * CLAUDE_CODE_EXTRA_BODY environment variable if present and on any beta
@@ -2501,6 +2533,14 @@ async function* queryModel(
         throw streamingError
       }
 
+      if (shouldSkipStreamingToNonStreamingFallback(streamingError)) {
+        logForDebugging(
+          `Error streaming (non-streaming fallback skipped for unrecoverable API error): ${errorMessage(streamingError)}`,
+          { level: 'error' },
+        )
+        throw streamingError
+      }
+
       logForDebugging(
         `Error streaming, falling back to non-streaming mode: ${errorMessage(streamingError)}`,
         { level: 'error' },
@@ -2819,14 +2859,16 @@ async function* queryModel(
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
       const fallbackUsage = fallbackMessage.message.usage
-      usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason
-      const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage)
-      costUSD += addToTotalSessionCost(
-        fallbackCost,
-        fallbackUsage,
-        options.model,
-      )
+      if (fallbackUsage) {
+        usage = updateUsage(EMPTY_USAGE, fallbackUsage)
+        const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage)
+        costUSD += addToTotalSessionCost(
+          fallbackCost,
+          fallbackUsage,
+          options.model,
+        )
+      }
     }
   }
 

@@ -30,7 +30,6 @@ import {
   getGeminiAuthMethod,
   getAnthropicApiKeyWithSource,
   getAuthTokenSource,
-  getCodexOAuthTokens,
   getOauthAccountInfo,
   getSubscriptionType,
   isUsing3PServices,
@@ -38,7 +37,7 @@ import {
   saveOAuthTokensIfNeeded,
   validateForceLoginOrg,
 } from '../../utils/auth.js'
-import { getGlobalConfig, saveGlobalConfig } from '../../utils/config.js'
+import { saveGlobalConfig } from '../../utils/config.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isRunningOnHomespace } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
@@ -54,6 +53,7 @@ import {
   getGeminiBackendPreference,
   resolveGeminiBackend,
 } from '../../services/gemini/backendResolver.js'
+import { resolveCodexRuntimeSelection } from '../../services/runtimeBackends/codexBackendResolver.js'
 import { runCodexOAuthFlow } from '../../services/oauth/codex-client.js'
 
 type AuthProviderTarget = 'anthropic' | 'codex' | 'all'
@@ -106,29 +106,19 @@ export function getAnthropicProviderStatus(): ProviderStatusPayload {
 }
 
 export function getCodexProviderStatus(): ProviderStatusPayload {
-  const cfg = getGlobalConfig()
-  const legacyOpenAiTokens = cfg?.openaiOauthTokens
-  const codexTokens = getCodexOAuthTokens()
-  const authenticated = Boolean(
-    codexTokens?.accessToken ||
-      (legacyOpenAiTokens?.access_token &&
-        legacyOpenAiTokens?.scopes?.includes('codex')),
-  )
+  const resolution = resolveCodexRuntimeSelection()
 
   return {
     supported: true,
-    authenticated,
-    authMethod: authenticated ? 'oauth_token' : null,
-    verificationState: 'verified',
-    canLoginFromUi: true,
+    authenticated: resolution.authenticated,
+    authMethod: resolution.authMethod,
+    verificationState: resolution.authenticated ? 'verified' : 'unknown',
+    canLoginFromUi: resolution.canLoginFromUi,
     capabilities: {
       teamLaunch: true,
       oneShot: true,
     },
-    statusMessage:
-      !authenticated && getAPIProvider() === 'openai'
-        ? 'OpenAI provider is enabled but no Codex OAuth session is stored.'
-        : null,
+    statusMessage: resolution.statusMessage,
   }
 }
 

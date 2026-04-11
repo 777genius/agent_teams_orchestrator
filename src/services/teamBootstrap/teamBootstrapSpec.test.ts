@@ -59,6 +59,15 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toContain('member_briefing')
     expect(request.members[0]?.prompt).toContain('forge-labs')
     expect(request.members[0]?.prompt).toContain('Communicate in English')
+    expect(request.members[0]?.prompt).toContain(
+      'Review flow rule: review is a state transition on the SAME work task'
+    )
+    expect(request.members[0]?.prompt).toContain(
+      'Do NOT create a separate "review task"'
+    )
+    expect(request.members[0]?.prompt).toContain(
+      'If no reviewer exists, leave #X completed.'
+    )
   })
 
   test('preserves explicit member prompts when provided', async () => {
@@ -71,7 +80,7 @@ describe('team bootstrap spec normalization', () => {
       mode: 'create',
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
       team: {
         name: 'atlas-hq',
@@ -89,6 +98,69 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toBe('custom bootstrap prompt')
   })
 
+  test('readTeamBootstrapSpec accepts the current claude_team initiator source', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const specPath = join(tempRoot, 'bootstrap-spec.json')
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-current-source',
+        mode: 'create',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [{ name: 'alice' }],
+      } satisfies TeamBootstrapSpec),
+      'utf8',
+    )
+
+    const request = await readTeamBootstrapSpec(specPath)
+    expect(request.initiator.source).toBe('claude_team_agent_teams_orchestrator')
+    expect(request.members[0]?.prompt).toContain('member_briefing')
+  })
+
+  test('readTeamBootstrapSpec accepts hidden tool initiator values', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const specPath = join(tempRoot, 'bootstrap-tool-spec.json')
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-tool-source',
+        mode: 'create',
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [{ name: 'alice' }],
+      } satisfies TeamBootstrapSpec),
+      'utf8',
+    )
+
+    const request = await readTeamBootstrapSpec(specPath)
+    expect(request.initiator).toEqual({
+      kind: 'tool',
+      source: 'TeamBootstrap',
+    })
+    expect(request.members[0]?.prompt).toContain('member_briefing')
+  })
+
   test('normalizes permission seed tools deterministically', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })
@@ -99,7 +171,7 @@ describe('team bootstrap spec normalization', () => {
       mode: 'create',
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
       team: {
         name: 'atlas-hq',
@@ -124,7 +196,7 @@ describe('team bootstrap spec normalization', () => {
       mode: 'create',
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
       team: {
         name: 'atlas-hq',
@@ -147,7 +219,7 @@ describe('team bootstrap spec normalization', () => {
       mode: 'create',
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
       team: {
         name: 'atlas-hq',
@@ -219,7 +291,7 @@ describe('team bootstrap spec normalization', () => {
         mode: 'create',
         initiator: {
           kind: 'app',
-          source: 'claude_team_freecode',
+          source: 'claude_team_agent_teams_orchestrator',
         },
         team: {
           name: 'atlas-hq',
@@ -258,7 +330,7 @@ describe('team bootstrap spec normalization', () => {
         mode: 'create',
         initiator: {
           kind: 'app',
-          source: 'claude_team_freecode',
+          source: 'claude_team_agent_teams_orchestrator',
         },
         team: {
           name: 'atlas-hq',
@@ -290,7 +362,7 @@ describe('team bootstrap spec normalization', () => {
         mode: 'create',
         initiator: {
           kind: 'app',
-          source: 'claude_team_freecode',
+          source: 'claude_team_agent_teams_orchestrator',
         },
         team: {
           name: 'atlas-hq',
@@ -321,7 +393,7 @@ describe('team bootstrap spec normalization', () => {
         mode: 'create',
         initiator: {
           kind: 'app',
-          source: 'claude_team_freecode',
+          source: 'claude_team_agent_teams_orchestrator',
         },
         team: {
           name: 'atlas-hq',
@@ -381,7 +453,7 @@ describe('team bootstrap spec normalization', () => {
       },
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
     }
 
@@ -429,7 +501,7 @@ describe('team bootstrap spec normalization', () => {
       },
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
     }
 
@@ -472,7 +544,7 @@ describe('team bootstrap spec normalization', () => {
       },
       initiator: {
         kind: 'app',
-        source: 'claude_team_freecode',
+        source: 'claude_team_agent_teams_orchestrator',
       },
     }
 

@@ -2,7 +2,7 @@
  * Codex Fetch Adapter
  *
  * Intercepts fetch calls from the Anthropic SDK and routes them to
- * ChatGPT's Codex backend API, translating between Anthropic Messages API
+ * the selected Codex backend API, translating between Anthropic Messages API
  * format and OpenAI Responses API format.
  *
  * Supports:
@@ -12,7 +12,9 @@
  * - Tool use (tool_use → function_call, tool_result → function_call_output)
  * - Streaming events translation
  *
- * Endpoint: https://chatgpt.com/backend-api/codex/responses
+ * Endpoints:
+ * - OAuth adapter: https://chatgpt.com/backend-api/codex/responses
+ * - API key: https://api.openai.com/v1/responses
  */
 
 import { getCodexOAuthTokens } from '../../utils/auth.js'
@@ -256,6 +258,48 @@ function formatSSE(event: string, data: string): string {
   return `event: ${event}\ndata: ${data}\n\n`
 }
 
+type AnthropicStreamErrorType =
+  | 'api_error'
+  | 'authentication_error'
+  | 'billing_error'
+  | 'invalid_request_error'
+  | 'not_found_error'
+  | 'overloaded_error'
+  | 'permission_error'
+  | 'rate_limit_error'
+  | 'timeout_error'
+
+function mapCodexErrorCodeToAnthropicType(
+  code: string | null | undefined,
+): AnthropicStreamErrorType {
+  switch (code) {
+    case 'authentication_error':
+    case 'invalid_api_key':
+      return 'authentication_error'
+    case 'billing_error':
+    case 'insufficient_quota':
+      return 'billing_error'
+    case 'invalid_request_error':
+    case 'unsupported_parameter':
+      return 'invalid_request_error'
+    case 'model_not_found':
+    case 'not_found_error':
+      return 'not_found_error'
+    case 'overloaded_error':
+      return 'overloaded_error'
+    case 'permission_error':
+      return 'permission_error'
+    case 'rate_limit_exceeded':
+    case 'rate_limit_error':
+      return 'rate_limit_error'
+    case 'timeout':
+    case 'timeout_error':
+      return 'timeout_error'
+    default:
+      return 'api_error'
+  }
+}
+
 /**
  * Translates Codex streaming response to Anthropic format.
  * Converts Codex SSE events into Anthropic-compatible streaming events.
@@ -268,6 +312,9 @@ async function translateCodexStreamToAnthropic(
   codexModel: string,
 ): Promise<Response> {
   const messageId = `msg_codex_${Date.now()}`
+  const requestId =
+    codexResponse.headers.get('x-request-id') ||
+    codexResponse.headers.get('request-id')
 
   const readable = new ReadableStream({
     async start(controller) {
@@ -313,6 +360,30 @@ async function translateCodexStreamToAnthropic(
       let inToolCall = false
       let hadToolCalls = false
       let inReasoningBlock = false
+      let emittedTerminalError = false
+
+      const emitAnthropicError = (
+        type: AnthropicStreamErrorType,
+        message: string,
+      ): void => {
+        controller.enqueue(
+          encoder.encode(
+            formatSSE(
+              'error',
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type,
+                  message,
+                },
+                request_id: requestId,
+              }),
+            ),
+          ),
+        )
+        controller.close()
+        emittedTerminalError = true
+      }
 
       try {
         const reader = codexResponse.body?.getReader()
@@ -352,6 +423,28 @@ async function translateCodexStreamToAnthropic(
             }
 
             const eventType = event.type as string
+
+            if (eventType === 'error') {
+              const codexError =
+                (event.error as Record<string, unknown> | undefined) ?? event
+              const code =
+                typeof codexError?.code === 'string'
+                  ? codexError.code
+                  : typeof event.code === 'string'
+                    ? event.code
+                    : null
+              const message =
+                typeof codexError?.message === 'string'
+                  ? codexError.message
+                  : typeof event.message === 'string'
+                    ? event.message
+                    : 'Codex API stream failed.'
+              emitAnthropicError(
+                mapCodexErrorCodeToAnthropicType(code),
+                `Codex API error${code ? ` (${code})` : ''}: ${message}`,
+              )
+              return
+            }
 
             // ── Text output events ──────────────────────────────
             if (eventType === 'response.output_item.added') {
@@ -548,10 +641,27 @@ async function translateCodexStreamToAnthropic(
                 outputTokens = usage.output_tokens || outputTokens
                 inputTokens = usage.input_tokens || inputTokens
               }
+            } else if (eventType === 'response.failed') {
+              const response = event.response as Record<string, unknown> | undefined
+              const responseError = response?.error as Record<string, unknown> | undefined
+              const code =
+                typeof responseError?.code === 'string' ? responseError.code : null
+              const message =
+                typeof responseError?.message === 'string'
+                  ? responseError.message
+                  : 'Codex API stream failed.'
+              emitAnthropicError(
+                mapCodexErrorCodeToAnthropicType(code),
+                `Codex API error${code ? ` (${code})` : ''}: ${message}`,
+              )
+              return
             }
           }
         }
       } catch (err) {
+        if (emittedTerminalError) {
+          return
+        }
         // If we're in the middle of a text block, emit the error there
         if (!currentTextBlockStarted) {
           controller.enqueue(
@@ -599,6 +709,10 @@ async function translateCodexStreamToAnthropic(
       }
       if (inToolCall) {
         closeToolCallBlock(controller, encoder, contentBlockIndex, currentToolCallId, currentToolCallName, currentToolCallArgs)
+      }
+
+      if (emittedTerminalError) {
+        return
       }
 
       finishStream(controller, encoder, outputTokens, inputTokens, hadToolCalls)
@@ -712,17 +826,29 @@ async function translateCodexStreamToAnthropic(
 
 // ── Main fetch interceptor ──────────────────────────────────────────
 
-const CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex/responses'
+const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex/responses'
+const OPENAI_RESPONSES_BASE_URL = 'https://api.openai.com/v1/responses'
+
+export type CodexFetchAuth =
+  | {
+      type: 'oauth_token'
+      accessToken: string
+    }
+  | {
+      type: 'api_key'
+      apiKey: string
+    }
 
 /**
  * Creates a fetch function that intercepts Anthropic API calls and routes them to Codex.
- * @param accessToken - The Codex access token for authentication
+ * @param auth - The Codex authentication material for the selected runtime path
  * @returns A fetch function that translates Anthropic requests to Codex format
  */
 export function createCodexFetch(
-  accessToken: string,
+  auth: CodexFetchAuth,
 ): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
-  const accountId = extractAccountId(accessToken)
+  const accountId =
+    auth.type === 'oauth_token' ? extractAccountId(auth.accessToken) : null
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = input instanceof Request ? input.url : String(input)
@@ -746,24 +872,40 @@ export function createCodexFetch(
       anthropicBody = {}
     }
 
-    // Get current token (may have been refreshed)
-    const tokens = getCodexOAuthTokens()
-    const currentToken = tokens?.accessToken || accessToken
-
     // Translate to Codex format
     const { codexBody, codexModel } = translateToCodexBody(anthropicBody)
 
-    // Call Codex API
-    const codexResponse = await globalThis.fetch(CODEX_BASE_URL, {
+    // Get the current OAuth token when using the ChatGPT adapter path. The
+    // token may have been refreshed since the adapter was created.
+    const oauthAccessToken =
+      auth.type === 'oauth_token'
+        ? getCodexOAuthTokens()?.accessToken || auth.accessToken
+        : null
+
+    const requestHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      Authorization:
+        auth.type === 'oauth_token'
+          ? `Bearer ${oauthAccessToken}`
+          : `Bearer ${auth.apiKey}`,
+    }
+
+    if (auth.type === 'oauth_token' && accountId) {
+      requestHeaders['chatgpt-account-id'] = accountId
+      requestHeaders.originator = 'pi'
+      requestHeaders['OpenAI-Beta'] = 'responses=experimental'
+    }
+
+    const endpointUrl =
+      auth.type === 'oauth_token'
+        ? CHATGPT_CODEX_BASE_URL
+        : OPENAI_RESPONSES_BASE_URL
+
+    // Call the selected Codex runtime endpoint
+    const codexResponse = await globalThis.fetch(endpointUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-        Authorization: `Bearer ${currentToken}`,
-        'chatgpt-account-id': accountId,
-        originator: 'pi',
-        'OpenAI-Beta': 'responses=experimental',
-      },
+      headers: requestHeaders,
       body: JSON.stringify(codexBody),
     })
 

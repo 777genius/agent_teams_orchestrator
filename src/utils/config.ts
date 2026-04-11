@@ -241,8 +241,8 @@ export type GlobalConfig = {
   }
   geminiBackendPreference?: 'auto' | 'api' | 'cli' | 'cli-sdk'
   geminiResolvedBackend?: 'api' | 'cli' | 'cli-sdk'
-  codexBackendPreference?: 'auto' | 'adapter'
-  codexResolvedBackend?: 'adapter'
+  codexBackendPreference?: 'auto' | 'adapter' | 'api'
+  codexResolvedBackend?: 'adapter' | 'api'
   geminiProjectId?: string
   geminiLastAuthMethod?:
     | 'api_key'
