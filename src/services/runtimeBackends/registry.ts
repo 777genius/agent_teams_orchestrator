@@ -6,6 +6,7 @@ import {
   CLAUDE_OPUS_4_6_CONFIG,
   CLAUDE_SONNET_4_6_CONFIG,
 } from '../../utils/model/configs.js'
+import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
@@ -144,13 +145,13 @@ function getAnthropicAuthenticated(): {
 }
 
 function getAnthropicModels(): string[] {
-  return [
+  return filterDisplayModels([
     CLAUDE_SONNET_4_6_CONFIG.firstParty,
     `${CLAUDE_SONNET_4_6_CONFIG.firstParty}[1m]`,
     CLAUDE_OPUS_4_6_CONFIG.firstParty,
     `${CLAUDE_OPUS_4_6_CONFIG.firstParty}[1m]`,
     CLAUDE_HAIKU_4_5_CONFIG.firstParty,
-  ]
+  ])
 }
 
 function buildAnthropicStatus(): RuntimeProviderStatus {
@@ -180,11 +181,15 @@ function buildAnthropicStatus(): RuntimeProviderStatus {
 }
 
 function getCodexModels(): string[] {
-  return CODEX_MODELS.map(model => model.id)
+  return filterDisplayModels(CODEX_MODELS.map(model => model.id))
 }
 
 function getGeminiModels(): string[] {
-  return GEMINI_MODELS.map(model => model.id)
+  return filterDisplayModels(GEMINI_MODELS.map(model => model.id))
+}
+
+function filterDisplayModels(models: string[]): string[] {
+  return models.filter(model => isModelAllowed(model))
 }
 
 async function buildGeminiStatuses(): Promise<{
