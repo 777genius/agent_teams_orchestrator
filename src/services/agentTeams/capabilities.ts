@@ -14,6 +14,11 @@ import type {
 
 const DEFAULT_CAPABILITIES_ISSUER = 'voicetext-agent-teams-capabilities';
 const DEFAULT_CAPABILITIES_AUDIENCE = 'voicetext-agent-teams';
+const DEFAULT_PUBLIC_KEYS: Record<string, string> = {
+  // Matches the current backend default keyset in VoicetextAI/backend/config/default.toml.
+  // Env-provided keys override this fallback.
+  'local-dev-key-1': 'XmGH60QXtHa0jT5BcE8NXUN5x10RQnqeL8UfHRKrlHc=',
+};
 
 let refreshInFlight: Promise<AgentTeamsCapabilitiesRecord | null> | null = null;
 
@@ -123,6 +128,12 @@ function getPublicKeyMap(): Map<string, string> {
   if (singleKey) {
     const explicitKid = process.env.AGENT_TEAMS_CAPABILITIES_PUBLIC_KEY_KID?.trim();
     keyMap.set(explicitKid || '*', singleKey);
+  }
+
+  if (keyMap.size === 0) {
+    for (const [kid, key] of Object.entries(DEFAULT_PUBLIC_KEYS)) {
+      keyMap.set(kid, key);
+    }
   }
 
   return keyMap;
