@@ -57,7 +57,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.source_ref || github.ref }}
 
@@ -121,7 +121,7 @@ jobs:
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Upload packaged runtime
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.platform }}
           path: release/${{ matrix.archive_name }}
@@ -153,9 +153,14 @@ jobs:
           echo "runtime_version=$runtime_version" >> "$GITHUB_OUTPUT"
 
       - name: Download packaged runtimes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
 
       - name: Flatten downloaded artifacts
         shell: bash
@@ -182,69 +187,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node <<'EOF'
-          const crypto = require('node:crypto');
-          const fs = require('node:fs');
-          const path = require('node:path');
-
-          const releaseDir = path.join(process.cwd(), 'release-flat');
-          const runtimeVersion = process.env.RUNTIME_VERSION;
-          const targetReleaseTag = process.env.TARGET_RELEASE_TAG;
-          const manifestFile = `agent-teams-runtime-manifest-v${runtimeVersion}.json`;
-          const checksumsFile = `agent-teams-runtime-SHA256SUMS-v${runtimeVersion}`;
-          const assets = [
-            {
-              platform: 'darwin-arm64',
-              file: `agent-teams-runtime-darwin-arm64-v${runtimeVersion}.tar.gz`,
-              archiveKind: 'tar.gz',
-              binaryName: 'claude-multimodel',
-            },
-            {
-              platform: 'darwin-x64',
-              file: `agent-teams-runtime-darwin-x64-v${runtimeVersion}.tar.gz`,
-              archiveKind: 'tar.gz',
-              binaryName: 'claude-multimodel',
-            },
-            {
-              platform: 'linux-x64',
-              file: `agent-teams-runtime-linux-x64-v${runtimeVersion}.tar.gz`,
-              archiveKind: 'tar.gz',
-              binaryName: 'claude-multimodel',
-            },
-            {
-              platform: 'win32-x64',
-              file: `agent-teams-runtime-win32-x64-v${runtimeVersion}.zip`,
-              archiveKind: 'zip',
-              binaryName: 'claude-multimodel.exe',
-            },
-          ];
-
-          const manifest = {
-            version: runtimeVersion,
-            targetReleaseTag,
-            generatedAt: new Date().toISOString(),
-            sourceRepository: process.env.GITHUB_REPOSITORY,
-            sourceCommit: process.env.GITHUB_SHA,
-            assets: {},
-          };
-
-          let sums = '';
-          for (const asset of assets) {
-            const assetPath = path.join(releaseDir, asset.file);
-            const file = fs.readFileSync(assetPath);
-            const sha256 = crypto.createHash('sha256').update(file).digest('hex');
-            manifest.assets[asset.platform] = {
-              file: asset.file,
-              archiveKind: asset.archiveKind,
-              binaryName: asset.binaryName,
-              sha256,
-            };
-            sums += `${sha256}  ${asset.file}\n`;
-          }
-
-          fs.writeFileSync(path.join(releaseDir, manifestFile), JSON.stringify(manifest, null, 2));
-          fs.writeFileSync(path.join(releaseDir, checksumsFile), sums);
-          EOF
+          bun run ./scripts/generate-release-manifest.ts
 
       - name: Create target release if needed
         env:
