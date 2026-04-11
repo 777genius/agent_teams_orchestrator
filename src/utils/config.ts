@@ -605,6 +605,60 @@ export type GlobalConfig = {
     scopes?: string[]
     expires_at?: number
   }
+  agentTeams?: {
+    clientId?: string
+    session?: {
+      accessToken: string
+      refreshToken: string
+      accessExpiresAt: number
+      refreshExpiresAt: number
+      subject: {
+        id: string
+        tier: string
+      }
+    }
+    capabilities?: {
+      token: string
+      tokenType: 'JWT'
+      expiresAt: number
+      fetchedAt: number
+      integrity: 'verified' | 'transport'
+      claims: {
+        iss: string
+        aud: string
+        sub: string
+        exp: number
+        iat: number
+        jti: string
+        tier: string
+        features: Record<
+          string,
+          {
+            granted: boolean
+            required_tier: string
+            killswitched: boolean
+          }
+        >
+        providers: Record<
+          string,
+          {
+            granted: boolean
+            required_tier: string
+            killswitched: boolean
+          }
+        >
+        models: Record<
+          string,
+          {
+            granted: boolean
+            required_tier: string
+            killswitched: boolean
+          }
+        >
+        killswitches: Record<string, boolean>
+      }
+    }
+  }
 }
 
 /**

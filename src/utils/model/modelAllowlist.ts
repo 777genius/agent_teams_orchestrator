@@ -1,4 +1,5 @@
 import { getSettings_DEPRECATED } from '../settings/settings.js'
+import { isModelAllowedByAgentTeamsResolvedModel } from '../../services/agentTeams/modelAccessPolicy.js'
 import { isModelAlias, isModelFamilyAlias } from './aliases.js'
 import { parseUserSpecifiedModel } from './model.js'
 import { resolveOverriddenModel } from './modelStrings.js'
@@ -56,6 +57,16 @@ function modelMatchesVersionPrefix(model: string, entry: string): boolean {
   return false
 }
 
+function isAllowedByAgentTeams(model: string): boolean {
+  const resolvedModel = isModelAlias(model)
+    ? parseUserSpecifiedModel(model)
+    : model
+
+  return isModelAllowedByAgentTeamsResolvedModel(
+    resolvedModel.replace(/\[1m\]$/i, ''),
+  )
+}
+
 /**
  * Check if a family alias is narrowed by more specific entries in the allowlist.
  * When the allowlist contains both "opus" and "opus-4-5", the specific entry
@@ -100,15 +111,16 @@ function familyHasSpecificEntries(
 export function isModelAllowed(model: string): boolean {
   const settings = getSettings_DEPRECATED() || {}
   const { availableModels } = settings
+  const resolvedModel = resolveOverriddenModel(model)
+  const normalizedModel = resolvedModel.trim().toLowerCase()
+
   if (!availableModels) {
-    return true // No restrictions
+    return isAllowedByAgentTeams(normalizedModel) // No local restrictions
   }
   if (availableModels.length === 0) {
     return false // Empty allowlist blocks all user-specified models
   }
 
-  const resolvedModel = resolveOverriddenModel(model)
-  const normalizedModel = resolvedModel.trim().toLowerCase()
   const normalizedAllowlist = availableModels.map(m => m.trim().toLowerCase())
 
   // Direct match (alias-to-alias or full-name-to-full-name)
@@ -120,7 +132,7 @@ export function isModelAllowed(model: string): boolean {
       !isModelFamilyAlias(normalizedModel) ||
       !familyHasSpecificEntries(normalizedModel, normalizedAllowlist)
     ) {
-      return true
+      return isAllowedByAgentTeams(normalizedModel)
     }
   }
 
@@ -133,7 +145,7 @@ export function isModelAllowed(model: string): boolean {
       !familyHasSpecificEntries(entry, normalizedAllowlist) &&
       modelBelongsToFamily(normalizedModel, entry)
     ) {
-      return true
+      return isAllowedByAgentTeams(normalizedModel)
     }
   }
 
@@ -142,7 +154,7 @@ export function isModelAllowed(model: string): boolean {
   if (isModelAlias(normalizedModel)) {
     const resolved = parseUserSpecifiedModel(normalizedModel).toLowerCase()
     if (normalizedAllowlist.includes(resolved)) {
-      return true
+      return isAllowedByAgentTeams(normalizedModel)
     }
   }
 
@@ -151,7 +163,7 @@ export function isModelAllowed(model: string): boolean {
     if (!isModelFamilyAlias(entry) && isModelAlias(entry)) {
       const resolved = parseUserSpecifiedModel(entry).toLowerCase()
       if (resolved === normalizedModel) {
-        return true
+        return isAllowedByAgentTeams(normalizedModel)
       }
     }
   }
@@ -161,7 +173,7 @@ export function isModelAllowed(model: string): boolean {
   for (const entry of normalizedAllowlist) {
     if (!isModelFamilyAlias(entry) && !isModelAlias(entry)) {
       if (modelMatchesVersionPrefix(normalizedModel, entry)) {
-        return true
+        return isAllowedByAgentTeams(normalizedModel)
       }
     }
   }

@@ -15,7 +15,11 @@ import {
   isGeminiModel,
   mapModelAliasToGemini,
 } from './gemini.js'
-import { getCodexDisplayName, mapClaudeModelToCodex } from './codex.js'
+import {
+  CODEX_MODELS,
+  getCodexDisplayName,
+  mapClaudeModelToCodex,
+} from './codex.js'
 import {
   getSubscriptionType,
   isClaudeAISubscriber,
@@ -44,6 +48,41 @@ import { capitalize } from '../stringUtils.js'
 export type ModelShortName = string
 export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
+
+function getAccessPolicyFallbackCandidates(): string[] {
+  if (getAPIProvider() === 'gemini') {
+    return []
+  }
+
+  if (shouldUseCodexProviderRoutingForCurrentProcess()) {
+    return CODEX_MODELS.map(model => model.id)
+  }
+
+  return [
+    getDefaultSonnetModel(),
+    getDefaultHaikuModel(),
+    getDefaultOpusModel(),
+    getModelStrings().sonnet46,
+    getModelStrings().sonnet45,
+    getModelStrings().haiku45,
+    getModelStrings().opus46,
+    getModelStrings().opus41,
+  ].filter(Boolean)
+}
+
+function getAllowedModelOrFallback(model: string): string {
+  if (isModelAllowed(model)) {
+    return model
+  }
+
+  for (const candidate of getAccessPolicyFallbackCandidates()) {
+    if (isModelAllowed(candidate)) {
+      return candidate
+    }
+  }
+
+  return model
+}
 
 export function getSmallFastModel(): ModelName {
   if (getAPIProvider() === 'gemini') {
@@ -107,13 +146,13 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
 export function getMainLoopModel(): ModelName {
   const model = getUserSpecifiedModelSetting()
   if (model !== undefined && model !== null) {
-    return parseUserSpecifiedModel(model)
+    return getAllowedModelOrFallback(parseUserSpecifiedModel(model))
   }
   return getDefaultMainLoopModel()
 }
 
 export function getBestModel(): ModelName {
-  return getDefaultOpusModel()
+  return getAllowedModelOrFallback(getDefaultOpusModel())
 }
 
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
@@ -238,7 +277,9 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
  * (bypassing any user-specified values).
  */
 export function getDefaultMainLoopModel(): ModelName {
-  return parseUserSpecifiedModel(getDefaultMainLoopModelSetting())
+  return getAllowedModelOrFallback(
+    parseUserSpecifiedModel(getDefaultMainLoopModelSetting()),
+  )
 }
 
 // @[MODEL LAUNCH]: Add a canonical name mapping for the new model below.
