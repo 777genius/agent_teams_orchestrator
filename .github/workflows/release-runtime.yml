@@ -1,9 +1,6 @@
 name: Release Runtime
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       source_ref:
