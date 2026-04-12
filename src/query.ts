@@ -106,11 +106,13 @@ import type { Terminal, Continue } from './query/transitions.js'
 import { feature } from 'bun:bundle'
 import {
   getCurrentTurnTokenBudget,
+  getSessionId,
   getTurnOutputTokens,
   incrementBudgetContinuationCount,
 } from './bootstrap/state.js'
 import { createBudgetTracker, checkTokenBudget } from './query/tokenBudget.js'
 import { count } from './utils/array.js'
+import { annotateAmbientBoardTaskExecutionMessage } from './services/boardTaskActivity/BoardTaskTranscriptProjector.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const snipModule = feature('HISTORY_SNIP')
@@ -166,6 +168,17 @@ const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 function shouldSuppressAbortInterruptionMessage(reason: unknown): boolean {
   return reason === 'interrupt' || isBootstrapMemberBriefingLoopAbortReason(reason)
+}
+
+function emitTaskAware(
+  message: Message,
+  toolUseContext: ToolUseContext,
+): Message {
+  return annotateAmbientBoardTaskExecutionMessage({
+    message,
+    sessionId: getSessionId(),
+    agentId: toolUseContext.agentId,
+  })
 }
 
 /**
@@ -826,7 +839,8 @@ async function* queryLoop(
               withheld = true
             }
             if (!withheld) {
-              yield yieldMessage
+              const emittedMessage = emitTaskAware(yieldMessage, toolUseContext)
+              yield emittedMessage
             }
             if (message.type === 'assistant') {
               assistantMessages.push(message)
@@ -855,10 +869,14 @@ async function* queryLoop(
             ) {
               for (const result of streamingToolExecutor.getCompletedResults()) {
                 if (result.message) {
-                  yield result.message
+                  const emittedMessage = emitTaskAware(
+                    result.message,
+                    toolUseContext,
+                  )
+                  yield emittedMessage
                   toolResults.push(
                     ...normalizeMessagesForAPI(
-                      [result.message],
+                      [emittedMessage],
                       toolUseContext.options.tools,
                     ).filter(_ => _.type === 'user'),
                   )
@@ -1023,7 +1041,7 @@ async function* queryLoop(
         // aborted tools since it checks the abort signal in executeTool()
         for await (const update of streamingToolExecutor.getRemainingResults()) {
           if (update.message) {
-            yield update.message
+            yield emitTaskAware(update.message, toolUseContext)
           }
         }
       } else {
@@ -1392,18 +1410,19 @@ async function* queryLoop(
 
     for await (const update of toolUpdates) {
       if (update.message) {
-        yield update.message
+        const emittedMessage = emitTaskAware(update.message, toolUseContext)
+        yield emittedMessage
 
         if (
-          update.message.type === 'attachment' &&
-          update.message.attachment.type === 'hook_stopped_continuation'
+          emittedMessage.type === 'attachment' &&
+          emittedMessage.attachment.type === 'hook_stopped_continuation'
         ) {
           shouldPreventContinuation = true
         }
 
         toolResults.push(
           ...normalizeMessagesForAPI(
-            [update.message],
+            [emittedMessage],
             toolUseContext.options.tools,
           ).filter(_ => _.type === 'user'),
         )

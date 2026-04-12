@@ -21,6 +21,7 @@ import {
 import {
   addToToolDuration,
   getCodeEditToolDecisionCounter,
+  getSessionId,
   getStatsStore,
 } from '../../bootstrap/state.js'
 import {
@@ -134,6 +135,7 @@ import {
   runPostToolUseHooks,
   runPreToolUseHooks,
 } from './toolHooks.js'
+import { annotateBoardTaskToolResultMessage } from '../boardTaskActivity/BoardTaskTranscriptProjector.js'
 
 /** Minimum total hook duration (ms) to show inline timing summary */
 export const HOOK_TIMING_DISPLAY_THRESHOLD_MS = 500
@@ -1458,8 +1460,7 @@ async function checkPermissionsAndCallTool(
         }
       }
 
-      resultingMessages.push({
-        message: createUserMessage({
+      const userMessage = createUserMessage({
           content: contentBlocks,
           imagePasteIds: allowImageIds,
           toolUseResult:
@@ -1468,7 +1469,20 @@ async function checkPermissionsAndCallTool(
               : toolUseResult,
           mcpMeta: toolUseContext.agentId ? undefined : mcpMeta,
           sourceToolAssistantUUID: assistantMessage.uuid,
-        }),
+        })
+
+      const annotatedMessage = annotateBoardTaskToolResultMessage({
+        message: userMessage,
+        toolName: tool.name,
+        input: processedInput,
+        result: toolUseResult,
+        toolUseId: toolUseID,
+        sessionId: getSessionId(),
+        agentId: toolUseContext.agentId,
+      })
+
+      resultingMessages.push({
+        message: annotatedMessage,
         contextModifier: toolContextModifier
           ? {
               toolUseID: toolUseID,

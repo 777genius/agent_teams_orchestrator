@@ -1,4 +1,8 @@
 import type { UUID } from 'crypto'
+import type {
+  BoardTaskLinkV1,
+  BoardTaskToolActionV1,
+} from 'src/services/boardTaskActivity/contract.js'
 import type { FileHistorySnapshot } from 'src/utils/fileHistory.js'
 import type { ContentReplacementRecord } from 'src/utils/toolResultStorage.js'
 import type { AgentId } from './ids.js'
@@ -228,6 +232,8 @@ export type TranscriptMessage = SerializedMessage & {
   agentName?: string // Agent's custom name (from /rename or swarm)
   agentColor?: string // Agent's color (from /rename or swarm)
   promptId?: string // Correlates with OTel prompt.id for user prompt messages
+  boardTaskLinks?: BoardTaskLinkV1[]
+  boardTaskToolActions?: BoardTaskToolActionV1[]
 }
 
 export type SpeculationAcceptMessage = {

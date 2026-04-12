@@ -21,6 +21,13 @@ import {
 } from 'src/services/analytics/index.js'
 import { sanitizeToolNameForAnalytics } from 'src/services/analytics/metadata.js'
 import type { AgentId } from 'src/types/ids.js'
+import type {
+  BoardTaskCarrierFields,
+  BoardTaskLinkV1,
+  BoardTaskToolActionV1,
+  TaskAwareAssistantMessage,
+  TaskAwareUserMessage,
+} from '../services/boardTaskActivity/contract.js'
 import { companionIntroText } from '../buddy/prompt.js'
 import { NO_CONTENT_MESSAGE } from '../constants/messages.js'
 import { OUTPUT_STYLE_CONFIG } from '../constants/outputStyles.js'
@@ -359,6 +366,7 @@ function baseCreateAssistantMessage({
   error,
   errorDetails,
   isVirtual,
+  boardTaskLinks,
   usage = {
     input_tokens: 0,
     output_tokens: 0,
@@ -381,9 +389,10 @@ function baseCreateAssistantMessage({
   error?: SDKAssistantMessageError
   errorDetails?: string
   isVirtual?: true
+  boardTaskLinks?: BoardTaskLinkV1[]
   usage?: Usage
 }): AssistantMessage {
-  return {
+  const message: TaskAwareAssistantMessage = {
     type: 'assistant',
     uuid: randomUUID(),
     timestamp: new Date().toISOString(),
@@ -406,16 +415,22 @@ function baseCreateAssistantMessage({
     isApiErrorMessage,
     isVirtual,
   }
+  if (boardTaskLinks?.length) {
+    message.boardTaskLinks = boardTaskLinks
+  }
+  return message
 }
 
 export function createAssistantMessage({
   content,
   usage,
   isVirtual,
+  boardTaskLinks,
 }: {
   content: string | BetaContentBlock[]
   usage?: Usage
   isVirtual?: true
+  boardTaskLinks?: BoardTaskLinkV1[]
 }): AssistantMessage {
   return baseCreateAssistantMessage({
     content:
@@ -429,6 +444,7 @@ export function createAssistantMessage({
         : content,
     usage,
     isVirtual,
+    boardTaskLinks,
   })
 }
 
@@ -472,6 +488,8 @@ export function createUserMessage({
   sourceToolAssistantUUID,
   permissionMode,
   origin,
+  boardTaskLinks,
+  boardTaskToolActions,
 }: {
   content: string | ContentBlockParam[]
   isMeta?: true
@@ -498,8 +516,10 @@ export function createUserMessage({
   }
   // Provenance of this message. undefined = human (keyboard).
   origin?: MessageOrigin
+  boardTaskLinks?: BoardTaskLinkV1[]
+  boardTaskToolActions?: BoardTaskToolActionV1[]
 }): UserMessage {
-  const m: UserMessage = {
+  const m: TaskAwareUserMessage = {
     type: 'user',
     message: {
       role: 'user',
@@ -518,6 +538,12 @@ export function createUserMessage({
     sourceToolAssistantUUID,
     permissionMode,
     origin,
+  }
+  if (boardTaskLinks?.length) {
+    m.boardTaskLinks = boardTaskLinks
+  }
+  if (boardTaskToolActions?.length) {
+    m.boardTaskToolActions = boardTaskToolActions
   }
   return m
 }
@@ -727,6 +753,103 @@ export function deriveUUID(parentUUID: UUID, index: number): UUID {
   return `${parentUUID.slice(0, 24)}${hex}` as UUID
 }
 
+function cloneBoardTaskLink(link: BoardTaskLinkV1): BoardTaskLinkV1 {
+  return {
+    schemaVersion: link.schemaVersion,
+    ...(link.toolUseId ? { toolUseId: link.toolUseId } : {}),
+    task: {
+      ref: link.task.ref,
+      refKind: link.task.refKind,
+      ...(link.task.canonicalId ? { canonicalId: link.task.canonicalId } : {}),
+    },
+    targetRole: link.targetRole,
+    linkKind: link.linkKind,
+    ...(link.taskArgumentSlot
+      ? { taskArgumentSlot: link.taskArgumentSlot }
+      : {}),
+    actorContext: {
+      relation: link.actorContext.relation,
+      ...(link.actorContext.activeTask
+        ? {
+            activeTask: {
+              ref: link.actorContext.activeTask.ref,
+              refKind: link.actorContext.activeTask.refKind,
+              ...(link.actorContext.activeTask.canonicalId
+                ? { canonicalId: link.actorContext.activeTask.canonicalId }
+                : {}),
+            },
+          }
+        : {}),
+      ...(link.actorContext.activePhase
+        ? { activePhase: link.actorContext.activePhase }
+        : {}),
+      ...(link.actorContext.activeExecutionSeq
+        ? { activeExecutionSeq: link.actorContext.activeExecutionSeq }
+        : {}),
+    },
+  }
+}
+
+function cloneBoardTaskToolAction(
+  action: BoardTaskToolActionV1,
+): BoardTaskToolActionV1 {
+  return {
+    schemaVersion: action.schemaVersion,
+    toolUseId: action.toolUseId,
+    canonicalToolName: action.canonicalToolName,
+    ...(action.input ? { input: { ...action.input } } : {}),
+    ...(action.resultRefs ? { resultRefs: { ...action.resultRefs } } : {}),
+  }
+}
+
+function cloneBoardTaskLinks(
+  links: BoardTaskCarrierFields['boardTaskLinks'],
+): BoardTaskLinkV1[] | undefined {
+  if (!links?.length) {
+    return undefined
+  }
+  return links.map(cloneBoardTaskLink)
+}
+
+function cloneBoardTaskToolActions(
+  actions: BoardTaskCarrierFields['boardTaskToolActions'],
+): BoardTaskToolActionV1[] | undefined {
+  if (!actions?.length) {
+    return undefined
+  }
+  return actions.map(cloneBoardTaskToolAction)
+}
+
+function ambientBoardTaskLinks(
+  links: BoardTaskCarrierFields['boardTaskLinks'],
+): BoardTaskLinkV1[] | undefined {
+  return cloneBoardTaskLinks(links?.filter(link => link.toolUseId === undefined))
+}
+
+function matchingBoardTaskLinksForToolResult(
+  block: Extract<ContentBlockParam, { type: 'tool_result' }>,
+  links: BoardTaskCarrierFields['boardTaskLinks'],
+): BoardTaskLinkV1[] | undefined {
+  if (!links?.length) {
+    return undefined
+  }
+  return cloneBoardTaskLinks(
+    links.filter(link => link.toolUseId === block.tool_use_id),
+  )
+}
+
+function matchingBoardTaskToolActionsForToolResult(
+  block: Extract<ContentBlockParam, { type: 'tool_result' }>,
+  actions: BoardTaskCarrierFields['boardTaskToolActions'],
+): BoardTaskToolActionV1[] | undefined {
+  if (!actions?.length) {
+    return undefined
+  }
+  return cloneBoardTaskToolActions(
+    actions.filter(action => action.toolUseId === block.tool_use_id),
+  )
+}
+
 // Split messages, so each content block gets its own message
 export function normalizeMessages(
   messages: AssistantMessage[],
@@ -749,11 +872,19 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
   return messages.flatMap(message => {
     switch (message.type) {
       case 'assistant': {
+        const assistantMessage = message as TaskAwareAssistantMessage
+        const ambientLinks = ambientBoardTaskLinks(assistantMessage.boardTaskLinks)
+        let ambientAssigned = false
         isNewChain = isNewChain || message.message.content.length > 1
         return message.message.content.map((_, index) => {
           const uuid = isNewChain
             ? deriveUUID(message.uuid, index)
             : message.uuid
+          const boardTaskLinks =
+            !ambientAssigned && _.type === 'text' ? ambientLinks : undefined
+          if (boardTaskLinks?.length) {
+            ambientAssigned = true
+          }
           return {
             type: 'assistant' as const,
             timestamp: message.timestamp,
@@ -769,6 +900,7 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
             error: message.error,
             isApiErrorMessage: message.isApiErrorMessage,
             advisorModel: message.advisorModel,
+            ...(boardTaskLinks ? { boardTaskLinks } : {}),
           } as NormalizedAssistantMessage
         })
       }
@@ -779,6 +911,9 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
       case 'system':
         return [message]
       case 'user': {
+        const userMessage = message as TaskAwareUserMessage
+        const ambientLinks = ambientBoardTaskLinks(userMessage.boardTaskLinks)
+        let ambientAssigned = false
         if (typeof message.message.content === 'string') {
           const uuid = isNewChain ? deriveUUID(message.uuid, 0) : message.uuid
           return [
@@ -802,6 +937,22 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
               ? message.imagePasteIds[imageIndex]
               : undefined
           if (isImage) imageIndex++
+          const boardTaskLinks =
+            _.type === 'tool_result'
+              ? matchingBoardTaskLinksForToolResult(_, userMessage.boardTaskLinks)
+              : !ambientAssigned && _.type === 'text'
+                ? ambientLinks
+                : undefined
+          if (boardTaskLinks?.length && _.type === 'text') {
+            ambientAssigned = true
+          }
+          const boardTaskToolActions =
+            _.type === 'tool_result'
+              ? matchingBoardTaskToolActionsForToolResult(
+                  _,
+                  userMessage.boardTaskToolActions,
+                )
+              : undefined
           return {
             ...createUserMessage({
               content: [_],
@@ -813,6 +964,8 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
               timestamp: message.timestamp,
               imagePasteIds: imageId !== undefined ? [imageId] : undefined,
               origin: message.origin,
+              boardTaskLinks,
+              boardTaskToolActions,
             }),
             uuid: isNewChain ? deriveUUID(message.uuid, index) : message.uuid,
           } as NormalizedMessage
