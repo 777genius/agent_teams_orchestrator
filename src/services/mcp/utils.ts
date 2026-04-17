@@ -262,6 +262,7 @@ export function isMcpCommand(command: Command): boolean {
  */
 export function describeMcpConfigFilePath(scope: ConfigScope): string {
   switch (scope) {
+    case 'global':
     case 'user':
       return getGlobalClaudeFile()
     case 'project':
@@ -285,8 +286,10 @@ export function getScopeLabel(scope: ConfigScope): string {
       return 'Local config (private to you in this project)'
     case 'project':
       return 'Project config (shared via .mcp.json)'
+    case 'global':
+      return 'Global config (shared across providers)'
     case 'user':
-      return 'User config (available in all your projects)'
+      return 'User config (legacy alias for global)'
     case 'dynamic':
       return 'Dynamic config (from command line)'
     case 'enterprise':

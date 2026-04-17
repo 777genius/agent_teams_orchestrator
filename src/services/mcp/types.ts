@@ -11,6 +11,7 @@ export const ConfigScopeSchema = lazySchema(() =>
   z.enum([
     'local',
     'user',
+    'global',
     'project',
     'dynamic',
     'enterprise',

@@ -979,7 +979,11 @@ export function useManageMCPConnections(
       const stdioCommands: string[] = []
       for (const [name, serverConfig] of Object.entries(allConfigs)) {
         if (serverConfig.scope === 'enterprise') counts.enterprise++
-        else if (serverConfig.scope === 'user') counts.global++
+        else if (
+          serverConfig.scope === 'global' ||
+          serverConfig.scope === 'user'
+        )
+          counts.global++
         else if (serverConfig.scope === 'project') counts.project++
         else if (serverConfig.scope === 'local') counts.user++
         else if (serverConfig.scope === 'dynamic') counts.plugin++
