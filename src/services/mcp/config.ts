@@ -1314,7 +1314,7 @@ export async function getClaudeCodeMcpConfigs(
   const extraTargets = await extraDedupTargets
   const enabledManualServers: Record<string, ScopedMcpServerConfig> = {}
   for (const [name, config] of Object.entries({
-    ...userServers,
+    ...globalServers,
     ...approvedProjectServers,
     ...localServers,
     ...dynamicServers,
