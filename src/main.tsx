@@ -3919,11 +3919,22 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/mcp.js');
     await mcpRemoveHandler(name, options);
   });
-  mcp.command('list').description('List configured MCP servers. Note: The workspace trust dialog is skipped and stdio servers from .mcp.json are spawned for health checks. Only use this command in directories you trust.').action(async () => {
+  mcp.command('list').description('List configured MCP servers. Note: text mode spawns stdio servers for health checks. Use --json for a machine-readable config snapshot without health checks.').option('--json', 'Output as JSON without running health checks').action(async (options: {
+    json?: boolean;
+  }) => {
     const {
       mcpListHandler
     } = await import('./cli/handlers/mcp.js');
-    await mcpListHandler();
+    await mcpListHandler(options);
+  });
+  mcp.command('diagnose').description('Run bounded health checks for configured MCP servers').option('--json', 'Output as JSON').option('--text', 'Output as human-readable text').action(async (options: {
+    json?: boolean;
+    text?: boolean;
+  }) => {
+    const {
+      mcpDiagnoseHandler
+    } = await import('./cli/handlers/mcp.js');
+    await mcpDiagnoseHandler(options);
   });
   mcp.command('get <name>').description('Get details about an MCP server. Note: The workspace trust dialog is skipped and stdio servers from .mcp.json are spawned for health checks. Only use this command in directories you trust.').action(async (name: string) => {
     const {
