@@ -14,7 +14,14 @@ import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEve
 import { clearMcpClientConfig, clearServerTokensFromLocalStorage, getMcpClientConfig, readClientSecret, saveMcpClientSecret } from '../../services/mcp/auth.js';
 import { connectToServer, getMcpServerConnectionBatchSize } from '../../services/mcp/client.js';
 import { addMcpConfig, getAllMcpConfigs, getMcpConfigByName, getMcpConfigsByScope, removeMcpConfig } from '../../services/mcp/config.js';
+import {
+  buildMcpDiagnoseJsonPayload,
+  buildMcpListJsonPayload,
+  describeMcpServerTarget,
+  getMcpTransport,
+} from '../../services/mcp/cliJson.js';
 import type { ConfigScope, ScopedMcpServerConfig } from '../../services/mcp/types.js';
+import type { McpDiagnoseJsonEntry } from '../../services/mcp/cliJson.js';
 import { describeMcpConfigFilePath, ensureConfigScope, getScopeLabel } from '../../services/mcp/utils.js';
 import { AppStateProvider } from '../../state/AppState.js';
 import { getCurrentProjectConfig, getGlobalConfig, saveCurrentProjectConfig } from '../../utils/config.js';
@@ -22,7 +29,55 @@ import { isFsInaccessible } from '../../utils/errors.js';
 import { gracefulShutdown } from '../../utils/gracefulShutdown.js';
 import { safeParseJSON } from '../../utils/json.js';
 import { getPlatform } from '../../utils/platform.js';
+import { jsonStringify } from '../../utils/slowOperations.js';
 import { cliError, cliOk } from '../exit.js';
+
+const MCP_DIAGNOSE_TIMEOUT_MS = 10_000
+
+function toDiagnosticStatus(statusMessage: string): Pick<McpDiagnoseJsonEntry, 'status' | 'statusLabel'> {
+  if (statusMessage.startsWith('✓')) {
+    return { status: 'connected', statusLabel: statusMessage.slice(1).trim() || 'Connected' }
+  }
+  if (statusMessage.startsWith('!')) {
+    return {
+      status: 'needs-authentication',
+      statusLabel: statusMessage.slice(1).trim() || 'Needs authentication',
+    }
+  }
+  if (statusMessage.startsWith('⏱')) {
+    return { status: 'timeout', statusLabel: statusMessage.slice(1).trim() || 'Timed out' }
+  }
+  return { status: 'failed', statusLabel: statusMessage.replace(/^✗\s*/, '').trim() || 'Failed' }
+}
+
+async function diagnoseMcpServer(
+  name: string,
+  server: ScopedMcpServerConfig,
+): Promise<McpDiagnoseJsonEntry> {
+  const healthPromise = checkMcpServerHealth(name, server)
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+  const timeoutPromise = new Promise<string>(resolve => {
+    timeoutHandle = setTimeout(() => resolve('⏱ Timed out'), MCP_DIAGNOSE_TIMEOUT_MS)
+    timeoutHandle.unref?.()
+  })
+  const statusMessage = await Promise.race([healthPromise, timeoutPromise])
+  if (timeoutHandle) {
+    clearTimeout(timeoutHandle)
+  }
+  const normalized = toDiagnosticStatus(statusMessage)
+
+  return {
+    name,
+    scope: server.scope,
+    transport: getMcpTransport(server),
+    target: describeMcpServerTarget(server),
+    ...normalized,
+  }
+}
+
+function writeJson(payload: unknown): void {
+  process.stdout.write(jsonStringify(payload, null, 2) + '\n')
+}
 async function checkMcpServerHealth(name: string, server: ScopedMcpServerConfig): Promise<string> {
   try {
     const result = await connectToServer(name, server);
@@ -141,11 +196,17 @@ export async function mcpRemoveHandler(name: string, options: {
 }
 
 // mcp list (lines 4641–4688)
-export async function mcpListHandler(): Promise<void> {
+export async function mcpListHandler(options: { json?: boolean } = {}): Promise<void> {
   logEvent('tengu_mcp_list', {});
   const {
     servers: configs
   } = await getAllMcpConfigs();
+  if (options.json) {
+    writeJson(buildMcpListJsonPayload(configs))
+    await gracefulShutdown(0)
+    return
+  }
+
   if (Object.keys(configs).length === 0) {
     // biome-ignore lint/suspicious/noConsole:: intentional console output
     console.log('No MCP servers configured. Use `claude mcp add` to add a server.');
@@ -187,6 +248,50 @@ export async function mcpListHandler(): Promise<void> {
   // Use gracefulShutdown to properly clean up MCP server connections
   // (process.exit bypasses cleanup handlers, leaving child processes orphaned)
   await gracefulShutdown(0);
+}
+
+export async function mcpDiagnoseHandler(options: {
+  json?: boolean
+  text?: boolean
+} = {}): Promise<void> {
+  logEvent('tengu_mcp_diagnose', {})
+  const { servers: configs } = await getAllMcpConfigs()
+  const entries = Object.entries(configs)
+
+  if (entries.length === 0) {
+    if (options.json) {
+      writeJson(buildMcpDiagnoseJsonPayload([]))
+    } else {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.log('No MCP servers configured. Use `claude mcp add` to add a server.')
+    }
+    await gracefulShutdown(0)
+    return
+  }
+
+  if (!options.json) {
+    // biome-ignore lint/suspicious/noConsole:: intentional console output
+    console.log('Checking MCP server health...\n')
+  }
+
+  const diagnostics = await pMap(
+    entries,
+    async ([name, server]) => diagnoseMcpServer(name, server),
+    { concurrency: getMcpServerConnectionBatchSize() },
+  )
+
+  if (options.json) {
+    writeJson(buildMcpDiagnoseJsonPayload(diagnostics))
+  } else {
+    for (const diagnostic of diagnostics) {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.log(
+        `${diagnostic.name}: ${diagnostic.target} (${diagnostic.transport.toUpperCase()}) - ${diagnostic.statusLabel}`,
+      )
+    }
+  }
+
+  await gracefulShutdown(0)
 }
 
 // mcp get (lines 4694–4786)
