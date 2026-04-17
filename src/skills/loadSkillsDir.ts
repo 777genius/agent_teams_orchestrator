@@ -63,6 +63,7 @@ import { isRestrictedToPluginOnly } from '../utils/settings/pluginOnlyPolicy.js'
 import { HooksSchema, type HooksSettings } from '../utils/settings/types.js'
 import { createSignal } from '../utils/signal.js'
 import { registerMCPSkillBuilders } from './mcpSkillBuilders.js'
+import { getProviderSkillOverlayRoots } from './providerSkillRoots.js'
 
 export type LoadedFrom =
   | 'commands_DEPRECATED'
@@ -641,12 +642,12 @@ export const getSkillDirCommands = memoize(
     const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
     const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
 
-    logForDebugging(
-      `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, project=[${projectSkillsDirs.join(', ')}]`,
-    )
-
     // Load from additional directories (--add-dir)
     const additionalDirs = getAdditionalDirectoriesForClaudeMd()
+    const overlayRoots = getProviderSkillOverlayRoots(cwd, additionalDirs)
+    logForDebugging(
+      `Loading skills from: managed=${managedSkillsDir}, user=[${[userSkillsDir, ...overlayRoots.userSkillsDirs].join(', ')}], project=[${[...projectSkillsDirs, ...overlayRoots.projectSkillsDirs].join(', ')}], additional=[${[...additionalDirs.map(dir => join(dir, '.claude', 'skills')), ...overlayRoots.additionalSkillsDirs].join(', ')}]`,
+    )
     const skillsLocked = isRestrictedToPluginOnly('skills')
     const projectSettingsEnabled =
       isSettingSourceEnabled('projectSettings') && !skillsLocked
@@ -663,12 +664,10 @@ export const getSkillDirCommands = memoize(
         return []
       }
       const additionalSkillsNested = await Promise.all(
-        additionalDirs.map(dir =>
-          loadSkillsFromSkillsDir(
-            join(dir, '.claude', 'skills'),
-            'projectSettings',
-          ),
-        ),
+        [
+          ...additionalDirs.map(dir => join(dir, '.claude', 'skills')),
+          ...overlayRoots.additionalSkillsDirs,
+        ].map(dir => loadSkillsFromSkillsDir(dir, 'projectSettings')),
       )
       // No dedup needed — explicit dirs, user controls uniqueness.
       return additionalSkillsNested.flat().map(s => s.skill)
@@ -679,7 +678,9 @@ export const getSkillDirCommands = memoize(
     const [
       managedSkills,
       userSkills,
+      providerUserSkillsNested,
       projectSkillsNested,
+      providerProjectSkillsNested,
       additionalSkillsNested,
       legacyCommands,
     ] = await Promise.all([
@@ -688,6 +689,13 @@ export const getSkillDirCommands = memoize(
         : loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
       isSettingSourceEnabled('userSettings') && !skillsLocked
         ? loadSkillsFromSkillsDir(userSkillsDir, 'userSettings')
+        : Promise.resolve([]),
+      isSettingSourceEnabled('userSettings') && !skillsLocked
+        ? Promise.all(
+            overlayRoots.userSkillsDirs.map(dir =>
+              loadSkillsFromSkillsDir(dir, 'userSettings'),
+            ),
+          )
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
@@ -698,12 +706,17 @@ export const getSkillDirCommands = memoize(
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
-            additionalDirs.map(dir =>
-              loadSkillsFromSkillsDir(
-                join(dir, '.claude', 'skills'),
-                'projectSettings',
-              ),
+            overlayRoots.projectSkillsDirs.map(dir =>
+              loadSkillsFromSkillsDir(dir, 'projectSettings'),
             ),
+          )
+        : Promise.resolve([]),
+      projectSettingsEnabled
+        ? Promise.all(
+            [
+              ...additionalDirs.map(dir => join(dir, '.claude', 'skills')),
+              ...overlayRoots.additionalSkillsDirs,
+            ].map(dir => loadSkillsFromSkillsDir(dir, 'projectSettings')),
           )
         : Promise.resolve([]),
       // Legacy commands-as-skills goes through markdownConfigLoader with
@@ -717,7 +730,9 @@ export const getSkillDirCommands = memoize(
     const allSkillsWithPaths = [
       ...managedSkills,
       ...userSkills,
+      ...providerUserSkillsNested.flat(),
       ...projectSkillsNested.flat(),
+      ...providerProjectSkillsNested.flat(),
       ...additionalSkillsNested.flat(),
       ...legacyCommands,
     ]
