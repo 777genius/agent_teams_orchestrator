@@ -45,6 +45,50 @@ export type MarkdownFile = {
   source: SettingSource
 }
 
+export function getConfigDirsUpToHome(
+  configDirName: `.${string}`,
+  subdir: ClaudeConfigDirectory,
+  cwd: string,
+): string[] {
+  const home = resolve(homedir()).normalize('NFC')
+  const gitRoot = resolveStopBoundary(cwd)
+  let current = resolve(cwd)
+  const dirs: string[] = []
+
+  while (true) {
+    if (
+      normalizePathForComparison(current) === normalizePathForComparison(home)
+    ) {
+      break
+    }
+
+    const configSubdir = join(current, configDirName, subdir)
+    try {
+      statSync(configSubdir)
+      dirs.push(configSubdir)
+    } catch (e: unknown) {
+      if (!isFsInaccessible(e)) throw e
+    }
+
+    if (
+      gitRoot &&
+      normalizePathForComparison(current) ===
+        normalizePathForComparison(gitRoot)
+    ) {
+      break
+    }
+
+    const parent = dirname(current)
+    if (parent === current) {
+      break
+    }
+
+    current = parent
+  }
+
+  return dirs
+}
+
 /**
  * Extracts a description from markdown content
  * Uses the first non-empty line as the description, or falls back to a default
@@ -235,57 +279,7 @@ export function getProjectDirsUpToHome(
   subdir: ClaudeConfigDirectory,
   cwd: string,
 ): string[] {
-  const home = resolve(homedir()).normalize('NFC')
-  const gitRoot = resolveStopBoundary(cwd)
-  let current = resolve(cwd)
-  const dirs: string[] = []
-
-  // Traverse from current directory up to git root (or home if not in a git repo)
-  while (true) {
-    // Stop if we've reached the home directory (don't check it, as it's loaded separately as userDir)
-    // Use normalized comparison to handle Windows drive letter casing (C:\ vs c:\)
-    if (
-      normalizePathForComparison(current) === normalizePathForComparison(home)
-    ) {
-      break
-    }
-
-    const claudeSubdir = join(current, '.claude', subdir)
-    // Filter to existing dirs. This is a perf filter (avoids spawning
-    // ripgrep on non-existent dirs downstream) and the worktree fallback
-    // in loadMarkdownFilesForSubdir relies on it. statSync + explicit error
-    // handling instead of existsSync — re-throws unexpected errors rather
-    // than silently swallowing them. Downstream loadMarkdownFiles handles
-    // the TOCTOU window (dir disappearing before read) gracefully.
-    try {
-      statSync(claudeSubdir)
-      dirs.push(claudeSubdir)
-    } catch (e: unknown) {
-      if (!isFsInaccessible(e)) throw e
-    }
-
-    // Stop after processing the git root directory - this prevents commands from parent
-    // directories outside the repository from appearing in the project
-    if (
-      gitRoot &&
-      normalizePathForComparison(current) ===
-        normalizePathForComparison(gitRoot)
-    ) {
-      break
-    }
-
-    // Move to parent directory
-    const parent = dirname(current)
-
-    // Safety check: if parent is the same as current, we've reached the root
-    if (parent === current) {
-      break
-    }
-
-    current = parent
-  }
-
-  return dirs
+  return getConfigDirsUpToHome('.claude', subdir, cwd)
 }
 
 /**
