@@ -54,6 +54,35 @@ describe('MCP JSON helpers', () => {
     ).toBe('https://claude.ai/mcp/proxy')
   })
 
+  it('redacts sensitive URL query params and CLI flag values from targets', () => {
+    expect(
+      describeMcpServerTarget({
+        type: 'stdio',
+        command: 'npx',
+        args: [
+          '-y',
+          'mcp-remote',
+          'https://mcp.tavily.com/mcp/?tavilyApiKey=secret-value&agent=claude',
+          '--api-key',
+          'super-secret-token',
+        ],
+        scope: 'global',
+      }),
+    ).toBe(
+      'npx -y mcp-remote https://mcp.tavily.com/mcp/?tavilyApiKey=REDACTED&agent=REDACTED --api-key REDACTED',
+    )
+  })
+
+  it('redacts credentials and fragments in remote MCP URLs', () => {
+    expect(
+      describeMcpServerTarget({
+        type: 'http',
+        url: 'https://user:pass@example.com/mcp?token=abc#fragment-token',
+        scope: 'global',
+      }),
+    ).toBe('https://***:***@example.com/mcp?token=REDACTED#REDACTED')
+  })
+
   it('wraps diagnostics in a versioned JSON payload', () => {
     expect(
       buildMcpDiagnoseJsonPayload(

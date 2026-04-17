@@ -228,20 +228,20 @@ export async function mcpListHandler(options: { json?: boolean } = {}): Promise<
       server,
       status
     } of results) {
+      const target = describeMcpServerTarget(server)
       // Intentionally excluding sse-ide servers here since they're internal
       if (server.type === 'sse') {
         // biome-ignore lint/suspicious/noConsole:: intentional console output
-        console.log(`${name}: ${server.url} (SSE) - ${status}`);
+        console.log(`${name}: ${target} (SSE) - ${status}`);
       } else if (server.type === 'http') {
         // biome-ignore lint/suspicious/noConsole:: intentional console output
-        console.log(`${name}: ${server.url} (HTTP) - ${status}`);
+        console.log(`${name}: ${target} (HTTP) - ${status}`);
       } else if (server.type === 'claudeai-proxy') {
         // biome-ignore lint/suspicious/noConsole:: intentional console output
-        console.log(`${name}: ${server.url} - ${status}`);
+        console.log(`${name}: ${target} - ${status}`);
       } else if (!server.type || server.type === 'stdio') {
-        const args = Array.isArray(server.args) ? server.args : [];
         // biome-ignore lint/suspicious/noConsole:: intentional console output
-        console.log(`${name}: ${server.command} ${args.join(' ')} - ${status}`);
+        console.log(`${name}: ${target} - ${status}`);
       }
     }
   }
