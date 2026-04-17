@@ -4,6 +4,7 @@ import {
   buildMcpDiagnoseJsonPayload,
   buildMcpListJsonPayload,
   describeMcpServerTarget,
+  filterExtensionsManagedMcpServers,
 } from '../../services/mcp/cliJson.js'
 
 import type { ScopedMcpServerConfig } from '../../services/mcp/types.js'
@@ -21,6 +22,12 @@ describe('MCP JSON helpers', () => {
         type: 'http',
         url: 'https://mcp.example.com',
         scope: 'project',
+      },
+      'plugin:context7:context7': {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', '@upstash/context7-mcp'],
+        scope: 'dynamic',
       },
     } satisfies Record<string, ScopedMcpServerConfig>)
 
@@ -40,6 +47,32 @@ describe('MCP JSON helpers', () => {
           target: 'uvx zebra-mcp',
         },
       ],
+    })
+  })
+
+  it('filters dynamic MCP servers out of the Extensions JSON contract', () => {
+    expect(
+      filterExtensionsManagedMcpServers({
+        context7: {
+          type: 'stdio',
+          command: 'npx',
+          args: ['-y', '@upstash/context7-mcp@latest'],
+          scope: 'global',
+        },
+        'plugin:context7:context7': {
+          type: 'stdio',
+          command: 'npx',
+          args: ['-y', '@upstash/context7-mcp'],
+          scope: 'dynamic',
+        },
+      } satisfies Record<string, ScopedMcpServerConfig>),
+    ).toEqual({
+      context7: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', '@upstash/context7-mcp@latest'],
+        scope: 'global',
+      },
     })
   })
 
@@ -90,6 +123,14 @@ describe('MCP JSON helpers', () => {
           {
             name: 'context7',
             scope: 'global',
+            transport: 'stdio',
+            target: 'npx -y @upstash/context7-mcp',
+            status: 'connected',
+            statusLabel: 'Connected',
+          },
+          {
+            name: 'plugin:context7:context7',
+            scope: 'dynamic',
             transport: 'stdio',
             target: 'npx -y @upstash/context7-mcp',
             status: 'connected',

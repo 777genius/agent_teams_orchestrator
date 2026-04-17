@@ -1,5 +1,12 @@
 import type { ScopedMcpServerConfig } from './types.js'
 
+const EXTENSIONS_MANAGED_MCP_SCOPES = new Set([
+  'local',
+  'user',
+  'global',
+  'project',
+])
+
 const EMBEDDED_HTTP_URL_PATTERN = /https?:\/\/[^\s"'`]+/gi
 const SENSITIVE_FLAG_VALUE_PATTERN =
   /(--(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|secret|password|client[-_]?secret))(?:=([^\s]+)|\s+([^\s]+))/gi
@@ -29,6 +36,18 @@ export type McpDiagnoseJsonPayload = {
   schemaVersion: 1
   checkedAt: string
   diagnostics: McpDiagnoseJsonEntry[]
+}
+
+export function isExtensionsManagedMcpScope(scope: string): boolean {
+  return EXTENSIONS_MANAGED_MCP_SCOPES.has(scope)
+}
+
+export function filterExtensionsManagedMcpServers(
+  servers: Record<string, ScopedMcpServerConfig>,
+): Record<string, ScopedMcpServerConfig> {
+  return Object.fromEntries(
+    Object.entries(servers).filter(([, server]) => isExtensionsManagedMcpScope(server.scope)),
+  )
 }
 
 export function getMcpTransport(server: ScopedMcpServerConfig): string {
@@ -88,7 +107,7 @@ export function buildMcpListJsonPayload(
 ): McpListJsonPayload {
   return {
     schemaVersion: 1,
-    servers: Object.entries(servers)
+    servers: Object.entries(filterExtensionsManagedMcpServers(servers))
       .map(([name, server]) => ({
         name,
         scope: server.scope,
@@ -106,6 +125,6 @@ export function buildMcpDiagnoseJsonPayload(
   return {
     schemaVersion: 1,
     checkedAt,
-    diagnostics,
+    diagnostics: diagnostics.filter(diagnostic => isExtensionsManagedMcpScope(diagnostic.scope)),
   }
 }
