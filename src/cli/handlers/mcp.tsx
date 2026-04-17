@@ -164,7 +164,7 @@ export async function mcpRemoveHandler(name: string, options: {
     const scopes: Array<Exclude<ConfigScope, 'dynamic'>> = [];
     if (projectConfig.mcpServers?.[name]) scopes.push('local');
     if (mcpJsonExists) scopes.push('project');
-    if (globalConfig.mcpServers?.[name]) scopes.push('user');
+    if (globalConfig.mcpServers?.[name]) scopes.push('global');
     if (scopes.length === 0) {
       cliError(`No MCP server found with name: "${name}"`);
     } else if (scopes.length === 1) {

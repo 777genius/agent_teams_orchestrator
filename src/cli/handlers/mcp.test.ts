@@ -15,7 +15,7 @@ describe('MCP JSON helpers', () => {
         type: 'stdio',
         command: 'uvx',
         args: ['zebra-mcp'],
-        scope: 'user',
+        scope: 'global',
       },
       alpha: {
         type: 'http',
@@ -35,7 +35,7 @@ describe('MCP JSON helpers', () => {
         },
         {
           name: 'zebra',
-          scope: 'user',
+          scope: 'global',
           transport: 'stdio',
           target: 'uvx zebra-mcp',
         },
@@ -60,7 +60,7 @@ describe('MCP JSON helpers', () => {
         [
           {
             name: 'context7',
-            scope: 'user',
+            scope: 'global',
             transport: 'stdio',
             target: 'npx -y @upstash/context7-mcp',
             status: 'connected',
@@ -75,7 +75,7 @@ describe('MCP JSON helpers', () => {
       diagnostics: [
         {
           name: 'context7',
-          scope: 'user',
+          scope: 'global',
           transport: 'stdio',
           target: 'npx -y @upstash/context7-mcp',
           status: 'connected',

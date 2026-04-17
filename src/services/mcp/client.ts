@@ -3363,7 +3363,7 @@ export async function setupSdkMcpClients(
           client: {
             type: 'failed' as const,
             name,
-            config: { ...config, scope: 'user' as const },
+            config,
           },
           tools: [],
         }

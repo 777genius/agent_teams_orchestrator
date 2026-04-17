@@ -774,6 +774,13 @@ export async function addMcpConfig(
       }
       break
     }
+    case 'global': {
+      const globalConfig = getGlobalConfig()
+      if (globalConfig.mcpServers?.[name]) {
+        throw new Error(`MCP server ${name} already exists in global config`)
+      }
+      break
+    }
     case 'local': {
       const projectConfig = getCurrentProjectConfig()
       if (projectConfig.mcpServers?.[name]) {
@@ -814,6 +821,17 @@ export async function addMcpConfig(
     }
 
     case 'user': {
+      saveGlobalConfig(current => ({
+        ...current,
+        mcpServers: {
+          ...current.mcpServers,
+          [name]: validatedConfig,
+        },
+      }))
+      break
+    }
+
+    case 'global': {
       saveGlobalConfig(current => ({
         ...current,
         mcpServers: {
@@ -881,6 +899,21 @@ export async function removeMcpConfig(
       const config = getGlobalConfig()
       if (!config.mcpServers?.[name]) {
         throw new Error(`No user-scoped MCP server found with name: ${name}`)
+      }
+      saveGlobalConfig(current => {
+        const { [name]: _, ...restMcpServers } = current.mcpServers ?? {}
+        return {
+          ...current,
+          mcpServers: restMcpServers,
+        }
+      })
+      break
+    }
+
+    case 'global': {
+      const config = getGlobalConfig()
+      if (!config.mcpServers?.[name]) {
+        throw new Error(`No global-scoped MCP server found with name: ${name}`)
       }
       saveGlobalConfig(current => {
         const { [name]: _, ...restMcpServers } = current.mcpServers ?? {}
@@ -966,7 +999,7 @@ export function getProjectMcpConfigsFromCwd(): {
  * @returns Servers with scope information and any validation errors
  */
 export function getMcpConfigsByScope(
-  scope: 'project' | 'user' | 'local' | 'enterprise',
+  scope: 'project' | 'user' | 'global' | 'local' | 'enterprise',
 ): {
   servers: Record<string, ScopedMcpServerConfig>
   errors: ValidationError[]
@@ -978,6 +1011,7 @@ export function getMcpConfigsByScope(
   > = {
     project: 'projectSettings',
     user: 'userSettings',
+    global: 'userSettings',
     local: 'localSettings',
   }
 
@@ -1056,6 +1090,23 @@ export function getMcpConfigsByScope(
         errors,
       }
     }
+    case 'global': {
+      const mcpServers = getGlobalConfig().mcpServers
+      if (!mcpServers) {
+        return { servers: {}, errors: [] }
+      }
+
+      const { config, errors } = parseMcpConfig({
+        configObject: { mcpServers },
+        expandVars: true,
+        scope: 'global',
+      })
+
+      return {
+        servers: addScopeToServers(config?.mcpServers, scope),
+        errors,
+      }
+    }
     case 'local': {
       const mcpServers = getCurrentProjectConfig().mcpServers
       if (!mcpServers) {
@@ -1119,7 +1170,7 @@ export function getMcpConfigByName(name: string): ScopedMcpServerConfig | null {
     return enterpriseServers[name] ?? null
   }
 
-  const { servers: userServers } = getMcpConfigsByScope('user')
+  const { servers: globalServers } = getMcpConfigsByScope('global')
   const { servers: projectServers } = getMcpConfigsByScope('project')
   const { servers: localServers } = getMcpConfigsByScope('local')
   const dynamicServers = getDynamicMcpConfigsFromFlags()
@@ -1136,8 +1187,8 @@ export function getMcpConfigByName(name: string): ScopedMcpServerConfig | null {
   if (projectServers[name]) {
     return projectServers[name]
   }
-  if (userServers[name]) {
-    return userServers[name]
+  if (globalServers[name]) {
+    return globalServers[name]
   }
 
   return null
@@ -1185,9 +1236,9 @@ export async function getClaudeCodeMcpConfigs(
   const noServers: { servers: Record<string, ScopedMcpServerConfig> } = {
     servers: {},
   }
-  const { servers: userServers } = mcpLocked
+  const { servers: globalServers } = mcpLocked
     ? noServers
-    : getMcpConfigsByScope('user')
+    : getMcpConfigsByScope('global')
   const { servers: projectServers } = mcpLocked
     ? noServers
     : getMcpConfigsByScope('project')
@@ -1312,11 +1363,11 @@ export async function getClaudeCodeMcpConfigs(
     })
   }
 
-  // Merge in order of precedence: plugin < user < project < local
+  // Merge in order of precedence: plugin < global < project < local
   const configs = Object.assign(
     {},
     dedupedPluginServers,
-    userServers,
+    globalServers,
     approvedProjectServers,
     localServers,
     dynamicServers,
