@@ -10,6 +10,26 @@ export type RuntimeCapabilityInfo = {
   enabled: boolean
 }
 
+export type RuntimeExtensionCapabilityStatus =
+  | 'supported'
+  | 'read-only'
+  | 'unsupported'
+
+export type RuntimeExtensionOwnership = 'shared' | 'provider-scoped'
+
+export type RuntimeExtensionCapability = {
+  status: RuntimeExtensionCapabilityStatus
+  ownership: RuntimeExtensionOwnership
+  reason: string | null
+}
+
+export type RuntimeExtensionCapabilities = {
+  plugins: RuntimeExtensionCapability
+  mcp: RuntimeExtensionCapability
+  skills: RuntimeExtensionCapability
+  apiKeys: RuntimeExtensionCapability
+}
+
 export type RuntimeBackendOptionStatus = {
   id: RuntimeBackendId
   label: string
@@ -40,6 +60,7 @@ export type RuntimeProviderStatus = {
   capabilities: {
     teamLaunch: boolean
     oneShot: boolean
+    extensions: RuntimeExtensionCapabilities
   }
   statusMessage: string | null
   detailMessage: string | null
@@ -59,6 +80,6 @@ export type RuntimeProviderStatus = {
 }
 
 export type RuntimeStatusPayload = {
-  schemaVersion: 1
+  schemaVersion: 2
   providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>>
 }

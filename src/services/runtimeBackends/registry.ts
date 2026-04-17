@@ -19,6 +19,7 @@ import type {
   CodexRuntimeBackendId,
   ExternalRuntimeDiagnostic,
   GeminiRuntimeBackendId,
+  RuntimeExtensionCapabilities,
   RuntimeBackendOptionStatus,
   RuntimeProviderId,
   RuntimeProviderStatus,
@@ -57,6 +58,34 @@ function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): Ex
     detected: Boolean(binaryPath),
     statusMessage: binaryPath ? `${label} detected` : `${label} not found`,
     detailMessage: binaryPath ?? null,
+  }
+}
+
+function buildExtensionCapabilities(
+  overrides: Partial<RuntimeExtensionCapabilities> = {},
+): RuntimeExtensionCapabilities {
+  return {
+    plugins: {
+      status: 'supported',
+      ownership: 'shared',
+      reason: null,
+    },
+    mcp: {
+      status: 'supported',
+      ownership: 'shared',
+      reason: null,
+    },
+    skills: {
+      status: 'supported',
+      ownership: 'shared',
+      reason: null,
+    },
+    apiKeys: {
+      status: 'supported',
+      ownership: 'shared',
+      reason: null,
+    },
+    ...overrides,
   }
 }
 
@@ -168,6 +197,7 @@ function buildAnthropicStatus(): RuntimeProviderStatus {
     capabilities: {
       teamLaunch: true,
       oneShot: true,
+      extensions: buildExtensionCapabilities(),
     },
     statusMessage: anthropicAuth.authenticated ? null : 'Not connected',
     detailMessage: null,
@@ -408,6 +438,14 @@ export async function getUnifiedRuntimeStatusPayload(
       capabilities: {
         teamLaunch: true,
         oneShot: true,
+        extensions: buildExtensionCapabilities({
+          plugins: {
+            status: 'unsupported',
+            ownership: 'shared',
+            reason:
+              'Plugins are currently guaranteed only for Anthropic sessions in the multimodel runtime.',
+          },
+        }),
       },
       statusMessage: codex.statusMessage,
       detailMessage: codex.detailMessage,
@@ -433,6 +471,13 @@ export async function getUnifiedRuntimeStatusPayload(
       capabilities: {
         teamLaunch: true,
         oneShot: true,
+        extensions: buildExtensionCapabilities({
+          plugins: {
+            status: 'unsupported',
+            ownership: 'shared',
+            reason: 'Plugin execution is not currently guaranteed for Gemini sessions.',
+          },
+        }),
       },
       statusMessage: gemini.statusMessage,
       detailMessage: gemini.detailMessage,
@@ -446,7 +491,7 @@ export async function getUnifiedRuntimeStatusPayload(
   }
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     providers,
   }
 }
