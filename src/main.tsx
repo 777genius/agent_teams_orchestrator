@@ -3922,6 +3922,13 @@ async function run(): Promise<CommanderCommand> {
   mcp.command('list').description('List configured MCP servers. Note: text mode spawns stdio servers for health checks. Use --json for a machine-readable config snapshot without health checks.').option('--json', 'Output as JSON without running health checks').action(async (options: {
     json?: boolean;
   }) => {
+    if (options.json) {
+      const {
+        mcpListJsonHandler
+      } = await import('./cli/handlers/mcpJson.js');
+      await mcpListJsonHandler();
+      return;
+    }
     const {
       mcpListHandler
     } = await import('./cli/handlers/mcp.js');
@@ -3931,6 +3938,13 @@ async function run(): Promise<CommanderCommand> {
     json?: boolean;
     text?: boolean;
   }) => {
+    if (options.json) {
+      const {
+        mcpDiagnoseJsonHandler
+      } = await import('./cli/handlers/mcpJson.js');
+      await mcpDiagnoseJsonHandler();
+      return;
+    }
     const {
       mcpDiagnoseHandler
     } = await import('./cli/handlers/mcp.js');
