@@ -21,6 +21,7 @@ import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from 'src/services/analytics/index.js'
+import { touchBoardTaskLogFreshnessSignals } from 'src/services/boardTaskActivity/TaskLogFreshnessSignal.js'
 import {
   getOriginalCwd,
   getPlanSlugCache,
@@ -675,6 +676,11 @@ class Project {
           r()
         }
       }
+
+      await touchBoardTaskLogFreshnessSignals({
+        transcriptPath: filePath,
+        entries: batch.map(({ entry }) => entry),
+      })
     }
 
     // Clean up empty queues
