@@ -1,10 +1,9 @@
-import { CLAUDE_OPUS_4_6_CONFIG } from '../model/configs.js'
-import { getAPIProvider } from '../model/providers.js'
-
 // @[MODEL LAUNCH]: Update the fallback model below.
 // When the user has never set teammateDefaultModel in /config, new teammates
-// use Opus 4.6. Must be provider-aware so Bedrock/Vertex/Foundry customers get
-// the correct model ID.
+// default to the Opus alias instead of a pinned model ID. This preserves the
+// existing "teammates default to Opus" behavior while still flowing through the
+// normal alias-resolution path, so provider-specific and env-based overrides
+// (for example ANTHROPIC_DEFAULT_OPUS_MODEL) apply consistently.
 export function getHardcodedTeammateModelFallback(): string {
-  return CLAUDE_OPUS_4_6_CONFIG[getAPIProvider()]
+  return 'opus'
 }

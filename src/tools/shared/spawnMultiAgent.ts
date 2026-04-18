@@ -755,7 +755,7 @@ async function handleSpawnSplitPane(
   const provider = resolveTeammateProvider(input.provider)
   const effort = input.effort
 
-  // Resolve model: 'inherit' → leader's model; undefined → default Opus
+  // Resolve model: 'inherit' → leader's model; undefined → default Opus alias
   const model = resolveSpawnModel(
     input.model,
     getAppState().mainLoopModel,
@@ -1055,7 +1055,7 @@ async function handleSpawnSeparateWindow(
   const provider = resolveTeammateProvider(input.provider)
   const effort = input.effort
 
-  // Resolve model: 'inherit' → leader's model; undefined → default Opus
+  // Resolve model: 'inherit' → leader's model; undefined → default Opus alias
   const model = resolveSpawnModel(
     input.model,
     getAppState().mainLoopModel,
@@ -1408,7 +1408,7 @@ async function handleSpawnInProcess(
     )
   }
 
-  // Resolve model: 'inherit' → leader's model; undefined → default Opus
+  // Resolve model: 'inherit' → leader's model; undefined → default Opus alias
   const model = resolveSpawnModel(
     input.model,
     getAppState().mainLoopModel,
