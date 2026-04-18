@@ -21,6 +21,7 @@ import {
   recordTranscript,
   resetProjectForTesting,
 } from '../../utils/sessionStorage.js'
+import { getBoardTaskLogFreshnessSignalFilePath } from './TaskLogFreshnessSignal.js'
 import type { TaskAwareMessage } from './contract.js'
 
 describe('BoardTask transcript persistence', () => {
@@ -121,5 +122,44 @@ describe('BoardTask transcript persistence', () => {
         },
       },
     ])
+  })
+
+  test('touches per-task freshness signal after transcript persistence', async () => {
+    const taskId = '123e4567-e89b-12d3-a456-426614174111'
+    const message = createAssistantMessage({
+      content: 'Adding another task-linked transcript message.',
+    }) as TaskAwareMessage
+
+    message.boardTaskLinks = [
+      {
+        schemaVersion: 1,
+        task: {
+          ref: taskId,
+          refKind: 'canonical',
+          canonicalId: taskId,
+        },
+        targetRole: 'subject',
+        linkKind: 'execution',
+        actorContext: {
+          relation: 'same_task',
+        },
+      },
+    ]
+
+    await recordTranscript([message])
+    await flushSessionStorage()
+
+    const transcriptPath = getTranscriptPath()
+    const projectDir = join(transcriptPath, '..')
+    const freshnessPath = getBoardTaskLogFreshnessSignalFilePath(projectDir, taskId)
+    const freshnessEntry = JSON.parse(readFileSync(freshnessPath, 'utf8')) as {
+      taskId?: string
+      transcriptFile?: string
+      updatedAt?: string
+    }
+
+    expect(freshnessEntry.taskId).toBe(taskId)
+    expect(freshnessEntry.transcriptFile).toBe(`${getSessionId()}.jsonl`)
+    expect(typeof freshnessEntry.updatedAt).toBe('string')
   })
 })
