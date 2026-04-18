@@ -42,6 +42,19 @@ Run the built binary with `./cli` or `./cli-dev`. Set `ANTHROPIC_API_KEY` in the
   - src/voice/: voice input
   - src/tasks/: background task management
 
+## Security model
+
+This repository is a CLI runtime, not the Electron desktop app. It does not
+expose desktop IPC handlers.
+
+Filesystem and shell access are enforced through tool-specific permission
+validators, deny-first permission rules, path-safety checks, and sandbox-aware
+allowlists. Auto-edit flows intentionally treat sensitive locations such as
+`.git/`, `.vscode/`, `.idea/`, `.claude/`, Claude settings files, shell rc
+files, and other dangerous config paths as protected.
+
+See [.github/SECURITY.md](.github/SECURITY.md) for the current summary.
+
 ## Build system
 
 - scripts/build.ts is the build script and feature-flag bundler. Feature flags are set via build arguments (e.g., `--feature=ULTRAPLAN`) or presets like `--feature-set=dev-full` (see README for details).
