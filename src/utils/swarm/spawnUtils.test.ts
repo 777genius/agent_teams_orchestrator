@@ -101,4 +101,92 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       }
     }
   })
+
+  it('forwards ANTHROPIC_AUTH_TOKEN for anthropic teammate overrides', () => {
+    const originalToken = process.env.ANTHROPIC_AUTH_TOKEN
+
+    process.env.ANTHROPIC_AUTH_TOKEN = 'anthropic-proxy-token'
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'anthropic' })
+
+      expect(env).toContain('ANTHROPIC_AUTH_TOKEN=anthropic-proxy-token')
+    } finally {
+      if (originalToken === undefined) {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      } else {
+        process.env.ANTHROPIC_AUTH_TOKEN = originalToken
+      }
+    }
+  })
+
+  it('does not forward ANTHROPIC_AUTH_TOKEN for codex teammate overrides', () => {
+    const originalToken = process.env.ANTHROPIC_AUTH_TOKEN
+
+    process.env.ANTHROPIC_AUTH_TOKEN = 'anthropic-proxy-token'
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'codex' })
+
+      expect(env).not.toContain('ANTHROPIC_AUTH_TOKEN=anthropic-proxy-token')
+    } finally {
+      if (originalToken === undefined) {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      } else {
+        process.env.ANTHROPIC_AUTH_TOKEN = originalToken
+      }
+    }
+  })
+
+  it('forwards ANTHROPIC_AUTH_TOKEN when inheriting an anthropic host provider', () => {
+    const originalToken = process.env.ANTHROPIC_AUTH_TOKEN
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    process.env.ANTHROPIC_AUTH_TOKEN = 'anthropic-proxy-token'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+
+    try {
+      const env = buildInheritedEnvVars()
+
+      expect(env).toContain('ANTHROPIC_AUTH_TOKEN=anthropic-proxy-token')
+    } finally {
+      if (originalToken === undefined) {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      } else {
+        process.env.ANTHROPIC_AUTH_TOKEN = originalToken
+      }
+
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+    }
+  })
+
+  it('does not forward ANTHROPIC_AUTH_TOKEN when inheriting a codex host provider', () => {
+    const originalToken = process.env.ANTHROPIC_AUTH_TOKEN
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    process.env.ANTHROPIC_AUTH_TOKEN = 'anthropic-proxy-token'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+
+    try {
+      const env = buildInheritedEnvVars()
+
+      expect(env).not.toContain('ANTHROPIC_AUTH_TOKEN=anthropic-proxy-token')
+    } finally {
+      if (originalToken === undefined) {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+      } else {
+        process.env.ANTHROPIC_AUTH_TOKEN = originalToken
+      }
+
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+    }
+  })
 })
