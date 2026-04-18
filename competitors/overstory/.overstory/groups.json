@@ -1,0 +1,963 @@
+[
+	{
+		"id": "group-339cf335",
+		"name": "phase1-session-migration",
+		"memberIssueIds": [
+			"overstory-2zg1",
+			"overstory-xhg8"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-13T22:54:35.599Z",
+		"completedAt": "2026-02-14T03:16:45.184Z"
+	},
+	{
+		"id": "group-81378b46",
+		"name": "phase2-cli-and-run",
+		"memberIssueIds": [
+			"overstory-lezb",
+			"overstory-n6qk",
+			"overstory-ggbi",
+			"overstory-vajl"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-14T03:19:38.077Z",
+		"completedAt": "2026-02-14T05:48:16.020Z"
+	},
+	{
+		"id": "group-8977d59f",
+		"name": "agent-inspection",
+		"memberIssueIds": [
+			"overstory-iycz"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-14T03:56:38.536Z",
+		"completedAt": "2026-02-17T01:24:44.805Z"
+	},
+	{
+		"id": "group-176f478e",
+		"name": "mulch-expansion",
+		"memberIssueIds": [
+			"overstory-j53z",
+			"overstory-el16",
+			"overstory-95za"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-14T05:51:36.617Z",
+		"completedAt": "2026-02-14T06:41:09.925Z"
+	},
+	{
+		"id": "group-6460c5e8",
+		"name": "p1p2-batch",
+		"memberIssueIds": [
+			"overstory-g2za",
+			"overstory-lu8k",
+			"overstory-aeh4",
+			"overstory-kix0",
+			"overstory-r93n",
+			"overstory-1f9g",
+			"overstory-y9ec",
+			"overstory-q9qk",
+			"overstory-8vf9"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-15T20:17:01.828Z",
+		"completedAt": "2026-02-15T21:13:42.964Z"
+	},
+	{
+		"id": "group-4d506af2",
+		"name": "fix-failing-tests",
+		"memberIssueIds": [
+			"overstory-gv2i",
+			"overstory-giqq",
+			"overstory-oa1x"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-15T22:06:55.432Z",
+		"completedAt": "2026-02-15T22:39:36.506Z"
+	},
+	{
+		"id": "group-8ef68b6d",
+		"name": "backlog-batch-1",
+		"memberIssueIds": [
+			"overstory-bkvc",
+			"overstory-bc8v",
+			"overstory-yj6n",
+			"overstory-lua3",
+			"overstory-l87h",
+			"overstory-iwlg",
+			"overstory-xkvr"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-16T15:03:26.953Z",
+		"completedAt": "2026-02-16T15:57:45.926Z"
+	},
+	{
+		"id": "group-a8eef55e",
+		"name": "phase1-hardening",
+		"memberIssueIds": [
+			"overstory-pz8y",
+			"overstory-4h93",
+			"overstory-q1dp",
+			"overstory-givh",
+			"overstory-18zt",
+			"overstory-ttfo",
+			"overstory-2gu1",
+			"overstory-l13t",
+			"overstory-f0kl"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-16T21:01:52.405Z",
+		"completedAt": "2026-02-16T21:59:24.313Z"
+	},
+	{
+		"id": "group-d989193a",
+		"name": "mulch-insight-loop",
+		"memberIssueIds": [
+			"overstory-vdg7",
+			"overstory-b1ac",
+			"overstory-7kn2",
+			"overstory-7jr8"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-17T01:26:14.086Z",
+		"completedAt": "2026-02-17T01:39:43.396Z"
+	},
+	{
+		"id": "group-c3d6f2b0",
+		"name": "batch-2-intelligence",
+		"memberIssueIds": [
+			"overstory-e7hf",
+			"overstory-e1q2",
+			"overstory-i1v4",
+			"overstory-9kuz",
+			"overstory-6ib5",
+			"overstory-uh2h",
+			"overstory-mifc"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-17T01:50:13.735Z",
+		"completedAt": "2026-02-17T02:28:22.023Z"
+	},
+	{
+		"id": "group-789abdfe",
+		"name": "gitignore-fix",
+		"memberIssueIds": [
+			"overstory-8jo7"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-17T15:15:31.532Z",
+		"completedAt": "2026-02-17T15:29:26.526Z"
+	},
+	{
+		"id": "group-96dcccc8",
+		"name": "p1p2-workflow-fixes",
+		"memberIssueIds": [
+			"overstory-9sct",
+			"overstory-sgy6",
+			"overstory-8pcf",
+			"overstory-tgcl"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-17T15:35:39.805Z",
+		"completedAt": "2026-02-17T16:14:56.698Z"
+	},
+	{
+		"id": "group-933a3b72",
+		"name": "p1p2-batch-2",
+		"memberIssueIds": [
+			"overstory-e5jb",
+			"overstory-d9d8",
+			"overstory-6sc8",
+			"overstory-3e3s"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-18T15:14:35.484Z",
+		"completedAt": "2026-02-18T15:57:31.236Z"
+	},
+	{
+		"id": "group-e4629264",
+		"name": "backlog-priority-sweep",
+		"memberIssueIds": [
+			"overstory-6j2o",
+			"overstory-zq15",
+			"overstory-2bix",
+			"overstory-so0b",
+			"overstory-2ki1"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-19T00:31:06.559Z",
+		"completedAt": "2026-02-19T01:09:07.132Z"
+	},
+	{
+		"id": "group-06092dc7",
+		"name": "p1p2-sweep",
+		"memberIssueIds": [
+			"overstory-yg84",
+			"overstory-rgst",
+			"overstory-4szs",
+			"overstory-1ilu"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-19T20:21:09.590Z",
+		"completedAt": "2026-02-19T21:06:25.825Z"
+	},
+	{
+		"id": "group-95d1818d",
+		"name": "p1p2-dashboard-config",
+		"memberIssueIds": [
+			"overstory-x9n3",
+			"overstory-eft1",
+			"overstory-qqr4",
+			"overstory-99ec",
+			"overstory-4zcj",
+			"overstory-je5w",
+			"overstory-qfln",
+			"overstory-d1g8"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-20T15:25:14.163Z",
+		"completedAt": "2026-02-20T16:24:52.178Z"
+	},
+	{
+		"id": "group-9dac102d",
+		"name": "mulch-integration-batch",
+		"memberIssueIds": [
+			"overstory-rhk5",
+			"overstory-qn3h",
+			"overstory-0fuu",
+			"overstory-4jca",
+			"overstory-vs8z",
+			"overstory-xo8h"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-20T21:14:56.928Z",
+		"completedAt": "2026-02-20T21:31:36.706Z"
+	},
+	{
+		"id": "group-57479fcb",
+		"name": "sling-and-stop-batch",
+		"memberIssueIds": [
+			"overstory-4ygi",
+			"overstory-b3ks",
+			"overstory-ewco",
+			"overstory-2evj",
+			"overstory-beck"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-21T14:52:27.174Z",
+		"completedAt": "2026-02-21T15:20:56.387Z"
+	},
+	{
+		"id": "group-bdc25044",
+		"name": "bugfix-batch-1",
+		"memberIssueIds": [
+			"overstory-ghnu",
+			"overstory-ptpx",
+			"overstory-7za6"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-23T19:08:39.719Z",
+		"completedAt": "2026-02-23T19:31:55.704Z"
+	},
+	{
+		"id": "group-3060cc8c",
+		"name": "tracker-phase2",
+		"memberIssueIds": [
+			"overstory-wius",
+			"overstory-xe1b"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T01:47:15.397Z",
+		"completedAt": "2026-02-24T02:04:38.239Z"
+	},
+	{
+		"id": "group-ff154d62",
+		"name": "p1-bugfix-batch",
+		"memberIssueIds": [
+			"seeds-3522",
+			"seeds-81fc",
+			"seeds-b878",
+			"overstory-jydl",
+			"seeds-32a8"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T13:32:12.823Z",
+		"completedAt": "2026-02-24T14:07:25.808Z"
+	},
+	{
+		"id": "group-93f1be84",
+		"name": "priority-batch-1",
+		"memberIssueIds": [
+			"seeds-aff5",
+			"seeds-43b1",
+			"seeds-33b0"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T14:46:20.873Z",
+		"completedAt": "2026-02-24T15:22:39.908Z"
+	},
+	{
+		"id": "group-06caf11f",
+		"name": "cli-framework-migration",
+		"memberIssueIds": [
+			"seeds-c6d6",
+			"seeds-9c7b",
+			"seeds-606c",
+			"seeds-4516",
+			"seeds-2243",
+			"seeds-9629"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T15:53:19.762Z",
+		"completedAt": "2026-02-24T17:39:14.213Z"
+	},
+	{
+		"id": "group-1fbfec24",
+		"name": "test-suite-fix",
+		"memberIssueIds": [
+			"seeds-1f0c"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T18:56:53.989Z",
+		"completedAt": "2026-02-24T20:03:39.011Z"
+	},
+	{
+		"id": "group-59211cc6",
+		"name": "stability-sprint",
+		"memberIssueIds": [
+			"seeds-db01",
+			"seeds-96ed",
+			"seeds-52e4",
+			"seeds-ef20",
+			"seeds-de10"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T21:34:48.363Z",
+		"completedAt": "2026-02-24T22:12:11.440Z"
+	},
+	{
+		"id": "group-fd52df9e",
+		"name": "priority-sweep-5",
+		"memberIssueIds": [
+			"overstory-e2e0",
+			"overstory-f0f9",
+			"overstory-e879",
+			"overstory-34f3",
+			"overstory-648d",
+			"overstory-8d46",
+			"overstory-4p77",
+			"overstory-bd16",
+			"overstory-431e",
+			"overstory-ce20",
+			"overstory-2a2b"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-24T22:59:10.743Z",
+		"completedAt": "2026-02-25T18:26:48.061Z"
+	},
+	{
+		"id": "group-7ea581b7",
+		"name": "quality-and-bugs-6",
+		"memberIssueIds": [
+			"overstory-a705",
+			"overstory-3271",
+			"overstory-18d5"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T02:57:04.728Z",
+		"completedAt": "2026-02-25T14:33:54.987Z"
+	},
+	{
+		"id": "group-d655d724",
+		"name": "output-and-fixes-batch",
+		"memberIssueIds": [
+			"overstory-a705",
+			"overstory-3271",
+			"overstory-9ab0",
+			"overstory-596c",
+			"overstory-18d5"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T03:20:11.734Z",
+		"completedAt": "2026-02-25T18:26:48.447Z"
+	},
+	{
+		"id": "group-4e890e6c",
+		"name": "beacon-and-icons-batch",
+		"memberIssueIds": [
+			"overstory-c57b",
+			"overstory-f1db"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T14:35:52.026Z",
+		"completedAt": "2026-02-25T14:45:26.707Z"
+	},
+	{
+		"id": "group-3864e1f7",
+		"name": "tui-readiness-fixes",
+		"memberIssueIds": [
+			"overstory-88e6",
+			"overstory-5579"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T15:03:51.543Z",
+		"completedAt": "2026-02-25T15:10:47.219Z"
+	},
+	{
+		"id": "group-8a367b03",
+		"name": "cli-standards-batch",
+		"memberIssueIds": [
+			"overstory-4752",
+			"overstory-197c",
+			"overstory-a222",
+			"overstory-596c",
+			"overstory-eab8"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T16:12:18.948Z",
+		"completedAt": "2026-02-25T16:42:53.447Z"
+	},
+	{
+		"id": "group-780b2c6f",
+		"name": "wave1-cli-branding",
+		"memberIssueIds": [
+			"overstory-a356",
+			"overstory-f003",
+			"overstory-a2a5",
+			"overstory-b2db",
+			"overstory-d9da",
+			"overstory-a89a"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T18:31:32.580Z",
+		"completedAt": "2026-02-25T19:31:04.960Z"
+	},
+	{
+		"id": "group-7201c86f",
+		"name": "wave2-accent-colors",
+		"memberIssueIds": [
+			"overstory-267f",
+			"overstory-f6ea"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T19:07:39.078Z",
+		"completedAt": "2026-02-25T19:31:05.277Z"
+	},
+	{
+		"id": "group-e8d7d83d",
+		"name": "cli-standards-completion",
+		"memberIssueIds": [
+			"overstory-e4d9",
+			"overstory-d09c",
+			"overstory-0272",
+			"overstory-5005",
+			"overstory-0ec4",
+			"overstory-8a29",
+			"overstory-49f0",
+			"overstory-eeb9"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T19:42:59.477Z",
+		"completedAt": "2026-02-25T20:13:47.966Z"
+	},
+	{
+		"id": "group-391842cc",
+		"name": "spawn-control-batch",
+		"memberIssueIds": [
+			"overstory-gktc",
+			"overstory-c59b",
+			"overstory-pb1p",
+			"overstory-e9my",
+			"overstory-2381"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T22:02:50.853Z",
+		"completedAt": "2026-02-25T22:42:09.332Z"
+	},
+	{
+		"id": "group-542e14af",
+		"name": "branding-infra-batch",
+		"memberIssueIds": [
+			"overstory-6d64",
+			"overstory-nd62",
+			"overstory-5652",
+			"overstory-6322"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T23:07:55.105Z",
+		"completedAt": "2026-02-25T23:48:25.634Z"
+	},
+	{
+		"id": "group-72e8096a",
+		"name": "phase0-runtime-abstraction",
+		"memberIssueIds": [
+			"overstory-42ab",
+			"overstory-3a6b",
+			"overstory-3bd4",
+			"overstory-fd86",
+			"overstory-a977",
+			"overstory-6d4a",
+			"overstory-4f9c",
+			"overstory-4f22",
+			"overstory-7448",
+			"overstory-6ab5",
+			"overstory-8c39",
+			"overstory-5298",
+			"overstory-2a62",
+			"overstory-94ca"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-25T23:51:00.689Z",
+		"completedAt": "2026-02-26T02:04:05.658Z"
+	},
+	{
+		"id": "group-d7b704a9",
+		"name": "phase1-headless-print",
+		"memberIssueIds": [
+			"overstory-0d45",
+			"overstory-4130",
+			"overstory-252b"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T02:08:35.805Z",
+		"completedAt": "2026-02-26T02:24:27.465Z"
+	},
+	{
+		"id": "group-f91eab97",
+		"name": "pi-runtime-adapter",
+		"memberIssueIds": [
+			"overstory-6f2e",
+			"overstory-46ca",
+			"overstory-8163",
+			"overstory-62d2",
+			"overstory-bd4b",
+			"overstory-50ee"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T04:06:14.337Z",
+		"completedAt": "2026-02-26T05:04:33.465Z"
+	},
+	{
+		"id": "group-a39cc73e",
+		"name": "provider-checks",
+		"memberIssueIds": [
+			"overstory-xxu7"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T14:15:59.908Z",
+		"completedAt": "2026-02-27T02:01:35.462Z"
+	},
+	{
+		"id": "group-63657ebc",
+		"name": "supervisor-deprecation",
+		"memberIssueIds": [
+			"overstory-5999"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T14:58:23.918Z",
+		"completedAt": "2026-02-26T15:38:32.520Z"
+	},
+	{
+		"id": "group-24c4eb2e",
+		"name": "wave1-priority-batch",
+		"memberIssueIds": [
+			"overstory-72b0",
+			"overstory-b2f7",
+			"overstory-6eyw",
+			"overstory-2236"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T16:10:07.802Z",
+		"completedAt": "2026-02-26T16:31:47.644Z"
+	},
+	{
+		"id": "group-dc8f89f4",
+		"name": "wave2-feedback-loop",
+		"memberIssueIds": [
+			"overstory-qk0f"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T16:33:18.560Z",
+		"completedAt": "2026-02-26T17:30:59.034Z"
+	},
+	{
+		"id": "group-19498ce3",
+		"name": "small-batch-cleanup",
+		"memberIssueIds": [
+			"overstory-ww0t",
+			"overstory-58b5",
+			"overstory-7c75",
+			"overstory-4f6a"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T18:27:59.593Z",
+		"completedAt": "2026-02-26T18:38:16.728Z"
+	},
+	{
+		"id": "group-e043d4c5",
+		"name": "wave3-runtime-and-init",
+		"memberIssueIds": [
+			"overstory-44c4",
+			"overstory-g3ym",
+			"overstory-xxu7",
+			"overstory-865e",
+			"overstory-06ae"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-26T22:42:51.251Z",
+		"completedAt": "2026-02-27T02:01:35.654Z"
+	},
+	{
+		"id": "group-72de99b5",
+		"name": "runtime-docs",
+		"memberIssueIds": [
+			"overstory-68d2"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-27T16:45:11.906Z",
+		"completedAt": "2026-02-27T16:58:41.631Z"
+	},
+	{
+		"id": "group-0e6dfdc0",
+		"name": "dashboard-redesign",
+		"memberIssueIds": [
+			"overstory-f6e5",
+			"overstory-6be7",
+			"overstory-f1b5",
+			"overstory-8197"
+		],
+		"status": "completed",
+		"createdAt": "2026-02-27T19:36:27.513Z",
+		"completedAt": "2026-02-27T19:49:03.171Z"
+	},
+	{
+		"id": "group-3a0aabbb",
+		"name": "batch-prioritized-5",
+		"memberIssueIds": [
+			"overstory-3e88",
+			"overstory-305d",
+			"overstory-9b46",
+			"overstory-67db",
+			"overstory-byro"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-02T16:04:31.559Z",
+		"completedAt": "2026-03-02T16:19:57.931Z"
+	},
+	{
+		"id": "group-e0bdc596",
+		"name": "coordinator-cross-project",
+		"memberIssueIds": [
+			"overstory-5e77",
+			"overstory-f710",
+			"overstory-bcb2",
+			"overstory-129d",
+			"overstory-1b2f",
+			"overstory-1fdc"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T19:04:44.759Z",
+		"completedAt": "2026-03-03T19:36:46.397Z"
+	},
+	{
+		"id": "group-7c319b82",
+		"name": "guard-rules-tests",
+		"memberIssueIds": [
+			"overstory-f490"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T19:57:58.313Z",
+		"completedAt": "2026-03-03T20:09:52.794Z"
+	},
+	{
+		"id": "group-46cdb065",
+		"name": "sapling-integration-w1",
+		"memberIssueIds": [
+			"overstory-3e89"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T21:59:42.927Z",
+		"completedAt": "2026-03-03T22:42:01.166Z"
+	},
+	{
+		"id": "group-a47fb105",
+		"name": "sapling-integration-w2",
+		"memberIssueIds": [
+			"overstory-3c41",
+			"overstory-f9c3"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T22:06:12.649Z",
+		"completedAt": "2026-03-03T22:42:01.281Z"
+	},
+	{
+		"id": "group-4490750a",
+		"name": "sapling-integration-w3",
+		"memberIssueIds": [
+			"overstory-ceab",
+			"overstory-8247"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T22:17:49.464Z",
+		"completedAt": "2026-03-03T22:42:01.397Z"
+	},
+	{
+		"id": "group-74945594",
+		"name": "sapling-integration-w4",
+		"memberIssueIds": [
+			"overstory-db8a"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-03T22:29:51.728Z",
+		"completedAt": "2026-03-03T22:42:01.483Z"
+	},
+	{
+		"id": "group-c2a64de7",
+		"name": "sapling-fix",
+		"memberIssueIds": [
+			"overstory-0c94"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T01:19:54.806Z",
+		"completedAt": "2026-03-04T01:36:00.205Z"
+	},
+	{
+		"id": "group-e422957b",
+		"name": "sapling-batch",
+		"memberIssueIds": [
+			"overstory-c12c",
+			"overstory-93d9",
+			"overstory-5916",
+			"overstory-2bae",
+			"overstory-a0ae",
+			"overstory-a846",
+			"overstory-d999"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T15:06:36.064Z",
+		"completedAt": "2026-03-04T15:15:32.596Z"
+	},
+	{
+		"id": "group-0289f80b",
+		"name": "sapling-headless-batch",
+		"memberIssueIds": [
+			"overstory-21e1",
+			"overstory-28ae",
+			"overstory-3dbd"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T15:35:08.094Z",
+		"completedAt": "2026-03-04T17:22:01.804Z"
+	},
+	{
+		"id": "group-4c04ef3c",
+		"name": "sapling-rpc-batch",
+		"memberIssueIds": [
+			"overstory-16f8"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T17:24:41.500Z",
+		"completedAt": "2026-03-04T17:54:55.244Z"
+	},
+	{
+		"id": "group-1bf47e64",
+		"name": "batch-6-issues",
+		"memberIssueIds": [
+			"overstory-2f10",
+			"overstory-eaf3",
+			"overstory-8507",
+			"overstory-3da4",
+			"overstory-8447",
+			"overstory-36cd"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T18:45:05.629Z",
+		"completedAt": "2026-03-04T18:54:16.183Z"
+	},
+	{
+		"id": "group-2c453c1c",
+		"name": "dispatch-batch-1",
+		"memberIssueIds": [
+			"overstory-1b04",
+			"overstory-aa00",
+			"overstory-d4d7"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T20:04:30.313Z",
+		"completedAt": "2026-03-04T21:24:26.989Z"
+	},
+	{
+		"id": "group-8ea5f2f4",
+		"name": "dispatch-batch-2",
+		"memberIssueIds": [
+			"overstory-0f5f",
+			"overstory-9cea",
+			"overstory-453b",
+			"overstory-7ece",
+			"overstory-b971",
+			"overstory-2905",
+			"overstory-abf5"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-04T23:38:45.353Z",
+		"completedAt": "2026-03-04T23:57:42.725Z"
+	},
+	{
+		"id": "group-459b41ff",
+		"name": "medium-priority-batch",
+		"memberIssueIds": [
+			"overstory-7110",
+			"overstory-b87b",
+			"overstory-5897",
+			"overstory-a85c",
+			"overstory-2aa0"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-05T14:49:40.932Z",
+		"completedAt": "2026-03-05T15:07:52.194Z"
+	},
+	{
+		"id": "group-fde94bfe",
+		"name": "coordinator-self-exit",
+		"memberIssueIds": [
+			"overstory-aad5",
+			"overstory-cdff",
+			"overstory-1b69",
+			"overstory-3137"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-06T00:49:40.589Z",
+		"completedAt": "2026-03-06T01:06:21.147Z"
+	},
+	{
+		"id": "group-3e7bfc32",
+		"name": "high-priority-bugfix-batch",
+		"memberIssueIds": [
+			"overstory-0480",
+			"overstory-d331",
+			"overstory-fe42",
+			"overstory-3c76",
+			"overstory-adc5",
+			"overstory-5c08",
+			"overstory-0552",
+			"overstory-7738"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-06T14:07:43.286Z",
+		"completedAt": "2026-03-06T14:24:21.391Z"
+	},
+	{
+		"id": "group-6fb2a2d6",
+		"name": "fish-shell-fix",
+		"memberIssueIds": [
+			"overstory-9701"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-06T15:35:57.578Z",
+		"completedAt": "2026-03-06T15:41:56.199Z"
+	},
+	{
+		"id": "group-bbcd89ee",
+		"name": "sd-close-and-sessions",
+		"memberIssueIds": [
+			"overstory-d390",
+			"overstory-15fb"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-06T17:27:45.085Z",
+		"completedAt": "2026-03-06T18:00:32.683Z"
+	},
+	{
+		"id": "group-1587724d",
+		"name": "v1-audit-batch",
+		"memberIssueIds": [
+			"overstory-c0a9"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-07T14:32:12.397Z",
+		"completedAt": "2026-03-07T14:51:44.615Z"
+	},
+	{
+		"id": "group-24f46393",
+		"name": "bugfix-batch-2026-03-10",
+		"memberIssueIds": [
+			"overstory-161b",
+			"overstory-4b7e",
+			"overstory-e35d",
+			"overstory-a516",
+			"overstory-608c"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-10T14:11:29.988Z",
+		"completedAt": "2026-03-11T22:43:44.327Z"
+	},
+	{
+		"id": "group-86f4df03",
+		"name": "phase-1-profiles",
+		"memberIssueIds": [
+			"overstory-bdbe",
+			"overstory-b31b",
+			"overstory-05ce",
+			"overstory-3a08",
+			"overstory-1736",
+			"overstory-562e"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-11T22:51:30.506Z",
+		"completedAt": "2026-03-11T23:32:11.734Z"
+	},
+	{
+		"id": "group-8923fa2a",
+		"name": "phase-2-3-profiles",
+		"memberIssueIds": [
+			"overstory-45c5",
+			"overstory-2ad0",
+			"overstory-d831"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-11T23:47:45.777Z",
+		"completedAt": "2026-03-12T00:18:47.169Z"
+	},
+	{
+		"id": "group-2363f740",
+		"name": "discover-rework",
+		"memberIssueIds": [
+			"overstory-4203",
+			"overstory-1d17"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-12T01:16:06.710Z",
+		"completedAt": "2026-03-12T01:36:55.253Z"
+	},
+	{
+		"id": "group-875c5ab1",
+		"name": "watchdog-batch",
+		"memberIssueIds": [
+			"overstory-9da0",
+			"overstory-8013",
+			"overstory-d14f",
+			"overstory-2b0e",
+			"overstory-0fa6",
+			"overstory-a1a0",
+			"overstory-f1a1",
+			"overstory-1f08",
+			"overstory-cf52"
+		],
+		"status": "completed",
+		"createdAt": "2026-03-20T18:25:55.034Z",
+		"completedAt": "2026-03-20T18:56:12.037Z"
+	},
+	{
+		"id": "group-2dc90255",
+		"name": "bugfix-batch-1",
+		"memberIssueIds": [
+			"overstory-17d5",
+			"overstory-8156",
+			"overstory-a655",
+			"overstory-ee23"
+		],
+		"status": "active",
+		"createdAt": "2026-03-23T19:57:17.357Z",
+		"completedAt": null
+	}
+]

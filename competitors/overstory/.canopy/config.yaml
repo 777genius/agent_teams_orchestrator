@@ -1,0 +1,5 @@
+project: overstory
+version: 1
+emitDir: agents
+emitDirByTag:
+  slash-command: .claude/commands
