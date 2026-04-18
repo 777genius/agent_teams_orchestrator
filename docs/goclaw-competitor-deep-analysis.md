@@ -4,6 +4,12 @@ Date: 2026-04-16
 Studied revision: `f5917b0e` on `origin/dev`
 Previous local detached head before refresh: `2cbf8381`
 
+Structured companion:
+
+- `docs/goclaw/README.md`
+
+Use the `docs/goclaw/` folder when you want faster lookup by topic instead of one large archive document.
+
 ## Goal
 
 This document is not about designing our Rust orchestrator.
@@ -107,6 +113,300 @@ The real problem is:
 - too many cross-cutting concerns
 - too much implicit state flowing through context, metadata, and buses
 - part of the codebase is in a transition state: cleaner new surfaces exist, but some still bridge to older semantics underneath
+
+## Additional architect-level synthesis
+
+After digging further, four extra conclusions are worth making explicit:
+
+### 1. Hooks are one of the best positive reference subsystems in the codebase
+
+Hooks are unusually strong by GoClaw standards:
+
+- explicit domain vocabulary
+- explicit store contract
+- explicit security posture
+- auditability
+- PG and SQLite implementations
+- docs and tests that mostly agree with runtime reality
+
+This matters because it proves the team can build a real first-class extensibility subsystem when the contract is tight enough.
+
+### 2. Cache design is locally strong but globally fragmented
+
+GoClaw has several good cache techniques:
+
+- negative cache caps
+- version-busted decisions
+- permission-cache invalidation tests
+- skills loader versioning
+
+But the product does not have one uniform freshness model.
+
+It mixes:
+
+- TTL caches
+- version-busted caches
+- pubsub invalidation
+- write-behind caches
+- UI refetch-on-event
+- UI local mutation
+
+Issue `#683` is a good example of what happens when this broad freshness model is not sealed end-to-end.
+
+### 3. Migration discipline is stronger than contract discipline
+
+Their upgrade path shows real engineering maturity:
+
+- required schema version
+- dirty migration detection
+- data hooks
+- PG/SQLite parity on stronger new subsystems
+
+But that discipline does not fully carry over into runtime seams.
+
+In other words:
+
+- they are often good at evolving the schema
+- they are less consistent at retiring old runtime dialects
+
+### 4. Product breadth is one of the main reasons the seams stay expensive
+
+GoClaw is not only an orchestrator core.
+It is also a gateway, dashboard, browser-pairing system, channel platform, hooks host, skills runtime, package manager, multi-tenant engine, and tracing surface.
+
+This product breadth is strategically strong.
+It is also one of the main sources of:
+
+- compatibility shims
+- metadata bridges
+- split truth
+- ingress tax
+- docs/runtime drift
+
+So a top-architect reading of GoClaw is:
+
+- strong center
+- broad ambition
+- high seam pressure created by that ambition
+
+### 5. Observability is stronger than coherence
+
+GoClaw is better than average at generating signals:
+
+- traces
+- spans
+- status broadcasts
+- audit tables
+- websocket events
+- UI trace surfaces
+
+But the product is weaker at making those signals converge on one operator truth.
+
+That is why requests like `#611` for external tracing export matter.
+They are not just feature asks.
+They also signal that "we collect a lot of data" is not the same as "debugging is easy".
+
+### 6. Scaling discipline is strongest where failure domains are explicit
+
+Their good scaling patterns are:
+
+- explicit scheduler
+- explicit task recovery worker
+- tenanting as a first-class isolation axis
+
+Their weak scaling seams are:
+
+- partial stop semantics like `#789`
+- broad ingress fan-in with different delivery semantics
+
+### 7. Operational engineering taste is quietly stronger than the product shell suggests
+
+After looking deeper at skill upload, restore, auth-cache, and direct-exec paths, another conclusion is worth making explicit:
+
+- GoClaw often has good local platform engineering taste
+
+Examples:
+
+- content-hash idempotency for skill upload instead of ZIP-hash idempotency
+- per-slug upload locking to avoid version races
+- explicit restore modes instead of one ambiguous restore path
+- advisory-locked version creation
+- capped negative cache for API keys
+- direct-exec credentialed runs without shell interpretation
+- normalization-aware shell hardening
+
+These are not orchestration headlines.
+But they are good signs of engineering maturity.
+Issues `#845` and `#862` are useful external confirmation that users were pushing exactly on this seam:
+
+- better upload semantics
+- more accurate operator feedback
+
+### 8. That same operational layer also contains several quiet platform risks
+
+The deeper read also reinforced several smaller but important risks:
+
+- write-behind session caching creates a durability-honesty question
+- owner bypass semantics remain easy to misunderstand operationally
+- restore-mode richness increases semantic and testing load
+- some async helper failures are logged and treated as non-fatal, which can hide degraded quality
+
+This means GoClaw is not only a story of:
+
+- strong engine
+- weak seams
+
+It is also a story of:
+
+- good local engineering taste
+- but not enough global contract closure to fully cash in that taste
+
+### 9. Guarded power surfaces are one of the better non-core patterns
+
+Another positive layer worth calling out:
+
+- package install and uninstall are treated as dangerous power surfaces
+- they are guarded by admin role, master scope, and explicit rate limiting
+- GitHub release browsing has its own quota protection
+- hook HTTP callbacks use a genuinely strong SSRF-safe pinned-IP client
+
+These are good examples of protective friction placed at a real danger boundary.
+
+### 10. Operator-facing honesty is weaker than internal engineering in several areas
+
+The issue history reinforced a recurring problem:
+
+- internals can be reasonably strong
+- but the operator-facing contract is often less honest
+
+Examples:
+
+- PostgreSQL is a core substrate, but onboarding can still imply softer setup expectations
+- Docker and native installs do not always provide the same runtime reality
+- lifecycle commands like `make up` can hide more semantics than operators expect
+- config like `GOCLAW_GATEWAY_TOKEN` and `GOCLAW_OWNER_IDS` exposes internal auth layering in a confusing way
+
+This matters because platform products are judged heavily by install/update/predictability, not only by code quality.
+
+### 11. Some local security subsystems are stronger than the global auth picture
+
+One nuance that is easy to miss:
+
+- GoClaw's global authorization boundary is weaker than it should be
+- but several local security surfaces are quite good
+
+Examples:
+
+- hook command handler env allowlist
+- SSRF-safe pinned-IP HTTP hook client
+- guarded package-management endpoints
+- constrained GitHub binary intake
+- ACP permission modes
+
+This is useful because it shows the team has real security taste in local subsystem design even while the larger auth model remains too smeared.
+
+### 12. Surface maturity often drifts faster than runtime closure
+
+The issue history also reinforces another law:
+
+- UI, docs, and endpoint shape can get ahead of runtime maturity
+
+Examples:
+
+- custom tools surface drift (`#498`)
+- runtime/packages ambition outrunning closure (`#493`, `#900`)
+- image/environment capability mismatches (`#320`, `#722`)
+
+This is a different kind of architectural debt:
+
+- not weak code in the center
+- but weak honesty at the product edge
+- product/update/onboarding flows that already feel heavy for operators (`#312`, `#95`, `#934`)
+
+This leads to one more top-level lesson:
+
+- GoClaw handles explicit failure domains relatively well
+- GoClaw struggles more where failure domains are spread across ingress, wrappers, and side effects
+
+## Best practices worth stealing the most
+
+If I compress all research into the strongest positive practices, the top five are:
+
+1. Store-backed lifecycle state machine
+2. Post-turn reconciliation
+3. Recovery as a normal runtime subsystem
+4. Hooks as a first-class extensibility surface
+5. Migration discipline with dirty-state detection and tracked data hooks
+
+These are the parts of GoClaw that feel most like real architectural assets, not just local implementations.
+
+## Critical bad practices to avoid the most
+
+If I compress the whole study into the strongest warnings, the top five are:
+
+1. Distributed correctness through metadata and wrapper propagation
+2. Soft run modes and soft identity fields that sound stronger than they are
+3. Split truth between backend rows, events, websocket payloads, and UI projections
+4. Authorization smeared across router, handlers, and store
+5. Compatibility shims surviving too long in hot runtime seams
+
+These are the parts most likely to create long-term maintenance tax in a new system.
+
+## More interesting good decisions worth remembering
+
+Beyond the obvious orchestration core, there are several smaller but high-quality engineering decisions in GoClaw:
+
+- `credentialed_exec` uses a direct-exec model instead of shell interpolation for privileged flows
+- shell safety includes Unicode normalization and token-aware exemption logic
+- the team wrote `agent-identity-conventions.md` as an explicit design-law document for an expensive seam
+- API key auth includes a capped negative cache to resist token spraying
+- hooks include real circuit-breaker and budget logic, not just extensibility
+- skills combine file watching, version bumping, and advisory-lock-backed versioning
+- publish-time observers are used as a bridge toward stricter future contracts
+
+These are useful because they reveal engineering taste, not just feature breadth.
+
+## More subtle bad patterns worth remembering
+
+Several dangerous patterns in GoClaw are easy to underestimate because they look reasonable locally:
+
+- docs and product story can be stronger than runtime closure
+- `any`-typed seams appear even in core-adjacent wiring (`Stores.Hooks any`)
+- bounded queues can drop important work unless the drop is treated as contract, not implementation detail
+- local cache quality does not add up to one coherent freshness model
+- observability signal richness does not guarantee debugging coherence
+- compatibility defaults can quietly become permanent architectural structure
+
+These are not always the loudest bugs.
+They are often the patterns that make a system expensive over time.
+
+## Additional interesting patterns worth recording
+
+There are also several quieter reusable patterns in GoClaw that are worth preserving in memory:
+
+- budget-aware bootstrap truncation with per-file and global caps
+- bounded dedup maps with explicit cleanup
+- idempotent upsert and restore semantics
+- advisory locking around version creation
+- deny groups instead of one flat security regex bag
+- observer-driven contract migration
+
+These are not the headline orchestration features, but they reflect good platform engineering taste.
+
+## Another important warning
+
+GoClaw also shows the risk of a hidden second control plane.
+
+Beyond the explicit orchestration core, behavior is increasingly influenced by:
+
+- hints
+- nudges
+- budgets
+- compatibility branches
+- metadata carriers
+
+This is acceptable while those layers remain supportive.
+It becomes dangerous once they start carrying core correctness.
 
 ## Deep scorecard
 
@@ -245,7 +545,7 @@ Among top-churn Go files since `2025-01-01`:
 - `internal/http/agents.go` - no direct same-file test
 - `internal/store/team_store.go` - no direct same-file test
 - `internal/tools/team_tasks_tool.go` - no direct same-file test
-- `internal/tools/delegate.go` - no direct same-file test
+- `internal/tools/delegate_tool.go` - no direct same-file test
 
 This matters because it highlights where they rely on:
 
@@ -4057,3 +4357,412 @@ It shows both:
 
 - what a strong orchestration engine looks like
 - and how quickly complexity spreads when too many adjacent concerns are absorbed into one product
+
+## Additional architect notes: defensive minimalism is one of their better non-core patterns
+
+One layer that deserves explicit credit is prompt and capability slimming.
+
+GoClaw does several good things here:
+
+- explicit prompt modes: `full`, `task`, `minimal`, `none`
+- mode-aware context-file allowlists
+- hard bootstrap tool narrowing for open agents (`write_file` only)
+- channel-aware tool filtering to keep visible tooling closer to actual capability
+- issue-driven prompt compression work instead of vague prompt-tuning folklore
+- `ReserveTokens` as an early compaction buffer instead of waiting for the hard edge
+
+This is worth stealing.
+
+It shows good engineering taste:
+
+- minimize capability and prompt weight deliberately
+- measure token pressure
+- encode some of that reduction in runtime logic, not only in prose
+
+### But the same layer still leaks fail-open behavior
+
+⚠️ This is the important warning.
+
+The minimization layer is not fully contract-honest:
+
+- unknown prompt modes widen to full
+- invalid configured prompt modes also effectively fall back to full
+- predefined-agent bootstrap keeps full tools and relies more on prompt obedience than on hard capability narrowing
+- prompt preview is useful, but it is not the full runtime truth
+
+So the deeper lesson is:
+
+- they understand defensive minimalism
+- but they do not enforce it consistently enough at every seam
+
+## Additional architect notes: capability-aware reasoning control is strong, but compatibility shadows are real
+
+Another quietly good area is reasoning control.
+
+GoClaw is ahead of many competitors here because it does not treat reasoning as one flat toggle.
+
+Good patterns:
+
+- provider-owned `reasoning_defaults`
+- agent inherit/custom override model
+- explicit fallback policies: `downgrade`, `off`, `provider_default`
+- capability-aware normalization for known model families
+- `StripThinking` for known leaky models
+
+This is strong design.
+
+It turns reasoning into a typed decision layer rather than a blind UI flag.
+
+### But they also carry a compatibility shadow
+
+⚠️ The cost of this stronger model is that the old `thinking_level` shim still lives beside it.
+
+That creates a second policy language:
+
+- modern reasoning config
+- legacy coarse thinking-level semantics
+
+And this sits next to other heuristic controls:
+
+- `ReserveTokens`
+- inline/search thresholds
+- prompt compression heuristics
+
+Each piece is locally reasonable.
+Together they create another soft control layer around the main runtime.
+
+That does not make the feature bad.
+It just means the same recurring lesson applies again:
+
+- strong center
+- growing shadow layers around the center
+
+## Additional architect notes: bootstrap is a real first-run contract, but healing already surrounds it
+
+Another useful seam is onboarding.
+
+GoClaw does something better than many competitors here:
+
+- first-run onboarding is represented by an explicit artifact (`BOOTSTRAP.md`)
+- completion is an actual state transition (empty write deletes the row)
+- the runtime adds reminder and cleanup logic when the model does not complete the ritual cleanly
+
+This is worth stealing.
+
+It is much better than:
+
+- hidden first-run booleans
+- UI-only onboarding
+- vague "the model will probably handle it" logic
+
+### But the same seam already shows drift and softening
+
+⚠️ The warning signs are also visible:
+
+- open-agent bootstrap is hard-narrowed more honestly than predefined-agent bootstrap
+- channel-aware shortcut paths can skip interactive bootstrap and pre-fill user state
+- USER completeness is checked heuristically, not semantically
+- comments and tests already lag the evolved seeding behavior in small ways
+
+So this seam repeats the same wider lesson one more time:
+
+- explicit center
+- softening edges
+
+That makes bootstrap a very useful competitor lesson:
+
+- model onboarding as real state
+- but do not let repair nudges, ingress shortcuts, and stale comments quietly become the true contract
+
+## Additional architect notes: vault ingestion shows good defensive omission taste
+
+Another quieter but genuinely good layer is vault ingestion.
+
+GoClaw does several things right there:
+
+- bounded workspace walk limits
+- unconditional symlink refusal
+- explicit exclusion of root-level bootstrap and authority-bearing context files
+- explicit exclusion of `web-fetch/` content because external content is treated as more dangerous
+- hidden-directory omission with a narrow carve-out
+- extension allowlisting as defense in depth
+
+This is a useful lesson because it shows a broader architectural instinct:
+
+- not everything visible to the filesystem should be eligible for semantic ingestion
+
+That is worth stealing.
+
+### But even this layer shows small drift signals
+
+⚠️ The same pattern appears again in miniature:
+
+- unreadable entries are silently skipped
+- some normalization edge cases are accepted as tradeoffs
+- nested files with the same names as root-level context files can still be ingested
+- even one test message already lags the current expected entry count
+
+None of those points destroy the subsystem.
+But they reinforce the same recurring lesson:
+
+- even good defensive layers need contract honesty and drift control
+
+## Additional architect notes: input-guarding is useful, but softer than the word "guard" suggests
+
+Another interesting layer is prompt-injection and untrusted-content handling.
+
+GoClaw does several useful things:
+
+- a named `InputGuard` subsystem with tests
+- configurable actions (`log`, `warn`, `block`, `off`)
+- scanning of some web-tool results, not only direct user input
+- explicit wrapping of MCP tool output as untrusted external content
+- marker sanitization and hidden-content skipping around fetched web content
+
+This is good engineering taste.
+
+It shows they understand that:
+
+- untrusted content can arrive from users
+- but also from tools and external integrations
+
+### But this layer is still detection-first, not hard security-first
+
+⚠️ The important nuance is that the default action is `warn`.
+
+So the effective default posture is:
+
+- detect
+- log
+- annotate
+- continue
+
+That is legitimate as a product tradeoff.
+But it is not a hard security boundary.
+
+And because the subsystem is named a "guard", there is a risk that maintainers or operators overestimate what it guarantees.
+
+So the deeper lesson is:
+
+- boundary marking and lightweight tripwires are worth stealing
+- but regex-based warning systems should never be mistaken for the main security contract
+
+## Additional architect notes: workspace sharing is thoughtfully decomposed, but migration already shows dual truth risk
+
+Another genuinely useful seam is workspace sharing.
+
+GoClaw does several things better than average here:
+
+- file sharing is separate from memory sharing
+- memory sharing is separate from KG sharing
+- session sharing is separate from all of the above
+- delegate workspaces have an explicit shared path + read-only export model
+- there is a newer immutable `WorkspaceContext` direction in `internal/workspace/`
+
+That is strong architectural taste.
+
+It avoids the common anti-pattern where one "shared workspace" flag silently changes:
+
+- filesystem scope
+- memory scope
+- knowledge scope
+- session scope
+
+### The strongest idea here
+
+The strongest design idea is not just the flags.
+
+It is the **orthogonal sharing model** plus the push toward a **single workspace resolution step per run**.
+
+That is worth stealing.
+
+### But the migration seam is risky
+
+⚠️ The warning sign is that the old and new workspace models are both still alive:
+
+- legacy tool-context paths still use `WithToolWorkspace` / `ToolWorkspaceFromCtx`
+- team paths still use `WithToolTeamWorkspace`
+- shared memory / KG / session behavior still uses legacy context flags
+- the newer `workspace.WithContext(...)` model exists beside them
+
+That means GoClaw currently has a dual-truth migration seam:
+
+- the target architecture is cleaner
+- the operational reality still depends on the older contract
+
+And there is already a compatibility shadow in the web UI:
+
+- read top-level `workspace_sharing`
+- fallback to `other_config.workspace_sharing`
+
+So the deeper lesson is:
+
+- orthogonal sharing axes are excellent
+- single-run workspace resolution is excellent
+- but you do not want two workspace contracts alive for long in the same runtime
+
+## Additional architect notes: RunContext consolidation is the right move, but carrier drift is still real
+
+Another useful seam is `RunContext`.
+
+This is one of the clearest signs that GoClaw's maintainers understand their own context-sprawl problem.
+
+They introduced a typed run envelope that captures:
+
+- identity
+- tenant
+- sender
+- workspace
+- team/task/delegation scope
+- tool settings
+- sandbox config
+- sharing flags
+
+That is a good architectural move.
+
+It is the correct direction for a system that has historically carried too much meaning through ad hoc context keys and metadata.
+
+### Why this is worth stealing
+
+The idea is strong because it creates:
+
+- one typed execution snapshot
+- one place to inspect a run's resolved scope
+- one future anchor for execution-contract hardening
+
+This is worth stealing.
+
+### But the migration is not finished
+
+⚠️ The warning is that the old carrier model is still fully alive:
+
+- raw context keys still get injected
+- tool-specific keys still get injected
+- accessor helpers now often read explicit ctx key first and `RunContext` second
+- `RunContext` itself is assembled from already-resolved legacy values
+
+That means the system currently has:
+
+- a new consolidated envelope
+- old individual carriers
+- fallback readers that bridge both
+
+This is a useful transition pattern.
+It is also an obvious long-term risk.
+
+If this state lives too long, the system does not actually reduce semantic surface.
+It just duplicates it.
+
+So the deeper lesson is:
+
+- introducing a typed run envelope is correct
+- but it only pays off if the older carrier model actually dies
+
+## Additional architect notes: self-adaptation is measured better than average, but still narrower than the product story
+
+Another useful seam is agent evolution.
+
+GoClaw does something better than many competitors here:
+
+- it treats adaptation as a metrics-driven suggestion system, not pure prompt mythology
+- suggestions are created as explicit records
+- admin review gates the dangerous path
+- guardrails exist for data threshold, locked params, bounded change, and rollback thresholds
+- rollback baseline is explicitly stored
+
+That is worth stealing.
+
+It is a much healthier pattern than pretending agents should freely rewrite themselves whenever they feel like it.
+
+### What is strong here
+
+The strongest decisions are:
+
+- measured suggestion generation
+- human review before application
+- narrow auto-apply scope
+- explicit rollback support
+
+This is good engineering restraint.
+
+### What is still soft
+
+⚠️ The warning is that the broader product story around evolution is richer than the current hardened runtime contract.
+
+The subsystem currently mixes:
+
+- real measured suggestions
+- prompt-level skill nudges
+- self-evolve write permissions
+- soft guidance around skill creation
+
+That means "evolution" is still a blended concept that spans:
+
+- hard state
+- admin workflows
+- prompt steering
+- postscript suggestions
+
+And the mutation path still relies on generic config update patterns.
+
+So the deeper lesson is:
+
+- measured self-adaptation is worth stealing
+- but soft nudges and prompt coaching should never be confused with the same contract as safe runtime self-modification
+
+## Additional architect notes: context pressure control is strong, but it is becoming a shadow policy system
+
+Another useful seam is compaction and pruning.
+
+GoClaw does better than many competitors here because context pressure is treated as a real runtime concern:
+
+- explicit prune stage
+- soft trim
+- hard clear
+- pre-compaction memory flush
+- compaction
+- abort if still over budget
+
+That is worth stealing.
+
+It is much stronger than ad hoc truncation or provider-specific guesswork.
+
+### What is strong here
+
+The strongest ideas are:
+
+- staged degradation instead of binary truncation
+- explicit `ReserveTokens` headroom
+- special handling for expensive-to-recreate media results
+- durable-memory capture before destructive compaction
+
+This is good systems engineering.
+
+### What is risky here
+
+⚠️ The warning is that this subsystem is already dense with interacting policy knobs:
+
+- soft trim ratio
+- hard clear ratio
+- keep-last rules
+- min-prunable thresholds
+- media exceptions
+- reserve buffer
+- cache TTL gate
+- memory flush behavior
+- compaction cadence
+
+Each one is locally sensible.
+Together they form another shadow policy language around the runtime.
+
+And parts of the system are still heuristic:
+
+- regex-based important-tail detection
+- fallback token estimation
+- extractive memory fallback when flush is weak
+- provider-capability-dependent cache behavior
+
+So the deeper lesson is:
+
+- staged pressure control is worth stealing
+- but you do not want the pressure subsystem to become an unreadable hidden policy jungle
