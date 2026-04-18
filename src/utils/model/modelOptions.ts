@@ -32,7 +32,6 @@ import {
   getMarketingNameForModel,
   getUserSpecifiedModelSetting,
   isOpus1mMergeEnabled,
-  getOpus46PricingSuffix,
   renderDefaultModelSetting,
   type ModelSetting,
 } from './model.js'
@@ -144,13 +143,14 @@ function getOpus41Option(): ModelOption {
   }
 }
 
-function getOpus46Option(fastMode = false): ModelOption {
+function getOpus46Option(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
+  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
   return {
     value: is3P ? getModelStrings().opus46 : 'opus',
     label: 'Opus',
-    description: `Opus 4.6 · Most capable for complex work${getOpus46PricingSuffix(fastMode)}`,
-    descriptionForModel: 'Opus 4.6 - most capable for complex work',
+    description: `${opusLabel} · Most capable for complex work`,
+    descriptionForModel: `${opusLabel} - most capable for complex work`,
   }
 }
 
@@ -165,14 +165,15 @@ export function getSonnet46_1MOption(): ModelOption {
   }
 }
 
-export function getOpus46_1MOption(fastMode = false): ModelOption {
+export function getOpus46_1MOption(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
+  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `Opus 4.6 for long sessions${getOpus46PricingSuffix(fastMode)}`,
+    description: `${opusLabel} for long sessions`,
     descriptionForModel:
-      'Opus 4.6 with 1M context window - for long sessions with large codebases',
+      `${opusLabel} with 1M context window - for long sessions with large codebases`,
   }
 }
 
@@ -232,11 +233,12 @@ function getCodexModelOptions(): ModelOption[] {
   }))
 }
 
-function getMaxOpusOption(fastMode = false): ModelOption {
+function getMaxOpusOption(_fastMode = false): ModelOption {
+  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.6' : 'Opus 4.7'
   return {
     value: 'opus',
     label: 'Opus',
-    description: `Opus 4.6 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`,
+    description: `${opusLabel} · Most capable for complex work`,
   }
 }
 
@@ -250,23 +252,25 @@ export function getMaxSonnet46_1MOption(): ModelOption {
   }
 }
 
-export function getMaxOpus46_1MOption(fastMode = false): ModelOption {
+export function getMaxOpus46_1MOption(_fastMode = false): ModelOption {
   const billingInfo = isClaudeAISubscriber() ? ' · Billed as extra usage' : ''
+  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.6' : 'Opus 4.7'
   return {
     value: 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `Opus 4.6 with 1M context${billingInfo}${getOpus46PricingSuffix(fastMode)}`,
+    description: `${opusLabel} with 1M context${billingInfo}`,
   }
 }
 
-function getMergedOpus1MOption(fastMode = false): ModelOption {
+function getMergedOpus1MOption(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
+  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `Opus 4.6 with 1M context · Most capable for complex work${!is3P && fastMode ? getOpus46PricingSuffix(fastMode) : ''}`,
+    description: `${opusLabel} with 1M context · Most capable for complex work`,
     descriptionForModel:
-      'Opus 4.6 with 1M context - most capable for complex work',
+      `${opusLabel} with 1M context - most capable for complex work`,
   }
 }
 
@@ -286,7 +290,7 @@ function getOpusPlanOption(): ModelOption {
   return {
     value: 'opusplan',
     label: 'Opus Plan Mode',
-    description: 'Use Opus 4.6 in plan mode, Sonnet 4.6 otherwise',
+    description: 'Use Opus 4.7 in plan mode, Sonnet 4.6 otherwise',
   }
 }
 

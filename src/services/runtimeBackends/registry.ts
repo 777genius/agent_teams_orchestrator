@@ -3,6 +3,7 @@ import { getGlobalConfig } from '../../utils/config.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
 import {
   CLAUDE_HAIKU_4_5_CONFIG,
+  CLAUDE_OPUS_4_7_CONFIG,
   CLAUDE_OPUS_4_6_CONFIG,
   CLAUDE_SONNET_4_6_CONFIG,
 } from '../../utils/model/configs.js'
@@ -177,9 +178,11 @@ function getAnthropicModels(): string[] {
   return filterDisplayModels([
     CLAUDE_SONNET_4_6_CONFIG.firstParty,
     `${CLAUDE_SONNET_4_6_CONFIG.firstParty}[1m]`,
+    CLAUDE_OPUS_4_7_CONFIG.firstParty,
+    `${CLAUDE_OPUS_4_7_CONFIG.firstParty}[1m]`,
+    CLAUDE_HAIKU_4_5_CONFIG.firstParty,
     CLAUDE_OPUS_4_6_CONFIG.firstParty,
     `${CLAUDE_OPUS_4_6_CONFIG.firstParty}[1m]`,
-    CLAUDE_HAIKU_4_5_CONFIG.firstParty,
   ])
 }
 

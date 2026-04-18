@@ -62,6 +62,7 @@ function getAccessPolicyFallbackCandidates(): string[] {
     getDefaultSonnetModel(),
     getDefaultHaikuModel(),
     getDefaultOpusModel(),
+    getModelStrings().opus47,
     getModelStrings().sonnet46,
     getModelStrings().sonnet45,
     getModelStrings().haiku45,
@@ -96,6 +97,7 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
     model === getModelStrings().opus40 ||
     model === getModelStrings().opus41 ||
     model === getModelStrings().opus45 ||
+    model === getModelStrings().opus47 ||
     model === getModelStrings().opus46
   )
 }
@@ -169,7 +171,7 @@ export function getDefaultOpusModel(): ModelName {
   if (getAPIProvider() !== 'firstParty') {
     return getModelStrings().opus46
   }
-  return getModelStrings().opus46
+  return getModelStrings().opus47
 }
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
@@ -293,6 +295,9 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   name = name.toLowerCase()
   // Special cases for Claude 4+ models to differentiate versions
   // Order matters: check more specific versions first (4-5 before 4)
+  if (name.includes('claude-opus-4-7')) {
+    return 'claude-opus-4-7'
+  }
   if (name.includes('claude-opus-4-6')) {
     return 'claude-opus-4-6'
   }
@@ -393,7 +398,7 @@ export function getCanonicalName(fullModelName: ModelName): ModelShortName {
 
 // @[MODEL LAUNCH]: Update the default model description strings shown to users.
 export function getClaudeAiUserDefaultModelDescription(
-  fastMode = false,
+  _fastMode = false,
 ): string {
   if (getAPIProvider() === 'gemini') {
     return 'Gemini 2.5 Pro · Most capable Gemini model for complex coding work'
@@ -403,9 +408,9 @@ export function getClaudeAiUserDefaultModelDescription(
   }
   if (isMaxSubscriber() || isTeamPremiumSubscriber()) {
     if (isOpus1mMergeEnabled()) {
-      return `Opus 4.6 with 1M context · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+      return 'Opus 4.7 with 1M context · Most capable for complex work'
     }
-    return `Opus 4.6 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+    return 'Opus 4.7 · Most capable for complex work'
   }
   return 'Sonnet 4.6 · Best for everyday tasks'
 }
@@ -414,7 +419,7 @@ export function renderDefaultModelSetting(
   setting: ModelName | ModelAlias,
 ): string {
   if (setting === 'opusplan') {
-    return 'Opus 4.6 in plan mode, else Sonnet 4.6'
+    return 'Opus 4.7 in plan mode, else Sonnet 4.6'
   }
   return renderModelName(parseUserSpecifiedModel(setting))
 }
@@ -475,6 +480,10 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
   }
 
   switch (model) {
+    case getModelStrings().opus47:
+      return 'Opus 4.7'
+    case getModelStrings().opus47 + '[1m]':
+      return 'Opus 4.7 (1M context)'
     case getModelStrings().opus46:
       return 'Opus 4.6'
     case getModelStrings().opus46 + '[1m]':
@@ -624,7 +633,7 @@ export function parseUserSpecifiedModel(
 
   // Opus 4/4.1 are no longer available on the first-party API (same as
   // Claude.ai) — silently remap to the current Opus default. The 'opus'
-  // alias already resolves to 4.6, so the only users on these explicit
+  // alias already resolves to 4.7, so the only users on these explicit
   // strings pinned them in settings/env/--model/SDK before 4.5 launched.
   // 3P providers may not yet have 4.6 capacity, so pass through unchanged.
   if (
@@ -739,6 +748,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   const has1m = modelId.toLowerCase().includes('[1m]')
   const canonical = getCanonicalName(modelId)
 
+  if (canonical.includes('claude-opus-4-7')) {
+    return has1m ? 'Opus 4.7 (with 1M context)' : 'Opus 4.7'
+  }
   if (canonical.includes('claude-opus-4-6')) {
     return has1m ? 'Opus 4.6 (with 1M context)' : 'Opus 4.6'
   }
