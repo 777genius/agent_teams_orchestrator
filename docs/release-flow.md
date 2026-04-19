@@ -55,6 +55,10 @@ Steps:
 
 This does **not** publish new runtime assets to `claude_agent_teams_ui`.
 
+Important:
+- a private source release alone does **not** update what end users download
+- if `claude_team` is still pinned to an older runtime in `runtime.lock.json`, users will keep bootstrapping that older binary
+
 ## Publish runtime assets into an existing UI release
 
 Use this when the runtime binary must be refreshed for public `pnpm dev` or packaged app flows.
@@ -67,7 +71,12 @@ Run the private workflow `release-runtime.yml` with:
 
 This builds the runtime from the private repo and uploads the versioned archives into the chosen public UI release.
 
+After publishing assets, also update `claude_team/runtime.lock.json` to the new runtime version if you want `pnpm dev` and packaged app flows to start using it.
+
 ## Recommended rule
 
 - create a private orchestrator release whenever you want a clean source milestone
 - publish runtime assets into `claude_agent_teams_ui` only when the public app/dev delivery path actually needs new binaries
+- if the new runtime adds commands or behavior expected by the UI, do **both**:
+  - publish the runtime assets into the UI release
+  - bump `claude_team/runtime.lock.json`
