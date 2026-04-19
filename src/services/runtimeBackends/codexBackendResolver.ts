@@ -7,6 +7,8 @@ import type { CodexRuntimeBackendId } from './types.js'
 export const CODEX_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
 export const CODEX_API_KEY_BETA_ENV_VAR = 'CLAUDE_CODE_CODEX_API_KEY_BETA'
 export const CODEX_NATIVE_BETA_ENV_VAR = 'CLAUDE_CODE_CODEX_NATIVE_BETA'
+export const CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR =
+  'CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK'
 export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
 export const CODEX_RUNTIME_BACKEND_ENV_VAR = 'CLAUDE_CODE_CODEX_BACKEND'
 
@@ -17,6 +19,7 @@ export type CodexRuntimeResolution = {
   resolvedBackendId: CodexResolvedRuntimeBackendId | null
   featureFlagEnabled: boolean
   nativeFeatureFlagEnabled: boolean
+  nativeInternalUnlockEnabled: boolean
   oauthAuthenticated: boolean
   apiKeyConfigured: boolean
   nativeApiKeyConfigured: boolean
@@ -38,6 +41,12 @@ export function isCodexNativeBetaEnabled(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return isEnvTruthy(env[CODEX_NATIVE_BETA_ENV_VAR])
+}
+
+export function isCodexNativeInternalUnlockEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isEnvTruthy(env[CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR])
 }
 
 export function getCodexApiKey(
@@ -86,6 +95,7 @@ export function resolveCodexRuntimeSelection(params?: {
   apiKeyConfigured?: boolean
   featureFlagEnabled?: boolean
   nativeFeatureFlagEnabled?: boolean
+  nativeInternalUnlockEnabled?: boolean
   nativeApiKeyConfigured?: boolean
   nativeBinaryDetected?: boolean
 }): CodexRuntimeResolution {
@@ -94,6 +104,9 @@ export function resolveCodexRuntimeSelection(params?: {
     params?.featureFlagEnabled ?? isCodexApiKeyBetaEnabled(env)
   const nativeFeatureFlagEnabled =
     params?.nativeFeatureFlagEnabled ?? isCodexNativeBetaEnabled(env)
+  const nativeInternalUnlockEnabled =
+    params?.nativeInternalUnlockEnabled ??
+    isCodexNativeInternalUnlockEnabled(env)
   const selectedBackendId =
     params?.preference ?? getCodexRuntimeBackendPreference(env)
   const oauthAuthenticated =
@@ -196,6 +209,7 @@ export function resolveCodexRuntimeSelection(params?: {
     resolvedBackendId,
     featureFlagEnabled,
     nativeFeatureFlagEnabled,
+    nativeInternalUnlockEnabled,
     oauthAuthenticated,
     apiKeyConfigured,
     nativeApiKeyConfigured,

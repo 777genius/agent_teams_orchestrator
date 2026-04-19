@@ -13,12 +13,15 @@ import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
+  CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR,
   resolveCodexRuntimeSelection,
 } from './codexBackendResolver.js'
 import type {
+  RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
   ExternalRuntimeDiagnostic,
   GeminiRuntimeBackendId,
+  RuntimeBackendOptionState,
   RuntimeExtensionCapabilities,
   RuntimeBackendOptionStatus,
   RuntimeProviderId,
@@ -127,6 +130,8 @@ function buildGeminiOptionStatus(
     selectable: true,
     recommended,
     available: ok,
+    state: ok ? 'ready' : 'authentication-required',
+    audience: 'general',
     statusMessage,
     detailMessage,
   }
@@ -139,6 +144,12 @@ function buildCodexOptionStatus(
   detailMessage: string | null,
   recommended = false,
   selectable = true,
+  state: RuntimeBackendOptionState = ok
+    ? selectable
+      ? 'ready'
+      : 'locked'
+    : 'degraded',
+  audience: RuntimeBackendOptionAudience = 'general',
 ): RuntimeBackendOptionStatus {
   return {
     id,
@@ -147,6 +158,8 @@ function buildCodexOptionStatus(
     selectable,
     recommended,
     available: ok,
+    state,
+    audience,
     statusMessage,
     detailMessage,
   }
@@ -365,27 +378,40 @@ function buildCodexStatuses(): {
 
   let codexNativeStatusMessage: string | null
   let codexNativeDetailMessage: string | null
-  const codexNativeSelectable = false
+  const codexNativeSelectable = codexNativeReady && resolution.nativeInternalUnlockEnabled
+  let codexNativeState: RuntimeBackendOptionState
 
   if (codexNativeReady) {
-    codexNativeStatusMessage = 'Ready'
-    codexNativeDetailMessage =
-      'The local codex exec JSON seam is wired for the experimental codex-native lane. The lane remains non-default and non-selectable until phase-0 sign-off.'
+    if (codexNativeSelectable) {
+      codexNativeStatusMessage = 'Ready for internal use'
+      codexNativeDetailMessage =
+        'The local codex exec JSON seam is wired for internal codex-native usage. The lane remains non-default and auto never resolves into it.'
+      codexNativeState = 'ready'
+    } else {
+      codexNativeStatusMessage = 'Ready but locked'
+      codexNativeDetailMessage =
+        `The local codex exec JSON seam is wired, but the lane stays locked until ${CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR} is enabled for internal rollout.`
+      codexNativeState = 'locked'
+    }
   } else if (!resolution.nativeFeatureFlagEnabled) {
     codexNativeStatusMessage = 'Disabled'
     codexNativeDetailMessage =
       'Enable CLAUDE_CODE_CODEX_NATIVE_BETA to expose the codex-native lane.'
+    codexNativeState = 'disabled'
   } else if (!resolution.nativeBinaryDetected) {
     codexNativeStatusMessage = 'Codex CLI not found'
     codexNativeDetailMessage =
       'Install a Codex runtime binary before enabling the codex-native lane.'
+    codexNativeState = 'runtime-missing'
   } else if (!resolution.nativeApiKeyConfigured) {
     codexNativeStatusMessage = 'Authentication required'
     codexNativeDetailMessage =
       'Set CODEX_API_KEY to use the codex-native lane.'
+    codexNativeState = 'authentication-required'
   } else {
-    codexNativeStatusMessage = 'Unavailable'
+    codexNativeStatusMessage = 'Degraded'
     codexNativeDetailMessage = 'Codex native runtime is not ready.'
+    codexNativeState = 'degraded'
   }
 
   return {
@@ -430,6 +456,8 @@ function buildCodexStatuses(): {
               codexNativeDetailMessage,
               false,
               codexNativeSelectable,
+              codexNativeState,
+              'internal',
             ),
           ]
         : []),

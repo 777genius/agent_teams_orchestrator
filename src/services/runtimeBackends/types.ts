@@ -30,6 +30,16 @@ export type RuntimeExtensionCapabilities = {
   apiKeys: RuntimeExtensionCapability
 }
 
+export type RuntimeBackendOptionState =
+  | 'ready'
+  | 'locked'
+  | 'disabled'
+  | 'authentication-required'
+  | 'runtime-missing'
+  | 'degraded'
+
+export type RuntimeBackendOptionAudience = 'general' | 'internal'
+
 export type RuntimeBackendOptionStatus = {
   id: RuntimeBackendId
   label: string
@@ -37,6 +47,8 @@ export type RuntimeBackendOptionStatus = {
   selectable: boolean
   recommended: boolean
   available: boolean
+  state: RuntimeBackendOptionState
+  audience: RuntimeBackendOptionAudience
   statusMessage: string | null
   detailMessage: string | null
 }
