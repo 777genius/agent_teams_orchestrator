@@ -42,12 +42,14 @@ const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
   auto: 'Auto',
   adapter: 'Default adapter',
   api: 'OpenAI API',
+  'codex-native': 'Codex native',
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
   auto: 'Automatically prefer the best available Codex runtime path',
   adapter: 'Use the built-in Codex fetch adapter',
   api: 'Use OPENAI_API_KEY with the public OpenAI Responses API',
+  'codex-native': 'Use the local codex exec JSON seam under the experimental codex-native lane',
 }
 
 function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): ExternalRuntimeDiagnostic {
@@ -136,12 +138,13 @@ function buildCodexOptionStatus(
   statusMessage: string | null,
   detailMessage: string | null,
   recommended = false,
+  selectable = true,
 ): RuntimeBackendOptionStatus {
   return {
     id,
     label: CODEX_BACKEND_LABELS[id],
     description: CODEX_BACKEND_DESCRIPTIONS[id],
-    selectable: true,
+    selectable,
     recommended,
     available: ok,
     statusMessage,
@@ -356,6 +359,34 @@ function buildCodexStatuses(): {
   backend: RuntimeProviderStatus['backend']
 } {
   const resolution = resolveCodexRuntimeSelection()
+  const showCodexNativeOption =
+    resolution.nativeFeatureFlagEnabled || resolution.selectedBackendId === 'codex-native'
+  const codexNativeReady = resolution.resolvedBackendId === 'codex-native'
+
+  let codexNativeStatusMessage: string | null
+  let codexNativeDetailMessage: string | null
+  const codexNativeSelectable = false
+
+  if (codexNativeReady) {
+    codexNativeStatusMessage = 'Ready'
+    codexNativeDetailMessage =
+      'The local codex exec JSON seam is wired for the experimental codex-native lane. The lane remains non-default and non-selectable until phase-0 sign-off.'
+  } else if (!resolution.nativeFeatureFlagEnabled) {
+    codexNativeStatusMessage = 'Disabled'
+    codexNativeDetailMessage =
+      'Enable CLAUDE_CODE_CODEX_NATIVE_BETA to expose the codex-native lane.'
+  } else if (!resolution.nativeBinaryDetected) {
+    codexNativeStatusMessage = 'Codex CLI not found'
+    codexNativeDetailMessage =
+      'Install a Codex runtime binary before enabling the codex-native lane.'
+  } else if (!resolution.nativeApiKeyConfigured) {
+    codexNativeStatusMessage = 'Authentication required'
+    codexNativeDetailMessage =
+      'Set CODEX_API_KEY to use the codex-native lane.'
+  } else {
+    codexNativeStatusMessage = 'Unavailable'
+    codexNativeDetailMessage = 'Codex native runtime is not ready.'
+  }
 
   return {
     selectedBackendId: resolution.selectedBackendId,
@@ -390,6 +421,18 @@ function buildCodexStatuses(): {
             ),
           ]
         : []),
+      ...(showCodexNativeOption
+        ? [
+            buildCodexOptionStatus(
+              'codex-native',
+              codexNativeReady,
+              codexNativeStatusMessage,
+              codexNativeDetailMessage,
+              false,
+              codexNativeSelectable,
+            ),
+          ]
+        : []),
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
@@ -412,6 +455,13 @@ function buildCodexStatuses(): {
               endpointLabel: 'api.openai.com/v1/responses',
               authMethodDetail: 'api_key',
             }
+          : resolution.resolvedBackendId === 'codex-native'
+            ? {
+                kind: 'codex-native',
+                label: 'Codex native',
+                endpointLabel: 'codex exec --json',
+                authMethodDetail: 'api_key',
+              }
           : null,
   }
 }

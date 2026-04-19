@@ -354,9 +354,17 @@ export async function getAnthropicClient({
       return new Anthropic(clientConfig)
     }
 
+    if (resolution.resolvedBackendId === 'codex-native') {
+      throw new Error(
+        'Codex native runtime must execute through the dedicated QueryEngine codex-native lane. The Anthropic-style fetch adapter is not valid for codex-native.'
+      )
+    }
+
     throw new Error(
       resolution.selectedBackendId === 'api'
         ? 'Codex OpenAI API mode is selected, but OPENAI_API_KEY is not configured.'
+        : resolution.selectedBackendId === 'codex-native'
+          ? 'Codex native runtime is selected, but this code path still expects the old adapter/api transport. Route through the dedicated codex-native execution lane instead.'
         : resolution.featureFlagEnabled
           ? 'Codex provider is enabled, but neither OPENAI_API_KEY nor a Codex OAuth session is available.'
           : 'Codex provider is enabled, but no Codex OAuth session is available.',

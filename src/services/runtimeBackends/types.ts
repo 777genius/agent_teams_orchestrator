@@ -1,7 +1,7 @@
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini'
 
 export type GeminiRuntimeBackendId = 'auto' | 'api' | 'cli-sdk'
-export type CodexRuntimeBackendId = 'auto' | 'adapter' | 'api'
+export type CodexRuntimeBackendId = 'auto' | 'adapter' | 'api' | 'codex-native'
 export type RuntimeBackendId = GeminiRuntimeBackendId | CodexRuntimeBackendId
 
 export type RuntimeCapabilityInfo = {

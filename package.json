@@ -19,7 +19,8 @@
     "compile": "bun run ./scripts/build.ts --compile",
     "dev": "bun run ./src/entrypoints/cli.tsx",
     "smoke:anthropic-api": "bun run ./scripts/anthropic-api-smoke.ts",
-    "smoke:codex-api": "bun run ./scripts/codex-api-smoke.ts"
+    "smoke:codex-api": "bun run ./scripts/codex-api-smoke.ts",
+    "signoff:codex-native-phase0": "bun run ./scripts/codex-native-phase0-signoff.ts"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "^0.3.0",

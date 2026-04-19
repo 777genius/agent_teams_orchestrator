@@ -6,6 +6,8 @@ import type { CodexRuntimeBackendId } from './types.js'
 
 export const CODEX_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
 export const CODEX_API_KEY_BETA_ENV_VAR = 'CLAUDE_CODE_CODEX_API_KEY_BETA'
+export const CODEX_NATIVE_BETA_ENV_VAR = 'CLAUDE_CODE_CODEX_NATIVE_BETA'
+export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
 export const CODEX_RUNTIME_BACKEND_ENV_VAR = 'CLAUDE_CODE_CODEX_BACKEND'
 
 export type CodexResolvedRuntimeBackendId = Exclude<CodexRuntimeBackendId, 'auto'>
@@ -14,8 +16,11 @@ export type CodexRuntimeResolution = {
   selectedBackendId: CodexRuntimeBackendId
   resolvedBackendId: CodexResolvedRuntimeBackendId | null
   featureFlagEnabled: boolean
+  nativeFeatureFlagEnabled: boolean
   oauthAuthenticated: boolean
   apiKeyConfigured: boolean
+  nativeApiKeyConfigured: boolean
+  nativeBinaryDetected: boolean
   authenticated: boolean
   authMethod: 'oauth_token' | 'api_key' | null
   canLoginFromUi: boolean
@@ -29,6 +34,12 @@ export function isCodexApiKeyBetaEnabled(
   return isEnvTruthy(env[CODEX_API_KEY_BETA_ENV_VAR])
 }
 
+export function isCodexNativeBetaEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isEnvTruthy(env[CODEX_NATIVE_BETA_ENV_VAR])
+}
+
 export function getCodexApiKey(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
@@ -40,9 +51,21 @@ export function getCodexApiKey(
   return trimmed.length > 0 ? trimmed : null
 }
 
+export function getCodexNativeApiKey(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const raw = env[CODEX_NATIVE_API_KEY_ENV_VAR]
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const trimmed = raw.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
 export function normalizeCodexBackendPreference(
   value: string | null | undefined,
 ): CodexRuntimeBackendId {
+  if (value === 'codex-native') return 'codex-native'
   if (value === 'adapter') return 'adapter'
   if (value === 'api') return 'api'
   return 'auto'
@@ -62,19 +85,30 @@ export function resolveCodexRuntimeSelection(params?: {
   oauthAuthenticated?: boolean
   apiKeyConfigured?: boolean
   featureFlagEnabled?: boolean
+  nativeFeatureFlagEnabled?: boolean
+  nativeApiKeyConfigured?: boolean
+  nativeBinaryDetected?: boolean
 }): CodexRuntimeResolution {
   const env = params?.env ?? process.env
   const featureFlagEnabled =
     params?.featureFlagEnabled ?? isCodexApiKeyBetaEnabled(env)
+  const nativeFeatureFlagEnabled =
+    params?.nativeFeatureFlagEnabled ?? isCodexNativeBetaEnabled(env)
   const selectedBackendId =
     params?.preference ?? getCodexRuntimeBackendPreference(env)
   const oauthAuthenticated =
     params?.oauthAuthenticated ?? Boolean(getCodexOAuthTokens()?.accessToken)
   const apiKeyConfigured =
     params?.apiKeyConfigured ?? Boolean(getCodexApiKey(env))
+  const nativeApiKeyConfigured =
+    params?.nativeApiKeyConfigured ?? Boolean(getCodexNativeApiKey(env))
+  const nativeBinaryDetected =
+    params?.nativeBinaryDetected ?? Boolean(Bun.which('codex'))
 
   const apiBackendAvailable = featureFlagEnabled && apiKeyConfigured
   const adapterAvailable = oauthAuthenticated
+  const nativeBackendAvailable =
+    nativeFeatureFlagEnabled && nativeBinaryDetected && nativeApiKeyConfigured
 
   let resolvedBackendId: CodexResolvedRuntimeBackendId | null = null
   if (selectedBackendId === 'auto') {
@@ -83,6 +117,8 @@ export function resolveCodexRuntimeSelection(params?: {
       : adapterAvailable
         ? 'adapter'
         : null
+  } else if (selectedBackendId === 'codex-native') {
+    resolvedBackendId = nativeBackendAvailable ? 'codex-native' : null
   } else if (selectedBackendId === 'api') {
     resolvedBackendId = apiBackendAvailable ? 'api' : null
   } else {
@@ -93,19 +129,26 @@ export function resolveCodexRuntimeSelection(params?: {
   const authMethod =
     resolvedBackendId === 'api'
       ? 'api_key'
+      : resolvedBackendId === 'codex-native'
+        ? 'api_key'
       : resolvedBackendId === 'adapter'
         ? 'oauth_token'
         : null
-  const canLoginFromUi = selectedBackendId !== 'api'
+  const canLoginFromUi =
+    selectedBackendId !== 'api' && selectedBackendId !== 'codex-native'
 
   const statusMessage = authenticated
     ? resolvedBackendId === 'api'
       ? selectedBackendId === 'auto'
         ? 'Resolved to OpenAI API'
         : 'OpenAI API ready'
+      : resolvedBackendId === 'codex-native'
+        ? 'Codex native runtime ready'
       : selectedBackendId === 'auto'
         ? 'Resolved to Default adapter'
         : 'Default adapter ready'
+    : selectedBackendId === 'codex-native'
+      ? 'Codex native runtime not ready'
     : selectedBackendId === 'api'
       ? 'Codex OpenAI API not ready'
       : selectedBackendId === 'adapter'
@@ -115,8 +158,22 @@ export function resolveCodexRuntimeSelection(params?: {
   let detailMessage: string | null
   if (resolvedBackendId === 'api') {
     detailMessage = 'Codex OpenAI Responses API backend is ready.'
+  } else if (resolvedBackendId === 'codex-native') {
+    detailMessage = 'Codex native runtime is ready through the local codex exec seam.'
   } else if (resolvedBackendId === 'adapter') {
     detailMessage = 'Codex adapter is ready.'
+  } else if (selectedBackendId === 'codex-native') {
+    if (!nativeFeatureFlagEnabled) {
+      detailMessage =
+        `Codex native runtime is disabled until ${CODEX_NATIVE_BETA_ENV_VAR} is enabled.`
+    } else if (!nativeBinaryDetected) {
+      detailMessage =
+        'Codex native runtime requires the codex CLI binary to be installed and discoverable.'
+    } else if (!nativeApiKeyConfigured) {
+      detailMessage = `Codex native runtime requires ${CODEX_NATIVE_API_KEY_ENV_VAR}.`
+    } else {
+      detailMessage = 'Codex native runtime is not ready.'
+    }
   } else if (selectedBackendId === 'api') {
     detailMessage = featureFlagEnabled
       ? `Codex API key mode requires ${CODEX_API_KEY_ENV_VAR}.`
@@ -138,8 +195,11 @@ export function resolveCodexRuntimeSelection(params?: {
     selectedBackendId,
     resolvedBackendId,
     featureFlagEnabled,
+    nativeFeatureFlagEnabled,
     oauthAuthenticated,
     apiKeyConfigured,
+    nativeApiKeyConfigured,
+    nativeBinaryDetected,
     authenticated,
     authMethod,
     canLoginFromUi,

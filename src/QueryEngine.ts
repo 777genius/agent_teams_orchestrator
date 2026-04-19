@@ -35,6 +35,8 @@ import { hasAutoMemPathOverride } from './memdir/paths.js'
 import { query } from './query.js'
 import { categorizeRetryableAPIError } from './services/api/errors.js'
 import type { MCPServerConnection } from './services/mcp/types.js'
+import { executeCodexNativeTurn } from './services/codexNative/turnExecutor.js'
+import { resolveCodexRuntimeSelection } from './services/runtimeBackends/codexBackendResolver.js'
 import type { AppState } from './state/AppState.js'
 import { type Tools, type ToolUseContext, toolMatchesName } from './Tool.js'
 import type { AgentDefinition } from './tools/AgentTool/loadAgentsDir.js'
@@ -47,6 +49,7 @@ import { getGlobalConfig } from './utils/config.js'
 import { getCwd } from './utils/cwd.js'
 import { isBareMode, isEnvTruthy } from './utils/envUtils.js'
 import { getFastModeState } from './utils/fastMode.js'
+import { shouldUseCodexProviderRoutingForCurrentProcess } from './utils/auth.js'
 import {
   type FileHistoryState,
   fileHistoryEnabled,
@@ -652,6 +655,53 @@ export class QueryEngine {
             message.uuid,
           )
         })
+    }
+
+    const codexRuntimeResolution = shouldUseCodexProviderRoutingForCurrentProcess()
+      ? resolveCodexRuntimeSelection()
+      : null
+    if (codexRuntimeResolution?.resolvedBackendId === 'codex-native') {
+      const replayedUserMessages = messagesToAck.flatMap(message => {
+        if (message.type !== 'user') {
+          return []
+        }
+
+        return [
+          {
+            type: 'user' as const,
+            message: message.message,
+            session_id: getSessionId(),
+            parent_tool_use_id: null,
+            uuid: message.uuid,
+            timestamp: message.timestamp,
+            isReplay: true,
+          } satisfies SDKUserMessageReplay,
+        ]
+      })
+
+      const nativeSummary = yield* executeCodexNativeTurn({
+        prompt,
+        jsonSchema,
+        cwd,
+        model: mainLoopModel,
+        effortValue: initialAppState.effortValue,
+        permissionMode: initialAppState.toolPermissionContext.mode,
+        additionalWritableDirectories: Array.from(
+          initialAppState.toolPermissionContext.additionalWorkingDirectories.keys(),
+        ),
+        persistSession,
+        replayedUserMessages,
+        transcriptMessages: messages,
+        mutableMessages: this.mutableMessages,
+        totalUsage: this.totalUsage,
+        permissionDenials: this.permissionDenials,
+        initialAppState,
+        startTime,
+        abortSignal: this.abortController.signal,
+        setSDKStatus,
+      })
+      this.totalUsage = nativeSummary.totalUsage
+      return
     }
 
     // Track current message usage (reset on each message_start)
