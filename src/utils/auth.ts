@@ -1718,24 +1718,7 @@ export function isClaudeAISubscriber(): boolean {
 }
 
 export function isCodexSubscriber(): boolean {
-  // Check if we're using OpenAI API via environment variable
-  if (getAPIProvider() === 'openai') {
-    return true
-  }
-
-  const tokens = getCodexOAuthTokens()
-  if (tokens?.accessToken) {
-    return true
-  }
-
-  // Legacy config fallback
-  const config = getGlobalConfig()
-  const openaiTokens = config?.openaiOauthTokens
-  if (openaiTokens?.access_token && openaiTokens?.scopes?.includes('codex')) {
-    return true
-  }
-
-  return false
+  return getAPIProvider() === 'openai'
 }
 
 export function hasExplicitHostManagedProviderSelection(): boolean {
