@@ -228,17 +228,6 @@ export type GlobalConfig = {
   hasResetAutoModeOptInForDefaultOffer?: boolean // ant-only: one-shot migration guard, re-prompts churned auto-mode users
   oauthAccount?: AccountInfo
 
-  /**
-   * OpenAI Codex OAuth tokens, stored separately from Anthropic credentials.
-   * These are acquired via the Codex OAuth flow (auth.openai.com) and are used
-   * as Bearer tokens against OpenAI's API — they are never sent to Anthropic servers.
-   */
-  codexOAuth?: {
-    accessToken: string
-    refreshToken: string
-    expiresAt: number
-    accountId: string
-  }
   geminiBackendPreference?: 'auto' | 'api' | 'cli' | 'cli-sdk'
   geminiResolvedBackend?: 'api' | 'cli' | 'cli-sdk'
   codexBackendPreference?: 'codex-native'
@@ -598,13 +587,6 @@ export type GlobalConfig = {
   // (avoiding 11× saveGlobalConfig lock+re-read on every startup).
   migrationVersion?: number
 
-  // OpenAI OAuth tokens for Codex API access
-  openaiOauthTokens?: {
-    access_token: string
-    refresh_token?: string
-    scopes?: string[]
-    expires_at?: number
-  }
   agentTeams?: {
     clientId?: string
     session?: {
