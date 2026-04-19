@@ -1,15 +1,5 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 
-type CodexStatusFixtureOptions = {
-  selectedBackendId?: 'auto' | 'adapter' | 'api' | 'codex-native'
-  openAiApiKey?: string | null
-  codexApiKey?: string | null
-  nativeBetaEnabled?: boolean
-  internalUnlockEnabled?: boolean
-  oauthAuthenticated?: boolean
-  nativeBinaryDetected?: boolean
-}
-
 function setOptionalEnv(
   key: string,
   value: string | null | undefined,
@@ -32,36 +22,20 @@ function setOptionalEnv(
   process.env[key] = value
 }
 
-async function loadCodexStatus(
-  options: CodexStatusFixtureOptions = {},
-) {
+async function loadCodexStatus(options: {
+  backendEnv?: string | null
+  openAiApiKey?: string | null
+  codexApiKey?: string | null
+  nativeBinaryDetected?: boolean
+} = {}) {
   const originalCodexBackend = process.env.CLAUDE_CODE_CODEX_BACKEND
-  const originalCodexApiBeta = process.env.CLAUDE_CODE_CODEX_API_KEY_BETA
-  const originalCodexNativeBeta = process.env.CLAUDE_CODE_CODEX_NATIVE_BETA
-  const originalCodexNativeInternalUnlock =
-    process.env.CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY
   const originalCodexApiKey = process.env.CODEX_API_KEY
 
   setOptionalEnv(
     'CLAUDE_CODE_CODEX_BACKEND',
-    options.selectedBackendId ?? 'codex-native',
+    options.backendEnv ?? 'codex-native',
     originalCodexBackend,
-  )
-  setOptionalEnv(
-    'CLAUDE_CODE_CODEX_API_KEY_BETA',
-    '1',
-    originalCodexApiBeta,
-  )
-  setOptionalEnv(
-    'CLAUDE_CODE_CODEX_NATIVE_BETA',
-    options.nativeBetaEnabled === false ? null : '1',
-    originalCodexNativeBeta,
-  )
-  setOptionalEnv(
-    'CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK',
-    options.internalUnlockEnabled ? '1' : null,
-    originalCodexNativeInternalUnlock,
   )
   setOptionalEnv('OPENAI_API_KEY', options.openAiApiKey ?? null, originalOpenAiApiKey)
   setOptionalEnv('CODEX_API_KEY', options.codexApiKey ?? null, originalCodexApiKey)
@@ -71,8 +45,6 @@ async function loadCodexStatus(
     mock.module(authModulePath, () => ({
       getAuthTokenSource: () => ({ source: 'none', hasToken: false }),
       getAnthropicApiKeyWithSource: () => ({ source: 'none' }),
-      getCodexOAuthTokens: () =>
-        options.oauthAuthenticated ? { accessToken: 'oauth-token' } : null,
     }))
 
     const configModulePath = new URL('../../utils/config.ts', import.meta.url).href
@@ -160,21 +132,6 @@ async function loadCodexStatus(
     }
   } finally {
     setOptionalEnv('CLAUDE_CODE_CODEX_BACKEND', undefined, originalCodexBackend)
-    setOptionalEnv(
-      'CLAUDE_CODE_CODEX_API_KEY_BETA',
-      undefined,
-      originalCodexApiBeta,
-    )
-    setOptionalEnv(
-      'CLAUDE_CODE_CODEX_NATIVE_BETA',
-      undefined,
-      originalCodexNativeBeta,
-    )
-    setOptionalEnv(
-      'CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK',
-      undefined,
-      originalCodexNativeInternalUnlock,
-    )
     setOptionalEnv('OPENAI_API_KEY', undefined, originalOpenAiApiKey)
     setOptionalEnv('CODEX_API_KEY', undefined, originalCodexApiKey)
   }
@@ -186,70 +143,69 @@ afterEach(() => {
 })
 
 describe('codex-native registry rollout states', () => {
+  test('reports ready when the codex binary and CODEX_API_KEY are present', async () => {
+    const codex = await loadCodexStatus({
+      codexApiKey: 'sk-native-test',
+    })
+
+    expect(codex?.selectedBackendId).toBe('codex-native')
+    expect(codex?.resolvedBackendId).toBe('codex-native')
+    expect(codex?.availableBackends).toHaveLength(1)
+    expect(codex?.availableBackends[0]).toMatchObject({
+      id: 'codex-native',
+      selectable: true,
+      available: true,
+      state: 'ready',
+      audience: 'general',
+      statusMessage: 'Ready',
+    })
+  })
+
+  test('reports authentication-required when both supported API key env vars are missing', async () => {
+    const codex = await loadCodexStatus({
+      codexApiKey: null,
+      openAiApiKey: null,
+    })
+
+    expect(codex?.selectedBackendId).toBe('codex-native')
+    expect(codex?.resolvedBackendId).toBeNull()
+    expect(codex?.availableBackends[0]).toMatchObject({
+      id: 'codex-native',
+      selectable: false,
+      available: false,
+      state: 'authentication-required',
+      audience: 'general',
+      statusMessage: 'Authentication required',
+    })
+  })
+
   test('reports runtime-missing when the codex binary is not detected', async () => {
     const codex = await loadCodexStatus({
-      selectedBackendId: 'codex-native',
       codexApiKey: 'sk-native-test',
       nativeBinaryDetected: false,
     })
 
     expect(codex?.selectedBackendId).toBe('codex-native')
     expect(codex?.resolvedBackendId).toBeNull()
-    expect(codex?.availableBackends.find(option => option.id === 'codex-native')).toMatchObject({
+    expect(codex?.availableBackends[0]).toMatchObject({
       id: 'codex-native',
       selectable: false,
       available: false,
       state: 'runtime-missing',
-      audience: 'internal',
+      audience: 'general',
       statusMessage: 'Codex CLI not found',
     })
   })
 
-  test('reports authentication-required when CODEX_API_KEY is missing', async () => {
+  test('normalizes legacy backend env values to the native option', async () => {
     const codex = await loadCodexStatus({
-      selectedBackendId: 'codex-native',
+      backendEnv: 'api',
+      openAiApiKey: 'sk-openai-test',
       codexApiKey: null,
-      nativeBinaryDetected: true,
     })
 
     expect(codex?.selectedBackendId).toBe('codex-native')
-    expect(codex?.resolvedBackendId).toBeNull()
-    expect(codex?.availableBackends.find(option => option.id === 'codex-native')).toMatchObject({
-      id: 'codex-native',
-      selectable: false,
-      available: false,
-      state: 'authentication-required',
-      audience: 'internal',
-      statusMessage: 'Authentication required',
-    })
-  })
-
-  test('keeps auto resolved to the old codex lanes even when codex-native is internally unlockable', async () => {
-    const codex = await loadCodexStatus({
-      selectedBackendId: 'auto',
-      openAiApiKey: 'sk-openai-test',
-      codexApiKey: 'sk-native-test',
-      nativeBinaryDetected: true,
-      internalUnlockEnabled: true,
-    })
-
-    expect(codex?.selectedBackendId).toBe('auto')
-    expect(codex?.resolvedBackendId).toBe('api')
-    expect(codex?.availableBackends.find(option => option.id === 'auto')).toMatchObject({
-      id: 'auto',
-      selectable: true,
-      available: true,
-      state: 'ready',
-      audience: 'general',
-      statusMessage: 'Resolved to OpenAI API',
-    })
-    expect(codex?.availableBackends.find(option => option.id === 'codex-native')).toMatchObject({
-      id: 'codex-native',
-      selectable: true,
-      available: true,
-      state: 'ready',
-      audience: 'internal',
-      statusMessage: 'Ready for internal use',
-    })
+    expect(codex?.resolvedBackendId).toBe('codex-native')
+    expect(codex?.availableBackends.map(option => option.id)).toEqual(['codex-native'])
   })
 })

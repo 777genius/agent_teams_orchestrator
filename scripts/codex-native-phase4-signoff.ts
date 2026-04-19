@@ -116,13 +116,11 @@ async function runScenario(
     throw new Error(`scenario ${scenario.id} did not include a codex provider`)
   }
 
-  const nativeOption = codex.availableBackends?.find(
-    backend => backend.id === 'codex-native',
-  )
-  if (!nativeOption) {
-    throw new Error(`scenario ${scenario.id} did not include the codex-native option`)
+  if (codex.availableBackends?.length !== 1 || codex.availableBackends[0]?.id !== 'codex-native') {
+    throw new Error(`scenario ${scenario.id} still exposed legacy Codex backend options`)
   }
 
+  const nativeOption = codex.availableBackends[0]
   assertEqual(
     codex.selectedBackendId ?? null,
     scenario.expectation.selectedBackendId,
@@ -186,36 +184,10 @@ const runtimeMissingPath = '/usr/bin:/bin'
 
 const scenarios: Scenario[] = [
   {
-    id: 'locked',
+    id: 'ready',
     env: {
       CLAUDE_CODE_CODEX_BACKEND: 'codex-native',
-      CLAUDE_CODE_CODEX_API_KEY_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK: undefined,
-      CODEX_API_KEY: 'sk-phase1-native',
-      OPENAI_API_KEY: undefined,
-    },
-    expectation: {
-      selectedBackendId: 'codex-native',
-      resolvedBackendId: 'codex-native',
-      providerStatusMessage: 'Codex native runtime ready',
-      nativeOption: {
-        selectable: false,
-        available: true,
-        state: 'locked',
-        audience: 'internal',
-        statusMessage: 'Ready but locked',
-      },
-    },
-  },
-  {
-    id: 'internal-unlock-ready',
-    env: {
-      CLAUDE_CODE_CODEX_BACKEND: 'codex-native',
-      CLAUDE_CODE_CODEX_API_KEY_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK: '1',
-      CODEX_API_KEY: 'sk-phase1-native',
+      CODEX_API_KEY: 'sk-phase4-native',
       OPENAI_API_KEY: undefined,
     },
     expectation: {
@@ -226,8 +198,8 @@ const scenarios: Scenario[] = [
         selectable: true,
         available: true,
         state: 'ready',
-        audience: 'internal',
-        statusMessage: 'Ready for internal use',
+        audience: 'general',
+        statusMessage: 'Ready',
       },
     },
   },
@@ -235,21 +207,18 @@ const scenarios: Scenario[] = [
     id: 'authentication-required',
     env: {
       CLAUDE_CODE_CODEX_BACKEND: 'codex-native',
-      CLAUDE_CODE_CODEX_API_KEY_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK: undefined,
       CODEX_API_KEY: undefined,
       OPENAI_API_KEY: undefined,
     },
     expectation: {
       selectedBackendId: 'codex-native',
       resolvedBackendId: null,
-      providerStatusMessage: 'Codex native runtime not ready',
+      providerStatusMessage: 'Codex native runtime unavailable',
       nativeOption: {
         selectable: false,
         available: false,
         state: 'authentication-required',
-        audience: 'internal',
+        audience: 'general',
         statusMessage: 'Authentication required',
       },
     },
@@ -258,46 +227,40 @@ const scenarios: Scenario[] = [
     id: 'runtime-missing',
     env: {
       CLAUDE_CODE_CODEX_BACKEND: 'codex-native',
-      CLAUDE_CODE_CODEX_API_KEY_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK: undefined,
-      CODEX_API_KEY: 'sk-phase1-native',
+      CODEX_API_KEY: 'sk-phase4-native',
       OPENAI_API_KEY: undefined,
       PATH: runtimeMissingPath,
     },
     expectation: {
       selectedBackendId: 'codex-native',
       resolvedBackendId: null,
-      providerStatusMessage: 'Codex native runtime not ready',
+      providerStatusMessage: 'Codex native runtime unavailable',
       nativeOption: {
         selectable: false,
         available: false,
         state: 'runtime-missing',
-        audience: 'internal',
+        audience: 'general',
         statusMessage: 'Codex CLI not found',
       },
     },
   },
   {
-    id: 'auto-fallback-stays-old-lane',
+    id: 'openai-api-key-also-works',
     env: {
-      CLAUDE_CODE_CODEX_BACKEND: 'auto',
-      CLAUDE_CODE_CODEX_API_KEY_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_BETA: '1',
-      CLAUDE_CODE_CODEX_NATIVE_INTERNAL_UNLOCK: '1',
-      CODEX_API_KEY: 'sk-phase1-native',
-      OPENAI_API_KEY: 'sk-phase1-openai',
+      CLAUDE_CODE_CODEX_BACKEND: 'api',
+      CODEX_API_KEY: undefined,
+      OPENAI_API_KEY: 'sk-phase4-openai',
     },
     expectation: {
-      selectedBackendId: 'auto',
-      resolvedBackendId: 'api',
-      providerStatusMessage: 'Resolved to OpenAI API',
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: 'codex-native',
+      providerStatusMessage: 'Codex native runtime ready',
       nativeOption: {
         selectable: true,
         available: true,
         state: 'ready',
-        audience: 'internal',
-        statusMessage: 'Ready for internal use',
+        audience: 'general',
+        statusMessage: 'Ready',
       },
     },
   },

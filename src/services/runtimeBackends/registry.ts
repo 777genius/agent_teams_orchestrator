@@ -12,10 +12,7 @@ import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
-import {
-  CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR,
-  resolveCodexRuntimeSelection,
-} from './codexBackendResolver.js'
+import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
 import type {
   RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
@@ -42,20 +39,17 @@ const GEMINI_BACKEND_DESCRIPTIONS: Record<GeminiRuntimeBackendId, string> = {
 }
 
 const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Auto',
-  adapter: 'Default adapter',
-  api: 'OpenAI API',
   'codex-native': 'Codex native',
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Automatically prefer the best available Codex runtime path',
-  adapter: 'Use the built-in Codex fetch adapter',
-  api: 'Use OPENAI_API_KEY with the public OpenAI Responses API',
-  'codex-native': 'Use the local codex exec JSON seam under the experimental codex-native lane',
+  'codex-native': 'Use the local codex exec JSON seam as the supported Codex runtime path',
 }
 
-function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): ExternalRuntimeDiagnostic {
+function detectExternalBinary(
+  binaryName: 'gemini' | 'codex',
+  label: string,
+): ExternalRuntimeDiagnostic {
   const binaryPath = Bun.which(binaryName)
   return {
     id: 'cli-bin',
@@ -144,11 +138,7 @@ function buildCodexOptionStatus(
   detailMessage: string | null,
   recommended = false,
   selectable = true,
-  state: RuntimeBackendOptionState = ok
-    ? selectable
-      ? 'ready'
-      : 'locked'
-    : 'degraded',
+  state: RuntimeBackendOptionState = ok ? 'ready' : 'degraded',
   audience: RuntimeBackendOptionAudience = 'general',
 ): RuntimeBackendOptionStatus {
   return {
@@ -372,98 +362,36 @@ function buildCodexStatuses(): {
   backend: RuntimeProviderStatus['backend']
 } {
   const resolution = resolveCodexRuntimeSelection()
-  const showCodexNativeOption =
-    resolution.nativeFeatureFlagEnabled || resolution.selectedBackendId === 'codex-native'
-  const codexNativeAvailable =
-    resolution.nativeFeatureFlagEnabled &&
-    resolution.nativeBinaryDetected &&
-    resolution.nativeApiKeyConfigured
-
-  let codexNativeStatusMessage: string | null
-  let codexNativeDetailMessage: string | null
-  const codexNativeSelectable = codexNativeAvailable && resolution.nativeInternalUnlockEnabled
-  let codexNativeState: RuntimeBackendOptionState
-
-  if (codexNativeAvailable) {
-    if (codexNativeSelectable) {
-      codexNativeStatusMessage = 'Ready for internal use'
-      codexNativeDetailMessage =
-        'The local codex exec JSON seam is wired for internal codex-native usage. The lane remains non-default and auto never resolves into it.'
-      codexNativeState = 'ready'
-    } else {
-      codexNativeStatusMessage = 'Ready but locked'
-      codexNativeDetailMessage =
-        `The local codex exec JSON seam is wired, but the lane stays locked until ${CODEX_NATIVE_INTERNAL_UNLOCK_ENV_VAR} is enabled for internal rollout.`
-      codexNativeState = 'locked'
-    }
-  } else if (!resolution.nativeFeatureFlagEnabled) {
-    codexNativeStatusMessage = 'Disabled'
-    codexNativeDetailMessage =
-      'Enable CLAUDE_CODE_CODEX_NATIVE_BETA to expose the codex-native lane.'
-    codexNativeState = 'disabled'
-  } else if (!resolution.nativeBinaryDetected) {
-    codexNativeStatusMessage = 'Codex CLI not found'
-    codexNativeDetailMessage =
-      'Install a Codex runtime binary before enabling the codex-native lane.'
-    codexNativeState = 'runtime-missing'
-  } else if (!resolution.nativeApiKeyConfigured) {
-    codexNativeStatusMessage = 'Authentication required'
-    codexNativeDetailMessage =
-      'Set CODEX_API_KEY to use the codex-native lane.'
-    codexNativeState = 'authentication-required'
-  } else {
-    codexNativeStatusMessage = 'Degraded'
-    codexNativeDetailMessage = 'Codex native runtime is not ready.'
-    codexNativeState = 'degraded'
-  }
+  const codexNativeAvailable = resolution.resolvedBackendId === 'codex-native'
+  const codexNativeState: RuntimeBackendOptionState = codexNativeAvailable
+    ? 'ready'
+    : !resolution.nativeBinaryDetected
+      ? 'runtime-missing'
+      : !resolution.nativeApiKeyConfigured
+        ? 'authentication-required'
+        : 'degraded'
+  const codexNativeStatusMessage = codexNativeAvailable
+    ? 'Ready'
+    : !resolution.nativeBinaryDetected
+      ? 'Codex CLI not found'
+      : !resolution.nativeApiKeyConfigured
+        ? 'Authentication required'
+        : 'Degraded'
 
   return {
     selectedBackendId: resolution.selectedBackendId,
     resolvedBackendId: resolution.resolvedBackendId,
     availableBackends: [
       buildCodexOptionStatus(
-        'auto',
-        resolution.resolvedBackendId !== null,
-        resolution.resolvedBackendId
-          ? `Resolved to ${CODEX_BACKEND_LABELS[resolution.resolvedBackendId]}`
-          : 'Unavailable',
+        'codex-native',
+        codexNativeAvailable,
+        codexNativeStatusMessage,
         resolution.detailMessage,
         true,
+        codexNativeAvailable,
+        codexNativeState,
+        'general',
       ),
-      buildCodexOptionStatus(
-        'adapter',
-        resolution.oauthAuthenticated,
-        resolution.oauthAuthenticated ? 'Ready' : 'Authentication required',
-        resolution.oauthAuthenticated
-          ? 'Uses the local Codex OAuth session via the built-in adapter.'
-          : 'Sign in with Codex OAuth to use the built-in adapter.',
-      ),
-      ...(resolution.featureFlagEnabled
-        ? [
-            buildCodexOptionStatus(
-              'api',
-              resolution.apiKeyConfigured,
-              resolution.apiKeyConfigured ? 'Ready' : 'Authentication required',
-              resolution.apiKeyConfigured
-                ? 'Uses OPENAI_API_KEY with api.openai.com/v1/responses.'
-                : 'Set OPENAI_API_KEY to use the public OpenAI Responses API.',
-            ),
-          ]
-        : []),
-      ...(showCodexNativeOption
-        ? [
-            buildCodexOptionStatus(
-              'codex-native',
-              codexNativeAvailable,
-              codexNativeStatusMessage,
-              codexNativeDetailMessage,
-              false,
-              codexNativeSelectable,
-              codexNativeState,
-              'internal',
-            ),
-          ]
-        : []),
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
@@ -472,28 +400,14 @@ function buildCodexStatuses(): {
     detailMessage: resolution.detailMessage,
     canLoginFromUi: resolution.canLoginFromUi,
     backend:
-      resolution.resolvedBackendId === 'adapter'
+      resolution.resolvedBackendId === 'codex-native'
         ? {
-            kind: 'adapter',
-            label: 'Default adapter',
-            endpointLabel: 'chatgpt.com/backend-api/codex/responses',
-            authMethodDetail: 'oauth_token',
+            kind: 'codex-native',
+            label: 'Codex native',
+            endpointLabel: 'codex exec --json',
+            authMethodDetail: 'api_key',
           }
-        : resolution.resolvedBackendId === 'api'
-          ? {
-              kind: 'api',
-              label: 'OpenAI API',
-              endpointLabel: 'api.openai.com/v1/responses',
-              authMethodDetail: 'api_key',
-            }
-          : resolution.resolvedBackendId === 'codex-native'
-            ? {
-                kind: 'codex-native',
-                label: 'Codex native',
-                endpointLabel: 'codex exec --json',
-                authMethodDetail: 'api_key',
-              }
-          : null,
+        : null,
   }
 }
 
@@ -524,7 +438,7 @@ export async function getUnifiedRuntimeStatusPayload(
             status: 'unsupported',
             ownership: 'shared',
             reason:
-              'Plugins are currently guaranteed only for Anthropic sessions in the multimodel runtime.',
+              'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
           },
         }),
       },
