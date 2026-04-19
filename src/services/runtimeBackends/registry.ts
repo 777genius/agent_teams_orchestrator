@@ -374,14 +374,17 @@ function buildCodexStatuses(): {
   const resolution = resolveCodexRuntimeSelection()
   const showCodexNativeOption =
     resolution.nativeFeatureFlagEnabled || resolution.selectedBackendId === 'codex-native'
-  const codexNativeReady = resolution.resolvedBackendId === 'codex-native'
+  const codexNativeAvailable =
+    resolution.nativeFeatureFlagEnabled &&
+    resolution.nativeBinaryDetected &&
+    resolution.nativeApiKeyConfigured
 
   let codexNativeStatusMessage: string | null
   let codexNativeDetailMessage: string | null
-  const codexNativeSelectable = codexNativeReady && resolution.nativeInternalUnlockEnabled
+  const codexNativeSelectable = codexNativeAvailable && resolution.nativeInternalUnlockEnabled
   let codexNativeState: RuntimeBackendOptionState
 
-  if (codexNativeReady) {
+  if (codexNativeAvailable) {
     if (codexNativeSelectable) {
       codexNativeStatusMessage = 'Ready for internal use'
       codexNativeDetailMessage =
@@ -451,7 +454,7 @@ function buildCodexStatuses(): {
         ? [
             buildCodexOptionStatus(
               'codex-native',
-              codexNativeReady,
+              codexNativeAvailable,
               codexNativeStatusMessage,
               codexNativeDetailMessage,
               false,
