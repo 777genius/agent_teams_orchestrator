@@ -3,7 +3,7 @@
 # ── Stage 1: Build ──
 FROM node:22-alpine AS builder
 
-RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
+RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
 
 WORKDIR /app
 
