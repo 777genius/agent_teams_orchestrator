@@ -150,13 +150,15 @@ export class OpenCodeClientFactory {
           `/session/${id}/message${typeof limit === 'number' ? `?limit=${limit}` : ''}`,
         ),
       getPermissions: () =>
-        request<OpenCodePendingPermission[]>('/permission/', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
+        request<OpenCodePendingPermission[]>('/permission', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
       answerPermission: async body => {
+        const reply = body.decision === 'allow' ? 'once' : body.decision
         const payload = {
           requestID: body.requestId,
           requestId: body.requestId,
           sessionID: body.sessionId ?? undefined,
           sessionId: body.sessionId ?? undefined,
+          reply,
           response: body.decision,
           decision: body.decision,
           allow: body.decision === 'allow' || body.decision === 'always',
