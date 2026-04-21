@@ -1,8 +1,5 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
-import { stdin as input, stdout as output } from 'process'
-import { createInterface } from 'readline/promises'
-
 import {
   clearAuthRelatedCaches,
   performLogout,
@@ -24,8 +21,6 @@ import { getOauthProfileFromOauthToken } from '../../services/oauth/getOauthProf
 import { OAuthService } from '../../services/oauth/index.js'
 import type { OAuthTokens } from '../../services/oauth/types.js'
 import {
-  clearCodexOAuthTokens,
-  clearOfficialCodexCliOAuthTokens,
   clearOAuthTokenCache,
   getGeminiAuthMethod,
   getAnthropicApiKeyWithSource,
@@ -33,7 +28,6 @@ import {
   getOauthAccountInfo,
   getSubscriptionType,
   isUsing3PServices,
-  saveCodexOAuthTokens,
   saveOAuthTokensIfNeeded,
   validateForceLoginOrg,
 } from '../../utils/auth.js'
@@ -54,7 +48,6 @@ import {
   resolveGeminiBackend,
 } from '../../services/gemini/backendResolver.js'
 import { resolveCodexRuntimeSelection } from '../../services/runtimeBackends/codexBackendResolver.js'
-import { runCodexOAuthFlow } from '../../services/oauth/codex-client.js'
 
 type AuthProviderTarget = 'anthropic' | 'codex' | 'all'
 
@@ -129,43 +122,6 @@ export function getAllProviderStatuses(): Record<'anthropic' | 'codex', Provider
   }
 }
 
-async function promptForCodexManualInput(): Promise<string> {
-  const rl = createInterface({ input, output })
-  try {
-    return await rl.question(
-      'Paste the full redirect URL (or just the authorization code) if the browser callback does not complete automatically:\n',
-    )
-  } finally {
-    rl.close()
-  }
-}
-
-async function authLoginCodex(): Promise<void> {
-  try {
-    const codexTokens = await runCodexOAuthFlow(
-      async url => {
-        process.stdout.write('Opening browser to sign in to Codex...\n')
-        process.stdout.write(`If the browser did not open, visit: ${url}\n`)
-      },
-      async () => promptForCodexManualInput(),
-    )
-    saveCodexOAuthTokens(codexTokens)
-    process.stdout.write('Codex login successful.\n')
-    process.exit(0)
-  } catch (err) {
-    logError(err)
-    process.stderr.write(`Codex login failed: ${errorMessage(err)}\n`)
-    process.exit(1)
-  }
-}
-
-function clearLegacyOpenAIOAuthTokens(): void {
-  saveGlobalConfig(cfg => {
-    const { openaiOauthTokens: _legacyTokens, ...rest } = cfg
-    return rest as typeof cfg
-  })
-}
-
 /**
  * Returns true if the token carries any Anthropic-issued scope (user:* or org:*).
  * Codex tokens use OpenID Connect scopes (openid, profile, email, offline_access)
@@ -230,23 +186,13 @@ export async function installOAuthTokens(tokens: OAuthTokens): Promise<void> {
       logForDebugging(String(err), { level: 'error' }),
     )
   } else if (hasAnyAnthropicScope(tokens.scopes)) {
-    // API key creation is critical for Console users — let it throw.
+    // API key creation is critical for Console users - let it throw.
     const apiKey = await createAndStoreApiKey(tokens.accessToken)
     if (!apiKey) {
       throw new Error(
         'Unable to create API key. The server accepted the request but did not return a key.',
       )
     }
-  } else {
-    // Third-party provider (e.g. OpenAI Codex) — tokens carry no Anthropic
-    // scopes. Skip Anthropic API key creation entirely and store the tokens
-    // in their own dedicated config slot.
-    saveCodexOAuthTokens({
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken ?? '',
-      expiresAt: tokens.expiresAt ?? Date.now() + 3600_000,
-      accountId: (tokens.tokenAccount?.uuid ?? ''),
-    })
   }
 
   await clearAuthRelatedCaches()
@@ -266,8 +212,10 @@ export async function authLogin({
   provider?: AuthProviderTarget
 }): Promise<void> {
   if (provider === 'codex') {
-    await authLoginCodex()
-    return
+    process.stderr.write(
+      'Codex native does not support OAuth login. Configure OPENAI_API_KEY or CODEX_API_KEY instead.\n',
+    )
+    process.exit(1)
   }
 
   if (provider === 'all') {
@@ -600,17 +548,10 @@ export async function authLogoutByProvider(
   provider?: AuthProviderTarget,
 ): Promise<void> {
   if (provider === 'codex') {
-    clearCodexOAuthTokens()
-    clearLegacyOpenAIOAuthTokens()
-    await clearOfficialCodexCliOAuthTokens()
-    process.stdout.write('Successfully logged out from Codex.\n')
+    process.stdout.write(
+      'Codex native uses API-key credentials only. Remove OPENAI_API_KEY or CODEX_API_KEY to stop authenticating Codex.\n',
+    )
     process.exit(0)
-  }
-
-  if (provider === 'all') {
-    clearCodexOAuthTokens()
-    clearLegacyOpenAIOAuthTokens()
-    await clearOfficialCodexCliOAuthTokens()
   }
 
   try {
@@ -633,7 +574,7 @@ export async function authLogoutByProvider(
   }
   process.stdout.write(
     provider === 'all'
-      ? 'Successfully logged out from Anthropic and Codex.\n'
+      ? 'Successfully logged out from Anthropic. Codex native uses API-key credentials and was left unchanged.\n'
       : 'Successfully logged out from your Anthropic account.\n',
   )
   process.exit(0)

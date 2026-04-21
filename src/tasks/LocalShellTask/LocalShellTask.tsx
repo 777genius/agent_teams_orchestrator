@@ -2,6 +2,7 @@ import { feature } from 'bun:bundle';
 import { stat } from 'fs/promises';
 import { OUTPUT_FILE_TAG, STATUS_TAG, SUMMARY_TAG, TASK_ID_TAG, TASK_NOTIFICATION_TAG, TOOL_USE_ID_TAG } from '../../constants/xml.js';
 import { abortSpeculation } from '../../services/PromptSuggestion/speculation.js';
+import { completeDeferredTaskChangeShellSnapshot } from '../../services/taskChangeLedger/TaskChangeLedgerService.js';
 import type { AppState } from '../../state/AppState.js';
 import type { LocalShellSpawnInput, SetAppState, Task, TaskContext, TaskHandle } from '../../Task.js';
 import { createTaskStateBase } from '../../Task.js';
@@ -241,6 +242,7 @@ export async function spawnShellTask(input: LocalShellSpawnInput & {
       };
     });
     enqueueShellNotification(taskId, description, wasKilled ? 'killed' : result.code === 0 ? 'completed' : 'failed', result.code, setAppState, toolUseId, kind, agentId);
+    void completeDeferredTaskChangeShellSnapshot(taskId, wasKilled ? 'killed' : result.code === 0 ? 'succeeded' : 'failed');
     void evictTaskOutput(taskId);
   });
   return {
@@ -362,6 +364,7 @@ function backgroundTask(taskId: string, getAppState: () => AppState, setAppState
       const finalStatus = result.code === 0 ? 'completed' : 'failed';
       enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, kind, agentId);
     }
+    void completeDeferredTaskChangeShellSnapshot(taskId, wasKilled ? 'killed' : result.code === 0 ? 'succeeded' : 'failed');
     void evictTaskOutput(taskId);
   });
   return true;
@@ -468,6 +471,7 @@ export function backgroundExistingForegroundTask(taskId: string, shellCommand: S
     cleanupFn?.();
     const finalStatus = wasKilled ? 'killed' : result.code === 0 ? 'completed' : 'failed';
     enqueueShellNotification(taskId, description, finalStatus, result.code, setAppState, toolUseId, undefined, agentId);
+    void completeDeferredTaskChangeShellSnapshot(taskId, wasKilled ? 'killed' : result.code === 0 ? 'succeeded' : 'failed');
     void evictTaskOutput(taskId);
   });
   return true;

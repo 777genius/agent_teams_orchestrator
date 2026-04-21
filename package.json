@@ -1,6 +1,6 @@
 {
   "name": "claude-multimodel",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "private": true,
   "description": "Reconstructed Bun CLI workspace for the Claude Code source snapshot.",
   "type": "module",
@@ -20,7 +20,8 @@
     "dev": "bun run ./src/entrypoints/cli.tsx",
     "test:task-change-ledger": "bun test src/services/boardTaskActivity/BoardTaskTranscriptPersistence.test.ts src/services/taskChangeLedger",
     "smoke:anthropic-api": "bun run ./scripts/anthropic-api-smoke.ts",
-    "smoke:codex-api": "bun run ./scripts/codex-api-smoke.ts"
+    "signoff:codex-native-phase0": "bun run ./scripts/codex-native-phase0-signoff.ts",
+    "signoff:codex-native-phase4": "bun run ./scripts/codex-native-phase4-signoff.ts"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "^0.3.0",

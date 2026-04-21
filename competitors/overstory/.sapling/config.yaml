@@ -1,0 +1,5 @@
+# Sapling project configuration
+project: "overstory"
+model: MiniMax-M2.5
+max_turns: 200
+context_pipeline: v1

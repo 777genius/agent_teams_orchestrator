@@ -1,11 +1,8 @@
 import chalk from 'chalk'
 import { exec } from 'child_process'
 import { execa } from 'execa'
-import { readFileSync } from 'fs'
 import { mkdir, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
-import { homedir } from 'os'
-import { join } from 'path'
 import { CLAUDE_AI_PROFILE_SCOPE } from 'src/constants/oauth.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -34,10 +31,6 @@ import {
   refreshOAuthToken,
   shouldUseClaudeAIAuth,
 } from '../services/oauth/client.js'
-import {
-  extractCodexAccountId,
-  type CodexTokens,
-} from '../services/oauth/codex-client.js'
 import { getOauthProfileFromOauthToken } from '../services/oauth/getOauthProfile.js'
 import type { OAuthTokens, SubscriptionType } from '../services/oauth/types.js'
 import {
@@ -1327,137 +1320,6 @@ export function clearOAuthTokenCache(): void {
   clearKeychainCache()
 }
 
-// ── Codex OAuth token storage ────────────────────────────────────────────────
-// These functions manage OpenAI Codex tokens separately from Anthropic's
-// claudeAiOauth keychain entry. Codex tokens are stored in the GlobalConfig
-// JSON file (not in the system keychain) and are only ever sent to OpenAI's
-// API, never to Anthropic's servers.
-
-/**
- * Saves the OpenAI Codex OAuth tokens to GlobalConfig.
- * Does NOT overwrite or interfere with Anthropic's claudeAiOauth block.
- */
-export function saveCodexOAuthTokens(tokens: CodexTokens): void {
-  saveGlobalConfig((cfg) => ({
-    ...cfg,
-    codexOAuth: {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      expiresAt: tokens.expiresAt,
-      accountId: tokens.accountId,
-    },
-  }))
-}
-
-type OfficialCodexCliAuthFile = {
-  auth_mode?: string
-  tokens?: {
-    access_token?: string
-    refresh_token?: string
-    account_id?: string
-  }
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split('.')
-    if (parts.length !== 3) return null
-    const payload = parts[1] ?? ''
-    const decoded = Buffer.from(payload, 'base64url').toString('utf8')
-    return JSON.parse(decoded) as Record<string, unknown>
-  } catch {
-    return null
-  }
-}
-
-function extractCodexAccessTokenExpiry(accessToken: string): number | null {
-  const payload = decodeJwtPayload(accessToken)
-  const exp = payload?.exp
-  return typeof exp === 'number' ? exp * 1000 : null
-}
-
-function getOfficialCodexCliAuthPath(): string {
-  return join(homedir(), '.codex', 'auth.json')
-}
-
-function getOfficialCodexCliOAuthTokens(): CodexTokens | null {
-  try {
-    const raw = readFileSync(getOfficialCodexCliAuthPath(), 'utf8')
-    const parsed = jsonParse(raw) as OfficialCodexCliAuthFile | null
-    const accessToken = parsed?.tokens?.access_token
-    const refreshToken = parsed?.tokens?.refresh_token
-
-    if (!accessToken || !refreshToken) {
-      return null
-    }
-
-    const expiresAt = extractCodexAccessTokenExpiry(accessToken)
-    const accountId =
-      parsed?.tokens?.account_id ?? extractCodexAccountId(accessToken)
-
-    if (!expiresAt || !accountId) {
-      return null
-    }
-
-    return {
-      accessToken,
-      refreshToken,
-      expiresAt,
-      accountId,
-    }
-  } catch {
-    return null
-  }
-}
-
-/**
- * Retrieves the stored Codex OAuth tokens from GlobalConfig.
- * Returns null if no Codex tokens are stored.
- */
-export function getCodexOAuthTokens(): CodexTokens | null {
-  const cfg = getGlobalConfig()
-  const stored = cfg.codexOAuth
-  if (
-    !stored?.accessToken ||
-    !stored.refreshToken ||
-    !stored.expiresAt ||
-    !stored.accountId
-  ) {
-    return getOfficialCodexCliOAuthTokens()
-  }
-  return {
-    accessToken: stored.accessToken,
-    refreshToken: stored.refreshToken,
-    expiresAt: stored.expiresAt,
-    accountId: stored.accountId,
-  }
-}
-
-/**
- * Removes Codex OAuth tokens from GlobalConfig (e.g., on logout).
- */
-export function clearCodexOAuthTokens(): void {
-  saveGlobalConfig((cfg) => {
-    const { codexOAuth: _removed, ...rest } = cfg
-    return rest as typeof cfg
-  })
-}
-
-export async function clearOfficialCodexCliOAuthTokens(): Promise<void> {
-  try {
-    await execa('codex', ['logout'], {
-      reject: false,
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-    })
-  } catch {
-    // Best-effort only. If the official CLI is unavailable, we still clear the
-    // local mirrored Codex session metadata.
-  }
-}
-
-
 let lastCredentialsMtimeMs = 0
 
 // Cross-process staleness: another CC instance may write fresh tokens to
@@ -1718,24 +1580,7 @@ export function isClaudeAISubscriber(): boolean {
 }
 
 export function isCodexSubscriber(): boolean {
-  // Check if we're using OpenAI API via environment variable
-  if (getAPIProvider() === 'openai') {
-    return true
-  }
-
-  const tokens = getCodexOAuthTokens()
-  if (tokens?.accessToken) {
-    return true
-  }
-
-  // Legacy config fallback
-  const config = getGlobalConfig()
-  const openaiTokens = config?.openaiOauthTokens
-  if (openaiTokens?.access_token && openaiTokens?.scopes?.includes('codex')) {
-    return true
-  }
-
-  return false
+  return getAPIProvider() === 'openai'
 }
 
 export function hasExplicitHostManagedProviderSelection(): boolean {

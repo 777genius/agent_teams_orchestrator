@@ -1,0 +1,31 @@
+# OTel overlay — rebuilds with OTel support + adds Jaeger for trace visualization.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.otel.yml up
+#
+# Jaeger UI: http://localhost:16686
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.68.0
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+
+  goclaw:
+    build:
+      args:
+        ENABLE_OTEL: "true"
+    environment:
+      - GOCLAW_TELEMETRY_ENABLED=true
+      - GOCLAW_TELEMETRY_ENDPOINT=jaeger:4317
+      - GOCLAW_TELEMETRY_PROTOCOL=grpc
+      - GOCLAW_TELEMETRY_INSECURE=true
+      - GOCLAW_TELEMETRY_SERVICE_NAME=goclaw-gateway
+    depends_on:
+      jaeger:
+        condition: service_started

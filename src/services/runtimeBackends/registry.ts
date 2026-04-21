@@ -1,25 +1,32 @@
 import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
-import {
-  CLAUDE_HAIKU_4_5_CONFIG,
-  CLAUDE_OPUS_4_7_CONFIG,
-  CLAUDE_OPUS_4_6_CONFIG,
-  CLAUDE_SONNET_4_6_CONFIG,
-} from '../../utils/model/configs.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
+import {
+  buildOpenCodeCapabilityInfo,
+  buildOpenCodeDetailMessage,
+  buildOpenCodeStatusMessage,
+} from '../opencode/OpenCodeDiagnostics.js'
+import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
-  resolveCodexRuntimeSelection,
-} from './codexBackendResolver.js'
+  getAnthropicRuntimeFastModeCapability,
+  getAnthropicRuntimeModelCatalog,
+  getAnthropicRuntimeReasoningEfforts,
+  getAnthropicVisibleRuntimeModels,
+} from './anthropicCatalog.js'
+import { buildAnthropicRuntimeStatus } from './anthropicStatus.js'
+import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
 import type {
+  RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
   ExternalRuntimeDiagnostic,
   GeminiRuntimeBackendId,
+  RuntimeBackendOptionState,
   RuntimeExtensionCapabilities,
   RuntimeBackendOptionStatus,
   RuntimeProviderId,
@@ -40,18 +47,17 @@ const GEMINI_BACKEND_DESCRIPTIONS: Record<GeminiRuntimeBackendId, string> = {
 }
 
 const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Auto',
-  adapter: 'Default adapter',
-  api: 'OpenAI API',
+  'codex-native': 'Codex native',
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Automatically prefer the best available Codex runtime path',
-  adapter: 'Use the built-in Codex fetch adapter',
-  api: 'Use OPENAI_API_KEY with the public OpenAI Responses API',
+  'codex-native': 'Use the local codex exec JSON seam as the supported Codex runtime path',
 }
 
-function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): ExternalRuntimeDiagnostic {
+function detectExternalBinary(
+  binaryName: 'gemini' | 'codex',
+  label: string,
+): ExternalRuntimeDiagnostic {
   const binaryPath = Bun.which(binaryName)
   return {
     id: 'cli-bin',
@@ -126,6 +132,8 @@ function buildGeminiOptionStatus(
     selectable: true,
     recommended,
     available: ok,
+    state: ok ? 'ready' : 'authentication-required',
+    audience: 'general',
     statusMessage,
     detailMessage,
   }
@@ -137,14 +145,19 @@ function buildCodexOptionStatus(
   statusMessage: string | null,
   detailMessage: string | null,
   recommended = false,
+  selectable = true,
+  state: RuntimeBackendOptionState = ok ? 'ready' : 'degraded',
+  audience: RuntimeBackendOptionAudience = 'general',
 ): RuntimeBackendOptionStatus {
   return {
     id,
     label: CODEX_BACKEND_LABELS[id],
     description: CODEX_BACKEND_DESCRIPTIONS[id],
-    selectable: true,
+    selectable,
     recommended,
     available: ok,
+    state,
+    audience,
     statusMessage,
     detailMessage,
   }
@@ -174,43 +187,19 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
-function getAnthropicModels(): string[] {
-  return filterDisplayModels([
-    CLAUDE_SONNET_4_6_CONFIG.firstParty,
-    `${CLAUDE_SONNET_4_6_CONFIG.firstParty}[1m]`,
-    CLAUDE_OPUS_4_7_CONFIG.firstParty,
-    `${CLAUDE_OPUS_4_7_CONFIG.firstParty}[1m]`,
-    CLAUDE_HAIKU_4_5_CONFIG.firstParty,
-    CLAUDE_OPUS_4_6_CONFIG.firstParty,
-    `${CLAUDE_OPUS_4_6_CONFIG.firstParty}[1m]`,
-  ])
-}
-
-function buildAnthropicStatus(): RuntimeProviderStatus {
+async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
   const anthropicAuth = getAnthropicAuthenticated()
-
-  return {
-    providerId: 'anthropic',
-    displayName: 'Anthropic',
-    supported: true,
-    authenticated: anthropicAuth.authenticated,
-    authMethod: anthropicAuth.authMethod,
-    verificationState: 'verified',
-    canLoginFromUi: true,
-    capabilities: {
-      teamLaunch: true,
-      oneShot: true,
-      extensions: buildExtensionCapabilities(),
-    },
-    statusMessage: anthropicAuth.authenticated ? null : 'Not connected',
-    detailMessage: null,
-    selectedBackendId: null,
-    resolvedBackendId: null,
-    availableBackends: [],
-    externalRuntimeDiagnostics: [],
-    models: getAnthropicModels(),
-    backend: null,
-  }
+  const modelCatalog = await getAnthropicRuntimeModelCatalog()
+  const reasoningEfforts = getAnthropicRuntimeReasoningEfforts(modelCatalog)
+  const fastMode = getAnthropicRuntimeFastModeCapability()
+  return buildAnthropicRuntimeStatus({
+    auth: anthropicAuth,
+    modelCatalog,
+    visibleModels: getAnthropicVisibleRuntimeModels(modelCatalog),
+    reasoningEfforts,
+    fastMode,
+    extensions: buildExtensionCapabilities(),
+  })
 }
 
 function getCodexModels(): string[] {
@@ -223,6 +212,74 @@ function getGeminiModels(): string[] {
 
 function filterDisplayModels(models: string[]): string[] {
   return models.filter(model => isModelAllowed(model))
+}
+
+async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
+  const snapshot = await openCodeInventoryService.probe()
+  const authenticated = snapshot.connectedProviders.length > 0
+
+  return {
+    providerId: 'opencode',
+    displayName: 'OpenCode',
+    supported: snapshot.detected,
+    authenticated,
+    authMethod: authenticated ? 'opencode_managed' : null,
+    verificationState: !snapshot.detected
+      ? 'offline'
+      : snapshot.probeError && snapshot.models.length === 0 && !authenticated
+        ? 'error'
+        : 'verified',
+    canLoginFromUi: false,
+    capabilities: {
+      teamLaunch: false,
+      oneShot: false,
+      extensions: buildExtensionCapabilities({
+        plugins: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode manages plugin lifecycle. Desktop management wiring is not enabled yet.',
+        },
+        mcp: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode manages MCP lifecycle. Team launch wiring is still pending.',
+        },
+        skills: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode skill roots are detected by the runtime, but desktop control is not enabled yet.',
+        },
+        apiKeys: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'Provider credentials are managed through OpenCode providers and auth storage.',
+        },
+      }),
+    },
+    statusMessage: buildOpenCodeStatusMessage(snapshot),
+    detailMessage: buildOpenCodeDetailMessage(snapshot),
+    selectedBackendId: null,
+    resolvedBackendId: null,
+    availableBackends: [],
+    externalRuntimeDiagnostics: [
+      {
+        id: 'cli-bin',
+        label: 'OpenCode CLI',
+        detected: snapshot.detected,
+        statusMessage: snapshot.detected ? 'OpenCode CLI detected' : 'OpenCode CLI not found',
+        detailMessage: snapshot.binaryPath,
+      },
+    ],
+    models: snapshot.models,
+    backend: snapshot.detected
+      ? {
+          kind: 'opencode-cli',
+          label: 'OpenCode CLI',
+          authMethodDetail: snapshot.profile?.authState ?? null,
+        }
+      : null,
+    capabilitiesInfo: buildOpenCodeCapabilityInfo(snapshot),
+  }
 }
 
 async function buildGeminiStatuses(): Promise<{
@@ -359,40 +416,36 @@ function buildCodexStatuses(): {
   backend: RuntimeProviderStatus['backend']
 } {
   const resolution = resolveCodexRuntimeSelection()
+  const codexNativeAvailable = resolution.resolvedBackendId === 'codex-native'
+  const codexNativeState: RuntimeBackendOptionState = codexNativeAvailable
+    ? 'ready'
+    : !resolution.nativeBinaryDetected
+      ? 'runtime-missing'
+      : !resolution.nativeApiKeyConfigured
+        ? 'authentication-required'
+        : 'degraded'
+  const codexNativeStatusMessage = codexNativeAvailable
+    ? 'Ready'
+    : !resolution.nativeBinaryDetected
+      ? 'Codex CLI not found'
+      : !resolution.nativeApiKeyConfigured
+        ? 'Authentication required'
+        : 'Degraded'
 
   return {
     selectedBackendId: resolution.selectedBackendId,
     resolvedBackendId: resolution.resolvedBackendId,
     availableBackends: [
       buildCodexOptionStatus(
-        'auto',
-        resolution.resolvedBackendId !== null,
-        resolution.resolvedBackendId
-          ? `Resolved to ${CODEX_BACKEND_LABELS[resolution.resolvedBackendId]}`
-          : 'Unavailable',
+        'codex-native',
+        codexNativeAvailable,
+        codexNativeStatusMessage,
         resolution.detailMessage,
         true,
+        codexNativeAvailable,
+        codexNativeState,
+        'general',
       ),
-      buildCodexOptionStatus(
-        'adapter',
-        resolution.oauthAuthenticated,
-        resolution.oauthAuthenticated ? 'Ready' : 'Authentication required',
-        resolution.oauthAuthenticated
-          ? 'Uses the local Codex OAuth session via the built-in adapter.'
-          : 'Sign in with Codex OAuth to use the built-in adapter.',
-      ),
-      ...(resolution.featureFlagEnabled
-        ? [
-            buildCodexOptionStatus(
-              'api',
-              resolution.apiKeyConfigured,
-              resolution.apiKeyConfigured ? 'Ready' : 'Authentication required',
-              resolution.apiKeyConfigured
-                ? 'Uses OPENAI_API_KEY with api.openai.com/v1/responses.'
-                : 'Set OPENAI_API_KEY to use the public OpenAI Responses API.',
-            ),
-          ]
-        : []),
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
@@ -401,21 +454,14 @@ function buildCodexStatuses(): {
     detailMessage: resolution.detailMessage,
     canLoginFromUi: resolution.canLoginFromUi,
     backend:
-      resolution.resolvedBackendId === 'adapter'
+      resolution.resolvedBackendId === 'codex-native'
         ? {
-            kind: 'adapter',
-            label: 'Default adapter',
-            endpointLabel: 'chatgpt.com/backend-api/codex/responses',
-            authMethodDetail: 'oauth_token',
+            kind: 'codex-native',
+            label: 'Codex native',
+            endpointLabel: 'codex exec --json',
+            authMethodDetail: 'api_key',
           }
-        : resolution.resolvedBackendId === 'api'
-          ? {
-              kind: 'api',
-              label: 'OpenAI API',
-              endpointLabel: 'api.openai.com/v1/responses',
-              authMethodDetail: 'api_key',
-            }
-          : null,
+        : null,
   }
 }
 
@@ -425,7 +471,7 @@ export async function getUnifiedRuntimeStatusPayload(
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
 
   if (!providerFilter || providerFilter === 'anthropic') {
-    providers.anthropic = buildAnthropicStatus()
+    providers.anthropic = await buildAnthropicStatus()
   }
 
   if (!providerFilter || providerFilter === 'codex') {
@@ -446,7 +492,7 @@ export async function getUnifiedRuntimeStatusPayload(
             status: 'unsupported',
             ownership: 'shared',
             reason:
-              'Plugins are currently guaranteed only for Anthropic sessions in the multimodel runtime.',
+              'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
           },
         }),
       },
@@ -457,6 +503,17 @@ export async function getUnifiedRuntimeStatusPayload(
       availableBackends: codex.availableBackends,
       externalRuntimeDiagnostics: [detectExternalBinary('codex', 'Codex CLI')],
       models: getCodexModels(),
+      runtimeCapabilities: {
+        modelCatalog: {
+          dynamic: true,
+          source: 'runtime',
+        },
+        reasoningEffort: {
+          supported: true,
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          configPassthrough: true,
+        },
+      },
       backend: codex.backend,
     }
   }
@@ -491,6 +548,10 @@ export async function getUnifiedRuntimeStatusPayload(
       models: getGeminiModels(),
       backend: gemini.backend,
     }
+  }
+
+  if (!providerFilter || providerFilter === 'opencode') {
+    providers.opencode = await buildOpenCodeStatus()
   }
 
   return {

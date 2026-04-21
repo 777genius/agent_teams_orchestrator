@@ -1,0 +1,50 @@
+defmodule Cortex.Store.Schemas.Run do
+  @moduledoc """
+  Ecto schema for an orchestration run.
+
+  Tracks the overall execution of an orchestra.yaml configuration,
+  including aggregate cost, duration, and status.
+  """
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  alias Cortex.Store.Schemas.{GateDecision, TeamRun}
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  @foreign_key_type :binary_id
+
+  schema "runs" do
+    field(:name, :string)
+    field(:config_yaml, :string)
+    field(:status, :string, default: "pending")
+    field(:team_count, :integer, default: 0)
+    field(:total_cost_usd, :float, default: 0.0)
+    field(:total_input_tokens, :integer)
+    field(:total_output_tokens, :integer)
+    field(:total_cache_read_tokens, :integer)
+    field(:total_cache_creation_tokens, :integer)
+    field(:total_duration_ms, :integer)
+    field(:started_at, :utc_datetime_usec)
+    field(:completed_at, :utc_datetime_usec)
+    field(:workspace_path, :string)
+    field(:mode, :string, default: "workflow")
+    field(:gossip_rounds_completed, :integer, default: 0)
+    field(:gossip_rounds_total, :integer, default: 0)
+    field(:gated_at_tier, :integer)
+
+    has_many(:team_runs, TeamRun)
+    has_many(:gate_decisions, GateDecision)
+
+    timestamps(type: :utc_datetime_usec)
+  end
+
+  @required_fields ~w(name)a
+  @optional_fields ~w(config_yaml status team_count total_cost_usd total_input_tokens total_output_tokens total_cache_read_tokens total_cache_creation_tokens total_duration_ms started_at completed_at workspace_path mode gossip_rounds_completed gossip_rounds_total gated_at_tier)a
+
+  def changeset(run, attrs) do
+    run
+    |> cast(attrs, @required_fields ++ @optional_fields)
+    |> validate_required(@required_fields)
+    |> validate_inclusion(:status, ~w(pending running completed failed stopped gated cancelled))
+  end
+end

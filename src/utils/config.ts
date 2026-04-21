@@ -228,21 +228,10 @@ export type GlobalConfig = {
   hasResetAutoModeOptInForDefaultOffer?: boolean // ant-only: one-shot migration guard, re-prompts churned auto-mode users
   oauthAccount?: AccountInfo
 
-  /**
-   * OpenAI Codex OAuth tokens, stored separately from Anthropic credentials.
-   * These are acquired via the Codex OAuth flow (auth.openai.com) and are used
-   * as Bearer tokens against OpenAI's API — they are never sent to Anthropic servers.
-   */
-  codexOAuth?: {
-    accessToken: string
-    refreshToken: string
-    expiresAt: number
-    accountId: string
-  }
   geminiBackendPreference?: 'auto' | 'api' | 'cli' | 'cli-sdk'
   geminiResolvedBackend?: 'api' | 'cli' | 'cli-sdk'
-  codexBackendPreference?: 'auto' | 'adapter' | 'api'
-  codexResolvedBackend?: 'adapter' | 'api'
+  codexBackendPreference?: 'codex-native'
+  codexResolvedBackend?: 'codex-native'
   geminiProjectId?: string
   geminiLastAuthMethod?:
     | 'api_key'
@@ -547,7 +536,7 @@ export type GlobalConfig = {
   // Teammate spawn mode: 'auto' | 'tmux' | 'in-process'
   teammateMode?: 'auto' | 'tmux' | 'in-process' // How to spawn teammates (default: 'auto')
   // Model for new teammates when the tool call doesn't pass one.
-  // undefined = hardcoded Opus (backward-compat); null = leader's model; string = model alias/ID.
+  // undefined = hardcoded Opus alias (backward-compat); null = leader's model; string = model alias/ID.
   teammateDefaultModel?: string | null
 
   // PR status footer configuration (feature-flagged via GrowthBook)
@@ -598,13 +587,6 @@ export type GlobalConfig = {
   // (avoiding 11× saveGlobalConfig lock+re-read on every startup).
   migrationVersion?: number
 
-  // OpenAI OAuth tokens for Codex API access
-  openaiOauthTokens?: {
-    access_token: string
-    refresh_token?: string
-    scopes?: string[]
-    expires_at?: number
-  }
   agentTeams?: {
     clientId?: string
     session?: {

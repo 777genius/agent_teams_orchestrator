@@ -994,7 +994,7 @@ async function run(): Promise<CommanderCommand> {
     return Number.isFinite(n) ? n : undefined;
   }).hideHelp()).option('--from-pr [value]', 'Resume a session linked to a PR by PR number/URL, or open interactive picker with optional search term', value => value || true).option('--no-session-persistence', 'Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)').addOption(new Option('--resume-session-at <message id>', 'When resuming, only messages up to and including the assistant message with <message.id> (use with --resume in print mode)').argParser(String).hideHelp()).addOption(new Option('--rewind-files <user-message-id>', 'Restore files to state at the specified user message and exit (requires --resume)').hideHelp()).addOption(new Option('--team-bootstrap-spec <file>', 'Run deterministic team bootstrap from a spec file before the first user turn').hideHelp()).addOption(new Option('--team-bootstrap-user-prompt-file <file>', 'Queue the first real user task from a file after deterministic bootstrap completes').hideHelp())
   // @[MODEL LAUNCH]: Update the example model ID in the --model help text.
-  .option('--model <model>', `Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').`).addOption(new Option('--effort <level>', `Effort level for the current session (low, medium, high, max)`).argParser((rawValue: string) => {
+  .option('--model <model>', `Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').`).addOption(new Option('--effort <level>', `Effort level for the current session (none, minimal, low, medium, high, xhigh, max)`).argParser((rawValue: string) => {
     const value = rawValue.toLowerCase();
     const allowed = ['low', 'medium', 'high', 'max'];
     if (!allowed.includes(value)) {
@@ -4167,10 +4167,10 @@ async function run(): Promise<CommanderCommand> {
   });
 
   const model = program.command('model').description('Inspect model availability').configureHelp(createSortedHelpConfig());
-  model.command('list').description('List available models by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  model.command('list').description('List available models by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
-    provider?: 'anthropic' | 'codex' | 'all';
+    provider?: 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all';
   }) => {
     const {
       modelList
@@ -4179,15 +4179,85 @@ async function run(): Promise<CommanderCommand> {
   });
 
   const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
-  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
-    provider?: 'anthropic' | 'codex' | 'gemini' | 'all';
+    provider?: 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all';
   }) => {
     const {
       runtimeStatus
     } = await import('./cli/handlers/runtime.js');
     await runtimeStatus(opts);
+  });
+  runtime.command('verify').description('Run a live runtime verification probe for provider-backed hosts').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'opencode' | 'all';
+  }) => {
+    const {
+      runtimeVerify
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeVerify(opts);
+  });
+  runtime.command('verify-model').description('Run an execution-grade model probe for provider-backed runtimes').requiredOption('--model <modelId>', 'Provider-scoped model identifier to verify').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'opencode' | 'all';
+    model: string;
+  }) => {
+    const {
+      runtimeVerifyModel
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeVerifyModel(opts);
+  });
+  runtime.command('reconcile').description('Reconcile a stored provider-backed session against durable runtime state').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'opencode' | 'all';
+    team: string;
+    member: string;
+    limit?: number;
+  }) => {
+    const {
+      runtimeReconcile
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeReconcile(opts);
+  });
+  runtime.command('transcript').description('Project a stored provider-backed session into canonical transcript items').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'opencode' | 'all';
+    team: string;
+    member: string;
+    limit?: number;
+  }) => {
+    const {
+      runtimeTranscript
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeTranscript(opts);
+  });
+  runtime.command('preview').description('Observe a stored provider-backed session through the OpenCode SSE preview stream').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--timeout <ms>', 'Maximum preview observation time in milliseconds').argParser(Number)).addOption(new Option('--idle-timeout <ms>', 'Stop preview observation after this much inactivity').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+    json?: boolean;
+    text?: boolean;
+    provider?: 'opencode' | 'all';
+    team: string;
+    member: string;
+    timeout?: number;
+    idleTimeout?: number;
+  }) => {
+    const {
+      runtimePreview
+    } = await import('./cli/handlers/runtime.js');
+    await runtimePreview(opts);
+  });
+  runtime.command('opencode-command').description('Execute an OpenCode bridge command envelope').requiredOption('--input <path>', 'Path to bridge command envelope JSON').option('--json', 'Output as JSON').action(async (opts: {
+    input: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeOpenCodeCommand
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeOpenCodeCommand(opts);
   });
 
   /**

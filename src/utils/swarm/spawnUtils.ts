@@ -22,6 +22,7 @@ import { getCustomApiKeyStatus } from '../config.js'
 import { logForDebugging } from '../debug.js'
 import { isRunningOnHomespace } from '../envUtils.js'
 import { execFileNoThrow } from '../execFileNoThrow.js'
+import { getAPIProvider } from '../model/providers.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { sleep } from '../sleep.js'
 import type { TeammateProvider } from './backends/types.js'
@@ -150,12 +151,12 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_ENTRY_PROVIDER',
   'CLAUDE_CODE_GEMINI_BACKEND',
   'CLAUDE_CODE_CODEX_BACKEND',
-  'CLAUDE_CODE_CODEX_API_KEY_BETA',
   // Custom API endpoint
   'ANTHROPIC_BASE_URL',
   'GEMINI_BASE_URL',
   'GEMINI_API_VERSION',
   'GEMINI_API_KEY',
+  'CODEX_API_KEY',
   'OPENAI_API_KEY',
   'GOOGLE_APPLICATION_CREDENTIALS',
   'GOOGLE_CLOUD_PROJECT',
@@ -203,6 +204,23 @@ function getExplicitEntryProvider(provider: TeammateProvider): string {
 const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
   PROVIDER_SELECTION_ENV_VARS,
 )
+
+function getCurrentTeammateProviderForEnvForwarding(): TeammateProvider {
+  const provider = getAPIProvider()
+  if (provider === 'openai') {
+    return 'codex'
+  }
+  if (provider === 'gemini') {
+    return 'gemini'
+  }
+  return 'anthropic'
+}
+
+function shouldForwardAnthropicAuthToken(
+  provider: TeammateProvider | undefined,
+): boolean {
+  return (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'anthropic'
+}
 
 export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
   anthropicApiKey: string | undefined
@@ -272,6 +290,17 @@ export function buildInheritedEnvVars(options?: {
         envVars.push(`${key}=${quote([value])}`)
       }
     }
+  }
+
+  // Keep the external Anthropic bearer token aligned with the forwarded
+  // ANTHROPIC_BASE_URL, but only for Anthropic-routed teammates.
+  if (
+    shouldForwardAnthropicAuthToken(provider) &&
+    process.env.ANTHROPIC_AUTH_TOKEN
+  ) {
+    envVars.push(
+      `ANTHROPIC_AUTH_TOKEN=${quote([process.env.ANTHROPIC_AUTH_TOKEN])}`,
+    )
   }
 
   if (provider) {

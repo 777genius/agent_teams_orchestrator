@@ -7,6 +7,7 @@ import {
   buildMcpDiagnoseJsonPayload,
   buildMcpListJsonPayload,
   describeMcpServerTarget,
+  filterExtensionsManagedMcpServers,
   getMcpTransport,
   type McpDiagnoseJsonEntry,
 } from '../../services/mcp/cliJson.js'
@@ -16,7 +17,7 @@ import type { ScopedMcpServerConfig } from '../../services/mcp/types.js'
 import { gracefulShutdown } from '../../utils/gracefulShutdown.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
-const MCP_DIAGNOSE_TIMEOUT_MS = 10_000
+const MCP_DIAGNOSE_TIMEOUT_MS = 15_000
 
 function writeJson(payload: unknown): void {
   process.stdout.write(jsonStringify(payload, null, 2) + '\n')
@@ -85,14 +86,14 @@ async function diagnoseMcpServer(
 export async function mcpListJsonHandler(): Promise<void> {
   logEvent('tengu_mcp_list', {})
   const { servers: configs } = await getAllMcpConfigs()
-  writeJson(buildMcpListJsonPayload(configs))
+  writeJson(buildMcpListJsonPayload(filterExtensionsManagedMcpServers(configs)))
   await gracefulShutdown(0)
 }
 
 export async function mcpDiagnoseJsonHandler(): Promise<void> {
   logEvent('tengu_mcp_diagnose', {})
   const { servers: configs } = await getAllMcpConfigs()
-  const entries = Object.entries(configs)
+  const entries = Object.entries(filterExtensionsManagedMcpServers(configs))
 
   if (entries.length === 0) {
     writeJson(buildMcpDiagnoseJsonPayload([]))

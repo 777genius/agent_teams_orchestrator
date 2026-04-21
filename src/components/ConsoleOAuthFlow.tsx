@@ -9,9 +9,8 @@ import { Box, Link, Text } from '../ink.js';
 import { useKeybinding } from '../keybindings/useKeybinding.js';
 import { getSSLErrorHint } from '../services/api/errorUtils.js';
 import { sendNotification } from '../services/notifier.js';
-import { runCodexOAuthFlow } from '../services/oauth/codex-client.js';
 import { OAuthService } from '../services/oauth/index.js';
-import { getOauthAccountInfo, saveCodexOAuthTokens, validateForceLoginOrg } from '../utils/auth.js';
+import { getOauthAccountInfo, validateForceLoginOrg } from '../utils/auth.js';
 import { logError } from '../utils/log.js';
 import { getSettings_DEPRECATED } from '../utils/settings/settings.js';
 import { Select } from './CustomSelect/select.js';
@@ -85,7 +84,6 @@ export function ConsoleOAuthFlow({
     // Use Claude AI auth for setup-token mode to support user:inference scope
     return mode === 'setup-token' || forceLoginMethod === 'claudeai';
   });
-  const [loginWithCodex, setLoginWithCodex] = useState(false);
   // After a few seconds we suggest the user to copy/paste url if the
   // browser did not open automatically. In this flow we expect the user to
   // copy the code from the browser and paste it in the terminal
@@ -264,45 +262,16 @@ export function ConsoleOAuthFlow({
     }
   }, [oauthService, setShowPastePrompt, loginWithClaudeAi, mode, orgUUID]);
 
-  // Codex-specific OAuth flow — completely separate from the Anthropic OAuthService
-  const startCodexOAuth = useCallback(async () => {
-    try {
-      logEvent('tengu_oauth_codex_flow_start', {});
-      const codexTokens = await runCodexOAuthFlow(async (url) => {
-        setOAuthStatus({ state: 'waiting_for_login', url });
-        setTimeout(setShowPastePrompt, 3000, true);
-      });
-      // Save directly via saveCodexOAuthTokens (bypasses installOAuthTokens Anthropic path)
-      saveCodexOAuthTokens(codexTokens);
-      logEvent('tengu_oauth_codex_success', {});
-      setOAuthStatus({ state: 'success' });
-      void sendNotification({ message: 'Codex login successful', notificationType: 'auth_success' }, terminal);
-    } catch (err) {
-      const msg = (err as Error).message;
-      logEvent('tengu_oauth_codex_error', {
-        error: msg as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      });
-      setOAuthStatus({ state: 'error', message: msg, toRetry: { state: 'idle' } });
-    }
-  }, [setShowPastePrompt, terminal]);
-
   const pendingOAuthStartRef = useRef(false);
   useEffect(() => {
     if (oauthStatus.state === 'ready_to_start' && !pendingOAuthStartRef.current) {
       pendingOAuthStartRef.current = true;
-      if (loginWithCodex) {
-        process.nextTick((startCodexOAuth_0: () => Promise<void>, pendingOAuthStartRef_0: React.MutableRefObject<boolean>) => {
-          void startCodexOAuth_0();
-          pendingOAuthStartRef_0.current = false;
-        }, startCodexOAuth, pendingOAuthStartRef);
-      } else {
-        process.nextTick((startOAuth_0: () => Promise<void>, pendingOAuthStartRef_0: React.MutableRefObject<boolean>) => {
-          void startOAuth_0();
-          pendingOAuthStartRef_0.current = false;
-        }, startOAuth, pendingOAuthStartRef);
-      }
+      process.nextTick((startOAuth_0: () => Promise<void>, pendingOAuthStartRef_0: React.MutableRefObject<boolean>) => {
+        void startOAuth_0();
+        pendingOAuthStartRef_0.current = false;
+      }, startOAuth, pendingOAuthStartRef);
     }
-  }, [oauthStatus.state, startOAuth, startCodexOAuth, loginWithCodex]);
+  }, [oauthStatus.state, startOAuth]);
 
   // Auto-exit for setup-token mode
   useEffect(() => {
@@ -357,7 +326,7 @@ export function ConsoleOAuthFlow({
             </Box>
           </Box>}
       <Box paddingLeft={1} flexDirection="column" gap={1}>
-        <OAuthStatusMessage oauthStatus={oauthStatus} mode={mode} startingMessage={startingMessage} forcedMethodMessage={forcedMethodMessage} showPastePrompt={showPastePrompt} pastedCode={pastedCode} setPastedCode={setPastedCode} cursorOffset={cursorOffset} setCursorOffset={setCursorOffset} textInputColumns={textInputColumns} handleSubmitCode={handleSubmitCode} setOAuthStatus={setOAuthStatus} setLoginWithClaudeAi={setLoginWithClaudeAi} setLoginWithCodex={setLoginWithCodex} />
+        <OAuthStatusMessage oauthStatus={oauthStatus} mode={mode} startingMessage={startingMessage} forcedMethodMessage={forcedMethodMessage} showPastePrompt={showPastePrompt} pastedCode={pastedCode} setPastedCode={setPastedCode} cursorOffset={cursorOffset} setCursorOffset={setCursorOffset} textInputColumns={textInputColumns} handleSubmitCode={handleSubmitCode} setOAuthStatus={setOAuthStatus} setLoginWithClaudeAi={setLoginWithClaudeAi} />
       </Box>
     </Box>;
 }
@@ -375,7 +344,6 @@ type OAuthStatusMessageProps = {
   handleSubmitCode: (value: string, url: string) => void;
   setOAuthStatus: (status: OAuthStatus) => void;
   setLoginWithClaudeAi: (value: boolean) => void;
-  setLoginWithCodex: (value: boolean) => void;
 };
 function OAuthStatusMessage(t0) {
   const $ = _c(52);
@@ -392,8 +360,7 @@ function OAuthStatusMessage(t0) {
     textInputColumns,
     handleSubmitCode,
     setOAuthStatus,
-    setLoginWithClaudeAi,
-    setLoginWithCodex
+    setLoginWithClaudeAi
   } = t0;
   switch (oauthStatus.state) {
     case "idle":
@@ -439,29 +406,20 @@ function OAuthStatusMessage(t0) {
           t6 = [t4, t5, {
             label: <Text>3rd-party platform ·{" "}<Text dimColor={true}>Amazon Bedrock, Microsoft Foundry, or Vertex AI</Text>{"\n"}</Text>,
             value: "platform"
-          }, {
-            label: <Text>OpenAI Codex account ·{" "}<Text dimColor={true}>ChatGPT Plus/Pro subscription</Text>{"\n"}</Text>,
-            value: "codex"
           }];
           $[5] = t6;
         } else {
           t6 = $[5];
         }
         let t7;
-        if ($[6] !== setLoginWithClaudeAi || $[7] !== setOAuthStatus || $[8] !== setLoginWithCodex) {
+        if ($[6] !== setLoginWithClaudeAi || $[7] !== setOAuthStatus) {
           t7 = <Box><Select options={t6} onChange={value_0 => {
               if (value_0 === "platform") {
                 logEvent("tengu_oauth_platform_selected", {});
                 setOAuthStatus({
                   state: "platform_setup"
                 });
-              } else if (value_0 === "codex") {
-                logEvent("tengu_oauth_codex_selected", {});
-                setLoginWithCodex(true);
-                setLoginWithClaudeAi(false);
-                setOAuthStatus({ state: "ready_to_start" });
               } else {
-                setLoginWithCodex(false);
                 setOAuthStatus({
                   state: "ready_to_start"
                 });
@@ -476,7 +434,6 @@ function OAuthStatusMessage(t0) {
             }} /></Box>;
           $[6] = setLoginWithClaudeAi;
           $[7] = setOAuthStatus;
-          $[8] = setLoginWithCodex;
           $[9] = t7;
         } else {
           t7 = $[9];

@@ -14,9 +14,12 @@ import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 export type { EffortLevel }
 
 export const EFFORT_LEVELS = [
+  'none',
+  'minimal',
   'low',
   'medium',
   'high',
+  'xhigh',
   'max',
 ] as const satisfies readonly EffortLevel[]
 
@@ -240,10 +243,16 @@ export function getEffortLevelDescription(level: EffortLevel): string {
   switch (level) {
     case 'low':
       return 'Quick, straightforward implementation with minimal overhead'
+    case 'none':
+      return 'No extra reasoning effort'
+    case 'minimal':
+      return 'Minimal reasoning effort'
     case 'medium':
       return 'Balanced approach with standard implementation and testing'
     case 'high':
       return 'Comprehensive implementation with extensive testing and documentation'
+    case 'xhigh':
+      return 'Extra high reasoning for supported Codex models'
     case 'max':
       return 'Maximum capability with deepest reasoning (Opus 4.7 and Opus 4.6)'
   }

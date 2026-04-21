@@ -1,0 +1,180 @@
+import { describe, expect, test } from 'bun:test'
+
+import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+
+import type { OpenCodeHostHandle, OpenCodePreparedProfile } from './types.js'
+
+const profile: OpenCodePreparedProfile = {
+  projectPath: '/tmp/project',
+  profileRootKey: 'profile-root',
+  profileRootPath: '/tmp/profile-root',
+  projectBehaviorFingerprint: 'behavior-v1',
+  behaviorSources: ['AGENTS.md', 'opencode.json'],
+  managedConfig: {
+    default_agent: 'teammate',
+    share: 'disabled',
+    autoupdate: false,
+    snapshot: false,
+  },
+  managedConfigFingerprint: 'managed-config-v1',
+  homePath: '/tmp/profile-root/home',
+  xdgConfigHome: '/tmp/profile-root/config',
+  xdgDataHome: '/tmp/profile-root/data',
+  xdgCacheHome: '/tmp/profile-root/cache',
+  managedAuthPath: '/tmp/profile-root/data/opencode/auth.json',
+  sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
+  sourceAuthFingerprint: 'source-auth',
+  managedAuthFingerprint: 'managed-auth',
+  authState: 'ok',
+  env: {},
+}
+
+const host: OpenCodeHostHandle = {
+  hostKey: 'host-key',
+  profileRootKey: 'profile-root',
+  projectPath: '/tmp/project',
+  projectBehaviorFingerprint: 'behavior-v1',
+  baseUrl: 'http://127.0.0.1:4096',
+  port: 4096,
+  pid: 123,
+  version: '1.4.0',
+  state: 'healthy',
+  profile,
+  resolvedConfigFingerprint: 'resolved-fingerprint',
+  diagnostics: [],
+}
+
+describe('OpenCodeExecutionProbe', () => {
+  test('marks model available when the durable assistant reply matches the expected probe output', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                parentID: 'msg-user-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.reason).toBeNull()
+    expect(result.durableState).toBe('idle')
+    expect(result.latestAssistantText).toBe('PONG')
+  })
+
+  test('marks model unavailable when OpenCode returns a token refresh failure', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-error',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+                error: {
+                  name: 'UnknownError',
+                  data: {
+                    message: 'Token refresh failed: 401',
+                  },
+                },
+              },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-error' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('Token refresh failed: 401')
+    expect(result.durableState).toBe('error')
+  })
+})

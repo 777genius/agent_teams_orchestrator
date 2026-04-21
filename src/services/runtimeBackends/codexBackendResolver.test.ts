@@ -1,76 +1,92 @@
 import { describe, expect, test } from 'bun:test'
 
-import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
+import {
+  getCodexApiKey,
+  getCodexRuntimeBackendPreference,
+  normalizeCodexBackendPreference,
+  resolveCodexRuntimeSelection,
+} from './codexBackendResolver.js'
 
 describe('codexBackendResolver', () => {
-  test('auto prefers the OpenAI API when beta is enabled and OPENAI_API_KEY is configured', () => {
+  test('normalizes every stored legacy preference to codex-native', () => {
+    expect(normalizeCodexBackendPreference(undefined)).toBe('codex-native')
+    expect(normalizeCodexBackendPreference(null)).toBe('codex-native')
+    expect(normalizeCodexBackendPreference('auto')).toBe('codex-native')
+    expect(normalizeCodexBackendPreference('adapter')).toBe('codex-native')
+    expect(normalizeCodexBackendPreference('api')).toBe('codex-native')
+    expect(normalizeCodexBackendPreference('codex-native')).toBe('codex-native')
+  })
+
+  test('prefers CODEX_API_KEY and falls back to OPENAI_API_KEY', () => {
+    expect(getCodexApiKey({ CODEX_API_KEY: 'sk-native', OPENAI_API_KEY: 'sk-openai' })).toBe(
+      'sk-native',
+    )
+    expect(getCodexApiKey({ OPENAI_API_KEY: 'sk-openai' })).toBe('sk-openai')
+    expect(getCodexApiKey({})).toBeNull()
+  })
+
+  test('always reports the native backend as selected', () => {
+    expect(getCodexRuntimeBackendPreference({ CLAUDE_CODE_CODEX_BACKEND: 'api' })).toBe(
+      'codex-native',
+    )
+  })
+
+  test('reports runtime-missing when the codex binary is unavailable', () => {
     const result = resolveCodexRuntimeSelection({
-      preference: 'auto',
-      featureFlagEnabled: true,
-      oauthAuthenticated: true,
+      env: {},
+      nativeBinaryDetected: false,
       apiKeyConfigured: true,
+      nativeApiKeyConfigured: true,
     })
 
     expect(result).toMatchObject({
-      selectedBackendId: 'auto',
-      resolvedBackendId: 'api',
-      authenticated: true,
-      authMethod: 'api_key',
-      canLoginFromUi: true,
-      statusMessage: 'Resolved to OpenAI API',
-    })
-  })
-
-  test('auto falls back to the built-in adapter when no API key is configured', () => {
-    const result = resolveCodexRuntimeSelection({
-      preference: 'auto',
-      featureFlagEnabled: true,
-      oauthAuthenticated: true,
-      apiKeyConfigured: false,
-    })
-
-    expect(result).toMatchObject({
-      selectedBackendId: 'auto',
-      resolvedBackendId: 'adapter',
-      authenticated: true,
-      authMethod: 'oauth_token',
-    })
-  })
-
-  test('api mode stays unavailable without OPENAI_API_KEY even when beta is enabled', () => {
-    const result = resolveCodexRuntimeSelection({
-      preference: 'api',
-      featureFlagEnabled: true,
-      oauthAuthenticated: true,
-      apiKeyConfigured: false,
-    })
-
-    expect(result).toMatchObject({
-      selectedBackendId: 'api',
+      selectedBackendId: 'codex-native',
       resolvedBackendId: null,
       authenticated: false,
       authMethod: null,
       canLoginFromUi: false,
-      statusMessage: 'Codex OpenAI API not ready',
-      detailMessage: 'Codex API key mode requires OPENAI_API_KEY.',
+      statusMessage: 'Codex native runtime unavailable',
+      detailMessage:
+        'Codex native runtime requires the codex CLI binary to be installed and discoverable.',
     })
   })
 
-  test('api mode stays disabled until the beta flag is enabled', () => {
+  test('reports authentication-required when neither CODEX_API_KEY nor OPENAI_API_KEY is configured', () => {
     const result = resolveCodexRuntimeSelection({
-      preference: 'api',
-      featureFlagEnabled: false,
-      oauthAuthenticated: false,
-      apiKeyConfigured: true,
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
     })
 
     expect(result).toMatchObject({
-      selectedBackendId: 'api',
+      selectedBackendId: 'codex-native',
       resolvedBackendId: null,
       authenticated: false,
+      authMethod: null,
       canLoginFromUi: false,
+      statusMessage: 'Codex native runtime unavailable',
       detailMessage:
-        'Codex API key mode is disabled until the beta flag is enabled.',
+        'Codex native runtime requires CODEX_API_KEY or OPENAI_API_KEY.',
+    })
+  })
+
+  test('resolves to codex-native when the binary and any supported API key are present', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: true,
+      nativeApiKeyConfigured: true,
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: 'codex-native',
+      authenticated: true,
+      authMethod: 'api_key',
+      canLoginFromUi: false,
+      statusMessage: 'Codex native runtime ready',
+      detailMessage: 'Codex native runtime is ready through the local codex exec seam.',
     })
   })
 })

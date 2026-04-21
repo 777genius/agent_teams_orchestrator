@@ -24,7 +24,13 @@ export function mapEffortToCodexReasoning(
   if (!effort) {
     return undefined
   }
-  return { effort: effort === 'max' ? 'high' : effort }
+  if (effort === 'low' || effort === 'medium' || effort === 'high') {
+    return { effort }
+  }
+  if (effort === 'none' || effort === 'minimal') {
+    return { effort: 'low' }
+  }
+  return { effort: 'high' }
 }
 
 export function mapEffortToGeminiThinkingConfig(

@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 
+import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
+import { resolveTeammateModel } from './spawnMultiAgent.js'
+
+afterEach(() => {
+  delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+})
 
 describe('spawnMultiAgent bootstrap confirmation', () => {
   it('counts heartbeat, peer-summary heartbeat, interrupted, and task-terminal idle as bootstrap confirmation', () => {
@@ -258,5 +264,23 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
         '2026-04-08T12:00:02.000Z',
       ),
     ).toBe(false)
+  })
+})
+
+describe('resolveTeammateModel', () => {
+  it('defaults unset teammate models to the Opus alias path', () => {
+    expect(resolveTeammateModel(undefined, null)).toBe('opus')
+  })
+
+  it('lets the default Opus alias honor env-based overrides at resolution time', () => {
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'custom-opus-model'
+
+    expect(parseUserSpecifiedModel(resolveTeammateModel(undefined, null))).toBe(
+      'custom-opus-model',
+    )
+  })
+
+  it('still inherits the leader model when inherit is requested explicitly', () => {
+    expect(resolveTeammateModel('inherit', 'leader-model')).toBe('leader-model')
   })
 })
