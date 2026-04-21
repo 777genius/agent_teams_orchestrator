@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { spawn, spawnSync } from 'child_process'
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from 'bun:test'
+import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { access, mkdtemp, readFile, rm, writeFile, mkdir, unlink } from 'fs/promises'
 import { tmpdir } from 'os'
@@ -26,6 +26,7 @@ let sessionId = 'session-1'
 let configDir = ''
 let previousClaudeConfigDir: string | undefined
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
+setDefaultTimeout(20_000)
 
 function runGit(args: string[], cwd = repoDir): string {
   const result = spawnSync('git', args, {
@@ -112,20 +113,15 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 async function runProcess(args: string[], cwd = repoDir): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(args[0]!, args.slice(1), {
-      cwd,
-      stdio: 'ignore',
-    })
-    child.on('error', reject)
-    child.on('exit', code => {
-      if (code === 0) {
-        resolve()
-      } else {
-        reject(new Error(`${args.join(' ')} exited with code ${code}`))
-      }
-    })
+  const result = spawnSync(args[0]!, args.slice(1), {
+    cwd,
+    encoding: 'utf8',
   })
+  if (result.status !== 0) {
+    throw new Error(
+      `${args.join(' ')} exited with code ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    )
+  }
 }
 
 function getPowerShellExecutable(): string | null {
@@ -497,7 +493,9 @@ describe('TaskChangeLedgerService integration', () => {
     await runProcess([
       process.execPath,
       '-e',
-      "const { writeFileSync } = require('fs'); setTimeout(() => writeFileSync('src/real-process.ts', 'export const value = 2;\\n'), 25)",
+      `require('fs').writeFileSync(${JSON.stringify(
+        join(repoDir, 'src', 'real-process.ts'),
+      )}, 'export const value = 2;\\n')`,
     ])
     await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
 

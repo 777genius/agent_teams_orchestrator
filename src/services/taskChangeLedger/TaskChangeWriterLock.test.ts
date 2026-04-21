@@ -53,6 +53,35 @@ function buildOwnerPayload(taskId: string, ownerId: string, sessionId: string, h
   }
 }
 
+async function readOwnerPayload(lockRootDir: string, taskId: string): Promise<{
+  ownerId?: string
+  heartbeatAt?: string
+}> {
+  return JSON.parse(await readFile(buildOwnerPath(lockRootDir, taskId), 'utf8')) as {
+    ownerId?: string
+    heartbeatAt?: string
+  }
+}
+
+async function waitForHeartbeatAfter(
+  lockRootDir: string,
+  taskId: string,
+  previousHeartbeatAt: string,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  const previousMs = Date.parse(previousHeartbeatAt)
+  while (Date.now() < deadline) {
+    const owner = await readOwnerPayload(lockRootDir, taskId)
+    const heartbeatMs = Date.parse(owner.heartbeatAt ?? '')
+    if (Number.isFinite(heartbeatMs) && heartbeatMs > previousMs) {
+      return
+    }
+    await wait(25)
+  }
+  throw new Error('Timed out waiting for task writer lock heartbeat')
+}
+
 describe('TaskChangeWriterLock', () => {
   let tempDir: string | null = null
 
@@ -272,11 +301,14 @@ describe('TaskChangeWriterLock', () => {
       taskId,
       sessionId: 'session-1',
       ownerId: 'owner-1',
-      heartbeatIntervalMs: 20,
-      staleThresholdMs: 150,
+      heartbeatIntervalMs: 50,
+      staleThresholdMs: 1_000,
     })
 
-    await wait(180)
+    const initialOwner = await readOwnerPayload(lockRootDir, taskId)
+    expect(initialOwner.ownerId).toBe('owner-1')
+    await waitForHeartbeatAfter(lockRootDir, taskId, initialOwner.heartbeatAt ?? '')
+    await wait(1_100)
 
     await expect(
       acquireTaskWriterLock({
@@ -284,15 +316,13 @@ describe('TaskChangeWriterLock', () => {
         taskId,
         sessionId: 'session-2',
         ownerId: 'owner-2',
-        waitBudgetMs: 80,
-        heartbeatIntervalMs: 20,
-        staleThresholdMs: 150,
+        waitBudgetMs: 120,
+        heartbeatIntervalMs: 50,
+        staleThresholdMs: 1_000,
       }),
     ).rejects.toThrow('Timed out acquiring task writer lock')
 
-    const persistedOwner = JSON.parse(
-      await readFile(buildOwnerPath(lockRootDir, taskId), 'utf8'),
-    ) as { ownerId?: string }
+    const persistedOwner = await readOwnerPayload(lockRootDir, taskId)
     expect(persistedOwner.ownerId).toBe('owner-1')
 
     await first.release()
