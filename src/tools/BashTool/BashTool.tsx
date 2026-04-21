@@ -285,6 +285,11 @@ const outputSchema = lazySchema(() => z.object({
   backgroundTaskId: z.string().optional().describe('ID of the background task if command is running in background'),
   backgroundedByUser: z.boolean().optional().describe('True if the user manually backgrounded the command with Ctrl+B'),
   assistantAutoBackgrounded: z.boolean().optional().describe('True if assistant-mode auto-backgrounded a long-running blocking command'),
+  ledgerFileChanges: z.array(z.object({
+    filePath: z.string(),
+    beforeContent: z.string(),
+    afterContent: z.string()
+  })).optional().describe('Internal exact file changes captured by Bash simulations'),
   dangerouslyDisableSandbox: z.boolean().optional().describe('Flag to indicate if sandbox mode was overridden'),
   returnCodeInterpretation: z.string().optional().describe('Semantic interpretation for non-error exit codes with special meaning'),
   noOutputExpected: z.boolean().optional().describe('Whether the command is expected to produce no output on success'),
@@ -413,7 +418,12 @@ async function applySedEdit(simulatedEdit: {
     data: {
       stdout: '',
       stderr: '',
-      interrupted: false
+      interrupted: false,
+      ledgerFileChanges: [{
+        filePath: absoluteFilePath,
+        beforeContent: originalContent,
+        afterContent: newContent
+      }]
     }
   };
 }

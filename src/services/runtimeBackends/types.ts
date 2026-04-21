@@ -1,4 +1,4 @@
-export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini'
+export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
 export type GeminiRuntimeBackendId = 'auto' | 'api' | 'cli-sdk'
 export type CodexRuntimeBackendId = 'auto' | 'adapter' | 'api'
@@ -28,6 +28,20 @@ export type RuntimeExtensionCapabilities = {
   mcp: RuntimeExtensionCapability
   skills: RuntimeExtensionCapability
   apiKeys: RuntimeExtensionCapability
+}
+
+export type RuntimeReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+
+export type RuntimeProviderCapabilities = {
+  modelCatalog?: {
+    dynamic: boolean
+    source: 'app-server' | 'static-fallback' | 'runtime'
+  }
+  reasoningEffort?: {
+    supported: boolean
+    values: RuntimeReasoningEffort[]
+    configPassthrough: boolean
+  }
 }
 
 export type RuntimeBackendOptionStatus = {
@@ -69,6 +83,7 @@ export type RuntimeProviderStatus = {
   availableBackends: RuntimeBackendOptionStatus[]
   externalRuntimeDiagnostics: ExternalRuntimeDiagnostic[]
   models: string[]
+  runtimeCapabilities?: RuntimeProviderCapabilities
   backend: {
     kind: string
     label: string

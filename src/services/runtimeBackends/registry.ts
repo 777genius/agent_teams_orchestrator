@@ -11,6 +11,12 @@ import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
+import {
+  buildOpenCodeCapabilityInfo,
+  buildOpenCodeDetailMessage,
+  buildOpenCodeStatusMessage,
+} from '../opencode/OpenCodeDiagnostics.js'
+import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
   resolveCodexRuntimeSelection,
@@ -220,6 +226,74 @@ function getGeminiModels(): string[] {
 
 function filterDisplayModels(models: string[]): string[] {
   return models.filter(model => isModelAllowed(model))
+}
+
+async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
+  const snapshot = await openCodeInventoryService.probe()
+  const authenticated = snapshot.connectedProviders.length > 0
+
+  return {
+    providerId: 'opencode',
+    displayName: 'OpenCode',
+    supported: snapshot.detected,
+    authenticated,
+    authMethod: authenticated ? 'opencode_managed' : null,
+    verificationState: !snapshot.detected
+      ? 'offline'
+      : snapshot.probeError && snapshot.models.length === 0 && !authenticated
+        ? 'error'
+        : 'verified',
+    canLoginFromUi: false,
+    capabilities: {
+      teamLaunch: false,
+      oneShot: false,
+      extensions: buildExtensionCapabilities({
+        plugins: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode manages plugin lifecycle. Desktop management wiring is not enabled yet.',
+        },
+        mcp: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode manages MCP lifecycle. Team launch wiring is still pending.',
+        },
+        skills: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'OpenCode skill roots are detected by the runtime, but desktop control is not enabled yet.',
+        },
+        apiKeys: {
+          status: 'read-only',
+          ownership: 'provider-scoped',
+          reason: 'Provider credentials are managed through OpenCode providers and auth storage.',
+        },
+      }),
+    },
+    statusMessage: buildOpenCodeStatusMessage(snapshot),
+    detailMessage: buildOpenCodeDetailMessage(snapshot),
+    selectedBackendId: null,
+    resolvedBackendId: null,
+    availableBackends: [],
+    externalRuntimeDiagnostics: [
+      {
+        id: 'cli-bin',
+        label: 'OpenCode CLI',
+        detected: snapshot.detected,
+        statusMessage: snapshot.detected ? 'OpenCode CLI detected' : 'OpenCode CLI not found',
+        detailMessage: snapshot.binaryPath,
+      },
+    ],
+    models: snapshot.models,
+    backend: snapshot.detected
+      ? {
+          kind: 'opencode-cli',
+          label: 'OpenCode CLI',
+          authMethodDetail: snapshot.profile?.authState ?? null,
+        }
+      : null,
+    capabilitiesInfo: buildOpenCodeCapabilityInfo(snapshot),
+  }
 }
 
 async function buildGeminiStatuses(): Promise<{
@@ -454,6 +528,17 @@ export async function getUnifiedRuntimeStatusPayload(
       availableBackends: codex.availableBackends,
       externalRuntimeDiagnostics: [detectExternalBinary('codex', 'Codex CLI')],
       models: getCodexModels(),
+      runtimeCapabilities: {
+        modelCatalog: {
+          dynamic: false,
+          source: 'runtime',
+        },
+        reasoningEffort: {
+          supported: true,
+          values: ['low', 'medium', 'high'],
+          configPassthrough: false,
+        },
+      },
       backend: codex.backend,
     }
   }
@@ -488,6 +573,10 @@ export async function getUnifiedRuntimeStatusPayload(
       models: getGeminiModels(),
       backend: gemini.backend,
     }
+  }
+
+  if (!providerFilter || providerFilter === 'opencode') {
+    providers.opencode = await buildOpenCodeStatus()
   }
 
   return {

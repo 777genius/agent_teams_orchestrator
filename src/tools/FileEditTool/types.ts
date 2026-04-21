@@ -65,9 +65,14 @@ const outputSchema = lazySchema(() =>
     filePath: z.string().describe('The file path that was edited'),
     oldString: z.string().describe('The original string that was replaced'),
     newString: z.string().describe('The new string that replaced it'),
+    actualNewString: z
+      .string()
+      .optional()
+      .describe('The actual new string written after quote normalization'),
     originalFile: z
       .string()
       .describe('The original file contents before editing'),
+    updatedFile: z.string().optional().describe('The full file contents after editing'),
     structuredPatch: z
       .array(hunkSchema())
       .describe('Diff patch showing the changes'),

@@ -136,6 +136,12 @@ import {
   runPreToolUseHooks,
 } from './toolHooks.js'
 import { annotateBoardTaskToolResultMessage } from '../boardTaskActivity/BoardTaskTranscriptProjector.js'
+import {
+  captureTaskChangeToolResult,
+  deferTaskChangeShellSnapshot,
+  finishTaskChangeShellSnapshot,
+  maybeBeginTaskChangeShellSnapshot,
+} from '../taskChangeLedger/TaskChangeLedgerService.js'
 
 /** Minimum total hook duration (ms) to show inline timing summary */
 export const HOOK_TIMING_DISPLAY_THRESHOLD_MS = 500
@@ -339,6 +345,36 @@ function getMcpServerBaseUrlFromToolName(
     return undefined
   }
   return getLoggingSafeMcpBaseUrl(serverConnection.config)
+}
+
+function isSimulatedSedEditInput(toolName: string, input: unknown): boolean {
+  return toolName === BASH_TOOL_NAME && !!input && typeof input === 'object' && '_simulatedSedEdit' in input
+}
+
+function taskChangeSnapshotSourceForTool(
+  toolName: string,
+  isSimulatedSedEdit: boolean,
+): 'shell_snapshot' | 'powershell_snapshot' | 'post_tool_hook_snapshot' {
+  if (toolName === POWERSHELL_TOOL_NAME) {
+    return 'powershell_snapshot'
+  }
+  if (toolName === BASH_TOOL_NAME && !isSimulatedSedEdit) {
+    return 'shell_snapshot'
+  }
+  return 'post_tool_hook_snapshot'
+}
+
+function taskChangeSnapshotConfidenceForTool(
+  toolName: string,
+  isSimulatedSedEdit: boolean,
+): 'high' | 'medium' {
+  if (
+    (toolName === BASH_TOOL_NAME && !isSimulatedSedEdit) ||
+    toolName === POWERSHELL_TOOL_NAME
+  ) {
+    return 'high'
+  }
+  return 'medium'
 }
 
 export async function* runToolUse(
@@ -1185,6 +1221,12 @@ async function checkPermissionsAndCallTool(
   const startTime = Date.now()
 
   startSessionActivity('tool_exec')
+  let shellSnapshot: Awaited<
+    ReturnType<typeof maybeBeginTaskChangeShellSnapshot>
+  > | null = null
+  let taskChangeLedgerResultData: unknown
+  let taskChangeToolResultCaptured = false
+  let taskChangeLedgerFilePaths: string[] = []
   // If processedInput still points at the backfill clone, no hook/permission
   // replaced it — pass the pre-backfill callInput so call() sees the model's
   // original field values. Otherwise converge on the hook-supplied input.
@@ -1210,7 +1252,27 @@ async function checkPermissionsAndCallTool(
   } else if (processedInput !== backfilledClone) {
     callInput = processedInput
   }
+  const isSimulatedSedEdit = isSimulatedSedEditInput(tool.name, callInput)
+  const taskChangeSnapshotSource = taskChangeSnapshotSourceForTool(
+    tool.name,
+    isSimulatedSedEdit,
+  )
+  const taskChangeSnapshotConfidence = taskChangeSnapshotConfidenceForTool(
+    tool.name,
+    isSimulatedSedEdit,
+  )
   try {
+    shellSnapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: tool.name,
+      input: callInput,
+      toolUseId: toolUseID,
+      sessionId: getSessionId(),
+      agentId: toolUseContext.agentId,
+      includeNonBashTool:
+        isCodeEditingTool(tool.name) ||
+        isSimulatedSedEdit ||
+        tool.name === POWERSHELL_TOOL_NAME,
+    })
     const result = await tool.call(
       callInput,
       {
@@ -1229,6 +1291,22 @@ async function checkPermissionsAndCallTool(
     )
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
+    taskChangeLedgerResultData = result.data
+    const backgroundTaskId =
+      result.data &&
+      typeof result.data === 'object' &&
+      'backgroundTaskId' in result.data &&
+      typeof (result.data as Record<string, unknown>).backgroundTaskId ===
+        'string'
+        ? ((result.data as Record<string, unknown>).backgroundTaskId as string)
+        : null
+    if (backgroundTaskId) {
+      deferTaskChangeShellSnapshot(backgroundTaskId, shellSnapshot, {
+        source: taskChangeSnapshotSource,
+        confidence: taskChangeSnapshotConfidence,
+      })
+      shellSnapshot = null
+    }
 
     // Log tool content/output as span event if enabled
     if (result.data && typeof result.data === 'object') {
@@ -1556,6 +1634,23 @@ async function checkPermissionsAndCallTool(
       )
     }
 
+    taskChangeLedgerFilePaths = await captureTaskChangeToolResult({
+      toolName: tool.name,
+      resultData: taskChangeLedgerResultData,
+      toolUseId: toolUseID,
+      sessionId: getSessionId(),
+      agentId: toolUseContext.agentId,
+      toolStatus: 'succeeded',
+      materializePostHookDiskState: true,
+    })
+    taskChangeToolResultCaptured = true
+    await finishTaskChangeShellSnapshot(shellSnapshot, 'succeeded', {
+      source: taskChangeSnapshotSource,
+      confidence: taskChangeSnapshotConfidence,
+      excludedFilePaths: taskChangeLedgerFilePaths,
+    })
+    shellSnapshot = null
+
     if (isMcpTool(tool)) {
       await addToolResult(toolOutput)
     }
@@ -1608,6 +1703,26 @@ async function checkPermissionsAndCallTool(
   } catch (error) {
     const durationMs = Date.now() - startTime
     addToToolDuration(durationMs)
+    if (!taskChangeToolResultCaptured && taskChangeLedgerResultData !== undefined) {
+      taskChangeLedgerFilePaths = await captureTaskChangeToolResult({
+        toolName: tool.name,
+        resultData: taskChangeLedgerResultData,
+        toolUseId: toolUseID,
+        sessionId: getSessionId(),
+        agentId: toolUseContext.agentId,
+        toolStatus: 'failed',
+        materializePostHookDiskState: true,
+      })
+      taskChangeToolResultCaptured = true
+    }
+    const finishFailedTaskChangeSnapshot = async () => {
+      await finishTaskChangeShellSnapshot(shellSnapshot, 'failed', {
+        source: taskChangeSnapshotSource,
+        confidence: taskChangeSnapshotConfidence,
+        excludedFilePaths: taskChangeLedgerFilePaths,
+      })
+      shellSnapshot = null
+    }
 
     endToolExecutionSpan({
       success: false,
@@ -1736,6 +1851,7 @@ async function checkPermissionsAndCallTool(
           BOOTSTRAP_MEMBER_BRIEFING_LOOP_ABORT_REASON,
         )
       }
+      await finishFailedTaskChangeSnapshot()
       return [
         {
           message: createUserMessage({
@@ -1778,6 +1894,7 @@ async function checkPermissionsAndCallTool(
     )) {
       hookMessages.push(hookResult)
     }
+    await finishFailedTaskChangeSnapshot()
 
     return [
       {
