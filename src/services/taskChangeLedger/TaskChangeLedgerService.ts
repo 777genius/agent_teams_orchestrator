@@ -5,6 +5,7 @@ import {
   appendFile,
   mkdir,
   open,
+  readdir,
   readFile,
   rename,
   rm,
@@ -55,6 +56,8 @@ const JOURNAL_STAMP_TAIL_BYTES = 4096
 const TASK_WRITER_LOCK_WAIT_BUDGET_MS = 2000
 const DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION = 1
 const DEFERRED_SHELL_SNAPSHOT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const DEFERRED_SHELL_SNAPSHOT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+const MAX_DEFERRED_SHELL_SNAPSHOT_CLEANUP_FILES = 100
 const DEFERRED_SHELL_SNAPSHOT_RECOVERY_WARNING =
   'Task change ledger recovered a deferred shell snapshot from disk after in-memory state was unavailable.'
 const DEFERRED_SHELL_SNAPSHOT_MEMORY_ONLY_WARNING =
@@ -364,6 +367,7 @@ type PendingDeferredShellSnapshot = {
 
 const pendingShellSnapshots = new Map<string, PendingDeferredShellSnapshot>()
 const taskWriteQueues = new Map<string, Promise<void>>()
+let lastDeferredShellSnapshotCleanupAt = 0
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function isWindowsReservedArtifactSegment(segment: string): boolean {
@@ -406,11 +410,13 @@ function getDeferredShellSnapshotProjectRecordPath(
   )
 }
 
+function getDeferredShellSnapshotGlobalPointerDir(): string {
+  return join(getClaudeConfigHomeDir(), 'task-change-ledger', 'pending-shell-snapshots')
+}
+
 function getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId: string): string {
   return join(
-    getClaudeConfigHomeDir(),
-    'task-change-ledger',
-    'pending-shell-snapshots',
+    getDeferredShellSnapshotGlobalPointerDir(),
     `${encodeTaskId(backgroundTaskId)}.json`,
   )
 }
@@ -710,11 +716,12 @@ function isExpiredIsoTimestamp(expiresAt: unknown): boolean {
 
 function isDeferredShellSnapshotPointer(
   value: Record<string, unknown> | null,
-  backgroundTaskId: string,
+  backgroundTaskId?: string,
 ): value is DeferredShellSnapshotPointerV1 {
   return (
     value?.schemaVersion === DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION &&
-    value.backgroundTaskId === backgroundTaskId &&
+    typeof value.backgroundTaskId === 'string' &&
+    (backgroundTaskId === undefined || value.backgroundTaskId === backgroundTaskId) &&
     typeof value.gitRoot === 'string' &&
     typeof value.projectRecordPath === 'string' &&
     typeof value.createdAt === 'string' &&
@@ -755,6 +762,116 @@ async function removeDeferredShellSnapshotArtifacts(params: {
   )
 }
 
+function getExpectedProjectRecordPathFromPointer(
+  pointer: DeferredShellSnapshotPointerV1,
+): string {
+  return getDeferredShellSnapshotProjectRecordPath(
+    pointer.gitRoot,
+    pointer.backgroundTaskId,
+  )
+}
+
+async function removeDeferredShellSnapshotPointerAndExpectedRecord(
+  pointer: DeferredShellSnapshotPointerV1,
+  globalPointerPath: string,
+): Promise<void> {
+  const expectedProjectRecordPath = getExpectedProjectRecordPathFromPointer(pointer)
+  await removeDeferredShellSnapshotArtifacts({
+    projectRecordPath:
+      pointer.projectRecordPath === expectedProjectRecordPath
+        ? expectedProjectRecordPath
+        : undefined,
+    globalPointerPath,
+  })
+}
+
+async function isActiveDeferredShellSnapshotPointer(
+  pointer: DeferredShellSnapshotPointerV1,
+  globalPointerPath: string,
+): Promise<boolean> {
+  const expectedProjectRecordPath = getExpectedProjectRecordPathFromPointer(pointer)
+  if (
+    pointer.projectRecordPath !== expectedProjectRecordPath ||
+    isExpiredIsoTimestamp(pointer.expiresAt)
+  ) {
+    await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+    return false
+  }
+
+  try {
+    const parsedRecord = parseJsonObject(await readFile(expectedProjectRecordPath, 'utf8'))
+    if (
+      !isPersistedDeferredShellSnapshot(parsedRecord, pointer.backgroundTaskId) ||
+      isExpiredIsoTimestamp(parsedRecord.expiresAt)
+    ) {
+      await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+      return false
+    }
+    return true
+  } catch {
+    await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+    return false
+  }
+}
+
+async function cleanupExpiredDeferredShellSnapshots(force = false): Promise<void> {
+  const now = Date.now()
+  if (
+    !force &&
+    now - lastDeferredShellSnapshotCleanupAt <
+      DEFERRED_SHELL_SNAPSHOT_CLEANUP_INTERVAL_MS
+  ) {
+    return
+  }
+  lastDeferredShellSnapshotCleanupAt = now
+
+  let entries: Awaited<ReturnType<typeof readdir>>
+  const pointerDir = getDeferredShellSnapshotGlobalPointerDir()
+  try {
+    entries = await readdir(pointerDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  for (const entry of entries.slice(0, MAX_DEFERRED_SHELL_SNAPSHOT_CLEANUP_FILES)) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue
+    }
+    const globalPointerPath = join(pointerDir, entry.name)
+    try {
+      const parsedPointer = parseJsonObject(await readFile(globalPointerPath, 'utf8'))
+      if (!isDeferredShellSnapshotPointer(parsedPointer)) {
+        await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+        continue
+      }
+      await isActiveDeferredShellSnapshotPointer(parsedPointer, globalPointerPath)
+    } catch {
+      await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+    }
+  }
+}
+
+async function assertNoActiveDeferredShellSnapshotPointer(
+  backgroundTaskId: string,
+): Promise<void> {
+  const globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
+  let parsedPointer: Record<string, unknown> | null
+  try {
+    parsedPointer = parseJsonObject(await readFile(globalPointerPath, 'utf8'))
+  } catch {
+    return
+  }
+  if (!isDeferredShellSnapshotPointer(parsedPointer, backgroundTaskId)) {
+    await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+    return
+  }
+  if (await isActiveDeferredShellSnapshotPointer(parsedPointer, globalPointerPath)) {
+    throw new Error(
+      `Deferred shell snapshot already exists for background task ${backgroundTaskId}`,
+    )
+  }
+}
+
 async function persistDeferredShellSnapshot(
   backgroundTaskId: string,
   snapshot: ShellSnapshot,
@@ -785,9 +902,19 @@ async function persistDeferredShellSnapshot(
     expiresAt,
   }
 
-  await writeAtomic(projectRecordPath, `${JSON.stringify(record)}\n`)
-  await writeAtomic(globalPointerPath, `${JSON.stringify(pointer)}\n`)
-  return { projectRecordPath, globalPointerPath }
+  let wroteProjectRecord = false
+  try {
+    await assertNoActiveDeferredShellSnapshotPointer(backgroundTaskId)
+    await writeAtomic(projectRecordPath, `${JSON.stringify(record)}\n`)
+    wroteProjectRecord = true
+    await writeAtomic(globalPointerPath, `${JSON.stringify(pointer)}\n`)
+    return { projectRecordPath, globalPointerPath }
+  } catch (error) {
+    if (wroteProjectRecord) {
+      await removeDeferredShellSnapshotArtifacts({ projectRecordPath })
+    }
+    throw error
+  }
 }
 
 async function readPersistedDeferredShellSnapshot(
@@ -2429,14 +2556,10 @@ export async function deferTaskChangeShellSnapshot(
     snapshot,
     ...(options ? { options } : {}),
   }
-  pending.projectRecordPath = getDeferredShellSnapshotProjectRecordPath(
-    snapshot.gitRoot,
-    backgroundTaskId,
-  )
-  pending.globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
   pendingShellSnapshots.set(backgroundTaskId, pending)
 
   try {
+    await cleanupExpiredDeferredShellSnapshots()
     const persisted = await persistDeferredShellSnapshot(
       backgroundTaskId,
       snapshot,
@@ -2446,12 +2569,6 @@ export async function deferTaskChangeShellSnapshot(
     pending.globalPointerPath = persisted.globalPointerPath
   } catch (error) {
     logError(error)
-    await removeDeferredShellSnapshotArtifacts({
-      projectRecordPath: pending.projectRecordPath,
-      globalPointerPath: pending.globalPointerPath,
-    })
-    delete pending.projectRecordPath
-    delete pending.globalPointerPath
     snapshot.warnings.push(DEFERRED_SHELL_SNAPSHOT_MEMORY_ONLY_WARNING)
   }
 }
@@ -2611,6 +2728,7 @@ export async function completeDeferredTaskChangeShellSnapshot(
 
 export function clearDeferredTaskChangeShellSnapshotsForTests(): void {
   pendingShellSnapshots.clear()
+  lastDeferredShellSnapshotCleanupAt = 0
 }
 
 export function buildTaskChangeLedgerDebugPath(taskId: string): string {
