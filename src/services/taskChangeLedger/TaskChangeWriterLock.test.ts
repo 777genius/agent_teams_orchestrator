@@ -260,6 +260,51 @@ describe('TaskChangeWriterLock', () => {
     await first.release()
   })
 
+  test('does not steal a fresh ownerless lock directory', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'task-writer-lock-'))
+    const lockRootDir = join(tempDir, 'locks')
+    const taskId = 'task-ownerless-fresh'
+    await mkdir(buildLockDir(lockRootDir, taskId), { recursive: true, mode: 0o700 })
+
+    await expect(
+      acquireTaskWriterLock({
+        lockRootDir,
+        taskId,
+        sessionId: 'session-2',
+        ownerId: 'owner-2',
+        waitBudgetMs: 120,
+        heartbeatIntervalMs: 25,
+        staleThresholdMs: 1_000,
+      }),
+    ).rejects.toThrow('Timed out acquiring task writer lock')
+
+    await expect(readFile(buildOwnerPath(lockRootDir, taskId), 'utf8')).rejects.toThrow()
+  })
+
+  test('steals an ownerless lock directory after it becomes stale', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'task-writer-lock-'))
+    const lockRootDir = join(tempDir, 'locks')
+    const taskId = 'task-ownerless-stale'
+    await mkdir(buildLockDir(lockRootDir, taskId), { recursive: true, mode: 0o700 })
+    await wait(80)
+
+    const lock = await acquireTaskWriterLock({
+      lockRootDir,
+      taskId,
+      sessionId: 'session-2',
+      ownerId: 'owner-2',
+      waitBudgetMs: 120,
+      heartbeatIntervalMs: 25,
+      staleThresholdMs: 20,
+    })
+
+    expect(lock.stoleStaleLock).toBe(true)
+    const persistedOwner = await readOwnerPayload(lockRootDir, taskId)
+    expect(persistedOwner.ownerId).toBe('owner-2')
+
+    await lock.release()
+  })
+
   test('steals a stale lock and reports it to the caller', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'task-writer-lock-'))
     const lockRootDir = join(tempDir, 'locks')

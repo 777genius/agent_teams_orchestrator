@@ -1,5 +1,5 @@
-import { createHash } from 'crypto'
-import { mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { createHash, randomUUID } from 'crypto'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 
 type TaskWriterLockOwner = {
@@ -30,6 +30,8 @@ const DEFAULT_WAIT_BUDGET_MS = 2_000
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000
 const DEFAULT_STALE_THRESHOLD_MS = 30_000
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
+const OWNER_RENAME_RETRY_DELAYS_MS = [5, 15, 35, 75]
+const RETRYABLE_OWNER_RENAME_ERROR_CODES = new Set(['EACCES', 'EBUSY', 'EPERM'])
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -64,10 +66,51 @@ function buildOwnerPath(lockDir: string): string {
   return join(lockDir, 'owner.json')
 }
 
+function getErrorCode(error: unknown): string {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : ''
+}
+
+async function renameOwnerFileWithRetry(
+  tempOwnerPath: string,
+  ownerPath: string,
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tempOwnerPath, ownerPath)
+      return
+    } catch (error) {
+      const code = getErrorCode(error)
+      const retryDelayMs = OWNER_RENAME_RETRY_DELAYS_MS[attempt]
+      if (
+        retryDelayMs === undefined ||
+        !RETRYABLE_OWNER_RENAME_ERROR_CODES.has(code)
+      ) {
+        throw error
+      }
+      await sleep(retryDelayMs)
+    }
+  }
+}
+
 async function writeOwnerFile(lockDir: string, owner: TaskWriterLockOwner): Promise<void> {
   const ownerPath = buildOwnerPath(lockDir)
   await mkdir(dirname(ownerPath), { recursive: true, mode: 0o700 })
-  await writeFile(ownerPath, JSON.stringify(owner), { encoding: 'utf8', mode: 0o600 })
+  const tempOwnerPath = join(
+    dirname(ownerPath),
+    `.owner.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
+  )
+  try {
+    await writeFile(tempOwnerPath, JSON.stringify(owner), {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+    await renameOwnerFileWithRetry(tempOwnerPath, ownerPath)
+  } catch (error) {
+    await rm(tempOwnerPath, { force: true }).catch(() => undefined)
+    throw error
+  }
 }
 
 async function readOwnerFile(lockDir: string): Promise<TaskWriterLockOwner | null> {
@@ -108,6 +151,31 @@ function isStaleOwner(
     return true
   }
   return nowMs - heartbeatAtMs > staleThresholdMs
+}
+
+async function getInvalidOwnerAgeMs(lockDir: string, nowMs: number): Promise<number> {
+  let newestMtimeMs = Number.NEGATIVE_INFINITY
+  for (const artifactPath of [buildOwnerPath(lockDir), lockDir]) {
+    try {
+      const artifactStats = await stat(artifactPath)
+      newestMtimeMs = Math.max(newestMtimeMs, artifactStats.mtimeMs)
+    } catch {
+      // Missing or unreadable artifacts are handled by the final infinity fallback.
+    }
+  }
+  return Number.isFinite(newestMtimeMs) ? nowMs - newestMtimeMs : Number.POSITIVE_INFINITY
+}
+
+async function isStaleLock(
+  lockDir: string,
+  owner: TaskWriterLockOwner | null,
+  staleThresholdMs: number,
+  nowMs: number,
+): Promise<boolean> {
+  if (owner) {
+    return isStaleOwner(owner, staleThresholdMs, nowMs)
+  }
+  return (await getInvalidOwnerAgeMs(lockDir, nowMs)) > staleThresholdMs
 }
 
 export async function acquireTaskWriterLock(
@@ -183,7 +251,7 @@ export async function acquireTaskWriterLock(
 
     const owner = await readOwnerFile(lockDir)
     const nowMs = Date.now()
-    if (isStaleOwner(owner, staleThresholdMs, nowMs)) {
+    if (await isStaleLock(lockDir, owner, staleThresholdMs, nowMs)) {
       await rm(lockDir, { recursive: true, force: true })
       stoleStaleLock = true
       continue
