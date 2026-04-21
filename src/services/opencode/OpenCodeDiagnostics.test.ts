@@ -1,0 +1,62 @@
+import { describe, expect, test } from 'bun:test'
+
+import {
+  buildOpenCodeCapabilityInfo,
+  buildOpenCodeDetailMessage,
+} from './OpenCodeDiagnostics.js'
+
+import type { OpenCodeInventorySnapshot, OpenCodePreparedProfile } from './types.js'
+
+const profile: OpenCodePreparedProfile = {
+  projectPath: '/tmp/project',
+  profileRootKey: 'profile-root',
+  profileRootPath: '/tmp/profile-root',
+  projectBehaviorFingerprint: 'behavior-fingerprint-123456',
+  behaviorSources: [
+    'AGENTS.md',
+    '.opencode/package.json',
+    '.opencode/plugins/team-hooks.ts',
+  ],
+  managedConfig: {
+    default_agent: 'teammate',
+  },
+  managedConfigFingerprint: 'managed-fingerprint-123456',
+  homePath: '/tmp/profile-root/home',
+  xdgConfigHome: '/tmp/profile-root/config',
+  xdgDataHome: '/tmp/profile-root/data',
+  xdgCacheHome: '/tmp/profile-root/cache',
+  managedAuthPath: '/tmp/profile-root/data/opencode/auth.json',
+  sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
+  sourceAuthFingerprint: 'source-auth',
+  managedAuthFingerprint: 'managed-auth',
+  authState: 'ok',
+  env: {},
+}
+
+const snapshot: OpenCodeInventorySnapshot = {
+  detected: true,
+  binaryPath: '/opt/homebrew/bin/opencode',
+  version: '1.4.0',
+  projectPath: '/tmp/project',
+  profile,
+  connectedProviders: [{ id: 'openai', authHint: 'oauth', source: 'credentials' }],
+  availableProviders: ['openai'],
+  models: ['openai/gpt-5.4-mini'],
+  agents: [{ id: 'teammate', mode: 'primary' }],
+  authStorePath: profile.managedAuthPath,
+  probeError: null,
+  diagnostics: [],
+}
+
+describe('OpenCodeDiagnostics', () => {
+  test('surfaces project plugin behavior sources in runtime status metadata', () => {
+    const capabilities = buildOpenCodeCapabilityInfo(snapshot)
+
+    expect(capabilities).toContainEqual({
+      id: 'project-plugins',
+      label: '1 project plugin files',
+      enabled: true,
+    })
+    expect(buildOpenCodeDetailMessage(snapshot)).toContain('project plugins 1')
+  })
+})
