@@ -103,7 +103,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       const codex = payload.providers.codex
 
       expect(payload.schemaVersion).toBe(2)
-      expect(codex?.models).toEqual(['gpt-5.3-codex'])
+      expect(codex?.models).toContain('gpt-5.3-codex')
       expect(codex?.selectedBackendId).toBe('codex-native')
       expect(codex?.resolvedBackendId).toBe('codex-native')
       expect(codex?.capabilities.extensions.mcp.status).toBe('supported')

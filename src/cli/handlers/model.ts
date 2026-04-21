@@ -1,11 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import {
-  CLAUDE_HAIKU_4_5_CONFIG,
-  CLAUDE_OPUS_4_6_CONFIG,
-  CLAUDE_SONNET_4_6_CONFIG,
-} from '../../utils/model/configs.js'
-import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
 } from '../../utils/model/codex.js'
@@ -15,6 +10,7 @@ import {
 } from '../../utils/model/gemini.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { openCodeInventoryService } from '../../services/opencode/OpenCodeInventoryService.js'
+import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/anthropicCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 type ModelProviderTarget = 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all'
@@ -77,36 +73,21 @@ export async function getProviderModels(provider: InternalModelProvider): Promis
     }
     case 'anthropic':
     default:
-      return {
-        defaultModel: CLAUDE_SONNET_4_6_CONFIG.firstParty,
-        displayName: 'Anthropic',
-        models: [
-          {
-            id: CLAUDE_SONNET_4_6_CONFIG.firstParty,
-            label: 'Sonnet 4.6',
-            description: 'Best for everyday coding tasks',
-          },
-          {
-            id: `${CLAUDE_SONNET_4_6_CONFIG.firstParty}[1m]`,
-            label: 'Sonnet 4.6 (1M context)',
-            description: 'Long-context Sonnet for large codebases',
-          },
-          {
-            id: CLAUDE_OPUS_4_6_CONFIG.firstParty,
-            label: 'Opus 4.6',
-            description: 'Most capable for complex work',
-          },
-          {
-            id: `${CLAUDE_OPUS_4_6_CONFIG.firstParty}[1m]`,
-            label: 'Opus 4.6 (1M context)',
-            description: 'Long-context Opus for complex work',
-          },
-          {
-            id: CLAUDE_HAIKU_4_5_CONFIG.firstParty,
-            label: 'Haiku 4.5',
-            description: 'Fastest for quick answers',
-          },
-        ],
+      {
+        const catalog = await getAnthropicRuntimeModelCatalog()
+        return {
+          defaultModel: catalog.defaultLaunchModel ?? 'opus[1m]',
+          displayName: 'Anthropic',
+          models: catalog.models.map((model) => ({
+            id: model.launchModel,
+            label: model.displayName,
+            description:
+              model.statusMessage
+              ?? (model.hidden
+                ? 'Anthropic compatibility launch value preserved for persisted team selections.'
+                : 'Anthropic launch value normalized from the runtime-backed model catalog.'),
+          })),
+        }
       }
   }
 }

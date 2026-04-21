@@ -1,11 +1,6 @@
 import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
-import {
-  CLAUDE_HAIKU_4_5_CONFIG,
-  CLAUDE_OPUS_4_6_CONFIG,
-  CLAUDE_SONNET_4_6_CONFIG,
-} from '../../utils/model/configs.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
@@ -18,6 +13,11 @@ import {
 } from '../opencode/OpenCodeDiagnostics.js'
 import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
+import {
+  getAnthropicRuntimeModelCatalog,
+  getAnthropicRuntimeReasoningEfforts,
+  getAnthropicVisibleRuntimeModels,
+} from './anthropicCatalog.js'
 import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
 import type {
   RuntimeBackendOptionAudience,
@@ -185,18 +185,10 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
-function getAnthropicModels(): string[] {
-  return filterDisplayModels([
-    CLAUDE_SONNET_4_6_CONFIG.firstParty,
-    `${CLAUDE_SONNET_4_6_CONFIG.firstParty}[1m]`,
-    CLAUDE_OPUS_4_6_CONFIG.firstParty,
-    `${CLAUDE_OPUS_4_6_CONFIG.firstParty}[1m]`,
-    CLAUDE_HAIKU_4_5_CONFIG.firstParty,
-  ])
-}
-
-function buildAnthropicStatus(): RuntimeProviderStatus {
+async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
   const anthropicAuth = getAnthropicAuthenticated()
+  const modelCatalog = await getAnthropicRuntimeModelCatalog()
+  const reasoningEfforts = getAnthropicRuntimeReasoningEfforts(modelCatalog)
 
   return {
     providerId: 'anthropic',
@@ -217,7 +209,19 @@ function buildAnthropicStatus(): RuntimeProviderStatus {
     resolvedBackendId: null,
     availableBackends: [],
     externalRuntimeDiagnostics: [],
-    models: getAnthropicModels(),
+    models: getAnthropicVisibleRuntimeModels(modelCatalog),
+    modelCatalog,
+    runtimeCapabilities: {
+      modelCatalog: {
+        dynamic: true,
+        source: modelCatalog.source,
+      },
+      reasoningEffort: {
+        supported: reasoningEfforts.length > 0,
+        values: reasoningEfforts,
+        configPassthrough: false,
+      },
+    },
     backend: null,
   }
 }
@@ -491,7 +495,7 @@ export async function getUnifiedRuntimeStatusPayload(
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
 
   if (!providerFilter || providerFilter === 'anthropic') {
-    providers.anthropic = buildAnthropicStatus()
+    providers.anthropic = await buildAnthropicStatus()
   }
 
   if (!providerFilter || providerFilter === 'codex') {

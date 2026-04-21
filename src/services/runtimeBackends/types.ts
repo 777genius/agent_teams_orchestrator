@@ -30,7 +30,6 @@ export type RuntimeExtensionCapabilities = {
   apiKeys: RuntimeExtensionCapability
 }
 
-<<<<<<< HEAD
 export type RuntimeBackendOptionState =
   | 'ready'
   | 'locked'
@@ -43,10 +42,56 @@ export type RuntimeBackendOptionAudience = 'general' | 'internal'
 
 export type RuntimeReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
+export type RuntimeProviderModelCatalogSource =
+  | 'anthropic-models-api'
+  | 'app-server'
+  | 'static-fallback'
+  | 'runtime'
+
+export type RuntimeProviderModelCatalogStatus =
+  | 'ready'
+  | 'stale'
+  | 'degraded'
+  | 'unavailable'
+
+export type RuntimeProviderModelCatalogItem = {
+  id: string
+  launchModel: string
+  displayName: string
+  hidden: boolean
+  supportedReasoningEfforts: RuntimeReasoningEffort[]
+  defaultReasoningEffort: RuntimeReasoningEffort | null
+  inputModalities: string[]
+  supportsPersonality: boolean
+  isDefault: boolean
+  upgrade: boolean
+  source: RuntimeProviderModelCatalogSource
+  badgeLabel?: string | null
+  statusMessage?: string | null
+}
+
+export type RuntimeProviderModelCatalog = {
+  schemaVersion: 1
+  providerId: RuntimeProviderId
+  source: RuntimeProviderModelCatalogSource
+  status: RuntimeProviderModelCatalogStatus
+  fetchedAt: string
+  staleAt: string
+  defaultModelId: string | null
+  defaultLaunchModel: string | null
+  models: RuntimeProviderModelCatalogItem[]
+  diagnostics: {
+    configReadState: 'ready' | 'unsupported' | 'failed' | 'skipped'
+    appServerState: 'healthy' | 'degraded' | 'runtime-missing' | 'incompatible'
+    message?: string | null
+    code?: string | null
+  }
+}
+
 export type RuntimeProviderCapabilities = {
   modelCatalog?: {
     dynamic: boolean
-    source: 'app-server' | 'static-fallback' | 'runtime'
+    source: RuntimeProviderModelCatalogSource
   }
   reasoningEffort?: {
     supported: boolean
@@ -96,6 +141,7 @@ export type RuntimeProviderStatus = {
   availableBackends: RuntimeBackendOptionStatus[]
   externalRuntimeDiagnostics: ExternalRuntimeDiagnostic[]
   models: string[]
+  modelCatalog?: RuntimeProviderModelCatalog | null
   runtimeCapabilities?: RuntimeProviderCapabilities
   backend: {
     kind: string
