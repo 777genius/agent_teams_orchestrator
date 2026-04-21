@@ -75,18 +75,18 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     expect(env).toContain('CLAUDE_CODE_ENTRY_PROVIDER=codex')
   })
 
-  it('forwards Codex API key beta env vars to tmux teammates', () => {
+  it('forwards Codex API key env vars to tmux teammates', () => {
     const originalApiKey = process.env.OPENAI_API_KEY
-    const originalBeta = process.env.CLAUDE_CODE_CODEX_API_KEY_BETA
+    const originalCodexApiKey = process.env.CODEX_API_KEY
 
     process.env.OPENAI_API_KEY = 'sk-openai-teammate'
-    process.env.CLAUDE_CODE_CODEX_API_KEY_BETA = '1'
+    process.env.CODEX_API_KEY = 'sk-codex-teammate'
 
     try {
       const env = buildInheritedEnvVars({ provider: 'codex' })
 
       expect(env).toContain('OPENAI_API_KEY=sk-openai-teammate')
-      expect(env).toContain('CLAUDE_CODE_CODEX_API_KEY_BETA=1')
+      expect(env).toContain('CODEX_API_KEY=sk-codex-teammate')
     } finally {
       if (originalApiKey === undefined) {
         delete process.env.OPENAI_API_KEY
@@ -94,10 +94,10 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         process.env.OPENAI_API_KEY = originalApiKey
       }
 
-      if (originalBeta === undefined) {
-        delete process.env.CLAUDE_CODE_CODEX_API_KEY_BETA
+      if (originalCodexApiKey === undefined) {
+        delete process.env.CODEX_API_KEY
       } else {
-        process.env.CLAUDE_CODE_CODEX_API_KEY_BETA = originalBeta
+        process.env.CODEX_API_KEY = originalCodexApiKey
       }
     }
   })

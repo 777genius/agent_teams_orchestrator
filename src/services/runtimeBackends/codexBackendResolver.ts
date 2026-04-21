@@ -1,21 +1,21 @@
-import { getCodexOAuthTokens } from '../../utils/auth.js'
-import { getGlobalConfig } from '../../utils/config.js'
-import { isEnvTruthy } from '../../utils/envUtils.js'
-
 import type { CodexRuntimeBackendId } from './types.js'
 
-export const CODEX_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
-export const CODEX_API_KEY_BETA_ENV_VAR = 'CLAUDE_CODE_CODEX_API_KEY_BETA'
+export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
+export const OPENAI_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
 export const CODEX_RUNTIME_BACKEND_ENV_VAR = 'CLAUDE_CODE_CODEX_BACKEND'
 
-export type CodexResolvedRuntimeBackendId = Exclude<CodexRuntimeBackendId, 'auto'>
+export type CodexResolvedRuntimeBackendId = CodexRuntimeBackendId
 
 export type CodexRuntimeResolution = {
   selectedBackendId: CodexRuntimeBackendId
   resolvedBackendId: CodexResolvedRuntimeBackendId | null
   featureFlagEnabled: boolean
+  nativeFeatureFlagEnabled: boolean
+  nativeInternalUnlockEnabled: boolean
   oauthAuthenticated: boolean
   apiKeyConfigured: boolean
+  nativeApiKeyConfigured: boolean
+  nativeBinaryDetected: boolean
   authenticated: boolean
   authMethod: 'oauth_token' | 'api_key' | null
   canLoginFromUi: boolean
@@ -23,37 +23,38 @@ export type CodexRuntimeResolution = {
   detailMessage: string | null
 }
 
-export function isCodexApiKeyBetaEnabled(
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return isEnvTruthy(env[CODEX_API_KEY_BETA_ENV_VAR])
-}
-
 export function getCodexApiKey(
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  const raw = env[CODEX_API_KEY_ENV_VAR]
-  if (typeof raw !== 'string') {
-    return null
+  const candidates = [env[CODEX_NATIVE_API_KEY_ENV_VAR], env[OPENAI_API_KEY_ENV_VAR]]
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') {
+      continue
+    }
+    const trimmed = candidate.trim()
+    if (trimmed.length > 0) {
+      return trimmed
+    }
   }
-  const trimmed = raw.trim()
-  return trimmed.length > 0 ? trimmed : null
+  return null
+}
+
+export function getCodexNativeApiKey(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return getCodexApiKey(env)
 }
 
 export function normalizeCodexBackendPreference(
-  value: string | null | undefined,
+  _value: string | null | undefined,
 ): CodexRuntimeBackendId {
-  if (value === 'adapter') return 'adapter'
-  if (value === 'api') return 'api'
-  return 'auto'
+  return 'codex-native'
 }
 
 export function getCodexRuntimeBackendPreference(
-  env: NodeJS.ProcessEnv = process.env,
+  _env: NodeJS.ProcessEnv = process.env,
 ): CodexRuntimeBackendId {
-  return normalizeCodexBackendPreference(
-    env[CODEX_RUNTIME_BACKEND_ENV_VAR] ?? getGlobalConfig().codexBackendPreference,
-  )
+  return 'codex-native'
 }
 
 export function resolveCodexRuntimeSelection(params?: {
@@ -62,84 +63,57 @@ export function resolveCodexRuntimeSelection(params?: {
   oauthAuthenticated?: boolean
   apiKeyConfigured?: boolean
   featureFlagEnabled?: boolean
+  nativeFeatureFlagEnabled?: boolean
+  nativeInternalUnlockEnabled?: boolean
+  nativeApiKeyConfigured?: boolean
+  nativeBinaryDetected?: boolean
 }): CodexRuntimeResolution {
   const env = params?.env ?? process.env
-  const featureFlagEnabled =
-    params?.featureFlagEnabled ?? isCodexApiKeyBetaEnabled(env)
-  const selectedBackendId =
-    params?.preference ?? getCodexRuntimeBackendPreference(env)
-  const oauthAuthenticated =
-    params?.oauthAuthenticated ?? Boolean(getCodexOAuthTokens()?.accessToken)
-  const apiKeyConfigured =
-    params?.apiKeyConfigured ?? Boolean(getCodexApiKey(env))
+  const featureFlagEnabled = params?.featureFlagEnabled ?? true
+  const nativeFeatureFlagEnabled = params?.nativeFeatureFlagEnabled ?? true
+  const nativeInternalUnlockEnabled =
+    params?.nativeInternalUnlockEnabled ?? true
+  const selectedBackendId = params?.preference ?? getCodexRuntimeBackendPreference(env)
+  const oauthAuthenticated = params?.oauthAuthenticated ?? false
+  const apiKeyConfigured = params?.apiKeyConfigured ?? Boolean(getCodexApiKey(env))
+  const nativeApiKeyConfigured = params?.nativeApiKeyConfigured ?? apiKeyConfigured
+  const nativeBinaryDetected =
+    params?.nativeBinaryDetected ?? Boolean(Bun.which('codex'))
 
-  const apiBackendAvailable = featureFlagEnabled && apiKeyConfigured
-  const adapterAvailable = oauthAuthenticated
-
-  let resolvedBackendId: CodexResolvedRuntimeBackendId | null = null
-  if (selectedBackendId === 'auto') {
-    resolvedBackendId = apiBackendAvailable
-      ? 'api'
-      : adapterAvailable
-        ? 'adapter'
-        : null
-  } else if (selectedBackendId === 'api') {
-    resolvedBackendId = apiBackendAvailable ? 'api' : null
-  } else {
-    resolvedBackendId = adapterAvailable ? 'adapter' : null
-  }
-
+  const nativeBackendAvailable = nativeBinaryDetected && nativeApiKeyConfigured
+  const resolvedBackendId = nativeBackendAvailable ? 'codex-native' : null
   const authenticated = resolvedBackendId !== null
-  const authMethod =
-    resolvedBackendId === 'api'
-      ? 'api_key'
-      : resolvedBackendId === 'adapter'
-        ? 'oauth_token'
-        : null
-  const canLoginFromUi = selectedBackendId !== 'api'
+  const authMethod = resolvedBackendId ? 'api_key' : null
+  const canLoginFromUi = false
 
-  const statusMessage = authenticated
-    ? resolvedBackendId === 'api'
-      ? selectedBackendId === 'auto'
-        ? 'Resolved to OpenAI API'
-        : 'OpenAI API ready'
-      : selectedBackendId === 'auto'
-        ? 'Resolved to Default adapter'
-        : 'Default adapter ready'
-    : selectedBackendId === 'api'
-      ? 'Codex OpenAI API not ready'
-      : selectedBackendId === 'adapter'
-        ? 'Codex adapter not ready'
-        : 'No Codex runtime backend is ready'
-
+  let statusMessage: string | null
   let detailMessage: string | null
-  if (resolvedBackendId === 'api') {
-    detailMessage = 'Codex OpenAI Responses API backend is ready.'
-  } else if (resolvedBackendId === 'adapter') {
-    detailMessage = 'Codex adapter is ready.'
-  } else if (selectedBackendId === 'api') {
-    detailMessage = featureFlagEnabled
-      ? `Codex API key mode requires ${CODEX_API_KEY_ENV_VAR}.`
-      : 'Codex API key mode is disabled until the beta flag is enabled.'
-  } else if (!featureFlagEnabled) {
+  if (authenticated) {
+    statusMessage = 'Codex native runtime ready'
+    detailMessage = 'Codex native runtime is ready through the local codex exec seam.'
+  } else if (!nativeBinaryDetected) {
+    statusMessage = 'Codex native runtime unavailable'
     detailMessage =
-      'Codex OAuth session not found. Sign in to use the built-in adapter.'
-  } else if (apiKeyConfigured) {
+      'Codex native runtime requires the codex CLI binary to be installed and discoverable.'
+  } else if (!nativeApiKeyConfigured) {
+    statusMessage = 'Codex native runtime unavailable'
     detailMessage =
-      'Codex API key is configured, but the selected backend is unavailable.'
-  } else if (oauthAuthenticated) {
-    detailMessage =
-      'Codex OAuth session is available, but the selected backend is unavailable.'
+      `Codex native runtime requires ${CODEX_NATIVE_API_KEY_ENV_VAR} or ${OPENAI_API_KEY_ENV_VAR}.`
   } else {
-    detailMessage = `Set ${CODEX_API_KEY_ENV_VAR} or sign in with Codex OAuth.`
+    statusMessage = 'Codex native runtime degraded'
+    detailMessage = 'Codex native runtime is not ready.'
   }
 
   return {
     selectedBackendId,
     resolvedBackendId,
     featureFlagEnabled,
+    nativeFeatureFlagEnabled,
+    nativeInternalUnlockEnabled,
     oauthAuthenticated,
     apiKeyConfigured,
+    nativeApiKeyConfigured,
+    nativeBinaryDetected,
     authenticated,
     authMethod,
     canLoginFromUi,

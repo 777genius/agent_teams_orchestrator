@@ -6,7 +6,6 @@ import {
   getAnthropicApiKey,
   getApiKeyFromApiKeyHelper,
   getClaudeAIOAuthTokens,
-  getCodexOAuthTokens,
   isClaudeAISubscriber,
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
@@ -34,7 +33,6 @@ import {
   getCodexApiKey,
   resolveCodexRuntimeSelection,
 } from '../runtimeBackends/codexBackendResolver.js'
-import { createCodexFetch } from './codex-fetch-adapter.js'
 import { createGeminiFetch } from './gemini-fetch-adapter.js'
 
 /**
@@ -323,43 +321,17 @@ export async function getAnthropicClient({
   // Gemini, or another provider for this session.
   if (shouldUseCodexProviderRoutingForCurrentProcess()) {
     const resolution = resolveCodexRuntimeSelection()
-    const codexTokens = getCodexOAuthTokens()
+    if (resolution.resolvedBackendId === 'codex-native') {
+      throw new Error(
+        'Codex native runtime must execute through the dedicated QueryEngine codex-native lane. The Anthropic-style fetch adapter is not valid for codex-native.'
+      )
+    }
+
     const codexApiKey = getCodexApiKey()
-
-    if (resolution.resolvedBackendId === 'api' && codexApiKey) {
-      const codexFetch = createCodexFetch({
-        type: 'api_key',
-        apiKey: codexApiKey,
-      })
-      const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-        apiKey: 'codex-placeholder', // SDK requires a key but the fetch adapter handles auth
-        ...ARGS,
-        fetch: codexFetch as unknown as typeof globalThis.fetch,
-        ...(isDebugToStdErr() && { logger: createStderrLogger() }),
-      }
-      return new Anthropic(clientConfig)
-    }
-
-    if (resolution.resolvedBackendId === 'adapter' && codexTokens?.accessToken) {
-      const codexFetch = createCodexFetch({
-        type: 'oauth_token',
-        accessToken: codexTokens.accessToken,
-      })
-      const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-        apiKey: 'codex-placeholder', // SDK requires a key but the fetch adapter handles auth
-        ...ARGS,
-        fetch: codexFetch as unknown as typeof globalThis.fetch,
-        ...(isDebugToStdErr() && { logger: createStderrLogger() }),
-      }
-      return new Anthropic(clientConfig)
-    }
-
     throw new Error(
-      resolution.selectedBackendId === 'api'
-        ? 'Codex OpenAI API mode is selected, but OPENAI_API_KEY is not configured.'
-        : resolution.featureFlagEnabled
-          ? 'Codex provider is enabled, but neither OPENAI_API_KEY nor a Codex OAuth session is available.'
-          : 'Codex provider is enabled, but no Codex OAuth session is available.',
+      codexApiKey
+        ? 'Codex provider is pinned to the native runtime, but this code path still expects the removed legacy transport. Route through the dedicated codex-native execution lane instead.'
+        : 'Codex provider is pinned to the native runtime, but no CODEX_API_KEY or OPENAI_API_KEY is configured.',
     )
   }
 

@@ -1,7 +1,7 @@
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
 export type GeminiRuntimeBackendId = 'auto' | 'api' | 'cli-sdk'
-export type CodexRuntimeBackendId = 'auto' | 'adapter' | 'api'
+export type CodexRuntimeBackendId = 'codex-native'
 export type RuntimeBackendId = GeminiRuntimeBackendId | CodexRuntimeBackendId
 
 export type RuntimeCapabilityInfo = {
@@ -30,6 +30,17 @@ export type RuntimeExtensionCapabilities = {
   apiKeys: RuntimeExtensionCapability
 }
 
+<<<<<<< HEAD
+export type RuntimeBackendOptionState =
+  | 'ready'
+  | 'locked'
+  | 'disabled'
+  | 'authentication-required'
+  | 'runtime-missing'
+  | 'degraded'
+
+export type RuntimeBackendOptionAudience = 'general' | 'internal'
+
 export type RuntimeReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
 export type RuntimeProviderCapabilities = {
@@ -51,6 +62,8 @@ export type RuntimeBackendOptionStatus = {
   selectable: boolean
   recommended: boolean
   available: boolean
+  state: RuntimeBackendOptionState
+  audience: RuntimeBackendOptionAudience
   statusMessage: string | null
   detailMessage: string | null
 }

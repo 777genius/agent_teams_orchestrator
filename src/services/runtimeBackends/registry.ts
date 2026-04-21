@@ -18,13 +18,13 @@ import {
 } from '../opencode/OpenCodeDiagnostics.js'
 import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
-import {
-  resolveCodexRuntimeSelection,
-} from './codexBackendResolver.js'
+import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
 import type {
+  RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
   ExternalRuntimeDiagnostic,
   GeminiRuntimeBackendId,
+  RuntimeBackendOptionState,
   RuntimeExtensionCapabilities,
   RuntimeBackendOptionStatus,
   RuntimeProviderId,
@@ -45,18 +45,17 @@ const GEMINI_BACKEND_DESCRIPTIONS: Record<GeminiRuntimeBackendId, string> = {
 }
 
 const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Auto',
-  adapter: 'Default adapter',
-  api: 'OpenAI API',
+  'codex-native': 'Codex native',
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
-  auto: 'Automatically prefer the best available Codex runtime path',
-  adapter: 'Use the built-in Codex fetch adapter',
-  api: 'Use OPENAI_API_KEY with the public OpenAI Responses API',
+  'codex-native': 'Use the local codex exec JSON seam as the supported Codex runtime path',
 }
 
-function detectExternalBinary(binaryName: 'gemini' | 'codex', label: string): ExternalRuntimeDiagnostic {
+function detectExternalBinary(
+  binaryName: 'gemini' | 'codex',
+  label: string,
+): ExternalRuntimeDiagnostic {
   const binaryPath = Bun.which(binaryName)
   return {
     id: 'cli-bin',
@@ -131,6 +130,8 @@ function buildGeminiOptionStatus(
     selectable: true,
     recommended,
     available: ok,
+    state: ok ? 'ready' : 'authentication-required',
+    audience: 'general',
     statusMessage,
     detailMessage,
   }
@@ -142,14 +143,19 @@ function buildCodexOptionStatus(
   statusMessage: string | null,
   detailMessage: string | null,
   recommended = false,
+  selectable = true,
+  state: RuntimeBackendOptionState = ok ? 'ready' : 'degraded',
+  audience: RuntimeBackendOptionAudience = 'general',
 ): RuntimeBackendOptionStatus {
   return {
     id,
     label: CODEX_BACKEND_LABELS[id],
     description: CODEX_BACKEND_DESCRIPTIONS[id],
-    selectable: true,
+    selectable,
     recommended,
     available: ok,
+    state,
+    audience,
     statusMessage,
     detailMessage,
   }
@@ -430,40 +436,36 @@ function buildCodexStatuses(): {
   backend: RuntimeProviderStatus['backend']
 } {
   const resolution = resolveCodexRuntimeSelection()
+  const codexNativeAvailable = resolution.resolvedBackendId === 'codex-native'
+  const codexNativeState: RuntimeBackendOptionState = codexNativeAvailable
+    ? 'ready'
+    : !resolution.nativeBinaryDetected
+      ? 'runtime-missing'
+      : !resolution.nativeApiKeyConfigured
+        ? 'authentication-required'
+        : 'degraded'
+  const codexNativeStatusMessage = codexNativeAvailable
+    ? 'Ready'
+    : !resolution.nativeBinaryDetected
+      ? 'Codex CLI not found'
+      : !resolution.nativeApiKeyConfigured
+        ? 'Authentication required'
+        : 'Degraded'
 
   return {
     selectedBackendId: resolution.selectedBackendId,
     resolvedBackendId: resolution.resolvedBackendId,
     availableBackends: [
       buildCodexOptionStatus(
-        'auto',
-        resolution.resolvedBackendId !== null,
-        resolution.resolvedBackendId
-          ? `Resolved to ${CODEX_BACKEND_LABELS[resolution.resolvedBackendId]}`
-          : 'Unavailable',
+        'codex-native',
+        codexNativeAvailable,
+        codexNativeStatusMessage,
         resolution.detailMessage,
         true,
+        codexNativeAvailable,
+        codexNativeState,
+        'general',
       ),
-      buildCodexOptionStatus(
-        'adapter',
-        resolution.oauthAuthenticated,
-        resolution.oauthAuthenticated ? 'Ready' : 'Authentication required',
-        resolution.oauthAuthenticated
-          ? 'Uses the local Codex OAuth session via the built-in adapter.'
-          : 'Sign in with Codex OAuth to use the built-in adapter.',
-      ),
-      ...(resolution.featureFlagEnabled
-        ? [
-            buildCodexOptionStatus(
-              'api',
-              resolution.apiKeyConfigured,
-              resolution.apiKeyConfigured ? 'Ready' : 'Authentication required',
-              resolution.apiKeyConfigured
-                ? 'Uses OPENAI_API_KEY with api.openai.com/v1/responses.'
-                : 'Set OPENAI_API_KEY to use the public OpenAI Responses API.',
-            ),
-          ]
-        : []),
     ],
     authenticated: resolution.authenticated,
     authMethod: resolution.authMethod,
@@ -472,21 +474,14 @@ function buildCodexStatuses(): {
     detailMessage: resolution.detailMessage,
     canLoginFromUi: resolution.canLoginFromUi,
     backend:
-      resolution.resolvedBackendId === 'adapter'
+      resolution.resolvedBackendId === 'codex-native'
         ? {
-            kind: 'adapter',
-            label: 'Default adapter',
-            endpointLabel: 'chatgpt.com/backend-api/codex/responses',
-            authMethodDetail: 'oauth_token',
+            kind: 'codex-native',
+            label: 'Codex native',
+            endpointLabel: 'codex exec --json',
+            authMethodDetail: 'api_key',
           }
-        : resolution.resolvedBackendId === 'api'
-          ? {
-              kind: 'api',
-              label: 'OpenAI API',
-              endpointLabel: 'api.openai.com/v1/responses',
-              authMethodDetail: 'api_key',
-            }
-          : null,
+        : null,
   }
 }
 
@@ -517,7 +512,7 @@ export async function getUnifiedRuntimeStatusPayload(
             status: 'unsupported',
             ownership: 'shared',
             reason:
-              'Plugins are currently guaranteed only for Anthropic sessions in the multimodel runtime.',
+              'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
           },
         }),
       },
@@ -530,13 +525,13 @@ export async function getUnifiedRuntimeStatusPayload(
       models: getCodexModels(),
       runtimeCapabilities: {
         modelCatalog: {
-          dynamic: false,
+          dynamic: true,
           source: 'runtime',
         },
         reasoningEffort: {
           supported: true,
-          values: ['low', 'medium', 'high'],
-          configPassthrough: false,
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          configPassthrough: true,
         },
       },
       backend: codex.backend,
