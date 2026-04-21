@@ -6,6 +6,10 @@ import envPaths from 'env-paths'
 
 import { getCwd } from '../../utils/cwd.js'
 import {
+  applyOpenCodeAutoUpdatePolicy,
+  isOpenCodeAutoUpdateAllowed,
+} from './OpenCodeAutoUpdatePolicy.js'
+import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
@@ -136,12 +140,12 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
 
 export function buildManagedConfig(
   appMcpConfig?: OpenCodeMcpServerConfig | null,
+  options: { allowAutoUpdate?: boolean } = {},
 ): Record<string, unknown> {
   const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     default_agent: 'teammate',
     share: 'disabled',
-    autoupdate: false,
     snapshot: false,
     agent: {
       teammate: {
@@ -168,6 +172,10 @@ export function buildManagedConfig(
     },
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
     // so setting plugin here would shadow user and project extension points.
+  }
+
+  if (options.allowAutoUpdate !== true) {
+    config.autoupdate = false
   }
 
   if (appMcpConfig) {
@@ -209,7 +217,9 @@ export class OpenCodeProfileManager {
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
     const { projectBehaviorFingerprint, behaviorSources } =
       await collectProjectBehaviorMetadata(resolvedProjectPath)
-    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig())
+    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
+      allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
+    })
     const managedConfigFingerprint = hashString(JSON.stringify(managedConfig))
     const profileRootPath = path.join(
       this.paths.data,
@@ -269,7 +279,7 @@ export class OpenCodeProfileManager {
         : !sourceAuthFingerprint || sourceAuthFingerprint === managedAuthFingerprint
           ? 'ok'
           : 'stale',
-      env: {
+      env: applyOpenCodeAutoUpdatePolicy({
         ...process.env,
         HOME: homePath,
         USERPROFILE: homePath,
@@ -277,9 +287,8 @@ export class OpenCodeProfileManager {
         XDG_DATA_HOME: xdgDataHome,
         XDG_CACHE_HOME: xdgCacheHome,
         OPENCODE_DISABLE_CLAUDE_CODE: '1',
-        OPENCODE_DISABLE_AUTOUPDATE: 'true',
         OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
-      },
+      }),
     }
   }
 }

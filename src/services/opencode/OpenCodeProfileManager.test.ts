@@ -8,6 +8,7 @@ import {
   buildManagedConfig,
   collectProjectBehaviorMetadata,
 } from './OpenCodeProfileManager.js'
+import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
 
 describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
@@ -85,5 +86,20 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         timeout: 8000,
       },
     })
+  })
+
+  test('disables OpenCode auto-update by default but keeps an explicit app override possible', () => {
+    const managedConfig = buildManagedConfig()
+    const overrideConfig = buildManagedConfig(null, { allowAutoUpdate: true })
+
+    expect(managedConfig.autoupdate).toBe(false)
+    expect(overrideConfig).not.toHaveProperty('autoupdate')
+    expect(applyOpenCodeAutoUpdatePolicy({}).OPENCODE_DISABLE_AUTOUPDATE).toBe('1')
+    expect(
+      applyOpenCodeAutoUpdatePolicy({
+        CLAUDE_TEAM_OPENCODE_ALLOW_AUTOUPDATE: '1',
+        OPENCODE_DISABLE_AUTOUPDATE: '1',
+      }).OPENCODE_DISABLE_AUTOUPDATE,
+    ).toBeUndefined()
   })
 })
