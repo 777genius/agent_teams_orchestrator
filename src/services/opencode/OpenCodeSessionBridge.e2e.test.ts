@@ -99,7 +99,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
       await openCodeSessionBridge.releaseSession(record)
       await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
     }
-  })
+  }, 90_000)
 
   liveTest('projects a real OpenCode bash tool call into canonical transcript blocks', async () => {
     const selectedModel = await getLiveModel()
@@ -119,7 +119,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
         openCodeSessionBridge.sendMessage(record, {
           text: 'Run pwd and then answer with the working directory only.',
         }),
-        25_000,
+        90_000,
         'sendMessage(tool)',
       )
 
@@ -194,5 +194,5 @@ describe('OpenCodeSessionBridge live e2e', () => {
       await openCodeSessionBridge.releaseSession(record)
       await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
     }
-  })
+  }, 120_000)
 })

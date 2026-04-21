@@ -46,4 +46,64 @@ describe('OpenCodeClientFactory permissions API', () => {
       always: false,
     })
   })
+
+  test('lists experimental tool ids from the OpenCode endpoint used by readiness', async () => {
+    const paths: string[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async input => {
+        paths.push(String(input))
+        return new Response(JSON.stringify(['agent-teams_runtime_deliver_message']), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await expect(factory.create('http://127.0.0.1:4096').listExperimentalToolIds())
+      .resolves.toEqual(['agent-teams_runtime_deliver_message'])
+    expect(paths).toEqual(['http://127.0.0.1:4096/experimental/tool/ids'])
+  })
+
+  test('passes directory when listing experimental tool ids for project-scoped MCP tools', async () => {
+    const paths: string[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async input => {
+        paths.push(String(input))
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await factory.create('http://127.0.0.1:4096').listExperimentalToolIds({
+      directory: '/repo with spaces',
+    })
+
+    expect(paths).toEqual([
+      'http://127.0.0.1:4096/experimental/tool/ids?directory=%2Frepo+with+spaces',
+    ])
+  })
+
+  test('lists experimental tools with provider, model and directory query params', async () => {
+    const paths: string[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async input => {
+        paths.push(String(input))
+        return new Response(JSON.stringify([{ id: 'agent-teams_runtime_deliver_message' }]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await expect(factory.create('http://127.0.0.1:4096').listExperimentalTools({
+      directory: '/repo',
+      provider: 'opencode',
+      model: 'big-pickle',
+    })).resolves.toEqual([{ id: 'agent-teams_runtime_deliver_message' }])
+    expect(paths).toEqual([
+      'http://127.0.0.1:4096/experimental/tool?directory=%2Frepo&provider=opencode&model=big-pickle',
+    ])
+  })
 })

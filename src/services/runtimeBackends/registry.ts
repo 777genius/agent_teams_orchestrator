@@ -231,7 +231,7 @@ async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
         : 'verified',
     canLoginFromUi: false,
     capabilities: {
-      teamLaunch: false,
+      teamLaunch: snapshot.detected && authenticated,
       oneShot: false,
       extensions: buildExtensionCapabilities({
         plugins: {
@@ -242,7 +242,7 @@ async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
         mcp: {
           status: 'read-only',
           ownership: 'provider-scoped',
-          reason: 'OpenCode manages MCP lifecycle. Team launch wiring is still pending.',
+          reason: 'OpenCode manages MCP lifecycle. Team launch uses app-owned runtime MCP proof.',
         },
         skills: {
           status: 'read-only',

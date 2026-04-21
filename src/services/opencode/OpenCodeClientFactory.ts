@@ -20,11 +20,19 @@ export type OpenCodeClient = {
   listAgents(): Promise<OpenCodeAgentResponse[]>
   getMcp(): Promise<OpenCodeMcpResponse>
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
+  connectMcp?(name: string): Promise<OpenCodeMcpResponse>
   createSession(body?: { parentID?: string; title?: string }): Promise<OpenCodeSessionSummary>
   getSession(id: string): Promise<OpenCodeSessionSummary>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatus>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
   getPermissions(): Promise<OpenCodePendingPermission[]>
+  listExperimentalToolIds(input?: { directory?: string | null; workspace?: string | null }): Promise<string[]>
+  listExperimentalTools(input: {
+    directory?: string | null
+    workspace?: string | null
+    provider: string
+    model: string
+  }): Promise<Array<{ id?: string; name?: string; parameters?: unknown }>>
   answerPermission(body: {
     requestId: string
     sessionId?: string | null
@@ -69,6 +77,18 @@ type OpenCodeClientFactoryDeps = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
+const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
+
+function buildQueryPath(path: string, query: Record<string, string | null | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value && value.trim().length > 0) {
+      params.set(key, value)
+    }
+  }
+  const encoded = params.toString()
+  return encoded.length > 0 ? `${path}?${encoded}` : path
+}
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text()
@@ -138,6 +158,10 @@ export class OpenCodeClientFactory {
             config,
           }),
         }),
+      connectMcp: name =>
+        request<OpenCodeMcpResponse>(`/mcp/${encodeURIComponent(name)}/connect`, {
+          method: 'POST',
+        }),
       createSession: body =>
         request<OpenCodeSessionSummary>('/session', {
           method: 'POST',
@@ -151,6 +175,20 @@ export class OpenCodeClientFactory {
         ),
       getPermissions: () =>
         request<OpenCodePendingPermission[]>('/permission', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
+      listExperimentalToolIds: input =>
+        request<string[]>(buildQueryPath('/experimental/tool/ids', {
+          directory: input?.directory,
+          workspace: input?.workspace,
+        })),
+      listExperimentalTools: input =>
+        request<Array<{ id?: string; name?: string; parameters?: unknown }>>(
+          buildQueryPath('/experimental/tool', {
+            directory: input.directory,
+            workspace: input.workspace,
+            provider: input.provider,
+            model: input.model,
+          }),
+        ),
       answerPermission: async body => {
         const reply = body.decision === 'allow' ? 'once' : body.decision
         const payload = {
@@ -191,12 +229,12 @@ export class OpenCodeClientFactory {
         request<OpenCodeMessage>(`/session/${id}/message`, {
           method: 'POST',
           body: JSON.stringify(body),
-        }),
+        }, MESSAGE_REQUEST_TIMEOUT_MS),
       promptSessionAsync: async (id, body) => {
         await request<void>(`/session/${id}/prompt_async`, {
           method: 'POST',
           body: JSON.stringify(body),
-        })
+        }, MESSAGE_REQUEST_TIMEOUT_MS)
       },
       abortSession: id =>
         request<boolean>(`/session/${id}/abort`, {

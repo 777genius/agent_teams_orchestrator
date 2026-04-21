@@ -42,6 +42,7 @@ export type ResolvedAppMcpLaunchConfig = {
 type OpenCodeMcpClient = {
   getMcp(): Promise<OpenCodeMcpResponse>
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
+  connectMcp?(name: string): Promise<OpenCodeMcpResponse>
 }
 
 type OpenCodeMcpManagerDeps = {
@@ -291,13 +292,50 @@ export class OpenCodeMcpManager {
     const existingMatch = getMatchedAppMcpEntry(existingMcp)
 
     if (existingMatch.matchedServerName) {
+      const connected = inferMcpConnected(existingMatch.entry)
+      if (connected !== true && params.attachIfMissing && typeof client.connectMcp === 'function') {
+        try {
+          await client.connectMcp(existingMatch.matchedServerName)
+          const connectedMcp = await this.waitForMcpConnected(client, existingMatch.matchedServerName)
+          const connectedMatch = getMatchedAppMcpEntry(connectedMcp)
+          const refreshedConnected = inferMcpConnected(connectedMatch.entry)
+          return {
+            mcp: connectedMcp,
+            summary: {
+              serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+              matchedServerName: connectedMatch.matchedServerName,
+              status: refreshedConnected === true ? 'attached' : 'present',
+              connected: refreshedConnected,
+              launchSource: null,
+              availableServerNames: getMcpServerNames(connectedMcp),
+              diagnostics: refreshedConnected === true
+                ? []
+                : [`OpenCode app MCP server ${existingMatch.matchedServerName} did not report connected after connect`],
+            },
+          }
+        } catch (error) {
+          return {
+            mcp: existingMcp,
+            summary: {
+              serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+              matchedServerName: existingMatch.matchedServerName,
+              status: 'attach_failed',
+              connected,
+              launchSource: null,
+              availableServerNames: getMcpServerNames(existingMcp),
+              diagnostics: [`OpenCode app MCP connect failed: ${error instanceof Error ? error.message : String(error)}`],
+            },
+          }
+        }
+      }
+
       return {
         mcp: existingMcp,
         summary: {
           serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
           matchedServerName: existingMatch.matchedServerName,
           status: 'present',
-          connected: inferMcpConnected(existingMatch.entry),
+          connected,
           launchSource: null,
           availableServerNames: getMcpServerNames(existingMcp),
           diagnostics: [],
@@ -396,6 +434,23 @@ export class OpenCodeMcpManager {
         },
       }
     }
+  }
+
+  private async waitForMcpConnected(
+    client: OpenCodeMcpClient,
+    serverName: string,
+  ): Promise<OpenCodeMcpResponse> {
+    const verifyStartedAt = Date.now()
+    let latest = await client.getMcp()
+    while (Date.now() - verifyStartedAt < this.verifyTimeoutMs) {
+      const match = getMatchedAppMcpEntry(latest)
+      if (match.matchedServerName === serverName && inferMcpConnected(match.entry) === true) {
+        return latest
+      }
+      await this.sleepMs(this.verifyPollMs)
+      latest = await client.getMcp()
+    }
+    return latest
   }
 }
 

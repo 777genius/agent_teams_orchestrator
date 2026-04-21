@@ -1,6 +1,17 @@
 import { createHash } from 'node:crypto'
 
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import {
+  type OpenCodeBridgeCommandEvidence,
+  validateOpenCodeBridgeStateChangingPreconditions,
+} from './OpenCodeBridgePreconditions.js'
+import {
+  OPEN_CODE_APP_MCP_SERVER_NAME,
+  resolveOpenCodeAppMcpLaunchConfig,
+} from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
@@ -15,6 +26,7 @@ import type {
 } from './types.js'
 
 const BRIDGE_SCHEMA_VERSION = 1
+const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -66,6 +78,17 @@ type LaunchMemberDraft = {
   evidence: Array<{ kind: string; observedAt: string }>
   diagnostics: string[]
 }
+
+const REQUIRED_AGENT_TEAMS_RUNTIME_TOOLS = [
+  'runtime_bootstrap_checkin',
+  'runtime_deliver_message',
+  'runtime_task_event',
+  'runtime_heartbeat',
+] as const
+
+const REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS = REQUIRED_AGENT_TEAMS_RUNTIME_TOOLS.map(tool =>
+  `${OPEN_CODE_APP_MCP_SERVER_NAME}_${tool}`,
+)
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -125,6 +148,14 @@ function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
     binaryFingerprint: snapshot?.host?.version ? `version:${snapshot.host.version}` : null,
     version: snapshot?.host?.version ?? null,
     capabilitySnapshotId,
+  }
+}
+
+function createRuntimePreconditionSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
+  return {
+    ...createRuntimeSnapshot(snapshot),
+    runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+    activeRunId: null,
   }
 }
 
@@ -232,17 +263,140 @@ function getSelectedModel(body: Record<string, unknown>, fallbackSnapshot: OpenC
     ?? null
 }
 
-function readinessData(snapshot: OpenCodeProvisioningSnapshot, selectedModel: string | null, executionOutcome?: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>>) {
+type AppMcpToolProof = {
+  ok: boolean
+  observedTools: string[]
+  missingTools: string[]
+  diagnostics: string[]
+  route: string | null
+}
+
+const APP_MCP_PREFLIGHT_TIMEOUT_MS = 10_000
+
+async function proveAppMcpTools(
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<AppMcpToolProof> {
+  if (!snapshot.host) {
+    return {
+      ok: false,
+      observedTools: [],
+      missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
+      diagnostics: ['OpenCode host is unavailable; app MCP tools cannot be proven'],
+      route: null,
+    }
+  }
+
+  try {
+    const observedTools = await listAppMcpToolsFromLaunchConfig()
+    return matchAppMcpTools(observedTools, 'mcp:tools/list')
+  } catch (error) {
+    return {
+      ok: false,
+      observedTools: [],
+      missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
+      diagnostics: [
+        `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+        'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
+      ],
+      route: 'mcp:tools/list',
+    }
+  }
+}
+
+async function listAppMcpToolsFromLaunchConfig(): Promise<string[]> {
+  const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+  const command = launchConfig.config.command
+  if (!command || command.length === 0) {
+    throw new Error('Agent Teams MCP launch config is missing a local command')
+  }
+
+  const [binary, ...args] = command
+  if (!binary) {
+    throw new Error('Agent Teams MCP launch config binary is empty')
+  }
+
+  const client = new Client({
+    name: 'agent-teams-opencode-readiness',
+    version: '1.0.0',
+  })
+  const transport = new StdioClientTransport({
+    command: binary,
+    args,
+    env: buildMcpPreflightEnv(launchConfig.config.environment),
+  })
+
+  try {
+    await withTimeout(client.connect(transport), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+    const result = await withTimeout(client.listTools(), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+    return (result.tools ?? [])
+      .map(tool => tool.name)
+      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+      .map(name => `${OPEN_CODE_APP_MCP_SERVER_NAME}_${name}`)
+  } finally {
+    await client.close().catch(() => undefined)
+  }
+}
+
+function buildMcpPreflightEnv(extra?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string') {
+      env[key] = value
+    }
+  }
+  return {
+    ...env,
+    ...(extra ?? {}),
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  }
+}
+
+function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolProof {
+  const observed = new Set(observedTools)
+  const missingTools = REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS.filter(tool => !observed.has(tool))
+  return {
+    ok: missingTools.length === 0,
+    observedTools: Array.from(new Set(observedTools)).sort(),
+    missingTools,
+    diagnostics: missingTools.length === 0
+      ? []
+      : [`OpenCode app MCP tools missing from ${route}: ${missingTools.join(', ')}`],
+    route,
+  }
+}
+
+function readinessData(
+  snapshot: OpenCodeProvisioningSnapshot,
+  selectedModel: string | null,
+  executionOutcome: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined,
+  toolProof: AppMcpToolProof,
+) {
   const connectedProviders = snapshot.providers?.connected ?? []
   const models = snapshot.configProviders?.providers
     ?.flatMap(provider => Object.keys(asRecord(provider.models) ?? {}).map(model => `${provider.id}/${model}`))
     .filter((model): model is string => Boolean(model))
     ?? []
   const appMcpConnected = snapshot.appMcp?.connected === true || snapshot.appMcp?.status === 'present' || snapshot.appMcp?.status === 'attached'
-  const requiredToolsPresent = appMcpConnected
+  const requiredToolsPresent = appMcpConnected && toolProof.ok
   const diagnostics = [
     ...snapshot.diagnostics,
     ...(executionOutcome?.diagnostics ?? []),
+    ...toolProof.diagnostics,
   ]
   let state: string = 'ready'
   let launchAllowed = true
@@ -267,7 +421,11 @@ function readinessData(snapshot: OpenCodeProvisioningSnapshot, selectedModel: st
   } else if (!appMcpConnected || !requiredToolsPresent) {
     state = 'mcp_unavailable'
     launchAllowed = false
-    missing.push('Agent Teams MCP tools are not visible in OpenCode')
+    missing.push(
+      toolProof.missingTools.length > 0
+        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP tools are not visible in OpenCode',
+    )
   } else if (executionOutcome && executionOutcome.outcome !== 'available') {
     state = 'model_unavailable'
     launchAllowed = false
@@ -291,8 +449,8 @@ function readinessData(snapshot: OpenCodeProvisioningSnapshot, selectedModel: st
     diagnostics,
     evidence: {
       capabilitiesReady: true,
-      mcpToolProofRoute: snapshot.appMcp?.matchedServerName ? 'opencode_mcp_status' : null,
-      observedMcpTools: Object.keys(snapshot.mcp ?? {}),
+      mcpToolProofRoute: toolProof.route,
+      observedMcpTools: toolProof.observedTools,
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
   }
@@ -332,6 +490,7 @@ function buildTeamLaunchData(params: {
   members: Record<string, LaunchMemberDraft>
   diagnostics: TeamDiagnostic[]
   warnings?: TeamWarning[]
+  commandEvidence?: OpenCodeBridgeCommandEvidence
 }) {
   const states = Object.values(params.members).map(member => member.launchState)
   const now = nowIso()
@@ -361,6 +520,12 @@ function buildTeamLaunchData(params: {
     ),
     warnings: params.warnings ?? [],
     diagnostics: params.diagnostics,
+    ...(params.commandEvidence?.idempotencyKey
+      ? { idempotencyKey: params.commandEvidence.idempotencyKey }
+      : {}),
+    manifestHighWatermark: params.commandEvidence?.manifestHighWatermark ?? null,
+    runtimeStoreManifestHighWatermark:
+      params.commandEvidence?.runtimeStoreManifestHighWatermark ?? null,
     durableCheckpoints: [
       { name: 'required_tools_proven', observedAt: now },
       { name: 'delivery_ready', observedAt: now },
@@ -396,8 +561,9 @@ async function runReadiness(envelope: BridgeEnvelope) {
       diagnostics: [error instanceof Error ? error.message : String(error)],
     }))
     : undefined
+  const toolProof = await proveAppMcpTools(snapshot)
 
-  return { snapshot, data: readinessData(snapshot, selectedModel, executionOutcome) }
+  return { snapshot, data: readinessData(snapshot, selectedModel, executionOutcome, toolProof) }
 }
 
 async function runLaunch(envelope: BridgeEnvelope) {
@@ -411,6 +577,10 @@ async function runLaunch(envelope: BridgeEnvelope) {
   }
 
   const snapshot = await openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd)
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
@@ -452,6 +622,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
       selectedModel,
       members,
       diagnostics,
+      commandEvidence,
       warnings: asString(body.mode) === 'dogfood'
         ? [{ code: 'opencode_dogfood_mode', message: 'OpenCode dogfood launch mode is active.' }]
         : [],
@@ -467,6 +638,11 @@ async function runReconcile(envelope: BridgeEnvelope) {
     throw new Error('opencode.reconcileTeam requires runId and teamId/teamName')
   }
   const expectedMembers = Array.isArray(body.expectedMembers) ? body.expectedMembers : []
+  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
   let selectedModel = 'unknown/unknown'
@@ -490,10 +666,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
     }
   }
 
-  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   return {
     snapshot,
-    data: buildTeamLaunchData({ runId, selectedModel, members, diagnostics }),
+    data: buildTeamLaunchData({ runId, selectedModel, members, diagnostics, commandEvidence }),
   }
 }
 
@@ -504,6 +679,11 @@ async function runStop(envelope: BridgeEnvelope) {
   if (!runId || !teamId) {
     throw new Error('opencode.stopTeam requires runId and teamId/teamName')
   }
+  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
   const records = (await openCodeSessionStore.list()).filter(record => record.teamId === teamId)
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   for (const record of records) {
@@ -521,7 +701,6 @@ async function runStop(envelope: BridgeEnvelope) {
       diagnostics,
     }
   }
-  const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   return {
     snapshot,
     data: {
@@ -530,6 +709,9 @@ async function runStop(envelope: BridgeEnvelope) {
       members,
       warnings: [],
       diagnostics: [],
+      ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+      manifestHighWatermark: commandEvidence.manifestHighWatermark,
+      runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
     },
   }
 }
@@ -550,9 +732,13 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
   }
+  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath)
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
   const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
-  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath)
   return {
     snapshot,
     data: {
@@ -570,6 +756,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
       },
       warnings: [],
       diagnostics: reconciled.summary.diagnostics.map(message => teamDiagnostic('permission_reconcile', message, 'info')),
+      ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+      manifestHighWatermark: commandEvidence.manifestHighWatermark,
+      runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
     },
   }
 }
@@ -634,9 +823,7 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
           supportedCommands: SUPPORTED_COMMANDS,
         },
         runtime: {
-          ...createRuntimeSnapshot(snapshot),
-          runtimeStoreManifestHighWatermark: 0,
-          activeRunId: null,
+          ...createRuntimePreconditionSnapshot(snapshot),
         },
         featureFlags: {
           opencodeTeamLaunch: true,

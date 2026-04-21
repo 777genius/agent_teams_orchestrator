@@ -135,7 +135,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.supported).toBe(true)
       expect(opencode?.authenticated).toBe(true)
       expect(opencode?.models).toEqual(['openai/gpt-5.4', 'openai/gpt-5.4-mini'])
-      expect(opencode?.capabilities.teamLaunch).toBe(false)
+      expect(opencode?.capabilities.teamLaunch).toBe(true)
       expect(opencode?.capabilities.extensions.plugins.status).toBe('read-only')
       expect(opencode?.backend?.kind).toBe('opencode-cli')
       expect(opencode?.capabilitiesInfo?.some((item) => item.id === 'managed-profile')).toBe(true)
