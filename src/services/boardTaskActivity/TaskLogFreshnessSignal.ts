@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { mkdir, writeFile } from 'fs/promises'
 import { basename, join, relative, sep } from 'path'
 
@@ -42,8 +43,28 @@ export function getBoardTaskLogFreshnessDir(projectDir: string): string {
   return join(projectDir, BOARD_TASK_LOG_FRESHNESS_DIRNAME)
 }
 
+function isWindowsReservedArtifactSegment(segment: string): boolean {
+  const stem = segment.split('.')[0]?.toUpperCase() ?? ''
+  return (
+    !segment ||
+    stem === 'CON' ||
+    stem === 'PRN' ||
+    stem === 'AUX' ||
+    stem === 'NUL' ||
+    /^COM[1-9]$/.test(stem) ||
+    /^LPT[1-9]$/.test(stem)
+  )
+}
+
+function isOpaqueSafeTaskIdSegment(segment: string): boolean {
+  return /^task-id-[0-9a-f]{32}$/.test(segment)
+}
+
 export function encodeBoardTaskLogFreshnessTaskId(taskId: string): string {
-  return encodeURIComponent(taskId)
+  const encoded = encodeURIComponent(taskId)
+  return isWindowsReservedArtifactSegment(encoded)
+    ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
+    : encoded
 }
 
 export function decodeBoardTaskLogFreshnessTaskId(fileName: string): string | null {
@@ -52,6 +73,9 @@ export function decodeBoardTaskLogFreshnessTaskId(fileName: string): string | nu
   }
   const encodedTaskId = fileName.slice(0, -BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX.length)
   if (!encodedTaskId) {
+    return null
+  }
+  if (isOpaqueSafeTaskIdSegment(encodedTaskId)) {
     return null
   }
   try {

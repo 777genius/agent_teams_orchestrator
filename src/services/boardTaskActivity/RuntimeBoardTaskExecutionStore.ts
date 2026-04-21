@@ -145,6 +145,21 @@ export class RuntimeBoardTaskExecutionStore {
     return this.getState(sessionId, agentId)?.openScopes.size ?? 0
   }
 
+  getActiveScopes(
+    sessionId: string,
+    agentId?: string,
+  ): ActiveScope[] {
+    const state = this.getState(sessionId, agentId)
+    if (!state) {
+      return []
+    }
+    return [...state.openScopes.values()].map(scope => ({
+      locator: cloneLocator(scope.locator),
+      phase: scope.phase,
+      activeExecutionSeq: scope.activeExecutionSeq,
+    }))
+  }
+
   getActorContextForTarget(
     sessionId: string,
     agentId: string | undefined,
