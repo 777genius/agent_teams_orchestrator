@@ -128,7 +128,10 @@ const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
 const version = dev ? getDevVersion(pkg.version) : pkg.version
 
-mkdirSync(dirname(outfile), { recursive: true })
+const outfileDir = dirname(outfile)
+if (outfileDir !== '.') {
+  mkdirSync(outfileDir, { recursive: true })
+}
 
 function patchGeminiCliCoreWasmImports(): void {
   const shellUtilsPath =
