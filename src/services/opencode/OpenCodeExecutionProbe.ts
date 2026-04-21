@@ -61,6 +61,21 @@ function classifyProbeFailure(params: {
   const lower = reason.toLowerCase()
 
   if (
+    lower.includes('token refresh failed')
+    || lower.includes('authentication failed')
+    || lower.includes('auth failed')
+    || lower.includes('unauthorized')
+    || lower.includes('forbidden')
+    || /\b401\b/.test(lower)
+    || /\b403\b/.test(lower)
+  ) {
+    return {
+      outcome: 'not_authenticated',
+      reason,
+    }
+  }
+
+  if (
     lower.includes('model is not supported')
     || lower.includes('model not supported')
     || lower.includes('unsupported model')
@@ -70,11 +85,6 @@ function classifyProbeFailure(params: {
     || lower.includes('unknown model')
     || lower.includes('invalid model')
     || lower.includes('not available for your account')
-    || lower.includes('token refresh failed')
-    || lower.includes('unauthorized')
-    || lower.includes('forbidden')
-    || lower.includes('401')
-    || lower.includes('403')
   ) {
     return {
       outcome: 'unavailable',

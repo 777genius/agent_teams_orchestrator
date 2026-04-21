@@ -404,7 +404,7 @@ export type OpenCodeLogProjection = {
   messages: OpenCodeProjectedLogMessage[]
 }
 
-export type OpenCodeExecutionProbeOutcome = 'available' | 'unavailable' | 'unknown'
+export type OpenCodeExecutionProbeOutcome = 'available' | 'unavailable' | 'not_authenticated' | 'unknown'
 
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'

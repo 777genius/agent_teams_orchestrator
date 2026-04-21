@@ -131,14 +131,22 @@ function normalizeStable(value: unknown): unknown {
   }, {})
 }
 
+function uniqueSortedStrings(values: Iterable<string>): string[] {
+  return Array.from(new Set(Array.from(values).filter(Boolean))).sort()
+}
+
 function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
   const capabilitySnapshotId = snapshot
     ? `opencode:${hashStable({
       version: snapshot.host?.version ?? null,
       projectPath: snapshot.projectPath,
-      configFingerprint: snapshot.host?.resolvedConfigFingerprint ?? null,
+      // Keep the launch-gate snapshot stable across equivalent host restarts.
+      // The live resolved fingerprint may include ephemeral host-specific MCP payloads,
+      // so use stable project + managed-config identity here instead.
+      projectBehaviorFingerprint: snapshot.profile?.projectBehaviorFingerprint ?? null,
+      managedConfigFingerprint: snapshot.profile?.managedConfigFingerprint ?? null,
       mcpServers: Object.keys(snapshot.mcp ?? {}).sort(),
-      providers: snapshot.providers?.connected ?? [],
+      providers: uniqueSortedStrings(snapshot.providers?.connected ?? []),
     }).slice(0, 32)}`
     : null
 
@@ -425,6 +433,12 @@ function readinessData(
       toolProof.missingTools.length > 0
         ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
         : 'Agent Teams MCP tools are not visible in OpenCode',
+    )
+  } else if (executionOutcome && executionOutcome.outcome === 'not_authenticated') {
+    state = 'not_authenticated'
+    launchAllowed = false
+    missing.push(
+      executionOutcome.reason ?? 'OpenCode provider authentication failed for the selected model',
     )
   } else if (executionOutcome && executionOutcome.outcome !== 'available') {
     state = 'model_unavailable'

@@ -187,6 +187,30 @@ export function buildManagedConfig(
   return config
 }
 
+function normalizeManagedConfigForFingerprint(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(item => normalizeManagedConfigForFingerprint(item))
+  }
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+  return Object.keys(record).sort().reduce<Record<string, unknown>>((acc, key) => {
+    // Environment values like PATH, TMPDIR, and control URLs are runtime
+    // transport detail, not capability identity for production proof.
+    if (key === 'environment') {
+      return acc
+    }
+    acc[key] = normalizeManagedConfigForFingerprint(record[key])
+    return acc
+  }, {})
+}
+
+export function buildManagedConfigFingerprint(managedConfig: Record<string, unknown>): string {
+  return hashString(JSON.stringify(normalizeManagedConfigForFingerprint(managedConfig)))
+}
+
 export class OpenCodeProfileManager {
   private readonly paths = envPaths('claude-multimodel')
 
@@ -220,7 +244,7 @@ export class OpenCodeProfileManager {
     const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
       allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
     })
-    const managedConfigFingerprint = hashString(JSON.stringify(managedConfig))
+    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const profileRootPath = path.join(
       this.paths.data,
       'opencode',

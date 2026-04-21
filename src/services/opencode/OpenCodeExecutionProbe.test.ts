@@ -114,7 +114,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.latestAssistantText).toBe('PONG')
   })
 
-  test('marks model unavailable when OpenCode returns a token refresh failure', async () => {
+  test('marks model auth as invalid when OpenCode returns a token refresh failure', async () => {
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -173,7 +173,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('not_authenticated')
     expect(result.reason).toContain('Token refresh failed: 401')
     expect(result.durableState).toBe('error')
   })
