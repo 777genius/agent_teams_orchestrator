@@ -10,7 +10,7 @@ import type {
   OpenCodeMcpStatusEntry,
 } from './types.js'
 
-const OPEN_CODE_APP_MCP_SERVER_NAME = 'agent-teams'
+export const OPEN_CODE_APP_MCP_SERVER_NAME = 'agent-teams'
 const OPEN_CODE_APP_MCP_SERVER_ALIASES = [
   OPEN_CODE_APP_MCP_SERVER_NAME,
   'agent_teams',
@@ -20,15 +20,21 @@ const OPEN_CODE_APP_MCP_VERIFY_TIMEOUT_MS = 5_000
 const OPEN_CODE_APP_MCP_VERIFY_POLL_MS = 250
 const OPEN_CODE_MCP_ENTRY_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY'
 const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
-const OPEN_CODE_MCP_ENVIRONMENT_BLOCKLIST = [
-  'OPENCODE_CONFIG_CONTENT',
-  'OPENCODE_DISABLE_AUTOUPDATE',
-  'OPENCODE_DISABLE_CLAUDE_CODE',
-  'OPENCODE_SERVER_PASSWORD',
-  'OPENCODE_SERVER_USERNAME',
-]
+const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
+  'PATH',
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'LANG',
+  'LC_ALL',
+  'CLAUDE_TEAM_CONTROL_URL',
+] as const
 
-type ResolvedAppMcpLaunchConfig = {
+export type ResolvedAppMcpLaunchConfig = {
   source: OpenCodeAppMcpLaunchSource
   config: OpenCodeMcpServerConfig
 }
@@ -61,7 +67,7 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
-async function pathExists(targetPath: string): Promise<boolean> {
+async function defaultPathExists(targetPath: string): Promise<boolean> {
   try {
     await Bun.file(targetPath).exists()
     return true
@@ -80,16 +86,99 @@ function resolveNodeCommand(): string {
 
 function buildForwardedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
   const forwarded: Record<string, string> = {}
-  for (const [key, value] of Object.entries(env)) {
+  for (const key of OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST) {
+    const value = env[key]
     if (typeof value !== 'string' || value.length === 0) {
-      continue
-    }
-    if (key.startsWith('OPENCODE_') || OPEN_CODE_MCP_ENVIRONMENT_BLOCKLIST.includes(key)) {
       continue
     }
     forwarded[key] = value
   }
   return forwarded
+}
+
+export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
+  env?: NodeJS.ProcessEnv
+  pathExists?: (targetPath: string) => Promise<boolean>
+} = {}): Promise<ResolvedAppMcpLaunchConfig> {
+  const env = deps.env ?? process.env
+  const pathExists = deps.pathExists ?? defaultPathExists
+  const forwardedEnvironment = buildForwardedEnvironment(env)
+  const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
+  const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
+
+  if (entryOverride) {
+    const absoluteEntry = path.resolve(entryOverride)
+    return {
+      source: 'env-override',
+      config: {
+        type: 'local',
+        command: [commandOverride ?? resolveNodeCommand(), absoluteEntry],
+        environment: forwardedEnvironment,
+        enabled: true,
+        timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+      },
+    }
+  }
+
+  const workspaceRoot = getWorkspaceRoot()
+  const builtEntry = path.join(
+    workspaceRoot,
+    'claude_team',
+    'mcp-server',
+    'dist',
+    'index.js',
+  )
+  if (await pathExists(builtEntry)) {
+    return {
+      source: 'workspace-dist',
+      config: {
+        type: 'local',
+        command: [resolveNodeCommand(), builtEntry],
+        environment: forwardedEnvironment,
+        enabled: true,
+        timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+      },
+    }
+  }
+
+  const sourceEntry = path.join(
+    workspaceRoot,
+    'claude_team',
+    'mcp-server',
+    'src',
+    'index.ts',
+  )
+  const tsxCandidates = [
+    path.join(workspaceRoot, 'claude_team', 'mcp-server', 'node_modules', '.bin', 'tsx'),
+    path.join(workspaceRoot, 'claude_team', 'node_modules', '.bin', 'tsx'),
+    path.join(workspaceRoot, 'node_modules', '.bin', 'tsx'),
+  ]
+
+  if (await pathExists(sourceEntry)) {
+    for (const tsxBinary of tsxCandidates) {
+      if (!(await pathExists(tsxBinary))) {
+        continue
+      }
+
+      return {
+        source: 'workspace-src',
+        config: {
+          type: 'local',
+          command: [tsxBinary, sourceEntry],
+          environment: forwardedEnvironment,
+          enabled: true,
+          timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+        },
+      }
+    }
+  }
+
+  throw new Error(
+    [
+      'Unable to resolve the agent-teams MCP entrypoint for OpenCode dynamic attach',
+      `Set ${OPEN_CODE_MCP_ENTRY_ENV} to override the entrypoint path if needed.`,
+    ].join(' '),
+  )
 }
 
 function getMcpServerNames(mcp: OpenCodeMcpResponse): string[] {
@@ -163,10 +252,6 @@ export class OpenCodeMcpManager {
     return this.deps.clientFactory ?? openCodeClientFactory
   }
 
-  private async pathExists(targetPath: string): Promise<boolean> {
-    return (this.deps.pathExists ?? pathExists)(targetPath)
-  }
-
   private async sleepMs(ms: number): Promise<void> {
     if (this.deps.sleepMs) {
       await this.deps.sleepMs(ms)
@@ -188,84 +273,10 @@ export class OpenCodeMcpManager {
       return this.deps.resolveLaunchConfig()
     }
 
-    const env = this.deps.env ?? process.env
-    const forwardedEnvironment = buildForwardedEnvironment(env)
-    const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
-    const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
-
-    if (entryOverride) {
-      const absoluteEntry = path.resolve(entryOverride)
-      return {
-        source: 'env-override',
-        config: {
-          type: 'local',
-          command: [commandOverride ?? resolveNodeCommand(), absoluteEntry],
-          environment: forwardedEnvironment,
-          enabled: true,
-          timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
-        },
-      }
-    }
-
-    const workspaceRoot = getWorkspaceRoot()
-    const builtEntry = path.join(
-      workspaceRoot,
-      'claude_team',
-      'mcp-server',
-      'dist',
-      'index.js',
-    )
-    if (await this.pathExists(builtEntry)) {
-      return {
-        source: 'workspace-dist',
-        config: {
-          type: 'local',
-          command: [resolveNodeCommand(), builtEntry],
-          environment: forwardedEnvironment,
-          enabled: true,
-          timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
-        },
-      }
-    }
-
-    const sourceEntry = path.join(
-      workspaceRoot,
-      'claude_team',
-      'mcp-server',
-      'src',
-      'index.ts',
-    )
-    const tsxCandidates = [
-      path.join(workspaceRoot, 'claude_team', 'mcp-server', 'node_modules', '.bin', 'tsx'),
-      path.join(workspaceRoot, 'claude_team', 'node_modules', '.bin', 'tsx'),
-      path.join(workspaceRoot, 'node_modules', '.bin', 'tsx'),
-    ]
-
-    if (await this.pathExists(sourceEntry)) {
-      for (const tsxBinary of tsxCandidates) {
-        if (!(await this.pathExists(tsxBinary))) {
-          continue
-        }
-
-        return {
-          source: 'workspace-src',
-          config: {
-            type: 'local',
-            command: [tsxBinary, sourceEntry],
-            environment: forwardedEnvironment,
-            enabled: true,
-            timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
-          },
-        }
-      }
-    }
-
-    throw new Error(
-      [
-        'Unable to resolve the agent-teams MCP entrypoint for OpenCode dynamic attach',
-        `Set ${OPEN_CODE_MCP_ENTRY_ENV} to override the entrypoint path if needed.`,
-      ].join(' '),
-    )
+    return resolveOpenCodeAppMcpLaunchConfig({
+      env: this.deps.env,
+      pathExists: this.deps.pathExists,
+    })
   }
 
   async ensureAppMcp(params: {

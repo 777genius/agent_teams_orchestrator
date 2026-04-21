@@ -5,7 +5,11 @@ import path from 'node:path'
 import envPaths from 'env-paths'
 
 import { getCwd } from '../../utils/cwd.js'
-import type { OpenCodePreparedProfile } from './types.js'
+import {
+  OPEN_CODE_APP_MCP_SERVER_NAME,
+  resolveOpenCodeAppMcpLaunchConfig,
+} from './OpenCodeMcpManager.js'
+import type { OpenCodeMcpServerConfig, OpenCodePreparedProfile } from './types.js'
 
 function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -130,8 +134,10 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
   }
 }
 
-export function buildManagedConfig(): Record<string, unknown> {
-  return {
+export function buildManagedConfig(
+  appMcpConfig?: OpenCodeMcpServerConfig | null,
+): Record<string, unknown> {
+  const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     default_agent: 'teammate',
     share: 'disabled',
@@ -163,6 +169,14 @@ export function buildManagedConfig(): Record<string, unknown> {
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
     // so setting plugin here would shadow user and project extension points.
   }
+
+  if (appMcpConfig) {
+    config.mcp = {
+      [OPEN_CODE_APP_MCP_SERVER_NAME]: appMcpConfig,
+    }
+  }
+
+  return config
 }
 
 export class OpenCodeProfileManager {
@@ -182,12 +196,20 @@ export class OpenCodeProfileManager {
     return hashString(projectPath).slice(0, 16)
   }
 
+  private async resolveManagedAppMcpConfig(): Promise<OpenCodeMcpServerConfig | null> {
+    try {
+      return (await resolveOpenCodeAppMcpLaunchConfig()).config
+    } catch {
+      return null
+    }
+  }
+
   async prepareProfile(projectPath?: string | null): Promise<OpenCodePreparedProfile> {
     const resolvedProjectPath = this.getProjectPath(projectPath)
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
     const { projectBehaviorFingerprint, behaviorSources } =
       await collectProjectBehaviorMetadata(resolvedProjectPath)
-    const managedConfig = buildManagedConfig()
+    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig())
     const managedConfigFingerprint = hashString(JSON.stringify(managedConfig))
     const profileRootPath = path.join(
       this.paths.data,

@@ -4250,6 +4250,15 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimePreview(opts);
   });
+  runtime.command('opencode-command').description('Execute an OpenCode bridge command envelope').requiredOption('--input <path>', 'Path to bridge command envelope JSON').option('--json', 'Output as JSON').action(async (opts: {
+    input: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeOpenCodeCommand
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeOpenCodeCommand(opts);
+  });
 
   /**
    * Helper function to handle marketplace command errors consistently.

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { OpenCodeMcpManager } from './OpenCodeMcpManager.js'
+import {
+  OpenCodeMcpManager,
+  resolveOpenCodeAppMcpLaunchConfig,
+} from './OpenCodeMcpManager.js'
 
 describe('OpenCodeMcpManager', () => {
   test('treats an existing app MCP server as present without reattaching', async () => {
@@ -117,5 +120,35 @@ describe('OpenCodeMcpManager', () => {
 
     expect(result.summary.status).toBe('attach_failed')
     expect(result.summary.diagnostics[0]).toContain('still absent from /mcp')
+  })
+
+  test('resolves env override MCP launch config without forwarding OpenCode runtime env', async () => {
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/usr/local/bin/node',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp.js',
+        OPENCODE_CONFIG_CONTENT: '{"mcp":{}}',
+        OPENCODE_SERVER_PASSWORD: 'secret',
+        SAFE_ENV: 'forward-me',
+        PATH: '/usr/local/bin:/usr/bin',
+        CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config).toMatchObject({
+      type: 'local',
+      command: ['/usr/local/bin/node', '/tmp/agent-teams-mcp.js'],
+      enabled: true,
+      timeout: 8000,
+      environment: {
+        PATH: '/usr/local/bin:/usr/bin',
+        CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
+      },
+    })
+    expect(result.config.environment?.SAFE_ENV).toBeUndefined()
+    expect(result.config.environment?.OPENCODE_CONFIG_CONTENT).toBeUndefined()
+    expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
 })

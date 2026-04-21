@@ -61,4 +61,29 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       snapshot: false,
     })
   })
+
+  test('can embed the app-owned MCP server without shadowing plugins', () => {
+    const managedConfig = buildManagedConfig({
+      type: 'local',
+      command: ['node', '/tmp/agent-teams-mcp.js'],
+      environment: {
+        HOME: '/tmp/profile-home',
+      },
+      enabled: true,
+      timeout: 8000,
+    })
+
+    expect('plugin' in managedConfig).toBe(false)
+    expect(managedConfig.mcp).toEqual({
+      'agent-teams': {
+        type: 'local',
+        command: ['node', '/tmp/agent-teams-mcp.js'],
+        environment: {
+          HOME: '/tmp/profile-home',
+        },
+        enabled: true,
+        timeout: 8000,
+      },
+    })
+  })
 })

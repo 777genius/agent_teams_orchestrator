@@ -41,8 +41,14 @@ describe('OpenCodeInventoryService parsers', () => {
 
   test('parses model and agent output', () => {
     expect(
-      parseOpenCodeModelsOutput('openai/gpt-5.4\nopencode/qwen3.6-plus-free\n'),
-    ).toEqual(['openai/gpt-5.4', 'opencode/qwen3.6-plus-free'])
+      parseOpenCodeModelsOutput(
+        'openai/gpt-5.4\nopenrouter/moonshotai/kimi-k2\nopencode/qwen3.6-plus-free\n',
+      ),
+    ).toEqual([
+      'openai/gpt-5.4',
+      'openrouter/moonshotai/kimi-k2',
+      'opencode/qwen3.6-plus-free',
+    ])
 
     expect(parseOpenCodeAgentListOutput('build (primary)\nexplore (subagent)\n')).toEqual([
       { id: 'build', mode: 'primary' },

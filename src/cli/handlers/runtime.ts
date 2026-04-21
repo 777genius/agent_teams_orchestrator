@@ -7,11 +7,13 @@ import { openCodeExecutionProbe } from '../../services/opencode/OpenCodeExecutio
 import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
+import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import type {
   RuntimeProviderId,
   RuntimeProviderStatus,
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { readFile } from 'node:fs/promises'
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 
@@ -520,5 +522,16 @@ export async function runtimeTranscript(opts: {
     }, null, 2) + '\n')
   }
 
+  process.exit(0)
+}
+
+export async function runtimeOpenCodeCommand(opts: {
+  input: string
+  json?: boolean
+}): Promise<void> {
+  const raw = await readFile(opts.input, 'utf8')
+  const envelope = JSON.parse(raw) as unknown
+  const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+  process.stdout.write(jsonStringify(result) + '\n')
   process.exit(0)
 }

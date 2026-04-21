@@ -25,6 +25,11 @@ export type OpenCodeClient = {
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatus>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
   getPermissions(): Promise<OpenCodePendingPermission[]>
+  answerPermission(body: {
+    requestId: string
+    sessionId?: string | null
+    decision: 'allow' | 'always' | 'reject'
+  }): Promise<unknown>
   sendSessionMessage(
     id: string,
     body: {
@@ -146,6 +151,40 @@ export class OpenCodeClientFactory {
         ),
       getPermissions: () =>
         request<OpenCodePendingPermission[]>('/permission/', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
+      answerPermission: async body => {
+        const payload = {
+          requestID: body.requestId,
+          requestId: body.requestId,
+          sessionID: body.sessionId ?? undefined,
+          sessionId: body.sessionId ?? undefined,
+          response: body.decision,
+          decision: body.decision,
+          allow: body.decision === 'allow' || body.decision === 'always',
+          always: body.decision === 'always',
+        }
+        const encodedRequestId = encodeURIComponent(body.requestId)
+        const candidatePaths = [
+          `/permission/${encodedRequestId}`,
+          `/permission/${encodedRequestId}/reply`,
+          `/permission/${encodedRequestId}/respond`,
+          `/permission/reply`,
+          `/permission/respond`,
+        ]
+        let lastError: unknown = null
+        for (const path of candidatePaths) {
+          try {
+            return await request<unknown>(path, {
+              method: 'POST',
+              body: JSON.stringify(payload),
+            }, PERMISSION_REQUEST_TIMEOUT_MS)
+          } catch (error) {
+            lastError = error
+          }
+        }
+        throw lastError instanceof Error
+          ? lastError
+          : new Error(`OpenCode permission answer failed for ${body.requestId}`)
+      },
       sendSessionMessage: (id, body) =>
         request<OpenCodeMessage>(`/session/${id}/message`, {
           method: 'POST',

@@ -33,9 +33,7 @@ function getTrimmedNonEmptyLines(output: string): string[] {
 }
 
 export function parseOpenCodeModelsOutput(output: string): string[] {
-  return getTrimmedNonEmptyLines(output).filter(line =>
-    /^[a-z0-9-]+\/[A-Za-z0-9._:-]+$/i.test(line),
-  )
+  return getTrimmedNonEmptyLines(output).filter(line => /^[a-z0-9-]+\/\S+$/i.test(line))
 }
 
 export function parseOpenCodeProvidersOutput(output: string): {

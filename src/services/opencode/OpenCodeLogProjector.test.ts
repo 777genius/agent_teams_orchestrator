@@ -401,4 +401,43 @@ describe('OpenCodeLogProjector', () => {
       projection.messages.every(message => !message.timestamp.startsWith('1970-01-01')),
     ).toBe(true)
   })
+
+  test('preserves slash-containing OpenCode model ids in projected logs', () => {
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 1,
+        messages: [
+          {
+            id: 'msg-assistant-2',
+            parentId: 'msg-user-2',
+            role: 'assistant',
+            agent: 'teammate',
+            providerId: 'openrouter',
+            modelId: 'moonshotai/kimi-k2',
+            createdAt: 300,
+            completedAt: 301,
+            text: 'Using Kimi K2',
+            reasoningText: '',
+            previewText: 'Using Kimi K2',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [{ type: 'text', text: 'Using Kimi K2' }],
+            finishReason: 'stop',
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    expect(projection.messages).toEqual([
+      expect.objectContaining({
+        uuid: 'msg-assistant-2',
+        type: 'assistant',
+        model: 'openrouter/moonshotai/kimi-k2',
+      }),
+    ])
+  })
 })

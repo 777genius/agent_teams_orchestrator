@@ -176,11 +176,24 @@ export type OpenCodeSessionSummary = {
 export type OpenCodeSessionStatus = 'idle' | 'busy' | 'retry'
 
 export type OpenCodePendingPermission = {
+  id?: string
   requestID?: string
+  requestId?: string
+  permissionID?: string
+  permissionId?: string
   sessionID?: string
+  sessionId?: string
+  session?: string
   tool?: string
+  toolName?: string
+  name?: string
   title?: string
+  description?: string
   kind?: string
+  type?: string
+  metadata?: Record<string, unknown>
+  permission?: Record<string, unknown>
+  [key: string]: unknown
 }
 
 export type OpenCodeSseEvent = {

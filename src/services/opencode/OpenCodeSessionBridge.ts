@@ -2,6 +2,7 @@ import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
+import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -437,6 +438,23 @@ export class OpenCodeSessionBridge {
     })
   }
 
+  async answerPermission(
+    record: OpenCodeSessionRecord,
+    params: {
+      requestId: string
+      decision: 'allow' | 'always' | 'reject'
+    },
+  ): Promise<unknown> {
+    return this.withSessionHost(record, async ({ baseUrl }) => {
+      const client = this.clientFactory.create(baseUrl)
+      return client.answerPermission({
+        requestId: params.requestId,
+        sessionId: record.opencodeSessionId,
+        decision: params.decision,
+      })
+    })
+  }
+
   async getSession(record: OpenCodeSessionRecord): Promise<OpenCodeSessionSummary> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
@@ -528,10 +546,9 @@ export class OpenCodeSessionBridge {
         messages,
       })
       summary.profileAuthState = profile.authState
-      const pendingPermissionRequestIds = pendingPermissions
-        .filter(permission => permission.sessionID === record.opencodeSessionId)
-        .map(permission => permission.requestID)
-        .filter((value): value is string => Boolean(value))
+      const pendingPermissionRequestIds = normalizeOpenCodePermissions(pendingPermissions)
+        .filter(permission => permission.sessionId === record.opencodeSessionId)
+        .map(permission => permission.requestId)
       summary.pendingPermissionRequestIds = pendingPermissionRequestIds
       if (pendingPermissionRequestIds.length > 0) {
         summary.durableState = 'blocked'
