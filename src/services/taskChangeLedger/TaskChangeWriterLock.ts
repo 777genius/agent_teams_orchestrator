@@ -29,6 +29,7 @@ type AcquireTaskWriterLockResult = {
 const DEFAULT_WAIT_BUDGET_MS = 2_000
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000
 const DEFAULT_STALE_THRESHOLD_MS = 30_000
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -49,7 +50,8 @@ function isWindowsReservedArtifactSegment(segment: string): boolean {
 
 function encodeTaskId(taskId: string): string {
   const encoded = encodeURIComponent(taskId)
-  return isWindowsReservedArtifactSegment(encoded)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
     ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
     : encoded
 }

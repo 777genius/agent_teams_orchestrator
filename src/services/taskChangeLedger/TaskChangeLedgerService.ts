@@ -318,6 +318,7 @@ const pendingShellSnapshots = new Map<
   { snapshot: ShellSnapshot; options?: FinishShellSnapshotOptions }
 >()
 const taskWriteQueues = new Map<string, Promise<void>>()
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function isWindowsReservedArtifactSegment(segment: string): boolean {
   const stem = segment.split('.')[0]?.toUpperCase() ?? ''
@@ -334,7 +335,8 @@ function isWindowsReservedArtifactSegment(segment: string): boolean {
 
 function encodeTaskId(taskId: string): string {
   const encoded = encodeURIComponent(taskId)
-  return isWindowsReservedArtifactSegment(encoded)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
     ? `task-id-${sha256(taskId).slice(0, 32)}`
     : encoded
 }

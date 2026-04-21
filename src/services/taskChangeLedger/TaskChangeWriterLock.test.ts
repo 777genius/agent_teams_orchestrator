@@ -7,6 +7,8 @@ import { join } from 'path'
 
 import { acquireTaskWriterLock } from './TaskChangeWriterLock.js'
 
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
+
 function wait(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -26,7 +28,8 @@ function isWindowsReservedArtifactSegment(segment: string): boolean {
 
 function encodeTaskId(taskId: string): string {
   const encoded = encodeURIComponent(taskId)
-  return isWindowsReservedArtifactSegment(encoded)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
     ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
     : encoded
 }
@@ -136,6 +139,30 @@ describe('TaskChangeWriterLock', () => {
     ) as { taskId?: string }
     expect(persistedOwner.taskId).toBe(taskId)
     await expect(readFile(join(lockRootDir, 'CON.lock', 'owner.json'), 'utf8')).rejects.toThrow()
+
+    await lock.release()
+  })
+
+  test('uses a short hashed lock directory for very long task ids', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'task-writer-lock-'))
+    const lockRootDir = join(tempDir, 'locks')
+    const taskId = `task-${'x'.repeat(180)}`
+
+    const lock = await acquireTaskWriterLock({
+      lockRootDir,
+      taskId,
+      sessionId: 'session-1',
+      ownerId: 'owner-1',
+      heartbeatIntervalMs: 25,
+    })
+
+    const persistedOwner = JSON.parse(
+      await readFile(buildOwnerPath(lockRootDir, taskId), 'utf8'),
+    ) as { taskId?: string }
+    expect(persistedOwner.taskId).toBe(taskId)
+    expect(encodeTaskId(taskId)).toBe(
+      `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`,
+    )
 
     await lock.release()
   })

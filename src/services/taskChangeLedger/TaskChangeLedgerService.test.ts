@@ -22,6 +22,7 @@ import { clearDynamicTeamContext, setDynamicTeamContext } from '../../utils/team
 
 let repoDir = ''
 let sessionId = 'session-1'
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function runGit(args: string[], cwd = repoDir): string {
   const result = spawnSync('git', args, {
@@ -109,7 +110,8 @@ function isWindowsReservedArtifactSegment(segment: string): boolean {
 
 function encodeTaskId(taskId: string): string {
   const encoded = encodeURIComponent(taskId)
-  return isWindowsReservedArtifactSegment(encoded)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
     ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
     : encoded
 }
@@ -217,6 +219,30 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(events[0]?.memberName).toBe('alice')
     expect(events[1]?.memberName).toBe('alice')
+  })
+
+  test('uses short hashed artifact names for very long task ids', async () => {
+    const agentId = 'alice@test'
+    const taskId = `task-${'x'.repeat(180)}`
+    openScope(taskId, 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/long-task.ts',
+        content: 'export const longTask = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-long-task-write',
+      sessionId,
+      agentId,
+    })
+
+    const expectedSegment = `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+
+    expect(bundle.taskId).toBe(taskId)
+    expect(encodeTaskId(taskId)).toBe(expectedSegment)
   })
 
   test('captures bash create/delete via deferred background completion', async () => {

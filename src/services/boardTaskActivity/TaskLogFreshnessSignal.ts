@@ -7,6 +7,7 @@ import { getProjectsDir } from '../../utils/sessionStoragePortable.js'
 
 export const BOARD_TASK_LOG_FRESHNESS_DIRNAME = '.board-task-log-freshness'
 const BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX = '.json'
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function asCanonicalTaskId(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
@@ -62,7 +63,8 @@ function isOpaqueSafeTaskIdSegment(segment: string): boolean {
 
 export function encodeBoardTaskLogFreshnessTaskId(taskId: string): string {
   const encoded = encodeURIComponent(taskId)
-  return isWindowsReservedArtifactSegment(encoded)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
     ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
     : encoded
 }
