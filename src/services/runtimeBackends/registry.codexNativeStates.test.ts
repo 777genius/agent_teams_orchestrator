@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 
 function setOptionalEnv(
   key: string,
@@ -40,107 +40,29 @@ async function loadCodexStatus(options: {
   setOptionalEnv('OPENAI_API_KEY', options.openAiApiKey ?? null, originalOpenAiApiKey)
   setOptionalEnv('CODEX_API_KEY', options.codexApiKey ?? null, originalCodexApiKey)
 
-  try {
-    const authModulePath = new URL('../../utils/auth.js', import.meta.url).href
-    mock.module(authModulePath, () => ({
-      getAuthTokenSource: () => ({ source: 'none', hasToken: false }),
-      getAnthropicApiKeyWithSource: () => ({ source: 'none' }),
-    }))
-
-    const configModulePath = new URL('../../utils/config.js', import.meta.url).href
-    mock.module(configModulePath, () => ({
-      getGlobalConfig: () => ({
-        geminiBackendPreference: 'auto',
-      }),
-    }))
-
-    const geminiAuthModulePath = new URL('../../utils/geminiAuth.js', import.meta.url).href
-    mock.module(geminiAuthModulePath, () => ({
-      getGeminiApiVersion: () => 'v1beta',
-      getGeminiBaseUrl: () => 'https://generativelanguage.googleapis.com',
-    }))
-
-    const modelConfigsModulePath = new URL('../../utils/model/configs.js', import.meta.url).href
-    mock.module(modelConfigsModulePath, () => ({
-      CLAUDE_HAIKU_4_5_CONFIG: { firstParty: 'claude-haiku-4-5' },
-      CLAUDE_OPUS_4_6_CONFIG: { firstParty: 'claude-opus-4-6' },
-      CLAUDE_SONNET_4_6_CONFIG: { firstParty: 'claude-sonnet-4-6' },
-    }))
-
-    const modelAllowlistModulePath = new URL(
-      '../../utils/model/modelAllowlist.js',
-      import.meta.url,
-    ).href
-    mock.module(modelAllowlistModulePath, () => ({
-      isModelAllowed: () => true,
-    }))
-
-    const codexModelsModulePath = new URL('../../utils/model/codex.js', import.meta.url).href
-    mock.module(codexModelsModulePath, () => ({
-      CODEX_MODELS: [{ id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' }],
-    }))
-
-    const geminiModelsModulePath = new URL('../../utils/model/gemini.js', import.meta.url).href
-    mock.module(geminiModelsModulePath, () => ({
-      GEMINI_MODELS: [],
-    }))
-
-    const apiBackendPath = new URL('../gemini/backends/apiBackend.js', import.meta.url).href
-    mock.module(apiBackendPath, () => ({
-      geminiApiBackend: {
-        validate: async () => ({
-          ok: false,
-          backend: 'api',
-          authMethod: 'none',
-          endpointLabel: 'https://generativelanguage.googleapis.com/v1beta',
-          message: 'Not configured',
-        }),
-      },
-    }))
-
-    const cliBackendPath = new URL('../gemini/backends/cliBackend.js', import.meta.url).href
-    mock.module(cliBackendPath, () => ({
-      geminiCliBackend: {
-        validate: async () => ({
-          ok: false,
-          backend: 'cli',
-          authMethod: 'none',
-          endpointLabel: 'Code Assist (cloudcode-pa.googleapis.com/v1internal)',
-          message: 'Not configured',
-        }),
-      },
-    }))
-
-    const originalWhich = Bun.which
-    Bun.which = ((binaryName: string) => {
-      if (binaryName === 'codex') {
-        return options.nativeBinaryDetected === false ? null : '/usr/local/bin/codex'
-      }
-      return originalWhich(binaryName)
-    }) as typeof Bun.which
-
-    try {
-      const registryModulePath = new URL('./registry.js', import.meta.url).href
-      const { getUnifiedRuntimeStatusPayload } = await import(
-        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
-      )
-
-      const payload = await getUnifiedRuntimeStatusPayload('codex')
-      return payload.providers.codex
-    } finally {
-      Bun.which = originalWhich
+  const originalWhich = Bun.which
+  Bun.which = ((binaryName: string) => {
+    if (binaryName === 'codex') {
+      return options.nativeBinaryDetected === false ? null : '/usr/local/bin/codex'
     }
+    return originalWhich(binaryName)
+  }) as typeof Bun.which
+
+  try {
+    const registryModulePath = new URL('./registry.js', import.meta.url).href
+    const { getUnifiedRuntimeStatusPayload } = await import(
+      `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+
+    const payload = await getUnifiedRuntimeStatusPayload('codex')
+    return payload.providers.codex
   } finally {
+    Bun.which = originalWhich
     setOptionalEnv('CLAUDE_CODE_CODEX_BACKEND', undefined, originalCodexBackend)
     setOptionalEnv('OPENAI_API_KEY', undefined, originalOpenAiApiKey)
     setOptionalEnv('CODEX_API_KEY', undefined, originalCodexApiKey)
   }
 }
-
-afterEach(() => {
-  mock.restore()
-  mock.clearAllMocks()
-})
 
 describe('codex-native registry rollout states', () => {
   test('reports ready when the codex binary and CODEX_API_KEY are present', async () => {

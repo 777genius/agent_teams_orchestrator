@@ -4,8 +4,11 @@ import {
   access,
   appendFile,
   mkdir,
+  open,
+  readdir,
   readFile,
   rename,
+  rm,
   stat,
   writeFile,
 } from 'fs/promises'
@@ -23,9 +26,11 @@ import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
 import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
 import type { AgentId } from '../../types/ids.js'
 import { getCwd } from '../../utils/cwd.js'
+import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { logError } from '../../utils/log.js'
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getProjectDir } from '../../utils/sessionStoragePortable.js'
+import { getAgentName } from '../../utils/teammate.js'
 import { getRuntimeBoardTaskExecutionStore } from '../boardTaskActivity/RuntimeBoardTaskExecutionStore.js'
 import type { BoardTaskLocator, BoardTaskPhase } from '../boardTaskActivity/contract.js'
 import {
@@ -34,8 +39,11 @@ import {
   type GitChangePathEntry,
   type GitChangeRelation,
 } from './GitChangePathProvider.js'
+import { acquireTaskWriterLock } from './TaskChangeWriterLock.js'
 
-const TASK_CHANGE_LEDGER_SCHEMA_VERSION = 1
+const TASK_CHANGE_JOURNAL_SCHEMA_VERSION = 1
+const TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION = 2
+const TASK_CHANGE_FRESHNESS_SCHEMA_VERSION = 2
 const TASK_CHANGE_LEDGER_DIRNAME = '.board-task-changes'
 const TASK_CHANGE_FRESHNESS_DIRNAME = '.board-task-change-freshness'
 const TASK_CHANGE_FILE_SUFFIX = '.json'
@@ -44,6 +52,16 @@ const MAX_SHELL_SNAPSHOT_FILES = 80
 const MAX_GIT_PATH_ENTRIES = 500
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024
 const GIT_TIMEOUT_MS = 2000
+const JOURNAL_STAMP_TAIL_BYTES = 4096
+const TASK_WRITER_LOCK_WAIT_BUDGET_MS = 2000
+const DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION = 1
+const DEFERRED_SHELL_SNAPSHOT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const DEFERRED_SHELL_SNAPSHOT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+const MAX_DEFERRED_SHELL_SNAPSHOT_CLEANUP_FILES = 100
+const DEFERRED_SHELL_SNAPSHOT_RECOVERY_WARNING =
+  'Task change ledger recovered a deferred shell snapshot from disk after in-memory state was unavailable.'
+const DEFERRED_SHELL_SNAPSHOT_MEMORY_ONLY_WARNING =
+  'Task change ledger could not persist deferred shell snapshot; recovery is memory-only.'
 
 type TaskChangeConfidence = 'exact' | 'high' | 'medium' | 'low' | 'ambiguous'
 type TaskChangeOperation = 'create' | 'modify' | 'delete'
@@ -81,7 +99,7 @@ type ContentStateRef = {
 type TaskChangeRelation = GitChangeRelation
 
 type TaskChangeEventV1 = {
-  schemaVersion: typeof TASK_CHANGE_LEDGER_SCHEMA_VERSION
+  schemaVersion: typeof TASK_CHANGE_JOURNAL_SCHEMA_VERSION
   eventId: string
   taskId: string
   taskRef: string
@@ -90,6 +108,7 @@ type TaskChangeEventV1 = {
   executionSeq: number
   sessionId: string
   agentId?: string
+  memberName?: string
   toolUseId: string
   source: TaskChangeSource
   operation: TaskChangeOperation
@@ -114,7 +133,7 @@ type TaskChangeEventV1 = {
 }
 
 type TaskChangeNoticeV1 = {
-  schemaVersion: typeof TASK_CHANGE_LEDGER_SCHEMA_VERSION
+  schemaVersion: typeof TASK_CHANGE_JOURNAL_SCHEMA_VERSION
   noticeId: string
   taskId: string
   taskRef: string
@@ -123,36 +142,135 @@ type TaskChangeNoticeV1 = {
   executionSeq: number
   sessionId: string
   agentId?: string
+  memberName?: string
   toolUseId: string
   timestamp: string
   severity: 'warning'
   message: string
+  code?: 'multi-scope-skipped' | 'journal-recovered' | 'writer-lock-stolen'
 }
 
-type TaskChangeBundleFileV1 = {
+type JournalFileStamp = {
+  bytes: number
+  mtimeMs: number
+  tailSha256: string | null
+}
+
+type TaskChangeJournalStamp = {
+  events?: JournalFileStamp
+  notices?: JournalFileStamp
+}
+
+type TaskChangeContributorSummaryV2 = {
+  actorKey: string
+  agentId?: string
+  memberName?: string
+  eventCount: number
+  noticeCount: number
+  touchedFileCount: number
+  visibleFileCount: number
+  toolUseCount: number
+  cumulativeLinesAdded: number
+  cumulativeLinesRemoved: number
+  firstTimestamp: string
+  lastTimestamp: string
+}
+
+type TaskChangeSummaryScopeV2 = {
+  confidence: {
+    tier: 1 | 2 | 3 | 4
+    label: 'high' | 'medium' | 'low' | 'fallback'
+    reason: string
+  }
+  primaryActorKey?: string
+  primaryAgentId?: string
+  primaryMemberName?: string
+  memberName: string
+  agentIds: string[]
+  memberNames?: string[]
+  startTimestamp: string
+  endTimestamp: string
+  toolUseIds: string[]
+  toolUseCount: number
+  toolUseIdsTruncated?: boolean
+  phaseSet: Array<'work' | 'review'>
+  executionSeqRange?: { start: number; end: number }
+  confidenceBreakdown?: {
+    capture: 'exact' | 'high' | 'medium' | 'low'
+    attribution: 'high' | 'medium' | 'low' | 'ambiguous'
+    reviewability: 'full-text' | 'mixed' | 'metadata-only'
+  }
+  visibleFileCount: number
+  contributors: TaskChangeContributorSummaryV2[]
+}
+
+type TaskChangeSummaryFileV2 = {
+  changeKey: string
   filePath: string
   relativePath: string
-  eventIds: string[]
+  displayPath?: string
   linesAdded: number
   linesRemoved: number
-  isNewFile: boolean
+  diffStatKnown: boolean
+  eventCount: number
+  firstTimestamp: string
+  lastTimestamp: string
+  latestOperation: TaskChangeOperation
+  createdInTask: boolean
+  deletedInTask: boolean
+  baselineExists?: boolean
+  finalExists?: boolean
+  latestBeforeHash: string | null
   latestAfterHash: string | null
+  latestBeforeState?: ContentStateRef
+  latestAfterState?: ContentStateRef
+  contentAvailability: 'full-text' | 'hash-only' | 'metadata-only'
+  reviewability: 'full-text' | 'partial-text' | 'metadata-only'
+  relation?: TaskChangeRelation
+  primaryActorKey?: string
+  agentIds: string[]
+  memberNames?: string[]
+  executionSeqRange?: { start: number; end: number }
+  warnings?: string[]
 }
 
-type TaskChangeBundleV1 = {
-  schemaVersion: typeof TASK_CHANGE_LEDGER_SCHEMA_VERSION
+type TaskChangeSummaryBundleV2 = {
+  schemaVersion: typeof TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION
   source: 'task-change-ledger'
+  bundleKind: 'summary'
   taskId: string
   generatedAt: string
+  journalStamp: TaskChangeJournalStamp
+  integrity: 'ok' | 'recovered' | 'partial'
   eventCount: number
-  files: TaskChangeBundleFileV1[]
+  noticeCount: number
+  scope: TaskChangeSummaryScopeV2
+  files: TaskChangeSummaryFileV2[]
   totalLinesAdded: number
   totalLinesRemoved: number
+  diffStatCompleteness: 'complete' | 'partial'
   totalFiles: number
   confidence: 'high' | 'medium' | 'low'
+  warningCount: number
   warnings: string[]
-  events: TaskChangeEventV1[]
-  notices?: TaskChangeNoticeV1[]
+}
+
+type TaskChangeFreshnessSignalV2 = {
+  schemaVersion: typeof TASK_CHANGE_FRESHNESS_SCHEMA_VERSION
+  source: 'task-change-ledger'
+  taskId: string
+  updatedAt: string
+  journalStamp: TaskChangeJournalStamp
+  eventCount: number
+  noticeCount: number
+  integrity: 'ok' | 'recovered' | 'partial'
+  bundleSchemaVersion: typeof TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION
+  bundleKind: 'summary'
+}
+
+type JournalReadResult<T> = {
+  entries: T[]
+  recovered: boolean
 }
 
 type ExactFileChange = {
@@ -206,14 +324,71 @@ type FinishShellSnapshotOptions = {
   excludedFilePaths?: Iterable<string>
 }
 
-const pendingShellSnapshots = new Map<
-  string,
-  { snapshot: ShellSnapshot; options?: FinishShellSnapshotOptions }
->()
+type SerializedShellSnapshot = Omit<
+  ShellSnapshot,
+  'beforeFiles' | 'beforeStatusPaths' | 'beforeStatusEntries'
+> & {
+  beforeFiles: Array<[string, ShellSnapshotFile]>
+  beforeStatusPaths: string[]
+  beforeStatusEntries: Array<[string, GitChangePathEntry]>
+}
+
+type SerializedFinishShellSnapshotOptions = Omit<
+  FinishShellSnapshotOptions,
+  'excludedFilePaths'
+> & {
+  excludedFilePaths?: string[]
+}
+
+type PersistedDeferredShellSnapshotV1 = {
+  schemaVersion: typeof DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION
+  backgroundTaskId: string
+  createdAt: string
+  expiresAt: string
+  snapshot: SerializedShellSnapshot
+  options?: SerializedFinishShellSnapshotOptions
+}
+
+type DeferredShellSnapshotPointerV1 = {
+  schemaVersion: typeof DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION
+  backgroundTaskId: string
+  gitRoot: string
+  projectRecordPath: string
+  createdAt: string
+  expiresAt: string
+}
+
+type PendingDeferredShellSnapshot = {
+  snapshot: ShellSnapshot
+  options?: FinishShellSnapshotOptions
+  projectRecordPath?: string
+  globalPointerPath?: string
+}
+
+const pendingShellSnapshots = new Map<string, PendingDeferredShellSnapshot>()
 const taskWriteQueues = new Map<string, Promise<void>>()
+let lastDeferredShellSnapshotCleanupAt = 0
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
+
+function isWindowsReservedArtifactSegment(segment: string): boolean {
+  const stem = segment.split('.')[0]?.toUpperCase() ?? ''
+  return (
+    !segment ||
+    stem === 'CON' ||
+    stem === 'PRN' ||
+    stem === 'AUX' ||
+    stem === 'NUL' ||
+    /^COM[1-9]$/.test(stem) ||
+    /^LPT[1-9]$/.test(stem)
+  )
+}
 
 function encodeTaskId(taskId: string): string {
-  return encodeURIComponent(taskId)
+  const encoded = encodeURIComponent(taskId)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
+    ? `task-id-${sha256(taskId).slice(0, 32)}`
+    : encoded
 }
 
 function getLedgerProjectDir(): string {
@@ -222,6 +397,28 @@ function getLedgerProjectDir(): string {
 
 function getLedgerDir(projectDir = getLedgerProjectDir()): string {
   return join(projectDir, TASK_CHANGE_LEDGER_DIRNAME)
+}
+
+function getDeferredShellSnapshotProjectRecordPath(
+  gitRoot: string,
+  backgroundTaskId: string,
+): string {
+  return join(
+    getLedgerDir(gitRoot),
+    'pending-shell-snapshots',
+    `${encodeTaskId(backgroundTaskId)}.json`,
+  )
+}
+
+function getDeferredShellSnapshotGlobalPointerDir(): string {
+  return join(getClaudeConfigHomeDir(), 'task-change-ledger', 'pending-shell-snapshots')
+}
+
+function getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId: string): string {
+  return join(
+    getDeferredShellSnapshotGlobalPointerDir(),
+    `${encodeTaskId(backgroundTaskId)}.json`,
+  )
 }
 
 function getEventsPath(taskId: string, projectDir = getLedgerProjectDir()): string {
@@ -234,6 +431,10 @@ function getNoticesPath(taskId: string, projectDir = getLedgerProjectDir()): str
 
 function getBundlePath(taskId: string, projectDir = getLedgerProjectDir()): string {
   return join(getLedgerDir(projectDir), 'bundles', `${encodeTaskId(taskId)}.json`)
+}
+
+function getLockRootDir(projectDir = getLedgerProjectDir()): string {
+  return join(getLedgerDir(projectDir), 'locks')
 }
 
 function getFreshnessPath(taskId: string, projectDir = getLedgerProjectDir()): string {
@@ -252,6 +453,68 @@ function byteLength(content: string): number {
   return Buffer.byteLength(content, 'utf8')
 }
 
+function normalizeLedgerPathForKey(filePath: string): string {
+  let normalized = filePath.replace(/\\/g, '/')
+  while (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1)
+  }
+  return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')
+    ? normalized.toLowerCase()
+    : normalized
+}
+
+function isTaskChangeLedgerInternalRelativePath(relativePath: string): boolean {
+  return (
+    relativePath === TASK_CHANGE_LEDGER_DIRNAME ||
+    relativePath.startsWith(`${TASK_CHANGE_LEDGER_DIRNAME}/`) ||
+    relativePath === TASK_CHANGE_FRESHNESS_DIRNAME ||
+    relativePath.startsWith(`${TASK_CHANGE_FRESHNESS_DIRNAME}/`)
+  )
+}
+
+function buildChangeKey(params: {
+  filePath: string
+  operation: TaskChangeOperation
+  relation?: TaskChangeRelation
+}): string {
+  if (params.relation?.kind === 'rename') {
+    return `rename:${normalizeLedgerPathForKey(params.relation.oldPath)}->${normalizeLedgerPathForKey(params.relation.newPath)}`
+  }
+  if (params.relation?.kind === 'copy') {
+    return `copy:${normalizeLedgerPathForKey(params.relation.oldPath)}->${normalizeLedgerPathForKey(params.relation.newPath)}`
+  }
+  const normalizedPath = normalizeLedgerPathForKey(params.filePath)
+  if (params.operation === 'create') {
+    return `create:${normalizedPath}`
+  }
+  if (params.operation === 'delete') {
+    return `delete:${normalizedPath}`
+  }
+  return `path:${normalizedPath}`
+}
+
+function buildActorKey(input: { agentId?: string; memberName?: string; sessionId: string }): string {
+  if (input.memberName?.trim()) {
+    return `member:${input.memberName.trim()}`
+  }
+  if (input.agentId) {
+    return `agent:${input.agentId}`
+  }
+  return `session:${input.sessionId}`
+}
+
+function resolveLedgerMemberName(agentId?: AgentId): string | undefined {
+  const explicitAgentName = getAgentName()?.trim()
+  if (explicitAgentName) {
+    return explicitAgentName
+  }
+  if (!agentId) {
+    return undefined
+  }
+  const deterministicTeammateIdMatch = /^([^@\s]+)@[^@\s]+$/.exec(agentId)
+  return deterministicTeammateIdMatch?.[1]?.trim() || undefined
+}
+
 function normalizeFilePath(filePath: string, workspaceRoot: string): string {
   return isAbsolute(filePath) ? filePath : resolve(workspaceRoot, filePath)
 }
@@ -259,7 +522,7 @@ function normalizeFilePath(filePath: string, workspaceRoot: string): string {
 function displayRelativePath(filePath: string, workspaceRoot: string): string {
   const rel = relative(workspaceRoot, filePath)
   if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
-    return rel
+    return rel.replace(/\\/g, '/')
   }
   return filePath.split(/[\\/]/).slice(-3).join('/')
 }
@@ -367,6 +630,357 @@ async function writeAtomic(filePath: string, content: string): Promise<void> {
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
   await writeFile(tmpPath, content, { encoding: 'utf8', mode: 0o600 })
   await rename(tmpPath, filePath)
+}
+
+function serializeShellSnapshot(snapshot: ShellSnapshot): SerializedShellSnapshot {
+  return {
+    ...snapshot,
+    beforeFiles: [...snapshot.beforeFiles.entries()],
+    beforeStatusPaths: [...snapshot.beforeStatusPaths],
+    beforeStatusEntries: [...snapshot.beforeStatusEntries.entries()],
+  }
+}
+
+function deserializeShellSnapshot(snapshot: SerializedShellSnapshot): ShellSnapshot {
+  const beforeFiles = Array.isArray(snapshot.beforeFiles)
+    ? snapshot.beforeFiles.filter(
+        (entry): entry is [string, ShellSnapshotFile] =>
+          Array.isArray(entry) && typeof entry[0] === 'string',
+      )
+    : []
+  const beforeStatusPaths = Array.isArray(snapshot.beforeStatusPaths)
+    ? snapshot.beforeStatusPaths.filter((entry): entry is string => typeof entry === 'string')
+    : []
+  const beforeStatusEntries = Array.isArray(snapshot.beforeStatusEntries)
+    ? snapshot.beforeStatusEntries.filter(
+        (entry): entry is [string, GitChangePathEntry] =>
+          Array.isArray(entry) && typeof entry[0] === 'string',
+      )
+    : []
+  return {
+    ...snapshot,
+    beforeFiles: new Map(beforeFiles),
+    beforeStatusPaths: new Set(beforeStatusPaths),
+    beforeStatusEntries: new Map(beforeStatusEntries),
+  }
+}
+
+function serializeFinishShellSnapshotOptions(
+  options?: FinishShellSnapshotOptions,
+): SerializedFinishShellSnapshotOptions | undefined {
+  if (!options) {
+    return undefined
+  }
+  return {
+    ...(options.source ? { source: options.source } : {}),
+    ...(options.confidence ? { confidence: options.confidence } : {}),
+    ...(options.excludedFilePaths
+      ? { excludedFilePaths: [...options.excludedFilePaths] }
+      : {}),
+  }
+}
+
+function deserializeFinishShellSnapshotOptions(
+  options?: SerializedFinishShellSnapshotOptions,
+): FinishShellSnapshotOptions | undefined {
+  if (!options) {
+    return undefined
+  }
+  return {
+    ...(options.source ? { source: options.source } : {}),
+    ...(options.confidence ? { confidence: options.confidence } : {}),
+    ...(Array.isArray(options.excludedFilePaths)
+      ? { excludedFilePaths: options.excludedFilePaths }
+      : {}),
+  }
+}
+
+function parseJsonObject(content: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(content)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function isExpiredIsoTimestamp(expiresAt: unknown): boolean {
+  if (typeof expiresAt !== 'string') {
+    return true
+  }
+  const timestamp = Date.parse(expiresAt)
+  return !Number.isFinite(timestamp) || timestamp <= Date.now()
+}
+
+function isDeferredShellSnapshotPointer(
+  value: Record<string, unknown> | null,
+  backgroundTaskId?: string,
+): value is DeferredShellSnapshotPointerV1 {
+  return (
+    value?.schemaVersion === DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION &&
+    typeof value.backgroundTaskId === 'string' &&
+    (backgroundTaskId === undefined || value.backgroundTaskId === backgroundTaskId) &&
+    typeof value.gitRoot === 'string' &&
+    typeof value.projectRecordPath === 'string' &&
+    typeof value.createdAt === 'string' &&
+    typeof value.expiresAt === 'string'
+  )
+}
+
+function isPersistedDeferredShellSnapshot(
+  value: Record<string, unknown> | null,
+  backgroundTaskId: string,
+): value is PersistedDeferredShellSnapshotV1 {
+  return (
+    value?.schemaVersion === DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION &&
+    value.backgroundTaskId === backgroundTaskId &&
+    typeof value.createdAt === 'string' &&
+    typeof value.expiresAt === 'string' &&
+    !!value.snapshot &&
+    typeof value.snapshot === 'object' &&
+    !Array.isArray(value.snapshot)
+  )
+}
+
+async function removeDeferredShellSnapshotArtifacts(params: {
+  projectRecordPath?: string
+  globalPointerPath?: string
+}): Promise<void> {
+  await Promise.all(
+    [params.projectRecordPath, params.globalPointerPath].map(async filePath => {
+      if (!filePath) {
+        return
+      }
+      try {
+        await rm(filePath, { force: true })
+      } catch (error) {
+        logError(error)
+      }
+    }),
+  )
+}
+
+function getExpectedProjectRecordPathFromPointer(
+  pointer: DeferredShellSnapshotPointerV1,
+): string {
+  return getDeferredShellSnapshotProjectRecordPath(
+    pointer.gitRoot,
+    pointer.backgroundTaskId,
+  )
+}
+
+async function removeDeferredShellSnapshotPointerAndExpectedRecord(
+  pointer: DeferredShellSnapshotPointerV1,
+  globalPointerPath: string,
+): Promise<void> {
+  const expectedProjectRecordPath = getExpectedProjectRecordPathFromPointer(pointer)
+  await removeDeferredShellSnapshotArtifacts({
+    projectRecordPath:
+      pointer.projectRecordPath === expectedProjectRecordPath
+        ? expectedProjectRecordPath
+        : undefined,
+    globalPointerPath,
+  })
+}
+
+async function isActiveDeferredShellSnapshotPointer(
+  pointer: DeferredShellSnapshotPointerV1,
+  globalPointerPath: string,
+): Promise<boolean> {
+  const expectedProjectRecordPath = getExpectedProjectRecordPathFromPointer(pointer)
+  if (
+    pointer.projectRecordPath !== expectedProjectRecordPath ||
+    isExpiredIsoTimestamp(pointer.expiresAt)
+  ) {
+    await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+    return false
+  }
+
+  try {
+    const parsedRecord = parseJsonObject(await readFile(expectedProjectRecordPath, 'utf8'))
+    if (
+      !isPersistedDeferredShellSnapshot(parsedRecord, pointer.backgroundTaskId) ||
+      isExpiredIsoTimestamp(parsedRecord.expiresAt)
+    ) {
+      await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+      return false
+    }
+    return true
+  } catch {
+    await removeDeferredShellSnapshotPointerAndExpectedRecord(pointer, globalPointerPath)
+    return false
+  }
+}
+
+async function cleanupExpiredDeferredShellSnapshots(force = false): Promise<void> {
+  const now = Date.now()
+  if (
+    !force &&
+    now - lastDeferredShellSnapshotCleanupAt <
+      DEFERRED_SHELL_SNAPSHOT_CLEANUP_INTERVAL_MS
+  ) {
+    return
+  }
+  lastDeferredShellSnapshotCleanupAt = now
+
+  let entries: Awaited<ReturnType<typeof readdir>>
+  const pointerDir = getDeferredShellSnapshotGlobalPointerDir()
+  try {
+    entries = await readdir(pointerDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  for (const entry of entries.slice(0, MAX_DEFERRED_SHELL_SNAPSHOT_CLEANUP_FILES)) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue
+    }
+    const globalPointerPath = join(pointerDir, entry.name)
+    try {
+      const parsedPointer = parseJsonObject(await readFile(globalPointerPath, 'utf8'))
+      if (!isDeferredShellSnapshotPointer(parsedPointer)) {
+        await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+        continue
+      }
+      await isActiveDeferredShellSnapshotPointer(parsedPointer, globalPointerPath)
+    } catch {
+      await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+    }
+  }
+}
+
+async function assertNoActiveDeferredShellSnapshotPointer(
+  backgroundTaskId: string,
+): Promise<void> {
+  const globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
+  let parsedPointer: Record<string, unknown> | null
+  try {
+    parsedPointer = parseJsonObject(await readFile(globalPointerPath, 'utf8'))
+  } catch {
+    return
+  }
+  if (!isDeferredShellSnapshotPointer(parsedPointer, backgroundTaskId)) {
+    await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+    return
+  }
+  if (await isActiveDeferredShellSnapshotPointer(parsedPointer, globalPointerPath)) {
+    throw new Error(
+      `Deferred shell snapshot already exists for background task ${backgroundTaskId}`,
+    )
+  }
+}
+
+async function persistDeferredShellSnapshot(
+  backgroundTaskId: string,
+  snapshot: ShellSnapshot,
+  options?: FinishShellSnapshotOptions,
+): Promise<{ projectRecordPath: string; globalPointerPath: string }> {
+  const projectRecordPath = getDeferredShellSnapshotProjectRecordPath(
+    snapshot.gitRoot,
+    backgroundTaskId,
+  )
+  const globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
+  const createdAt = new Date().toISOString()
+  const expiresAt = new Date(Date.now() + DEFERRED_SHELL_SNAPSHOT_TTL_MS).toISOString()
+  const serializedOptions = serializeFinishShellSnapshotOptions(options)
+  const record: PersistedDeferredShellSnapshotV1 = {
+    schemaVersion: DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION,
+    backgroundTaskId,
+    createdAt,
+    expiresAt,
+    snapshot: serializeShellSnapshot(snapshot),
+    ...(serializedOptions ? { options: serializedOptions } : {}),
+  }
+  const pointer: DeferredShellSnapshotPointerV1 = {
+    schemaVersion: DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION,
+    backgroundTaskId,
+    gitRoot: snapshot.gitRoot,
+    projectRecordPath,
+    createdAt,
+    expiresAt,
+  }
+
+  let wroteProjectRecord = false
+  try {
+    await assertNoActiveDeferredShellSnapshotPointer(backgroundTaskId)
+    await writeAtomic(projectRecordPath, `${JSON.stringify(record)}\n`)
+    wroteProjectRecord = true
+    await writeAtomic(globalPointerPath, `${JSON.stringify(pointer)}\n`)
+    return { projectRecordPath, globalPointerPath }
+  } catch (error) {
+    if (wroteProjectRecord) {
+      await removeDeferredShellSnapshotArtifacts({ projectRecordPath })
+    }
+    throw error
+  }
+}
+
+async function readPersistedDeferredShellSnapshot(
+  backgroundTaskId: string,
+): Promise<{
+  snapshot: ShellSnapshot
+  options?: FinishShellSnapshotOptions
+  projectRecordPath: string
+  globalPointerPath: string
+} | null> {
+  const globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
+  let pointer: DeferredShellSnapshotPointerV1
+  try {
+    const parsedPointer = parseJsonObject(await readFile(globalPointerPath, 'utf8'))
+    if (!isDeferredShellSnapshotPointer(parsedPointer, backgroundTaskId)) {
+      await removeDeferredShellSnapshotArtifacts({ globalPointerPath })
+      return null
+    }
+    pointer = parsedPointer
+  } catch {
+    return null
+  }
+
+  const expectedProjectRecordPath = getDeferredShellSnapshotProjectRecordPath(
+    pointer.gitRoot,
+    backgroundTaskId,
+  )
+  if (
+    pointer.projectRecordPath !== expectedProjectRecordPath ||
+    isExpiredIsoTimestamp(pointer.expiresAt)
+  ) {
+    await removeDeferredShellSnapshotArtifacts({
+      projectRecordPath:
+        pointer.projectRecordPath === expectedProjectRecordPath
+          ? expectedProjectRecordPath
+          : undefined,
+      globalPointerPath,
+    })
+    return null
+  }
+
+  try {
+    const parsedRecord = parseJsonObject(await readFile(expectedProjectRecordPath, 'utf8'))
+    if (
+      !isPersistedDeferredShellSnapshot(parsedRecord, backgroundTaskId) ||
+      isExpiredIsoTimestamp(parsedRecord.expiresAt)
+    ) {
+      await removeDeferredShellSnapshotArtifacts({
+        projectRecordPath: expectedProjectRecordPath,
+        globalPointerPath,
+      })
+      return null
+    }
+    return {
+      snapshot: deserializeShellSnapshot(parsedRecord.snapshot),
+      options: deserializeFinishShellSnapshotOptions(parsedRecord.options),
+      projectRecordPath: expectedProjectRecordPath,
+      globalPointerPath,
+    }
+  } catch {
+    await removeDeferredShellSnapshotArtifacts({
+      projectRecordPath: expectedProjectRecordPath,
+      globalPointerPath,
+    })
+    return null
+  }
 }
 
 async function buildContentRef(
@@ -532,149 +1146,591 @@ async function appendNotice(notice: TaskChangeNoticeV1, projectDir: string): Pro
   })
 }
 
-async function readTaskEvents(taskId: string, projectDir: string): Promise<TaskChangeEventV1[]> {
-  const eventsPath = getEventsPath(taskId, projectDir)
+async function readJournalFileStamp(filePath: string): Promise<JournalFileStamp | undefined> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    handle = await open(filePath, 'r')
+    const fileStat = await handle.stat()
+    if (!fileStat.isFile()) {
+      return undefined
+    }
+    const tailLength = Math.min(fileStat.size, JOURNAL_STAMP_TAIL_BYTES)
+    const tail = Buffer.alloc(tailLength)
+    if (tailLength > 0) {
+      await handle.read(tail, 0, tailLength, fileStat.size - tailLength)
+    }
+    return {
+      bytes: fileStat.size,
+      mtimeMs: fileStat.mtimeMs,
+      tailSha256: tailLength > 0 ? sha256(tail) : null,
+    }
+  } catch {
+    return undefined
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function computeTaskJournalStamp(
+  taskId: string,
+  projectDir: string,
+): Promise<TaskChangeJournalStamp> {
+  const [events, notices] = await Promise.all([
+    readJournalFileStamp(getEventsPath(taskId, projectDir)),
+    readJournalFileStamp(getNoticesPath(taskId, projectDir)),
+  ])
+  return {
+    ...(events ? { events } : {}),
+    ...(notices ? { notices } : {}),
+  }
+}
+
+function journalStampsEqual(
+  left: TaskChangeJournalStamp,
+  right: TaskChangeJournalStamp,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+async function readJournalEntries<T extends { taskId: string; schemaVersion: number }>(params: {
+  filePath: string
+  taskId: string
+  schemaVersion: number
+  idField: 'eventId' | 'noticeId'
+}): Promise<JournalReadResult<T>> {
   let raw: string
   try {
-    raw = await readFile(eventsPath, 'utf8')
+    raw = await readFile(params.filePath, 'utf8')
   } catch {
-    return []
+    return { entries: [], recovered: false }
   }
 
-  const deduped = new Map<string, TaskChangeEventV1>()
+  const entries: T[] = []
+  const seenIds = new Set<string>()
+  let recovered = false
   for (const line of raw.split('\n')) {
     if (!line.trim()) {
       continue
     }
     try {
-      const parsed = JSON.parse(line) as TaskChangeEventV1
+      const parsed = JSON.parse(line) as T & Record<string, unknown>
+      const id = parsed?.[params.idField]
       if (
-        parsed?.schemaVersion === TASK_CHANGE_LEDGER_SCHEMA_VERSION &&
-        typeof parsed.eventId === 'string' &&
-        parsed.taskId === taskId
+        parsed?.schemaVersion !== params.schemaVersion ||
+        typeof id !== 'string' ||
+        parsed.taskId !== params.taskId
       ) {
-        deduped.set(parsed.eventId, parsed)
+        recovered = true
+        continue
       }
+      if (seenIds.has(id)) {
+        recovered = true
+        continue
+      }
+      seenIds.add(id)
+      entries.push(parsed)
     } catch {
-      // Ignore partial/corrupt trailing lines; future appends remain readable.
+      recovered = true
     }
   }
-  return [...deduped.values()].sort((a, b) => {
-    const timeDiff = Date.parse(a.timestamp) - Date.parse(b.timestamp)
-    return timeDiff === 0 ? a.eventId.localeCompare(b.eventId) : timeDiff
+  return { entries, recovered }
+}
+
+async function readTaskEvents(
+  taskId: string,
+  projectDir: string,
+): Promise<JournalReadResult<TaskChangeEventV1>> {
+  return readJournalEntries<TaskChangeEventV1>({
+    filePath: getEventsPath(taskId, projectDir),
+    taskId,
+    schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
+    idField: 'eventId',
   })
 }
 
-async function readTaskNotices(taskId: string, projectDir: string): Promise<TaskChangeNoticeV1[]> {
-  const noticesPath = getNoticesPath(taskId, projectDir)
-  let raw: string
+async function readTaskNotices(
+  taskId: string,
+  projectDir: string,
+): Promise<JournalReadResult<TaskChangeNoticeV1>> {
+  return readJournalEntries<TaskChangeNoticeV1>({
+    filePath: getNoticesPath(taskId, projectDir),
+    taskId,
+    schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
+    idField: 'noticeId',
+  })
+}
+
+async function readContentTextFromRef(
+  projectDir: string,
+  ref: ContentRef | null,
+): Promise<string | null> {
+  if (!ref?.blobRef) {
+    return null
+  }
   try {
-    raw = await readFile(noticesPath, 'utf8')
+    return await readFile(join(getLedgerDir(projectDir), 'blobs', ref.blobRef), 'utf8')
   } catch {
-    return []
+    return null
   }
-
-  const deduped = new Map<string, TaskChangeNoticeV1>()
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) {
-      continue
-    }
-    try {
-      const parsed = JSON.parse(line) as TaskChangeNoticeV1
-      if (
-        parsed?.schemaVersion === TASK_CHANGE_LEDGER_SCHEMA_VERSION &&
-        typeof parsed.noticeId === 'string' &&
-        parsed.taskId === taskId
-      ) {
-        deduped.set(parsed.noticeId, parsed)
-      }
-    } catch {
-      // Ignore partial/corrupt trailing lines; future appends remain readable.
-    }
-  }
-  return [...deduped.values()].sort((a, b) => {
-    const timeDiff = Date.parse(a.timestamp) - Date.parse(b.timestamp)
-    return timeDiff === 0 ? a.noticeId.localeCompare(b.noticeId) : timeDiff
-  })
 }
 
-async function rebuildBundle(taskId: string, projectDir: string): Promise<void> {
-  const events = await readTaskEvents(taskId, projectDir)
-  const notices = await readTaskNotices(taskId, projectDir)
+function compareOptionalStrings(left: string | null, right: string | null): boolean | null {
+  if (left === null || right === null) {
+    return null
+  }
+  return left === right
+}
+
+function deriveSideText(
+  side: 'before' | 'after',
+  event: TaskChangeEventV1,
+  fullText: string | null,
+): string | null {
+  if (fullText !== null) {
+    return fullText
+  }
+  if (side === 'before' && event.operation === 'create') {
+    return ''
+  }
+  if (side === 'after' && event.operation === 'delete') {
+    return ''
+  }
+  return null
+}
+
+function statesEqual(
+  baselineState: ContentStateRef | undefined,
+  finalState: ContentStateRef | undefined,
+  baselineText: string | null,
+  finalText: string | null,
+): boolean {
+  const textComparison = compareOptionalStrings(baselineText, finalText)
+  if (textComparison !== null) {
+    return textComparison
+  }
+  if (
+    baselineState?.exists !== undefined &&
+    finalState?.exists !== undefined &&
+    baselineState.exists !== finalState.exists
+  ) {
+    return false
+  }
+  if (baselineState?.sha256 && finalState?.sha256) {
+    return baselineState.sha256 === finalState.sha256
+  }
+  if (
+    baselineState?.exists !== undefined &&
+    finalState?.exists !== undefined &&
+    baselineState.exists === finalState.exists &&
+    baselineState.exists === false
+  ) {
+    return true
+  }
+  return false
+}
+
+function confidenceLabelForEvents(events: TaskChangeEventV1[]): 'high' | 'medium' | 'low' {
+  if (events.some(event => event.confidence === 'low' || event.confidence === 'ambiguous')) {
+    return 'low'
+  }
+  if (events.some(event => event.confidence === 'medium')) {
+    return 'medium'
+  }
+  return 'high'
+}
+
+function deriveCaptureConfidence(
+  events: TaskChangeEventV1[],
+): 'exact' | 'high' | 'medium' | 'low' {
+  if (events.every(event => event.confidence === 'exact')) {
+    return 'exact'
+  }
+  if (events.some(event => event.confidence === 'low' || event.confidence === 'ambiguous')) {
+    return 'low'
+  }
+  if (events.some(event => event.confidence === 'medium')) {
+    return 'medium'
+  }
+  return 'high'
+}
+
+async function rebuildBundle(taskId: string, projectDir: string): Promise<{
+  bundle: TaskChangeSummaryBundleV2
+  freshness: TaskChangeFreshnessSignalV2
+}> {
+  const [eventRead, noticeRead, journalStamp] = await Promise.all([
+    readTaskEvents(taskId, projectDir),
+    readTaskNotices(taskId, projectDir),
+    computeTaskJournalStamp(taskId, projectDir),
+  ])
+  const events = eventRead.entries
+  const notices = noticeRead.entries
+  const recovered = eventRead.recovered || noticeRead.recovered
   const warnings = new Set<string>()
-  const filesByPath = new Map<
-    string,
-    {
-      filePath: string
-      relativePath: string
-      eventIds: string[]
-      linesAdded: number
-      linesRemoved: number
-      isNewFile: boolean
-      latestAfterHash: string | null
-    }
-  >()
 
+  type Accumulator = {
+    groupKey: string
+    filePath: string
+    relativePath: string
+    displayPath?: string
+    relation?: TaskChangeRelation
+    events: TaskChangeEventV1[]
+    warnings: Set<string>
+    agentIds: Set<string>
+    memberNames: Set<string>
+    actorCounts: Map<string, number>
+    executionSeqMin: number
+    executionSeqMax: number
+  }
+
+  const accumulators = new Map<string, Accumulator>()
   for (const event of events) {
     for (const warning of event.warnings ?? []) {
       warnings.add(warning)
     }
-
-    const existing = filesByPath.get(event.filePath) ?? {
-      filePath: event.filePath,
-      relativePath: event.relativePath,
-      eventIds: [],
-      linesAdded: 0,
-      linesRemoved: 0,
-      isNewFile: event.operation === 'create',
-      latestAfterHash: null,
+    if (event.toolStatus === 'failed') {
+      warnings.add(`Tool ${event.toolUseId} failed after changing files.`)
     }
-
-    const { added, removed } =
-      event.linesAdded !== undefined && event.linesRemoved !== undefined
-        ? { added: event.linesAdded, removed: event.linesRemoved }
-        : countLineChanges(event.oldString ?? null, event.newString ?? null)
-    existing.eventIds.push(event.eventId)
-    existing.linesAdded += added
-    existing.linesRemoved += removed
-    existing.isNewFile ||= event.operation === 'create'
-    existing.latestAfterHash = event.after?.sha256 ?? null
-    filesByPath.set(event.filePath, existing)
+    if (event.toolStatus === 'killed') {
+      warnings.add(`Background tool ${event.toolUseId} was killed after changing files.`)
+    }
+    const groupKey = event.relation
+      ? `${event.relation.kind}:${normalizeLedgerPathForKey(event.relation.oldPath)}->${normalizeLedgerPathForKey(event.relation.newPath)}`
+      : `path:${normalizeLedgerPathForKey(event.filePath)}`
+    const existing = accumulators.get(groupKey) ?? {
+      groupKey,
+      filePath: event.relation?.newPath
+        ? (isAbsolute(event.relation.newPath)
+            ? event.relation.newPath
+            : join(event.workspaceRoot, event.relation.newPath))
+        : event.filePath,
+      relativePath: event.relation?.newPath ?? event.relativePath,
+      ...(event.relation?.newPath ? { displayPath: event.relation.newPath } : {}),
+      ...(event.relation ? { relation: event.relation } : {}),
+      events: [],
+      warnings: new Set<string>(),
+      agentIds: new Set<string>(),
+      memberNames: new Set<string>(),
+      actorCounts: new Map<string, number>(),
+      executionSeqMin: event.executionSeq,
+      executionSeqMax: event.executionSeq,
+    }
+    existing.events.push(event)
+    event.agentId && existing.agentIds.add(event.agentId)
+    event.memberName && existing.memberNames.add(event.memberName)
+    const actorKey = buildActorKey({
+      agentId: event.agentId,
+      memberName: event.memberName,
+      sessionId: event.sessionId,
+    })
+    existing.actorCounts.set(actorKey, (existing.actorCounts.get(actorKey) ?? 0) + 1)
+    existing.executionSeqMin = Math.min(existing.executionSeqMin, event.executionSeq)
+    existing.executionSeqMax = Math.max(existing.executionSeqMax, event.executionSeq)
+    for (const warning of event.warnings ?? []) {
+      existing.warnings.add(warning)
+    }
+    accumulators.set(groupKey, existing)
   }
+
   for (const notice of notices) {
     warnings.add(notice.message)
   }
+  if (recovered) {
+    warnings.add('Task change ledger recovered from malformed journal lines.')
+  }
 
-  const files = [...filesByPath.values()]
-  const hasLowConfidence = events.some(
-    event => event.confidence === 'medium' || event.confidence === 'low',
-  )
-  const bundle: TaskChangeBundleV1 = {
-    schemaVersion: TASK_CHANGE_LEDGER_SCHEMA_VERSION,
+  const contributorTouched = new Map<string, Set<string>>()
+  const contributorVisible = new Map<string, Set<string>>()
+  const contributorSummaries = new Map<string, TaskChangeContributorSummaryV2>()
+  const files: TaskChangeSummaryFileV2[] = []
+
+  for (const accumulator of accumulators.values()) {
+    const firstEvent = accumulator.events[0]
+    const lastEvent = accumulator.events[accumulator.events.length - 1]
+    const baselineState = firstEvent.beforeState ??
+      (firstEvent.before
+        ? contentStateFromContentRef(firstEvent.before)
+        : firstEvent.operation === 'create'
+          ? { exists: false }
+          : undefined)
+    const finalState = lastEvent.afterState ??
+      (lastEvent.after
+        ? contentStateFromContentRef(lastEvent.after)
+        : lastEvent.operation === 'delete'
+          ? { exists: false }
+          : undefined)
+    const [baselineRawText, finalRawText] = await Promise.all([
+      readContentTextFromRef(projectDir, firstEvent.before),
+      readContentTextFromRef(projectDir, lastEvent.after),
+    ])
+    const baselineText = deriveSideText('before', firstEvent, baselineRawText)
+    const finalText = deriveSideText('after', lastEvent, finalRawText)
+    const reviewability =
+      baselineText !== null && finalText !== null
+        ? 'full-text'
+        : baselineText !== null || finalText !== null
+          ? 'partial-text'
+          : 'metadata-only'
+    const contentAvailability =
+      reviewability === 'full-text'
+        ? 'full-text'
+        : baselineState?.sha256 || finalState?.sha256
+          ? 'hash-only'
+          : 'metadata-only'
+    const diffStatKnown = reviewability === 'full-text'
+    const lineStats = diffStatKnown
+      ? countLineChanges(baselineText, finalText)
+      : { added: 0, removed: 0 }
+
+    const visible = accumulator.relation
+      ? accumulator.relation.kind === 'rename'
+        ? normalizeLedgerPathForKey(accumulator.relation.oldPath) !==
+          normalizeLedgerPathForKey(accumulator.relation.newPath)
+        : finalState?.exists !== false
+      : !statesEqual(baselineState, finalState, baselineText, finalText)
+
+    const primaryActorKey = [...accumulator.actorCounts.entries()].sort((left, right) => {
+      if (right[1] !== left[1]) {
+        return right[1] - left[1]
+      }
+      return left[0].localeCompare(right[0])
+    })[0]?.[0]
+
+    for (const event of accumulator.events) {
+      const actorKey = buildActorKey({
+        agentId: event.agentId,
+        memberName: event.memberName,
+        sessionId: event.sessionId,
+      })
+      const touched = contributorTouched.get(actorKey) ?? new Set<string>()
+      touched.add(accumulator.groupKey)
+      contributorTouched.set(actorKey, touched)
+
+      const summary = contributorSummaries.get(actorKey) ?? {
+        actorKey,
+        ...(event.agentId ? { agentId: event.agentId } : {}),
+        ...(event.memberName ? { memberName: event.memberName } : {}),
+        eventCount: 0,
+        noticeCount: 0,
+        touchedFileCount: 0,
+        visibleFileCount: 0,
+        toolUseCount: 0,
+        cumulativeLinesAdded: 0,
+        cumulativeLinesRemoved: 0,
+        firstTimestamp: event.timestamp,
+        lastTimestamp: event.timestamp,
+      }
+      const eventLineStats =
+        event.linesAdded !== undefined && event.linesRemoved !== undefined
+          ? { added: event.linesAdded, removed: event.linesRemoved }
+          : countLineChanges(event.oldString ?? null, event.newString ?? null)
+      summary.eventCount += 1
+      summary.toolUseCount += 1
+      summary.cumulativeLinesAdded += eventLineStats.added
+      summary.cumulativeLinesRemoved += eventLineStats.removed
+      summary.firstTimestamp =
+        Date.parse(summary.firstTimestamp) <= Date.parse(event.timestamp)
+          ? summary.firstTimestamp
+          : event.timestamp
+      summary.lastTimestamp =
+        Date.parse(summary.lastTimestamp) >= Date.parse(event.timestamp)
+          ? summary.lastTimestamp
+          : event.timestamp
+      contributorSummaries.set(actorKey, summary)
+    }
+
+    if (!visible) {
+      continue
+    }
+
+    for (const actorKey of accumulator.actorCounts.keys()) {
+      const visibleSet = contributorVisible.get(actorKey) ?? new Set<string>()
+      visibleSet.add(accumulator.groupKey)
+      contributorVisible.set(actorKey, visibleSet)
+    }
+
+    files.push({
+      changeKey: buildChangeKey({
+        filePath: accumulator.filePath,
+        operation: lastEvent.operation,
+        ...(accumulator.relation ? { relation: accumulator.relation } : {}),
+      }),
+      filePath: accumulator.filePath,
+      relativePath: accumulator.relativePath,
+      ...(accumulator.displayPath ? { displayPath: accumulator.displayPath } : {}),
+      linesAdded: lineStats.added,
+      linesRemoved: lineStats.removed,
+      diffStatKnown,
+      eventCount: accumulator.events.length,
+      firstTimestamp: firstEvent.timestamp,
+      lastTimestamp: lastEvent.timestamp,
+      latestOperation: lastEvent.operation,
+      createdInTask: baselineState?.exists === false && finalState?.exists !== false,
+      deletedInTask: baselineState?.exists !== false && finalState?.exists === false,
+      ...(baselineState?.exists !== undefined ? { baselineExists: baselineState.exists } : {}),
+      ...(finalState?.exists !== undefined ? { finalExists: finalState.exists } : {}),
+      latestBeforeHash: firstEvent.before?.sha256 ?? baselineState?.sha256 ?? null,
+      latestAfterHash: lastEvent.after?.sha256 ?? finalState?.sha256 ?? null,
+      ...(baselineState ? { latestBeforeState: baselineState } : {}),
+      ...(finalState ? { latestAfterState: finalState } : {}),
+      contentAvailability,
+      reviewability,
+      ...(accumulator.relation ? { relation: accumulator.relation } : {}),
+      ...(primaryActorKey ? { primaryActorKey } : {}),
+      agentIds: [...accumulator.agentIds].sort(),
+      ...(accumulator.memberNames.size > 0 ? { memberNames: [...accumulator.memberNames].sort() } : {}),
+      executionSeqRange: {
+        start: accumulator.executionSeqMin,
+        end: accumulator.executionSeqMax,
+      },
+      ...(accumulator.warnings.size > 0 ? { warnings: [...accumulator.warnings] } : {}),
+    })
+  }
+
+  for (const notice of notices) {
+    const actorKey = buildActorKey({
+      agentId: notice.agentId,
+      memberName: notice.memberName,
+      sessionId: notice.sessionId,
+    })
+    const summary = contributorSummaries.get(actorKey) ?? {
+      actorKey,
+      ...(notice.agentId ? { agentId: notice.agentId } : {}),
+      ...(notice.memberName ? { memberName: notice.memberName } : {}),
+      eventCount: 0,
+      noticeCount: 0,
+      touchedFileCount: 0,
+      visibleFileCount: 0,
+      toolUseCount: 0,
+      cumulativeLinesAdded: 0,
+      cumulativeLinesRemoved: 0,
+      firstTimestamp: notice.timestamp,
+      lastTimestamp: notice.timestamp,
+    }
+    summary.noticeCount += 1
+    summary.firstTimestamp =
+      Date.parse(summary.firstTimestamp) <= Date.parse(notice.timestamp)
+        ? summary.firstTimestamp
+        : notice.timestamp
+    summary.lastTimestamp =
+      Date.parse(summary.lastTimestamp) >= Date.parse(notice.timestamp)
+        ? summary.lastTimestamp
+        : notice.timestamp
+    contributorSummaries.set(actorKey, summary)
+  }
+
+  const contributors = [...contributorSummaries.values()]
+    .map(summary => ({
+      ...summary,
+      touchedFileCount: contributorTouched.get(summary.actorKey)?.size ?? 0,
+      visibleFileCount: contributorVisible.get(summary.actorKey)?.size ?? 0,
+    }))
+    .sort((left, right) => {
+      if (right.visibleFileCount !== left.visibleFileCount) {
+        return right.visibleFileCount - left.visibleFileCount
+      }
+      if (right.eventCount !== left.eventCount) {
+        return right.eventCount - left.eventCount
+      }
+      return left.actorKey.localeCompare(right.actorKey)
+    })
+
+  const uniqueToolUseIds = [...new Set([
+    ...events.map(event => event.toolUseId),
+    ...notices.map(notice => notice.toolUseId),
+  ])]
+  const captureConfidence = deriveCaptureConfidence(events)
+  const bundleConfidence = confidenceLabelForEvents(events)
+  const scope: TaskChangeSummaryScopeV2 = {
+    confidence: {
+      tier:
+        bundleConfidence === 'high' ? 1 : bundleConfidence === 'medium' ? 2 : 3,
+      label: bundleConfidence,
+      reason: recovered
+        ? 'Derived from task-change ledger with recovery from malformed journal lines'
+        : 'Derived from task-change ledger',
+    },
+    ...(contributors[0]?.actorKey ? { primaryActorKey: contributors[0].actorKey } : {}),
+    ...(contributors[0]?.agentId ? { primaryAgentId: contributors[0].agentId } : {}),
+    ...(contributors[0]?.memberName ? { primaryMemberName: contributors[0].memberName } : {}),
+    memberName:
+      contributors[0]?.memberName ??
+      contributors[0]?.agentId ??
+      contributors[0]?.actorKey ??
+      '',
+    agentIds: [...new Set(events.flatMap(event => (event.agentId ? [event.agentId] : [])))].sort(),
+    ...(events.some(event => !!event.memberName)
+      ? {
+          memberNames: [
+            ...new Set(events.flatMap(event => (event.memberName ? [event.memberName] : []))),
+          ].sort(),
+        }
+      : {}),
+    startTimestamp: events[0]?.timestamp ?? notices[0]?.timestamp ?? new Date().toISOString(),
+    endTimestamp:
+      events[events.length - 1]?.timestamp ??
+      notices[notices.length - 1]?.timestamp ??
+      new Date().toISOString(),
+    toolUseIds: uniqueToolUseIds.slice(0, 256),
+    toolUseCount: uniqueToolUseIds.length,
+    ...(uniqueToolUseIds.length > 256 ? { toolUseIdsTruncated: true } : {}),
+    phaseSet: [...new Set(events.map(event => event.phase))].sort(),
+    ...(events.length > 0
+      ? {
+          executionSeqRange: {
+            start: Math.min(...events.map(event => event.executionSeq)),
+            end: Math.max(...events.map(event => event.executionSeq)),
+          },
+        }
+      : {}),
+    confidenceBreakdown: {
+      capture: captureConfidence,
+      attribution: events.every(event => event.agentId) ? 'high' : 'medium',
+      reviewability: files.every(file => file.reviewability === 'full-text')
+        ? 'full-text'
+        : files.some(file => file.reviewability === 'full-text' || file.reviewability === 'partial-text')
+          ? 'mixed'
+          : 'metadata-only',
+    },
+    visibleFileCount: files.length,
+    contributors,
+  }
+
+  const bundle: TaskChangeSummaryBundleV2 = {
+    schemaVersion: TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION,
     source: 'task-change-ledger',
+    bundleKind: 'summary',
     taskId,
     generatedAt: new Date().toISOString(),
+    journalStamp,
+    integrity: recovered ? 'recovered' : 'ok',
     eventCount: events.length,
+    noticeCount: notices.length,
+    scope,
     files,
     totalLinesAdded: files.reduce((sum, file) => sum + file.linesAdded, 0),
     totalLinesRemoved: files.reduce((sum, file) => sum + file.linesRemoved, 0),
+    diffStatCompleteness: files.every(file => file.diffStatKnown) ? 'complete' : 'partial',
     totalFiles: files.length,
-    confidence: hasLowConfidence ? 'medium' : 'high',
+    confidence: bundleConfidence,
+    warningCount: warnings.size,
     warnings: [...warnings],
-    events,
-    ...(notices.length > 0 ? { notices } : {}),
   }
 
-  await writeAtomic(getBundlePath(taskId, projectDir), JSON.stringify(bundle))
-  await writeAtomic(
-    getFreshnessPath(taskId, projectDir),
-    JSON.stringify({
-      taskId,
-      updatedAt: bundle.generatedAt,
-      eventCount: events.length,
-      source: 'task-change-ledger',
-    }),
-  )
+  const freshness: TaskChangeFreshnessSignalV2 = {
+    schemaVersion: TASK_CHANGE_FRESHNESS_SCHEMA_VERSION,
+    source: 'task-change-ledger',
+    taskId,
+    updatedAt: bundle.generatedAt,
+    journalStamp,
+    eventCount: events.length,
+    noticeCount: notices.length,
+    integrity: bundle.integrity,
+    bundleSchemaVersion: TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION,
+    bundleKind: 'summary',
+  }
+
+  return { bundle, freshness }
 }
 
 function enqueueTaskWrite(taskId: string, write: () => Promise<void>): Promise<void> {
@@ -691,6 +1747,74 @@ function enqueueTaskWrite(taskId: string, write: () => Promise<void>): Promise<v
   return next
 }
 
+async function writeDerivedArtifacts(taskId: string, projectDir: string): Promise<void> {
+  const { bundle, freshness } = await rebuildBundle(taskId, projectDir)
+  try {
+    await writeAtomic(getBundlePath(taskId, projectDir), JSON.stringify(bundle))
+    await writeAtomic(getFreshnessPath(taskId, projectDir), JSON.stringify(freshness))
+  } catch (error) {
+    const partialFreshness: TaskChangeFreshnessSignalV2 = {
+      ...freshness,
+      integrity: 'partial',
+      updatedAt: new Date().toISOString(),
+    }
+    try {
+      await writeAtomic(getFreshnessPath(taskId, projectDir), JSON.stringify(partialFreshness))
+    } catch (freshnessError) {
+      logError(freshnessError)
+    }
+    throw error
+  }
+}
+
+async function runTaskLedgerWrite(params: {
+  scope: ResolvedTaskScope
+  sessionId: string
+  agentId?: AgentId
+  toolUseId: string
+  projectDir: string
+  write: () => Promise<void>
+}): Promise<void> {
+  const lock = await acquireTaskWriterLock({
+    lockRootDir: getLockRootDir(params.projectDir),
+    taskId: params.scope.taskId,
+    sessionId: params.sessionId,
+    ownerId: randomUUID(),
+    waitBudgetMs: TASK_WRITER_LOCK_WAIT_BUDGET_MS,
+  })
+
+  try {
+    await params.write()
+    if (lock.stoleStaleLock) {
+      const noticeBase: Omit<TaskChangeNoticeV1, 'noticeId'> = {
+        schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
+        taskId: params.scope.taskId,
+        taskRef: params.scope.task.ref,
+        taskRefKind: params.scope.task.refKind,
+        phase: params.scope.phase,
+        executionSeq: params.scope.executionSeq,
+        sessionId: params.sessionId,
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+        toolUseId: params.toolUseId,
+        timestamp: new Date().toISOString(),
+        severity: 'warning',
+        message: 'Task change ledger stole a stale writer lock before rebuilding the summary.',
+        code: 'writer-lock-stolen',
+      }
+      await appendNotice(
+        {
+          ...noticeBase,
+          noticeId: buildNoticeId(noticeBase),
+        },
+        params.projectDir,
+      )
+    }
+    await writeDerivedArtifacts(params.scope.taskId, params.projectDir)
+  } finally {
+    await lock.release()
+  }
+}
+
 async function persistNotice(params: {
   scope: ResolvedTaskScope
   sessionId: string
@@ -699,8 +1823,9 @@ async function persistNotice(params: {
   message: string
 }): Promise<void> {
   const projectDir = getLedgerProjectDir()
+  const memberName = resolveLedgerMemberName(params.agentId)
   const noticeBase: Omit<TaskChangeNoticeV1, 'noticeId'> = {
-    schemaVersion: TASK_CHANGE_LEDGER_SCHEMA_VERSION,
+    schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
     taskId: params.scope.taskId,
     taskRef: params.scope.task.ref,
     taskRefKind: params.scope.task.refKind,
@@ -708,18 +1833,30 @@ async function persistNotice(params: {
     executionSeq: params.scope.executionSeq,
     sessionId: params.sessionId,
     ...(params.agentId ? { agentId: params.agentId } : {}),
+    ...(memberName ? { memberName } : {}),
     toolUseId: params.toolUseId,
     timestamp: new Date().toISOString(),
     severity: 'warning',
     message: params.message,
+    ...(params.message.includes('multiple task scopes were active')
+      ? { code: 'multi-scope-skipped' as const }
+      : {}),
   }
   const notice: TaskChangeNoticeV1 = {
     ...noticeBase,
     noticeId: buildNoticeId(noticeBase),
   }
   await enqueueTaskWrite(params.scope.taskId, async () => {
-    await appendNotice(notice, projectDir)
-    await rebuildBundle(params.scope.taskId, projectDir)
+    await runTaskLedgerWrite({
+      scope: params.scope,
+      sessionId: params.sessionId,
+      agentId: params.agentId,
+      toolUseId: params.toolUseId,
+      projectDir,
+      write: async () => {
+        await appendNotice(notice, projectDir)
+      },
+    })
   })
 }
 
@@ -737,6 +1874,7 @@ async function persistEvents(changes: ExactFileChange[], params: {
 
   const projectDir = getLedgerProjectDir()
   const timestamp = new Date().toISOString()
+  const memberName = resolveLedgerMemberName(params.agentId)
   const events: TaskChangeEventV1[] = []
 
   for (const change of changes) {
@@ -770,7 +1908,7 @@ async function persistEvents(changes: ExactFileChange[], params: {
       change.newString ?? change.afterContent,
     )
     const eventBase: Omit<TaskChangeEventV1, 'eventId'> = {
-      schemaVersion: TASK_CHANGE_LEDGER_SCHEMA_VERSION,
+      schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
       taskId: params.scope.taskId,
       taskRef: params.scope.task.ref,
       taskRefKind: params.scope.task.refKind,
@@ -778,6 +1916,7 @@ async function persistEvents(changes: ExactFileChange[], params: {
       executionSeq: params.scope.executionSeq,
       sessionId: params.sessionId,
       ...(params.agentId ? { agentId: params.agentId } : {}),
+      ...(memberName ? { memberName } : {}),
       toolUseId: params.toolUseId,
       source: change.source,
       operation,
@@ -810,10 +1949,18 @@ async function persistEvents(changes: ExactFileChange[], params: {
   }
 
   await enqueueTaskWrite(params.scope.taskId, async () => {
-    for (const event of events) {
-      await appendEvent(event, projectDir)
-    }
-    await rebuildBundle(params.scope.taskId, projectDir)
+    await runTaskLedgerWrite({
+      scope: params.scope,
+      sessionId: params.sessionId,
+      agentId: params.agentId,
+      toolUseId: params.toolUseId,
+      projectDir,
+      write: async () => {
+        for (const event of events) {
+          await appendEvent(event, projectDir)
+        }
+      },
+    })
   })
 }
 
@@ -1141,7 +2288,7 @@ async function readGitBlob(
   revision: string,
   relativePath: string,
 ): Promise<ShellSnapshotFile> {
-  const objectSpec = `${revision}:${relativePath}`
+  const objectSpec = `${revision}:${relativePath.replace(/\\/g, '/')}`
   const objectIdResult = await execFileNoThrowWithCwd('git', ['rev-parse', objectSpec], {
     cwd: gitRoot,
     timeout: GIT_TIMEOUT_MS,
@@ -1176,6 +2323,7 @@ async function readGitBlob(
     timeout: GIT_TIMEOUT_MS,
     preserveOutputOnError: false,
     maxBuffer: MAX_TEXT_BLOB_BYTES,
+    stripFinalNewline: false,
   })
   if (result.code !== 0) {
     return objectId || sizeResult.code === 0
@@ -1325,7 +2473,7 @@ function buildExcludedRelativePaths(
   }
   for (const filePath of filePaths) {
     const normalized = normalizeFilePath(filePath, gitRoot)
-    const relativePath = relative(gitRoot, normalized)
+    const relativePath = relative(gitRoot, normalized).replace(/\\/g, '/')
     if (relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath)) {
       excluded.add(relativePath)
     }
@@ -1396,15 +2544,33 @@ export async function maybeBeginTaskChangeShellSnapshot(params: {
   }
 }
 
-export function deferTaskChangeShellSnapshot(
+export async function deferTaskChangeShellSnapshot(
   backgroundTaskId: string,
   snapshot: ShellSnapshot | null,
   options?: FinishShellSnapshotOptions,
-): void {
+): Promise<void> {
   if (!snapshot) {
     return
   }
-  pendingShellSnapshots.set(backgroundTaskId, { snapshot, options })
+  const pending: PendingDeferredShellSnapshot = {
+    snapshot,
+    ...(options ? { options } : {}),
+  }
+  pendingShellSnapshots.set(backgroundTaskId, pending)
+
+  try {
+    await cleanupExpiredDeferredShellSnapshots()
+    const persisted = await persistDeferredShellSnapshot(
+      backgroundTaskId,
+      snapshot,
+      options,
+    )
+    pending.projectRecordPath = persisted.projectRecordPath
+    pending.globalPointerPath = persisted.globalPointerPath
+  } catch (error) {
+    logError(error)
+    snapshot.warnings.push(DEFERRED_SHELL_SNAPSHOT_MEMORY_ONLY_WARNING)
+  }
 }
 
 export async function finishTaskChangeShellSnapshot(
@@ -1431,6 +2597,11 @@ export async function finishTaskChangeShellSnapshot(
       ...committedChangePaths.entries,
     ])
     const allPaths = new Set(allPathEntries.keys())
+    for (const relativePath of [...allPaths]) {
+      if (isTaskChangeLedgerInternalRelativePath(relativePath)) {
+        allPaths.delete(relativePath)
+      }
+    }
     const excludedRelativePaths = buildExcludedRelativePaths(
       snapshot.gitRoot,
       options.excludedFilePaths,
@@ -1532,15 +2703,32 @@ export async function completeDeferredTaskChangeShellSnapshot(
   toolStatus: TaskChangeToolStatus,
 ): Promise<void> {
   const pending = pendingShellSnapshots.get(backgroundTaskId)
-  if (!pending) {
+  pendingShellSnapshots.delete(backgroundTaskId)
+
+  const recovered = pending
+    ? null
+    : await readPersistedDeferredShellSnapshot(backgroundTaskId)
+  const entry = pending ?? recovered
+  if (!entry) {
     return
   }
-  pendingShellSnapshots.delete(backgroundTaskId)
-  await finishTaskChangeShellSnapshot(
-    pending.snapshot,
-    toolStatus,
-    pending.options,
-  )
+  if (recovered) {
+    recovered.snapshot.warnings.push(DEFERRED_SHELL_SNAPSHOT_RECOVERY_WARNING)
+  }
+
+  try {
+    await finishTaskChangeShellSnapshot(entry.snapshot, toolStatus, entry.options)
+  } finally {
+    await removeDeferredShellSnapshotArtifacts({
+      projectRecordPath: entry.projectRecordPath,
+      globalPointerPath: entry.globalPointerPath,
+    })
+  }
+}
+
+export function clearDeferredTaskChangeShellSnapshotsForTests(): void {
+  pendingShellSnapshots.clear()
+  lastDeferredShellSnapshotCleanupAt = 0
 }
 
 export function buildTaskChangeLedgerDebugPath(taskId: string): string {

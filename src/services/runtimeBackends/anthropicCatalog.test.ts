@@ -90,8 +90,8 @@ describe('anthropic runtime catalog', () => {
     expect(catalog.models.find((model) => model.launchModel === 'opus[1m]')).toMatchObject({
       displayName: 'Opus 4.7 (1M)',
       hidden: true,
-      supportedReasoningEfforts: [],
-      defaultReasoningEffort: null,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
       supportsFastMode: false,
       source: 'anthropic-models-api',
     })

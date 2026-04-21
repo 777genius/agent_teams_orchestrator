@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { readFileSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { basename, join } from 'path'
 import { randomUUID } from 'crypto'
 
 import {
@@ -161,5 +161,77 @@ describe('BoardTask transcript persistence', () => {
     expect(freshnessEntry.taskId).toBe(taskId)
     expect(freshnessEntry.transcriptFile).toBe(`${getSessionId()}.jsonl`)
     expect(typeof freshnessEntry.updatedAt).toBe('string')
+  })
+
+  test('uses a Windows-safe freshness filename for reserved task ids', async () => {
+    const taskId = 'CON'
+    const message = createAssistantMessage({
+      content: 'Adding a reserved-name task-linked transcript message.',
+    }) as TaskAwareMessage
+
+    message.boardTaskLinks = [
+      {
+        schemaVersion: 1,
+        task: {
+          ref: taskId,
+          refKind: 'canonical',
+          canonicalId: taskId,
+        },
+        targetRole: 'subject',
+        linkKind: 'execution',
+        actorContext: {
+          relation: 'same_task',
+        },
+      },
+    ]
+
+    await recordTranscript([message])
+    await flushSessionStorage()
+
+    const transcriptPath = getTranscriptPath()
+    const projectDir = join(transcriptPath, '..')
+    const freshnessPath = getBoardTaskLogFreshnessSignalFilePath(projectDir, taskId)
+    const freshnessEntry = JSON.parse(readFileSync(freshnessPath, 'utf8')) as {
+      taskId?: string
+    }
+
+    expect(basename(freshnessPath)).not.toBe('CON.json')
+    expect(freshnessEntry.taskId).toBe(taskId)
+  })
+
+  test('uses a short hashed freshness filename for very long task ids', async () => {
+    const taskId = `task-${'x'.repeat(180)}`
+    const message = createAssistantMessage({
+      content: 'Adding a long task-linked transcript message.',
+    }) as TaskAwareMessage
+
+    message.boardTaskLinks = [
+      {
+        schemaVersion: 1,
+        task: {
+          ref: taskId,
+          refKind: 'canonical',
+          canonicalId: taskId,
+        },
+        targetRole: 'subject',
+        linkKind: 'execution',
+        actorContext: {
+          relation: 'same_task',
+        },
+      },
+    ]
+
+    await recordTranscript([message])
+    await flushSessionStorage()
+
+    const transcriptPath = getTranscriptPath()
+    const projectDir = join(transcriptPath, '..')
+    const freshnessPath = getBoardTaskLogFreshnessSignalFilePath(projectDir, taskId)
+    const freshnessEntry = JSON.parse(readFileSync(freshnessPath, 'utf8')) as {
+      taskId?: string
+    }
+
+    expect(basename(freshnessPath)).toMatch(/^task-id-[0-9a-f]{32}\.json$/)
+    expect(freshnessEntry.taskId).toBe(taskId)
   })
 })

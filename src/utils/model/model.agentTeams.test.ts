@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { clearAgentTeamsStateForTesting, setAgentTeamsCapabilitiesForTesting } from '../../services/agentTeams/store.js';
 import type { AgentTeamsCapabilitiesRecord } from '../../services/agentTeams/types.js';
-import { getDefaultMainLoopModel, getMainLoopModel } from './model.js';
+import {
+  getDefaultMainLoopModel,
+  getDefaultOpusModel,
+  getMainLoopModel,
+  getMarketingNameForModel,
+  getPublicModelDisplayName,
+  parseUserSpecifiedModel,
+} from './model.js';
+import { getFastModeModel, isFastModeSupportedByModel } from '../fastMode.js';
 
 function createCodexCapabilities(
   tier: string,
@@ -48,7 +56,10 @@ function createCodexCapabilities(
 afterEach(() => {
   clearAgentTeamsStateForTesting();
   delete process.env.CLAUDE_CODE_USE_OPENAI;
+  delete process.env.CLAUDE_CODE_USE_BEDROCK;
+  delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   delete process.env.ANTHROPIC_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
   delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   delete process.env.CLAUDE_CODE_ENTRY_PROVIDER;
 });
@@ -89,5 +100,35 @@ describe('model access fallback with agent_teams capabilities', () => {
     );
 
     expect(getMainLoopModel()).toBe('gpt-5.3-codex');
+  });
+});
+
+describe('Opus 4.7 defaults', () => {
+  it('resolves the first-party Opus alias to Opus 4.7', () => {
+    expect(getDefaultOpusModel()).toBe('claude-opus-4-7');
+    expect(parseUserSpecifiedModel('opus')).toBe('claude-opus-4-7');
+    expect(parseUserSpecifiedModel('opus[1m]')).toBe('claude-opus-4-7[1m]');
+  });
+
+  it('keeps third-party Opus defaults pinned to 4.6', () => {
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+
+    expect(getDefaultOpusModel()).toContain('opus-4-6');
+  });
+
+  it('treats Opus 4.7 as the public first-party Opus model for labels and core capabilities', () => {
+    expect(getPublicModelDisplayName('claude-opus-4-7')).toBe('Opus 4.7');
+    expect(getPublicModelDisplayName('claude-opus-4-7[1m]')).toBe('Opus 4.7 (1M context)');
+    expect(getMarketingNameForModel('claude-opus-4-7[1m]')).toBe(
+      'Opus 4.7 (with 1M context)'
+    );
+  });
+
+  it('keeps fast mode pinned to explicit Opus 4.6 while opus resolves to 4.7', () => {
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+
+    expect(getFastModeModel()).toBe('claude-opus-4-6');
+    expect(isFastModeSupportedByModel('opus')).toBe(false);
+    expect(isFastModeSupportedByModel('claude-opus-4-6')).toBe(true);
   });
 });

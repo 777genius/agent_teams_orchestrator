@@ -285,7 +285,13 @@ export async function getGitCommittedPathEntries(params: {
   maxPaths: number
 }): Promise<GitChangePathResult> {
   const result = await runGitCapped(
-    ['diff', '--name-status', '-z', `${params.beforeHead}..${params.afterHead}`],
+    [
+      'diff',
+      '--name-status',
+      '-z',
+      '--find-copies-harder',
+      `${params.beforeHead}..${params.afterHead}`,
+    ],
     {
       cwd: params.gitRoot,
       timeoutMs: params.timeoutMs,
