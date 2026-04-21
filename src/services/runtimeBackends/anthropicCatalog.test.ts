@@ -80,19 +80,35 @@ describe('anthropic runtime catalog', () => {
       'sonnet',
       'haiku',
     ])
-    expect(getAnthropicRuntimeReasoningEfforts(catalog)).toEqual(['low', 'medium', 'high'])
+    expect(getAnthropicRuntimeReasoningEfforts(catalog)).toEqual([
+      'low',
+      'medium',
+      'high',
+      'max',
+    ])
 
     expect(catalog.models.find((model) => model.launchModel === 'opus[1m]')).toMatchObject({
       displayName: 'Opus 4.7 (1M)',
       hidden: true,
-      supportedReasoningEfforts: ['low', 'medium', 'high'],
+      supportedReasoningEfforts: [],
       defaultReasoningEffort: null,
+      supportsFastMode: false,
+      source: 'anthropic-models-api',
+    })
+    expect(catalog.models.find((model) => model.launchModel === 'claude-opus-4-6')).toMatchObject({
+      displayName: 'Opus 4.6',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      supportsFastMode: true,
       source: 'anthropic-models-api',
     })
     expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
       displayName: 'Haiku 4.5',
       hidden: false,
       supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      supportsFastMode: false,
       source: 'anthropic-models-api',
     })
   })
@@ -114,6 +130,8 @@ describe('anthropic runtime catalog', () => {
     ])
     expect(catalog.models.find((model) => model.launchModel === 'claude-sonnet-4-6[1m]')).toMatchObject({
       hidden: true,
+      defaultReasoningEffort: 'high',
+      supportsFastMode: false,
       source: 'static-fallback',
     })
   })

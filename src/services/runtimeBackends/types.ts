@@ -40,7 +40,14 @@ export type RuntimeBackendOptionState =
 
 export type RuntimeBackendOptionAudience = 'general' | 'internal'
 
-export type RuntimeReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export type RuntimeReasoningEffort =
+  | 'none'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
 
 export type RuntimeProviderModelCatalogSource =
   | 'anthropic-models-api'
@@ -61,6 +68,7 @@ export type RuntimeProviderModelCatalogItem = {
   hidden: boolean
   supportedReasoningEfforts: RuntimeReasoningEffort[]
   defaultReasoningEffort: RuntimeReasoningEffort | null
+  supportsFastMode?: boolean
   inputModalities: string[]
   supportsPersonality: boolean
   isDefault: boolean
@@ -97,6 +105,12 @@ export type RuntimeProviderCapabilities = {
     supported: boolean
     values: RuntimeReasoningEffort[]
     configPassthrough: boolean
+  }
+  fastMode?: {
+    supported: boolean
+    available: boolean
+    reason: string | null
+    source: 'runtime'
   }
 }
 

@@ -14,10 +14,12 @@ import {
 import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
+  getAnthropicRuntimeFastModeCapability,
   getAnthropicRuntimeModelCatalog,
   getAnthropicRuntimeReasoningEfforts,
   getAnthropicVisibleRuntimeModels,
 } from './anthropicCatalog.js'
+import { buildAnthropicRuntimeStatus } from './anthropicStatus.js'
 import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
 import type {
   RuntimeBackendOptionAudience,
@@ -189,41 +191,15 @@ async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
   const anthropicAuth = getAnthropicAuthenticated()
   const modelCatalog = await getAnthropicRuntimeModelCatalog()
   const reasoningEfforts = getAnthropicRuntimeReasoningEfforts(modelCatalog)
-
-  return {
-    providerId: 'anthropic',
-    displayName: 'Anthropic',
-    supported: true,
-    authenticated: anthropicAuth.authenticated,
-    authMethod: anthropicAuth.authMethod,
-    verificationState: 'verified',
-    canLoginFromUi: true,
-    capabilities: {
-      teamLaunch: true,
-      oneShot: true,
-      extensions: buildExtensionCapabilities(),
-    },
-    statusMessage: anthropicAuth.authenticated ? null : 'Not connected',
-    detailMessage: null,
-    selectedBackendId: null,
-    resolvedBackendId: null,
-    availableBackends: [],
-    externalRuntimeDiagnostics: [],
-    models: getAnthropicVisibleRuntimeModels(modelCatalog),
+  const fastMode = getAnthropicRuntimeFastModeCapability()
+  return buildAnthropicRuntimeStatus({
+    auth: anthropicAuth,
     modelCatalog,
-    runtimeCapabilities: {
-      modelCatalog: {
-        dynamic: true,
-        source: modelCatalog.source,
-      },
-      reasoningEffort: {
-        supported: reasoningEfforts.length > 0,
-        values: reasoningEfforts,
-        configPassthrough: false,
-      },
-    },
-    backend: null,
-  }
+    visibleModels: getAnthropicVisibleRuntimeModels(modelCatalog),
+    reasoningEfforts,
+    fastMode,
+    extensions: buildExtensionCapabilities(),
+  })
 }
 
 function getCodexModels(): string[] {

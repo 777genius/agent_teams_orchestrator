@@ -1,15 +1,27 @@
 import axios from 'axios'
 
 import {
+  convertEffortValueToLevel,
+  getDefaultEffortForModel,
+  modelSupportsEffort,
+  modelSupportsMaxEffort,
+} from '../../utils/effort.js'
+import {
   getAuthHeaders,
   getUserAgent,
   withOAuth401Retry,
 } from '../../utils/http.js'
+import {
+  getFastModeUnavailableReason,
+  isFastModeEnabled,
+  isFastModeSupportedByModel,
+} from '../../utils/fastMode.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import type {
   RuntimeProviderModelCatalog,
   RuntimeProviderModelCatalogItem,
   RuntimeProviderModelCatalogStatus,
+  RuntimeProviderCapabilities,
   RuntimeReasoningEffort,
 } from './types.js'
 
@@ -20,7 +32,7 @@ const ANTHROPIC_FALLBACK_CACHE_TTL_MS = 60 * 1_000
 const ONE_MILLION_INPUT_TOKENS = 1_000_000
 const ANTHROPIC_DEFAULT_LAUNCH_MODEL = 'opus[1m]'
 const ANTHROPIC_STATIC_VISIBLE_MODELS = new Set(['opus', 'claude-opus-4-6', 'sonnet', 'haiku'])
-const ANTHROPIC_EFFORT_ORDER: RuntimeReasoningEffort[] = ['low', 'medium', 'high']
+const ANTHROPIC_EFFORT_ORDER: RuntimeReasoningEffort[] = ['low', 'medium', 'high', 'max']
 
 type AnthropicCatalogFamily = 'opus' | 'sonnet' | 'haiku'
 
@@ -218,18 +230,56 @@ function hasCompleteCapabilityData(model: AnthropicApiModelInfo | null | undefin
   )
 }
 
-function parseAnthropicReasoningEfforts(model: AnthropicApiModelInfo | null): RuntimeReasoningEffort[] {
-  const capabilities = model?.capabilities
-  if (!isRecord(capabilities)) {
+function normalizeResolvedModelId(model: AnthropicApiModelInfo | null): string | null {
+  const resolvedId = model?.id?.trim()
+  return resolvedId && resolvedId.length > 0 ? resolvedId : null
+}
+
+function resolveFallbackPreferredModelId(
+  definition: AnthropicLaunchDefinition,
+): string | null {
+  const preferredModelId = definition.preferredLiveIds[0]?.trim()
+  return preferredModelId && preferredModelId.length > 0 ? preferredModelId : null
+}
+
+function resolveRuntimeBackedAnthropicEfforts(model: AnthropicApiModelInfo | null): RuntimeReasoningEffort[] {
+  const resolvedModelId = normalizeResolvedModelId(model)
+  if (!resolvedModelId || !modelSupportsEffort(resolvedModelId)) {
     return []
   }
 
-  const effortCapability = capabilities.effort
-  if (!isRecord(effortCapability) || readCapabilitySupport(effortCapability) !== true) {
-    return []
+  const efforts: RuntimeReasoningEffort[] = ['low', 'medium', 'high']
+  if (modelSupportsMaxEffort(resolvedModelId)) {
+    efforts.push('max')
+  }
+  return efforts
+}
+
+function resolveAnthropicDefaultReasoningEffort(
+  model: AnthropicApiModelInfo | null,
+): RuntimeReasoningEffort | null {
+  const resolvedModelId = normalizeResolvedModelId(model)
+  if (!resolvedModelId || !modelSupportsEffort(resolvedModelId)) {
+    return null
   }
 
-  return ANTHROPIC_EFFORT_ORDER.filter(level => readCapabilitySupport(effortCapability[level]))
+  try {
+    const defaultEffort = getDefaultEffortForModel(resolvedModelId)
+    return defaultEffort === undefined ? 'high' : convertEffortValueToLevel(defaultEffort)
+  } catch {
+    // Runtime catalog fallback must stay usable even when auth-scoped
+    // subscriber metadata is unavailable in the current process.
+    return 'high'
+  }
+}
+
+function resolveAnthropicFastModeSupport(model: AnthropicApiModelInfo | null): boolean {
+  const resolvedModelId = normalizeResolvedModelId(model)
+  if (!resolvedModelId) {
+    return false
+  }
+
+  return isFastModeSupportedByModel(resolvedModelId)
 }
 
 function parseAnthropicInputModalities(model: AnthropicApiModelInfo | null): string[] {
@@ -285,8 +335,14 @@ function createAnthropicCatalogItem(params: {
   const displayName = formatAnthropicCatalogItemDisplayName(params.definition, params.liveModel)
   const supportedReasoningEfforts =
     params.source === 'anthropic-models-api'
-      ? parseAnthropicReasoningEfforts(params.liveModel)
+      ? resolveRuntimeBackedAnthropicEfforts(params.liveModel)
       : params.definition.fallbackReasoningEfforts
+  const defaultReasoningEffort =
+    params.source === 'anthropic-models-api'
+      ? resolveAnthropicDefaultReasoningEffort(params.liveModel)
+      : resolveAnthropicDefaultReasoningEffort({
+          id: resolveFallbackPreferredModelId(params.definition),
+        })
 
   return {
     id: params.definition.launchModel,
@@ -294,7 +350,11 @@ function createAnthropicCatalogItem(params: {
     displayName,
     hidden: params.definition.hidden,
     supportedReasoningEfforts,
-    defaultReasoningEffort: null,
+    defaultReasoningEffort,
+    supportsFastMode:
+      params.source === 'anthropic-models-api'
+        ? resolveAnthropicFastModeSupport(params.liveModel)
+        : false,
     inputModalities:
       params.source === 'anthropic-models-api'
         ? parseAnthropicInputModalities(params.liveModel)
@@ -580,6 +640,26 @@ export function getAnthropicRuntimeReasoningEfforts(
   return ANTHROPIC_EFFORT_ORDER.filter((effort) =>
     catalog.models.some((model) => model.supportedReasoningEfforts.includes(effort)),
   )
+}
+
+export function getAnthropicRuntimeFastModeCapability(): NonNullable<
+  RuntimeProviderCapabilities['fastMode']
+> {
+  const supported = isFastModeEnabled()
+  const runtimeUnavailableReason = supported
+    ? getFastModeUnavailableReason()
+    : 'Fast mode is not available'
+  const available =
+    supported
+    && (runtimeUnavailableReason === null
+      || runtimeUnavailableReason === 'Fast mode is not available in the Agent SDK')
+
+  return {
+    supported,
+    available,
+    reason: available ? null : runtimeUnavailableReason,
+    source: 'runtime',
+  }
 }
 
 export function createStaticAnthropicRuntimeModelCatalog(params: {
