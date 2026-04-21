@@ -15,6 +15,7 @@ type ExecFileOptions = {
   abortSignal?: AbortSignal
   timeout?: number
   preserveOutputOnError?: boolean
+  stripFinalNewline?: boolean
   // Setting useCwd=false avoids circular dependencies during initialization
   // getCwd() -> PersistentShell -> logEvent() -> execFileNoThrow
   useCwd?: boolean
@@ -36,6 +37,7 @@ export function execFileNoThrow(
     abortSignal: options.abortSignal,
     timeout: options.timeout,
     preserveOutputOnError: options.preserveOutputOnError,
+    stripFinalNewline: options.stripFinalNewline,
     cwd: options.useCwd ? getCwd() : undefined,
     env: options.env,
     stdin: options.stdin,
@@ -48,6 +50,7 @@ type ExecFileWithCwdOptions = {
   timeout?: number
   preserveOutputOnError?: boolean
   maxBuffer?: number
+  stripFinalNewline?: boolean
   cwd?: string
   env?: NodeJS.ProcessEnv
   shell?: boolean | string | undefined
@@ -96,6 +99,7 @@ export function execFileNoThrowWithCwd(
     cwd: finalCwd,
     env: finalEnv,
     maxBuffer,
+    stripFinalNewline = true,
     shell,
     stdin: finalStdin,
     input: finalInput,
@@ -109,6 +113,7 @@ export function execFileNoThrowWithCwd(
     // Use execa for cross-platform .bat/.cmd compatibility on Windows
     execa(file, args, {
       maxBuffer,
+      stripFinalNewline,
       signal: abortSignal,
       timeout: finalTimeout,
       cwd: finalCwd,
