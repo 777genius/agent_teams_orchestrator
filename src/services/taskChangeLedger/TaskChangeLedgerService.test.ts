@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
-import { mkdtemp, readFile, rm, writeFile, mkdir, unlink } from 'fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile, mkdir, unlink } from 'fs/promises'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 
@@ -13,6 +13,7 @@ import { getRuntimeBoardTaskExecutionStore } from '../boardTaskActivity/RuntimeB
 import type { BoardTaskLocator, BoardTaskPhase } from '../boardTaskActivity/contract.js'
 import {
   captureTaskChangeToolResult,
+  clearDeferredTaskChangeShellSnapshotsForTests,
   completeDeferredTaskChangeShellSnapshot,
   deferTaskChangeShellSnapshot,
   finishTaskChangeShellSnapshot,
@@ -22,6 +23,8 @@ import { clearDynamicTeamContext, setDynamicTeamContext } from '../../utils/team
 
 let repoDir = ''
 let sessionId = 'session-1'
+let configDir = ''
+let previousClaudeConfigDir: string | undefined
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
 function runGit(args: string[], cwd = repoDir): string {
@@ -95,6 +98,15 @@ async function readJsonl<T>(filePath: string): Promise<T[]> {
     .map(line => JSON.parse(line) as T)
 }
 
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function isWindowsReservedArtifactSegment(segment: string): boolean {
   const stem = segment.split('.')[0]?.toUpperCase() ?? ''
   return (
@@ -139,6 +151,24 @@ function freshnessPath(taskId: string): string {
   return join(repoDir, '.board-task-change-freshness', `${encodeTaskId(taskId)}.json`)
 }
 
+function deferredProjectSnapshotPath(backgroundTaskId: string): string {
+  return join(
+    repoDir,
+    '.board-task-changes',
+    'pending-shell-snapshots',
+    `${encodeTaskId(backgroundTaskId)}.json`,
+  )
+}
+
+function deferredGlobalPointerPath(backgroundTaskId: string): string {
+  return join(
+    configDir,
+    'task-change-ledger',
+    'pending-shell-snapshots',
+    `${encodeTaskId(backgroundTaskId)}.json`,
+  )
+}
+
 function lockDir(taskId: string): string {
   return join(repoDir, '.board-task-changes', 'locks', `${encodeTaskId(taskId)}.lock`)
 }
@@ -157,15 +187,28 @@ function sha256(content: string): string {
 
 beforeEach(async () => {
   getRuntimeBoardTaskExecutionStore().clearForTests()
+  clearDeferredTaskChangeShellSnapshotsForTests()
+  previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+  configDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-config-'))
+  process.env.CLAUDE_CONFIG_DIR = configDir
   repoDir = await createGitRepo()
   setRepoContext(repoDir)
 })
 
 afterEach(async () => {
   getRuntimeBoardTaskExecutionStore().clearForTests()
+  clearDeferredTaskChangeShellSnapshotsForTests()
   clearDynamicTeamContext()
   if (repoDir) {
     await rm(repoDir, { recursive: true, force: true })
+  }
+  if (configDir) {
+    await rm(configDir, { recursive: true, force: true })
+  }
+  if (previousClaudeConfigDir === undefined) {
+    delete process.env.CLAUDE_CONFIG_DIR
+  } else {
+    process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir
   }
 })
 
@@ -262,7 +305,7 @@ describe('TaskChangeLedgerService integration', () => {
     await unlink(join(repoDir, 'src', 'old.ts'))
     await writeRepoFile('src/new.ts', 'export const newValue = 2;\n')
 
-    deferTaskChangeShellSnapshot('bg-task-1', snapshot)
+    await deferTaskChangeShellSnapshot('bg-task-1', snapshot)
     await completeDeferredTaskChangeShellSnapshot('bg-task-1', 'succeeded')
 
     const bundle = await readJson<Record<string, unknown>>(bundlePath('task-shell-background'))
@@ -284,6 +327,266 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(new Set(events.map(event => event.toolStatus))).toEqual(new Set(['succeeded']))
     expect(new Set(events.map(event => event.source))).toEqual(new Set(['shell_snapshot']))
+  })
+
+  test('persists deferred snapshot artifacts and removes them after memory completion', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-memory-cleanup'
+    openScope('task-deferred-memory-cleanup', 'work', agentId)
+    await writeRepoFile('src/memory.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit src/memory.ts' },
+      toolUseId: 'tool-memory-cleanup',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/memory.ts', 'export const value = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(true)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(true)
+
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath('task-deferred-memory-cleanup'),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.toolStatus).toBe('succeeded')
+  })
+
+  test('continues memory-only when durable deferred snapshot write fails', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-memory-only'
+    openScope('task-deferred-memory-only', 'work', agentId)
+    await writeRepoFile('src/memory-only.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+    await writeFile(join(configDir, 'task-change-ledger'), 'not a directory', 'utf8')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit src/memory-only.ts' },
+      toolUseId: 'tool-memory-only',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/memory-only.ts', 'export const value = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath('task-deferred-memory-only'),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.warnings).toEqual(
+      expect.arrayContaining([
+        'Task change ledger could not persist deferred shell snapshot; recovery is memory-only.',
+      ]),
+    )
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(false)
+  })
+
+  test('recovers deferred snapshot from disk and preserves snapshot options', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-recovered-powershell'
+    openScope('task-deferred-recovery', 'work', agentId)
+    await writeRepoFile('src/keep.ts', 'export const keep = 1;\n')
+    await writeRepoFile('src/skip.ts', 'export const skip = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: 'PowerShell',
+      input: { command: 'Set-Content src/keep.ts; Set-Content src/skip.ts' },
+      includeNonBashTool: true,
+      toolUseId: 'tool-recovery',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/keep.ts', 'export const keep = 2;\n')
+    await writeRepoFile('src/skip.ts', 'export const skip = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot, {
+      source: 'powershell_snapshot',
+      confidence: 'medium',
+      excludedFilePaths: [join(repoDir, 'src', 'skip.ts')],
+    })
+    clearDeferredTaskChangeShellSnapshotsForTests()
+
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath('task-deferred-recovery'),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.filePath).toBe(join(repoDir, 'src', 'keep.ts'))
+    expect(events[0]?.source).toBe('powershell_snapshot')
+    expect(events[0]?.confidence).toBe('medium')
+    expect(events[0]?.warnings).toEqual(
+      expect.arrayContaining([
+        'Task change ledger recovered a deferred shell snapshot from disk after in-memory state was unavailable.',
+      ]),
+    )
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+  })
+
+  test('does not attribute files when deferred snapshot pointer is corrupt', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-corrupt-pointer'
+    openScope('task-corrupt-pointer', 'work', agentId)
+    await writeRepoFile('src/corrupt.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit src/corrupt.ts' },
+      toolUseId: 'tool-corrupt-pointer',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/corrupt.ts', 'export const value = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+    clearDeferredTaskChangeShellSnapshotsForTests()
+    await writeFile(deferredGlobalPointerPath(backgroundTaskId), '{bad-json', 'utf8')
+
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    expect(await pathExists(eventsPath('task-corrupt-pointer'))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+  })
+
+  test('cleans stale deferred pointer when project snapshot record is missing', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-missing-record'
+    openScope('task-missing-record', 'work', agentId)
+    await writeRepoFile('src/missing-record.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit src/missing-record.ts' },
+      toolUseId: 'tool-missing-record',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/missing-record.ts', 'export const value = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+    clearDeferredTaskChangeShellSnapshotsForTests()
+    await rm(deferredProjectSnapshotPath(backgroundTaskId), { force: true })
+
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    expect(await pathExists(eventsPath('task-missing-record'))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+  })
+
+  test('ignores and cleans expired deferred snapshot records', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-expired-record'
+    openScope('task-expired-record', 'work', agentId)
+    await writeRepoFile('src/expired.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit src/expired.ts' },
+      toolUseId: 'tool-expired-record',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/expired.ts', 'export const value = 2;\n')
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+    clearDeferredTaskChangeShellSnapshotsForTests()
+
+    const record = await readJson<Record<string, unknown>>(
+      deferredProjectSnapshotPath(backgroundTaskId),
+    )
+    await writeFile(
+      deferredProjectSnapshotPath(backgroundTaskId),
+      `${JSON.stringify({
+        ...record,
+        expiresAt: new Date(Date.now() - 1000).toISOString(),
+      })}\n`,
+      'utf8',
+    )
+
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+
+    expect(await pathExists(eventsPath('task-expired-record'))).toBe(false)
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+  })
+
+  test('uses safe artifact paths for reserved deferred background task ids', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'CON'
+    const expectedSegment = `task-id-${createHash('sha256')
+      .update(backgroundTaskId)
+      .digest('hex')
+      .slice(0, 32)}`
+    openScope('task-reserved-background-id', 'work', agentId)
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'touch src/reserved.ts' },
+      toolUseId: 'tool-reserved-background-id',
+      sessionId,
+      agentId,
+    })
+
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+
+    expect(deferredProjectSnapshotPath(backgroundTaskId)).toContain(
+      `${expectedSegment}.json`,
+    )
+    expect(deferredGlobalPointerPath(backgroundTaskId)).toContain(
+      `${expectedSegment}.json`,
+    )
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(true)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(true)
+  })
+
+  test('records failed and killed statuses for deferred background snapshots', async () => {
+    const agentId = 'alice@test'
+    const cases: Array<['failed' | 'killed', string]> = [
+      ['failed', 'task-deferred-failed'],
+      ['killed', 'task-deferred-killed'],
+    ]
+
+    for (const [status, taskId] of cases) {
+      getRuntimeBoardTaskExecutionStore().clearForTests()
+      openScope(taskId, 'work', agentId)
+      await writeRepoFile(`src/${status}.ts`, 'export const value = 1;\n')
+
+      const snapshot = await maybeBeginTaskChangeShellSnapshot({
+        toolName: BASH_TOOL_NAME,
+        input: { command: `edit src/${status}.ts` },
+        toolUseId: `tool-${status}`,
+        sessionId,
+        agentId,
+      })
+
+      await writeRepoFile(`src/${status}.ts`, 'export const value = 2;\n')
+      await deferTaskChangeShellSnapshot(`bg-${status}`, snapshot)
+      await completeDeferredTaskChangeShellSnapshot(`bg-${status}`, status)
+
+      const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+        eventsPath(taskId),
+      )
+      expect(events).toHaveLength(1)
+      expect(events[0]?.toolStatus).toBe(status)
+    }
   })
 
   test('captures rename relation through powershell snapshot mode', async () => {

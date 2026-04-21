@@ -1301,7 +1301,7 @@ async function checkPermissionsAndCallTool(
         ? ((result.data as Record<string, unknown>).backgroundTaskId as string)
         : null
     if (backgroundTaskId) {
-      deferTaskChangeShellSnapshot(backgroundTaskId, shellSnapshot, {
+      await deferTaskChangeShellSnapshot(backgroundTaskId, shellSnapshot, {
         source: taskChangeSnapshotSource,
         confidence: taskChangeSnapshotConfidence,
       })
