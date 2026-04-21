@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -371,13 +372,16 @@ function buildTeamLaunchData(params: {
 async function runReadiness(envelope: BridgeEnvelope) {
   const snapshot = await openCodeProvisioningProbe.probe(asString(envelope.body.projectPath) ?? envelope.cwd)
   const selectedModel = getSelectedModel(envelope.body, snapshot)
-  const executionOutcome = envelope.body.requireExecutionProbe === true && selectedModel
+  const executionModel = envelope.body.requireExecutionProbe === true && selectedModel
+    ? resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
+    : null
+  const executionOutcome = executionModel
     ? await openCodeExecutionProbe.probeModel({
-      selectedModel,
+      selectedModel: executionModel,
       projectPath: snapshot.projectPath,
     }).catch(error => ({
       providerId: 'opencode' as const,
-      modelId: selectedModel,
+      modelId: executionModel,
       probePrompt: '',
       expectedOutput: '',
       outcome: 'unknown' as const,
@@ -407,6 +411,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
   }
 
   const snapshot = await openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd)
+  const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
 
@@ -419,7 +424,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
     const record = await openCodeSessionBridge.ensureSession({
       teamId,
       memberName: name,
-      selectedModel,
+      selectedModel: apiSelectedModel,
       title: `${teamId} - ${name}`,
       projectPath: snapshot.projectPath,
     })
