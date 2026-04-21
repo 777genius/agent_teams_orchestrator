@@ -25,6 +25,7 @@ const bootstrapMemberSchema = z.strictObject({
   model: z.string().trim().min(1).optional(),
   provider: z.enum(['anthropic', 'codex', 'gemini']).optional(),
   effort: z.string().trim().min(1).optional(),
+  isolation: z.enum(['worktree']).optional(),
   agentType: z.string().trim().min(1).optional(),
   description: z.string().trim().min(1).optional(),
   useSplitPane: z.boolean().optional(),
@@ -114,6 +115,7 @@ function normalizeMember(
     ...(member.provider ? { provider: member.provider } : {}),
     ...(member.model ? { model: member.model } : {}),
     ...(member.effort ? { effort: member.effort } : {}),
+    ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
     ...(member.cwd ? { cwd: member.cwd } : {}),
     ...(member.useSplitPane ? { useSplitPane: member.useSplitPane } : {}),
     ...(member.planModeRequired
@@ -153,6 +155,7 @@ export function buildRequestHash(
       provider: member.provider ?? null,
       model: member.model ?? null,
       effort: member.effort ?? null,
+      isolation: member.isolation ?? null,
       cwd: member.cwd ?? null,
       useSplitPane: member.useSplitPane ?? false,
       planModeRequired: member.planModeRequired ?? false,

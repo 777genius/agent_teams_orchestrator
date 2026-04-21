@@ -36,6 +36,11 @@ export type TeammateContext = {
   isInProcess: true
   /** Abort controller for lifecycle management (linked to parent) */
   abortController: AbortController
+  /** Optional git worktree isolation metadata for this teammate */
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
 }
 
 const teammateContextStorage = new AsyncLocalStorage<TeammateContext>()
@@ -88,6 +93,10 @@ export function createTeammateContext(config: {
   planModeRequired: boolean
   parentSessionId: string
   abortController: AbortController
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
 }): TeammateContext {
   return {
     ...config,

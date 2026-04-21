@@ -71,6 +71,11 @@ export type InProcessSpawnConfig = {
   model?: string
   /** Optional effort override for this teammate */
   effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Optional git worktree isolation metadata */
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
 }
 
 /**
@@ -107,7 +112,19 @@ export async function spawnInProcessTeammate(
   config: InProcessSpawnConfig,
   context: SpawnContext,
 ): Promise<InProcessSpawnOutput> {
-  const { name, teamName, prompt, color, planModeRequired, model, effort } = config
+  const {
+    name,
+    teamName,
+    prompt,
+    color,
+    planModeRequired,
+    model,
+    effort,
+    worktreePath,
+    worktreeBranch,
+    baseWorkspaceRoot,
+    dirtyLeaderWarning,
+  } = config
   const { setAppState } = context
 
   // Generate deterministic agent ID
@@ -146,6 +163,10 @@ export async function spawnInProcessTeammate(
       planModeRequired,
       parentSessionId,
       abortController,
+      ...(worktreePath ? { worktreePath } : {}),
+      ...(worktreeBranch ? { worktreeBranch } : {}),
+      ...(baseWorkspaceRoot ? { baseWorkspaceRoot } : {}),
+      ...(dirtyLeaderWarning ? { dirtyLeaderWarning } : {}),
     })
 
     // Register agent in Perfetto trace for hierarchy visualization
@@ -169,6 +190,10 @@ export async function spawnInProcessTeammate(
       prompt,
       model,
       effort,
+      ...(worktreePath ? { worktreePath } : {}),
+      ...(worktreeBranch ? { worktreeBranch } : {}),
+      ...(baseWorkspaceRoot ? { baseWorkspaceRoot } : {}),
+      ...(dirtyLeaderWarning ? { dirtyLeaderWarning } : {}),
       abortController,
       awaitingPlanApproval: false,
       spinnerVerb: sample(getSpinnerVerbs()),

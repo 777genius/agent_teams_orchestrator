@@ -4,6 +4,7 @@
  */
 
 import React from 'react'
+import { randomUUID } from 'crypto'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -11,8 +12,10 @@ import {
   getFlagSettingsPath,
   getInlinePlugins,
   getMainLoopModelOverride,
+  getOriginalCwd,
   getSessionBypassPermissionsMode,
   getSessionId,
+  getSessionProjectDir,
   getStrictMcpConfig,
 } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
@@ -92,6 +95,14 @@ import {
 } from '../../utils/swarm/teammateLayoutManager.js'
 import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js'
 import { registerTask } from '../../utils/task/framework.js'
+import { getProjectDir } from '../../utils/sessionStoragePortable.js'
+import {
+  TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV,
+  TASK_CHANGE_LEDGER_PROJECT_DIR_ENV,
+  TASK_CHANGE_WORKTREE_BRANCH_ENV,
+  TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV,
+  TASK_CHANGE_WORKTREE_PATH_ENV,
+} from '../../services/taskChangeLedger/env.js'
 import {
   classifyIdleNotification,
   readMailbox,
@@ -100,6 +111,11 @@ import {
 } from '../../utils/teammateMailbox.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import { isCustomAgent } from '../AgentTool/loadAgentsDir.js'
+import {
+  createTeammateWorktree,
+  hasWorktreeChanges,
+  removeAgentWorktree,
+} from '../../utils/worktree.js'
 
 function getDefaultTeammateModel(leaderModel: string | null): string {
   const configured = getGlobalConfig().teammateDefaultModel
@@ -343,6 +359,9 @@ export type SpawnOutput = {
   team_name?: string
   is_splitpane?: boolean
   plan_mode_required?: boolean
+  worktreePath?: string
+  worktreeBranch?: string
+  dirtyLeaderWarning?: string
 }
 
 export type DuplicateSkippedReason = 'already_running' | 'bootstrap_pending'
@@ -373,6 +392,7 @@ export type SpawnTeammateConfig = {
   provider?: TeammateProvider
   effort?: EffortLevel
   agent_type?: string
+  isolation?: 'worktree'
   description?: string
   /** request_id of the API call whose response contained the tool_use that
    *  spawned this teammate. Threaded through to TeammateAgentContext for
@@ -392,8 +412,20 @@ type SpawnInput = {
   provider?: TeammateProvider
   effort?: EffortLevel
   agent_type?: string
+  isolation?: 'worktree'
   description?: string
   invokingRequestId?: string
+  worktreeInfo?: TeammateWorktreeInfo
+}
+
+type TeammateWorktreeInfo = {
+  worktreePath: string
+  worktreeBranch?: string
+  headCommit?: string
+  gitRoot?: string
+  hookBased?: boolean
+  baseWorkspaceRoot: string
+  dirtyLeaderWarning?: string
 }
 
 type SpawnResult = {
@@ -408,6 +440,67 @@ type ExistingTeammateDecision =
     }
 
 const pendingTeammateSpawnReservations = new Set<string>()
+
+function getLeaderTaskLedgerProjectDir(): string {
+  return getSessionProjectDir() ?? getProjectDir(getOriginalCwd())
+}
+
+function buildTeammateWorktreeSlug(teamName: string, teammateName: string): string {
+  const teamSegment = sanitizeName(teamName).replace(/^-+|-+$/g, '') || 'team'
+  const nameSegment = sanitizeName(teammateName).replace(/^-+|-+$/g, '') || 'teammate'
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 8)
+  return `team-${teamSegment.slice(0, 18)}-${nameSegment.slice(0, 18)}-${suffix}`
+}
+
+async function createWorktreeForTeammate(
+  teamName: string,
+  teammateName: string,
+): Promise<TeammateWorktreeInfo> {
+  return createTeammateWorktree(buildTeammateWorktreeSlug(teamName, teammateName))
+}
+
+async function cleanupCreatedTeammateWorktree(
+  worktreeInfo: TeammateWorktreeInfo | undefined,
+): Promise<void> {
+  if (!worktreeInfo) {
+    return
+  }
+  if (worktreeInfo.hookBased || !worktreeInfo.headCommit || !worktreeInfo.gitRoot) {
+    logForDebugging(
+      `[spawnTeammate] Keeping teammate worktree after failed spawn: ${worktreeInfo.worktreePath}`,
+    )
+    return
+  }
+  const changed = await hasWorktreeChanges(
+    worktreeInfo.worktreePath,
+    worktreeInfo.headCommit,
+  )
+  if (changed) {
+    logForDebugging(
+      `[spawnTeammate] Keeping dirty teammate worktree after failed spawn: ${worktreeInfo.worktreePath}`,
+    )
+    return
+  }
+  await removeAgentWorktree(
+    worktreeInfo.worktreePath,
+    worktreeInfo.worktreeBranch,
+    worktreeInfo.gitRoot,
+    worktreeInfo.hookBased,
+  )
+}
+
+function worktreeEnv(worktreeInfo: TeammateWorktreeInfo | undefined): Record<string, string | undefined> {
+  if (!worktreeInfo) {
+    return {}
+  }
+  return {
+    [TASK_CHANGE_LEDGER_PROJECT_DIR_ENV]: getLeaderTaskLedgerProjectDir(),
+    [TASK_CHANGE_WORKTREE_PATH_ENV]: worktreeInfo.worktreePath,
+    [TASK_CHANGE_WORKTREE_BRANCH_ENV]: worktreeInfo.worktreeBranch,
+    [TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV]: worktreeInfo.baseWorkspaceRoot,
+    [TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV]: worktreeInfo.dirtyLeaderWarning,
+  }
+}
 
 async function resolveExistingTeammateState(
   input: SpawnInput,
@@ -754,6 +847,7 @@ async function handleSpawnSplitPane(
   const { name, prompt, agent_type, cwd, plan_mode_required } = input
   const provider = resolveTeammateProvider(input.provider)
   const effort = input.effort
+  const worktreeInfo = input.worktreeInfo
 
   // Resolve model: 'inherit' → leader's model; undefined → default Opus alias
   const model = resolveSpawnModel(
@@ -783,7 +877,7 @@ async function handleSpawnSplitPane(
 
   // Generate deterministic agent ID from name and team
   const teammateId = formatAgentId(sanitizedName, teamName)
-  const workingDir = cwd || getCwd()
+  const workingDir = worktreeInfo?.worktreePath ?? cwd ?? getCwd()
 
   // Detect the appropriate backend and check if setup is needed
   let detectionResult = await detectAndGetBackend()
@@ -912,12 +1006,15 @@ async function handleSpawnSplitPane(
   try {
     const envStr = buildInheritedEnvVars({
       provider,
-      extraEnv: startupReadySentinel
-        ? {
-            [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
-              startupReadySentinel.filePath,
-          }
-        : undefined,
+      extraEnv: {
+        ...worktreeEnv(worktreeInfo),
+        ...(startupReadySentinel
+          ? {
+              [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
+                startupReadySentinel.filePath,
+            }
+          : {}),
+      },
     })
     const spawnCommand = wrapTeammateSpawnCommand(
       `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
@@ -964,6 +1061,7 @@ async function handleSpawnSplitPane(
           tmuxSessionName: sessionName,
           tmuxPaneId: paneId,
           cwd: workingDir,
+          ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
           spawnedAt: Date.now(),
         },
       },
@@ -982,6 +1080,7 @@ async function handleSpawnSplitPane(
     insideTmux,
     backendType: detectionResult.backend.type,
     toolUseId: context.toolUseId,
+    worktreeInfo,
   })
 
   // Register agent in the team file
@@ -1000,6 +1099,17 @@ async function handleSpawnSplitPane(
       bootstrapExpectedAfter: launchBoundaryIso,
       tmuxPaneId: paneId,
       cwd: workingDir,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.headCommit ? { worktreeHeadCommit: worktreeInfo.headCommit } : {}),
+      ...(worktreeInfo?.gitRoot ? { worktreeGitRoot: worktreeInfo.gitRoot } : {}),
+      ...(worktreeInfo?.hookBased ? { worktreeHookBased: true } : {}),
+      ...(worktreeInfo?.baseWorkspaceRoot
+        ? { worktreeBaseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+        : {}),
+      ...(worktreeInfo?.dirtyLeaderWarning
+        ? { worktreeDirtyWarning: worktreeInfo.dirtyLeaderWarning }
+        : {}),
       subscriptions: [],
       backendType: detectionResult.backend.type,
     }),
@@ -1038,6 +1148,11 @@ async function handleSpawnSplitPane(
       team_name: teamName,
       is_splitpane: true,
       plan_mode_required,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.dirtyLeaderWarning
+        ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+        : {}),
     },
   }
 }
@@ -1054,6 +1169,7 @@ async function handleSpawnSeparateWindow(
   const { name, prompt, agent_type, cwd, plan_mode_required } = input
   const provider = resolveTeammateProvider(input.provider)
   const effort = input.effort
+  const worktreeInfo = input.worktreeInfo
 
   // Resolve model: 'inherit' → leader's model; undefined → default Opus alias
   const model = resolveSpawnModel(
@@ -1084,7 +1200,7 @@ async function handleSpawnSeparateWindow(
   // Generate deterministic agent ID from name and team
   const teammateId = formatAgentId(sanitizedName, teamName)
   const windowName = `teammate-${sanitizeName(sanitizedName)}`
-  const workingDir = cwd || getCwd()
+  const workingDir = worktreeInfo?.worktreePath ?? cwd ?? getCwd()
 
   // Ensure the swarm session exists
   await ensureSession(SWARM_SESSION_NAME)
@@ -1177,6 +1293,7 @@ async function handleSpawnSeparateWindow(
     const envStr = buildInheritedEnvVars({
       provider,
       extraEnv: {
+        ...worktreeEnv(worktreeInfo),
         [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
       },
     })
@@ -1229,6 +1346,7 @@ async function handleSpawnSeparateWindow(
           tmuxSessionName: SWARM_SESSION_NAME,
           tmuxPaneId: paneId,
           cwd: workingDir,
+          ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
           spawnedAt: Date.now(),
         },
       },
@@ -1248,6 +1366,7 @@ async function handleSpawnSeparateWindow(
     insideTmux: false,
     backendType: 'tmux',
     toolUseId: context.toolUseId,
+    worktreeInfo,
   })
 
   // Register agent in the team file
@@ -1266,6 +1385,17 @@ async function handleSpawnSeparateWindow(
       bootstrapExpectedAfter: launchBoundaryIso,
       tmuxPaneId: paneId,
       cwd: workingDir,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.headCommit ? { worktreeHeadCommit: worktreeInfo.headCommit } : {}),
+      ...(worktreeInfo?.gitRoot ? { worktreeGitRoot: worktreeInfo.gitRoot } : {}),
+      ...(worktreeInfo?.hookBased ? { worktreeHookBased: true } : {}),
+      ...(worktreeInfo?.baseWorkspaceRoot
+        ? { worktreeBaseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+        : {}),
+      ...(worktreeInfo?.dirtyLeaderWarning
+        ? { worktreeDirtyWarning: worktreeInfo.dirtyLeaderWarning }
+        : {}),
       subscriptions: [],
       backendType: 'tmux', // This handler always uses tmux directly
     }),
@@ -1304,6 +1434,11 @@ async function handleSpawnSeparateWindow(
       team_name: teamName,
       is_splitpane: false,
       plan_mode_required,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.dirtyLeaderWarning
+        ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+        : {}),
     },
   }
 }
@@ -1326,6 +1461,7 @@ function registerOutOfProcessTeammateTask(
     insideTmux,
     backendType,
     toolUseId,
+    worktreeInfo,
   }: {
     teammateId: string
     sanitizedName: string
@@ -1337,6 +1473,7 @@ function registerOutOfProcessTeammateTask(
     insideTmux: boolean
     backendType: BackendType
     toolUseId?: string
+    worktreeInfo?: TeammateWorktreeInfo
   },
 ): void {
   const taskId = generateTaskId('in_process_teammate')
@@ -1362,6 +1499,14 @@ function registerOutOfProcessTeammateTask(
       parentSessionId: getSessionId(),
     },
     prompt,
+    ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+    ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+    ...(worktreeInfo?.baseWorkspaceRoot
+      ? { baseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+      : {}),
+    ...(worktreeInfo?.dirtyLeaderWarning
+      ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+      : {}),
     abortController,
     awaitingPlanApproval: false,
     permissionMode: plan_mode_required ? 'plan' : 'default',
@@ -1401,6 +1546,7 @@ async function handleSpawnInProcess(
   const { name, prompt, agent_type, plan_mode_required } = input
   const provider = resolveTeammateProvider(input.provider)
   const effort = input.effort
+  const worktreeInfo = input.worktreeInfo
 
   if (requiresSeparateProcessForProvider(input.provider)) {
     throw new Error(
@@ -1462,6 +1608,14 @@ async function handleSpawnInProcess(
     planModeRequired: plan_mode_required ?? false,
     model,
     effort,
+    ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+    ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+    ...(worktreeInfo?.baseWorkspaceRoot
+      ? { baseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+      : {}),
+    ...(worktreeInfo?.dirtyLeaderWarning
+      ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+      : {}),
   }
 
   logTeammateSpawnSnapshot({
@@ -1522,7 +1676,8 @@ async function handleSpawnInProcess(
               color: teammateColor,
               tmuxSessionName: 'in-process',
               tmuxPaneId: 'in-process',
-              cwd: getCwd(),
+              cwd: worktreeInfo?.worktreePath ?? getCwd(),
+              ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
               spawnedAt: Date.now(),
             },
           },
@@ -1545,7 +1700,18 @@ async function handleSpawnInProcess(
         joinedAt: Date.now(),
         bootstrapExpectedAfter: launchBoundaryIso,
         tmuxPaneId: 'in-process',
-        cwd: getCwd(),
+        cwd: worktreeInfo?.worktreePath ?? getCwd(),
+        ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+        ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+        ...(worktreeInfo?.headCommit ? { worktreeHeadCommit: worktreeInfo.headCommit } : {}),
+        ...(worktreeInfo?.gitRoot ? { worktreeGitRoot: worktreeInfo.gitRoot } : {}),
+        ...(worktreeInfo?.hookBased ? { worktreeHookBased: true } : {}),
+        ...(worktreeInfo?.baseWorkspaceRoot
+          ? { worktreeBaseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+          : {}),
+        ...(worktreeInfo?.dirtyLeaderWarning
+          ? { worktreeDirtyWarning: worktreeInfo.dirtyLeaderWarning }
+          : {}),
         subscriptions: [],
         backendType: 'in-process',
       }),
@@ -1587,6 +1753,14 @@ async function handleSpawnInProcess(
         toolUseContext: { ...context, messages: [] },
         abortController: result.abortController,
         invokingRequestId: input.invokingRequestId,
+        ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+        ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+        ...(worktreeInfo?.baseWorkspaceRoot
+          ? { baseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+          : {}),
+        ...(worktreeInfo?.dirtyLeaderWarning
+          ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+          : {}),
       })
       logForDebugging(
         `[handleSpawnInProcess] Started agent execution for ${teammateId}`,
@@ -1625,6 +1799,11 @@ async function handleSpawnInProcess(
       team_name: teamName,
       is_splitpane: false,
       plan_mode_required,
+      ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+      ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+      ...(worktreeInfo?.dirtyLeaderWarning
+        ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+        : {}),
     },
   }
 }
@@ -1641,46 +1820,72 @@ async function handleSpawn(
 ): Promise<{ data: SpawnOutput }> {
   const requestedProvider = resolveTeammateProvider(input.provider)
   const forceSeparateProcess = requiresSeparateProcessForProvider(input.provider)
-
-  // Check if in-process mode is enabled via feature flag
-  if (isInProcessEnabled() && !forceSeparateProcess) {
-    return handleSpawnInProcess(input, context)
+  if (input.isolation === 'worktree' && input.cwd) {
+    throw new Error('cwd is mutually exclusive with isolation: "worktree" for teammate spawn.')
   }
 
-  // Pre-flight: ensure a pane backend is available before attempting pane-based spawn.
-  // This handles auto-mode cases like iTerm2 without it2 or tmux installed, where
-  // isInProcessEnabled() returns false but detectAndGetBackend() has no viable backend.
-  // Narrowly scoped so user cancellation and other spawn errors propagate normally.
+  let spawnedWorktreeInfo: TeammateWorktreeInfo | undefined
+  let spawnInput = input
+  if (input.isolation === 'worktree') {
+    const appState = context.getAppState()
+    const teamName = input.team_name || appState.teamContext?.teamName
+    if (!teamName || !input.name) {
+      throw new Error('team_name and name are required for worktree-isolated teammate spawn.')
+    }
+    const sanitizedName = sanitizeAgentName(input.name)
+    spawnedWorktreeInfo = await createWorktreeForTeammate(teamName, sanitizedName)
+    spawnInput = {
+      ...input,
+      cwd: spawnedWorktreeInfo.worktreePath,
+      worktreeInfo: spawnedWorktreeInfo,
+    }
+  }
+
   try {
-    await detectAndGetBackend()
-  } catch (error) {
-    if (forceSeparateProcess) {
-      throw new Error(
-        `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". A pane-based backend is required for mixed-provider teammates, but none is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
-      )
-    }
-    // Only fall back silently in auto mode. If the user explicitly configured
-    // teammateMode: 'tmux', let the error propagate so they see the actionable
-    // install instructions from getTmuxInstallInstructions().
-    if (getTeammateModeFromSnapshot() !== 'auto') {
-      throw error
-    }
-    logForDebugging(
-      `[handleSpawn] No pane backend available, falling back to in-process: ${errorMessage(error)}`,
-    )
-    // Record the fallback so isInProcessEnabled() reflects the actual mode
-    // (fixes banner and other UI that would otherwise show tmux attach commands).
-    markInProcessFallback()
-    return handleSpawnInProcess(input, context)
-  }
 
-  // Backend is available (and now cached) - proceed with pane spawning.
-  // Any errors here (user cancellation, validation, etc.) propagate to the caller.
-  const useSplitPane = input.use_splitpane !== false
-  if (useSplitPane) {
-    return handleSpawnSplitPane(input, context)
+    // Check if in-process mode is enabled via feature flag
+    if (isInProcessEnabled() && !forceSeparateProcess) {
+      return await handleSpawnInProcess(spawnInput, context)
+    }
+
+    // Pre-flight: ensure a pane backend is available before attempting pane-based spawn.
+    // This handles auto-mode cases like iTerm2 without it2 or tmux installed, where
+    // isInProcessEnabled() returns false but detectAndGetBackend() has no viable backend.
+    // Narrowly scoped so user cancellation and other spawn errors propagate normally.
+    try {
+      await detectAndGetBackend()
+    } catch (error) {
+      if (forceSeparateProcess) {
+        throw new Error(
+          `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". A pane-based backend is required for mixed-provider teammates, but none is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
+        )
+      }
+      // Only fall back silently in auto mode. If the user explicitly configured
+      // teammateMode: 'tmux', let the error propagate so they see the actionable
+      // install instructions from getTmuxInstallInstructions().
+      if (getTeammateModeFromSnapshot() !== 'auto') {
+        throw error
+      }
+      logForDebugging(
+        `[handleSpawn] No pane backend available, falling back to in-process: ${errorMessage(error)}`,
+      )
+      // Record the fallback so isInProcessEnabled() reflects the actual mode
+      // (fixes banner and other UI that would otherwise show tmux attach commands).
+      markInProcessFallback()
+      return await handleSpawnInProcess(spawnInput, context)
+    }
+
+    // Backend is available (and now cached) - proceed with pane spawning.
+    // Any errors here (user cancellation, validation, etc.) propagate to the caller.
+    const useSplitPane = spawnInput.use_splitpane !== false
+    if (useSplitPane) {
+      return await handleSpawnSplitPane(spawnInput, context)
+    }
+    return await handleSpawnSeparateWindow(spawnInput, context)
+  } catch (error) {
+    await cleanupCreatedTeammateWorktree(spawnedWorktreeInfo)
+    throw error
   }
-  return handleSpawnSeparateWindow(input, context)
 }
 
 // ============================================================================

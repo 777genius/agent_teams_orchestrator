@@ -235,7 +235,7 @@ function worktreePathFor(repoRoot: string, slug: string): string {
 async function getOrCreateWorktree(
   repoRoot: string,
   slug: string,
-  options?: { prNumber?: number },
+  options?: { prNumber?: number; baseRef?: string; baseCwd?: string },
 ): Promise<WorktreeCreateResult> {
   const worktreePath = worktreePathFor(repoRoot, slug)
   const worktreeBranch = worktreeBranchName(slug)
@@ -261,7 +261,21 @@ async function getOrCreateWorktree(
 
   let baseBranch: string
   let baseSha: string | null = null
-  if (options?.prNumber) {
+  if (options?.baseRef) {
+    baseBranch = options.baseRef
+    const { stdout, code: shaCode } = await execFileNoThrowWithCwd(
+      gitExe(),
+      ['rev-parse', options.baseRef],
+      { cwd: options.baseCwd ?? repoRoot },
+    )
+    if (shaCode !== 0) {
+      throw new Error(
+        `Failed to resolve base ref "${options.baseRef}": git rev-parse failed`,
+      )
+    }
+    baseSha = stdout.trim()
+    baseBranch = baseSha
+  } else if (options?.prNumber) {
     const { code: prFetchCode, stderr: prFetchStderr } =
       await execFileNoThrowWithCwd(
         gitExe(),
@@ -951,6 +965,75 @@ export async function createAgentWorktree(slug: string): Promise<{
   return { worktreePath, worktreeBranch, headCommit, gitRoot }
 }
 
+export async function createTeammateWorktree(slug: string): Promise<{
+  worktreePath: string
+  worktreeBranch?: string
+  headCommit?: string
+  gitRoot?: string
+  hookBased?: boolean
+  baseWorkspaceRoot: string
+  dirtyLeaderWarning?: string
+}> {
+  validateWorktreeSlug(slug)
+
+  const baseWorkspaceRoot = getCwd()
+
+  if (hasWorktreeCreateHook()) {
+    const hookResult = await executeWorktreeCreateHook(slug)
+    logForDebugging(
+      `Created hook-based teammate worktree at: ${hookResult.worktreePath}`,
+    )
+    return {
+      worktreePath: hookResult.worktreePath,
+      hookBased: true,
+      baseWorkspaceRoot,
+    }
+  }
+
+  const gitRoot = findCanonicalGitRoot(baseWorkspaceRoot)
+  if (!gitRoot) {
+    throw new Error(
+      'Cannot create teammate worktree: not in a git repository and no WorktreeCreate hooks are configured. ' +
+        'Configure WorktreeCreate/WorktreeRemove hooks in settings.json to use worktree isolation with other VCS systems.',
+    )
+  }
+
+  const { code: statusCode, stdout: statusOutput } =
+    await execFileNoThrowWithCwd(gitExe(), ['status', '--porcelain'], {
+      cwd: baseWorkspaceRoot,
+    })
+  const dirtyLeaderWarning =
+    statusCode === 0 && statusOutput.trim().length > 0
+      ? 'Leader workspace had uncommitted changes when this teammate worktree was created; the worktree starts from committed HEAD only.'
+      : undefined
+
+  const { worktreePath, worktreeBranch, headCommit, existed } =
+    await getOrCreateWorktree(gitRoot, slug, {
+      baseRef: 'HEAD',
+      baseCwd: baseWorkspaceRoot,
+    })
+
+  if (!existed) {
+    logForDebugging(
+      `Created teammate worktree at: ${worktreePath} on branch: ${worktreeBranch}`,
+    )
+    await performPostCreationSetup(gitRoot, worktreePath)
+  } else {
+    const now = new Date()
+    await utimes(worktreePath, now, now)
+    logForDebugging(`Resuming existing teammate worktree at: ${worktreePath}`)
+  }
+
+  return {
+    worktreePath,
+    worktreeBranch,
+    headCommit,
+    gitRoot,
+    baseWorkspaceRoot,
+    ...(dirtyLeaderWarning ? { dirtyLeaderWarning } : {}),
+  }
+}
+
 /**
  * Remove a worktree created by createAgentWorktree.
  * For git-based worktrees, removes the worktree directory and deletes the temporary branch.
@@ -1040,15 +1123,20 @@ const EPHEMERAL_WORKTREE_PATTERNS = [
   /^job-[a-zA-Z0-9._-]{1,55}-[0-9a-f]{8}$/,
 ]
 
+const EPHEMERAL_TEAMMATE_WORKTREE_PATTERNS = [
+  /^team-[a-zA-Z0-9._-]{1,18}-[a-zA-Z0-9._-]{1,18}-[0-9a-f]{8}$/,
+]
+
 /**
- * Remove stale agent/workflow worktrees older than cutoffDate.
+ * Remove stale agent/workflow/teammate worktrees older than cutoffDate.
  *
  * Safety:
  * - Only touches slugs matching ephemeral patterns (never user-named worktrees)
  * - Skips the current session's worktree
- * - Fail-closed: skips if git status fails or shows tracked changes
- *   (-uno: untracked files in a 30-day-old crashed agent worktree are build
- *   artifacts; skipping the untracked scan is 5-10× faster on large repos)
+ * - Fail-closed: skips if git status fails or shows tracked changes.
+ *   Teammate worktrees run a full status check so untracked user work is
+ *   preserved. Other crashed agent/workflow worktrees use -uno because their
+ *   untracked files are usually build artifacts and scanning is expensive.
  * - Fail-closed: skips if any commits aren't reachable from a remote
  *
  * `git worktree remove --force` handles both the directory and git's internal
@@ -1076,7 +1164,13 @@ export async function cleanupStaleAgentWorktrees(
   let removed = 0
 
   for (const slug of entries) {
-    if (!EPHEMERAL_WORKTREE_PATTERNS.some(p => p.test(slug))) {
+    const isEphemeralWorktree = EPHEMERAL_WORKTREE_PATTERNS.some(p =>
+      p.test(slug),
+    )
+    const isTeammateWorktree = EPHEMERAL_TEAMMATE_WORKTREE_PATTERNS.some(p =>
+      p.test(slug),
+    )
+    if (!isEphemeralWorktree && !isTeammateWorktree) {
       continue
     }
 
@@ -1101,7 +1195,12 @@ export async function cleanupStaleAgentWorktrees(
     const [status, unpushed] = await Promise.all([
       execFileNoThrowWithCwd(
         gitExe(),
-        ['--no-optional-locks', 'status', '--porcelain', '-uno'],
+        [
+          '--no-optional-locks',
+          'status',
+          '--porcelain',
+          ...(isTeammateWorktree ? [] : ['-uno']),
+        ],
         { cwd: worktreePath },
       ),
       execFileNoThrowWithCwd(

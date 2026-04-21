@@ -6,13 +6,12 @@ import { getSessionCreatedTeams } from '../../bootstrap/state.js'
 import { logForDebugging } from '../debug.js'
 import { getTeamsDir } from '../envUtils.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
-import { execFileNoThrowWithCwd } from '../execFileNoThrow.js'
-import { gitExe } from '../git.js'
 import { lazySchema } from '../lazySchema.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { jsonParse, jsonStringify } from '../slowOperations.js'
 import { getTasksDir, notifyTasksUpdated } from '../tasks.js'
 import { getAgentName, getTeamName, isTeammate } from '../teammate.js'
+import { hasWorktreeChanges, removeAgentWorktree } from '../worktree.js'
 import { type BackendType, isPaneBackend } from './backends/types.js'
 import { TEAM_LEAD_NAME } from './constants.js'
 
@@ -84,6 +83,12 @@ export type TeamFile = {
     tmuxPaneId: string
     cwd: string
     worktreePath?: string
+    worktreeBranch?: string
+    worktreeHeadCommit?: string
+    worktreeGitRoot?: string
+    worktreeHookBased?: boolean
+    worktreeBaseWorkspaceRoot?: string
+    worktreeDirtyWarning?: string
     sessionId?: string
     subscriptions: string[]
     backendType?: BackendType
@@ -354,6 +359,12 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.tmuxPaneId === b.tmuxPaneId &&
     a.cwd === b.cwd &&
     a.worktreePath === b.worktreePath &&
+    a.worktreeBranch === b.worktreeBranch &&
+    a.worktreeHeadCommit === b.worktreeHeadCommit &&
+    a.worktreeGitRoot === b.worktreeGitRoot &&
+    a.worktreeHookBased === b.worktreeHookBased &&
+    a.worktreeBaseWorkspaceRoot === b.worktreeBaseWorkspaceRoot &&
+    a.worktreeDirtyWarning === b.worktreeDirtyWarning &&
     a.sessionId === b.sessionId &&
     a.backendType === b.backendType &&
     a.isActive === b.isActive &&
@@ -873,70 +884,41 @@ export async function setMemberActive(
   return entry.chain
 }
 
-/**
- * Destroys a git worktree at the given path.
- * First attempts to use `git worktree remove`, then falls back to rm -rf.
- * Safe to call on non-existent paths.
- */
-async function destroyWorktree(worktreePath: string): Promise<void> {
-  // Read the .git file in the worktree to find the main repo
-  const gitFilePath = join(worktreePath, '.git')
-  let mainRepoPath: string | null = null
-
-  try {
-    const gitFileContent = (await readFile(gitFilePath, 'utf-8')).trim()
-    // The .git file contains something like: gitdir: /path/to/repo/.git/worktrees/worktree-name
-    const match = gitFileContent.match(/^gitdir:\s*(.+)$/)
-    if (match && match[1]) {
-      // Extract the main repo .git directory (go up from .git/worktrees/name to .git)
-      const worktreeGitDir = match[1]
-      // Go up 2 levels from .git/worktrees/name to get to .git, then get parent for repo root
-      const mainGitDir = join(worktreeGitDir, '..', '..')
-      mainRepoPath = join(mainGitDir, '..')
-    }
-  } catch {
-    // Ignore errors reading .git file (path doesn't exist, not a file, etc.)
+async function cleanupTeamMemberWorktree(member: TeamMember): Promise<void> {
+  if (!member.worktreePath) {
+    return
+  }
+  if (member.worktreeHookBased) {
+    logForDebugging(
+      `[TeammateTool] Keeping hook-based teammate worktree: ${member.worktreePath}`,
+    )
+    return
+  }
+  if (!member.worktreeHeadCommit || !member.worktreeGitRoot) {
+    logForDebugging(
+      `[TeammateTool] Keeping teammate worktree with incomplete cleanup metadata: ${member.worktreePath}`,
+      { level: 'warn' },
+    )
+    return
   }
 
-  // Try to remove using git worktree remove command
-  if (mainRepoPath) {
-    const result = await execFileNoThrowWithCwd(
-      gitExe(),
-      ['worktree', 'remove', '--force', worktreePath],
-      { cwd: mainRepoPath },
-    )
-
-    if (result.code === 0) {
-      logForDebugging(
-        `[TeammateTool] Removed worktree via git: ${worktreePath}`,
-      )
-      return
-    }
-
-    // Check if the error is "not a working tree" (already removed)
-    if (result.stderr?.includes('not a working tree')) {
-      logForDebugging(
-        `[TeammateTool] Worktree already removed: ${worktreePath}`,
-      )
-      return
-    }
-
+  const changed = await hasWorktreeChanges(
+    member.worktreePath,
+    member.worktreeHeadCommit,
+  )
+  if (changed) {
     logForDebugging(
-      `[TeammateTool] git worktree remove failed, falling back to rm: ${result.stderr}`,
+      `[TeammateTool] Keeping dirty teammate worktree: ${member.worktreePath}`,
     )
+    return
   }
 
-  // Fallback: manually remove the directory
-  try {
-    await rm(worktreePath, { recursive: true, force: true })
-    logForDebugging(
-      `[TeammateTool] Removed worktree directory manually: ${worktreePath}`,
-    )
-  } catch (error) {
-    logForDebugging(
-      `[TeammateTool] Failed to remove worktree ${worktreePath}: ${errorMessage(error)}`,
-    )
-  }
+  await removeAgentWorktree(
+    member.worktreePath,
+    member.worktreeBranch,
+    member.worktreeGitRoot,
+    member.worktreeHookBased,
+  )
 }
 
 /**
@@ -1030,20 +1012,21 @@ async function killOrphanedTeammatePanes(teamName: string): Promise<void> {
 export async function cleanupTeamDirectories(teamName: string): Promise<void> {
   const sanitizedName = sanitizeName(teamName)
 
-  // Read team file to get worktree paths BEFORE deleting the team directory
+  // Read team file to get worktree metadata BEFORE deleting the team directory
   const teamFile = readTeamFile(teamName)
-  const worktreePaths: string[] = []
+  const worktreeMembers: TeamMember[] = []
   if (teamFile) {
     for (const member of teamFile.members) {
       if (member.worktreePath) {
-        worktreePaths.push(member.worktreePath)
+        worktreeMembers.push(member)
       }
     }
   }
 
-  // Clean up worktrees first
-  for (const worktreePath of worktreePaths) {
-    await destroyWorktree(worktreePath)
+  // Clean up only clean teammate worktrees. Dirty/unknown worktrees are user
+  // work and must survive TeamDelete.
+  for (const member of worktreeMembers) {
+    await cleanupTeamMemberWorktree(member)
   }
 
   // Clean up team directory (~/.claude/teams/{team-name}/)

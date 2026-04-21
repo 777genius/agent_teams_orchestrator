@@ -181,6 +181,9 @@ type TeammateSpawnedOutput = {
   team_name?: string;
   is_splitpane?: boolean;
   plan_mode_required?: boolean;
+  worktreePath?: string;
+  worktreeBranch?: string;
+  dirtyLeaderWarning?: string;
 };
 
 type TeammateDuplicateSkippedOutput = DuplicateSkippedOutput & {
@@ -307,6 +310,13 @@ export const AgentTool = buildTool({
     if (teamName && name) {
       // Set agent definition color for grouped UI display before spawning
       const agentDef = subagent_type ? toolUseContext.options.agentDefinitions.activeAgents.find(a => a.agentType === subagent_type) : undefined;
+      const teammateIsolation = isolation ?? agentDef?.isolation;
+      if (teammateIsolation === 'worktree' && cwd) {
+        throw new Error('cwd is mutually exclusive with isolation: "worktree" for teammate spawn.');
+      }
+      if (teammateIsolation === 'remote') {
+        throw new Error('Remote isolation is not supported for persistent teammates. Omit team_name/name to spawn a remote subagent.');
+      }
       if (agentDef?.color) {
         setAgentColor(subagent_type!, agentDef.color);
       }
@@ -320,6 +330,8 @@ export const AgentTool = buildTool({
         model: model ?? agentDef?.model,
         provider,
         agent_type: subagent_type,
+        ...(teammateIsolation === 'worktree' ? { isolation: teammateIsolation } : {}),
+        ...(cwd ? { cwd } : {}),
         invokingRequestId: assistantMessage?.requestId
       }, toolUseContext);
 
@@ -1331,6 +1343,10 @@ export const AgentTool = buildTool({
     const internalData = data as InternalOutput;
     if (typeof internalData === 'object' && internalData !== null && 'status' in internalData && internalData.status === 'teammate_spawned') {
       const spawnData = internalData as TeammateSpawnedOutput;
+      const worktreeText = spawnData.worktreePath ? `
+worktreePath: ${spawnData.worktreePath}${spawnData.worktreeBranch ? `
+worktreeBranch: ${spawnData.worktreeBranch}` : ''}${spawnData.dirtyLeaderWarning ? `
+worktreeWarning: ${spawnData.dirtyLeaderWarning}` : ''}` : '';
       return {
         tool_use_id: toolUseID,
         type: 'tool_result',
@@ -1339,7 +1355,7 @@ export const AgentTool = buildTool({
           text: `Spawned successfully.
 agent_id: ${spawnData.teammate_id}
 name: ${spawnData.name}
-team_name: ${spawnData.team_name}
+team_name: ${spawnData.team_name}${worktreeText}
 The agent is now running and will receive instructions via mailbox.`
         }]
       };

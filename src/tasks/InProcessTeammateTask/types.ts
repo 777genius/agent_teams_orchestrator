@@ -32,6 +32,11 @@ export type InProcessTeammateTaskState = TaskStateBase & {
   model?: string
   // Optional effort override for this teammate
   effort?: 'low' | 'medium' | 'high' | 'max'
+  // Optional git worktree isolation metadata
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
   // Optional: Only set if teammate uses a specific agent definition
   // Many teammates run as general-purpose agents without a predefined definition
   selectedAgent?: AgentDefinition
