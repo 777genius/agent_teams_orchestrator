@@ -41,26 +41,26 @@ async function loadCodexStatus(options: {
   setOptionalEnv('CODEX_API_KEY', options.codexApiKey ?? null, originalCodexApiKey)
 
   try {
-    const authModulePath = new URL('../../utils/auth.ts', import.meta.url).href
+    const authModulePath = new URL('../../utils/auth.js', import.meta.url).href
     mock.module(authModulePath, () => ({
       getAuthTokenSource: () => ({ source: 'none', hasToken: false }),
       getAnthropicApiKeyWithSource: () => ({ source: 'none' }),
     }))
 
-    const configModulePath = new URL('../../utils/config.ts', import.meta.url).href
+    const configModulePath = new URL('../../utils/config.js', import.meta.url).href
     mock.module(configModulePath, () => ({
       getGlobalConfig: () => ({
         geminiBackendPreference: 'auto',
       }),
     }))
 
-    const geminiAuthModulePath = new URL('../../utils/geminiAuth.ts', import.meta.url).href
+    const geminiAuthModulePath = new URL('../../utils/geminiAuth.js', import.meta.url).href
     mock.module(geminiAuthModulePath, () => ({
       getGeminiApiVersion: () => 'v1beta',
       getGeminiBaseUrl: () => 'https://generativelanguage.googleapis.com',
     }))
 
-    const modelConfigsModulePath = new URL('../../utils/model/configs.ts', import.meta.url).href
+    const modelConfigsModulePath = new URL('../../utils/model/configs.js', import.meta.url).href
     mock.module(modelConfigsModulePath, () => ({
       CLAUDE_HAIKU_4_5_CONFIG: { firstParty: 'claude-haiku-4-5' },
       CLAUDE_OPUS_4_6_CONFIG: { firstParty: 'claude-opus-4-6' },
@@ -68,24 +68,24 @@ async function loadCodexStatus(options: {
     }))
 
     const modelAllowlistModulePath = new URL(
-      '../../utils/model/modelAllowlist.ts',
+      '../../utils/model/modelAllowlist.js',
       import.meta.url,
     ).href
     mock.module(modelAllowlistModulePath, () => ({
       isModelAllowed: () => true,
     }))
 
-    const codexModelsModulePath = new URL('../../utils/model/codex.ts', import.meta.url).href
+    const codexModelsModulePath = new URL('../../utils/model/codex.js', import.meta.url).href
     mock.module(codexModelsModulePath, () => ({
       CODEX_MODELS: [{ id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' }],
     }))
 
-    const geminiModelsModulePath = new URL('../../utils/model/gemini.ts', import.meta.url).href
+    const geminiModelsModulePath = new URL('../../utils/model/gemini.js', import.meta.url).href
     mock.module(geminiModelsModulePath, () => ({
       GEMINI_MODELS: [],
     }))
 
-    const apiBackendPath = new URL('../gemini/backends/apiBackend.ts', import.meta.url).href
+    const apiBackendPath = new URL('../gemini/backends/apiBackend.js', import.meta.url).href
     mock.module(apiBackendPath, () => ({
       geminiApiBackend: {
         validate: async () => ({
@@ -98,7 +98,7 @@ async function loadCodexStatus(options: {
       },
     }))
 
-    const cliBackendPath = new URL('../gemini/backends/cliBackend.ts', import.meta.url).href
+    const cliBackendPath = new URL('../gemini/backends/cliBackend.js', import.meta.url).href
     mock.module(cliBackendPath, () => ({
       geminiCliBackend: {
         validate: async () => ({
@@ -120,7 +120,7 @@ async function loadCodexStatus(options: {
     }) as typeof Bun.which
 
     try {
-      const registryModulePath = new URL('./registry.ts', import.meta.url).href
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
       const { getUnifiedRuntimeStatusPayload } = await import(
         `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
       )

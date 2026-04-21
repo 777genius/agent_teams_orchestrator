@@ -18,26 +18,26 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     process.env.CODEX_API_KEY = 'sk-native-test'
 
     try {
-      const authModulePath = new URL('../../utils/auth.ts', import.meta.url).href
+      const authModulePath = new URL('../../utils/auth.js', import.meta.url).href
       mock.module(authModulePath, () => ({
         getAuthTokenSource: () => ({ source: 'none', hasToken: false }),
         getAnthropicApiKeyWithSource: () => ({ source: 'none' }),
       }))
 
-      const configModulePath = new URL('../../utils/config.ts', import.meta.url).href
+      const configModulePath = new URL('../../utils/config.js', import.meta.url).href
       mock.module(configModulePath, () => ({
         getGlobalConfig: () => ({
           geminiBackendPreference: 'auto',
         }),
       }))
 
-      const geminiAuthModulePath = new URL('../../utils/geminiAuth.ts', import.meta.url).href
+      const geminiAuthModulePath = new URL('../../utils/geminiAuth.js', import.meta.url).href
       mock.module(geminiAuthModulePath, () => ({
         getGeminiApiVersion: () => 'v1beta',
         getGeminiBaseUrl: () => 'https://generativelanguage.googleapis.com',
       }))
 
-      const modelConfigsModulePath = new URL('../../utils/model/configs.ts', import.meta.url).href
+      const modelConfigsModulePath = new URL('../../utils/model/configs.js', import.meta.url).href
       mock.module(modelConfigsModulePath, () => ({
         CLAUDE_HAIKU_4_5_CONFIG: { firstParty: 'claude-haiku-4-5' },
         CLAUDE_OPUS_4_6_CONFIG: { firstParty: 'claude-opus-4-6' },
@@ -45,14 +45,14 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       }))
 
       const modelAllowlistModulePath = new URL(
-        '../../utils/model/modelAllowlist.ts',
+        '../../utils/model/modelAllowlist.js',
         import.meta.url,
       ).href
       mock.module(modelAllowlistModulePath, () => ({
         isModelAllowed: () => true,
       }))
 
-      const codexModelsModulePath = new URL('../../utils/model/codex.ts', import.meta.url).href
+      const codexModelsModulePath = new URL('../../utils/model/codex.js', import.meta.url).href
       mock.module(codexModelsModulePath, () => ({
         CODEX_MODELS: [
           {
@@ -63,12 +63,12 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         ],
       }))
 
-      const geminiModelsModulePath = new URL('../../utils/model/gemini.ts', import.meta.url).href
+      const geminiModelsModulePath = new URL('../../utils/model/gemini.js', import.meta.url).href
       mock.module(geminiModelsModulePath, () => ({
         GEMINI_MODELS: [],
       }))
 
-      const apiBackendPath = new URL('../gemini/backends/apiBackend.ts', import.meta.url).href
+      const apiBackendPath = new URL('../gemini/backends/apiBackend.js', import.meta.url).href
       mock.module(apiBackendPath, () => ({
         geminiApiBackend: {
           validate: async () => ({
@@ -81,7 +81,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         },
       }))
 
-      const cliBackendPath = new URL('../gemini/backends/cliBackend.ts', import.meta.url).href
+      const cliBackendPath = new URL('../gemini/backends/cliBackend.js', import.meta.url).href
       mock.module(cliBackendPath, () => ({
         geminiCliBackend: {
           validate: async () => ({
@@ -94,7 +94,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         },
       }))
 
-      const registryModulePath = new URL('./registry.ts', import.meta.url).href
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
       const { getUnifiedRuntimeStatusPayload } = await import(
         `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
       )
@@ -151,49 +151,49 @@ describe('runtime backend registry with agent_teams capabilities', () => {
   })
 
   test('opencode runtime status surfaces managed inventory safely', async () => {
-    const authModulePath = new URL('../../utils/auth.ts', import.meta.url).href
+    const authModulePath = new URL('../../utils/auth.js', import.meta.url).href
     mock.module(authModulePath, () => ({
       getAuthTokenSource: () => ({ source: 'none', hasToken: false }),
       getAnthropicApiKeyWithSource: () => ({ source: 'none' }),
     }))
 
-    const configModulePath = new URL('../../utils/config.ts', import.meta.url).href
+    const configModulePath = new URL('../../utils/config.js', import.meta.url).href
     mock.module(configModulePath, () => ({
       getGlobalConfig: () => ({
         geminiBackendPreference: 'auto',
       }),
     }))
 
-    const geminiAuthModulePath = new URL('../../utils/geminiAuth.ts', import.meta.url).href
+    const geminiAuthModulePath = new URL('../../utils/geminiAuth.js', import.meta.url).href
     mock.module(geminiAuthModulePath, () => ({
       getGeminiApiVersion: () => 'v1beta',
       getGeminiBaseUrl: () => 'https://generativelanguage.googleapis.com',
     }))
 
-    const modelConfigsModulePath = new URL('../../utils/model/configs.ts', import.meta.url).href
+    const modelConfigsModulePath = new URL('../../utils/model/configs.js', import.meta.url).href
     mock.module(modelConfigsModulePath, () => ({
       CLAUDE_HAIKU_4_5_CONFIG: { firstParty: 'claude-haiku-4-5' },
       CLAUDE_OPUS_4_6_CONFIG: { firstParty: 'claude-opus-4-6' },
       CLAUDE_SONNET_4_6_CONFIG: { firstParty: 'claude-sonnet-4-6' },
     }))
 
-    const modelAllowlistModulePath = new URL('../../utils/model/modelAllowlist.ts', import.meta.url)
+    const modelAllowlistModulePath = new URL('../../utils/model/modelAllowlist.js', import.meta.url)
       .href
     mock.module(modelAllowlistModulePath, () => ({
       isModelAllowed: () => true,
     }))
 
-    const codexModelsModulePath = new URL('../../utils/model/codex.ts', import.meta.url).href
+    const codexModelsModulePath = new URL('../../utils/model/codex.js', import.meta.url).href
     mock.module(codexModelsModulePath, () => ({
       CODEX_MODELS: [],
     }))
 
-    const geminiModelsModulePath = new URL('../../utils/model/gemini.ts', import.meta.url).href
+    const geminiModelsModulePath = new URL('../../utils/model/gemini.js', import.meta.url).href
     mock.module(geminiModelsModulePath, () => ({
       GEMINI_MODELS: [],
     }))
 
-    const apiBackendPath = new URL('../gemini/backends/apiBackend.ts', import.meta.url).href
+    const apiBackendPath = new URL('../gemini/backends/apiBackend.js', import.meta.url).href
     mock.module(apiBackendPath, () => ({
       geminiApiBackend: {
         validate: async () => ({
@@ -206,7 +206,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       },
     }))
 
-    const cliBackendPath = new URL('../gemini/backends/cliBackend.ts', import.meta.url).href
+    const cliBackendPath = new URL('../gemini/backends/cliBackend.js', import.meta.url).href
     mock.module(cliBackendPath, () => ({
       geminiCliBackend: {
         validate: async () => ({
@@ -219,7 +219,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       },
     }))
 
-    const codexResolverPath = new URL('./codexBackendResolver.ts', import.meta.url).href
+    const codexResolverPath = new URL('./codexBackendResolver.js', import.meta.url).href
     mock.module(codexResolverPath, () => ({
       resolveCodexRuntimeSelection: () => ({
         selectedBackendId: 'auto',
@@ -235,69 +235,74 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       }),
     }))
 
-    const inventoryServicePath = new URL('../opencode/OpenCodeInventoryService.ts', import.meta.url)
+    const inventoryServicePath = new URL('../opencode/OpenCodeInventoryService.js', import.meta.url)
       .href
-    mock.module(inventoryServicePath, () => ({
-      openCodeInventoryService: {
-        probe: async () => ({
-          detected: true,
-          binaryPath: '/opt/homebrew/bin/opencode',
-          version: '1.4.0',
-          projectPath: '/tmp/project',
-          profile: {
-            projectPath: '/tmp/project',
-            profileRootKey: 'abc123',
-            profileRootPath: '/tmp/profile',
-            projectBehaviorFingerprint: 'behavior-v1',
-            behaviorSources: ['AGENTS.md', 'opencode.json'],
-            homePath: '/tmp/profile/home',
-            xdgConfigHome: '/tmp/profile/config',
-            xdgDataHome: '/tmp/profile/data',
-            xdgCacheHome: '/tmp/profile/cache',
-            managedConfig: {
-              default_agent: 'teammate',
-              share: 'disabled',
-              autoupdate: false,
-              snapshot: false,
-            },
-            managedConfigFingerprint: 'managed-config-v1',
-            managedAuthPath: '/tmp/profile/data/opencode/auth.json',
-            sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
-            sourceAuthFingerprint: 'source',
-            managedAuthFingerprint: 'managed',
-            authState: 'stale',
-            env: {},
-          },
-          connectedProviders: [
-            { id: 'openai', authHint: 'oauth', source: 'credentials' },
-          ],
-          availableProviders: ['openai', 'opencode'],
-          models: ['openai/gpt-5.4', 'openai/gpt-5.4-mini'],
-          agents: [
-            { id: 'build', mode: 'primary' },
-            { id: 'explore', mode: 'subagent' },
-          ],
-          authStorePath: '/tmp/profile/data/opencode/auth.json',
-          probeError: null,
-          diagnostics: [],
-        }),
+    const { openCodeInventoryService } = await import(inventoryServicePath)
+    const originalProbe = openCodeInventoryService.probe.bind(openCodeInventoryService)
+
+    openCodeInventoryService.probe = async () => ({
+      detected: true,
+      binaryPath: '/opt/homebrew/bin/opencode',
+      version: '1.4.0',
+      projectPath: '/tmp/project',
+      profile: {
+        projectPath: '/tmp/project',
+        profileRootKey: 'abc123',
+        profileRootPath: '/tmp/profile',
+        projectBehaviorFingerprint: 'behavior-v1',
+        behaviorSources: ['AGENTS.md', 'opencode.json'],
+        homePath: '/tmp/profile/home',
+        xdgConfigHome: '/tmp/profile/config',
+        xdgDataHome: '/tmp/profile/data',
+        xdgCacheHome: '/tmp/profile/cache',
+        managedConfig: {
+          default_agent: 'teammate',
+          share: 'disabled',
+          autoupdate: false,
+          snapshot: false,
+        },
+        managedConfigFingerprint: 'managed-config-v1',
+        managedAuthPath: '/tmp/profile/data/opencode/auth.json',
+        sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
+        sourceAuthFingerprint: 'source',
+        managedAuthFingerprint: 'managed',
+        authState: 'stale',
+        env: {},
       },
-    }))
+      connectedProviders: [
+        { id: 'openai', authHint: 'oauth', source: 'credentials' },
+      ],
+      availableProviders: ['openai', 'opencode'],
+      models: ['openai/gpt-5.4', 'openai/gpt-5.4-mini'],
+      agents: [
+        { id: 'build', mode: 'primary' },
+        { id: 'explore', mode: 'subagent' },
+      ],
+      authStorePath: '/tmp/profile/data/opencode/auth.json',
+      probeError: null,
+      diagnostics: [],
+    })
 
-    const registryModulePath = new URL('./registry.ts', import.meta.url).href
-    const { getUnifiedRuntimeStatusPayload } = await import(registryModulePath)
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
 
-    const payload = await getUnifiedRuntimeStatusPayload('opencode')
-    const opencode = payload.providers.opencode
+      const payload = await getUnifiedRuntimeStatusPayload('opencode')
+      const opencode = payload.providers.opencode
 
-    expect(payload.schemaVersion).toBe(2)
-    expect(opencode?.providerId).toBe('opencode')
-    expect(opencode?.supported).toBe(true)
-    expect(opencode?.authenticated).toBe(true)
-    expect(opencode?.models).toEqual(['openai/gpt-5.4', 'openai/gpt-5.4-mini'])
-    expect(opencode?.capabilities.teamLaunch).toBe(false)
-    expect(opencode?.capabilities.extensions.plugins.status).toBe('read-only')
-    expect(opencode?.backend?.kind).toBe('opencode-cli')
-    expect(opencode?.capabilitiesInfo?.some((item) => item.id === 'managed-profile')).toBe(true)
+      expect(payload.schemaVersion).toBe(2)
+      expect(opencode?.providerId).toBe('opencode')
+      expect(opencode?.supported).toBe(true)
+      expect(opencode?.authenticated).toBe(true)
+      expect(opencode?.models).toEqual(['openai/gpt-5.4', 'openai/gpt-5.4-mini'])
+      expect(opencode?.capabilities.teamLaunch).toBe(false)
+      expect(opencode?.capabilities.extensions.plugins.status).toBe('read-only')
+      expect(opencode?.backend?.kind).toBe('opencode-cli')
+      expect(opencode?.capabilitiesInfo?.some((item) => item.id === 'managed-profile')).toBe(true)
+    } finally {
+      openCodeInventoryService.probe = originalProbe
+    }
   })
 })
