@@ -389,6 +389,7 @@ export async function runTeamBootstrap(params: {
                 ...(member.model ? { model: member.model } : {}),
                 ...(member.provider ? { provider: member.provider } : {}),
                 ...(member.effort ? { effort: member.effort as never } : {}),
+                ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
                 ...(member.agentType ? { agent_type: member.agentType } : {}),
                 ...(member.description ? { description: member.description } : {}),
                 ...(member.useSplitPane

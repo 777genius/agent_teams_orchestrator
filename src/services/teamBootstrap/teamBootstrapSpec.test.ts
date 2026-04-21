@@ -98,6 +98,40 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toBe('custom bootstrap prompt')
   })
 
+  test('preserves teammate worktree isolation in normalized bootstrap requests', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-worktree-isolation',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'atlas-hq',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'alice',
+          prompt: 'custom bootstrap prompt',
+          isolation: 'worktree',
+        },
+        {
+          name: 'bob',
+          prompt: 'custom bootstrap prompt',
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members[0]?.isolation).toBe('worktree')
+    expect(request.members[1]?.isolation).toBeUndefined()
+  })
+
   test('readTeamBootstrapSpec accepts the current claude_team initiator source', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })

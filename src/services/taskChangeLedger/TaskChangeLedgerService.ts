@@ -31,6 +31,7 @@ import { logError } from '../../utils/log.js'
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getProjectDir } from '../../utils/sessionStoragePortable.js'
 import { getAgentName } from '../../utils/teammate.js'
+import { getTeammateContext } from '../../utils/teammateContext.js'
 import { getRuntimeBoardTaskExecutionStore } from '../boardTaskActivity/RuntimeBoardTaskExecutionStore.js'
 import type { BoardTaskLocator, BoardTaskPhase } from '../boardTaskActivity/contract.js'
 import {
@@ -40,6 +41,13 @@ import {
   type GitChangeRelation,
 } from './GitChangePathProvider.js'
 import { acquireTaskWriterLock } from './TaskChangeWriterLock.js'
+import {
+  TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV,
+  TASK_CHANGE_LEDGER_PROJECT_DIR_ENV,
+  TASK_CHANGE_WORKTREE_BRANCH_ENV,
+  TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV,
+  TASK_CHANGE_WORKTREE_PATH_ENV,
+} from './env.js'
 
 const TASK_CHANGE_JOURNAL_SCHEMA_VERSION = 1
 const TASK_CHANGE_SUMMARY_BUNDLE_SCHEMA_VERSION = 2
@@ -114,6 +122,10 @@ type TaskChangeEventV1 = {
   operation: TaskChangeOperation
   confidence: TaskChangeConfidence
   workspaceRoot: string
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
   filePath: string
   relativePath: string
   timestamp: string
@@ -202,6 +214,10 @@ type TaskChangeSummaryScopeV2 = {
   }
   visibleFileCount: number
   contributors: TaskChangeContributorSummaryV2[]
+  worktreePaths?: string[]
+  worktreeBranches?: string[]
+  baseWorkspaceRoots?: string[]
+  dirtyLeaderWarnings?: string[]
 }
 
 type TaskChangeSummaryFileV2 = {
@@ -227,6 +243,10 @@ type TaskChangeSummaryFileV2 = {
   contentAvailability: 'full-text' | 'hash-only' | 'metadata-only'
   reviewability: 'full-text' | 'partial-text' | 'metadata-only'
   relation?: TaskChangeRelation
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
   primaryActorKey?: string
   agentIds: string[]
   memberNames?: string[]
@@ -353,6 +373,7 @@ type DeferredShellSnapshotPointerV1 = {
   schemaVersion: typeof DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION
   backgroundTaskId: string
   gitRoot: string
+  projectDir?: string
   projectRecordPath: string
   createdAt: string
   expiresAt: string
@@ -392,6 +413,10 @@ function encodeTaskId(taskId: string): string {
 }
 
 function getLedgerProjectDir(): string {
+  const override = process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV]
+  if (override && isAbsolute(override)) {
+    return override
+  }
   return getSessionProjectDir() ?? getProjectDir(getOriginalCwd())
 }
 
@@ -399,12 +424,9 @@ function getLedgerDir(projectDir = getLedgerProjectDir()): string {
   return join(projectDir, TASK_CHANGE_LEDGER_DIRNAME)
 }
 
-function getDeferredShellSnapshotProjectRecordPath(
-  gitRoot: string,
-  backgroundTaskId: string,
-): string {
+function getDeferredShellSnapshotProjectRecordPath(projectDir: string, backgroundTaskId: string): string {
   return join(
-    getLedgerDir(gitRoot),
+    getLedgerDir(projectDir),
     'pending-shell-snapshots',
     `${encodeTaskId(backgroundTaskId)}.json`,
   )
@@ -476,12 +498,13 @@ function buildChangeKey(params: {
   filePath: string
   operation: TaskChangeOperation
   relation?: TaskChangeRelation
+  worktreePath?: string
 }): string {
   if (params.relation?.kind === 'rename') {
-    return `rename:${normalizeLedgerPathForKey(params.relation.oldPath)}->${normalizeLedgerPathForKey(params.relation.newPath)}`
+    return buildRelationChangeKey(params.relation, params.worktreePath)
   }
   if (params.relation?.kind === 'copy') {
-    return `copy:${normalizeLedgerPathForKey(params.relation.oldPath)}->${normalizeLedgerPathForKey(params.relation.newPath)}`
+    return buildRelationChangeKey(params.relation, params.worktreePath)
   }
   const normalizedPath = normalizeLedgerPathForKey(params.filePath)
   if (params.operation === 'create') {
@@ -491,6 +514,16 @@ function buildChangeKey(params: {
     return `delete:${normalizedPath}`
   }
   return `path:${normalizedPath}`
+}
+
+function buildRelationChangeKey(
+  relation: TaskChangeRelation,
+  worktreePath?: string,
+): string {
+  const pathPart = `${normalizeLedgerPathForKey(relation.oldPath)}->${normalizeLedgerPathForKey(relation.newPath)}`
+  return worktreePath
+    ? `${relation.kind}:${normalizeLedgerPathForKey(worktreePath)}:${pathPart}`
+    : `${relation.kind}:${pathPart}`
 }
 
 function buildActorKey(input: { agentId?: string; memberName?: string; sessionId: string }): string {
@@ -513,6 +546,42 @@ function resolveLedgerMemberName(agentId?: AgentId): string | undefined {
   }
   const deterministicTeammateIdMatch = /^([^@\s]+)@[^@\s]+$/.exec(agentId)
   return deterministicTeammateIdMatch?.[1]?.trim() || undefined
+}
+
+function isSameOrDescendantPath(childPath: string, parentPath: string): boolean {
+  const rel = relative(parentPath, childPath)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+function getLedgerWorktreeMetadata(workspaceRoot: string): {
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
+} {
+  const context = getTeammateContext()
+  const worktreePath =
+    context?.worktreePath ?? process.env[TASK_CHANGE_WORKTREE_PATH_ENV]
+  if (!worktreePath) {
+    return {}
+  }
+  if (!isSameOrDescendantPath(workspaceRoot, worktreePath)) {
+    return {}
+  }
+  const worktreeBranch =
+    context?.worktreeBranch ?? process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV]
+  const baseWorkspaceRoot =
+    context?.baseWorkspaceRoot ??
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV]
+  const dirtyLeaderWarning =
+    context?.dirtyLeaderWarning ??
+    process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV]
+  return {
+    worktreePath,
+    ...(worktreeBranch ? { worktreeBranch } : {}),
+    ...(baseWorkspaceRoot ? { baseWorkspaceRoot } : {}),
+    ...(dirtyLeaderWarning ? { dirtyLeaderWarning } : {}),
+  }
 }
 
 function normalizeFilePath(filePath: string, workspaceRoot: string): string {
@@ -723,6 +792,7 @@ function isDeferredShellSnapshotPointer(
     typeof value.backgroundTaskId === 'string' &&
     (backgroundTaskId === undefined || value.backgroundTaskId === backgroundTaskId) &&
     typeof value.gitRoot === 'string' &&
+    (value.projectDir === undefined || typeof value.projectDir === 'string') &&
     typeof value.projectRecordPath === 'string' &&
     typeof value.createdAt === 'string' &&
     typeof value.expiresAt === 'string'
@@ -766,7 +836,7 @@ function getExpectedProjectRecordPathFromPointer(
   pointer: DeferredShellSnapshotPointerV1,
 ): string {
   return getDeferredShellSnapshotProjectRecordPath(
-    pointer.gitRoot,
+    pointer.projectDir ?? pointer.gitRoot,
     pointer.backgroundTaskId,
   )
 }
@@ -877,8 +947,9 @@ async function persistDeferredShellSnapshot(
   snapshot: ShellSnapshot,
   options?: FinishShellSnapshotOptions,
 ): Promise<{ projectRecordPath: string; globalPointerPath: string }> {
+  const projectDir = getLedgerProjectDir()
   const projectRecordPath = getDeferredShellSnapshotProjectRecordPath(
-    snapshot.gitRoot,
+    projectDir,
     backgroundTaskId,
   )
   const globalPointerPath = getDeferredShellSnapshotGlobalPointerPath(backgroundTaskId)
@@ -897,6 +968,7 @@ async function persistDeferredShellSnapshot(
     schemaVersion: DEFERRED_SHELL_SNAPSHOT_SCHEMA_VERSION,
     backgroundTaskId,
     gitRoot: snapshot.gitRoot,
+    projectDir,
     projectRecordPath,
     createdAt,
     expiresAt,
@@ -939,7 +1011,7 @@ async function readPersistedDeferredShellSnapshot(
   }
 
   const expectedProjectRecordPath = getDeferredShellSnapshotProjectRecordPath(
-    pointer.gitRoot,
+    pointer.projectDir ?? pointer.gitRoot,
     backgroundTaskId,
   )
   if (
@@ -1374,6 +1446,10 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     relativePath: string
     displayPath?: string
     relation?: TaskChangeRelation
+    worktreePath?: string
+    worktreeBranch?: string
+    baseWorkspaceRoot?: string
+    dirtyLeaderWarning?: string
     events: TaskChangeEventV1[]
     warnings: Set<string>
     agentIds: Set<string>
@@ -1395,7 +1471,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       warnings.add(`Background tool ${event.toolUseId} was killed after changing files.`)
     }
     const groupKey = event.relation
-      ? `${event.relation.kind}:${normalizeLedgerPathForKey(event.relation.oldPath)}->${normalizeLedgerPathForKey(event.relation.newPath)}`
+      ? buildRelationChangeKey(event.relation, event.worktreePath)
       : `path:${normalizeLedgerPathForKey(event.filePath)}`
     const existing = accumulators.get(groupKey) ?? {
       groupKey,
@@ -1407,6 +1483,10 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       relativePath: event.relation?.newPath ?? event.relativePath,
       ...(event.relation?.newPath ? { displayPath: event.relation.newPath } : {}),
       ...(event.relation ? { relation: event.relation } : {}),
+      ...(event.worktreePath ? { worktreePath: event.worktreePath } : {}),
+      ...(event.worktreeBranch ? { worktreeBranch: event.worktreeBranch } : {}),
+      ...(event.baseWorkspaceRoot ? { baseWorkspaceRoot: event.baseWorkspaceRoot } : {}),
+      ...(event.dirtyLeaderWarning ? { dirtyLeaderWarning: event.dirtyLeaderWarning } : {}),
       events: [],
       warnings: new Set<string>(),
       agentIds: new Set<string>(),
@@ -1554,6 +1634,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
         filePath: accumulator.filePath,
         operation: lastEvent.operation,
         ...(accumulator.relation ? { relation: accumulator.relation } : {}),
+        ...(accumulator.worktreePath ? { worktreePath: accumulator.worktreePath } : {}),
       }),
       filePath: accumulator.filePath,
       relativePath: accumulator.relativePath,
@@ -1576,6 +1657,14 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       contentAvailability,
       reviewability,
       ...(accumulator.relation ? { relation: accumulator.relation } : {}),
+      ...(accumulator.worktreePath ? { worktreePath: accumulator.worktreePath } : {}),
+      ...(accumulator.worktreeBranch ? { worktreeBranch: accumulator.worktreeBranch } : {}),
+      ...(accumulator.baseWorkspaceRoot
+        ? { baseWorkspaceRoot: accumulator.baseWorkspaceRoot }
+        : {}),
+      ...(accumulator.dirtyLeaderWarning
+        ? { dirtyLeaderWarning: accumulator.dirtyLeaderWarning }
+        : {}),
       ...(primaryActorKey ? { primaryActorKey } : {}),
       agentIds: [...accumulator.agentIds].sort(),
       ...(accumulator.memberNames.size > 0 ? { memberNames: [...accumulator.memberNames].sort() } : {}),
@@ -1641,6 +1730,10 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
   ])]
   const captureConfidence = deriveCaptureConfidence(events)
   const bundleConfidence = confidenceLabelForEvents(events)
+  const worktreePaths = [...new Set(events.flatMap(event => (event.worktreePath ? [event.worktreePath] : [])))].sort()
+  const worktreeBranches = [...new Set(events.flatMap(event => (event.worktreeBranch ? [event.worktreeBranch] : [])))].sort()
+  const baseWorkspaceRoots = [...new Set(events.flatMap(event => (event.baseWorkspaceRoot ? [event.baseWorkspaceRoot] : [])))].sort()
+  const dirtyLeaderWarnings = [...new Set(events.flatMap(event => (event.dirtyLeaderWarning ? [event.dirtyLeaderWarning] : [])))].sort()
   const scope: TaskChangeSummaryScopeV2 = {
     confidence: {
       tier:
@@ -1694,6 +1787,10 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     },
     visibleFileCount: files.length,
     contributors,
+    ...(worktreePaths.length > 0 ? { worktreePaths } : {}),
+    ...(worktreeBranches.length > 0 ? { worktreeBranches } : {}),
+    ...(baseWorkspaceRoots.length > 0 ? { baseWorkspaceRoots } : {}),
+    ...(dirtyLeaderWarnings.length > 0 ? { dirtyLeaderWarnings } : {}),
   }
 
   const bundle: TaskChangeSummaryBundleV2 = {
@@ -1875,6 +1972,7 @@ async function persistEvents(changes: ExactFileChange[], params: {
   const projectDir = getLedgerProjectDir()
   const timestamp = new Date().toISOString()
   const memberName = resolveLedgerMemberName(params.agentId)
+  const worktreeMetadata = getLedgerWorktreeMetadata(params.workspaceRoot)
   const events: TaskChangeEventV1[] = []
 
   for (const change of changes) {
@@ -1922,6 +2020,7 @@ async function persistEvents(changes: ExactFileChange[], params: {
       operation,
       confidence: change.confidence,
       workspaceRoot: params.workspaceRoot,
+      ...worktreeMetadata,
       filePath,
       relativePath: displayRelativePath(filePath, params.workspaceRoot),
       timestamp,
@@ -1939,7 +2038,16 @@ async function persistEvents(changes: ExactFileChange[], params: {
       ...(change.structuredPatch !== undefined
         ? { structuredPatch: change.structuredPatch }
         : {}),
-      ...(change.warnings?.length ? { warnings: change.warnings } : {}),
+      ...(change.warnings?.length || worktreeMetadata.dirtyLeaderWarning
+        ? {
+            warnings: [
+              ...(change.warnings ?? []),
+              ...(worktreeMetadata.dirtyLeaderWarning
+                ? [worktreeMetadata.dirtyLeaderWarning]
+                : []),
+            ],
+          }
+        : {}),
     }
     events.push({ ...eventBase, eventId: buildEventId(eventBase) })
   }

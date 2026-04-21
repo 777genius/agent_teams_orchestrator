@@ -30,6 +30,7 @@ export type TeamBootstrapSpec = {
     provider?: BootstrapProvider
     model?: string
     effort?: string
+    isolation?: 'worktree'
     cwd?: string
     useSplitPane?: boolean
     planModeRequired?: boolean
@@ -81,6 +82,7 @@ export type NormalizedBootstrapMember = {
   provider?: BootstrapProvider
   model?: string
   effort?: string
+  isolation?: 'worktree'
   cwd?: string
   useSplitPane?: boolean
   planModeRequired?: boolean

@@ -67,6 +67,7 @@ import { tokenCountWithEstimation } from '../../utils/tokens.js'
 import { createAbortController } from '../abortController.js'
 import { type AgentContext, runWithAgentContext } from '../agentContext.js'
 import { count } from '../array.js'
+import { runWithCwdOverride } from '../cwd.js'
 import { logForDebugging } from '../debug.js'
 import { cloneFileStateCache } from '../fileStateCache.js'
 import {
@@ -487,6 +488,11 @@ export type InProcessRunnerConfig = {
   model?: string
   /** Optional effort override for this teammate */
   effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Optional git worktree isolation metadata */
+  worktreePath?: string
+  worktreeBranch?: string
+  baseWorkspaceRoot?: string
+  dirtyLeaderWarning?: string
   /** Optional system prompt override for this teammate */
   systemPrompt?: string
   /** How to apply the system prompt: 'replace' or 'append' to default */
@@ -901,6 +907,7 @@ export async function runInProcessTeammate(
     allowedTools,
     allowPermissionPrompts,
     invokingRequestId,
+    worktreePath,
   } = config
   const { setAppState } = toolUseContext
 
@@ -1162,6 +1169,9 @@ export async function runInProcessTeammate(
       let workWasAborted = false
 
       // Run agent within contexts
+      const runInTeammateCwd = <T,>(fn: () => T): T =>
+        worktreePath ? runWithCwdOverride(worktreePath, fn) : fn()
+
       await runWithTeammateContext(teammateContext, async () => {
         return runWithAgentContext(agentContext, async () => {
           // Mark task as running (not idle)
@@ -1177,35 +1187,36 @@ export async function runInProcessTeammate(
           // In-process teammates are async but run in the same process as the leader,
           // so they CAN show permission prompts (unlike true background agents).
           // Use currentWorkAbortController so Escape stops this turn only, not the teammate.
-          for await (const message of runAgent({
-            agentDefinition: iterationAgentDefinition,
-            promptMessages,
-            toolUseContext,
-            canUseTool: createInProcessCanUseTool(
-              identity,
-              currentWorkAbortController,
-              (waitMs: number) => {
-                updateTaskState(
-                  taskId,
-                  task => ({
-                    ...task,
-                    totalPausedMs: (task.totalPausedMs ?? 0) + waitMs,
-                  }),
-                  setAppState,
-                )
-              },
-            ),
-            isAsync: true,
-            canShowPermissionPrompts: allowPermissionPrompts ?? true,
-            forkContextMessages,
-            querySource: 'agent:custom',
-            override: { abortController: currentWorkAbortController },
-            model: model as ModelAlias | undefined,
-            preserveToolUseResults: true,
-            availableTools: toolUseContext.options.tools,
-            allowedTools,
-            contentReplacementState: teammateReplacementState,
-          })) {
+          await runInTeammateCwd(async () => {
+            for await (const message of runAgent({
+              agentDefinition: iterationAgentDefinition,
+              promptMessages,
+              toolUseContext,
+              canUseTool: createInProcessCanUseTool(
+                identity,
+                currentWorkAbortController,
+                (waitMs: number) => {
+                  updateTaskState(
+                    taskId,
+                    task => ({
+                      ...task,
+                      totalPausedMs: (task.totalPausedMs ?? 0) + waitMs,
+                    }),
+                    setAppState,
+                  )
+                },
+              ),
+              isAsync: true,
+              canShowPermissionPrompts: allowPermissionPrompts ?? true,
+              forkContextMessages,
+              querySource: 'agent:custom',
+              override: { abortController: currentWorkAbortController },
+              model: model as ModelAlias | undefined,
+              preserveToolUseResults: true,
+              availableTools: toolUseContext.options.tools,
+              allowedTools,
+              contentReplacementState: teammateReplacementState,
+            })) {
             // Check lifecycle abort first (kills whole teammate)
             if (abortController.signal.aborted) {
               logForDebugging(
@@ -1276,6 +1287,7 @@ export async function runInProcessTeammate(
               setAppState,
             )
           }
+          })
 
           return { success: true, messages: iterationMessages }
         })

@@ -87,4 +87,31 @@ describe('teamHelpers bootstrapExpectedAfter', () => {
 
     expect(unchanged.changed).toBe(false)
   })
+
+  it('persists teammate worktree cleanup metadata and treats identical metadata as a no-op', () => {
+    const member = {
+      agentId: 'alice@atlas-hq',
+      name: 'alice',
+      joinedAt: 1,
+      bootstrapExpectedAfter: '2026-04-08T12:00:00.000Z',
+      tmuxPaneId: 'pane-1',
+      cwd: '/tmp/project/.claude/worktrees/team-atlas-alice-12345678',
+      worktreePath: '/tmp/project/.claude/worktrees/team-atlas-alice-12345678',
+      worktreeBranch: 'worktree-team-atlas-alice-12345678',
+      worktreeHeadCommit: 'abc123',
+      worktreeGitRoot: '/tmp/project',
+      worktreeBaseWorkspaceRoot: '/tmp/project',
+      worktreeDirtyWarning: 'Leader workspace had uncommitted changes.',
+      subscriptions: [],
+      backendType: 'tmux' as const,
+    }
+    const original = upsertTeamMember(createTeamFile(), member).teamFile
+
+    expect(original.members[0]?.worktreePath).toBe(member.worktreePath)
+    expect(original.members[0]?.worktreeBranch).toBe(member.worktreeBranch)
+    expect(original.members[0]?.worktreeHeadCommit).toBe(member.worktreeHeadCommit)
+    expect(original.members[0]?.worktreeGitRoot).toBe(member.worktreeGitRoot)
+    expect(original.members[0]?.worktreeDirtyWarning).toBe(member.worktreeDirtyWarning)
+    expect(upsertTeamMember(original, member).changed).toBe(false)
+  })
 })

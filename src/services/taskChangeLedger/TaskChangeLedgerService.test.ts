@@ -19,12 +19,24 @@ import {
   finishTaskChangeShellSnapshot,
   maybeBeginTaskChangeShellSnapshot,
 } from './TaskChangeLedgerService.js'
+import {
+  TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV,
+  TASK_CHANGE_LEDGER_PROJECT_DIR_ENV,
+  TASK_CHANGE_WORKTREE_BRANCH_ENV,
+  TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV,
+  TASK_CHANGE_WORKTREE_PATH_ENV,
+} from './env.js'
 import { clearDynamicTeamContext, setDynamicTeamContext } from '../../utils/teammate.js'
 
 let repoDir = ''
 let sessionId = 'session-1'
 let configDir = ''
 let previousClaudeConfigDir: string | undefined
+let previousLedgerProjectDir: string | undefined
+let previousWorktreePath: string | undefined
+let previousWorktreeBranch: string | undefined
+let previousBaseWorkspaceRoot: string | undefined
+let previousWorktreeDirtyWarning: string | undefined
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 setDefaultTimeout(20_000)
 
@@ -224,6 +236,11 @@ beforeEach(async () => {
   getRuntimeBoardTaskExecutionStore().clearForTests()
   clearDeferredTaskChangeShellSnapshotsForTests()
   previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+  previousLedgerProjectDir = process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV]
+  previousWorktreePath = process.env[TASK_CHANGE_WORKTREE_PATH_ENV]
+  previousWorktreeBranch = process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV]
+  previousBaseWorkspaceRoot = process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV]
+  previousWorktreeDirtyWarning = process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV]
   configDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-config-'))
   process.env.CLAUDE_CONFIG_DIR = configDir
   repoDir = await createGitRepo()
@@ -244,6 +261,31 @@ afterEach(async () => {
     delete process.env.CLAUDE_CONFIG_DIR
   } else {
     process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir
+  }
+  if (previousLedgerProjectDir === undefined) {
+    delete process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV]
+  } else {
+    process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV] = previousLedgerProjectDir
+  }
+  if (previousWorktreePath === undefined) {
+    delete process.env[TASK_CHANGE_WORKTREE_PATH_ENV]
+  } else {
+    process.env[TASK_CHANGE_WORKTREE_PATH_ENV] = previousWorktreePath
+  }
+  if (previousWorktreeBranch === undefined) {
+    delete process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV]
+  } else {
+    process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV] = previousWorktreeBranch
+  }
+  if (previousBaseWorkspaceRoot === undefined) {
+    delete process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV]
+  } else {
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV] = previousBaseWorkspaceRoot
+  }
+  if (previousWorktreeDirtyWarning === undefined) {
+    delete process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV]
+  } else {
+    process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV] = previousWorktreeDirtyWarning
   }
 })
 
@@ -297,6 +339,229 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(events[0]?.memberName).toBe('alice')
     expect(events[1]?.memberName).toBe('alice')
+  })
+
+  test('writes centralized ledger artifacts while preserving worktree file metadata', async () => {
+    const agentId = 'alice@test'
+    const worktreeDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-worktree-'))
+    const dirtyWarning =
+      'Leader workspace had uncommitted changes when this teammate worktree was created; the worktree starts from committed HEAD only.'
+    process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV] = repoDir
+    process.env[TASK_CHANGE_WORKTREE_PATH_ENV] = worktreeDir
+    process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV] = 'worktree-team-atlas-alice-12345678'
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV] = repoDir
+    process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV] = dirtyWarning
+    setCwdState(worktreeDir)
+    openScope('task-worktree-ledger', 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/worktree.ts',
+        content: 'export const isolated = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-worktree-write',
+      sessionId,
+      agentId,
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-worktree-ledger'))
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath('task-worktree-ledger'),
+    )
+    const files = bundle.files as Array<Record<string, unknown>>
+    const scope = bundle.scope as Record<string, unknown>
+
+    expect(files[0]?.filePath).toBe(join(worktreeDir, 'src', 'worktree.ts'))
+    expect(files[0]?.worktreePath).toBe(worktreeDir)
+    expect(files[0]?.worktreeBranch).toBe('worktree-team-atlas-alice-12345678')
+    expect(files[0]?.baseWorkspaceRoot).toBe(repoDir)
+    expect(files[0]?.dirtyLeaderWarning).toBe(dirtyWarning)
+    expect(scope.worktreePaths).toEqual([worktreeDir])
+    expect(scope.worktreeBranches).toEqual(['worktree-team-atlas-alice-12345678'])
+    expect(bundle.warnings).toContain(dirtyWarning)
+    expect(events[0]?.workspaceRoot).toBe(worktreeDir)
+    expect(events[0]?.worktreePath).toBe(worktreeDir)
+
+    await rm(worktreeDir, { recursive: true, force: true })
+  })
+
+  test('ignores inherited worktree metadata when the workspace root is outside the worktree', async () => {
+    const agentId = 'alice@test'
+    const worktreeDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-worktree-'))
+    const outsideDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-outside-'))
+    const dirtyWarning =
+      'Leader workspace had uncommitted changes when this teammate worktree was created; the worktree starts from committed HEAD only.'
+    process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV] = repoDir
+    process.env[TASK_CHANGE_WORKTREE_PATH_ENV] = worktreeDir
+    process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV] = 'worktree-team-atlas-alice-12345678'
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV] = repoDir
+    process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV] = dirtyWarning
+    setCwdState(outsideDir)
+    openScope('task-worktree-env-outside', 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/outside.ts',
+        content: 'export const outside = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-outside-write',
+      sessionId,
+      agentId,
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(
+      bundlePath('task-worktree-env-outside'),
+    )
+    const files = bundle.files as Array<Record<string, unknown>>
+    const scope = bundle.scope as Record<string, unknown>
+
+    expect(files[0]?.filePath).toBe(join(outsideDir, 'src', 'outside.ts'))
+    expect(files[0]?.worktreePath).toBeUndefined()
+    expect(scope.worktreePaths).toBeUndefined()
+    expect(bundle.warnings).not.toContain(dirtyWarning)
+
+    await rm(worktreeDir, { recursive: true, force: true })
+    await rm(outsideDir, { recursive: true, force: true })
+  })
+
+  test('persists deferred worktree snapshot records under the centralized ledger project dir', async () => {
+    const agentId = 'alice@test'
+    const backgroundTaskId = 'bg-worktree-centralized'
+    const worktreeDir = await createGitRepo()
+    const worktreePendingPath = join(
+      worktreeDir,
+      '.board-task-changes',
+      'pending-shell-snapshots',
+      `${encodeTaskId(backgroundTaskId)}.json`,
+    )
+    process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV] = repoDir
+    process.env[TASK_CHANGE_WORKTREE_PATH_ENV] = worktreeDir
+    process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV] = 'worktree-team-atlas-alice-12345678'
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV] = repoDir
+    setCwdState(worktreeDir)
+    openScope('task-worktree-deferred-centralized', 'work', agentId)
+    await mkdir(join(worktreeDir, 'src'), { recursive: true })
+    await writeFile(join(worktreeDir, 'src', 'background.ts'), 'export const value = 1;\n')
+    runGit(['add', '.'], worktreeDir)
+    runGit(['commit', '-m', 'initial commit'], worktreeDir)
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'background edit src/background.ts' },
+      toolUseId: 'tool-worktree-deferred',
+      sessionId,
+      agentId,
+    })
+    await deferTaskChangeShellSnapshot(backgroundTaskId, snapshot)
+
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(true)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(true)
+    expect(await pathExists(worktreePendingPath)).toBe(false)
+    const persistedPointer = await readJson<Record<string, unknown>>(
+      deferredGlobalPointerPath(backgroundTaskId),
+    )
+    expect(persistedPointer.projectDir).toBe(repoDir)
+    expect(persistedPointer.projectRecordPath).toBe(deferredProjectSnapshotPath(backgroundTaskId))
+    expect(Date.parse(String(persistedPointer.expiresAt))).toBeGreaterThan(Date.now())
+    const persistedRecord = await readJson<Record<string, unknown>>(
+      deferredProjectSnapshotPath(backgroundTaskId),
+    )
+    expect((persistedRecord.snapshot as Record<string, unknown>).beforeHead).toBe(
+      runGit(['rev-parse', 'HEAD'], worktreeDir),
+    )
+    expect((persistedRecord.snapshot as Record<string, unknown>).gitRoot).toBe(worktreeDir)
+    expect((persistedRecord.snapshot as Record<string, unknown>).workspaceRoot).toBe(worktreeDir)
+    expect(
+      ((persistedRecord.snapshot as Record<string, unknown>).scope as Record<string, unknown>)
+        .taskId,
+    ).toBe('task-worktree-deferred-centralized')
+
+    clearDeferredTaskChangeShellSnapshotsForTests()
+    await writeFile(join(worktreeDir, 'src', 'background.ts'), 'export const value = 2;\n')
+    expect(runGit(['status', '--porcelain'], worktreeDir)).toContain('src/background.ts')
+    expect(runGit(['show', 'HEAD:src/background.ts'], worktreeDir)).toBe('export const value = 1;')
+    expect(await readFile(join(worktreeDir, 'src', 'background.ts'), 'utf8')).toBe(
+      'export const value = 2;\n',
+    )
+    await completeDeferredTaskChangeShellSnapshot(backgroundTaskId, 'succeeded')
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath('task-worktree-deferred-centralized'),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.filePath).toBe(join(worktreeDir, 'src', 'background.ts'))
+    expect(events[0]?.worktreePath).toBe(worktreeDir)
+    expect(events[0]?.warnings).toEqual(
+      expect.arrayContaining([
+        'Task change ledger recovered a deferred shell snapshot from disk after in-memory state was unavailable.',
+      ]),
+    )
+    expect(await pathExists(deferredProjectSnapshotPath(backgroundTaskId))).toBe(false)
+    expect(await pathExists(deferredGlobalPointerPath(backgroundTaskId))).toBe(false)
+
+    await rm(worktreeDir, { recursive: true, force: true })
+  })
+
+  test('keeps identical relative rename relations isolated per worktree', async () => {
+    const taskId = 'task-worktree-relation-isolation'
+    const worktreeA = await createGitRepo()
+    const worktreeB = await createGitRepo()
+    process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV] = repoDir
+    process.env[TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV] = repoDir
+
+    for (const [index, worktreeDir] of [worktreeA, worktreeB].entries()) {
+      const agentId = index === 0 ? 'alice@test' : 'bob@test'
+      process.env[TASK_CHANGE_WORKTREE_PATH_ENV] = worktreeDir
+      process.env[TASK_CHANGE_WORKTREE_BRANCH_ENV] =
+        `worktree-team-atlas-${index === 0 ? 'alice' : 'bob'}-12345678`
+      setCwdState(worktreeDir)
+      openScope(taskId, 'work', agentId)
+      await mkdir(join(worktreeDir, 'src'), { recursive: true })
+      await writeFile(
+        join(worktreeDir, 'src', 'old.ts'),
+        `export const value = ${index};\n`,
+        'utf8',
+      )
+      runGit(['add', '.'], worktreeDir)
+      runGit(['commit', '-m', 'initial commit'], worktreeDir)
+
+      const snapshot = await maybeBeginTaskChangeShellSnapshot({
+        toolName: BASH_TOOL_NAME,
+        input: { command: 'mv src/old.ts src/new.ts' },
+        toolUseId: `tool-worktree-rename-${index}`,
+        sessionId,
+        agentId,
+      })
+      runGit(['mv', 'src/old.ts', 'src/new.ts'], worktreeDir)
+      await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+    }
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files).toHaveLength(2)
+    const normalizeKey = (filePath: string): string => {
+      const normalized = filePath.replace(/\\/g, '/')
+      return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')
+        ? normalized.toLowerCase()
+        : normalized
+    }
+    expect(new Set(files.map(file => file.changeKey))).toEqual(
+      new Set([
+        `rename:${normalizeKey(worktreeA)}:src/old.ts->src/new.ts`,
+        `rename:${normalizeKey(worktreeB)}:src/old.ts->src/new.ts`,
+      ]),
+    )
+    expect(files.map(file => file.worktreePath).sort()).toEqual(
+      [worktreeA, worktreeB].sort(),
+    )
+
+    await rm(worktreeA, { recursive: true, force: true })
+    await rm(worktreeB, { recursive: true, force: true })
   })
 
   test('uses short hashed artifact names for very long task ids', async () => {

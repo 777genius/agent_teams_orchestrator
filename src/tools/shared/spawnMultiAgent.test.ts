@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'bun:test'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
 import { resolveTeammateModel } from './spawnMultiAgent.js'
+import { spawnTeammate } from './spawnMultiAgent.js'
 
 afterEach(() => {
   delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
@@ -282,5 +283,23 @@ describe('resolveTeammateModel', () => {
 
   it('still inherits the leader model when inherit is requested explicitly', () => {
     expect(resolveTeammateModel('inherit', 'leader-model')).toBe('leader-model')
+  })
+})
+
+describe('spawnTeammate worktree isolation validation', () => {
+  it('rejects cwd with worktree isolation before spawn side effects', async () => {
+    await expect(
+      spawnTeammate(
+        {
+          name: 'alice',
+          prompt: 'work',
+          cwd: '/tmp/alice',
+          isolation: 'worktree',
+        },
+        {
+          getAppState: () => ({}),
+        } as never,
+      ),
+    ).rejects.toThrow('cwd is mutually exclusive with isolation: "worktree"')
   })
 })
