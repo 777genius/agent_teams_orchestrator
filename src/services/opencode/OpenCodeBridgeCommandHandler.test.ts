@@ -785,6 +785,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.runtimePid).toBe(123)
   })
 
+  test('aggregates runtime permissions across all sessions in the addressed lane', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'alice',
+        opencodeSessionId: 'session-alice',
+      }),
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary:
+        record.opencodeSessionId === 'session-alice'
+          ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            pendingPermissionRequestIds: ['perm-1'],
+          })
+          : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            pendingPermissionRequestIds: ['perm-2', 'perm-1'],
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.listRuntimePermissions', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'primary',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.permissions.map(permission => permission.requestId)).toEqual([
+      'perm-1',
+      'perm-2',
+    ])
+  })
+
   test('rejects ambiguous transcript reads without laneId when multiple lanes exist', async () => {
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),

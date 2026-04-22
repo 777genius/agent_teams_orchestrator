@@ -950,10 +950,17 @@ async function runListPermissions(envelope: BridgeEnvelope) {
         throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
       }
     }
-    const firstRecord = records[0]
-    if (firstRecord) {
-      const reconciled = await openCodeSessionBridge.reconcileSession(firstRecord, { limit: 1 })
-      permissions = reconciled.summary.pendingPermissionRequestIds.map(requestID => ({ requestID }))
+    if (records.length > 0) {
+      const requestIds = new Set<string>()
+      for (const record of records) {
+        const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 1 })
+        for (const requestID of reconciled.summary.pendingPermissionRequestIds) {
+          if (requestID.trim()) {
+            requestIds.add(requestID.trim())
+          }
+        }
+      }
+      permissions = [...requestIds].map(requestID => ({ requestID }))
     }
   }
   return {
