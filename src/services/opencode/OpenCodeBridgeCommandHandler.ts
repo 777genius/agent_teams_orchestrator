@@ -893,27 +893,24 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
   const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+  const selectedModel = record.selectedModel
+  const members: Record<string, LaunchMemberDraft> = {
+    [record.memberName]: {
+      sessionId: record.opencodeSessionId,
+      launchState: bridgeStateFromSummary(reconciled.summary),
+      evidence: evidenceFromSummary(reconciled.summary),
+      diagnostics: reconciled.summary.diagnostics,
+    },
+  }
   return {
     snapshot,
-    data: {
+    data: buildTeamLaunchData({
       runId: asString(body.runId) ?? 'unknown',
-      teamLaunchState: reconciled.summary.pendingPermissionRequestIds.length > 0
-        ? 'permission_blocked'
-        : 'launching',
-      members: {
-        [record.memberName]: {
-          sessionId: record.opencodeSessionId,
-          launchState: bridgeStateFromSummary(reconciled.summary),
-          model: record.selectedModel,
-          evidence: evidenceFromSummary(reconciled.summary),
-        },
-      },
-      warnings: [],
+      selectedModel,
+      members,
       diagnostics: reconciled.summary.diagnostics.map(message => teamDiagnostic('permission_reconcile', message, 'info')),
-      ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
-      manifestHighWatermark: commandEvidence.manifestHighWatermark,
-      runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
-    },
+      commandEvidence,
+    }),
   }
 }
 

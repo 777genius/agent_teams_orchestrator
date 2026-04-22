@@ -701,6 +701,45 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.error.message).toContain('laneId is required')
   })
 
+  test('marks the lane ready after answering permission when bootstrap confirmation is already present', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () =>
+      buildRecord({
+        laneId: 'secondary:opencode:alice',
+        memberName: 'alice',
+      })) as typeof openCodeSessionStore.get
+    const answered: Array<{ requestId: string; decision: string }> = []
+    openCodeSessionBridge.answerPermission = (async (_record, input) => {
+      answered.push(input)
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        pendingPermissionRequestIds: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        requestId: 'perm-1',
+        decision: 'allow',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(answered).toEqual([{ requestId: 'perm-1', decision: 'allow' }])
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+  })
+
   test('rejects ambiguous transcript reads without laneId when multiple lanes exist', async () => {
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
