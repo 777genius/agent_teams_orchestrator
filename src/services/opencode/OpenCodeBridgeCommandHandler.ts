@@ -579,6 +579,7 @@ function buildTeamLaunchData(params: {
           ...(member.pendingPermissionRequestIds?.length
             ? { pendingPermissionRequestIds: [...new Set(member.pendingPermissionRequestIds)] }
             : {}),
+          ...(member.diagnostics.length ? { diagnostics: [...member.diagnostics] } : {}),
           model: params.selectedModel,
           ...(typeof member.runtimePid === 'number' && member.runtimePid > 0
             ? { runtimePid: member.runtimePid }

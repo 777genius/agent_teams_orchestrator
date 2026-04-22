@@ -579,6 +579,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         messageCount: 0,
         durableState: 'blocked',
         pendingPermissionRequestIds: ['perm-1', 'perm-1', 'perm-2'],
+        diagnostics: ['waiting for permission approval'],
         messages: [],
       }),
     })) as typeof openCodeSessionBridge.reconcileSession
@@ -602,6 +603,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.teamLaunchState).toBe('permission_blocked')
     expect(result.data.members.alice?.launchState).toBe('permission_blocked')
     expect(result.data.members.alice?.pendingPermissionRequestIds).toEqual(['perm-1', 'perm-2'])
+    expect(result.data.members.alice?.diagnostics).toEqual(['waiting for permission approval'])
   })
 
   test('reconciles only the addressed lane members', async () => {
