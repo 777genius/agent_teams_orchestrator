@@ -76,6 +76,7 @@ type TeamWarning = {
 type LaunchMemberDraft = {
   sessionId: string
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
+  pendingPermissionRequestIds?: string[]
   runtimePid?: number
   evidence: Array<{ kind: string; observedAt: string }>
   diagnostics: string[]
@@ -575,6 +576,9 @@ function buildTeamLaunchData(params: {
         {
           sessionId: member.sessionId,
           launchState: member.launchState,
+          ...(member.pendingPermissionRequestIds?.length
+            ? { pendingPermissionRequestIds: [...new Set(member.pendingPermissionRequestIds)] }
+            : {}),
           model: params.selectedModel,
           ...(typeof member.runtimePid === 'number' && member.runtimePid > 0
             ? { runtimePid: member.runtimePid }
@@ -739,6 +743,9 @@ async function runLaunch(envelope: BridgeEnvelope) {
     members[name] = {
       sessionId: record.opencodeSessionId,
       launchState,
+      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+        : {}),
       ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
         ? { runtimePid: snapshot.host.pid }
         : {}),
@@ -797,6 +804,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
     members[name] = {
       sessionId: record.opencodeSessionId,
       launchState: bridgeStateFromSummary(reconciled.summary),
+      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+        : {}),
       ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
         ? { runtimePid: snapshot.host.pid }
         : {}),
@@ -898,6 +908,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
     [record.memberName]: {
       sessionId: record.opencodeSessionId,
       launchState: bridgeStateFromSummary(reconciled.summary),
+      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+        : {}),
       evidence: evidenceFromSummary(reconciled.summary),
       diagnostics: reconciled.summary.diagnostics,
     },
