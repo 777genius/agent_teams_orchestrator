@@ -54,7 +54,7 @@ const bootstrapSpecSchema = z.strictObject({
       .max(64)
       .optional(),
   }),
-  members: z.array(bootstrapMemberSchema).min(1).max(8),
+  members: z.array(bootstrapMemberSchema).max(8),
   launch: z
     .strictObject({
       bootstrapTimeoutMs: z.number().int().positive().max(120_000).optional(),

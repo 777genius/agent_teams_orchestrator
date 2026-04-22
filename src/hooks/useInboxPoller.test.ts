@@ -13,6 +13,7 @@ import {
   isBootstrapMemberBriefingCallableNow,
   isBootstrapMailboxInstructionText,
   isMemberBriefingToolName,
+  shouldDeferPendingInboxDelivery,
 } from './useInboxPoller.js'
 import { createAssistantMessage, createUserMessage } from '../utils/messages.js'
 
@@ -233,6 +234,69 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         waitStartedAt: 0,
       }),
     ).toEqual({ type: 'proceed' })
+  })
+
+  test('does not defer bootstrap teammate delivery while loading', () => {
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: true,
+        focusedInputDialog: undefined,
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'bootstrap-row',
+            messageId: 'bootstrap-msg',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"relay-works-6","memberName":"alice"}',
+          },
+        ],
+      }),
+    ).toBe(false)
+  })
+
+  test('still defers ordinary teammate delivery while loading', () => {
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: true,
+        focusedInputDialog: undefined,
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'regular-row',
+            messageId: 'regular-msg',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'user',
+            status: 'pending',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Тут?',
+          },
+        ],
+      }),
+    ).toBe(true)
+  })
+
+  test('always defers when a dialog is focused', () => {
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: false,
+        focusedInputDialog: 'tool-permission',
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'bootstrap-row',
+            messageId: 'bootstrap-msg',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"relay-works-6","memberName":"alice"}',
+          },
+        ],
+      }),
+    ).toBe(true)
   })
 
   test('bootstrap transcript activity signature changes when transcript appends', () => {

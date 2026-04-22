@@ -226,6 +226,28 @@ export function getOrdinaryPendingMessage({
   )
 }
 
+export function shouldDeferPendingInboxDelivery(params: {
+  isLoading: boolean
+  focusedInputDialog: string | undefined
+  isTeammateSession: boolean
+  pendingMessages: readonly PendingInboxMirrorMessage[]
+}): boolean {
+  if (params.focusedInputDialog) {
+    return true
+  }
+
+  if (!params.isLoading) {
+    return false
+  }
+
+  const bootstrapPendingMessage = getBootstrapPendingMessage({
+    pendingMessages: params.pendingMessages,
+    isTeammateSession: params.isTeammateSession,
+  })
+
+  return bootstrapPendingMessage == null
+}
+
 export function getBootstrapInlineHandoffPrompt({
   bootstrapInstructionText,
   teamName,
@@ -1319,11 +1341,6 @@ export function useInboxPoller({
   useEffect(() => {
     if (!enabled) return
 
-    // Skip if busy or in a dialog
-    if (isLoading || focusedInputDialog) {
-      return
-    }
-
     // Use ref to avoid dependency on appState object (prevents infinite loop)
     const currentAppState = store.getState()
     const agentName = getAgentNameToPoll(currentAppState)
@@ -1331,6 +1348,21 @@ export function useInboxPoller({
     const sessionId = getSessionId()
     const teamName = currentAppState.teamContext?.teamName
     const now = Date.now()
+
+    const liveOwnedMessagesForGate = currentAppState.inbox.messages.filter(message =>
+      isLiveInboxMirrorMessageOwnedBySession(message, sessionId),
+    )
+
+    if (
+      shouldDeferPendingInboxDelivery({
+        isLoading,
+        focusedInputDialog,
+        isTeammateSession: isTeammate(),
+        pendingMessages: liveOwnedMessagesForGate,
+      })
+    ) {
+      return
+    }
 
     const staleMirroredMessageIds = new Set(
       currentAppState.inbox.messages
@@ -1350,9 +1382,7 @@ export function useInboxPoller({
       }))
     }
 
-    const liveOwnedMessages = currentAppState.inbox.messages.filter(message =>
-      isLiveInboxMirrorMessageOwnedBySession(message, sessionId),
-    )
+    const liveOwnedMessages = liveOwnedMessagesForGate
     const activeBootstrapMessages = liveOwnedMessages.filter(
       message =>
         isBootstrapMailboxInstructionText(message.text) &&

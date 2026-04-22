@@ -70,6 +70,31 @@ describe('team bootstrap spec normalization', () => {
     )
   })
 
+  test('allows startup bootstrap specs with zero teammates for lead-only primary lanes', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-zero-members',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'forge-labs',
+        cwd: workspaceDir,
+      },
+      lead: {
+        agentLanguage: 'English',
+      },
+      members: [],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members).toEqual([])
+  })
+
   test('preserves explicit member prompts when provided', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })

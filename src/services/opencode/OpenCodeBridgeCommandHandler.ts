@@ -76,6 +76,7 @@ type TeamWarning = {
 type LaunchMemberDraft = {
   sessionId: string
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
+  runtimePid?: number
   evidence: Array<{ kind: string; observedAt: string }>
   diagnostics: string[]
 }
@@ -575,6 +576,9 @@ function buildTeamLaunchData(params: {
           sessionId: member.sessionId,
           launchState: member.launchState,
           model: params.selectedModel,
+          ...(typeof member.runtimePid === 'number' && member.runtimePid > 0
+            ? { runtimePid: member.runtimePid }
+            : {}),
           evidence: member.evidence,
         },
       ]),
@@ -735,6 +739,9 @@ async function runLaunch(envelope: BridgeEnvelope) {
     members[name] = {
       sessionId: record.opencodeSessionId,
       launchState,
+      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+        ? { runtimePid: snapshot.host.pid }
+        : {}),
       evidence: evidenceFromSummary(reconciled.summary),
       diagnostics: reconciled.summary.diagnostics,
     }
@@ -790,6 +797,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
     members[name] = {
       sessionId: record.opencodeSessionId,
       launchState: bridgeStateFromSummary(reconciled.summary),
+      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+        ? { runtimePid: snapshot.host.pid }
+        : {}),
       evidence: evidenceFromSummary(reconciled.summary),
       diagnostics: reconciled.summary.diagnostics,
     }

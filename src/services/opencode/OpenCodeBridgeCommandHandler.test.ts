@@ -507,6 +507,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toHaveLength(1)
     expect(ensureInputs[0]?.laneId).toBe('secondary:opencode:alice')
+    expect(
+      (result.data as { members: Record<string, { runtimePid?: number }> }).members.alice?.runtimePid,
+    ).toBe(123)
     expect(Object.keys((result.data as { members: Record<string, unknown> }).members)).toEqual([
       'alice',
     ])
@@ -544,6 +547,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
 
     expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(
+        (result.data as { members: Record<string, { runtimePid?: number }> }).members.alice
+          ?.runtimePid,
+      ).toBe(123)
+    }
     expect(getCalls).toEqual([
       {
         teamId: 'team-a',
