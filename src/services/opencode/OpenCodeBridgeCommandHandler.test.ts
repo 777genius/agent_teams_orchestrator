@@ -606,6 +606,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.diagnostics).toEqual(['waiting for permission approval'])
   })
 
+  test('includes permission-blocked evidence when durable state is blocked before request ids materialize', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: null,
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        messageCount: 0,
+        durableState: 'blocked',
+        pendingPermissionRequestIds: [],
+        messages: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.members.alice?.launchState).toBe('permission_blocked')
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toContain(
+      'permission_blocked',
+    )
+  })
+
   test('reconciles only the addressed lane members', async () => {
     const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
     openCodeProvisioningProbe.probe = async () => snapshot

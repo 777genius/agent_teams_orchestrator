@@ -537,7 +537,7 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
   const evidence = [
     { kind: 'member_session_recorded', observedAt },
   ]
-  if (summary.pendingPermissionRequestIds.length > 0) {
+  if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
   if (summary.latestAssistantMessageId) {
