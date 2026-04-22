@@ -782,6 +782,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(answered).toEqual([{ requestId: 'perm-1', decision: 'allow' }])
     expect(result.data.teamLaunchState).toBe('ready')
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.runtimePid).toBe(123)
   })
 
   test('rejects ambiguous transcript reads without laneId when multiple lanes exist', async () => {

@@ -911,6 +911,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
       ...(reconciled.summary.pendingPermissionRequestIds.length > 0
         ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
         : {}),
+      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+        ? { runtimePid: snapshot.host.pid }
+        : {}),
       evidence: evidenceFromSummary(reconciled.summary),
       diagnostics: reconciled.summary.diagnostics,
     },
