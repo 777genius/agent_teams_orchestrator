@@ -13,6 +13,7 @@ import {
   isBootstrapMemberBriefingCallableNow,
   isBootstrapMailboxInstructionText,
   isMemberBriefingToolName,
+  shouldSkipBootstrapReadinessWait,
   shouldDeferPendingInboxDelivery,
 } from './useInboxPoller.js'
 import { createAssistantMessage, createUserMessage } from '../utils/messages.js'
@@ -174,6 +175,29 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         teamName: 'harbor-labs',
       }),
     ).toBeNull()
+  })
+
+  test('skips bootstrap readiness wait when a full inline handoff prompt is available', () => {
+    expect(
+      shouldSkipBootstrapReadinessWait({
+        bootstrapInstructionText:
+          'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs","memberName":"alice"}',
+        teamName: 'harbor-labs',
+        memberName: 'alice',
+        toolCallableNow: false,
+      }),
+    ).toBe(true)
+  })
+
+  test('keeps bootstrap readiness wait when teammate context is incomplete and tool is deferred', () => {
+    expect(
+      shouldSkipBootstrapReadinessWait({
+        bootstrapInstructionText:
+          'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs","memberName":"alice"}',
+        teamName: 'harbor-labs',
+        toolCallableNow: false,
+      }),
+    ).toBe(false)
   })
 
   test('treats prefixed member_briefing as callable when tool search is off', () => {

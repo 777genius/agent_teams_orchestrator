@@ -275,6 +275,25 @@ export function getBootstrapInlineHandoffPrompt({
   ].join('\n')
 }
 
+export function shouldSkipBootstrapReadinessWait(params: {
+  bootstrapInstructionText: string
+  teamName?: string
+  memberName?: string
+  toolCallableNow: boolean
+}): boolean {
+  if (params.toolCallableNow) {
+    return true
+  }
+
+  return (
+    getBootstrapInlineHandoffPrompt({
+      bootstrapInstructionText: params.bootstrapInstructionText,
+      teamName: params.teamName,
+      memberName: params.memberName,
+    }) !== null
+  )
+}
+
 export function getOrdinaryInlineHandoffPrompt({
   from,
   text,
@@ -1619,6 +1638,15 @@ export function useInboxPoller({
         `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
       )
 
+      const bootstrapPrompt =
+        bootstrapPendingMessage != null
+          ? getBootstrapInlineHandoffPrompt({
+              bootstrapInstructionText: bootstrapPendingMessage.text,
+              memberName: currentAppState.teamContext?.selfAgentName,
+              teamName: currentAppState.teamContext?.teamName,
+            })
+          : null
+
       if (bootstrapPendingMessage?.messageId) {
         const effectiveTools = assembleToolPool(
           currentAppState.toolPermissionContext,
@@ -1629,14 +1657,22 @@ export function useInboxPoller({
             toolSearchEnabledOptimistic: isToolSearchEnabledOptimistic(),
             tools: effectiveTools,
           })
+        const shouldBypassReadinessWait = shouldSkipBootstrapReadinessWait({
+          bootstrapInstructionText: bootstrapPendingMessage.text,
+          teamName: currentAppState.teamContext?.teamName,
+          memberName: currentAppState.teamContext?.selfAgentName,
+          toolCallableNow: memberBriefingCallableNow,
+        })
         const readinessWait = bootstrapReadinessWaitsRef.current.get(
           bootstrapPendingMessage.messageId,
         )
-        const readinessDecision = getBootstrapReadinessDecision({
-          now,
-          toolCallableNow: memberBriefingCallableNow,
-          waitStartedAt: readinessWait?.startedAt,
-        })
+        const readinessDecision = shouldBypassReadinessWait
+          ? ({ type: 'proceed' } as const)
+          : getBootstrapReadinessDecision({
+              now,
+              toolCallableNow: memberBriefingCallableNow,
+              waitStartedAt: readinessWait?.startedAt,
+            })
 
         if (readinessDecision.type === 'wait') {
           if (!readinessWait) {
@@ -1664,22 +1700,13 @@ export function useInboxPoller({
           bootstrapReadinessWaitsRef.current.delete(
             bootstrapPendingMessage.messageId,
           )
-          if (!memberBriefingCallableNow) {
+          if (!memberBriefingCallableNow && !shouldBypassReadinessWait) {
             logForDebugging(
               '[InboxPoller] member_briefing still not callable after bootstrap readiness grace period; falling back to current bootstrap handoff behavior',
             )
           }
         }
       }
-
-      const bootstrapPrompt =
-        bootstrapPendingMessage != null
-          ? getBootstrapInlineHandoffPrompt({
-              bootstrapInstructionText: bootstrapPendingMessage.text,
-              memberName: currentAppState.teamContext?.selfAgentName,
-              teamName: currentAppState.teamContext?.teamName,
-            })
-          : null
       const ordinaryPrompt =
         ordinaryPendingMessage != null
           ? getOrdinaryInlineHandoffPrompt({
