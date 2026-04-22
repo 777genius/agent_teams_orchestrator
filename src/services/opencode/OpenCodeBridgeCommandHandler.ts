@@ -525,7 +525,7 @@ function bridgeStateFromSummary(summary: OpenCodeSessionReconcileSummary): 'crea
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     return 'permission_blocked'
   }
-  if (summary.latestAssistantMessageId || summary.durableState === 'idle') {
+  if (summary.latestAssistantMessageId) {
     return 'confirmed_alive'
   }
   return 'created'
@@ -539,7 +539,7 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
   if (summary.pendingPermissionRequestIds.length > 0) {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
-  if (summary.latestAssistantMessageId || summary.durableState === 'idle') {
+  if (summary.latestAssistantMessageId) {
     evidence.push({ kind: 'bootstrap_confirmed', observedAt })
     evidence.push({ kind: 'member_ready', observedAt })
   }

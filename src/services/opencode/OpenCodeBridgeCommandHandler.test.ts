@@ -515,6 +515,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('keeps a launched member pending until OpenCode emits an assistant bootstrap confirmation', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: null,
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        messageCount: 0,
+        durableState: 'idle',
+        messages: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+      'member_session_recorded',
+    ])
+  })
+
   test('reconciles only the addressed lane members', async () => {
     const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
     openCodeProvisioningProbe.probe = async () => snapshot
@@ -559,6 +604,46 @@ describe('OpenCodeBridgeCommandHandler', () => {
         laneId: 'secondary:opencode:alice',
         memberName: 'alice',
       },
+    ])
+  })
+
+  test('keeps a reconciled lane pending until OpenCode emits an assistant bootstrap confirmation', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
+      buildRecord({
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: memberName ?? laneIdOrMemberName,
+        opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: null,
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        messageCount: 0,
+        durableState: 'idle',
+        messages: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+      'member_session_recorded',
     ])
   })
 
