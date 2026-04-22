@@ -752,6 +752,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
         laneId: 'secondary:opencode:alice',
         memberName: 'alice',
       })) as typeof openCodeSessionStore.get
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'secondary:opencode:alice',
+        memberName: 'alice',
+      }),
+    ]) as typeof openCodeSessionStore.list
     const answered: Array<{ requestId: string; decision: string }> = []
     openCodeSessionBridge.answerPermission = (async (_record, input) => {
       answered.push(input)
@@ -783,6 +789,68 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.teamLaunchState).toBe('ready')
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.alice?.runtimePid).toBe(123)
+  })
+
+  test('keeps lane-level permission state after answering one member when another member is still blocked', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () =>
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'alice',
+        opencodeSessionId: 'session-alice',
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'alice',
+        opencodeSessionId: 'session-alice',
+      }),
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.answerPermission = (async () => {}) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary:
+        record.opencodeSessionId === 'session-alice'
+          ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            pendingPermissionRequestIds: [],
+          })
+          : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: null,
+            latestAssistantText: null,
+            latestAssistantPreview: null,
+            messageCount: 0,
+            durableState: 'blocked',
+            pendingPermissionRequestIds: ['perm-bob'],
+            messages: [],
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        requestId: 'perm-alice',
+        decision: 'allow',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('permission_blocked')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.bob?.launchState).toBe('permission_blocked')
+    expect(result.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
   })
 
   test('aggregates runtime permissions across all sessions in the addressed lane', async () => {

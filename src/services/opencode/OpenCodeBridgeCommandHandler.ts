@@ -902,11 +902,16 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
-  const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+  const laneRecords = (await openCodeSessionStore.list()).filter(
+    candidate => candidate.teamId === record.teamId && candidate.laneId === record.laneId,
+  )
   const selectedModel = record.selectedModel
-  const members: Record<string, LaunchMemberDraft> = {
-    [record.memberName]: {
-      sessionId: record.opencodeSessionId,
+  const members: Record<string, LaunchMemberDraft> = {}
+  const diagnostics: TeamDiagnostic[] = []
+  for (const laneRecord of laneRecords) {
+    const reconciled = await openCodeSessionBridge.reconcileSession(laneRecord, { limit: 50 })
+    members[laneRecord.memberName] = {
+      sessionId: laneRecord.opencodeSessionId,
       launchState: bridgeStateFromSummary(reconciled.summary),
       ...(reconciled.summary.pendingPermissionRequestIds.length > 0
         ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
@@ -916,7 +921,12 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
         : {}),
       evidence: evidenceFromSummary(reconciled.summary),
       diagnostics: reconciled.summary.diagnostics,
-    },
+    }
+    diagnostics.push(
+      ...reconciled.summary.diagnostics.map(message =>
+        teamDiagnostic('permission_reconcile', `${laneRecord.memberName}: ${message}`, 'info'),
+      ),
+    )
   }
   return {
     snapshot,
@@ -924,7 +934,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
       runId: asString(body.runId) ?? 'unknown',
       selectedModel,
       members,
-      diagnostics: reconciled.summary.diagnostics.map(message => teamDiagnostic('permission_reconcile', message, 'info')),
+      diagnostics,
       commandEvidence,
     }),
   }
