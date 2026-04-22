@@ -52,6 +52,7 @@ const host: OpenCodeHostHandle = {
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
     teamId: 'team-a',
+    laneId: 'primary',
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openai/gpt-5.4-mini',
@@ -167,7 +168,7 @@ describe('OpenCodeSessionBridge', () => {
           upserts.push(record)
           return 'created'
         },
-        markStale: async (_teamId, _memberName, staleReason) => {
+        markStale: async (_teamId, _laneId, _memberName, staleReason) => {
           staleReasons.push(staleReason)
           return buildRecord({ staleReason })
         },

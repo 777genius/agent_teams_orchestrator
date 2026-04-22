@@ -1,3 +1,8 @@
+import {
+  filterCodexModelsForCurrentProcess,
+  isCodexModelSupportedForCurrentProcess,
+} from './codexRuntimeAccess.js'
+
 export const CODEX_MODELS = [
   {
     id: 'gpt-5.4',
@@ -55,8 +60,20 @@ export function mapClaudeModelToCodex(claudeModel: string | null): string {
   if (!claudeModel) return DEFAULT_CODEX_MODEL
   if (isCodexModel(claudeModel)) return claudeModel
   const lower = claudeModel.toLowerCase()
-  if (lower.includes('opus')) return 'gpt-5.1-codex-max'
-  if (lower.includes('haiku')) return 'gpt-5.1-codex-mini'
-  if (lower.includes('sonnet')) return 'gpt-5.2-codex'
-  return DEFAULT_CODEX_MODEL
+  const mappedModel = lower.includes('opus')
+    ? 'gpt-5.1-codex-max'
+    : lower.includes('haiku')
+      ? 'gpt-5.1-codex-mini'
+      : lower.includes('sonnet')
+        ? 'gpt-5.2-codex'
+        : DEFAULT_CODEX_MODEL
+
+  if (isCodexModelSupportedForCurrentProcess(mappedModel)) {
+    return mappedModel
+  }
+
+  return (
+    filterCodexModelsForCurrentProcess(CODEX_MODELS.map(model => model.id))[0] ??
+    DEFAULT_CODEX_MODEL
+  )
 }

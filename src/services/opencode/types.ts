@@ -463,6 +463,7 @@ export type OpenCodeSessionPreviewSummary = {
 
 export type OpenCodeSessionRecord = {
   teamId: string
+  laneId?: string
   memberName: string
   providerId: 'opencode'
   selectedModel: string

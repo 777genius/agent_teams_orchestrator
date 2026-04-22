@@ -66,6 +66,7 @@ import { countToolCalls, SYNTHETIC_MESSAGES } from './utils/messages.js'
 import {
   getMainLoopModel,
   parseUserSpecifiedModel,
+  resolveAllowedModelSetting,
 } from './utils/model/model.js'
 import { loadAllPluginsCacheOnly } from './utils/plugins/pluginLoader.js'
 import {
@@ -275,7 +276,7 @@ export class QueryEngine {
 
     const initialAppState = getAppState()
     const initialMainLoopModel = userSpecifiedModel
-      ? parseUserSpecifiedModel(userSpecifiedModel)
+      ? resolveAllowedModelSetting(userSpecifiedModel)
       : getMainLoopModel()
 
     const initialThinkingConfig: ThinkingConfig = thinkingConfig

@@ -22,8 +22,12 @@ import type { AppState } from '../../state/AppState.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { getModelUsage, getTotalAPIDuration, getTotalCost } from '../../cost-tracker.js'
 import type { NonNullableUsage } from '../../entrypoints/sdk/coreTypes.js'
-import { getCodexNativeApiKey } from '../runtimeBackends/codexBackendResolver.js'
+import {
+  getCodexForcedLoginMethod,
+  getCodexNativeApiKey,
+} from '../runtimeBackends/codexBackendResolver.js'
 import { runCodexNativeExec } from './execRunner.js'
+import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import {
   createCodexNativeExecutionSummaryMessage,
   createCodexNativeThreadStatusMessage,
@@ -320,6 +324,8 @@ export async function* executeCodexNativeTurn(
       additionalWritableDirectories: params.additionalWritableDirectories,
       ephemeral: shouldUseEphemeralCodexNativeThread(),
       apiKey: getCodexNativeApiKey() ?? undefined,
+      forcedLoginMethod: getCodexForcedLoginMethod() ?? undefined,
+      configOverrides: buildCodexNativeMcpConfigOverrides(),
       abortSignal: params.abortSignal,
     })
 

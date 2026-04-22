@@ -99,6 +99,34 @@ describe('buildCodexNativeExecArgs', () => {
       'Reply only with OK',
     ])
   })
+
+  test('passes forced login method and MCP config overrides through -c flags', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        forcedLoginMethod: 'chatgpt',
+        configOverrides: [
+          'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+          'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
+        ],
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-c',
+      'forced_login_method="chatgpt"',
+      '-c',
+      'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+      '-c',
+      'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
+      'Reply only with OK',
+    ])
+  })
 })
 
 describe('runCodexNativeExec', () => {
@@ -146,6 +174,7 @@ describe('runCodexNativeExec', () => {
       ],
       expect.objectContaining({
         cwd: '/tmp/demo',
+        stdin: 'ignore',
         env: expect.objectContaining({
           CODEX_API_KEY: 'sk-codex',
         }),
@@ -275,6 +304,89 @@ describe('runCodexNativeExec', () => {
     await expect(remaining).rejects.toThrow(
       'Codex native exec exited with code 1: fatal native failure',
     )
+  })
+
+  test('suppresses stdin and cleanup noise and rewrites analytics html spam into one warning', async () => {
+    const process = new FakeCodexProcess()
+
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.122.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    await iterator.next()
+
+    const remaining = (async () => {
+      const observed = []
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          return observed
+        }
+        observed.push(next.value)
+      }
+    })()
+
+    process.stderr.write('Reading additional input from stdin...\n')
+    process.stderr.write(
+      '2026-04-21T23:08:10.237795Z  WARN codex_analytics::client: events failed with status 403 Forbidden: <html>\n',
+    )
+    process.stderr.write('  <head>\n')
+    process.stderr.write('  <body>\n')
+    process.stderr.write(
+      '2026-04-21T23:08:17.075276Z  WARN codex_rmcp_client::stdio_server_launcher: Failed to terminate MCP process group 50669: Operation not permitted (os error 1)\n',
+    )
+    process.stderr.write(
+      '2026-04-21T23:08:18.208719Z  WARN codex_core::shell_snapshot: Failed to delete shell snapshot at AbsolutePathBuf(\"/tmp/foo\"): Os { code: 2, kind: NotFound, message: \"No such file or directory\" }\n',
+    )
+    process.stderr.write('plain warning that should survive\n')
+    process.stdout.write(
+      '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\n',
+    )
+    process.stdout.end()
+    process.stderr.end()
+    process.emit('close', 0, null)
+
+    await expect(remaining).resolves.toEqual([
+      {
+        type: 'normalized_event',
+        event: {
+          type: 'warning',
+          source: 'stderr',
+          text: 'Codex analytics events were blocked with 403 Forbidden. Continuing without analytics.',
+        },
+      },
+      {
+        type: 'normalized_event',
+        event: {
+          type: 'warning',
+          source: 'stderr',
+          text: 'plain warning that should survive',
+        },
+      },
+      {
+        type: 'normalized_event',
+        event: {
+          type: 'usage_updated',
+          inputTokens: 1,
+          cachedInputTokens: 0,
+          outputTokens: 1,
+        },
+      },
+      {
+        type: 'normalized_event',
+        event: {
+          type: 'turn_completed',
+        },
+      },
+    ])
   })
 
   test('records ambient native credential routing when CODEX_API_KEY already exists in process env', async () => {

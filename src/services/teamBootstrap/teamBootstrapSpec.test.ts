@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -101,6 +101,7 @@ describe('team bootstrap spec normalization', () => {
   test('preserves teammate worktree isolation in normalized bootstrap requests', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })
+    const workspaceRealpath = await realpath(workspaceDir)
 
     const request = await buildTeamBootstrapRequestFromSpec({
       version: 1,
@@ -119,17 +120,21 @@ describe('team bootstrap spec normalization', () => {
         {
           name: 'alice',
           prompt: 'custom bootstrap prompt',
+          cwd: workspaceDir,
           isolation: 'worktree',
         },
         {
           name: 'bob',
           prompt: 'custom bootstrap prompt',
+          cwd: workspaceDir,
         },
       ],
     } satisfies TeamBootstrapSpec)
 
     expect(request.members[0]?.isolation).toBe('worktree')
+    expect(request.members[0]?.cwd).toBeUndefined()
     expect(request.members[1]?.isolation).toBeUndefined()
+    expect(request.members[1]?.cwd).toBe(workspaceRealpath)
   })
 
   test('readTeamBootstrapSpec accepts the current claude_team initiator source', async () => {

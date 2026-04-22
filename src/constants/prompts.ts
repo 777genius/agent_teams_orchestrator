@@ -20,6 +20,7 @@ import type { Tools } from '../Tool.js'
 import type { Command } from '../types/command.js'
 import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
 import {
+  getAuthlessProviderDefaultModel,
   getCanonicalName,
   getMarketingNameForModel,
 } from '../utils/model/model.js'
@@ -604,9 +605,13 @@ ${instructionBlocks}`
 }
 
 export async function computeEnvInfo(
-  modelId: string,
+  modelId: string | null | undefined,
   additionalWorkingDirectories?: string[],
 ): Promise<string> {
+  const resolvedModelId =
+    typeof modelId === 'string' && modelId.trim().length > 0
+      ? modelId
+      : getAuthlessProviderDefaultModel()
   const [isGit, unameSR] = await Promise.all([getIsGit(), getUnameSR()])
 
   // Undercover: keep ALL model names/IDs out of the system prompt so nothing
@@ -621,10 +626,10 @@ export async function computeEnvInfo(
   if (process.env.USER_TYPE === 'ant' && isUndercover()) {
     // suppress
   } else {
-    const marketingName = getMarketingNameForModel(modelId)
+    const marketingName = getMarketingNameForModel(resolvedModelId)
     modelDescription = marketingName
-      ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
-      : `You are powered by the model ${modelId}.`
+      ? `You are powered by the model named ${marketingName}. The exact model ID is ${resolvedModelId}.`
+      : `You are powered by the model ${resolvedModelId}.`
   }
 
   const additionalDirsInfo =
@@ -632,7 +637,7 @@ export async function computeEnvInfo(
       ? `Additional working directories: ${additionalWorkingDirectories.join(', ')}\n`
       : ''
 
-  const cutoff = getKnowledgeCutoff(modelId)
+  const cutoff = getKnowledgeCutoff(resolvedModelId)
   const knowledgeCutoffMessage = cutoff
     ? `\n\nAssistant knowledge cutoff is ${cutoff}.`
     : ''
@@ -649,9 +654,13 @@ ${modelDescription}${knowledgeCutoffMessage}`
 }
 
 export async function computeSimpleEnvInfo(
-  modelId: string,
+  modelId: string | null | undefined,
   additionalWorkingDirectories?: string[],
 ): Promise<string> {
+  const resolvedModelId =
+    typeof modelId === 'string' && modelId.trim().length > 0
+      ? modelId
+      : getAuthlessProviderDefaultModel()
   const [isGit, unameSR] = await Promise.all([getIsGit(), getUnameSR()])
 
   // Undercover: strip all model name/ID references. See computeEnvInfo.
@@ -660,13 +669,13 @@ export async function computeSimpleEnvInfo(
   if (process.env.USER_TYPE === 'ant' && isUndercover()) {
     // suppress
   } else {
-    const marketingName = getMarketingNameForModel(modelId)
+    const marketingName = getMarketingNameForModel(resolvedModelId)
     modelDescription = marketingName
-      ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
-      : `You are powered by the model ${modelId}.`
+      ? `You are powered by the model named ${marketingName}. The exact model ID is ${resolvedModelId}.`
+      : `You are powered by the model ${resolvedModelId}.`
   }
 
-  const cutoff = getKnowledgeCutoff(modelId)
+  const cutoff = getKnowledgeCutoff(resolvedModelId)
   const knowledgeCutoffMessage = cutoff
     ? `Assistant knowledge cutoff is ${cutoff}.`
     : null

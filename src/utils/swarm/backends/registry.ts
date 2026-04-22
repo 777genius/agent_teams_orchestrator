@@ -1,6 +1,7 @@
 import { getIsNonInteractiveSession } from '../../../bootstrap/state.js'
 import { logForDebugging } from '../../../utils/debug.js'
 import { isEnvTruthy } from '../../../utils/envUtils.js'
+import { getAPIProvider } from '../../../utils/model/providers.js'
 import { getPlatform } from '../../../utils/platform.js'
 import {
   isInITerm2,
@@ -447,6 +448,20 @@ export async function getTeammateExecutor(
   preferInProcess: boolean = false,
 ): Promise<TeammateExecutor> {
   if (preferInProcess && isInProcessEnabled()) {
+    if (getIsNonInteractiveSession() && getAPIProvider() === 'openai') {
+      try {
+        logForDebugging(
+          '[BackendRegistry] Preferring pane backend for non-interactive Codex teammates to avoid the in-process adapter lane.',
+        )
+        return await getPaneBackendExecutor()
+      } catch (error) {
+        logForDebugging(
+          `[BackendRegistry] Falling back to in-process executor for Codex teammates: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    }
     logForDebugging('[BackendRegistry] Using in-process executor')
     return getInProcessBackend()
   }

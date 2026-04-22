@@ -36,6 +36,54 @@ describe('mapCodexNativeExecLine', () => {
 
     expect(
       mapCodexNativeExecLine(
+        '{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"agent-teams","tool":"member_briefing","arguments":{"teamName":"harbor-labs","memberName":"alice"},"status":"in_progress"}}',
+      ),
+    ).toEqual([
+      {
+        type: 'tool_call_started',
+        itemId: 'item_1',
+        serverName: 'agent-teams',
+        toolName: 'member_briefing',
+        arguments: {
+          teamName: 'harbor-labs',
+          memberName: 'alice',
+        },
+        status: 'in_progress',
+      },
+    ])
+
+    expect(
+      mapCodexNativeExecLine(
+        '{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"agent-teams","tool":"member_briefing","arguments":{"teamName":"harbor-labs","memberName":"alice"},"result":{"content":[{"type":"text","text":"briefing ok"}],"structured_content":null},"error":null,"status":"completed"}}',
+      ),
+    ).toEqual([
+      {
+        type: 'tool_call_completed',
+        itemId: 'item_1',
+        serverName: 'agent-teams',
+        toolName: 'member_briefing',
+        arguments: {
+          teamName: 'harbor-labs',
+          memberName: 'alice',
+        },
+        status: 'completed',
+        resultText: 'briefing ok',
+        rawResult: {
+          content: [
+            {
+              type: 'text',
+              text: 'briefing ok',
+            },
+          ],
+          structured_content: null,
+        },
+        errorMessage: null,
+        isError: false,
+      },
+    ])
+
+    expect(
+      mapCodexNativeExecLine(
         '{"type":"turn.completed","usage":{"input_tokens":22559,"cached_input_tokens":3456,"output_tokens":45}}',
       ),
     ).toEqual([
@@ -89,6 +137,20 @@ describe('mapCodexNativeExecLine', () => {
       },
     ])
   })
+
+  test('drops unsupported item lifecycle events instead of surfacing noisy warnings', () => {
+    expect(
+      mapCodexNativeExecLine(
+        '{"type":"item.started","item":{"id":"item_9","type":"reasoning","text":"thinking"}}',
+      ),
+    ).toEqual([])
+
+    expect(
+      mapCodexNativeExecLine(
+        '{"type":"item.completed","item":{"id":"item_9","type":"reasoning","text":"thinking done"}}',
+      ),
+    ).toEqual([])
+  })
 })
 
 describe('mapCodexNativeExecOutput', () => {
@@ -100,6 +162,8 @@ describe('mapCodexNativeExecOutput', () => {
           '2026-04-19T14:53:22.412234Z  WARN codex_state::runtime: failed to open state db',
           '{"type":"turn.started"}',
           '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}',
+          '{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"agent-teams","tool":"member_briefing","arguments":{"teamName":"harbor-labs"},"status":"in_progress"}}',
+          '{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"agent-teams","tool":"member_briefing","arguments":{"teamName":"harbor-labs"},"result":{"content":[{"type":"text","text":"briefing ok"}],"structured_content":null},"error":null,"status":"completed"}}',
           '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":1}}',
         ].join('\n'),
       ),
@@ -120,6 +184,38 @@ describe('mapCodexNativeExecOutput', () => {
         type: 'assistant_text',
         itemId: 'item_0',
         text: 'OK',
+      },
+      {
+        type: 'tool_call_started',
+        itemId: 'item_1',
+        serverName: 'agent-teams',
+        toolName: 'member_briefing',
+        arguments: {
+          teamName: 'harbor-labs',
+        },
+        status: 'in_progress',
+      },
+      {
+        type: 'tool_call_completed',
+        itemId: 'item_1',
+        serverName: 'agent-teams',
+        toolName: 'member_briefing',
+        arguments: {
+          teamName: 'harbor-labs',
+        },
+        status: 'completed',
+        resultText: 'briefing ok',
+        rawResult: {
+          content: [
+            {
+              type: 'text',
+              text: 'briefing ok',
+            },
+          ],
+          structured_content: null,
+        },
+        errorMessage: null,
+        isError: false,
       },
       {
         type: 'usage_updated',

@@ -11,6 +11,10 @@ import {
 } from '@anthropic-ai/sdk'
 import { getModelStrings } from './modelStrings.js'
 import { isCodexModel } from './codex.js'
+import {
+  getCodexModelRuntimeDisabledReason,
+  isCodexModelSupportedForCurrentProcess,
+} from './codexRuntimeAccess.js'
 import { isGeminiModel } from './gemini.js'
 import { resolveGeminiBackend } from '../../services/gemini/backendResolver.js'
 
@@ -52,6 +56,14 @@ export async function validateModel(
     shouldUseCodexProviderRoutingForCurrentProcess() &&
     isCodexModel(normalizedModel)
   ) {
+    if (!isCodexModelSupportedForCurrentProcess(normalizedModel)) {
+      return {
+        valid: false,
+        error:
+          getCodexModelRuntimeDisabledReason(normalizedModel) ??
+          `Model '${normalizedModel}' is unavailable for the current Codex runtime`,
+      }
+    }
     validModelCache.set(normalizedModel, true)
     return { valid: true }
   }

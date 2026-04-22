@@ -459,7 +459,7 @@ function buildCodexStatuses(): {
             kind: 'codex-native',
             label: 'Codex native',
             endpointLabel: 'codex exec --json',
-            authMethodDetail: 'api_key',
+            authMethodDetail: resolution.authMethod,
           }
         : null,
   }

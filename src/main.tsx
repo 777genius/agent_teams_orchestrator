@@ -116,7 +116,7 @@ import { getGhAuthStatus } from './utils/github/ghAuthStatus.js';
 import { safeParseJSON } from './utils/json.js';
 import { logError } from './utils/log.js';
 import { getModelDeprecationWarning } from './utils/model/deprecation.js';
-import { getDefaultMainLoopModel, getUserSpecifiedModelSetting, normalizeModelStringForAPI, parseUserSpecifiedModel } from './utils/model/model.js';
+import { getDefaultMainLoopModel, getUserSpecifiedModelSetting, normalizeModelStringForAPI, parseUserSpecifiedModel, resolveAllowedModelSetting } from './utils/model/model.js';
 import { ensureModelStringsInitialized } from './utils/model/modelStrings.js';
 import { PERMISSION_MODES } from './utils/permissions/PermissionMode.js';
 import { checkAndDisableBypassPermissions, getAutoModeEnabledStateIfCached, initializeToolPermissionContext, initialPermissionModeFromCLI, isDefaultPermissionModeAuto, parseToolListFromCLI, removeDangerousPermissions, stripDangerousPermissionsForAutoMode, verifyAutoModeGateAccess } from './utils/permissions/permissionSetup.js';
@@ -166,7 +166,7 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
-import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
+import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('./utils/permissions/autoModeState.js') as typeof import('./utils/permissions/autoModeState.js') : null;
@@ -278,7 +278,7 @@ if ("external" !== 'ant' && isBeingDebugged()) {
  * call sites here rather than one here + one in QueryEngine.
  */
 function logSessionTelemetry(): void {
-  const model = parseUserSpecifiedModel(getInitialMainLoopModel() ?? getDefaultMainLoopModel());
+  const model = resolveAllowedModelSetting(getInitialMainLoopModel());
   void logSkillsLoaded(getCwd(), getContextWindowForModel(model, getSdkBetas()));
   void loadAllPluginsCacheOnly().then(({
     enabled,
@@ -435,12 +435,16 @@ function loadSettingsFromFlag(settingsFile: string): void {
     const trimmedSettings = settingsFile.trim();
     const looksLikeJson = trimmedSettings.startsWith('{') && trimmedSettings.endsWith('}');
     let settingsPath: string;
+    let inlineSettings: Record<string, unknown> | null = null;
     if (looksLikeJson) {
       // It's a JSON string - validate and create temp file
       const parsedJson = safeParseJSON(trimmedSettings);
       if (!parsedJson) {
         process.stderr.write(chalk.red('Error: Invalid JSON provided to --settings\n'));
         process.exit(1);
+      }
+      if (typeof parsedJson === 'object' && parsedJson !== null && !Array.isArray(parsedJson)) {
+        inlineSettings = parsedJson as Record<string, unknown>;
       }
 
       // Create a temporary file and write the JSON to it.
@@ -462,7 +466,11 @@ function loadSettingsFromFlag(settingsFile: string): void {
         resolvedPath: resolvedSettingsPath
       } = safeResolvePath(getFsImplementation(), settingsFile);
       try {
-        readFileSync(resolvedSettingsPath, 'utf8');
+        const fileContents = readFileSync(resolvedSettingsPath, 'utf8');
+        const parsedSettings = safeParseJSON(fileContents);
+        if (typeof parsedSettings === 'object' && parsedSettings !== null && !Array.isArray(parsedSettings)) {
+          inlineSettings = parsedSettings as Record<string, unknown>;
+        }
       } catch (e) {
         if (isENOENT(e)) {
           process.stderr.write(chalk.red(`Error: Settings file not found: ${resolvedSettingsPath}\n`));
@@ -473,6 +481,7 @@ function loadSettingsFromFlag(settingsFile: string): void {
       settingsPath = resolvedSettingsPath;
     }
     setFlagSettingsPath(settingsPath);
+    setFlagSettingsInline(inlineSettings);
     resetSettingsCache();
   } catch (error) {
     if (error instanceof Error) {
@@ -2114,14 +2123,14 @@ async function run(): Promise<CommanderCommand> {
     // If user didn't specify a model but agent has one, use the agent's model
     let effectiveModel = userSpecifiedModel;
     if (!effectiveModel && mainThreadAgentDefinition?.model && mainThreadAgentDefinition.model !== 'inherit') {
-      effectiveModel = parseUserSpecifiedModel(mainThreadAgentDefinition.model);
+      effectiveModel = resolveAllowedModelSetting(mainThreadAgentDefinition.model);
     }
     setMainLoopModelOverride(effectiveModel);
 
     // Compute resolved model for hooks (use user-specified model at launch)
     setInitialMainLoopModel(getUserSpecifiedModelSetting() || null);
     const initialMainLoopModel = getInitialMainLoopModel();
-    const resolvedInitialModel = parseUserSpecifiedModel(initialMainLoopModel ?? getDefaultMainLoopModel());
+    const resolvedInitialModel = resolveAllowedModelSetting(initialMainLoopModel);
     let advisorModel: string | undefined;
     if (isAdvisorEnabled()) {
       const advisorOption = canUserConfigureAdvisor() ? (options as {

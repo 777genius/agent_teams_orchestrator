@@ -17,9 +17,15 @@ import {
 } from './gemini.js'
 import {
   CODEX_MODELS,
+  DEFAULT_CODEX_MODEL,
   getCodexDisplayName,
+  isCodexModel,
   mapClaudeModelToCodex,
 } from './codex.js'
+import {
+  filterCodexModelsForCurrentProcess,
+  isCodexModelSupportedForCurrentProcess,
+} from './codexRuntimeAccess.js'
 import {
   getSubscriptionType,
   isClaudeAISubscriber,
@@ -49,13 +55,31 @@ export type ModelShortName = string
 export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
 
+export function getAuthlessProviderDefaultModel(): ModelName {
+  if (getAPIProvider() === 'gemini') {
+    return DEFAULT_GEMINI_MODEL
+  }
+
+  if (
+    getAPIProvider() === 'openai' ||
+    shouldUseCodexProviderRoutingForCurrentProcess()
+  ) {
+    return (
+      filterCodexModelsForCurrentProcess(CODEX_MODELS.map(model => model.id))[0] ??
+      DEFAULT_CODEX_MODEL
+    )
+  }
+
+  return getDefaultSonnetModel()
+}
+
 function getAccessPolicyFallbackCandidates(): string[] {
   if (getAPIProvider() === 'gemini') {
     return []
   }
 
   if (shouldUseCodexProviderRoutingForCurrentProcess()) {
-    return CODEX_MODELS.map(model => model.id)
+    return filterCodexModelsForCurrentProcess(CODEX_MODELS.map(model => model.id))
   }
 
   return [
@@ -72,7 +96,12 @@ function getAccessPolicyFallbackCandidates(): string[] {
 }
 
 function getAllowedModelOrFallback(model: string): string {
-  if (isModelAllowed(model)) {
+  if (
+    isModelAllowed(model) &&
+    (!shouldUseCodexProviderRoutingForCurrentProcess() ||
+      !isCodexModel(model) ||
+      isCodexModelSupportedForCurrentProcess(model))
+  ) {
     return model
   }
 
@@ -80,6 +109,13 @@ function getAllowedModelOrFallback(model: string): string {
     if (isModelAllowed(candidate)) {
       return candidate
     }
+  }
+
+  if (shouldUseCodexProviderRoutingForCurrentProcess() && isCodexModel(model)) {
+    return (
+      filterCodexModelsForCurrentProcess(CODEX_MODELS.map(candidate => candidate.id))[0] ??
+      model
+    )
   }
 
   return model
@@ -284,6 +320,14 @@ export function getDefaultMainLoopModel(): ModelName {
   )
 }
 
+export function resolveAllowedModelSetting(
+  model: ModelSetting | undefined | null,
+): ModelName {
+  return getAllowedModelOrFallback(
+    parseUserSpecifiedModel(model ?? getDefaultMainLoopModel()),
+  )
+}
+
 // @[MODEL LAUNCH]: Add a canonical name mapping for the new model below.
 /**
  * Pure string-match that strips date/provider suffixes from a first-party model
@@ -390,10 +434,16 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
  * @param fullModelName The full model name (e.g., 'claude-3-5-haiku-20241022')
  * @returns The short name (e.g., 'claude-3-5-haiku') if found, or the original name if no mapping exists
  */
-export function getCanonicalName(fullModelName: ModelName): ModelShortName {
+export function getCanonicalName(
+  fullModelName: ModelName | null | undefined,
+): ModelShortName {
+  const resolvedModelName =
+    typeof fullModelName === 'string' && fullModelName.trim().length > 0
+      ? fullModelName
+      : getAuthlessProviderDefaultModel()
   // Resolve overridden model IDs (e.g. Bedrock ARNs) back to canonical names.
   // resolved is always a 1P-format ID, so firstPartyNameToCanonical can handle it.
-  return firstPartyNameToCanonical(resolveOverriddenModel(fullModelName))
+  return firstPartyNameToCanonical(resolveOverriddenModel(resolvedModelName))
 }
 
 // @[MODEL LAUNCH]: Update the default model description strings shown to users.
@@ -592,9 +642,13 @@ export function getPublicModelName(model: ModelName): string {
  * @param modelInput The model alias or name provided by the user.
  */
 export function parseUserSpecifiedModel(
-  modelInput: ModelName | ModelAlias,
+  modelInput: ModelName | ModelAlias | null | undefined,
 ): ModelName {
-  const modelInputTrimmed = modelInput.trim()
+  const safeModelInput =
+    typeof modelInput === 'string' && modelInput.trim().length > 0
+      ? modelInput
+      : getAuthlessProviderDefaultModel()
+  const modelInputTrimmed = safeModelInput.trim()
   const normalizedModel = modelInputTrimmed.toLowerCase()
 
   const has1mTag = has1mContext(normalizedModel)
@@ -735,7 +789,13 @@ export function modelDisplayString(model: ModelSetting): string {
 }
 
 // @[MODEL LAUNCH]: Add a marketing name mapping for the new model below.
-export function getMarketingNameForModel(modelId: string): string | undefined {
+export function getMarketingNameForModel(
+  modelId: string | null | undefined,
+): string | undefined {
+  if (typeof modelId !== 'string' || modelId.trim().length === 0) {
+    return undefined
+  }
+
   const geminiDisplayName = getGeminiDisplayName(normalizeModelStringForAPI(modelId))
   if (geminiDisplayName) {
     return geminiDisplayName

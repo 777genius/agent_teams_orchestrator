@@ -385,7 +385,9 @@ export async function runTeamBootstrap(params: {
                 name: member.displayName,
                 prompt: member.prompt,
                 team_name: params.request.teamName,
-                ...(member.cwd ? { cwd: member.cwd } : {}),
+                ...(member.cwd && member.isolation !== 'worktree'
+                  ? { cwd: member.cwd }
+                  : {}),
                 ...(member.model ? { model: member.model } : {}),
                 ...(member.provider ? { provider: member.provider } : {}),
                 ...(member.effort ? { effort: member.effort as never } : {}),

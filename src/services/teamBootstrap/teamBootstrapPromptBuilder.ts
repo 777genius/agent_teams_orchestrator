@@ -112,9 +112,10 @@ export async function buildDeterministicBootstrapMemberPrompt(params: {
     params.spec.mode === 'launch'
       ? 'The team has already been reconnected and you are being re-attached as a persistent teammate.'
       : 'The team has already been created and you are being attached as a persistent teammate.',
-    'Your FIRST action: call MCP tool member_briefing with:',
+    'Your FIRST action: call MCP tool member_briefing on the "agent-teams" server with:',
     `{ teamName: "${params.spec.team.name}", memberName: "${params.member.name}" }`,
-    'Call member_briefing directly yourself. Do NOT use Agent, any subagent, or a delegated helper for this bootstrap step.',
+    'If tool search shows the prefixed MCP tool name instead, use mcp__agent-teams__member_briefing.',
+    'Call the MCP tool directly yourself. Do NOT run a shell command named member_briefing. Do NOT use Agent, any subagent, or a delegated helper for this bootstrap step.',
     `If member_briefing fails, send one short natural-language message to "${leadName}" with the exact error text.`,
     hasAssignedBoardWork
       ? 'After member_briefing succeeds, resume your queue normally and prioritize already-assigned board work before taking new blocking work.'

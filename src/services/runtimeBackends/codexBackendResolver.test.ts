@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   getCodexApiKey,
+  getCodexForcedLoginMethod,
   getCodexRuntimeBackendPreference,
   normalizeCodexBackendPreference,
   resolveCodexRuntimeSelection,
@@ -29,6 +30,24 @@ describe('codexBackendResolver', () => {
     expect(getCodexRuntimeBackendPreference({ CLAUDE_CODE_CODEX_BACKEND: 'api' })).toBe(
       'codex-native',
     )
+  })
+
+  test('reads the host-managed forced login method from inline settings', () => {
+    expect(
+      getCodexForcedLoginMethod({
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      }),
+    ).toBe('chatgpt')
+    expect(
+      getCodexForcedLoginMethod({
+        codex: {
+          forced_login_method: 'api',
+        },
+      }),
+    ).toBe('api')
+    expect(getCodexForcedLoginMethod({ codex: {} })).toBeNull()
   })
 
   test('reports runtime-missing when the codex binary is unavailable', () => {
@@ -87,6 +106,102 @@ describe('codexBackendResolver', () => {
       canLoginFromUi: false,
       statusMessage: 'Codex native runtime ready',
       detailMessage: 'Codex native runtime is ready through the local codex exec seam.',
+    })
+  })
+
+  test('resolves to codex-native when host-managed ChatGPT auth is selected even without API keys', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
+      chatgptLoginState: 'logged_in',
+      settingsInline: {
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: 'codex-native',
+      authenticated: true,
+      authMethod: 'oauth_token',
+      canLoginFromUi: false,
+      statusMessage: 'Codex native runtime ready',
+      detailMessage:
+        'Codex native runtime is ready through the local codex exec seam using the host-managed ChatGPT account path.',
+    })
+  })
+
+  test('does not mark pinned ChatGPT auth as ready when codex login is inactive', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
+      chatgptLoginState: 'not_logged_in',
+      settingsInline: {
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: null,
+      authenticated: false,
+      authMethod: null,
+      canLoginFromUi: false,
+      statusMessage: 'Codex native runtime unavailable',
+      detailMessage: 'Codex native runtime requires an active `codex login` ChatGPT session.',
+    })
+  })
+
+  test('falls back to API auth when auto ChatGPT routing is inactive but an API key exists', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      oauthAuthenticated: true,
+      apiKeyConfigured: true,
+      nativeApiKeyConfigured: true,
+      chatgptLoginState: 'not_logged_in',
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: 'codex-native',
+      authenticated: true,
+      authMethod: 'api_key',
+      canLoginFromUi: false,
+      statusMessage: 'Codex native runtime ready',
+      detailMessage: 'Codex native runtime is ready through the local codex exec seam.',
+    })
+  })
+
+  test('keeps api mode strict when host settings pin Codex to API auth', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
+      settingsInline: {
+        codex: {
+          forced_login_method: 'api',
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: null,
+      authenticated: false,
+      authMethod: null,
+      statusMessage: 'Codex native runtime unavailable',
+      detailMessage:
+        'Codex native runtime requires CODEX_API_KEY or OPENAI_API_KEY.',
     })
   })
 })

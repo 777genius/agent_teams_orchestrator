@@ -10,6 +10,7 @@ import {
 } from './OpenCodeBridgePreconditions.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
+  type ResolvedAppMcpLaunchConfig,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
@@ -265,12 +266,6 @@ function validateEnvelope(input: unknown): BridgeEnvelope {
   }
 }
 
-function getSelectedModel(body: Record<string, unknown>, fallbackSnapshot: OpenCodeProvisioningSnapshot): string | null {
-  return asString(body.selectedModel)
-    ?? asStringArray(fallbackSnapshot.providers?.default ? Object.values(fallbackSnapshot.providers.default) : [])[0]
-    ?? null
-}
-
 type AppMcpToolProof = {
   ok: boolean
   observedTools: string[]
@@ -280,6 +275,29 @@ type AppMcpToolProof = {
 }
 
 const APP_MCP_PREFLIGHT_TIMEOUT_MS = 10_000
+const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
+
+type AppMcpToolProofCacheEntry = {
+  expiresAt: number
+  proof: AppMcpToolProof
+}
+
+const appMcpToolProofCache = new Map<string, AppMcpToolProofCacheEntry>()
+const appMcpToolProofInFlight = new Map<string, Promise<AppMcpToolProof>>()
+
+function createAppMcpToolProofCacheKey(
+  launchConfig: ResolvedAppMcpLaunchConfig,
+): string {
+  return hashStable({
+    source: launchConfig.source,
+    config: launchConfig.config,
+  })
+}
+
+export function __resetAppMcpToolProofCacheForTests(): void {
+  appMcpToolProofCache.clear()
+  appMcpToolProofInFlight.clear()
+}
 
 async function proveAppMcpTools(
   snapshot: OpenCodeProvisioningSnapshot,
@@ -294,25 +312,52 @@ async function proveAppMcpTools(
     }
   }
 
-  try {
-    const observedTools = await listAppMcpToolsFromLaunchConfig()
-    return matchAppMcpTools(observedTools, 'mcp:tools/list')
-  } catch (error) {
-    return {
-      ok: false,
-      observedTools: [],
-      missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
-      diagnostics: [
-        `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
-        'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
-      ],
-      route: 'mcp:tools/list',
-    }
+  const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+  const cacheKey = createAppMcpToolProofCacheKey(launchConfig)
+  const cached = appMcpToolProofCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.proof
   }
+
+  const inFlight = appMcpToolProofInFlight.get(cacheKey)
+  if (inFlight) {
+    return inFlight
+  }
+
+  const proofPromise = (async () => {
+    try {
+      const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig)
+      const proof = matchAppMcpTools(observedTools, 'mcp:tools/list')
+      if (proof.ok) {
+        appMcpToolProofCache.set(cacheKey, {
+          expiresAt: Date.now() + APP_MCP_TOOL_PROOF_CACHE_TTL_MS,
+          proof,
+        })
+      }
+      return proof
+    } catch (error) {
+      return {
+        ok: false,
+        observedTools: [],
+        missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
+        diagnostics: [
+          `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+          'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
+        ],
+        route: 'mcp:tools/list',
+      }
+    } finally {
+      appMcpToolProofInFlight.delete(cacheKey)
+    }
+  })()
+
+  appMcpToolProofInFlight.set(cacheKey, proofPromise)
+  return proofPromise
 }
 
-async function listAppMcpToolsFromLaunchConfig(): Promise<string[]> {
-  const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
+async function listAppMcpToolsFromResolvedLaunchConfig(
+  launchConfig: ResolvedAppMcpLaunchConfig,
+): Promise<string[]> {
   const command = launchConfig.config.command
   if (!command || command.length === 0) {
     throw new Error('Agent Teams MCP launch config is missing a local command')
@@ -393,6 +438,7 @@ function readinessData(
   selectedModel: string | null,
   executionOutcome: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined,
   toolProof: AppMcpToolProof,
+  requireSelectedModel: boolean,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
   const models = snapshot.configProviders?.providers
@@ -422,7 +468,7 @@ function readinessData(
     state = 'not_authenticated'
     launchAllowed = false
     missing.push('No connected OpenCode providers found')
-  } else if (!selectedModel) {
+  } else if (requireSelectedModel && !selectedModel) {
     state = 'model_unavailable'
     launchAllowed = false
     missing.push('No OpenCode model is available')
@@ -450,6 +496,7 @@ function readinessData(
     state,
     launchAllowed,
     modelId: selectedModel,
+    availableModels: models,
     opencodeVersion: snapshot.host?.version ?? null,
     installMethod: 'unknown',
     binaryPath: 'opencode',
@@ -548,46 +595,112 @@ function buildTeamLaunchData(params: {
   }
 }
 
+function buildOpenCodeExecutionOutcome(
+  modelId: string,
+  outcome: 'available' | 'unavailable' | 'not_authenticated' | 'unknown',
+  reason: string | null,
+) {
+  return {
+    providerId: 'opencode' as const,
+    modelId,
+    probePrompt: '',
+    expectedOutput: '',
+    outcome,
+    reason,
+    durationMs: 0,
+    rawStatus: null,
+    durableState: 'unknown' as const,
+    latestAssistantText: null,
+    latestAssistantPreview: null,
+    toolCallCount: 0,
+    errorCount: reason ? 1 : 0,
+    diagnostics: reason ? [reason] : [],
+  }
+}
+
 async function runReadiness(envelope: BridgeEnvelope) {
   const snapshot = await openCodeProvisioningProbe.probe(asString(envelope.body.projectPath) ?? envelope.cwd)
-  const selectedModel = getSelectedModel(envelope.body, snapshot)
-  const executionModel = envelope.body.requireExecutionProbe === true && selectedModel
-    ? resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
-    : null
-  const executionOutcome = executionModel
-    ? await openCodeExecutionProbe.probeModel({
+  const selectedModel = asString(envelope.body.selectedModel)
+  const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
+  const toolProofPromise = proveAppMcpTools(snapshot)
+  let executionModel: string | null = null
+  let modelResolutionFailureReason: string | null = null
+  let executionOutcomePromise: Promise<Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined> =
+    Promise.resolve(undefined)
+
+  if (selectedModel) {
+    try {
+      executionModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      modelResolutionFailureReason = reason
+      executionOutcomePromise = Promise.resolve(
+        buildOpenCodeExecutionOutcome(selectedModel, 'unavailable', reason),
+      )
+    }
+  }
+
+  if (envelope.body.requireExecutionProbe === true && executionModel) {
+    executionOutcomePromise = openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: snapshot.projectPath,
-    }).catch(error => ({
-      providerId: 'opencode' as const,
-      modelId: executionModel,
-      probePrompt: '',
-      expectedOutput: '',
-      outcome: 'unknown' as const,
-      reason: error instanceof Error ? error.message : String(error),
-      durationMs: 0,
-      rawStatus: null,
-      durableState: 'unknown' as const,
-      latestAssistantText: null,
-      latestAssistantPreview: null,
-      toolCallCount: 0,
-      errorCount: 1,
-      diagnostics: [error instanceof Error ? error.message : String(error)],
-    }))
-    : undefined
-  const toolProof = await proveAppMcpTools(snapshot)
+    }).catch(error =>
+      buildOpenCodeExecutionOutcome(
+        executionModel,
+        'unknown',
+        error instanceof Error ? error.message : String(error),
+      ),
+    )
+  }
+  const [executionOutcome, toolProof] = await Promise.all([
+    executionOutcomePromise,
+    toolProofPromise,
+  ])
 
-  return { snapshot, data: readinessData(snapshot, selectedModel, executionOutcome, toolProof) }
+  if (modelResolutionFailureReason && selectedModel) {
+    const fallbackReadiness = readinessData(
+      snapshot,
+      selectedModel,
+      executionOutcome,
+      toolProof,
+      requireSelectedModel,
+    )
+    return {
+      snapshot,
+      data: {
+        ...fallbackReadiness,
+        state: 'model_unavailable',
+        launchAllowed: false,
+        missing: [modelResolutionFailureReason],
+        diagnostics: uniqueSortedStrings([
+          ...fallbackReadiness.diagnostics,
+          modelResolutionFailureReason,
+        ]),
+      },
+    }
+  }
+
+  return {
+    snapshot,
+    data: readinessData(
+      snapshot,
+      selectedModel,
+      executionOutcome,
+      toolProof,
+      requireSelectedModel,
+    ),
+  }
 }
 
 async function runLaunch(envelope: BridgeEnvelope) {
   const body = envelope.body
   const runId = asString(body.runId)
+  const laneId = asString(body.laneId)
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const selectedModel = asString(body.selectedModel)
   const membersRaw = Array.isArray(body.members) ? body.members : []
-  if (!runId || !teamId || !selectedModel || membersRaw.length === 0) {
-    throw new Error('opencode.launchTeam requires runId, teamId/teamName, selectedModel and members')
+  if (!runId || !laneId || !teamId || !selectedModel || membersRaw.length === 0) {
+    throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
   }
 
   const snapshot = await openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd)
@@ -607,6 +720,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
     const record = await openCodeSessionBridge.ensureSession({
       teamId,
+      laneId,
       memberName: name,
       selectedModel: apiSelectedModel,
       title: `${teamId} - ${name}`,
@@ -647,9 +761,10 @@ async function runLaunch(envelope: BridgeEnvelope) {
 async function runReconcile(envelope: BridgeEnvelope) {
   const body = envelope.body
   const runId = asString(body.runId)
+  const laneId = asString(body.laneId)
   const teamId = asString(body.teamId) ?? asString(body.teamName)
-  if (!runId || !teamId) {
-    throw new Error('opencode.reconcileTeam requires runId and teamId/teamName')
+  if (!runId || !laneId || !teamId) {
+    throw new Error('opencode.reconcileTeam requires runId, laneId and teamId/teamName')
   }
   const expectedMembers = Array.isArray(body.expectedMembers) ? body.expectedMembers : []
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
@@ -665,7 +780,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
     const member = asRecord(item)
     const name = asString(member?.name)
     if (!name) continue
-    const record = await openCodeSessionStore.get(teamId, name)
+    const record = await openCodeSessionStore.get(teamId, laneId, name)
     if (!record) {
       diagnostics.push(teamDiagnostic('member_session_missing', `No stored OpenCode session for ${teamId}/${name}`, 'warning'))
       continue
@@ -689,16 +804,19 @@ async function runReconcile(envelope: BridgeEnvelope) {
 async function runStop(envelope: BridgeEnvelope) {
   const body = envelope.body
   const runId = asString(body.runId)
+  const laneId = asString(body.laneId)
   const teamId = asString(body.teamId) ?? asString(body.teamName)
-  if (!runId || !teamId) {
-    throw new Error('opencode.stopTeam requires runId and teamId/teamName')
+  if (!runId || !laneId || !teamId) {
+    throw new Error('opencode.stopTeam requires runId, laneId and teamId/teamName')
   }
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
-  const records = (await openCodeSessionStore.list()).filter(record => record.teamId === teamId)
+  const records = (await openCodeSessionStore.list()).filter(
+    record => record.teamId === teamId && record.laneId === laneId,
+  )
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
   for (const record of records) {
     let stopped = false
@@ -733,6 +851,7 @@ async function runStop(envelope: BridgeEnvelope) {
 async function runAnswerPermission(envelope: BridgeEnvelope) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   const requestId = asString(body.requestId)
   const decision = asString(body.decision)
@@ -740,8 +859,19 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
     throw new Error('opencode.answerPermission requires teamId/teamName, requestId and allow/always/reject decision')
   }
   const candidates = memberName
-    ? [await openCodeSessionStore.get(teamId, memberName)]
-    : (await openCodeSessionStore.list()).filter(record => record.teamId === teamId)
+    ? (
+      laneId
+        ? [await openCodeSessionStore.get(teamId, laneId, memberName)]
+        : (await openCodeSessionStore.list()).filter(
+          record => record.teamId === teamId && record.memberName === memberName,
+        )
+    )
+    : (await openCodeSessionStore.list()).filter(
+      record => record.teamId === teamId && (!laneId || record.laneId === laneId),
+    )
+  if (!laneId && candidates.filter((candidate): candidate is OpenCodeSessionRecord => candidate !== null).length > 1) {
+    throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
+  }
   const record = candidates.find((candidate): candidate is OpenCodeSessionRecord => candidate !== null)
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
@@ -781,7 +911,22 @@ async function runListPermissions(envelope: BridgeEnvelope) {
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   let permissions: OpenCodePendingPermission[] = []
   if (snapshot.host) {
-    const records = await openCodeSessionStore.list()
+    const body = envelope.body
+    const teamId = asString(body.teamId) ?? asString(body.teamName)
+    const laneId = asString(body.laneId)
+    let records = await openCodeSessionStore.list()
+    if (teamId) {
+      records = records.filter(record => record.teamId === teamId)
+      if (laneId) {
+        records = records.filter(record => record.laneId === laneId)
+      }
+    }
+    if (!laneId && teamId) {
+      const laneCount = new Set(records.map(record => record.laneId)).size
+      if (laneCount > 1) {
+        throw new Error(`Multiple OpenCode lanes exist for ${teamId}; laneId is required`)
+      }
+    }
     const firstRecord = records[0]
     if (firstRecord) {
       const reconciled = await openCodeSessionBridge.reconcileSession(firstRecord, { limit: 1 })
@@ -799,11 +944,24 @@ async function runListPermissions(envelope: BridgeEnvelope) {
 async function runTranscript(envelope: BridgeEnvelope) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   if (!teamId || !memberName) {
     throw new Error('opencode.getRuntimeTranscript requires teamId/teamName and memberName')
   }
-  const record = await openCodeSessionStore.get(teamId, memberName)
+  const record = laneId
+    ? await openCodeSessionStore.get(teamId, laneId, memberName)
+    : (await openCodeSessionStore.list()).find(
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName,
+    ) ?? null
+  if (!laneId) {
+    const candidateCount = (await openCodeSessionStore.list()).filter(
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName,
+    ).length
+    if (candidateCount > 1) {
+      throw new Error(`Multiple OpenCode lanes exist for ${teamId}/${memberName}; laneId is required`)
+    }
+  }
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${memberName}`)
   }

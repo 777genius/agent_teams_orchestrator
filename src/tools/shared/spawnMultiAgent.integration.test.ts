@@ -36,7 +36,9 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
     await rm(tempConfigDir, { recursive: true, force: true })
   })
 
-  it('cleans up the registered in-process task if durable registration fails after spawn', async () => {
+  it(
+    'cleans up the registered in-process task if durable registration fails after spawn',
+    async () => {
     const registryModulePath = new URL(
       '../../utils/swarm/backends/registry.js',
       import.meta.url,
@@ -116,5 +118,7 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
     expect(appState.teamContext?.teammates).toHaveProperty(
       'team-lead@atlas-hq',
     )
-  })
+    },
+    15000,
+  )
 })

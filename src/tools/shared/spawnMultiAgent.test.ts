@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from 'bun:test'
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
+import { getSeparateProcessRequirement } from './spawnMultiAgent.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
 import { resolveTeammateModel } from './spawnMultiAgent.js'
 import { spawnTeammate } from './spawnMultiAgent.js'
@@ -283,6 +287,68 @@ describe('resolveTeammateModel', () => {
 
   it('still inherits the leader model when inherit is requested explicitly', () => {
     expect(resolveTeammateModel('inherit', 'leader-model')).toBe('leader-model')
+  })
+})
+
+describe('getSeparateProcessRequirement', () => {
+  it('forces separate-process execution for codex-native teammates even without provider mismatch', async () => {
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+    const originalCodexApiKey = process.env.CODEX_API_KEY
+    const originalPath = process.env.PATH
+    const tempBinDir = await mkdtemp(join(tmpdir(), 'spawn-codex-native-bin-'))
+
+    try {
+      const fakeCodexPath = join(tempBinDir, 'codex')
+      await writeFile(fakeCodexPath, '#!/bin/sh\nexit 0\n')
+      await chmod(fakeCodexPath, 0o755)
+
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+      process.env.CODEX_API_KEY = 'sk-codex-native-test'
+      process.env.PATH = `${tempBinDir}:${originalPath ?? ''}`
+
+      expect(getSeparateProcessRequirement(undefined)).toEqual({
+        required: true,
+        reason: 'codex-native-runtime',
+        provider: 'codex',
+      })
+    } finally {
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+      if (originalCodexApiKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+      if (originalPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = originalPath
+      }
+      await rm(tempBinDir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps provider-mismatch precedence over codex-native runtime forcing', () => {
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    try {
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+
+      expect(getSeparateProcessRequirement('codex')).toEqual({
+        required: true,
+        reason: 'provider-mismatch',
+        provider: 'codex',
+      })
+    } finally {
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+    }
   })
 })
 

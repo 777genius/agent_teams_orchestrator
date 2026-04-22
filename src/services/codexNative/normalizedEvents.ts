@@ -12,6 +12,26 @@ export type CodexNativeNormalizedEvent =
       text: string
     }
   | {
+      type: 'tool_call_started'
+      itemId: string
+      serverName: string
+      toolName: string
+      arguments: Record<string, unknown>
+      status: string
+    }
+  | {
+      type: 'tool_call_completed'
+      itemId: string
+      serverName: string
+      toolName: string
+      arguments: Record<string, unknown>
+      status: string
+      resultText: string | null
+      rawResult: unknown
+      errorMessage: string | null
+      isError: boolean
+    }
+  | {
       type: 'usage_updated'
       inputTokens: number
       cachedInputTokens: number

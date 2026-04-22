@@ -27,6 +27,7 @@ async function loadCodexStatus(options: {
   openAiApiKey?: string | null
   codexApiKey?: string | null
   nativeBinaryDetected?: boolean
+  settingsInline?: Record<string, unknown> | null
 } = {}) {
   const originalCodexBackend = process.env.CLAUDE_CODE_CODEX_BACKEND
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY
@@ -49,6 +50,12 @@ async function loadCodexStatus(options: {
   }) as typeof Bun.which
 
   try {
+    const bootstrapStateModulePath = new URL('../../bootstrap/state.js', import.meta.url).href
+    const { setFlagSettingsInline } = await import(
+      `${bootstrapStateModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+    setFlagSettingsInline(options.settingsInline ?? null)
+
     const registryModulePath = new URL('./registry.js', import.meta.url).href
     const { getUnifiedRuntimeStatusPayload } = await import(
       `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
@@ -57,6 +64,11 @@ async function loadCodexStatus(options: {
     const payload = await getUnifiedRuntimeStatusPayload('codex')
     return payload.providers.codex
   } finally {
+    const bootstrapStateModulePath = new URL('../../bootstrap/state.js', import.meta.url).href
+    const { setFlagSettingsInline } = await import(
+      `${bootstrapStateModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+    setFlagSettingsInline(null)
     Bun.which = originalWhich
     setOptionalEnv('CLAUDE_CODE_CODEX_BACKEND', undefined, originalCodexBackend)
     setOptionalEnv('OPENAI_API_KEY', undefined, originalOpenAiApiKey)
@@ -129,5 +141,33 @@ describe('codex-native registry rollout states', () => {
     expect(codex?.selectedBackendId).toBe('codex-native')
     expect(codex?.resolvedBackendId).toBe('codex-native')
     expect(codex?.availableBackends.map(option => option.id)).toEqual(['codex-native'])
+  })
+
+  test('reports ready for host-managed ChatGPT auth without requiring API keys', async () => {
+    const codex = await loadCodexStatus({
+      codexApiKey: null,
+      openAiApiKey: null,
+      settingsInline: {
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      },
+    })
+
+    expect(codex?.selectedBackendId).toBe('codex-native')
+    expect(codex?.resolvedBackendId).toBe('codex-native')
+    expect(codex?.authMethod).toBe('oauth_token')
+    expect(codex?.availableBackends[0]).toMatchObject({
+      id: 'codex-native',
+      selectable: true,
+      available: true,
+      state: 'ready',
+      audience: 'general',
+      statusMessage: 'Ready',
+    })
+    expect(codex?.backend).toMatchObject({
+      kind: 'codex-native',
+      authMethodDetail: 'oauth_token',
+    })
   })
 })

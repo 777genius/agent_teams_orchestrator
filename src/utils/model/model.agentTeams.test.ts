@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { clearAgentTeamsStateForTesting, setAgentTeamsCapabilitiesForTesting } from '../../services/agentTeams/store.js';
 import type { AgentTeamsCapabilitiesRecord } from '../../services/agentTeams/types.js';
 import {
+  getFlagSettingsInline,
+  setFlagSettingsInline,
+} from '../../bootstrap/state.js';
+import {
   getDefaultMainLoopModel,
   getDefaultOpusModel,
   getMainLoopModel,
@@ -55,6 +59,7 @@ function createCodexCapabilities(
 
 afterEach(() => {
   clearAgentTeamsStateForTesting();
+  setFlagSettingsInline(null);
   delete process.env.CLAUDE_CODE_USE_OPENAI;
   delete process.env.CLAUDE_CODE_USE_BEDROCK;
   delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
@@ -101,6 +106,21 @@ describe('model access fallback with agent_teams capabilities', () => {
 
     expect(getMainLoopModel()).toBe('gpt-5.3-codex');
   });
+
+  it('falls back from gpt-5.1-codex-max when host-managed Codex is pinned to ChatGPT auth', () => {
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex';
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+    process.env.ANTHROPIC_MODEL = 'gpt-5.1-codex-max';
+    const previousSettings = getFlagSettingsInline();
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+      },
+    });
+
+    expect(getMainLoopModel()).toBe('gpt-5.4');
+    setFlagSettingsInline(previousSettings);
+  });
 });
 
 describe('Opus 4.7 defaults', () => {
@@ -122,6 +142,18 @@ describe('Opus 4.7 defaults', () => {
     expect(getMarketingNameForModel('claude-opus-4-7[1m]')).toBe(
       'Opus 4.7 (with 1M context)'
     );
+  });
+
+  it('does not crash on empty model ids when rendering marketing names', () => {
+    expect(getMarketingNameForModel(null)).toBeUndefined();
+    expect(getMarketingNameForModel(undefined)).toBeUndefined();
+    expect(getMarketingNameForModel('')).toBeUndefined();
+  });
+
+  it('does not crash on empty model ids when resolving user-specified models', () => {
+    expect(typeof parseUserSpecifiedModel(null)).toBe('string');
+    expect(typeof parseUserSpecifiedModel(undefined)).toBe('string');
+    expect(typeof parseUserSpecifiedModel('')).toBe('string');
   });
 
   it('keeps fast mode pinned to explicit Opus 4.6 while opus resolves to 4.7', () => {

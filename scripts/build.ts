@@ -3,10 +3,13 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'fs'
-import { dirname, relative, resolve } from 'path'
+import { dirname, join, relative, resolve } from 'path'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -233,9 +236,23 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 TARGET="$SCRIPT_DIR/${targetRelativePath}"
 
+wait_for_target() {
+  local attempts=0
+  while [[ ! -f "$TARGET" && "$attempts" -lt 50 ]]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+
+  if [[ ! -f "$TARGET" ]]; then
+    echo "Runtime bundle not found after waiting: $TARGET" >&2
+    exit 127
+  fi
+}
+
 if [[ "\${1-}" == "runtime" && "\${2-}" == "status" ]]; then
   for arg in "$@"; do
     if [[ "$arg" == "--json" ]]; then
+      wait_for_target
       RAW_OUTPUT="$(
         bun "$TARGET" "$@" 2> >(cat >&2)
       )"
@@ -258,11 +275,29 @@ EOF
   done
 fi
 
+wait_for_target
 exec bun "$TARGET" "$@"
 `
 
   writeFileSync(launcherPath, launcher)
   chmodSync(launcherPath, 0o755)
+}
+
+function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {
+  mkdirSync(finalOutdir, { recursive: true })
+
+  for (const entryName of readdirSync(stagingOutdir)) {
+    const sourcePath = join(stagingOutdir, entryName)
+    const targetPath = join(finalOutdir, entryName)
+
+    if (statSync(sourcePath).isDirectory()) {
+      rmSync(targetPath, { recursive: true, force: true })
+    }
+
+    renameSync(sourcePath, targetPath)
+  }
+
+  rmSync(stagingOutdir, { recursive: true, force: true })
 }
 
 if (compile) {
@@ -293,8 +328,9 @@ if (compile) {
 
   console.log(`Built ${outfile}`)
 } else {
-  rmSync(bundleOutdir, { recursive: true, force: true })
-  mkdirSync(bundleOutdir, { recursive: true })
+  const stagingOutdir = `${bundleOutdir}.staging-${process.pid}-${Date.now()}`
+  rmSync(stagingOutdir, { recursive: true, force: true })
+  mkdirSync(stagingOutdir, { recursive: true })
 
   const cmd = extendBuildArgs([
     'bun',
@@ -305,7 +341,7 @@ if (compile) {
     '--format',
     'esm',
     '--outdir',
-    bundleOutdir,
+    stagingOutdir,
     '--minify',
     '--packages',
     'bundle',
@@ -314,6 +350,7 @@ if (compile) {
   ])
 
   runBuild(cmd)
+  publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 
   console.log(`Built ${outfile} -> ${bundleEntrypoint}`)

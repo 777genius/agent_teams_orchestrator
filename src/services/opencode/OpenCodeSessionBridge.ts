@@ -31,6 +31,7 @@ type OpenCodeSessionBridgeDeps = {
 
 type SessionIdentity = {
   teamId: string
+  laneId: string
   memberName: string
 }
 
@@ -126,6 +127,7 @@ export class OpenCodeSessionBridge {
         retainedHostKey: host.hostKey,
         record: {
         teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
         memberName: params.identity.memberName,
         providerId: 'opencode',
         selectedModel: params.selectedModel,
@@ -152,7 +154,7 @@ export class OpenCodeSessionBridge {
   }
 
   private buildSessionKey(identity: SessionIdentity): string {
-    return `${identity.teamId}::${identity.memberName}`
+    return `${identity.teamId}::${identity.laneId}::${identity.memberName}`
   }
 
   private async retainSessionHost(record: OpenCodeSessionRecord): Promise<void> {
@@ -168,7 +170,7 @@ export class OpenCodeSessionBridge {
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'memberName' | 'hostKey'>): Promise<void> {
+  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
     if (!retainedHostKey) {
@@ -323,13 +325,15 @@ export class OpenCodeSessionBridge {
 
   async ensureSession(params: {
     teamId: string
+    laneId?: string
     memberName: string
     selectedModel: string
     title?: string | null
     projectPath?: string | null
   }): Promise<OpenCodeSessionRecord> {
     const profile = await this.prepareProfile(params.projectPath)
-    const existing = await this.sessionStore.get(params.teamId, params.memberName)
+    const laneId = params.laneId?.trim() || 'primary'
+    const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
     if (
       existing &&
       existing.selectedModel === params.selectedModel &&
@@ -356,6 +360,7 @@ export class OpenCodeSessionBridge {
 
       await this.sessionStore.markStale(
         params.teamId,
+        laneId,
         params.memberName,
         staleReason,
       )
@@ -365,6 +370,7 @@ export class OpenCodeSessionBridge {
     const created = await this.createFreshSessionRecord({
       identity: {
         teamId: params.teamId,
+        laneId,
         memberName: params.memberName,
       },
       selectedModel: params.selectedModel,

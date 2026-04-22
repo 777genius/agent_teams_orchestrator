@@ -2,6 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { PassThrough, type Readable } from 'node:stream'
 import readline from 'node:readline'
 
+import type { CodexForcedLoginMethod } from '../runtimeBackends/codexBackendResolver.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
 
@@ -14,6 +15,8 @@ export type CodexNativeExecRunnerOptions = {
   additionalWritableDirectories?: string[]
   ephemeral?: boolean
   apiKey?: string | null
+  forcedLoginMethod?: CodexForcedLoginMethod | null
+  configOverrides?: string[]
   abortSignal?: AbortSignal
 }
 
@@ -72,6 +75,7 @@ type CodexNativeExecRunnerDeps = {
       cwd: string
       env: NodeJS.ProcessEnv
       signal?: AbortSignal
+      stdin: 'ignore'
       stdout: 'pipe'
       stderr: 'pipe'
     },
@@ -82,6 +86,10 @@ type CodexNativeExecRunnerDeps = {
 type QueuedLine = {
   stream: 'stdout' | 'stderr'
   line: string
+}
+
+type CodexNativeStderrFilterState = {
+  suppressAnalyticsHtmlContinuation: boolean
 }
 
 export function buildCodexNativeExecArgs(
@@ -101,6 +109,14 @@ export function buildCodexNativeExecArgs(
     args.push('-c', `model_reasoning_effort="${options.reasoningEffort}"`)
   }
 
+  if (options.forcedLoginMethod) {
+    args.push('-c', `forced_login_method="${options.forcedLoginMethod}"`)
+  }
+
+  for (const override of options.configOverrides ?? []) {
+    args.push('-c', override)
+  }
+
   if (options.sandboxMode) {
     args.push('--sandbox', options.sandboxMode)
   }
@@ -111,6 +127,71 @@ export function buildCodexNativeExecArgs(
 
   args.push(options.prompt)
   return args
+}
+
+function isCodexAnalyticsHtmlContinuation(line: string): boolean {
+  const trimmed = line.trim()
+  if (trimmed.length === 0) {
+    return true
+  }
+
+  return (
+    trimmed.startsWith('<') ||
+    trimmed.startsWith('</') ||
+    trimmed.startsWith('window.') ||
+    trimmed.startsWith('history.') ||
+    trimmed.startsWith('document.') ||
+    trimmed.includes('__cf_chl') ||
+    trimmed.includes('challenge-platform')
+  )
+}
+
+function rewriteCodexNativeStderrLine(
+  line: string,
+  state: CodexNativeStderrFilterState,
+): string | null {
+  if (state.suppressAnalyticsHtmlContinuation) {
+    if (isCodexAnalyticsHtmlContinuation(line)) {
+      return null
+    }
+    state.suppressAnalyticsHtmlContinuation = false
+  }
+
+  const trimmed = line.trim()
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  if (trimmed === 'Reading additional input from stdin...') {
+    return null
+  }
+
+  if (
+    trimmed.includes(
+      'codex_analytics::client: events failed with status 403 Forbidden: <html>',
+    )
+  ) {
+    state.suppressAnalyticsHtmlContinuation = true
+    return 'Codex analytics events were blocked with 403 Forbidden. Continuing without analytics.'
+  }
+
+  if (
+    trimmed.includes(
+      'codex_rmcp_client::stdio_server_launcher: Failed to terminate MCP process group',
+    )
+  ) {
+    return null
+  }
+
+  if (
+    trimmed.includes(
+      'codex_core::shell_snapshot: Failed to delete shell snapshot',
+    )
+  ) {
+    return null
+  }
+
+  return line
 }
 
 function defaultResolveVersion(executablePath: string): string | null {
@@ -220,6 +301,7 @@ export async function* runCodexNativeExec(
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
+      stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',
     }) ??
@@ -227,8 +309,7 @@ export async function* runCodexNativeExec(
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
 
   const stderrLines: string[] = []
@@ -240,6 +321,9 @@ export async function* runCodexNativeExec(
   }
 
   let threadId: string | null = null
+  const stderrFilterState: CodexNativeStderrFilterState = {
+    suppressAnalyticsHtmlContinuation: false,
+  }
 
   let spawnError: Error | null = null
   child.once('error', error => {
@@ -255,13 +339,20 @@ export async function* runCodexNativeExec(
 
   for await (const entry of queuedLines) {
     if (entry.stream === 'stderr') {
-      stderrLines.push(entry.line)
+      const rewrittenLine = rewriteCodexNativeStderrLine(
+        entry.line,
+        stderrFilterState,
+      )
+      if (!rewrittenLine) {
+        continue
+      }
+      stderrLines.push(rewrittenLine)
       yield {
         type: 'normalized_event',
         event: {
           type: 'warning',
           source: 'stderr',
-          text: entry.line,
+          text: rewrittenLine,
         },
       }
       continue

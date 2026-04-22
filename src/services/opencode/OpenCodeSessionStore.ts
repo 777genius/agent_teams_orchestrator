@@ -22,8 +22,8 @@ const LOCK_OPTIONS = {
   },
 }
 
-function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'memberName'>): string {
-  return `${record.teamId}::${record.memberName}`
+function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
+  return `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}`
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -100,9 +100,11 @@ export class OpenCodeSessionStore {
     return Object.values(store.records)
   }
 
-  async get(teamId: string, memberName: string): Promise<OpenCodeSessionRecord | null> {
+  async get(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<OpenCodeSessionRecord | null> {
+    const laneId = memberName ? laneIdOrMemberName : 'primary'
+    const normalizedMemberName = memberName ?? laneIdOrMemberName
     const store = await this.readStore()
-    return store.records[buildRecordKey({ teamId, memberName })] ?? null
+    return store.records[buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })] ?? null
   }
 
   async upsert(record: OpenCodeSessionRecord): Promise<UpsertResult> {
@@ -123,12 +125,16 @@ export class OpenCodeSessionStore {
 
   async markStale(
     teamId: string,
-    memberName: string,
-    staleReason: string,
+    laneIdOrMemberName: string,
+    memberNameOrStaleReason: string,
+    staleReasonMaybe?: string,
   ): Promise<OpenCodeSessionRecord | null> {
+    const laneId = staleReasonMaybe ? laneIdOrMemberName : 'primary'
+    const memberName = staleReasonMaybe ? memberNameOrStaleReason : laneIdOrMemberName
+    const staleReason = staleReasonMaybe ?? memberNameOrStaleReason
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, memberName })
+      const key = buildRecordKey({ teamId, laneId, memberName })
       const previous = store.records[key]
       if (!previous) {
         return null
@@ -150,10 +156,12 @@ export class OpenCodeSessionStore {
     })
   }
 
-  async delete(teamId: string, memberName: string): Promise<boolean> {
+  async delete(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<boolean> {
+    const laneId = memberName ? laneIdOrMemberName : 'primary'
+    const normalizedMemberName = memberName ?? laneIdOrMemberName
     return this.withStoreLock(async () => {
       const store = await this.readStore()
-      const key = buildRecordKey({ teamId, memberName })
+      const key = buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })
       if (!store.records[key]) {
         return false
       }

@@ -104,6 +104,7 @@ const bootstrapSpecSchema = z.strictObject({
 function normalizeMember(
   member: TeamBootstrapSpec['members'][number],
 ): NormalizedBootstrapMember {
+  const isWorktreeIsolated = member.isolation === 'worktree'
   return {
     originalName: member.name,
     displayName: member.name,
@@ -115,8 +116,8 @@ function normalizeMember(
     ...(member.provider ? { provider: member.provider } : {}),
     ...(member.model ? { model: member.model } : {}),
     ...(member.effort ? { effort: member.effort } : {}),
-    ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
-    ...(member.cwd ? { cwd: member.cwd } : {}),
+    ...(isWorktreeIsolated ? { isolation: 'worktree' as const } : {}),
+    ...(member.cwd && !isWorktreeIsolated ? { cwd: member.cwd } : {}),
     ...(member.useSplitPane ? { useSplitPane: member.useSplitPane } : {}),
     ...(member.planModeRequired
       ? { planModeRequired: member.planModeRequired }

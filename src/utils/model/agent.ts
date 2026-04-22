@@ -3,6 +3,7 @@ import { capitalize } from '../stringUtils.js'
 import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
 import {
+  getAuthlessProviderDefaultModel,
   getCanonicalName,
   getRuntimeMainLoopModel,
   parseUserSpecifiedModel,
@@ -36,7 +37,7 @@ export function getDefaultSubagentModel(): string {
  */
 export function getAgentModel(
   agentModel: string | undefined,
-  parentModel: string,
+  parentModel: string | null | undefined,
   toolSpecifiedModel?: ModelAlias,
   permissionMode?: PermissionMode,
 ): string {
@@ -44,10 +45,15 @@ export function getAgentModel(
     return parseUserSpecifiedModel(process.env.CLAUDE_CODE_SUBAGENT_MODEL)
   }
 
+  const resolvedParentModel =
+    typeof parentModel === 'string' && parentModel.trim().length > 0
+      ? parentModel
+      : getAuthlessProviderDefaultModel()
+
   // Extract Bedrock region prefix from parent model to inherit for subagents.
   // This ensures subagents use the same cross-region inference profile (e.g., "eu.", "us.")
   // as the parent, which is required when IAM permissions only allow specific regions.
-  const parentRegionPrefix = getBedrockRegionPrefix(parentModel)
+  const parentRegionPrefix = getBedrockRegionPrefix(resolvedParentModel)
 
   // Helper to apply parent region prefix for Bedrock models.
   // `originalSpec` is the raw model string before resolution (alias or full ID).
@@ -68,8 +74,8 @@ export function getAgentModel(
 
   // Prioritize tool-specified model if provided
   if (toolSpecifiedModel) {
-    if (aliasMatchesParentTier(toolSpecifiedModel, parentModel)) {
-      return parentModel
+    if (aliasMatchesParentTier(toolSpecifiedModel, resolvedParentModel)) {
+      return resolvedParentModel
     }
     const model = parseUserSpecifiedModel(toolSpecifiedModel)
     return applyParentRegionPrefix(model, toolSpecifiedModel)
@@ -82,13 +88,13 @@ export function getAgentModel(
     // This ensures agents using 'inherit' get opusplan→Opus resolution in plan mode
     return getRuntimeMainLoopModel({
       permissionMode: permissionMode ?? 'default',
-      mainLoopModel: parentModel,
+      mainLoopModel: resolvedParentModel,
       exceeds200kTokens: false,
     })
   }
 
-  if (aliasMatchesParentTier(agentModelWithExp, parentModel)) {
-    return parentModel
+  if (aliasMatchesParentTier(agentModelWithExp, resolvedParentModel)) {
+    return resolvedParentModel
   }
   const model = parseUserSpecifiedModel(agentModelWithExp)
   return applyParentRegionPrefix(model, agentModelWithExp)

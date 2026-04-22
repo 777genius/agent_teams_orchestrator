@@ -2,7 +2,7 @@ import type { AppState } from '../../state/AppState.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 
 const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
-  'Your FIRST action: call MCP tool member_briefing with:'
+  'Your FIRST action: call MCP tool member_briefing'
 const BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER =
   'The team has already been created and you are being attached as a persistent teammate.'
 

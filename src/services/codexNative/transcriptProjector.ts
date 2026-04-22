@@ -2,6 +2,7 @@ import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messag
 
 import {
   createAssistantMessage,
+  createUserMessage,
 } from '../../utils/messages.js'
 import type { Message } from '../../types/message.js'
 import type { NonNullableUsage } from '../../entrypoints/sdk/coreTypes.js'
@@ -48,6 +49,27 @@ function accumulateCodexNativeUsage(
   }
 }
 
+function buildCodexNativeMcpToolName(params: {
+  serverName: string
+  toolName: string
+}): string {
+  return `mcp__${params.serverName}__${params.toolName}`
+}
+
+function buildCodexNativeToolResultContent(event: Extract<
+  CodexNativeNormalizedEvent,
+  { type: 'tool_call_completed' }
+>): string {
+  if (event.resultText && event.resultText.trim().length > 0) {
+    return event.resultText
+  }
+  if (event.isError) {
+    const detail = event.errorMessage?.trim() || 'Codex MCP tool call failed.'
+    return `<tool_use_error>${detail}</tool_use_error>`
+  }
+  return 'Tool completed successfully.'
+}
+
 export class CodexNativeTranscriptProjector {
   private lastAssistantMessage: Extract<Message, { type: 'assistant' }> | null =
     null
@@ -66,6 +88,45 @@ export class CodexNativeTranscriptProjector {
         this.lastAssistantMessage = message
         return {
           appendedMessages: [message],
+          turnCompleted: false,
+        }
+      }
+      case 'tool_call_started': {
+        const toolUseMessage = createAssistantMessage({
+          content: [
+            {
+              type: 'tool_use',
+              id: event.itemId,
+              name: buildCodexNativeMcpToolName({
+                serverName: event.serverName,
+                toolName: event.toolName,
+              }),
+              input: event.arguments,
+            } as never,
+          ],
+        })
+        if (!this.lastAssistantMessage) {
+          this.lastAssistantMessage = toolUseMessage
+        }
+        return {
+          appendedMessages: [toolUseMessage],
+          turnCompleted: false,
+        }
+      }
+      case 'tool_call_completed': {
+        const toolResultMessage = createUserMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: event.itemId,
+              content: buildCodexNativeToolResultContent(event),
+              is_error: event.isError,
+            } as never,
+          ],
+          toolUseResult: event.rawResult,
+        })
+        return {
+          appendedMessages: [toolResultMessage],
           turnCompleted: false,
         }
       }

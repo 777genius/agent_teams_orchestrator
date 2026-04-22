@@ -25,6 +25,7 @@ import { execFileNoThrow } from '../execFileNoThrow.js'
 import { getAPIProvider } from '../model/providers.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { sleep } from '../sleep.js'
+import { getCodexForcedLoginMethod } from '../../services/runtimeBackends/codexBackendResolver.js'
 import type { TeammateProvider } from './backends/types.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
 import {
@@ -222,6 +223,15 @@ function shouldForwardAnthropicAuthToken(
   return (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'anthropic'
 }
 
+export function shouldClearCodexApiKeysForTeammateSpawn(
+  provider: TeammateProvider | undefined,
+): boolean {
+  return (
+    (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'codex' &&
+    getCodexForcedLoginMethod() === 'chatgpt'
+  )
+}
+
 export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
   anthropicApiKey: string | undefined
   customApiKeyStatus: 'approved' | 'rejected' | 'new'
@@ -256,6 +266,7 @@ export function buildInheritedEnvVars(options?: {
 }): string {
   const envVars = ['CLAUDECODE=1', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1']
   const provider = options?.provider
+  const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(provider)
 
   if (
     shouldClearAnthropicApiKeyForTeammateSpawn({
@@ -278,10 +289,18 @@ export function buildInheritedEnvVars(options?: {
     if (provider && PROVIDER_SELECTION_ENV_VAR_SET.has(key)) {
       continue
     }
+    if (clearCodexApiKeys && (key === 'CODEX_API_KEY' || key === 'OPENAI_API_KEY')) {
+      continue
+    }
     const value = process.env[key]
     if (value !== undefined && value !== '') {
       envVars.push(`${key}=${quote([value])}`)
     }
+  }
+
+  if (clearCodexApiKeys) {
+    envVars.push("CODEX_API_KEY=''")
+    envVars.push("OPENAI_API_KEY=''")
   }
 
   if (options?.extraEnv) {

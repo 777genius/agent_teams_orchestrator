@@ -10,12 +10,17 @@ import type {
 
 const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
+const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 60_000
+const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
+  sleep?: (ms: number) => Promise<void>
+  probeTimeoutMs?: number
+  pollIntervalMs?: number
 }
 
 function parseProviderScopedModel(selectedModel: string): {
@@ -36,6 +41,10 @@ function parseProviderScopedModel(selectedModel: string): {
 
 function nowMs(): number {
   return Date.now()
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function buildDurationMs(startedAtMs: number): number {
@@ -145,6 +154,10 @@ export class OpenCodeExecutionProbe {
     return this.deps.eventTranslator ?? openCodeEventTranslator
   }
 
+  private get sleep() {
+    return this.deps.sleep ?? sleep
+  }
+
   async probeModel(params: {
     selectedModel: string
     projectPath?: string | null
@@ -154,7 +167,9 @@ export class OpenCodeExecutionProbe {
     const startedAtMs = nowMs()
     const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
     const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
-    const diagnostics: string[] = []
+    const diagnostics = new Set<string>()
+    const probeTimeoutMs = Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS)
+    const pollIntervalMs = Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS)
 
     const host = await this.hostManager.ensureHost({
       projectPath: params.projectPath,
@@ -190,69 +205,120 @@ export class OpenCodeExecutionProbe {
           latestAssistantPreview: null,
           toolCallCount: 0,
           errorCount: 0,
-          diagnostics,
+          diagnostics: Array.from(diagnostics),
         }
       }
 
-      const [statusMap, messages] = await Promise.all([
-        client.getSessionStatus(),
-        client.getSessionMessages(session.id),
-      ])
+      let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
+      let latestDurableState: OpenCodeExecutionProbeResult['durableState'] = 'unknown'
+      let latestAssistantText: string | null = null
+      let latestAssistantPreview: string | null = null
+      let latestToolCallCount = 0
+      let latestErrorCount = 0
+      const deadlineMs = startedAtMs + probeTimeoutMs
 
-      const rawStatus = statusMap[session.id] ?? null
-      const summary = this.eventTranslator.reconcileSessionMessages({
-        sessionId: session.id,
-        rawStatus,
-        messages,
-      })
-      diagnostics.push(...summary.diagnostics)
+      for (;;) {
+        const [statusMap, messages] = await Promise.all([
+          client.getSessionStatus(),
+          client.getSessionMessages(session.id),
+        ])
 
-      if (
-        summary.durableState === 'idle'
-        && (isProbeSuccessOutput(summary.latestAssistantText) || isProbeSuccessOutput(summary.latestAssistantPreview))
-      ) {
+        const rawStatus = statusMap[session.id] ?? null
+        const summary = this.eventTranslator.reconcileSessionMessages({
+          sessionId: session.id,
+          rawStatus,
+          messages,
+        })
+        for (const diagnostic of summary.diagnostics) {
+          diagnostics.add(diagnostic)
+        }
+        latestRawStatus = rawStatus
+        latestDurableState = summary.durableState
+        latestAssistantText = summary.latestAssistantText
+        latestAssistantPreview = summary.latestAssistantPreview
+        latestToolCallCount = summary.toolCallCount
+        latestErrorCount = summary.errorCount
+
+        if (
+          summary.durableState === 'idle'
+          && (isProbeSuccessOutput(summary.latestAssistantText) || isProbeSuccessOutput(summary.latestAssistantPreview))
+        ) {
+          return {
+            providerId: 'opencode',
+            modelId: params.selectedModel,
+            probePrompt: prompt,
+            expectedOutput,
+            outcome: 'available',
+            reason: null,
+            durationMs: buildDurationMs(startedAtMs),
+            rawStatus,
+            durableState: summary.durableState,
+            latestAssistantText: summary.latestAssistantText,
+            latestAssistantPreview: summary.latestAssistantPreview,
+            toolCallCount: summary.toolCallCount,
+            errorCount: summary.errorCount,
+            diagnostics: Array.from(diagnostics),
+          }
+        }
+
+        const failureMessage =
+          getLatestAssistantMessageError(Array.from(diagnostics), messages)
+          ?? summary.latestAssistantPreview
+          ?? summary.latestAssistantText
+          ?? null
+        const shouldContinuePolling =
+          (summary.durableState === 'running'
+            || summary.durableState === 'retrying'
+            || summary.durableState === 'reply_pending'
+            || (summary.durableState === 'idle' && !failureMessage)
+            || (summary.durableState === 'unknown' && !failureMessage))
+          && nowMs() < deadlineMs
+
+        if (shouldContinuePolling) {
+          await this.sleep(Math.min(pollIntervalMs, Math.max(0, deadlineMs - nowMs())))
+          continue
+        }
+
+        if (!shouldContinuePolling && failureMessage) {
+          const classified = classifyProbeFailure({
+            message: failureMessage,
+          })
+
+          return {
+            providerId: 'opencode',
+            modelId: params.selectedModel,
+            probePrompt: prompt,
+            expectedOutput,
+            outcome: classified.outcome,
+            reason: classified.reason,
+            durationMs: buildDurationMs(startedAtMs),
+            rawStatus,
+            durableState: summary.durableState,
+            latestAssistantText: summary.latestAssistantText,
+            latestAssistantPreview: summary.latestAssistantPreview,
+            toolCallCount: summary.toolCallCount,
+            errorCount: summary.errorCount,
+            diagnostics: Array.from(diagnostics),
+          }
+        }
+
+        diagnostics.add('Model verification timed out')
         return {
           providerId: 'opencode',
           modelId: params.selectedModel,
           probePrompt: prompt,
           expectedOutput,
-          outcome: 'available',
-          reason: null,
+          outcome: 'unknown',
+          reason: 'Model verification timed out',
           durationMs: buildDurationMs(startedAtMs),
-          rawStatus,
-          durableState: summary.durableState,
-          latestAssistantText: summary.latestAssistantText,
-          latestAssistantPreview: summary.latestAssistantPreview,
-          toolCallCount: summary.toolCallCount,
-          errorCount: summary.errorCount,
-          diagnostics,
+          rawStatus: latestRawStatus,
+          durableState: latestDurableState,
+          latestAssistantText,
+          latestAssistantPreview,
+          toolCallCount: latestToolCallCount,
+          errorCount: latestErrorCount,
+          diagnostics: Array.from(diagnostics),
         }
-      }
-
-      const failureMessage =
-        getLatestAssistantMessageError(diagnostics, messages)
-        ?? summary.latestAssistantPreview
-        ?? summary.latestAssistantText
-        ?? `Unexpected OpenCode probe state (${summary.durableState})`
-      const classified = classifyProbeFailure({
-        message: failureMessage,
-      })
-
-      return {
-        providerId: 'opencode',
-        modelId: params.selectedModel,
-        probePrompt: prompt,
-        expectedOutput,
-        outcome: classified.outcome,
-        reason: classified.reason,
-        durationMs: buildDurationMs(startedAtMs),
-        rawStatus,
-        durableState: summary.durableState,
-        latestAssistantText: summary.latestAssistantText,
-        latestAssistantPreview: summary.latestAssistantPreview,
-        toolCallCount: summary.toolCallCount,
-        errorCount: summary.errorCount,
-        diagnostics,
       }
     } finally {
       await this.hostManager.releaseHost(host.hostKey)

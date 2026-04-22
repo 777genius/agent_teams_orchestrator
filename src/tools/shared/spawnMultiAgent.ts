@@ -96,6 +96,7 @@ import {
 import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js'
 import { registerTask } from '../../utils/task/framework.js'
 import { getProjectDir } from '../../utils/sessionStoragePortable.js'
+import { resolveCodexRuntimeSelection } from '../../services/runtimeBackends/codexBackendResolver.js'
 import {
   TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV,
   TASK_CHANGE_LEDGER_PROJECT_DIR_ENV,
@@ -165,7 +166,7 @@ function resolveTeammateProvider(
   return inputProvider ?? getCurrentTeammateProvider()
 }
 
-function requiresSeparateProcessForProvider(
+function crossesProviderBoundary(
   inputProvider: TeammateProvider | undefined,
 ): boolean {
   return (
@@ -173,12 +174,51 @@ function requiresSeparateProcessForProvider(
   )
 }
 
+type SeparateProcessRequirementReason =
+  | 'provider-mismatch'
+  | 'codex-native-runtime'
+
+export function getSeparateProcessRequirement(
+  inputProvider: TeammateProvider | undefined,
+): {
+  required: boolean
+  reason: SeparateProcessRequirementReason | null
+  provider: TeammateProvider
+} {
+  const provider = resolveTeammateProvider(inputProvider)
+
+  if (crossesProviderBoundary(inputProvider)) {
+    return {
+      required: true,
+      reason: 'provider-mismatch',
+      provider,
+    }
+  }
+
+  if (
+    provider === 'codex' &&
+    resolveCodexRuntimeSelection().resolvedBackendId === 'codex-native'
+  ) {
+    return {
+      required: true,
+      reason: 'codex-native-runtime',
+      provider,
+    }
+  }
+
+  return {
+    required: false,
+    reason: null,
+    provider,
+  }
+}
+
 function resolveSpawnModel(
   inputModel: string | undefined,
   leaderModel: string | null,
   inputProvider: TeammateProvider | undefined,
 ): string | undefined {
-  if (requiresSeparateProcessForProvider(inputProvider)) {
+  if (crossesProviderBoundary(inputProvider)) {
     // Do not inherit the leader's model across provider boundaries.
     // Let the spawned process pick its provider-native default unless a
     // teammate-specific model was explicitly requested.
@@ -965,7 +1005,7 @@ async function handleSpawnSplitPane(
     strictMcpConfig: Boolean(teamName),
   })
 
-  if (requiresSeparateProcessForProvider(input.provider)) {
+  if (crossesProviderBoundary(input.provider)) {
     inheritedFlags = stripInheritedModelFlag(inheritedFlags)
   }
 
@@ -1254,7 +1294,7 @@ async function handleSpawnSeparateWindow(
     strictMcpConfig: Boolean(teamName),
   })
 
-  if (requiresSeparateProcessForProvider(input.provider)) {
+  if (crossesProviderBoundary(input.provider)) {
     inheritedFlags = stripInheritedModelFlag(inheritedFlags)
   }
 
@@ -1544,11 +1584,17 @@ async function handleSpawnInProcess(
 ): Promise<{ data: SpawnOutput }> {
   const { setAppState, getAppState } = context
   const { name, prompt, agent_type, plan_mode_required } = input
-  const provider = resolveTeammateProvider(input.provider)
+  const separateProcessRequirement = getSeparateProcessRequirement(input.provider)
+  const { provider } = separateProcessRequirement
   const effort = input.effort
   const worktreeInfo = input.worktreeInfo
 
-  if (requiresSeparateProcessForProvider(input.provider)) {
+  if (separateProcessRequirement.required) {
+    if (separateProcessRequirement.reason === 'codex-native-runtime') {
+      throw new Error(
+        `Teammate "${name}" uses Codex native runtime, which must execute through a separate process and the dedicated codex-native lane, not the in-process adapter lane.`,
+      )
+    }
     throw new Error(
       `Teammate "${name}" requests provider "${provider}" which differs from the leader provider "${getCurrentTeammateProvider()}". Mixed-provider teammates must run in a separate process.`,
     )
@@ -1819,7 +1865,8 @@ async function handleSpawn(
   context: ToolUseContext,
 ): Promise<{ data: SpawnOutput }> {
   const requestedProvider = resolveTeammateProvider(input.provider)
-  const forceSeparateProcess = requiresSeparateProcessForProvider(input.provider)
+  const separateProcessRequirement = getSeparateProcessRequirement(input.provider)
+  const forceSeparateProcess = separateProcessRequirement.required
   if (input.isolation === 'worktree' && input.cwd) {
     throw new Error('cwd is mutually exclusive with isolation: "worktree" for teammate spawn.')
   }
@@ -1856,6 +1903,11 @@ async function handleSpawn(
       await detectAndGetBackend()
     } catch (error) {
       if (forceSeparateProcess) {
+        if (separateProcessRequirement.reason === 'codex-native-runtime') {
+          throw new Error(
+            `Teammate "${input.name}" uses Codex native runtime, which must run in a separate process through the dedicated codex-native lane. No pane-based backend is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
+          )
+        }
         throw new Error(
           `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". A pane-based backend is required for mixed-provider teammates, but none is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
         )

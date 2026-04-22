@@ -14,7 +14,7 @@ import { getCwd } from '../../utils/cwd.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import {
   getDefaultMainLoopModel,
-  parseUserSpecifiedModel,
+  resolveAllowedModelSetting,
 } from '../../utils/model/model.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { getResolvedTeammateMode } from '../../utils/swarm/backends/registry.js'
@@ -150,7 +150,7 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
     // Get the team lead's current model from launch/bootstrap state first.
     // TeamCreate can run before AppState fully reflects a new --model selection,
     // so relying on appState alone can incorrectly persist the previous model.
-    const leadModel = parseUserSpecifiedModel(
+    const leadModel = resolveAllowedModelSetting(
       getMainLoopModelOverride() ??
         getInitialMainLoopModel() ??
         appState.mainLoopModelForSession ??

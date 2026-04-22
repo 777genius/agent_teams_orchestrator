@@ -1482,9 +1482,29 @@ export async function runInProcessTeammate(
   } catch (error) {
     const errorMessage =
       error instanceof Error ? error.message : 'Unknown error'
+    const errorDetail =
+      error instanceof Error
+        ? JSON.stringify(
+            {
+              name: error.name,
+              message: error.message,
+              stack: error.stack ?? null,
+              cause:
+                error.cause instanceof Error
+                  ? {
+                      name: error.cause.name,
+                      message: error.cause.message,
+                      stack: error.cause.stack ?? null,
+                    }
+                  : (error.cause ?? null),
+            },
+            null,
+            2,
+          )
+        : String(error)
 
     logForDebugging(
-      `[inProcessRunner] Agent ${identity.agentId} failed: ${errorMessage}`,
+      `[inProcessRunner] Agent ${identity.agentId} failed: ${errorMessage}\n${errorDetail}`,
     )
 
     // Mark task as failed and notify any waiters
@@ -1564,6 +1584,10 @@ export function startInProcessTeammate(config: InProcessRunnerConfig): void {
   // pending - which can be hours for a long-running teammate.
   const agentId = config.identity.agentId
   void runInProcessTeammate(config).catch(error => {
-    logForDebugging(`[inProcessRunner] Unhandled error in ${agentId}: ${error}`)
+    const errorDetail =
+      error instanceof Error ? (error.stack ?? error.message) : String(error)
+    logForDebugging(
+      `[inProcessRunner] Unhandled error in ${agentId}: ${errorDetail}`,
+    )
   })
 }

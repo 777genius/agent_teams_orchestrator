@@ -185,7 +185,8 @@ export function getQueuedMailboxMetaPrompt({
     'Process the queued teammate mailbox attachment now.',
     'It contains your onboarding/bootstrap instructions from the team lead.',
     'Follow the attachment immediately.',
-    'If it instructs member_briefing, call member_briefing now.',
+    'If it instructs member_briefing, call the MCP tool member_briefing on the agent-teams server now.',
+    'Do not run a shell command named member_briefing.',
     'Do not ask for clarification if the attachment is present and readable.',
     'After bootstrap completes, continue with normal team mailbox and task behavior.',
   ].join(' ')
@@ -240,8 +241,9 @@ export function getBootstrapInlineHandoffPrompt({
 
   return [
     `You are bootstrapping into team "${teamName}" as member "${memberName}".`,
-    `Your first action is to call member_briefing with teamName="${teamName}" and memberName="${memberName}".`,
-    'Call member_briefing directly yourself. Do not use Agent, any subagent, or a delegated helper for this bootstrap step.',
+    `Your first action is to call the MCP tool member_briefing on the agent-teams server with teamName="${teamName}" and memberName="${memberName}".`,
+    'If tool search shows only the prefixed MCP name, use mcp__agent-teams__member_briefing.',
+    'Call the MCP tool directly yourself. Do not run a shell command named member_briefing. Do not use Agent, any subagent, or a delegated helper for this bootstrap step.',
     'Do not explore files, inbox paths, or team config before the first member_briefing attempt.',
     'If member_briefing fails, send one short natural-language message to "team-lead" with the exact error text.',
     'Bootstrap instructions from team-lead:',

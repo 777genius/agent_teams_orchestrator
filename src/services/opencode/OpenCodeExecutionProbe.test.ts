@@ -177,4 +177,156 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toContain('Token refresh failed: 401')
     expect(result.durableState).toBe('error')
   })
+
+  test('waits for a delayed assistant reply before deciding the probe outcome', async () => {
+    let statusCallCount = 0
+    let messageCallCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      pollIntervalMs: 0,
+      probeTimeoutMs: 50,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return { 'session-1': statusCallCount < 2 ? 'busy' : 'idle' }
+          },
+          getSessionMessages: async () => {
+            messageCallCount += 1
+            if (messageCallCount < 2) {
+              return [
+                {
+                  info: {
+                    id: 'msg-user-1',
+                    role: 'user',
+                    sessionID: 'session-1',
+                    time: { created: 100 },
+                  },
+                  parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+                },
+              ]
+            }
+            return [
+              {
+                info: {
+                  id: 'msg-user-1',
+                  role: 'user',
+                  sessionID: 'session-1',
+                  time: { created: 100 },
+                },
+                parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+              },
+              {
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  parentID: 'msg-user-1',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              },
+            ]
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-user-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(statusCallCount).toBeGreaterThanOrEqual(2)
+    expect(messageCallCount).toBeGreaterThanOrEqual(2)
+  })
+
+  test('returns a timeout when OpenCode never produces an assistant reply before the probe deadline', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      pollIntervalMs: 0,
+      probeTimeoutMs: 1,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'busy' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-user-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unknown')
+    expect(result.reason).toBe('Model verification timed out')
+  })
 })

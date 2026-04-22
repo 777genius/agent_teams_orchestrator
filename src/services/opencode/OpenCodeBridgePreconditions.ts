@@ -1,5 +1,6 @@
 export type OpenCodeBridgeCommandPreconditions = {
   handshakeIdentityHash: string
+  laneId: string | null
   expectedRunId: string | null
   expectedCapabilitySnapshotId: string | null
   expectedBehaviorFingerprint: string | null
@@ -29,6 +30,11 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
   input: ValidationInput,
 ): OpenCodeBridgeCommandEvidence {
   const preconditions = parseOpenCodeBridgePreconditions(input.body.preconditions)
+  const bodyLaneId = asOptionalNullableString(input.body.laneId, 'laneId')
+  const expectedLaneId = preconditions?.laneId ?? bodyLaneId ?? null
+  if (preconditions?.laneId && bodyLaneId && preconditions.laneId !== bodyLaneId) {
+    throw new Error('OpenCode bridge expected laneId precondition does not match command laneId')
+  }
   const bodyRunId = asOptionalString(input.body.runId, 'runId')
   const expectedRunId = preconditions?.expectedRunId ?? bodyRunId ?? null
   if (preconditions?.expectedRunId && bodyRunId && preconditions.expectedRunId !== bodyRunId) {
@@ -90,6 +96,7 @@ export function parseOpenCodeBridgePreconditions(
 
   return {
     handshakeIdentityHash: requireString(record.handshakeIdentityHash, 'handshakeIdentityHash'),
+    laneId: requireNullableString(record.laneId, 'laneId'),
     expectedRunId: requireNullableString(record.expectedRunId, 'expectedRunId'),
     expectedCapabilitySnapshotId: requireNullableString(
       record.expectedCapabilitySnapshotId,

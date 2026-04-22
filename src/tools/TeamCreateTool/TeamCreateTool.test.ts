@@ -5,10 +5,12 @@ import { join } from 'path'
 
 import {
   getCwdState,
+  getFlagSettingsInline,
   getInitialMainLoopModel,
   getMainLoopModelOverride,
   getOriginalCwd,
   setCwdState,
+  setFlagSettingsInline,
   setInitialMainLoopModel,
   setMainLoopModelOverride,
   setOriginalCwd,
@@ -24,6 +26,9 @@ describe('TeamCreateTool', () => {
   let previousCwd: string
   let previousModelOverride: string | null | undefined
   let previousInitialModel: string | null
+  let previousFlagSettingsInline: Record<string, unknown> | null
+  let previousEntryProvider: string | undefined
+  let previousProviderManagedByHost: string | undefined
 
   beforeEach(() => {
     tempConfigDir = mkdtempSync(join(tmpdir(), 'team-create-tool-'))
@@ -34,6 +39,9 @@ describe('TeamCreateTool', () => {
     previousCwd = getCwdState()
     previousModelOverride = getMainLoopModelOverride() as string | null | undefined
     previousInitialModel = getInitialMainLoopModel() as string | null
+    previousFlagSettingsInline = getFlagSettingsInline()
+    previousEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+    previousProviderManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
 
     setOriginalCwd(tempConfigDir)
     setCwdState(tempConfigDir)
@@ -50,6 +58,18 @@ describe('TeamCreateTool', () => {
     setCwdState(previousCwd)
     setMainLoopModelOverride(previousModelOverride)
     setInitialMainLoopModel(previousInitialModel)
+    setFlagSettingsInline(previousFlagSettingsInline)
+    if (previousEntryProvider === undefined) {
+      delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+    } else {
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = previousEntryProvider
+    }
+    if (previousProviderManagedByHost === undefined) {
+      delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    } else {
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+        previousProviderManagedByHost
+    }
 
     rmSync(tempConfigDir, { recursive: true, force: true })
   })
@@ -81,5 +101,39 @@ describe('TeamCreateTool', () => {
     expect(teamFile).not.toBeNull()
     expect(teamFile?.members[0]?.name).toBe('team-lead')
     expect(teamFile?.members[0]?.model).toBe('gemini-2.5-flash-lite')
+  })
+
+  test('falls back to a ChatGPT-supported Codex model for the lead config', async () => {
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+      },
+    })
+    setMainLoopModelOverride('gpt-5.1-codex-max')
+    setInitialMainLoopModel('gpt-5.1-codex-max')
+
+    let appState: AppState = {
+      teamContext: undefined,
+      mainLoopModel: 'gpt-5.1-codex-max',
+      mainLoopModelForSession: 'gpt-5.1-codex-max',
+    } as AppState
+
+    await TeamCreateTool.call(
+      {
+        team_name: 'codex-safe-fallback',
+        description: 'Codex ChatGPT auth fallback',
+      },
+      {
+        getAppState: () => appState,
+        setAppState: updater => {
+          appState = updater(appState)
+        },
+      } as never
+    )
+
+    const teamFile = await readTeamFileAsync('codex-safe-fallback')
+    expect(teamFile?.members[0]?.model).toBe('gpt-5.4')
   })
 })

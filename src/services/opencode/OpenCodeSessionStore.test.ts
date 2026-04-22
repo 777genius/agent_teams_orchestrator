@@ -8,6 +8,7 @@ import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 const baseRecord = {
   teamId: 'team-a',
+  laneId: 'primary',
   memberName: 'alice',
   providerId: 'opencode' as const,
   selectedModel: 'openai/gpt-5.4',
@@ -65,5 +66,23 @@ describe('OpenCodeSessionStore', () => {
     await store.upsert(baseRecord)
     expect(await store.delete(baseRecord.teamId, baseRecord.memberName)).toBe(true)
     expect(await store.get(baseRecord.teamId, baseRecord.memberName)).toBeNull()
+  })
+
+  test('stores sibling OpenCode lanes independently for the same team/member pair', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const primary = { ...baseRecord, laneId: 'primary', opencodeSessionId: 'session-primary' }
+    const secondary = {
+      ...baseRecord,
+      laneId: 'secondary:opencode:alice',
+      opencodeSessionId: 'session-secondary',
+    }
+
+    expect(await store.upsert(primary)).toBe('created')
+    expect(await store.upsert(secondary)).toBe('created')
+    expect(await store.get(baseRecord.teamId, 'primary', baseRecord.memberName)).toEqual(primary)
+    expect(
+      await store.get(baseRecord.teamId, 'secondary:opencode:alice', baseRecord.memberName),
+    ).toEqual(secondary)
+    expect(await store.list()).toHaveLength(2)
   })
 })

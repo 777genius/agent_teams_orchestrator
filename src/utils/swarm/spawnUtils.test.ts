@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test'
+import { getFlagSettingsInline, setFlagSettingsInline } from '../../bootstrap/state.js'
 
 import {
   buildInheritedEnvVars,
+  shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
 } from './spawnUtils.js'
 
@@ -99,6 +101,53 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       } else {
         process.env.CODEX_API_KEY = originalCodexApiKey
       }
+    }
+  })
+
+  it('clears Codex API key env vars for ChatGPT-auth codex teammates', () => {
+    const originalApiKey = process.env.OPENAI_API_KEY
+    const originalCodexApiKey = process.env.CODEX_API_KEY
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+    const originalSettingsInline = getFlagSettingsInline()
+
+    process.env.OPENAI_API_KEY = 'sk-openai-teammate'
+    process.env.CODEX_API_KEY = 'sk-codex-teammate'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+      },
+    })
+
+    try {
+      expect(shouldClearCodexApiKeysForTeammateSpawn('codex')).toBe(true)
+
+      const env = buildInheritedEnvVars({ provider: 'codex' })
+
+      expect(env).toContain("OPENAI_API_KEY=''")
+      expect(env).toContain("CODEX_API_KEY=''")
+      expect(env).not.toContain('OPENAI_API_KEY=sk-openai-teammate')
+      expect(env).not.toContain('CODEX_API_KEY=sk-codex-teammate')
+    } finally {
+      if (originalApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = originalApiKey
+      }
+
+      if (originalCodexApiKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+
+      setFlagSettingsInline(originalSettingsInline)
     }
   })
 

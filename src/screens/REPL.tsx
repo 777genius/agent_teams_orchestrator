@@ -144,6 +144,8 @@ import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
 import { query } from '../query.js';
+import { runCodexNativeTurnInRepl } from '../services/codexNative/replTurnBridge.js';
+import { resolveCodexRuntimeSelection } from '../services/runtimeBackends/codexBackendResolver.js';
 import { mergeClients, useMergedClients } from '../hooks/useMergedClients.js';
 import { getQuerySourceForREPL } from '../utils/promptCategory.js';
 import { useMergedTools } from '../hooks/useMergedTools.js';
@@ -207,6 +209,7 @@ import { useTaskListWatcher } from '../hooks/useTaskListWatcher.js';
 import type { SandboxAskCallback, NetworkHostPattern } from '../utils/sandbox/sandbox-adapter.js';
 import { type IDEExtensionInstallationStatus, closeOpenDiffs, getConnectedIdeClient, type IdeType } from '../utils/ide.js';
 import { useIDEIntegration } from '../hooks/useIDEIntegration.js';
+import { shouldUseCodexProviderRoutingForCurrentProcess } from '../utils/auth.js';
 import exit from '../commands/exit/index.js';
 import { ExitFlow } from '../components/ExitFlow.js';
 import { getCurrentWorktreeSession } from '../utils/worktree.js';
@@ -2798,16 +2801,36 @@ export function REPL({
     resetTurnHookDuration();
     resetTurnToolDuration();
     resetTurnClassifierDuration();
-    for await (const event of query({
-      messages: messagesIncludingNewMessages,
-      systemPrompt,
-      userContext,
-      systemContext,
-      canUseTool,
-      toolUseContext,
-      querySource: getQuerySourceForREPL()
-    })) {
-      onQueryEvent(event);
+    const codexRuntimeResolution = shouldUseCodexProviderRoutingForCurrentProcess() ? resolveCodexRuntimeSelection() : null;
+    if (codexRuntimeResolution?.resolvedBackendId === 'codex-native') {
+      const promptMessage = [...newMessages].reverse().find((message): message is UserMessage => message.type === 'user');
+      if (!promptMessage) {
+        throw new Error('Codex native REPL turn requires a user prompt message.');
+      }
+      await runCodexNativeTurnInRepl({
+        prompt: promptMessage.message.content,
+        cwd: getOriginalCwd(),
+        model: mainLoopModelParam,
+        effortValue: effort ?? store.getState().effortValue,
+        permissionMode: toolPermissionContext.mode,
+        additionalWritableDirectories: Array.from(toolPermissionContext.additionalWorkingDirectories.keys()),
+        initialAppState: store.getState(),
+        transcriptMessages: messagesIncludingNewMessages,
+        abortSignal: abortController.signal,
+        onReplEvent: onQueryEvent
+      });
+    } else {
+      for await (const event of query({
+        messages: messagesIncludingNewMessages,
+        systemPrompt,
+        userContext,
+        systemContext,
+        canUseTool,
+        toolUseContext,
+        querySource: getQuerySourceForREPL()
+      })) {
+        onQueryEvent(event);
+      }
     }
     if (feature('BUDDY')) {
       void fireCompanionObserver(messagesRef.current, reaction => setAppState(prev => prev.companionReaction === reaction ? prev : {
