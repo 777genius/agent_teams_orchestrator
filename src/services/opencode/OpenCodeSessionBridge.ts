@@ -239,6 +239,7 @@ export class OpenCodeSessionBridge {
         ? params.record
         : (await this.sessionStore.markStale(
             params.record.teamId,
+            params.record.laneId ?? 'primary',
             params.record.memberName,
             params.staleReason,
           )) ?? {
@@ -289,6 +290,7 @@ export class OpenCodeSessionBridge {
         ? params.record
         : (await this.sessionStore.markStale(
             params.record.teamId,
+            params.record.laneId ?? 'primary',
             params.record.memberName,
             params.staleReason,
           )) ?? {

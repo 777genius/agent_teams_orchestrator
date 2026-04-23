@@ -182,4 +182,112 @@ describe('OpenCodeHostManager', () => {
     expect(handle.diagnostics.some(message => message.includes('process exited with code 1'))).toBe(true)
     expect(manager.getHost('host-key')).toBeNull()
   })
+
+  test('keeps the resolved fingerprint stable across host transport drift', async () => {
+    const spawned = createMockChildProcess()
+    let phase: 'initial' | 'refresh' = 'initial'
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43113,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: phase === 'initial'
+              ? {
+                  server: { port: 43113 },
+                  default_agent: 'teammate',
+                  mcp: {
+                    'agent-teams': {
+                      command: ['node', 'cli.js'],
+                      environment: { PATH: '/usr/bin', TMPDIR: '/tmp/a' },
+                    },
+                  },
+                }
+              : {
+                  server: { port: 45888 },
+                  default_agent: 'teammate',
+                  mcp: {
+                    'agent-teams': {
+                      command: ['node', 'cli.js'],
+                      environment: { PATH: '/opt/homebrew/bin', TMPDIR: '/tmp/b' },
+                    },
+                  },
+                },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: phase === 'initial'
+              ? {
+                  providers: [
+                    { id: 'openai', models: { 'gpt-5.4-mini': {} } },
+                    { id: 'moonshot', models: { 'kimi-k2': {} } },
+                  ],
+                }
+              : {
+                  providers: [
+                    { id: 'moonshot', models: { 'kimi-k2': {} } },
+                    { id: 'openai', models: { 'gpt-5.4-mini': {} } },
+                  ],
+                },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: phase === 'initial'
+              ? [
+                  { name: 'teammate', mode: 'primary' },
+                  { name: 'reviewer', mode: 'subagent' },
+                ]
+              : [
+                  { name: 'reviewer', mode: 'subagent' },
+                  { name: 'teammate', mode: 'primary' },
+                ],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: phase === 'initial'
+              ? {
+                  'agent-teams': {
+                    connected: true,
+                    transport: { pid: 999, port: 1234 },
+                  },
+                }
+              : {
+                  'agent-teams': {
+                    connected: false,
+                    transport: { pid: 1001, port: 5678 },
+                  },
+                },
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      sleepMs: async () => {},
+    })
+
+    const handle = await manager.ensureHost({ hostKey: 'host-key' })
+    const initialFingerprint = handle.resolvedConfigFingerprint
+    phase = 'refresh'
+    const refreshedFingerprint = await manager.refreshResolvedConfigFingerprint('host-key')
+
+    expect(initialFingerprint).not.toBeNull()
+    expect(refreshedFingerprint).toBe(initialFingerprint)
+  })
 })

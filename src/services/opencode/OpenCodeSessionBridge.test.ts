@@ -372,7 +372,7 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   test('skips durable reconcile when stored project behavior has drifted', async () => {
-    const staleReasons: string[] = []
+    const staleMarks: Array<{ laneId: string; staleReason: string }> = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => ({
         ...profile,
@@ -387,8 +387,8 @@ describe('OpenCodeSessionBridge', () => {
       sessionStore: {
         get: async () => null,
         upsert: async () => 'unchanged',
-        markStale: async (_teamId, _memberName, staleReason) => {
-          staleReasons.push(staleReason)
+        markStale: async (_teamId, laneId, _memberName, staleReason) => {
+          staleMarks.push({ laneId, staleReason })
           return buildRecord({ staleReason })
         },
       },
@@ -399,16 +399,22 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.reconcileSession(buildRecord())
+    const result = await bridge.reconcileSession(buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+    }))
 
-    expect(staleReasons).toEqual(['project_behavior_changed'])
+    expect(staleMarks).toEqual([{
+      laneId: 'secondary:opencode:bob',
+      staleReason: 'project_behavior_changed',
+    }])
     expect(result.summary.reconcileOutcome).toBe('stale')
     expect(result.summary.staleReason).toBe('project_behavior_changed')
     expect(result.summary.messageCount).toBe(0)
   })
 
   test('marks session stale when resolved runtime behavior changes unexpectedly', async () => {
-    const staleReasons: string[] = []
+    const staleMarks: Array<{ laneId: string; staleReason: string }> = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
       hostManager: {
@@ -421,8 +427,8 @@ describe('OpenCodeSessionBridge', () => {
       sessionStore: {
         get: async () => null,
         upsert: async () => 'unchanged',
-        markStale: async (_teamId, _memberName, staleReason) => {
-          staleReasons.push(staleReason)
+        markStale: async (_teamId, laneId, _memberName, staleReason) => {
+          staleMarks.push({ laneId, staleReason })
           return buildRecord({ staleReason })
         },
       },
@@ -462,11 +468,15 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.reconcileSession(buildRecord())
+    const result = await bridge.reconcileSession(buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+    }))
 
-    expect(staleReasons).toEqual([
-      'resolved_behavior_changed:resolved-fingerprint->resolved-fingerprint-next',
-    ])
+    expect(staleMarks).toEqual([{
+      laneId: 'secondary:opencode:bob',
+      staleReason: 'resolved_behavior_changed:resolved-fingerprint->resolved-fingerprint-next',
+    }])
     expect(result.summary.reconcileOutcome).toBe('stale')
     expect(result.summary.staleReason).toBe(
       'resolved_behavior_changed:resolved-fingerprint->resolved-fingerprint-next',
@@ -873,7 +883,7 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   test('skips preview observation when the stored session is stale', async () => {
-    const staleReasons: string[] = []
+    const staleMarks: Array<{ laneId: string; staleReason: string }> = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => ({
         ...profile,
@@ -888,8 +898,8 @@ describe('OpenCodeSessionBridge', () => {
       sessionStore: {
         get: async () => null,
         upsert: async () => 'unchanged',
-        markStale: async (_teamId, _memberName, staleReason) => {
-          staleReasons.push(staleReason)
+        markStale: async (_teamId, laneId, _memberName, staleReason) => {
+          staleMarks.push({ laneId, staleReason })
           return buildRecord({ staleReason })
         },
       },
@@ -900,9 +910,15 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.observePreview(buildRecord())
+    const result = await bridge.observePreview(buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+    }))
 
-    expect(staleReasons).toEqual(['managed_auth_changed'])
+    expect(staleMarks).toEqual([{
+      laneId: 'secondary:opencode:bob',
+      staleReason: 'managed_auth_changed',
+    }])
     expect(result.summary.previewOutcome).toBe('stale')
     expect(result.summary.staleReason).toBe('managed_auth_changed')
     expect(result.summary.streamConnected).toBe(false)

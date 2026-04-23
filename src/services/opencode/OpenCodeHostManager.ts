@@ -33,6 +33,42 @@ function hashJson(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value) ?? '').digest('hex')
 }
 
+function normalizeResolvedFingerprintValue(
+  value: unknown,
+  scope: 'config' | 'configProviders' | 'agents' | 'mcp',
+): unknown {
+  if (scope === 'mcp') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return value
+    }
+    return Object.keys(value as Record<string, unknown>).sort()
+  }
+
+  if (Array.isArray(value)) {
+    const normalized = value.map(item => normalizeResolvedFingerprintValue(item, scope))
+    if (scope === 'configProviders' || scope === 'agents') {
+      return normalized.sort((left, right) =>
+        JSON.stringify(left).localeCompare(JSON.stringify(right)))
+    }
+    return normalized
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value
+  }
+
+  const record = value as Record<string, unknown>
+  return Object.keys(record).sort().reduce<Record<string, unknown>>((acc, key) => {
+    // Host transport details like loopback port and inherited environment
+    // are expected to drift across host restarts and must not stale sessions.
+    if (key === 'environment' || key === 'server') {
+      return acc
+    }
+    acc[key] = normalizeResolvedFingerprintValue(record[key], scope)
+    return acc
+  }, {})
+}
+
 async function allocateLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -137,10 +173,22 @@ export class OpenCodeHostManager {
       ])
 
       const fingerprintSource = {
-        config: config.status === 200 ? config.data : null,
-        configProviders: configProviders.status === 200 ? configProviders.data : null,
-        agents: agents.status === 200 ? agents.data : null,
-        mcp: mcp.status === 200 ? mcp.data : null,
+        config:
+          config.status === 200
+            ? normalizeResolvedFingerprintValue(config.data, 'config')
+            : null,
+        configProviders:
+          configProviders.status === 200
+            ? normalizeResolvedFingerprintValue(configProviders.data, 'configProviders')
+            : null,
+        agents:
+          agents.status === 200
+            ? normalizeResolvedFingerprintValue(agents.data, 'agents')
+            : null,
+        mcp:
+          mcp.status === 200
+            ? normalizeResolvedFingerprintValue(mcp.data, 'mcp')
+            : null,
       }
 
       if (
