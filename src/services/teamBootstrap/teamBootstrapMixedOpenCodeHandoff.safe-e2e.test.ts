@@ -1223,6 +1223,161 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
   }, SAFE_E2E_TIMEOUT_MS)
 
+  test('creates a new Anthropic and Codex mixed team while split OpenCode secondary lanes are ready and launching', async () => {
+    teamConfigExists = false
+    registeredMemberNames = new Set(['alice', 'reviewer', 'bob', 'jack'])
+    const { runTeamBootstrap } = await import('./teamBootstrapRunner.js')
+    const events = createProgressEventSink()
+    const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+    const promptInputs: string[] = []
+
+    openCodeProvisioningProbe.probe = async () => openCodeSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid: input.memberName === 'bob' ? 2410 : 2411,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptInputs.push(record.memberName)
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary:
+        record.memberName === 'jack'
+          ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: null,
+            latestAssistantText: null,
+            latestAssistantPreview: null,
+            messageCount: 0,
+            durableState: 'idle',
+            messages: [],
+          })
+          : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: `msg-${record.memberName}-ready`,
+            latestAssistantText: `${record.memberName} ready`,
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const primaryResult = await runTeamBootstrap({
+      request: request({
+        runId: 'run-mixed-create-anthropic-codex-split-opencode-launching',
+        mode: 'create',
+        description: 'new mixed Anthropic and Codex team with split OpenCode launching from safe e2e',
+        members: [
+          {
+            ...member('alice', 'anthropic', 'claude-opus-4-6'),
+            effort: 'high',
+          },
+          {
+            ...member('reviewer', 'codex', 'gpt-5.4-mini'),
+            effort: 'medium',
+          },
+        ],
+      }),
+      context: detachedContext(),
+      emit: events.emit,
+    })
+    const [bobResult, jackResult] = await Promise.all([
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-create-anthropic-codex-split-opencode-launching',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob OpenCode join' }],
+        }),
+      ),
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-create-anthropic-codex-split-opencode-launching',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          projectPath: '/tmp/project',
+          selectedModel: 'ling-2.6-flash-free',
+          members: [{ name: 'jack', role: 'Reviewer', prompt: 'Jack OpenCode join' }],
+        }),
+      ),
+    ])
+
+    expect(primaryResult.ok).toBe(true)
+    expect(bobResult.ok).toBe(true)
+    expect(jackResult.ok).toBe(true)
+    if (!primaryResult.ok || !bobResult.ok || !jackResult.ok) {
+      return
+    }
+    expect(createTeamCalls).toEqual([
+      {
+        team_name: 'atlas-hq',
+        description: 'new mixed Anthropic and Codex team with split OpenCode launching from safe e2e',
+      },
+    ])
+    expect(spawnInputs).toMatchObject([
+      {
+        name: 'alice',
+        provider: 'anthropic',
+        model: 'claude-opus-4-6',
+        effort: 'high',
+      },
+      {
+        name: 'reviewer',
+        provider: 'codex',
+        model: 'gpt-5.4-mini',
+        effort: 'medium',
+      },
+    ])
+    expect(spawnInputs.map(input => input.name)).not.toContain('bob')
+    expect(spawnInputs.map(input => input.name)).not.toContain('jack')
+    expect(primaryResult.summary.createdTeam).toBe(true)
+    expect(primaryResult.summary.reusedExistingTeam).toBe(false)
+    expect(primaryResult.summary.terminalStatus).toBe('completed')
+    expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer', 'bob', 'jack'])
+    expect(events.completedEvents).toEqual([
+      {
+        status: 'completed',
+        expectedMembers: ['alice', 'reviewer'],
+        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        failedMembers: [],
+      },
+    ])
+    expect(ensureInputs).toEqual([
+      {
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+      },
+      {
+        laneId: 'secondary:opencode:jack',
+        memberName: 'jack',
+        selectedModel: 'openrouter/ling-2.6-flash-free',
+      },
+    ])
+    expect(promptInputs.sort()).toEqual(['bob', 'jack'])
+    expect(bobResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.members.bob?.runtimePid).toBe(2410)
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.runtimePid).toBe(2411)
+    expect(jackResult.data.durableCheckpoints.map(checkpoint => checkpoint.name)).not.toContain(
+      'run_ready',
+    )
+  }, SAFE_E2E_TIMEOUT_MS)
+
   test('creates a new mixed team and keeps split OpenCode secondary lanes isolated when strict Codex primary bootstrap failed', async () => {
     teamConfigExists = false
     registeredMemberNames = new Set(['reviewer', 'bob', 'jack'])
@@ -3479,6 +3634,236 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(jackResult.data.teamLaunchState).toBe('ready')
     expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
     expect(jackResult.data.members.jack?.runtimePid).toBe(3303)
+    expect(jackResult.data.members.bob).toBeUndefined()
+  }, SAFE_E2E_TIMEOUT_MS)
+
+  test('keeps Anthropic and Codex mixed reopen partially joining when one OpenCode lane is still launching and a sibling lane is ready', async () => {
+    registeredMemberNames = new Set(['alice', 'reviewer', 'bob', 'jack'])
+    const { runTeamBootstrap } = await import('./teamBootstrapRunner.js')
+    const events = createProgressEventSink()
+    let ensureSessionCalls = 0
+    const getInputs: Array<{ laneId: string; memberName: string }> = []
+    const reconciledMembers: string[] = []
+
+    openCodeProvisioningProbe.probe = async () => openCodeSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionStore.get = (async (_teamId, laneIdOrMemberName, memberName) => {
+      const laneId = memberName ? laneIdOrMemberName : 'primary'
+      const resolvedMemberName = memberName ?? laneIdOrMemberName
+      getInputs.push({ laneId, memberName: resolvedMemberName })
+      return buildRecord({
+        laneId,
+        memberName: resolvedMemberName,
+        selectedModel:
+          resolvedMemberName === 'bob'
+            ? 'openrouter/minimax-m2.5-free'
+            : 'openrouter/ling-2.6-flash-free',
+        opencodeSessionId: `session-${resolvedMemberName}`,
+        runtimePid: resolvedMemberName === 'bob' ? 3304 : 3305,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      return {
+        record,
+        summary:
+          record.memberName === 'jack'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: null,
+              latestAssistantText: null,
+              latestAssistantPreview: null,
+              messageCount: 0,
+              durableState: 'idle',
+              messages: [],
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: `msg-${record.memberName}-ready`,
+              latestAssistantText: `${record.memberName} ready after reopen`,
+            }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const primaryResult = await runTeamBootstrap({
+      request: request({
+        runId: 'run-mixed-reopen-anthropic-codex-one-opencode-launching',
+        members: [
+          member('alice', 'anthropic', 'claude-opus-4-6'),
+          member('reviewer', 'codex', 'gpt-5.4-mini'),
+        ],
+      }),
+      context: attachedContext('atlas-hq'),
+      emit: events.emit,
+    })
+    const [bobResult, jackResult] = await Promise.all([
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-reopen-anthropic-codex-one-opencode-launching',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          expectedMembers: [{ name: 'bob', model: 'minimax-m2.5-free' }],
+        }),
+      ),
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-reopen-anthropic-codex-one-opencode-launching',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          expectedMembers: [{ name: 'jack', model: 'ling-2.6-flash-free' }],
+        }),
+      ),
+    ])
+
+    expect(primaryResult.ok).toBe(true)
+    expect(bobResult.ok).toBe(true)
+    expect(jackResult.ok).toBe(true)
+    if (!primaryResult.ok || !bobResult.ok || !jackResult.ok) {
+      return
+    }
+    expect(spawnInputs.map(input => input.name)).toEqual(['alice', 'reviewer'])
+    expect(primaryResult.summary.terminalStatus).toBe('completed')
+    expect(primaryResult.summary.failedMembers).toEqual([])
+    expect(ensureSessionCalls).toBe(0)
+    expect(getInputs).toEqual([
+      { laneId: 'secondary:opencode:bob', memberName: 'bob' },
+      { laneId: 'secondary:opencode:jack', memberName: 'jack' },
+    ])
+    expect(reconciledMembers.sort()).toEqual(['bob', 'jack'])
+    expect(bobResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.members.bob?.runtimePid).toBe(3304)
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.runtimePid).toBe(3305)
+    expect(jackResult.data.durableCheckpoints.map(checkpoint => checkpoint.name)).not.toContain(
+      'run_ready',
+    )
+    expect(jackResult.data.members.bob).toBeUndefined()
+  }, SAFE_E2E_TIMEOUT_MS)
+
+  test('keeps Anthropic and Codex mixed reopen split when one OpenCode lane is permission-blocked and a sibling lane is ready', async () => {
+    registeredMemberNames = new Set(['alice', 'reviewer', 'bob', 'jack'])
+    const { runTeamBootstrap } = await import('./teamBootstrapRunner.js')
+    const events = createProgressEventSink()
+    let ensureSessionCalls = 0
+    const getInputs: Array<{ laneId: string; memberName: string }> = []
+    const reconciledMembers: string[] = []
+
+    openCodeProvisioningProbe.probe = async () => openCodeSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionStore.get = (async (_teamId, laneIdOrMemberName, memberName) => {
+      const laneId = memberName ? laneIdOrMemberName : 'primary'
+      const resolvedMemberName = memberName ?? laneIdOrMemberName
+      getInputs.push({ laneId, memberName: resolvedMemberName })
+      return buildRecord({
+        laneId,
+        memberName: resolvedMemberName,
+        selectedModel:
+          resolvedMemberName === 'bob'
+            ? 'openrouter/minimax-m2.5-free'
+            : 'openrouter/ling-2.6-flash-free',
+        opencodeSessionId: `session-${resolvedMemberName}`,
+        runtimePid: resolvedMemberName === 'bob' ? 3306 : 3307,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      return {
+        record,
+        summary:
+          record.memberName === 'jack'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: null,
+              latestAssistantText: null,
+              latestAssistantPreview: null,
+              messageCount: 0,
+              durableState: 'blocked',
+              pendingPermissionRequestIds: ['perm-jack-shell'],
+              diagnostics: ['jack waiting for OpenCode permission after reopen'],
+              messages: [],
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: `msg-${record.memberName}-ready`,
+              latestAssistantText: `${record.memberName} ready after reopen`,
+            }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const primaryResult = await runTeamBootstrap({
+      request: request({
+        runId: 'run-mixed-reopen-anthropic-codex-one-opencode-permission',
+        members: [
+          member('alice', 'anthropic', 'claude-opus-4-6'),
+          member('reviewer', 'codex', 'gpt-5.4-mini'),
+        ],
+      }),
+      context: attachedContext('atlas-hq'),
+      emit: events.emit,
+    })
+    const [bobResult, jackResult] = await Promise.all([
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-reopen-anthropic-codex-one-opencode-permission',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          expectedMembers: [{ name: 'bob', model: 'minimax-m2.5-free' }],
+        }),
+      ),
+      executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-reopen-anthropic-codex-one-opencode-permission',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'atlas-hq',
+          expectedMembers: [{ name: 'jack', model: 'ling-2.6-flash-free' }],
+        }),
+      ),
+    ])
+
+    expect(primaryResult.ok).toBe(true)
+    expect(bobResult.ok).toBe(true)
+    expect(jackResult.ok).toBe(true)
+    if (!primaryResult.ok || !bobResult.ok || !jackResult.ok) {
+      return
+    }
+    expect(spawnInputs.map(input => input.name)).toEqual(['alice', 'reviewer'])
+    expect(primaryResult.summary.terminalStatus).toBe('completed')
+    expect(primaryResult.summary.failedMembers).toEqual([])
+    expect(ensureSessionCalls).toBe(0)
+    expect(getInputs).toEqual([
+      { laneId: 'secondary:opencode:bob', memberName: 'bob' },
+      { laneId: 'secondary:opencode:jack', memberName: 'jack' },
+    ])
+    expect(reconciledMembers.sort()).toEqual(['bob', 'jack'])
+    expect(bobResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.members.bob?.runtimePid).toBe(3306)
+    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
+    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.members.jack?.runtimePid).toBe(3307)
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
+      'perm-jack-shell',
+    ])
     expect(jackResult.data.members.bob).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
