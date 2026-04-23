@@ -1,6 +1,7 @@
 import { TEAM_LEAD_NAME } from 'src/utils/swarm/constants.js'
 import { readTeamFileAsync, sanitizeName } from 'src/utils/swarm/teamHelpers.js'
 import { listTasks } from 'src/utils/tasks.js'
+import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import type { TeamBootstrapSpec } from './teamBootstrapTypes.js'
 
 export function buildAgentLanguageInstruction(agentLanguage?: string): string {
@@ -56,8 +57,9 @@ function buildMemberIdentityLine(params: {
     params.member.provider && params.member.provider !== 'anthropic'
       ? ` Provider override: ${params.member.provider}.`
       : ''
-  const modelLine = params.member.model?.trim()
-    ? ` Model override: ${params.member.model.trim()}.`
+  const model = normalizeBootstrapModelSelection(params.member.model)
+  const modelLine = model
+    ? ` Model override: ${model}.`
     : ''
   const effortLine = params.member.effort
     ? ` Effort override: ${params.member.effort}.`

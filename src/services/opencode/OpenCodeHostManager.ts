@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import net from 'node:net'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import envPaths from 'env-paths'
 
 import { sleep } from '../../utils/sleep.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -12,8 +15,9 @@ const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 
 type ManagedHostEntry = {
   handle: OpenCodeHostHandle
-  child: ChildProcess
+  child: ChildProcess | null
   refCount: number
+  ownedByProcess: boolean
 }
 
 type FetchJsonResult = {
@@ -27,6 +31,26 @@ type OpenCodeHostManagerDeps = {
   fetchJson?: (url: string, init?: RequestInit) => Promise<FetchJsonResult>
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
+  isProcessAlive?: (pid: number) => boolean
+  persistentRegistryPath?: string | null
+}
+
+type PersistentHostRegistryRecord = {
+  hostKey: string
+  profileRootKey: string
+  projectPath: string
+  projectBehaviorFingerprint: string
+  baseUrl: string
+  port: number
+  pid: number
+  version: string | null
+  resolvedConfigFingerprint: string | null
+  updatedAt: string
+}
+
+type PersistentHostRegistryShape = {
+  schemaVersion: 1
+  hosts: Record<string, PersistentHostRegistryRecord>
 }
 
 function hashJson(value: unknown): string {
@@ -114,6 +138,23 @@ async function fetchJson(
   }
 }
 
+function defaultPersistentRegistryPath(): string {
+  const paths = envPaths('claude-multimodel')
+  return path.join(paths.data, 'opencode', 'host-registry.json')
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export class OpenCodeHostManager {
   private readonly hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
@@ -137,6 +178,152 @@ export class OpenCodeHostManager {
 
   private async sleepMs(ms: number): Promise<void> {
     return (this.deps.sleepMs ?? ((delay: number) => sleep(delay)))(ms)
+  }
+
+  private get persistentRegistryPath(): string | null {
+    return this.deps.persistentRegistryPath === undefined
+      ? defaultPersistentRegistryPath()
+      : this.deps.persistentRegistryPath
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
+  }
+
+  private async readPersistentRegistry(): Promise<PersistentHostRegistryShape> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return { schemaVersion: 1, hosts: {} }
+    }
+
+    try {
+      const parsed = JSON.parse(await readFile(registryPath, 'utf8')) as Partial<PersistentHostRegistryShape>
+      if (parsed.schemaVersion !== 1 || !parsed.hosts || typeof parsed.hosts !== 'object') {
+        return { schemaVersion: 1, hosts: {} }
+      }
+      return { schemaVersion: 1, hosts: parsed.hosts as Record<string, PersistentHostRegistryRecord> }
+    } catch {
+      return { schemaVersion: 1, hosts: {} }
+    }
+  }
+
+  private async writePersistentRegistry(registry: PersistentHostRegistryShape): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return
+    }
+    await mkdir(path.dirname(registryPath), { recursive: true })
+    const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`
+    await writeFile(tempPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+    await rename(tempPath, registryPath)
+  }
+
+  private async upsertPersistentHost(handle: OpenCodeHostHandle): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath || handle.pid <= 0) {
+      return
+    }
+    const registry = await this.readPersistentRegistry()
+    registry.hosts[handle.hostKey] = {
+      hostKey: handle.hostKey,
+      profileRootKey: handle.profileRootKey,
+      projectPath: handle.projectPath,
+      projectBehaviorFingerprint: handle.projectBehaviorFingerprint,
+      baseUrl: handle.baseUrl,
+      port: handle.port,
+      pid: handle.pid,
+      version: handle.version,
+      resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
+      updatedAt: new Date().toISOString(),
+    }
+    await this.writePersistentRegistry(registry)
+  }
+
+  private async removePersistentHost(hostKey: string): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return
+    }
+    const registry = await this.readPersistentRegistry()
+    if (!registry.hosts[hostKey]) {
+      return
+    }
+    delete registry.hosts[hostKey]
+    if (Object.keys(registry.hosts).length === 0) {
+      await unlink(registryPath).catch(() => undefined)
+      return
+    }
+    await this.writePersistentRegistry(registry)
+  }
+
+  private async checkHealthyHostOnce(baseUrl: string): Promise<{ version: string | null } | null> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 1_000)
+    try {
+      const result = await this.fetchJson(`${baseUrl}/global/health`, {
+        signal: controller.signal,
+      })
+      const data = result.data as { healthy?: boolean; version?: string }
+      if (result.status === 200 && data?.healthy === true) {
+        return {
+          version: typeof data.version === 'string' ? data.version : null,
+        }
+      }
+      return null
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  private async adoptPersistentHost(
+    hostKey: string,
+    profile: OpenCodePreparedProfile,
+  ): Promise<OpenCodeHostHandle | null> {
+    const record = (await this.readPersistentRegistry()).hosts[hostKey]
+    if (!record) {
+      return null
+    }
+    if (
+      record.projectPath !== profile.projectPath
+      || record.profileRootKey !== profile.profileRootKey
+      || record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
+      || !this.isProcessAlive(record.pid)
+    ) {
+      await this.removePersistentHost(hostKey).catch(() => undefined)
+      return null
+    }
+    const health = await this.checkHealthyHostOnce(record.baseUrl)
+    if (!health) {
+      await this.removePersistentHost(hostKey).catch(() => undefined)
+      return null
+    }
+
+    const handle: OpenCodeHostHandle = {
+      hostKey,
+      profileRootKey: record.profileRootKey,
+      projectPath: record.projectPath,
+      projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+      baseUrl: record.baseUrl,
+      port: record.port,
+      pid: record.pid,
+      version: health.version ?? record.version,
+      state: 'healthy',
+      profile,
+      resolvedConfigFingerprint: record.resolvedConfigFingerprint,
+      diagnostics: [`adopted persistent OpenCode host pid=${record.pid}`],
+    }
+    handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(handle.baseUrl)
+      ?? record.resolvedConfigFingerprint
+    this.hosts.set(hostKey, {
+      handle,
+      child: null,
+      refCount: this.pendingRefCounts.get(hostKey) ?? 1,
+      ownedByProcess: false,
+    })
+    await this.upsertPersistentHost(handle).catch(() => undefined)
+    return handle
   }
 
   private async waitForHealthyHost(baseUrl: string): Promise<{ version: string | null }> {
@@ -225,6 +412,9 @@ export class OpenCodeHostManager {
   }
 
   private bindHostLifecycle(hostKey: string, entry: ManagedHostEntry): void {
+    if (!entry.child) {
+      return
+    }
     const pushDiagnostic = (message: string): void => {
       entry.handle.diagnostics.push(message)
       if (entry.handle.diagnostics.length > 20) {
@@ -250,6 +440,7 @@ export class OpenCodeHostManager {
 
       this.hosts.delete(hostKey)
       this.pendingHosts.delete(hostKey)
+      void this.removePersistentHost(hostKey).catch(() => undefined)
     })
   }
 
@@ -295,6 +486,7 @@ export class OpenCodeHostManager {
       handle,
       child,
       refCount: this.pendingRefCounts.get(hostKey) ?? 1,
+      ownedByProcess: true,
     }
     this.hosts.set(hostKey, entry)
     this.bindHostLifecycle(hostKey, entry)
@@ -304,6 +496,7 @@ export class OpenCodeHostManager {
       handle.version = health.version
       handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(baseUrl)
       handle.state = 'healthy'
+      await this.upsertPersistentHost(handle).catch(() => undefined)
       return handle
     } catch (error) {
       handle.state = 'degraded'
@@ -340,7 +533,10 @@ export class OpenCodeHostManager {
     }
 
     this.pendingRefCounts.set(hostKey, 1)
-    const createPromise = this.createHost(hostKey, profile).finally(() => {
+    const createPromise = (async () => {
+      const adopted = await this.adoptPersistentHost(hostKey, profile)
+      return adopted ?? this.createHost(hostKey, profile)
+    })().finally(() => {
       this.pendingHosts.delete(hostKey)
       this.pendingRefCounts.delete(hostKey)
     })
@@ -377,10 +573,11 @@ export class OpenCodeHostManager {
       // Best effort.
     }
 
-    entry.child.kill('SIGTERM')
+    entry.child?.kill('SIGTERM')
     entry.handle.state = 'disposed'
     this.hosts.delete(hostKey)
     this.pendingHosts.delete(hostKey)
+    await this.removePersistentHost(hostKey).catch(() => undefined)
     return true
   }
 
@@ -392,7 +589,11 @@ export class OpenCodeHostManager {
 
     entry.refCount = Math.max(0, entry.refCount - 1)
     if (entry.refCount === 0) {
-      await this.disposeHost(hostKey)
+      if (entry.ownedByProcess) {
+        await this.disposeHost(hostKey)
+      } else {
+        this.hosts.delete(hostKey)
+      }
     }
   }
 }

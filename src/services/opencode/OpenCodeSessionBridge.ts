@@ -134,6 +134,7 @@ export class OpenCodeSessionBridge {
         projectPath: host.projectPath,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
+        runtimePid: host.pid > 0 ? host.pid : undefined,
         resolvedBehaviorFingerprint: host.resolvedConfigFingerprint,
         opencodeSessionId: session.id,
         lastCanonicalCursor: null,
@@ -157,17 +158,18 @@ export class OpenCodeSessionBridge {
     return `${identity.teamId}::${identity.laneId}::${identity.memberName}`
   }
 
-  private async retainSessionHost(record: OpenCodeSessionRecord): Promise<void> {
+  private async retainSessionHost(record: OpenCodeSessionRecord) {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
-      return
+      return null
     }
 
-    await this.hostManager.ensureHost({
+    const host = await this.hostManager.ensureHost({
       projectPath: record.projectPath,
       hostKey: record.hostKey,
     })
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
+    return host
   }
 
   async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
@@ -186,6 +188,7 @@ export class OpenCodeSessionBridge {
     callback: (context: {
       baseUrl: string
       resolvedConfigFingerprint: string | null
+      runtimePid: number | null
     }) => Promise<T>,
   ): Promise<T> {
     const host = await this.hostManager.ensureHost({
@@ -197,6 +200,7 @@ export class OpenCodeSessionBridge {
       return await callback({
         baseUrl: host.baseUrl,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+        runtimePid: host.pid > 0 ? host.pid : null,
       })
     } finally {
       await this.hostManager.releaseHost(host.hostKey)
@@ -344,8 +348,8 @@ export class OpenCodeSessionBridge {
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
       !existing.staleReason
     ) {
-      await this.retainSessionHost(existing)
-      return existing
+      const host = await this.retainSessionHost(existing)
+      return host?.pid && host.pid > 0 ? { ...existing, runtimePid: host.pid } : existing
     }
 
     if (existing) {
@@ -512,7 +516,7 @@ export class OpenCodeSessionBridge {
       })
     }
 
-    return this.withSessionHost(record, async ({ baseUrl, resolvedConfigFingerprint }) => {
+    return this.withSessionHost(record, async ({ baseUrl, resolvedConfigFingerprint, runtimePid }) => {
       if (
         record.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
@@ -591,7 +595,7 @@ export class OpenCodeSessionBridge {
       }
 
       return {
-        record: nextRecord,
+        record: runtimePid ? { ...nextRecord, runtimePid } : nextRecord,
         summary,
       }
     })

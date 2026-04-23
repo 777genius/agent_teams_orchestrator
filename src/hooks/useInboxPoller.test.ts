@@ -2,9 +2,12 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   findBootstrapAttemptOutcome,
+  findOrdinaryDirectReplyFallback,
+  findOrdinaryDirectReplyOutcome,
   getBootstrapTranscriptActivitySignature,
   getBootstrapReadinessDecision,
   getBootstrapProcessingAction,
+  getOrdinaryProcessingAction,
   getBootstrapInlineHandoffPrompt,
   getOrdinaryInlineHandoffPrompt,
   getOrdinaryPendingMessage,
@@ -446,6 +449,111 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBe('team_lead_fallback')
   })
 
+  test('detects successful SendMessage to user as ordinary direct reply', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-send',
+          input: {
+            message: 'На месте.',
+            summary: 'Ответ',
+            to: 'user',
+          },
+          name: 'SendMessage',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('user_send_message')
+  })
+
+  test('does not treat plain assistant text as ordinary direct reply', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [{ text: 'На месте.', type: 'text' } as never],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('none')
+  })
+
+  test('extracts plain assistant text as ordinary direct reply fallback', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [{ text: 'На месте.', type: 'text' } as never],
+    })
+
+    expect(
+      findOrdinaryDirectReplyFallback({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toEqual({ text: 'На месте.' })
+  })
+
+  test('does not fallback plain text when SendMessage to user was attempted', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'Отвечаю через инструмент.', type: 'text' } as never,
+        {
+          id: 'tool-send',
+          input: {
+            message: 'На месте.',
+            summary: 'Ответ',
+            to: 'user',
+          },
+          name: 'SendMessage',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyFallback({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBeNull()
+  })
+
   test('does not treat an errored member_briefing result as bootstrap success', () => {
     const submitted = createUserMessage({
       content: 'bootstrap handoff',
@@ -704,5 +812,125 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         },
       }),
     ).toEqual({ type: 'noop' })
+  })
+
+  test('lifecycle - ordinary direct row finalizes only after SendMessage to user', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const sendAttempt = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-send',
+          input: {
+            message: 'На месте.',
+            summary: 'Ответ',
+            to: 'user',
+          },
+          name: 'SendMessage',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const sendResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, sendAttempt, sendResult],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'user',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Тут?',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
+  })
+
+  test('lifecycle - ordinary direct row relays plain text instead of ignoring it', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [{ text: 'На месте.', type: 'text' } as never],
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'user',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Тут?',
+        },
+      }),
+    ).toEqual({ type: 'deliver_assistant_text', text: 'На месте.' })
+  })
+
+  test('lifecycle - ordinary non-user row finalizes after transcript activity', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [{ text: 'Принял задачу.', type: 'text' } as never],
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Возьми следующую задачу.',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
   })
 })

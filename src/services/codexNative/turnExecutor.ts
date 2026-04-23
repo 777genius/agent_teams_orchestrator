@@ -74,6 +74,37 @@ type ExecuteCodexNativeTurnDeps = {
   flushSessionStorage?: typeof flushSessionStorage
 }
 
+const DEFAULT_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS = 120_000
+const CODEX_NATIVE_MAILBOX_TIMEOUT_ENV = 'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS'
+
+function isOrdinaryQueuedMailboxPrompt(prompt: string): boolean {
+  return (
+    prompt.includes('Process this queued mailbox message now.') &&
+    prompt.includes('<queued_mailbox_message>') &&
+    prompt.includes('</queued_mailbox_message>')
+  )
+}
+
+export function resolveCodexNativeExecTimeoutMs(
+  prompt: string,
+  env: NodeJS.ProcessEnv = process.env,
+): number | null {
+  if (!isOrdinaryQueuedMailboxPrompt(prompt)) {
+    return null
+  }
+
+  const raw = env[CODEX_NATIVE_MAILBOX_TIMEOUT_ENV]
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) {
+      const timeoutMs = Math.max(0, Math.floor(parsed))
+      return timeoutMs > 0 ? timeoutMs : null
+    }
+  }
+
+  return DEFAULT_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS
+}
+
 function toCodexNativePromptText(
   prompt: string | ContentBlockParam[],
 ): { ok: true; text: string } | { ok: false; error: string } {
@@ -327,6 +358,7 @@ export async function* executeCodexNativeTurn(
       forcedLoginMethod: getCodexForcedLoginMethod() ?? undefined,
       configOverrides: buildCodexNativeMcpConfigOverrides(),
       abortSignal: params.abortSignal,
+      timeoutMs: resolveCodexNativeExecTimeoutMs(resolvedPrompt.text),
     })
 
     while (true) {

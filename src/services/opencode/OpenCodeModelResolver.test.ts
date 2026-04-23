@@ -28,6 +28,12 @@ function snapshot(overrides: Partial<OpenCodeProvisioningSnapshot> = {}): OpenCo
             shared: {},
           },
         },
+        {
+          id: 'openrouter',
+          models: {
+            'moonshotai/kimi-k2': {},
+          },
+        },
       ],
       default: {
         opencode: 'big-pickle',
@@ -49,10 +55,54 @@ function snapshot(overrides: Partial<OpenCodeProvisioningSnapshot> = {}): OpenCo
 }
 
 describe('resolveOpenCodeProviderScopedModel', () => {
-  test('preserves provider-scoped ids as-is', () => {
+  test('validates provider-scoped ids against the live catalog', () => {
     expect(resolveOpenCodeProviderScopedModel('openrouter/moonshotai/kimi-k2', snapshot())).toBe(
       'openrouter/moonshotai/kimi-k2',
     )
+  })
+
+  test('resolves raw catalog ids that contain slashes when the first segment is not a provider', () => {
+    expect(resolveOpenCodeProviderScopedModel('moonshotai/kimi-k2', snapshot())).toBe(
+      'openrouter/moonshotai/kimi-k2',
+    )
+  })
+
+  test('fails closed for ambiguous raw catalog ids that contain slashes', () => {
+    expect(() =>
+      resolveOpenCodeProviderScopedModel(
+        'moonshotai/kimi-k2',
+        snapshot({
+          configProviders: {
+            providers: [
+              {
+                id: 'openrouter',
+                models: {
+                  'moonshotai/kimi-k2': {},
+                },
+              },
+              {
+                id: 'proxy',
+                models: {
+                  'moonshotai/kimi-k2': {},
+                },
+              },
+            ],
+            default: {},
+          },
+          providers: {
+            all: [],
+            default: {},
+            connected: ['openrouter', 'proxy'],
+          },
+        }),
+      ),
+    ).toThrow(/OpenCode raw model id "moonshotai\/kimi-k2" is ambiguous/)
+  })
+
+  test('fails closed for unknown provider-scoped ids', () => {
+    expect(() =>
+      resolveOpenCodeProviderScopedModel('openrouter/ghost-model', snapshot()),
+    ).toThrow(/provider-scoped model "openrouter\/ghost-model" was not found/)
   })
 
   test('uses OpenCode default metadata for raw ids', () => {

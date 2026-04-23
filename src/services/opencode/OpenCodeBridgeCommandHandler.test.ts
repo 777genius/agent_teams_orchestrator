@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import {
@@ -72,12 +72,40 @@ const snapshot: OpenCodeProvisioningSnapshot = {
     diagnostics: [],
   },
   config: null,
-  configProviders: null,
-  providers: { connected: ['openrouter'] },
+  configProviders: {
+    providers: [
+      {
+        id: 'openrouter',
+        models: {
+          'minimax-m2.5-free': {},
+          'ling-2.6-flash-free': {},
+          'nemotron-3-super-free': {},
+          'moonshotai/kimi-k2': {},
+        },
+      },
+    ],
+    default: {
+      openrouter: 'minimax-m2.5-free',
+    },
+  },
+  providers: {
+    connected: ['openrouter'],
+    default: {
+      openrouter: 'minimax-m2.5-free',
+    },
+  },
   providerAuth: null,
   agents: [],
   mcp: {},
-  appMcp: null,
+  appMcp: {
+    serverName: 'agent-teams',
+    matchedServerName: 'agent-teams',
+    status: 'present',
+    connected: true,
+    launchSource: 'workspace-src',
+    availableServerNames: ['agent-teams'],
+    diagnostics: [],
+  },
   probeError: null,
   diagnostics: [],
 }
@@ -144,6 +172,9 @@ function buildReadinessSnapshot(
           id: 'openrouter',
           models: {
             'minimax-m2.5-free': {},
+            'ling-2.6-flash-free': {},
+            'nemotron-3-super-free': {},
+            'moonshotai/kimi-k2': {},
           },
         },
       ],
@@ -198,6 +229,10 @@ const originalGet = openCodeSessionStore.get
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
+
+beforeEach(() => {
+  mockRequiredMcpTools()
+})
 
 afterEach(() => {
   __resetAppMcpToolProofCacheForTests()
@@ -262,6 +297,158 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.state).toBe('model_unavailable')
     expect(result.data.launchAllowed).toBe(false)
     expect(result.data.missing[0]).toContain('was not found in the live provider catalog')
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('compatibility mode without execution probe still rejects unknown provider-scoped model ids', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/ghost-model',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain(
+      'provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
+    )
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('compatibility model rejection returns before starting MCP tool proof', async () => {
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    let connectCalls = 0
+    let listToolsCalls = 0
+    let executionProbeCalled = false
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run for rejected selected models')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        throw new Error('MCP tools/list should not run for rejected selected models')
+      }
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/ghost-model',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain(
+      'provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
+    )
+    expect(connectCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('compatibility mode without execution probe rejects selected models from disconnected providers', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        providers: {
+          connected: ['opencode'],
+          default: {},
+        },
+      })
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('not_authenticated')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain(
+      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+    )
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('compatibility provider rejection returns before starting MCP tool proof', async () => {
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        providers: {
+          connected: ['opencode'],
+          default: {},
+        },
+      })
+    let connectCalls = 0
+    let listToolsCalls = 0
+    let executionProbeCalled = false
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run for disconnected model providers')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        throw new Error('MCP tools/list should not run for disconnected model providers')
+      }
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('not_authenticated')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain(
+      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+    )
+    expect(connectCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
     expect(executionProbeCalled).toBe(false)
   })
 
@@ -515,6 +702,140 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('launches provider-scoped OpenCode model ids that contain nested slashes', async () => {
+    const ensureInputs: Array<{ memberName: string; selectedModel: string }> = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push({
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: 'msg-alice-ready',
+        latestAssistantText: 'alice ready',
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-nested-slash-model',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/moonshotai/kimi-k2',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Alice join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureInputs).toEqual([
+      {
+        memberName: 'alice',
+        selectedModel: 'openrouter/moonshotai/kimi-k2',
+      },
+    ])
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+  })
+
+  test('launches raw OpenCode model ids that contain slashes when the catalog match is unique', async () => {
+    const ensureInputs: Array<{ memberName: string; selectedModel: string }> = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push({
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: 'msg-alice-ready',
+        latestAssistantText: 'alice ready',
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-raw-slash-model',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'moonshotai/kimi-k2',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Alice join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureInputs).toEqual([
+      {
+        memberName: 'alice',
+        selectedModel: 'openrouter/moonshotai/kimi-k2',
+      },
+    ])
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+  })
+
+  test('uses the OpenCode session runtime pid during launch before host fallback', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid: 777,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.members.alice?.runtimePid).toBe(777)
+  })
+
   test('keeps a launched member pending until OpenCode emits an assistant bootstrap confirmation', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
@@ -558,6 +879,1765 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
       'member_session_recorded',
     ])
+  })
+
+  test('aggregates a multi-member OpenCode lane with ready and permission-blocked members', async () => {
+    const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+    const prompts: Array<{ memberName: string; text: string; agent: string }> = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid: input.memberName === 'alice' ? 701 : 702,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async (record, input) => {
+      prompts.push({
+        memberName: record.memberName,
+        text: input.text,
+        agent: input.agent ?? '',
+      })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary:
+        record.memberName === 'alice'
+          ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: 'msg-alice-ready',
+            latestAssistantText: 'ready',
+          })
+          : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: null,
+            latestAssistantText: null,
+            latestAssistantPreview: null,
+            messageCount: 0,
+            durableState: 'blocked',
+            pendingPermissionRequestIds: ['perm-bob', 'perm-bob', 'perm-shell'],
+            diagnostics: ['bob waiting for permission'],
+            messages: [],
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          { name: 'alice', role: 'Developer', prompt: 'Alice join' },
+          { name: 'bob', role: 'Reviewer', prompt: 'Bob join' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureInputs).toEqual([
+      {
+        laneId: 'primary',
+        memberName: 'alice',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+      },
+      {
+        laneId: 'primary',
+        memberName: 'bob',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+      },
+    ])
+    expect(prompts).toEqual([
+      { memberName: 'alice', text: 'Alice join', agent: 'teammate' },
+      { memberName: 'bob', text: 'Bob join', agent: 'teammate' },
+    ])
+    expect(result.data.teamLaunchState).toBe('permission_blocked')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.runtimePid).toBe(701)
+    expect(result.data.members.bob?.launchState).toBe('permission_blocked')
+    expect(result.data.members.bob?.runtimePid).toBe(702)
+    expect(result.data.members.bob?.pendingPermissionRequestIds).toEqual([
+      'perm-bob',
+      'perm-shell',
+    ])
+    expect(result.data.diagnostics).toEqual([
+      {
+        code: 'member_reconcile',
+        message: 'bob: bob waiting for permission',
+        severity: 'warning',
+      },
+    ])
+  })
+
+  test('keeps OpenCode peers visible when one launch member prompt delivery fails', async () => {
+    const ensureInputs: string[] = []
+    const promptAttempts: string[] = []
+    const reconciledMembers: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push(input.memberName)
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid:
+          input.memberName === 'alice'
+            ? 801
+            : input.memberName === 'bob'
+              ? 802
+              : 803,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptAttempts.push(record.memberName)
+      if (record.memberName === 'bob') {
+        throw new Error('bob prompt delivery failed')
+      }
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          { name: 'alice', role: 'Developer', prompt: 'Alice join' },
+          { name: 'bob', role: 'Reviewer', prompt: 'Bob join' },
+          { name: 'zoe', role: 'Developer', prompt: 'Zoe join' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
+    expect(promptAttempts).toEqual(['alice', 'bob', 'zoe'])
+    expect(reconciledMembers).toEqual(['alice', 'zoe'])
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.bob).toMatchObject({
+      sessionId: 'session-bob',
+      launchState: 'failed',
+      runtimePid: 802,
+      diagnostics: ['bob prompt delivery failed'],
+    })
+    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
+      'member_launch_failed',
+    ])
+    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'member_launch_failed',
+      message: 'bob: bob prompt delivery failed',
+      severity: 'error',
+    })
+  })
+
+  test('keeps OpenCode peers visible when one launch member session creation fails', async () => {
+    const ensureInputs: string[] = []
+    const promptAttempts: string[] = []
+    const reconciledMembers: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureInputs.push(input.memberName)
+      if (input.memberName === 'bob') {
+        throw new Error('bob ensure session failed')
+      }
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid: input.memberName === 'alice' ? 1101 : 1103,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptAttempts.push(record.memberName)
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          { name: 'alice', role: 'Developer', prompt: 'Alice join' },
+          { name: 'bob', role: 'Reviewer', prompt: 'Bob join' },
+          { name: 'zoe', role: 'Developer', prompt: 'Zoe join' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
+    expect(promptAttempts).toEqual(['alice', 'zoe'])
+    expect(reconciledMembers).toEqual(['alice', 'zoe'])
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.runtimePid).toBe(1101)
+    expect(result.data.members.bob).toMatchObject({
+      sessionId: 'failed:team-a:primary:bob',
+      launchState: 'failed',
+      runtimePid: 123,
+      diagnostics: ['bob ensure session failed'],
+    })
+    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
+      'member_launch_failed',
+    ])
+    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.zoe?.runtimePid).toBe(1103)
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'member_launch_failed',
+      message: 'bob: bob ensure session failed',
+      severity: 'error',
+    })
+  })
+
+  test('keeps ready peers visible when one OpenCode lane member reconciles as failed', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary:
+        record.memberName === 'alice'
+          ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: 'msg-alice-ready',
+            latestAssistantText: 'ready',
+          })
+          : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            staleReason: 'session store missing latest event',
+            errorCount: 1,
+            diagnostics: ['bob session stale'],
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          { name: 'alice', role: 'Developer', prompt: 'Alice join' },
+          { name: 'bob', role: 'Reviewer', prompt: 'Bob join' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.bob?.launchState).toBe('failed')
+    expect(result.data.members.bob?.runtimePid).toBe(123)
+    expect(result.data.diagnostics).toEqual([
+      {
+        code: 'member_reconcile',
+        message: 'bob: bob session stale',
+        severity: 'warning',
+      },
+    ])
+  })
+
+  test('rejects launch before creating sessions when the raw selected model is unknown', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-unknown-model',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'ghost-model',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode raw model id "ghost-model" was not found in the live provider catalog',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the provider-scoped selected model is unknown', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-unknown-scoped-model',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/ghost-model',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects ambiguous raw slash model launches before MCP proof or session creation', async () => {
+    let connectCalls = 0
+    let listToolsCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'openrouter',
+              models: {
+                'moonshotai/kimi-k2': {},
+              },
+            },
+            {
+              id: 'proxy',
+              models: {
+                'moonshotai/kimi-k2': {},
+              },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: ['openrouter', 'proxy'],
+          default: {},
+        },
+      })
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run before ambiguous launch model rejection')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        throw new Error('MCP tools/list should not run before ambiguous launch model rejection')
+      }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-ambiguous-raw-slash-model',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'moonshotai/kimi-k2',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode raw model id "moonshotai/kimi-k2" is ambiguous',
+    )
+    expect(connectCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch model failures before starting MCP tool proof', async () => {
+    let connectCalls = 0
+    let listToolsCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run before launch model rejection')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        throw new Error('MCP tools/list should not run before launch model rejection')
+      }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-launch-model-fail-fast',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/ghost-model',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode provider-scoped model "openrouter/ghost-model" was not found in the live provider catalog',
+    )
+    expect(connectCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the selected model provider is disconnected', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        providers: {
+          connected: ['opencode'],
+          default: {},
+        },
+      })
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-disconnected-scoped-model',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch provider failures before starting MCP tool proof', async () => {
+    let connectCalls = 0
+    let listToolsCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        providers: {
+          connected: ['opencode'],
+          default: {},
+        },
+      })
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run before launch provider rejection')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        throw new Error('MCP tools/list should not run before launch provider rejection')
+      }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-launch-provider-fail-fast',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+    )
+    expect(connectCalls).toBe(0)
+    expect(listToolsCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before probing runtime when duplicate member names are provided', async () => {
+    let probeCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      probeCalls += 1
+      return buildReadinessSnapshot()
+    }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-duplicate-member',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [
+          { name: 'bob', role: 'Developer', prompt: 'Bob side lane join' },
+          { name: 'BOB', role: 'Reviewer', prompt: 'Duplicate Bob side lane join' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'opencode.launchTeam members contains duplicate member name "BOB"',
+    )
+    expect(probeCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before probing runtime when a member name is blank', async () => {
+    let probeCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      probeCalls += 1
+      return buildReadinessSnapshot()
+    }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-blank-member',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: '   ', role: 'Developer', prompt: 'Blank side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'opencode.launchTeam members contains member without a valid name at index 0',
+    )
+    expect(probeCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the raw selected model is ambiguous', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'openrouter',
+              models: {
+                'minimax-m2.5-free': {},
+              },
+            },
+            {
+              id: 'opencode',
+              models: {
+                'minimax-m2.5-free': {},
+              },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: ['openrouter', 'opencode'],
+          default: {},
+        },
+      })
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-ambiguous-model',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('OpenCode raw model id "minimax-m2.5-free" is ambiguous')
+    expect(result.error.message).toContain('openrouter/minimax-m2.5-free')
+    expect(result.error.message).toContain('opencode/minimax-m2.5-free')
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when Agent Teams MCP is not connected', async () => {
+    let ensureSessionCalls = 0
+    let promptCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        appMcp: null,
+      })
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {
+      promptCalls += 1
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-missing-mcp',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'Agent Teams MCP tools are not visible in OpenCode',
+    )
+    expect(ensureSessionCalls).toBe(0)
+    expect(promptCalls).toBe(0)
+  })
+
+  test('rejects launch with the real host error before model lookup or session creation', async () => {
+    let connectCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        hostHealthy: false,
+        host: null,
+        configProviders: null,
+        probeError: 'OpenCode host failed health check',
+      })
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run when host is unhealthy')
+    }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-host-unhealthy',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('OpenCode host failed health check')
+    expect(result.error.message).not.toContain('was not found in the live provider catalog')
+    expect(connectCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch with no connected providers before MCP proof or session creation', async () => {
+    let connectCalls = 0
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+      throw new Error('MCP proof should not run when provider auth is missing')
+    }
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-no-providers',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('No connected OpenCode providers found')
+    expect(connectCalls).toBe(0)
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the capability snapshot precondition is stale', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-stale-capability',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge capability snapshot precondition mismatch',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the runtime manifest precondition is stale', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-stale-manifest',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        manifestHighWatermark: 1,
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge runtime manifest high watermark precondition is stale',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the lane precondition targets another mixed lane', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-lane-precondition',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:jack',
+          expectedRunId: 'run-lane-precondition',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-lane-mismatch',
+        },
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expected laneId precondition does not match command laneId',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('rejects launch before creating sessions when the run id precondition is stale', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-current',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:bob',
+          expectedRunId: 'run-stale',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-run-mismatch',
+        },
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expectedRunId precondition does not match command runId',
+    )
+    expect(ensureSessionCalls).toBe(0)
+  })
+
+  describe('OpenCode bridge launch matrix safe e2e', () => {
+    test('launches a pure OpenCode primary lane with all teammates ready', async () => {
+      const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+      const prompts: Array<{ memberName: string; text: string; agent: string }> = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionBridge.ensureSession = (async input => {
+        ensureInputs.push({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+        })
+        return buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })
+      }) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async (record, input) => {
+        prompts.push({
+          memberName: record.memberName,
+          text: input.text,
+          agent: input.agent ?? '',
+        })
+      }) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-opencode-primary',
+          laneId: 'primary',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [
+            { name: 'bob', role: 'Developer', prompt: 'Bob OpenCode join' },
+            { name: 'jack', role: 'Reviewer', prompt: 'Jack OpenCode join' },
+          ],
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(ensureInputs).toEqual([
+        {
+          laneId: 'primary',
+          memberName: 'bob',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+        {
+          laneId: 'primary',
+          memberName: 'jack',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+      ])
+      expect(prompts).toEqual([
+        { memberName: 'bob', text: 'Bob OpenCode join', agent: 'teammate' },
+        { memberName: 'jack', text: 'Jack OpenCode join', agent: 'teammate' },
+      ])
+      expect(result.data.teamLaunchState).toBe('ready')
+      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+      expect(result.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(result.data.durableCheckpoints.map(checkpoint => checkpoint.name)).toEqual([
+        'required_tools_proven',
+        'delivery_ready',
+        'run_ready',
+      ])
+    })
+
+    test('launches only the mixed-team OpenCode secondary lane member', async () => {
+      const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionBridge.ensureSession = (async input => {
+        ensureInputs.push({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+        })
+        return buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })
+      }) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(ensureInputs).toEqual([
+        {
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+      ])
+      expect(Object.keys(result.data.members)).toEqual(['bob'])
+      expect(result.data.teamLaunchState).toBe('ready')
+      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+      expect(result.data.members.alice).toBeUndefined()
+    })
+
+    test('keeps sequential mixed-team OpenCode secondary lanes isolated', async () => {
+      const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+      const prompts: Array<{ memberName: string; text: string }> = []
+      const readinessSnapshot = buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'openrouter',
+              models: {
+                'minimax-m2.5-free': {},
+                'ling-2.6-flash-free': {},
+              },
+            },
+          ],
+          default: {
+            openrouter: 'minimax-m2.5-free',
+          },
+        },
+      })
+      openCodeProvisioningProbe.probe = async () => readinessSnapshot
+      openCodeSessionBridge.ensureSession = (async input => {
+        ensureInputs.push({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+        })
+        return buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })
+      }) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async (record, input) => {
+        prompts.push({
+          memberName: record.memberName,
+          text: input.text,
+        })
+      }) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const bobResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+        }),
+      )
+      const jackResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-jack',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+          members: [{ name: 'jack', role: 'Developer', prompt: 'Jack side lane join' }],
+        }),
+      )
+
+      expect(bobResult.ok).toBe(true)
+      expect(jackResult.ok).toBe(true)
+      if (!bobResult.ok || !jackResult.ok) {
+        return
+      }
+      expect(ensureInputs).toEqual([
+        {
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+        {
+          laneId: 'secondary:opencode:jack',
+          memberName: 'jack',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+        },
+      ])
+      expect(prompts).toEqual([
+        { memberName: 'bob', text: 'Bob side lane join' },
+        { memberName: 'jack', text: 'Jack side lane join' },
+      ])
+      expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
+      expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
+      expect(bobResult.data.members.jack).toBeUndefined()
+      expect(jackResult.data.members.bob).toBeUndefined()
+      expect(bobResult.data.teamLaunchState).toBe('ready')
+      expect(jackResult.data.teamLaunchState).toBe('ready')
+    })
+
+    test('keeps failed and ready mixed-team OpenCode secondary lane launches isolated', async () => {
+      const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+      const readinessSnapshot = buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'openrouter',
+              models: {
+                'minimax-m2.5-free': {},
+                'ling-2.6-flash-free': {},
+              },
+            },
+          ],
+          default: {
+            openrouter: 'minimax-m2.5-free',
+          },
+        },
+      })
+      openCodeProvisioningProbe.probe = async () => readinessSnapshot
+      openCodeSessionBridge.ensureSession = (async input => {
+        ensureInputs.push({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+        })
+        return buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })
+      }) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary:
+          record.memberName === 'bob'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              staleReason: 'bob bootstrap session disappeared',
+              errorCount: 1,
+              diagnostics: ['bob bootstrap session disappeared'],
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: `msg-${record.memberName}-ready`,
+              latestAssistantText: `${record.memberName} ready`,
+            }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const bobResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+        }),
+      )
+      const jackResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-jack',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+          members: [{ name: 'jack', role: 'Developer', prompt: 'Jack side lane join' }],
+        }),
+      )
+
+      expect(bobResult.ok).toBe(true)
+      expect(jackResult.ok).toBe(true)
+      if (!bobResult.ok || !jackResult.ok) {
+        return
+      }
+      expect(ensureInputs).toEqual([
+        {
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+        {
+          laneId: 'secondary:opencode:jack',
+          memberName: 'jack',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+        },
+      ])
+      expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
+      expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
+      expect(bobResult.data.teamLaunchState).toBe('failed')
+      expect(bobResult.data.members.bob?.launchState).toBe('failed')
+      expect(jackResult.data.teamLaunchState).toBe('ready')
+      expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(jackResult.data.members.bob).toBeUndefined()
+    })
+
+    test('keeps permission-blocked and ready mixed-team OpenCode secondary lane launches isolated', async () => {
+      const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
+      const readinessSnapshot = buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'openrouter',
+              models: {
+                'minimax-m2.5-free': {},
+                'ling-2.6-flash-free': {},
+              },
+            },
+          ],
+          default: {
+            openrouter: 'minimax-m2.5-free',
+          },
+        },
+      })
+      openCodeProvisioningProbe.probe = async () => readinessSnapshot
+      openCodeSessionBridge.ensureSession = (async input => {
+        ensureInputs.push({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+        })
+        return buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })
+      }) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary:
+          record.memberName === 'bob'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: null,
+              latestAssistantText: null,
+              latestAssistantPreview: null,
+              messageCount: 0,
+              durableState: 'blocked',
+              pendingPermissionRequestIds: ['perm-bob', 'perm-bob'],
+              diagnostics: ['bob waiting for permission'],
+              messages: [],
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: `msg-${record.memberName}-ready`,
+              latestAssistantText: `${record.memberName} ready`,
+            }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const bobResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+        }),
+      )
+      const jackResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-mixed-secondary-jack',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+          members: [{ name: 'jack', role: 'Developer', prompt: 'Jack side lane join' }],
+        }),
+      )
+
+      expect(bobResult.ok).toBe(true)
+      expect(jackResult.ok).toBe(true)
+      if (!bobResult.ok || !jackResult.ok) {
+        return
+      }
+      expect(ensureInputs).toEqual([
+        {
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+        },
+        {
+          laneId: 'secondary:opencode:jack',
+          memberName: 'jack',
+          selectedModel: 'openrouter/ling-2.6-flash-free',
+        },
+      ])
+      expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
+      expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
+      expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
+      expect(bobResult.data.members.bob?.launchState).toBe('permission_blocked')
+      expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual([
+        'perm-bob',
+      ])
+      expect(jackResult.data.teamLaunchState).toBe('ready')
+      expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(jackResult.data.members.bob).toBeUndefined()
+    })
+
+    test('reconciles sequential mixed-team OpenCode secondary lanes independently', async () => {
+      const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
+      const reconciledMembers: string[] = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) => {
+        const laneId = memberName ? laneIdOrMemberName : 'primary'
+        const resolvedMemberName = memberName ?? laneIdOrMemberName
+        getCalls.push({
+          teamId,
+          laneId,
+          memberName: resolvedMemberName,
+        })
+        return buildRecord({
+          laneId,
+          memberName: resolvedMemberName,
+          selectedModel: resolvedMemberName === 'jack'
+            ? 'openrouter/ling-2.6-flash-free'
+            : 'openrouter/minimax-m2.5-free',
+          opencodeSessionId: `session-${resolvedMemberName}`,
+        })
+      }) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.reconcileSession = (async record => {
+        reconciledMembers.push(record.memberName)
+        return {
+          summary: buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: `msg-${record.memberName}-ready`,
+            latestAssistantText: `${record.memberName} ready`,
+          }),
+        }
+      }) as typeof openCodeSessionBridge.reconcileSession
+
+      const bobResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'bob', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+      const jackResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-secondary-jack',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'jack', model: 'openrouter/ling-2.6-flash-free' }],
+        }),
+      )
+
+      expect(bobResult.ok).toBe(true)
+      expect(jackResult.ok).toBe(true)
+      if (!bobResult.ok || !jackResult.ok) {
+        return
+      }
+      expect(getCalls).toEqual([
+        {
+          teamId: 'team-a',
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+        },
+        {
+          teamId: 'team-a',
+          laneId: 'secondary:opencode:jack',
+          memberName: 'jack',
+        },
+      ])
+      expect(reconciledMembers).toEqual(['bob', 'jack'])
+      expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
+      expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
+      expect(bobResult.data.diagnostics).toEqual([])
+      expect(jackResult.data.diagnostics).toEqual([])
+      expect(bobResult.data.teamLaunchState).toBe('ready')
+      expect(jackResult.data.teamLaunchState).toBe('ready')
+    })
+
+    test('rejects stale mixed-team OpenCode reconcile lane preconditions before reading sessions', async () => {
+      const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) => {
+        getCalls.push({
+          teamId,
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+        })
+        return buildRecord({
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+          opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+        })
+      }) as typeof openCodeSessionStore.get
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          preconditions: {
+            handshakeIdentityHash: 'handshake-1',
+            laneId: 'secondary:opencode:jack',
+            expectedRunId: 'run-mixed-secondary-bob',
+            expectedCapabilitySnapshotId: null,
+            expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: null,
+            commandLeaseId: null,
+            idempotencyKey: 'idempotency-reconcile-lane-mismatch',
+          },
+          expectedMembers: [{ name: 'bob', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+
+      expect(result.ok).toBe(false)
+      if (result.ok) {
+        return
+      }
+      expect(result.error.message).toContain(
+        'OpenCode bridge expected laneId precondition does not match command laneId',
+      )
+      expect(getCalls).toEqual([])
+    })
+
+    test('rejects stale mixed-team OpenCode reconcile run preconditions before reading sessions', async () => {
+      const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) => {
+        getCalls.push({
+          teamId,
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+        })
+        return buildRecord({
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+          opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+        })
+      }) as typeof openCodeSessionStore.get
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-current',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          preconditions: {
+            handshakeIdentityHash: 'handshake-1',
+            laneId: 'secondary:opencode:bob',
+            expectedRunId: 'run-stale',
+            expectedCapabilitySnapshotId: null,
+            expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: null,
+            commandLeaseId: null,
+            idempotencyKey: 'idempotency-reconcile-run-mismatch',
+          },
+          expectedMembers: [{ name: 'bob', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+
+      expect(result.ok).toBe(false)
+      if (result.ok) {
+        return
+      }
+      expect(result.error.message).toContain(
+        'OpenCode bridge expectedRunId precondition does not match command runId',
+      )
+      expect(getCalls).toEqual([])
+    })
+
+    test('keeps failed and ready mixed-team OpenCode secondary lane reconciles isolated', async () => {
+      const getCalls: Array<{ teamId: string; laneId: string; memberName: string }> = []
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) => {
+        const laneId = memberName ? laneIdOrMemberName : 'primary'
+        const resolvedMemberName = memberName ?? laneIdOrMemberName
+        getCalls.push({
+          teamId,
+          laneId,
+          memberName: resolvedMemberName,
+        })
+        return buildRecord({
+          laneId,
+          memberName: resolvedMemberName,
+          selectedModel: resolvedMemberName === 'jack'
+            ? 'openrouter/ling-2.6-flash-free'
+            : 'openrouter/minimax-m2.5-free',
+          opencodeSessionId: `session-${resolvedMemberName}`,
+        })
+      }) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary:
+          record.memberName === 'bob'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              staleReason: 'bob runtime state missing',
+              errorCount: 1,
+              diagnostics: ['bob runtime state missing'],
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: 'msg-jack-ready',
+              latestAssistantText: 'jack ready',
+            }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const bobResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-secondary-bob',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'bob', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+      const jackResult = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-mixed-secondary-jack',
+          laneId: 'secondary:opencode:jack',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'jack', model: 'openrouter/ling-2.6-flash-free' }],
+        }),
+      )
+
+      expect(bobResult.ok).toBe(true)
+      expect(jackResult.ok).toBe(true)
+      if (!bobResult.ok || !jackResult.ok) {
+        return
+      }
+      expect(getCalls).toEqual([
+        {
+          teamId: 'team-a',
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+        },
+        {
+          teamId: 'team-a',
+          laneId: 'secondary:opencode:jack',
+          memberName: 'jack',
+        },
+      ])
+      expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
+      expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
+      expect(bobResult.data.teamLaunchState).toBe('failed')
+      expect(bobResult.data.members.bob?.launchState).toBe('failed')
+      expect(jackResult.data.teamLaunchState).toBe('ready')
+      expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(jackResult.data.members.bob).toBeUndefined()
+    })
+
+    test('keeps a multi-member OpenCode lane launching until every member confirms bootstrap', async () => {
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionBridge.ensureSession = (async input =>
+        buildRecord({
+          laneId: input.laneId,
+          memberName: input.memberName,
+          selectedModel: input.selectedModel,
+          opencodeSessionId: `session-${input.memberName}`,
+        })) as typeof openCodeSessionBridge.ensureSession
+      openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary:
+          record.memberName === 'bob'
+            ? buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: 'msg-bob-ready',
+              latestAssistantText: 'bob ready',
+            })
+            : buildReconcileSummary({
+              sessionId: record.opencodeSessionId,
+              latestAssistantMessageId: null,
+              latestAssistantText: null,
+              latestAssistantPreview: null,
+              messageCount: 0,
+              durableState: 'idle',
+              messages: [],
+            }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-opencode-partial',
+          laneId: 'primary',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'openrouter/minimax-m2.5-free',
+          members: [
+            { name: 'bob', role: 'Developer', prompt: 'Bob join' },
+            { name: 'tom', role: 'Developer', prompt: 'Tom join' },
+          ],
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(result.data.teamLaunchState).toBe('launching')
+      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+      expect(result.data.members.tom?.launchState).toBe('created')
+      expect(result.data.durableCheckpoints.map(checkpoint => checkpoint.name)).not.toContain(
+        'run_ready',
+      )
+    })
   })
 
   test('includes pending permission request ids for permission-blocked launch members', async () => {
@@ -698,6 +2778,206 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('rejects reconcile before probing runtime when duplicate expected member names are provided', async () => {
+    let probeCalls = 0
+    const getCalls: string[] = []
+    const reconcileCalls: string[] = []
+    openCodeProvisioningProbe.probe = async () => {
+      probeCalls += 1
+      return snapshot
+    }
+    openCodeSessionStore.get = (async (_teamId, laneIdOrMemberName, memberName) => {
+      getCalls.push(memberName ?? laneIdOrMemberName)
+      return buildRecord({
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: memberName ?? laneIdOrMemberName,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls.push(record.memberName)
+      return {
+        summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-duplicate-reconcile',
+        laneId: 'secondary:opencode:mixed',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [
+          { name: 'bob', model: 'openrouter/minimax-m2.5-free' },
+          { name: 'Bob', model: 'openrouter/minimax-m2.5-free' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'opencode.reconcileTeam expectedMembers contains duplicate member name "Bob"',
+    )
+    expect(probeCalls).toBe(0)
+    expect(getCalls).toEqual([])
+    expect(reconcileCalls).toEqual([])
+  })
+
+  test('rejects reconcile before probing runtime when an expected member name is blank', async () => {
+    let probeCalls = 0
+    const getCalls: string[] = []
+    const reconcileCalls: string[] = []
+    openCodeProvisioningProbe.probe = async () => {
+      probeCalls += 1
+      return snapshot
+    }
+    openCodeSessionStore.get = (async (_teamId, laneIdOrMemberName, memberName) => {
+      getCalls.push(memberName ?? laneIdOrMemberName)
+      return buildRecord({
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: memberName ?? laneIdOrMemberName,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls.push(record.memberName)
+      return {
+        summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-blank-reconcile',
+        laneId: 'secondary:opencode:mixed',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [{ name: ' ', model: 'openrouter/minimax-m2.5-free' }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'opencode.reconcileTeam expectedMembers contains member without a valid name at index 0',
+    )
+    expect(probeCalls).toBe(0)
+    expect(getCalls).toEqual([])
+    expect(reconcileCalls).toEqual([])
+  })
+
+  test('keeps OpenCode peers visible when one reconcile member throws', async () => {
+    const getCalls: string[] = []
+    const reconcileCalls: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (_teamId, laneIdOrMemberName, memberName) => {
+      const resolvedMemberName = memberName ?? laneIdOrMemberName
+      getCalls.push(resolvedMemberName)
+      return buildRecord({
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: resolvedMemberName,
+        opencodeSessionId: `session-${resolvedMemberName}`,
+        runtimePid:
+          resolvedMemberName === 'alice'
+            ? 901
+            : resolvedMemberName === 'bob'
+              ? 902
+              : 903,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls.push(record.memberName)
+      if (record.memberName === 'bob') {
+        throw new Error('bob reconcile failed')
+      }
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:mixed',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [
+          { name: 'alice', model: 'openrouter/minimax-m2.5-free' },
+          { name: 'bob', model: 'openrouter/minimax-m2.5-free' },
+          { name: 'zoe', model: 'openrouter/minimax-m2.5-free' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(getCalls).toEqual(['alice', 'bob', 'zoe'])
+    expect(reconcileCalls).toEqual(['alice', 'bob', 'zoe'])
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.runtimePid).toBe(901)
+    expect(result.data.members.bob).toMatchObject({
+      sessionId: 'session-bob',
+      launchState: 'failed',
+      runtimePid: 902,
+      diagnostics: ['bob reconcile failed'],
+    })
+    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
+      'member_reconcile_failed',
+    ])
+    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.zoe?.runtimePid).toBe(903)
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'member_reconcile_failed',
+      message: 'bob: bob reconcile failed',
+      severity: 'error',
+    })
+  })
+
+  test('uses the reconciled OpenCode runtime pid before stored record and host fallback', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
+      buildRecord({
+        teamId,
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: memberName ?? laneIdOrMemberName,
+        opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+        runtimePid: 555,
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record: {
+        ...record,
+        runtimePid: 888,
+      },
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.members.alice?.runtimePid).toBe(888)
+  })
+
   test('keeps a reconciled lane pending until OpenCode emits an assistant bootstrap confirmation', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
@@ -738,6 +3018,58 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('keeps reconcile aggregate launching when an expected lane member has no session record yet', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (_teamId, _laneId, memberName) => {
+      if (memberName === 'bob') {
+        return null
+      }
+      return buildRecord({
+        laneId: 'secondary:opencode:mixed',
+        memberName: memberName ?? 'alice',
+        opencodeSessionId: `session-${memberName ?? 'alice'}`,
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: 'msg-ready',
+        latestAssistantText: 'ready',
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:mixed',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [
+          { name: 'alice', model: 'openrouter/minimax-m2.5-free' },
+          { name: 'bob', model: 'openrouter/minimax-m2.5-free' },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.bob).toBeUndefined()
+    expect(result.data.diagnostics).toEqual([
+      {
+        code: 'member_session_missing',
+        message: 'No stored OpenCode session for team-a/bob',
+        severity: 'warning',
+      },
+    ])
+    expect(result.data.durableCheckpoints.map(checkpoint => checkpoint.name)).not.toContain(
+      'run_ready',
+    )
+  })
+
   test('stops only the addressed lane', async () => {
     const abortedMembers: string[] = []
     const releasedMembers: string[] = []
@@ -768,7 +3100,290 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(releasedMembers).toEqual(['alice'])
   })
 
+  test('keeps stop failures isolated to the addressed mixed OpenCode secondary lane', async () => {
+    const abortedMembers: string[] = []
+    const releasedMembers: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      }),
+      buildRecord({
+        laneId: 'secondary:opencode:jack',
+        memberName: 'jack',
+        opencodeSessionId: 'session-jack',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.abort = (async record => {
+      abortedMembers.push(record.memberName)
+      throw new Error('bob abort failed')
+    }) as typeof openCodeSessionBridge.abort
+    openCodeSessionBridge.releaseSession = (async record => {
+      releasedMembers.push(record.memberName)
+    }) as typeof openCodeSessionBridge.releaseSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.stopTeam', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.stopped).toBe(false)
+    expect(Object.keys(result.data.members)).toEqual(['bob'])
+    expect(result.data.members.bob).toEqual({
+      sessionId: 'session-bob',
+      stopped: false,
+      diagnostics: ['bob abort failed'],
+    })
+    expect(result.data.members.jack).toBeUndefined()
+    expect(abortedMembers).toEqual(['bob'])
+    expect(releasedMembers).toEqual([])
+  })
+
+  test('rejects stale mixed OpenCode stop lane preconditions before listing sessions', async () => {
+    let listCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => {
+      listCalls += 1
+      return [
+        buildRecord({
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          opencodeSessionId: 'session-bob',
+        }),
+      ]
+    }) as typeof openCodeSessionStore.list
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.stopTeam', {
+        runId: 'run-stop-bob',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:jack',
+          expectedRunId: 'run-stop-bob',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-stop-lane-mismatch',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expected laneId precondition does not match command laneId',
+    )
+    expect(listCalls).toBe(0)
+  })
+
+  test('rejects stale mixed OpenCode stop run preconditions before listing sessions', async () => {
+    let listCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => {
+      listCalls += 1
+      return [
+        buildRecord({
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          opencodeSessionId: 'session-bob',
+        }),
+      ]
+    }) as typeof openCodeSessionStore.list
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.stopTeam', {
+        runId: 'run-current',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:bob',
+          expectedRunId: 'run-stale',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-stop-run-mismatch',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expectedRunId precondition does not match command runId',
+    )
+    expect(listCalls).toBe(0)
+  })
+
+  test('sends a message to the addressed OpenCode lane session', async () => {
+    const promptCalls: Array<{ memberName: string; text: string; agent?: string }> = []
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+      runtimePid: 456,
+    })
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (teamId, laneId, memberName) =>
+      teamId === 'team-a' && laneId === 'secondary:opencode:bob' && memberName === 'bob'
+        ? record
+        : null) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async (sessionRecord, input) => {
+      promptCalls.push({
+        memberName: sessionRecord.memberName,
+        text: input.text,
+        agent: input.agent,
+      })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: {
+        ...sessionRecord,
+        runtimePid: 789,
+      },
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello bob',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(promptCalls).toEqual([{ memberName: 'bob', text: 'hello bob', agent: 'teammate' }])
+    expect(result.data.accepted).toBe(true)
+    expect(result.data.sessionId).toBe('session-bob')
+    expect(result.data.runtimePid).toBe(789)
+  })
+
+  test('rejects stale mixed OpenCode send-message lane preconditions before reading sessions', async () => {
+    let getCalls = 0
+    let promptCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => {
+      getCalls += 1
+      return buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async () => {
+      promptCalls += 1
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-current-send',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello stale bob',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:jack',
+          expectedRunId: 'run-current-send',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'stale-send-lane',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expected laneId precondition does not match command laneId',
+    )
+    expect(getCalls).toBe(0)
+    expect(promptCalls).toBe(0)
+  })
+
+  test('rejects stale mixed OpenCode send-message run preconditions before prompting', async () => {
+    let getCalls = 0
+    let promptCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => {
+      getCalls += 1
+      return buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async () => {
+      promptCalls += 1
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-current-send',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello stale bob',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:bob',
+          expectedRunId: 'run-stale-send',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'stale-send-run',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expectedRunId precondition does not match command runId',
+    )
+    expect(getCalls).toBe(0)
+    expect(promptCalls).toBe(0)
+  })
+
   test('rejects ambiguous permission answers without laneId when multiple lanes exist', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
       buildRecord({ laneId: 'secondary:opencode:alice:alt', memberName: 'alice', opencodeSessionId: 'session-alt' }),
@@ -790,6 +3405,124 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain('laneId is required')
+  })
+
+  test('rejects stale mixed OpenCode permission lane preconditions before answering permissions', async () => {
+    let getCalls = 0
+    let answerCalls = 0
+    let reconcileCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => {
+      getCalls += 1
+      return buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.answerPermission = (async () => {
+      answerCalls += 1
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls += 1
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-permission-bob',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'bob',
+        requestId: 'perm-bob',
+        decision: 'allow',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:jack',
+          expectedRunId: 'run-permission-bob',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-permission-lane-mismatch',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expected laneId precondition does not match command laneId',
+    )
+    expect(getCalls).toBe(0)
+    expect(answerCalls).toBe(0)
+    expect(reconcileCalls).toBe(0)
+  })
+
+  test('rejects stale mixed OpenCode permission run preconditions before answering permissions', async () => {
+    let getCalls = 0
+    let answerCalls = 0
+    let reconcileCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => {
+      getCalls += 1
+      return buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      })
+    }) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.answerPermission = (async () => {
+      answerCalls += 1
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls += 1
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-current',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'bob',
+        requestId: 'perm-bob',
+        decision: 'allow',
+        preconditions: {
+          handshakeIdentityHash: 'handshake-1',
+          laneId: 'secondary:opencode:bob',
+          expectedRunId: 'run-stale',
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint: null,
+          expectedManifestHighWatermark: null,
+          commandLeaseId: null,
+          idempotencyKey: 'idempotency-permission-run-mismatch',
+        },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain(
+      'OpenCode bridge expectedRunId precondition does not match command runId',
+    )
+    expect(getCalls).toBe(0)
+    expect(answerCalls).toBe(0)
+    expect(reconcileCalls).toBe(0)
   })
 
   test('marks the lane ready after answering permission when bootstrap confirmation is already present', async () => {
@@ -900,6 +3633,164 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
   })
 
+  test('keeps OpenCode permission peers visible when one post-answer reconcile throws', async () => {
+    const answered: Array<{ memberName: string; requestId: string; decision: string }> = []
+    const reconciledMembers: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () =>
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'alice',
+        opencodeSessionId: 'session-alice',
+        runtimePid: 1001,
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'alice',
+        opencodeSessionId: 'session-alice',
+        runtimePid: 1001,
+      }),
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+        runtimePid: 1002,
+      }),
+      buildRecord({
+        laneId: 'primary',
+        memberName: 'zoe',
+        opencodeSessionId: 'session-zoe',
+        runtimePid: 1003,
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.answerPermission = (async (record, input) => {
+      answered.push({
+        memberName: record.memberName,
+        requestId: input.requestId,
+        decision: input.decision,
+      })
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      if (record.memberName === 'bob') {
+        throw new Error('bob post-permission reconcile failed')
+      }
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-1',
+        laneId: 'primary',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        requestId: 'perm-alice',
+        decision: 'allow',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(answered).toEqual([
+      { memberName: 'alice', requestId: 'perm-alice', decision: 'allow' },
+    ])
+    expect(reconciledMembers).toEqual(['alice', 'bob', 'zoe'])
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.runtimePid).toBe(1001)
+    expect(result.data.members.bob).toMatchObject({
+      sessionId: 'session-bob',
+      launchState: 'failed',
+      runtimePid: 1002,
+      diagnostics: ['bob post-permission reconcile failed'],
+    })
+    expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
+      'member_reconcile_failed',
+    ])
+    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.zoe?.runtimePid).toBe(1003)
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'permission_reconcile_failed',
+      message: 'bob: bob post-permission reconcile failed',
+      severity: 'error',
+    })
+  })
+
+  test('answers permission only inside the addressed mixed OpenCode secondary lane', async () => {
+    const answered: Array<{ memberName: string; requestId: string; decision: string }> = []
+    const reconciledMembers: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () =>
+      buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      }),
+      buildRecord({
+        laneId: 'secondary:opencode:jack',
+        memberName: 'jack',
+        opencodeSessionId: 'session-jack',
+      }),
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.answerPermission = (async (record, input) => {
+      answered.push({
+        memberName: record.memberName,
+        requestId: input.requestId,
+        decision: input.decision,
+      })
+    }) as typeof openCodeSessionBridge.answerPermission
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconciledMembers.push(record.memberName)
+      return {
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: `msg-${record.memberName}-ready`,
+          latestAssistantText: `${record.memberName} ready`,
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.answerPermission', {
+        runId: 'run-1',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'bob',
+        requestId: 'perm-bob',
+        decision: 'allow',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(answered).toEqual([
+      { memberName: 'bob', requestId: 'perm-bob', decision: 'allow' },
+    ])
+    expect(reconciledMembers).toEqual(['bob'])
+    expect(Object.keys(result.data.members)).toEqual(['bob'])
+    expect(result.data.members.jack).toBeUndefined()
+    expect(result.data.teamLaunchState).toBe('ready')
+  })
+
   test('aggregates runtime permissions across all sessions in the addressed lane', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.list = (async () => [
@@ -943,6 +3834,35 @@ describe('OpenCodeBridgeCommandHandler', () => {
       'perm-1',
       'perm-2',
     ])
+  })
+
+  test('rejects runtime permission aggregation without laneId when multiple OpenCode lanes exist', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        opencodeSessionId: 'session-bob',
+      }),
+      buildRecord({
+        laneId: 'secondary:opencode:jack',
+        memberName: 'jack',
+        opencodeSessionId: 'session-jack',
+      }),
+    ]) as typeof openCodeSessionStore.list
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.listRuntimePermissions', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('laneId is required')
   })
 
   test('rejects ambiguous transcript reads without laneId when multiple lanes exist', async () => {

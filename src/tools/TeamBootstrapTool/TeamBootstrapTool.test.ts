@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { PROVIDER_DEFAULT_MODEL_SELECTION } from '../../services/teamBootstrap/teamBootstrapModelSelection.js'
 import { TeamBootstrapTool, buildToolBootstrapSpec } from './TeamBootstrapTool.js'
 
 const originalDisableDeterministicBootstrap =
@@ -40,6 +41,43 @@ describe('TeamBootstrapTool.validateInput', () => {
     })
 
     expect(spec.ui?.emitStructuredEvents).toBe(false)
+  })
+
+  test('omits provider default model sentinel from hidden tool bootstrap specs', () => {
+    const spec = buildToolBootstrapSpec({
+      mode: 'create',
+      team_name: 'atlas-hq',
+      members: [
+        {
+          name: 'alice',
+          provider: 'codex',
+          model: PROVIDER_DEFAULT_MODEL_SELECTION,
+        },
+      ],
+    })
+
+    expect(spec.members[0]?.provider).toBe('codex')
+    expect(spec.members[0]?.model).toBeUndefined()
+  })
+
+  test('rejects OpenCode providers in the hidden primary bootstrap input schema', () => {
+    const parsed = TeamBootstrapTool.inputSchema.safeParse({
+      mode: 'launch',
+      team_name: 'atlas-hq',
+      members: [
+        {
+          name: 'bob',
+          provider: 'opencode',
+          model: 'openrouter/minimax-m2.5-free',
+        },
+      ],
+    })
+
+    expect(parsed.success).toBe(false)
+    if (parsed.success) {
+      throw new Error('expected hidden TeamBootstrap schema to reject OpenCode')
+    }
+    expect(parsed.error.message).toContain('Invalid option')
   })
 
   test('disables the hidden tool when deterministic bootstrap kill switch is active', () => {

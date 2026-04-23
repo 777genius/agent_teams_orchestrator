@@ -18,6 +18,7 @@ export type CodexNativeExecRunnerOptions = {
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
   abortSignal?: AbortSignal
+  timeoutMs?: number | null
 }
 
 export type CodexNativeBinaryIdentity = {
@@ -314,6 +315,45 @@ export async function* runCodexNativeExec(
 
   const stderrLines: string[] = []
   const queuedLines = createQueuedLineStream(child)
+  const timeoutMs =
+    typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
+      ? Math.max(0, Math.floor(options.timeoutMs))
+      : 0
+  let timedOut = false
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+  let forceKillHandle: ReturnType<typeof setTimeout> | null = null
+  const clearTimeouts = () => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle)
+      timeoutHandle = null
+    }
+    if (forceKillHandle) {
+      clearTimeout(forceKillHandle)
+      forceKillHandle = null
+    }
+  }
+
+  if (timeoutMs > 0) {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true
+      try {
+        if (!child.killed) {
+          child.kill('SIGTERM')
+        }
+      } catch {
+        // Best-effort timeout cleanup.
+      }
+      forceKillHandle = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // Best-effort timeout cleanup.
+        }
+      }, 5_000)
+      forceKillHandle.unref?.()
+    }, timeoutMs)
+    timeoutHandle.unref?.()
+  }
 
   yield {
     type: 'binary_identity',
@@ -337,62 +377,70 @@ export async function* runCodexNativeExec(
     },
   )
 
-  for await (const entry of queuedLines) {
-    if (entry.stream === 'stderr') {
-      const rewrittenLine = rewriteCodexNativeStderrLine(
-        entry.line,
-        stderrFilterState,
-      )
-      if (!rewrittenLine) {
+  try {
+    for await (const entry of queuedLines) {
+      if (entry.stream === 'stderr') {
+        const rewrittenLine = rewriteCodexNativeStderrLine(
+          entry.line,
+          stderrFilterState,
+        )
+        if (!rewrittenLine) {
+          continue
+        }
+        stderrLines.push(rewrittenLine)
+        yield {
+          type: 'normalized_event',
+          event: {
+            type: 'warning',
+            source: 'stderr',
+            text: rewrittenLine,
+          },
+        }
         continue
       }
-      stderrLines.push(rewrittenLine)
-      yield {
-        type: 'normalized_event',
-        event: {
-          type: 'warning',
-          source: 'stderr',
-          text: rewrittenLine,
-        },
-      }
-      continue
-    }
 
-    for (const event of mapCodexNativeExecLine(entry.line)) {
-      if (event.type === 'thread_started') {
-        threadId = event.threadId
-      }
-      yield {
-        type: 'normalized_event',
-        event,
+      for (const event of mapCodexNativeExecLine(entry.line)) {
+        if (event.type === 'thread_started') {
+          threadId = event.threadId
+        }
+        yield {
+          type: 'normalized_event',
+          event,
+        }
       }
     }
-  }
 
-  const exit = await exitPromise
+    const exit = await exitPromise
 
-  if (spawnError) {
-    throw spawnError
-  }
+    if (spawnError) {
+      throw spawnError
+    }
 
-  if (exit.code !== 0 || exit.signal) {
-    const detail = exit.signal
-      ? `signal ${exit.signal}`
-      : `code ${exit.code ?? 1}`
-    const stderrText =
-      stderrLines.length > 0 ? `: ${stderrLines.join('\n')}` : ''
-    throw new Error(`Codex native exec exited with ${detail}${stderrText}`)
-  }
+    if (timedOut) {
+      throw new Error(`Codex native exec timed out after ${timeoutMs}ms.`)
+    }
 
-  return {
-    identity,
-    threadId,
-    credentialSource,
-    completionPolicy: options.ephemeral === false ? 'persistent' : 'ephemeral',
-    finalHistoryCompleteness:
-      options.ephemeral === false
-        ? 'explicit-hydration-required'
-        : 'live-only',
-    finalUsageAuthority: 'live-turn-completed',
+    if (exit.code !== 0 || exit.signal) {
+      const detail = exit.signal
+        ? `signal ${exit.signal}`
+        : `code ${exit.code ?? 1}`
+      const stderrText =
+        stderrLines.length > 0 ? `: ${stderrLines.join('\n')}` : ''
+      throw new Error(`Codex native exec exited with ${detail}${stderrText}`)
+    }
+
+    return {
+      identity,
+      threadId,
+      credentialSource,
+      completionPolicy: options.ephemeral === false ? 'persistent' : 'ephemeral',
+      finalHistoryCompleteness:
+        options.ephemeral === false
+          ? 'explicit-hydration-required'
+          : 'live-only',
+      finalUsageAuthority: 'live-turn-completed',
+    }
+  } finally {
+    clearTimeouts()
   }
 }

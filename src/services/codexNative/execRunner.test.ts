@@ -11,9 +11,11 @@ class FakeCodexProcess extends EventEmitter {
   stdout = new PassThrough()
   stderr = new PassThrough()
   killed = false
+  killSignal: NodeJS.Signals | number | undefined
 
-  kill(): boolean {
+  kill(signal?: NodeJS.Signals | number): boolean {
     this.killed = true
+    this.killSignal = signal
     return true
   }
 }
@@ -269,6 +271,45 @@ describe('runCodexNativeExec', () => {
         },
       },
     ])
+  })
+
+  test('terminates a hung native exec after the configured timeout', async () => {
+    const process = new FakeCodexProcess()
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        timeoutMs: 1,
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    const first = await iterator.next()
+    expect(first.done).toBe(false)
+
+    setTimeout(() => {
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', null, 'SIGTERM')
+    }, 5)
+
+    try {
+      while (!(await iterator.next()).done) {
+        // Drain observations until timeout closes the fake process.
+      }
+      throw new Error('Expected timeout')
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe(
+        'Codex native exec timed out after 1ms.',
+      )
+    }
+    expect(process.killed).toBe(true)
+    expect(process.killSignal).toBe('SIGTERM')
   })
 
   test('throws a targeted error when codex exits non-zero', async () => {

@@ -35,6 +35,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.launchTeam',
   'opencode.reconcileTeam',
   'opencode.stopTeam',
+  'opencode.sendMessage',
   'opencode.answerPermission',
   'opencode.listRuntimePermissions',
   'opencode.getRuntimeTranscript',
@@ -82,6 +83,14 @@ type LaunchMemberDraft = {
   diagnostics: string[]
 }
 
+type SendMessageCommandData = {
+  accepted: boolean
+  sessionId?: string
+  memberName: string
+  runtimePid?: number
+  diagnostics: TeamDiagnostic[]
+}
+
 const REQUIRED_AGENT_TEAMS_RUNTIME_TOOLS = [
   'runtime_bootstrap_checkin',
   'runtime_deliver_message',
@@ -107,6 +116,21 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map(item => asString(item)).filter((item): item is string => item !== null)
     : []
+}
+
+function assertUniqueOpenCodeMemberNames(items: unknown[], context: string): void {
+  const seen = new Set<string>()
+  for (const [index, item] of items.entries()) {
+    const name = asString(asRecord(item)?.name)
+    if (!name) {
+      throw new Error(`${context} contains member without a valid name at index ${index}`)
+    }
+    const key = name.toLowerCase()
+    if (seen.has(key)) {
+      throw new Error(`${context} contains duplicate member name "${name}"`)
+    }
+    seen.add(key)
+  }
 }
 
 function nowIso(): string {
@@ -551,15 +575,23 @@ function buildTeamLaunchData(params: {
   runId: string
   selectedModel: string
   members: Record<string, LaunchMemberDraft>
+  expectedMemberNames?: string[]
   diagnostics: TeamDiagnostic[]
   warnings?: TeamWarning[]
   commandEvidence?: OpenCodeBridgeCommandEvidence
 }) {
   const states = Object.values(params.members).map(member => member.launchState)
   const now = nowIso()
+  const materializedMemberNames = new Set(Object.keys(params.members))
+  const missingExpectedMemberCount = (params.expectedMemberNames ?? []).filter(
+    memberName => !materializedMemberNames.has(memberName),
+  ).length
   const anyFailed = states.includes('failed')
   const anyPermissionBlocked = states.includes('permission_blocked')
-  const allReady = states.length > 0 && states.every(state => state === 'confirmed_alive')
+  const allReady =
+    states.length > 0 &&
+    missingExpectedMemberCount === 0 &&
+    states.every(state => state === 'confirmed_alive')
   const teamLaunchState = anyFailed
     ? 'failed'
     : anyPermissionBlocked
@@ -627,29 +659,113 @@ function buildOpenCodeExecutionOutcome(
   }
 }
 
+function skippedAppMcpToolProof(): AppMcpToolProof {
+  return {
+    ok: true,
+    observedTools: [],
+    missingTools: [],
+    diagnostics: [],
+    route: null,
+  }
+}
+
+function getProviderIdFromScopedModel(modelId: string): string | null {
+  const slashIndex = modelId.indexOf('/')
+  if (slashIndex <= 0) {
+    return null
+  }
+  return modelId.slice(0, slashIndex)
+}
+
+function getSelectedModelProviderConnectionFailure(
+  selectedModel: string | null,
+  snapshot: OpenCodeProvisioningSnapshot,
+): string | null {
+  if (!selectedModel) {
+    return null
+  }
+  const providerId = getProviderIdFromScopedModel(selectedModel)
+  if (!providerId) {
+    return null
+  }
+  const connectedProviders = new Set(snapshot.providers?.connected ?? [])
+  if (connectedProviders.has(providerId)) {
+    return null
+  }
+  return `OpenCode provider "${providerId}" for selected model "${selectedModel}" is not connected`
+}
+
 async function runReadiness(envelope: BridgeEnvelope) {
   const snapshot = await openCodeProvisioningProbe.probe(asString(envelope.body.projectPath) ?? envelope.cwd)
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
-  const toolProofPromise = proveAppMcpTools(snapshot)
   let executionModel: string | null = null
-  let modelResolutionFailureReason: string | null = null
+  let providerConnectionFailureReason: string | null = null
   let executionOutcomePromise: Promise<Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined> =
     Promise.resolve(undefined)
 
   if (selectedModel) {
     try {
       executionModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
+      providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
+        executionModel,
+        snapshot,
+      )
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      modelResolutionFailureReason = reason
-      executionOutcomePromise = Promise.resolve(
-        buildOpenCodeExecutionOutcome(selectedModel, 'unavailable', reason),
+      const executionOutcome = buildOpenCodeExecutionOutcome(selectedModel, 'unavailable', reason)
+      const fallbackReadiness = readinessData(
+        snapshot,
+        selectedModel,
+        executionOutcome,
+        skippedAppMcpToolProof(),
+        requireSelectedModel,
       )
+      return {
+        snapshot,
+        data: {
+          ...fallbackReadiness,
+          state: 'model_unavailable',
+          launchAllowed: false,
+          missing: [reason],
+          diagnostics: uniqueSortedStrings([
+            ...snapshot.diagnostics,
+            ...executionOutcome.diagnostics,
+            reason,
+          ]),
+        },
+      }
     }
   }
 
-  if (envelope.body.requireExecutionProbe === true && executionModel) {
+  if (providerConnectionFailureReason && executionModel) {
+    const executionOutcome = buildOpenCodeExecutionOutcome(
+      executionModel,
+      'not_authenticated',
+      providerConnectionFailureReason,
+    )
+    const fallbackReadiness = readinessData(
+      snapshot,
+      selectedModel,
+      executionOutcome,
+      skippedAppMcpToolProof(),
+      requireSelectedModel,
+    )
+    return {
+      snapshot,
+      data: {
+        ...fallbackReadiness,
+        state: 'not_authenticated',
+        launchAllowed: false,
+        missing: [providerConnectionFailureReason],
+        diagnostics: uniqueSortedStrings([
+          ...snapshot.diagnostics,
+          ...executionOutcome.diagnostics,
+          providerConnectionFailureReason,
+        ]),
+      },
+    }
+  } else if (envelope.body.requireExecutionProbe === true && executionModel) {
     executionOutcomePromise = openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: snapshot.projectPath,
@@ -661,33 +777,11 @@ async function runReadiness(envelope: BridgeEnvelope) {
       ),
     )
   }
+  const toolProofPromise = proveAppMcpTools(snapshot)
   const [executionOutcome, toolProof] = await Promise.all([
     executionOutcomePromise,
     toolProofPromise,
   ])
-
-  if (modelResolutionFailureReason && selectedModel) {
-    const fallbackReadiness = readinessData(
-      snapshot,
-      selectedModel,
-      executionOutcome,
-      toolProof,
-      requireSelectedModel,
-    )
-    return {
-      snapshot,
-      data: {
-        ...fallbackReadiness,
-        state: 'model_unavailable',
-        launchAllowed: false,
-        missing: [modelResolutionFailureReason],
-        diagnostics: uniqueSortedStrings([
-          ...fallbackReadiness.diagnostics,
-          modelResolutionFailureReason,
-        ]),
-      },
-    }
-  }
 
   return {
     snapshot,
@@ -701,6 +795,40 @@ async function runReadiness(envelope: BridgeEnvelope) {
   }
 }
 
+function isAppMcpConnected(snapshot: OpenCodeProvisioningSnapshot): boolean {
+  return snapshot.appMcp?.connected === true ||
+    snapshot.appMcp?.status === 'present' ||
+    snapshot.appMcp?.status === 'attached'
+}
+
+function assertOpenCodeLaunchRuntimeAvailable(
+  snapshot: OpenCodeProvisioningSnapshot,
+): void {
+  const connectedProviders = snapshot.providers?.connected ?? []
+  if (!snapshot.detected) {
+    throw new Error('OpenCode CLI not detected')
+  }
+  if (!snapshot.hostHealthy) {
+    throw new Error(snapshot.probeError ?? 'OpenCode host is not healthy')
+  }
+  if (connectedProviders.length === 0) {
+    throw new Error('No connected OpenCode providers found')
+  }
+}
+
+async function assertOpenCodeLaunchMcpReady(
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<void> {
+  const toolProof = await proveAppMcpTools(snapshot)
+  if (!isAppMcpConnected(snapshot) || !toolProof.ok) {
+    throw new Error(
+      toolProof.missingTools.length > 0
+        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP tools are not visible in OpenCode',
+    )
+  }
+}
+
 async function runLaunch(envelope: BridgeEnvelope) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -711,13 +839,23 @@ async function runLaunch(envelope: BridgeEnvelope) {
   if (!runId || !laneId || !teamId || !selectedModel || membersRaw.length === 0) {
     throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
   }
+  assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
 
   const snapshot = await openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
+  assertOpenCodeLaunchRuntimeAvailable(snapshot)
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
+  const providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
+    apiSelectedModel,
+    snapshot,
+  )
+  if (providerConnectionFailureReason) {
+    throw new Error(providerConnectionFailureReason)
+  }
+  await assertOpenCodeLaunchMcpReady(snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
 
@@ -727,35 +865,56 @@ async function runLaunch(envelope: BridgeEnvelope) {
     if (!name) continue
     const prompt = asString(member?.prompt)
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
-    const record = await openCodeSessionBridge.ensureSession({
-      teamId,
-      laneId,
-      memberName: name,
-      selectedModel: apiSelectedModel,
-      title: `${teamId} - ${name}`,
-      projectPath: snapshot.projectPath,
-    })
-    await openCodeSessionBridge.promptAsync(record, {
-      text: prompt,
-      agent: 'teammate',
-    })
-    const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
-    const launchState = bridgeStateFromSummary(reconciled.summary)
-    members[name] = {
-      sessionId: record.opencodeSessionId,
-      launchState,
-      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
-        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
-        : {}),
-      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
-        ? { runtimePid: snapshot.host.pid }
-        : {}),
-      evidence: evidenceFromSummary(reconciled.summary),
-      diagnostics: reconciled.summary.diagnostics,
+    let record: OpenCodeSessionRecord | null = null
+    try {
+      record = await openCodeSessionBridge.ensureSession({
+        teamId,
+        laneId,
+        memberName: name,
+        selectedModel: apiSelectedModel,
+        title: `${teamId} - ${name}`,
+        projectPath: snapshot.projectPath,
+      })
+      await openCodeSessionBridge.promptAsync(record, {
+        text: prompt,
+        agent: 'teammate',
+      })
+      const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+      const launchState = bridgeStateFromSummary(reconciled.summary)
+      members[name] = {
+        sessionId: record.opencodeSessionId,
+        launchState,
+        ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+          ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+          : {}),
+        ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
+          ? { runtimePid: reconciled.record.runtimePid }
+          : typeof record.runtimePid === 'number' && record.runtimePid > 0
+            ? { runtimePid: record.runtimePid }
+            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+              ? { runtimePid: snapshot.host.pid }
+              : {}),
+        evidence: evidenceFromSummary(reconciled.summary),
+        diagnostics: reconciled.summary.diagnostics,
+      }
+      diagnostics.push(
+        ...reconciled.summary.diagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
+      )
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      members[name] = {
+        sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
+        launchState: 'failed',
+        ...(typeof record?.runtimePid === 'number' && record.runtimePid > 0
+          ? { runtimePid: record.runtimePid }
+          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+            ? { runtimePid: snapshot.host.pid }
+            : {}),
+        evidence: [{ kind: 'member_launch_failed', observedAt: nowIso() }],
+        diagnostics: [reason],
+      }
+      diagnostics.push(teamDiagnostic('member_launch_failed', `${name}: ${reason}`, 'error'))
     }
-    diagnostics.push(
-      ...reconciled.summary.diagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
-    )
   }
 
   return {
@@ -782,6 +941,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
     throw new Error('opencode.reconcileTeam requires runId, laneId and teamId/teamName')
   }
   const expectedMembers = Array.isArray(body.expectedMembers) ? body.expectedMembers : []
+  assertUniqueOpenCodeMemberNames(expectedMembers, 'opencode.reconcileTeam expectedMembers')
   const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
@@ -801,24 +961,98 @@ async function runReconcile(envelope: BridgeEnvelope) {
       continue
     }
     selectedModel = record.selectedModel
-    const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
-    members[name] = {
-      sessionId: record.opencodeSessionId,
-      launchState: bridgeStateFromSummary(reconciled.summary),
-      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
-        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
-        : {}),
-      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
-        ? { runtimePid: snapshot.host.pid }
-        : {}),
-      evidence: evidenceFromSummary(reconciled.summary),
-      diagnostics: reconciled.summary.diagnostics,
+    const expectedModel = asString(member?.model)
+    if (expectedModel) {
+      let expectedSelectedModel: string
+      try {
+        expectedSelectedModel = resolveOpenCodeProviderScopedModel(expectedModel, snapshot)
+        const providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
+          expectedSelectedModel,
+          snapshot,
+        )
+        if (providerConnectionFailureReason) {
+          throw new Error(providerConnectionFailureReason)
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        members[name] = {
+          sessionId: record.opencodeSessionId,
+          launchState: 'failed',
+          ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
+            ? { runtimePid: record.runtimePid }
+            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+              ? { runtimePid: snapshot.host.pid }
+              : {}),
+          evidence: [{ kind: 'member_reconcile_failed', observedAt: nowIso() }],
+          diagnostics: [reason],
+        }
+        diagnostics.push(teamDiagnostic('member_model_unavailable', `${name}: ${reason}`, 'error'))
+        continue
+      }
+      if (expectedSelectedModel !== record.selectedModel) {
+        const reason = `Stored OpenCode session model "${record.selectedModel}" does not match expected model "${expectedSelectedModel}".`
+        members[name] = {
+          sessionId: record.opencodeSessionId,
+          launchState: 'failed',
+          ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
+            ? { runtimePid: record.runtimePid }
+            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+              ? { runtimePid: snapshot.host.pid }
+              : {}),
+          evidence: [{ kind: 'member_reconcile_failed', observedAt: nowIso() }],
+          diagnostics: [reason],
+        }
+        diagnostics.push(teamDiagnostic('member_model_mismatch', `${name}: ${reason}`, 'error'))
+        continue
+      }
+    }
+    try {
+      const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+      members[name] = {
+        sessionId: record.opencodeSessionId,
+        launchState: bridgeStateFromSummary(reconciled.summary),
+        ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+          ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+          : {}),
+        ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
+          ? { runtimePid: reconciled.record.runtimePid }
+          : typeof record.runtimePid === 'number' && record.runtimePid > 0
+            ? { runtimePid: record.runtimePid }
+            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+              ? { runtimePid: snapshot.host.pid }
+              : {}),
+        evidence: evidenceFromSummary(reconciled.summary),
+        diagnostics: reconciled.summary.diagnostics,
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      members[name] = {
+        sessionId: record.opencodeSessionId,
+        launchState: 'failed',
+        ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
+          ? { runtimePid: record.runtimePid }
+          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+            ? { runtimePid: snapshot.host.pid }
+            : {}),
+        evidence: [{ kind: 'member_reconcile_failed', observedAt: nowIso() }],
+        diagnostics: [reason],
+      }
+      diagnostics.push(teamDiagnostic('member_reconcile_failed', `${name}: ${reason}`, 'error'))
     }
   }
 
   return {
     snapshot,
-    data: buildTeamLaunchData({ runId, selectedModel, members, diagnostics, commandEvidence }),
+    data: buildTeamLaunchData({
+      runId,
+      selectedModel,
+      members,
+      expectedMemberNames: expectedMembers
+        .map(item => asString(asRecord(item)?.name))
+        .filter((name): name is string => name !== null),
+      diagnostics,
+      commandEvidence,
+    }),
   }
 }
 
@@ -869,6 +1103,59 @@ async function runStop(envelope: BridgeEnvelope) {
   }
 }
 
+async function runSendMessage(envelope: BridgeEnvelope): Promise<{
+  snapshot: OpenCodeProvisioningSnapshot
+  data: SendMessageCommandData
+}> {
+  const body = envelope.body
+  const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const laneId = asString(body.laneId)
+  const memberName = asString(body.memberName)
+  const text = asString(body.text)
+  if (!teamId || !laneId || !memberName || !text) {
+    throw new Error('opencode.sendMessage requires teamId/teamName, laneId, memberName and text')
+  }
+
+  const snapshot = await openCodeProvisioningProbe.probe(
+    asString(body.projectPath) ?? envelope.cwd,
+  )
+  validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
+  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
+  if (!record) {
+    throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
+  }
+
+  await openCodeSessionBridge.promptAsync(record, {
+    text,
+    agent: asString(body.agent) ?? 'teammate',
+    noReply: body.noReply === true,
+  })
+
+  const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+  const runtimePid =
+    typeof reconciled.record.runtimePid === 'number' && reconciled.record.runtimePid > 0
+      ? reconciled.record.runtimePid
+      : typeof record.runtimePid === 'number' && record.runtimePid > 0
+        ? record.runtimePid
+        : undefined
+
+  return {
+    snapshot,
+    data: {
+      accepted: true,
+      sessionId: record.opencodeSessionId,
+      memberName,
+      ...(runtimePid ? { runtimePid } : {}),
+      diagnostics: reconciled.summary.diagnostics.map(message =>
+        teamDiagnostic('opencode_send_reconcile', message, 'info'),
+      ),
+    },
+  }
+}
+
 async function runAnswerPermission(envelope: BridgeEnvelope) {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
@@ -879,6 +1166,13 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   if (!teamId || !requestId || (decision !== 'allow' && decision !== 'always' && decision !== 'reject')) {
     throw new Error('opencode.answerPermission requires teamId/teamName, requestId and allow/always/reject decision')
   }
+  const snapshot = await openCodeProvisioningProbe.probe(
+    asString(body.projectPath) ?? envelope.cwd,
+  )
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
   const candidates = memberName
     ? (
       laneId
@@ -897,11 +1191,6 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   if (!record) {
     throw new Error(`No OpenCode session record found for ${teamId}`)
   }
-  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath)
-  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
-    body,
-    runtime: createRuntimePreconditionSnapshot(snapshot),
-  })
   await openCodeSessionBridge.answerPermission(record, { requestId, decision })
   const laneRecords = (await openCodeSessionStore.list()).filter(
     candidate => candidate.teamId === record.teamId && candidate.laneId === record.laneId,
@@ -910,24 +1199,44 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
   for (const laneRecord of laneRecords) {
-    const reconciled = await openCodeSessionBridge.reconcileSession(laneRecord, { limit: 50 })
-    members[laneRecord.memberName] = {
-      sessionId: laneRecord.opencodeSessionId,
-      launchState: bridgeStateFromSummary(reconciled.summary),
-      ...(reconciled.summary.pendingPermissionRequestIds.length > 0
-        ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
-        : {}),
-      ...(typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
-        ? { runtimePid: snapshot.host.pid }
-        : {}),
-      evidence: evidenceFromSummary(reconciled.summary),
-      diagnostics: reconciled.summary.diagnostics,
+    try {
+      const reconciled = await openCodeSessionBridge.reconcileSession(laneRecord, { limit: 50 })
+      members[laneRecord.memberName] = {
+        sessionId: laneRecord.opencodeSessionId,
+        launchState: bridgeStateFromSummary(reconciled.summary),
+        ...(reconciled.summary.pendingPermissionRequestIds.length > 0
+          ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+          : {}),
+        ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
+          ? { runtimePid: reconciled.record.runtimePid }
+          : typeof laneRecord.runtimePid === 'number' && laneRecord.runtimePid > 0
+            ? { runtimePid: laneRecord.runtimePid }
+            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+              ? { runtimePid: snapshot.host.pid }
+              : {}),
+        evidence: evidenceFromSummary(reconciled.summary),
+        diagnostics: reconciled.summary.diagnostics,
+      }
+      diagnostics.push(
+        ...reconciled.summary.diagnostics.map(message =>
+          teamDiagnostic('permission_reconcile', `${laneRecord.memberName}: ${message}`, 'info'),
+        ),
+      )
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      members[laneRecord.memberName] = {
+        sessionId: laneRecord.opencodeSessionId,
+        launchState: 'failed',
+        ...(typeof laneRecord.runtimePid === 'number' && laneRecord.runtimePid > 0
+          ? { runtimePid: laneRecord.runtimePid }
+          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+            ? { runtimePid: snapshot.host.pid }
+            : {}),
+        evidence: [{ kind: 'member_reconcile_failed', observedAt: nowIso() }],
+        diagnostics: [reason],
+      }
+      diagnostics.push(teamDiagnostic('permission_reconcile_failed', `${laneRecord.memberName}: ${reason}`, 'error'))
     }
-    diagnostics.push(
-      ...reconciled.summary.diagnostics.map(message =>
-        teamDiagnostic('permission_reconcile', `${laneRecord.memberName}: ${message}`, 'info'),
-      ),
-    )
   }
   return {
     snapshot,
@@ -1067,6 +1376,8 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runReconcile(envelope)
     case 'opencode.stopTeam':
       return runStop(envelope)
+    case 'opencode.sendMessage':
+      return runSendMessage(envelope)
     case 'opencode.answerPermission':
       return runAnswerPermission(envelope)
     case 'opencode.listRuntimePermissions':

@@ -1,5 +1,8 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
@@ -109,6 +112,7 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       sleepMs: async () => {},
+      persistentRegistryPath: null,
     })
 
     const [first, second] = await Promise.all([
@@ -173,6 +177,7 @@ describe('OpenCodeHostManager', () => {
         }
       },
       sleepMs: async () => {},
+      persistentRegistryPath: null,
     })
 
     const handle = await manager.ensureHost({ hostKey: 'host-key' })
@@ -181,6 +186,84 @@ describe('OpenCodeHostManager', () => {
     expect(handle.state).toBe('degraded')
     expect(handle.diagnostics.some(message => message.includes('process exited with code 1'))).toBe(true)
     expect(manager.getHost('host-key')).toBeNull()
+  })
+
+  test('adopts a healthy host from the persistent registry instead of spawning another serve process', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess()
+    let spawnCount = 0
+    const fetchJson = async (url: string) => {
+      if (url.endsWith('/global/health')) {
+        return {
+          status: 200,
+          data: { healthy: true, version: '1.4.0' },
+        }
+      }
+      if (url.endsWith('/config')) {
+        return {
+          status: 200,
+          data: { server: { port: 43114 }, default_agent: 'teammate' },
+        }
+      }
+      if (url.endsWith('/config/providers')) {
+        return {
+          status: 200,
+          data: { providers: [], default: {} },
+        }
+      }
+      if (url.endsWith('/agent')) {
+        return {
+          status: 200,
+          data: [{ name: 'teammate', mode: 'primary' }],
+        }
+      }
+      if (url.endsWith('/mcp')) {
+        return {
+          status: 200,
+          data: {},
+        }
+      }
+      return {
+        status: 200,
+        data: { ok: true },
+      }
+    }
+
+    try {
+      const firstManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43114,
+        spawnHostProcess: () => {
+          spawnCount += 1
+          return spawned.child
+        },
+        fetchJson,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+      const created = await firstManager.ensureHost({ hostKey: 'host-key' })
+
+      const secondManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 49999,
+        spawnHostProcess: () => {
+          throw new Error('should adopt existing host')
+        },
+        fetchJson,
+        sleepMs: async () => {},
+        isProcessAlive: pid => pid === created.pid,
+        persistentRegistryPath: registryPath,
+      })
+      const adopted = await secondManager.ensureHost({ hostKey: 'host-key' })
+
+      expect(spawnCount).toBe(1)
+      expect(adopted.pid).toBe(created.pid)
+      expect(adopted.baseUrl).toBe(created.baseUrl)
+      expect(adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
   })
 
   test('keeps the resolved fingerprint stable across host transport drift', async () => {
@@ -280,6 +363,7 @@ describe('OpenCodeHostManager', () => {
         }
       },
       sleepMs: async () => {},
+      persistentRegistryPath: null,
     })
 
     const handle = await manager.ensureHost({ hostKey: 'host-key' })

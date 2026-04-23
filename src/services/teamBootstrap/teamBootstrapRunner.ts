@@ -21,6 +21,7 @@ import {
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
 import { getBootstrapSpawnDelayMs } from './teamBootstrapSpawnSchedule.js'
+import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
 import {
   assertStableTeamBootstrapRuntimeIdentity,
@@ -228,6 +229,16 @@ async function ensureLeaderAttachedToTeam(
   return 'attached_existing'
 }
 
+function assertPrimaryBootstrapProviderSupported(member: TeamBootstrapRequest['members'][number]): void {
+  const provider = member.provider
+  if (!provider || provider === 'anthropic' || provider === 'codex' || provider === 'gemini') {
+    return
+  }
+  throw new Error(
+    `Provider "${provider}" cannot be launched in primary bootstrap. OpenCode teammates must use secondary OpenCode runtime lanes.`,
+  )
+}
+
 function buildSummary(params: {
   request: TeamBootstrapRequest
   reusedExistingTeam: boolean
@@ -380,6 +391,8 @@ export async function runTeamBootstrap(params: {
             () => params.emit.memberSpawnStarted(member.displayName),
           )
           try {
+            assertPrimaryBootstrapProviderSupported(member)
+            const model = normalizeBootstrapModelSelection(member.model)
             const result = await spawnTeammate(
               {
                 name: member.displayName,
@@ -388,13 +401,13 @@ export async function runTeamBootstrap(params: {
                 ...(member.cwd && member.isolation !== 'worktree'
                   ? { cwd: member.cwd }
                   : {}),
-                ...(member.model ? { model: member.model } : {}),
+                ...(model ? { model } : {}),
                 ...(member.provider ? { provider: member.provider } : {}),
                 ...(member.effort ? { effort: member.effort as never } : {}),
                 ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
                 ...(member.agentType ? { agent_type: member.agentType } : {}),
                 ...(member.description ? { description: member.description } : {}),
-                ...(member.useSplitPane
+                ...(member.useSplitPane !== undefined
                   ? { use_splitpane: member.useSplitPane }
                   : {}),
                 ...(member.planModeRequired

@@ -49,6 +49,7 @@ import {
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import {
   getAgentName,
+  getTeammateColor,
   isPlanModeRequired,
   isTeamLead,
   isTeammate,
@@ -116,6 +117,7 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 
 const INBOX_POLL_INTERVAL_MS = 1000
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 5000
+const ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS = 5000
 const BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS = 15000
 const MEMBER_BRIEFING_TOOL_NAME = 'member_briefing'
 const PREFIXED_MEMBER_BRIEFING_TOOL_NAME = 'mcp__agent-teams__member_briefing'
@@ -307,6 +309,9 @@ export function getOrdinaryInlineHandoffPrompt({
     'Process this queued mailbox message now.',
     `Sender: "${from}".`,
     `Timestamp: "${timestamp}".`,
+    from.toLowerCase() === 'user'
+      ? 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
+      : 'If this message requires a reply, use SendMessage to the sender.',
     '',
     '<queued_mailbox_message>',
     text,
@@ -315,6 +320,10 @@ export function getOrdinaryInlineHandoffPrompt({
 }
 
 type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
+type OrdinaryAttemptOutcome = 'user_send_message' | 'none'
+type OrdinaryDirectReplyFallback = {
+  text: string
+}
 type BootstrapToolDescriptor = Pick<
   Tool,
   'alwaysLoad' | 'isMcp' | 'name' | 'shouldDefer'
@@ -390,7 +399,7 @@ function isToolResultUserMessage(message: AppState['messages'][number]): boolean
   )
 }
 
-function hasBootstrapAttemptObservedPostSubmitActivity({
+function hasAttemptObservedPostSubmitActivity({
   messages,
   submitUserMessageUuid,
 }: {
@@ -497,6 +506,153 @@ export function findBootstrapAttemptOutcome({
   return 'none'
 }
 
+export function findOrdinaryDirectReplyOutcome({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): OrdinaryAttemptOutcome {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return 'none'
+  }
+
+  const pendingUserReplyToolUseIds = new Set<string>()
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        for (const block of message.message.content) {
+          if (
+            block.type === 'tool_result' &&
+            pendingUserReplyToolUseIds.has(block.tool_use_id) &&
+            block.is_error !== true
+          ) {
+            return 'user_send_message'
+          }
+        }
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    for (const block of message.message.content) {
+      if (block.type !== 'tool_use') {
+        continue
+      }
+      if (
+        block.name === SEND_MESSAGE_TOOL_NAME &&
+        typeof block.input === 'object' &&
+        block.input !== null &&
+        'to' in block.input &&
+        typeof block.input.to === 'string' &&
+        block.input.to.toLowerCase() === 'user'
+      ) {
+        pendingUserReplyToolUseIds.add(block.id)
+      }
+    }
+  }
+
+  return 'none'
+}
+
+function extractAssistantText(message: AppState['messages'][number]): string {
+  if (message.type !== 'assistant') {
+    return ''
+  }
+
+  return message.message.content
+    .flatMap(block => {
+      if (block.type !== 'text') {
+        return []
+      }
+      return typeof block.text === 'string' ? [block.text.trim()] : []
+    })
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+export function findOrdinaryDirectReplyFallback({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): OrdinaryDirectReplyFallback | null {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return null
+  }
+
+  const assistantTextParts: string[] = []
+  let sawUserSendMessageAttempt = false
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    const text = extractAssistantText(message)
+    if (text) {
+      assistantTextParts.push(text)
+    }
+
+    for (const block of message.message.content) {
+      if (
+        block.type === 'tool_use' &&
+        block.name === SEND_MESSAGE_TOOL_NAME &&
+        typeof block.input === 'object' &&
+        block.input !== null &&
+        'to' in block.input &&
+        typeof block.input.to === 'string' &&
+        block.input.to.toLowerCase() === 'user'
+      ) {
+        sawUserSendMessageAttempt = true
+      }
+    }
+  }
+
+  if (sawUserSendMessageAttempt || assistantTextParts.length === 0) {
+    return null
+  }
+
+  return { text: assistantTextParts.join('\n\n') }
+}
+
+function getInboxReplySummary(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (!compact) {
+    return 'teammate reply'
+  }
+  return compact.length > 80 ? `${compact.slice(0, 77)}...` : compact
+}
+
 type BootstrapAttemptState = {
   submitUserMessageUuid: string
   submittedAt: number
@@ -508,12 +664,25 @@ type BootstrapReadinessWaitState = {
   startedAt: number
   timer: ReturnType<typeof setTimeout> | null
 }
+type OrdinaryAttemptState = {
+  submitUserMessageUuid: string
+  submittedAt: number
+  cooldownUntil: number
+  status: 'in_flight' | 'cooling_down'
+  timer: ReturnType<typeof setTimeout> | null
+}
 
 type BootstrapProcessingAction =
   | { type: 'noop' }
   | { type: 'reset_to_pending' }
   | { type: 'finalize' }
   | { type: 'schedule_cooldown' }
+type OrdinaryProcessingAction =
+  | { type: 'noop' }
+  | { type: 'reset_to_pending' }
+  | { type: 'finalize' }
+  | { type: 'schedule_cooldown' }
+  | { type: 'deliver_assistant_text'; text: string }
 
 export function getBootstrapProcessingAction({
   attempt,
@@ -548,11 +717,69 @@ export function getBootstrapProcessingAction({
     // otherwise we can race ahead of the first member_briefing response and
     // strand the row in processing.
     if (
-      !hasBootstrapAttemptObservedPostSubmitActivity({
+      !hasAttemptObservedPostSubmitActivity({
         messages,
         submitUserMessageUuid: attempt.submitUserMessageUuid,
       })
     ) {
+      return { type: 'noop' }
+    }
+    return { type: 'schedule_cooldown' }
+  }
+
+  return { type: 'noop' }
+}
+
+export function getOrdinaryProcessingAction({
+  attempt,
+  messages,
+  processingOrdinaryMessage,
+}: {
+  attempt?: OrdinaryAttemptState
+  messages: AppState['messages']
+  processingOrdinaryMessage?: PendingInboxMirrorMessage
+}): OrdinaryProcessingAction {
+  if (!processingOrdinaryMessage?.messageId) {
+    return { type: 'noop' }
+  }
+
+  if (!attempt) {
+    return { type: 'reset_to_pending' }
+  }
+
+  const outcome = findOrdinaryDirectReplyOutcome({
+    messages,
+    submitUserMessageUuid: attempt.submitUserMessageUuid,
+  })
+  const observedPostSubmitActivity = hasAttemptObservedPostSubmitActivity({
+    messages,
+    submitUserMessageUuid: attempt.submitUserMessageUuid,
+  })
+  const requiresUserReply =
+    processingOrdinaryMessage.from.toLowerCase() === 'user'
+
+  if (
+    outcome === 'user_send_message' ||
+    (!requiresUserReply && observedPostSubmitActivity)
+  ) {
+    return { type: 'finalize' }
+  }
+
+  if (requiresUserReply) {
+    const fallback = findOrdinaryDirectReplyFallback({
+      messages,
+      submitUserMessageUuid: attempt.submitUserMessageUuid,
+    })
+    if (fallback) {
+      return { type: 'deliver_assistant_text', text: fallback.text }
+    }
+  }
+
+  if (attempt.status === 'in_flight') {
+    // Accepted means the handoff prompt entered the REPL. It does not mean
+    // the teammate replied through SendMessage, so wait for transcript activity
+    // before retrying instead of marking the mailbox row as read immediately.
+    if (!observedPostSubmitActivity) {
       return { type: 'noop' }
     }
     return { type: 'schedule_cooldown' }
@@ -595,6 +822,9 @@ export function useInboxPoller({
   const bootstrapAttemptsRef = useRef<Map<string, BootstrapAttemptState>>(
     new Map(),
   )
+  const ordinaryAttemptsRef = useRef<Map<string, OrdinaryAttemptState>>(
+    new Map(),
+  )
   const ordinaryFinalizationInFlightRef = useRef<Set<string>>(new Set())
   const bootstrapReadinessWaitsRef = useRef<
     Map<string, BootstrapReadinessWaitState>
@@ -609,6 +839,12 @@ export function useInboxPoller({
         }
       }
       bootstrapAttemptsRef.current.clear()
+      for (const attempt of ordinaryAttemptsRef.current.values()) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+      }
+      ordinaryAttemptsRef.current.clear()
       for (const waitState of bootstrapReadinessWaitsRef.current.values()) {
         if (waitState.timer) {
           clearTimeout(waitState.timer)
@@ -1420,6 +1656,11 @@ export function useInboxPoller({
           isBootstrapMailboxInstructionText(message.text)
         ),
     )
+    const activeOrdinaryMessageIds = new Set(
+      activeOrdinaryMessages
+        .map(message => message.messageId)
+        .filter((messageId): messageId is string => !!messageId),
+    )
     const processingOrdinaryMessage = activeOrdinaryMessages.find(
       message => message.status === 'processing' && !!message.messageId,
     )
@@ -1430,6 +1671,14 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         bootstrapAttemptsRef.current.delete(messageId)
+      }
+    }
+    for (const [messageId, attempt] of ordinaryAttemptsRef.current.entries()) {
+      if (!activeOrdinaryMessageIds.has(messageId)) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        ordinaryAttemptsRef.current.delete(messageId)
       }
     }
     for (const [messageId, waitState] of bootstrapReadinessWaitsRef.current) {
@@ -1443,13 +1692,28 @@ export function useInboxPoller({
 
     if (processingOrdinaryMessage?.messageId) {
       if (
-        !ordinaryFinalizationInFlightRef.current.has(
+        ordinaryFinalizationInFlightRef.current.has(
           processingOrdinaryMessage.messageId,
         )
       ) {
-        // Ordinary direct mailbox rows are already delivered once the submit is
-        // accepted into the transcript. If file finalization is flaky, retry
-        // only the mark-read side effect and never re-submit the same row.
+        return
+      }
+
+      const attempt = ordinaryAttemptsRef.current.get(
+        processingOrdinaryMessage.messageId,
+      )
+      const processingAction = getOrdinaryProcessingAction({
+        attempt,
+        messages: getMessages(),
+        processingOrdinaryMessage,
+      })
+
+      if (processingAction.type === 'finalize' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
+
         ordinaryFinalizationInFlightRef.current.add(
           processingOrdinaryMessage.messageId,
         )
@@ -1478,14 +1742,132 @@ export function useInboxPoller({
             logForDebugging(
               `[InboxPoller] Failed to finalize ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
             )
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingOrdinaryMessage.id &&
+                  message.status === 'processing'
+                    ? { ...message, status: 'pending' as const }
+                    : message,
+                ),
+              },
+            }))
           } finally {
             ordinaryFinalizationInFlightRef.current.delete(
               processingOrdinaryMessage.messageId!,
             )
           }
         })()
+        return
       }
-      return
+
+      if (processingAction.type === 'deliver_assistant_text' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
+        ordinaryFinalizationInFlightRef.current.add(
+          processingOrdinaryMessage.messageId,
+        )
+
+        void (async () => {
+          try {
+            await writeToMailbox(
+              'user',
+              {
+                from: agentName,
+                text: processingAction.text,
+                summary: getInboxReplySummary(processingAction.text),
+                timestamp: new Date().toISOString(),
+                color: getTeammateColor(),
+              },
+              teamName,
+            )
+            await finalizeClaimedMessagesAsRead(
+              agentName,
+              [processingOrdinaryMessage.messageId!],
+              sessionId,
+              teamName,
+            )
+
+            const processingRowId = processingOrdinaryMessage.id
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingRowId
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } catch (error) {
+            logForDebugging(
+              `[InboxPoller] Failed to relay plain assistant text for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+            )
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingOrdinaryMessage.id &&
+                  message.status === 'processing'
+                    ? { ...message, status: 'pending' as const }
+                    : message,
+                ),
+              },
+            }))
+          } finally {
+            ordinaryFinalizationInFlightRef.current.delete(
+              processingOrdinaryMessage.messageId!,
+            )
+          }
+        })()
+        return
+      }
+
+      if (processingAction.type === 'schedule_cooldown' && attempt) {
+        const timer = setTimeout(() => {
+          ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId!)
+          setAppState(prev => ({
+            ...prev,
+            inbox: {
+              messages: prev.inbox.messages.map(message =>
+                message.messageId === processingOrdinaryMessage.messageId &&
+                message.status === 'processing'
+                  ? { ...message, status: 'pending' as const }
+                  : message,
+              ),
+            },
+          }))
+        }, ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS)
+
+        ordinaryAttemptsRef.current.set(processingOrdinaryMessage.messageId, {
+          ...attempt,
+          timer,
+          cooldownUntil: now + ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS,
+          status: 'cooling_down',
+        })
+        return
+      }
+
+      if (processingAction.type === 'reset_to_pending') {
+        setAppState(prev => ({
+          ...prev,
+          inbox: {
+            messages: prev.inbox.messages.map(message =>
+              message.id === processingOrdinaryMessage.id
+                ? { ...message, status: 'pending' as const }
+                : message,
+            ),
+          },
+        }))
+        return
+      }
+
+      if (processingAction.type === 'noop') {
+        return
+      }
     }
 
     const processingBootstrapMessage = activeBootstrapMessages.find(
@@ -1758,6 +2140,21 @@ export function useInboxPoller({
           },
         }))
       } else if (ordinaryPendingMessage?.messageId) {
+        if (!submitted.userMessageUuid) {
+          logForDebugging(
+            `[InboxPoller] Ordinary mailbox submission for ${ordinaryPendingMessage.messageId} was accepted without a transcript user message UUID; keeping row pending`,
+          )
+          return
+        }
+
+        ordinaryAttemptsRef.current.set(ordinaryPendingMessage.messageId, {
+          submitUserMessageUuid: submitted.userMessageUuid,
+          submittedAt: Date.now(),
+          cooldownUntil: 0,
+          status: 'in_flight',
+          timer: null,
+        })
+
         const ordinaryRowId = ordinaryPendingMessage.id
         setAppState(prev => ({
           ...prev,

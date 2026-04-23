@@ -7,6 +7,7 @@ import {
   buildTeamBootstrapRequestFromSpec,
   readTeamBootstrapSpec,
 } from './teamBootstrapSpec.js'
+import { PROVIDER_DEFAULT_MODEL_SELECTION } from './teamBootstrapModelSelection.js'
 import type { TeamBootstrapRequest, TeamBootstrapSpec } from './teamBootstrapTypes.js'
 
 describe('team bootstrap spec normalization', () => {
@@ -160,6 +161,232 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.cwd).toBeUndefined()
     expect(request.members[1]?.isolation).toBeUndefined()
     expect(request.members[1]?.cwd).toBe(workspaceRealpath)
+  })
+
+  test('preserves mixed teammate provider runtime selections for spawn', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const bobCwd = join(tempRoot, 'bob-workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    await mkdir(bobCwd, { recursive: true })
+    const workspaceRealpath = await realpath(workspaceDir)
+    const bobCwdRealpath = await realpath(bobCwd)
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-mixed-providers',
+      mode: 'launch',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'mixed-runtime-team',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'alice',
+          prompt: 'Alice bootstrap',
+          provider: 'anthropic',
+          model: 'claude-opus-4-6',
+          effort: 'high',
+        },
+        {
+          name: 'bob',
+          prompt: 'Bob bootstrap',
+          provider: 'codex',
+          model: 'gpt-5.4-mini',
+          effort: 'medium',
+          cwd: bobCwd,
+        },
+        {
+          name: 'zoe',
+          prompt: 'Zoe bootstrap',
+          provider: 'gemini',
+          model: 'gemini-2.5-flash',
+          effort: 'low',
+          cwd: workspaceDir,
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.cwd).toBe(workspaceRealpath)
+    expect(request.members).toMatchObject([
+      {
+        displayName: 'alice',
+        provider: 'anthropic',
+        model: 'claude-opus-4-6',
+        effort: 'high',
+      },
+      {
+        displayName: 'bob',
+        provider: 'codex',
+        model: 'gpt-5.4-mini',
+        effort: 'medium',
+        cwd: bobCwdRealpath,
+      },
+      {
+        displayName: 'zoe',
+        provider: 'gemini',
+        model: 'gemini-2.5-flash',
+        effort: 'low',
+        cwd: workspaceRealpath,
+      },
+    ])
+  })
+
+  test('normalizes provider-default model sentinel as no model override', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const baseSpec = {
+      version: 1,
+      runId: 'run-provider-default-sentinel',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'atlas-hq',
+        cwd: workspaceDir,
+      },
+      lead: {},
+    } satisfies Omit<TeamBootstrapSpec, 'members'>
+    const request = await buildTeamBootstrapRequestFromSpec({
+      ...baseSpec,
+      members: [
+        {
+          name: 'bob',
+          role: 'developer',
+          provider: 'codex',
+          model: PROVIDER_DEFAULT_MODEL_SELECTION,
+        },
+      ],
+    })
+    const omittedModelRequest = await buildTeamBootstrapRequestFromSpec({
+      ...baseSpec,
+      members: [
+        {
+          name: 'bob',
+          role: 'developer',
+          provider: 'codex',
+        },
+      ],
+    })
+
+    expect(request.members[0]?.model).toBeUndefined()
+    expect(request.members[0]?.prompt).not.toContain(PROVIDER_DEFAULT_MODEL_SELECTION)
+    expect(request.members[0]?.prompt).not.toContain('Model override')
+    expect(request.requestHash).toBe(omittedModelRequest.requestHash)
+  })
+
+  test('rejects OpenCode teammates in primary bootstrap specs so they use bridge lanes', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-opencode-in-primary.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-opencode-primary',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'mixed-runtime-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [
+          {
+            name: 'bob',
+            prompt: 'Bob OpenCode bootstrap',
+            provider: 'opencode',
+            model: 'openrouter/minimax-m2.5-free',
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /Invalid option: expected one of/i,
+    )
+  })
+
+  test('rejects duplicate teammate identities after name normalization', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-duplicate-member.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-duplicate-member',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'mixed-runtime-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [
+          {
+            name: 'Bob Smith',
+            prompt: 'Bob first bootstrap',
+            provider: 'codex',
+            model: 'gpt-5.4-mini',
+          },
+          {
+            name: 'bob-smith',
+            prompt: 'Bob duplicate bootstrap',
+            provider: 'gemini',
+            model: 'gemini-2.5-flash',
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(/collides/i)
+  })
+
+  test('preserves explicit split-pane false through normalized bootstrap requests', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-split-pane-false',
+      mode: 'launch',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'mixed-runtime-team',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'bob',
+          prompt: 'Bob bootstrap',
+          provider: 'codex',
+          model: 'gpt-5.4-mini',
+          useSplitPane: false,
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members[0]?.useSplitPane).toBe(false)
   })
 
   test('readTeamBootstrapSpec accepts the current claude_team initiator source', async () => {

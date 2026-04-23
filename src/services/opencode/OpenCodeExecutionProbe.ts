@@ -1,9 +1,14 @@
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
+  OpenCodeHostHandle,
   OpenCodeMessage,
   OpenCodePreparedProfile,
 } from './types.js'
@@ -12,6 +17,9 @@ const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
 const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 60_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
+const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 2 * 60_000
+const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
+const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
@@ -21,6 +29,19 @@ type OpenCodeExecutionProbeDeps = {
   sleep?: (ms: number) => Promise<void>
   probeTimeoutMs?: number
   pollIntervalMs?: number
+  persistentCache?: boolean
+  persistentCacheRoot?: string
+}
+
+type ProbeCacheFile = {
+  version: 1
+  expiresAtMs: number
+  result: OpenCodeExecutionProbeResult
+}
+
+type PersistentProbeCachePaths = {
+  cacheFilePath: string
+  lockDirPath: string
 }
 
 function parseProviderScopedModel(selectedModel: string): {
@@ -63,6 +84,43 @@ function normalizeFailureMessage(value: string): string {
   return trimmed
 }
 
+function extractJsonMessage(value: string): string | null {
+  try {
+    return extractNestedErrorMessage(JSON.parse(value))
+  } catch {
+    return null
+  }
+}
+
+function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
+  if (depth > 5) {
+    return null
+  }
+  if (typeof value === 'string') {
+    const parsedMessage = extractJsonMessage(value)
+    return parsedMessage ?? (value.trim() || null)
+  }
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const record = value as Record<string, unknown>
+  for (const key of ['message', 'reason', 'detail', 'title']) {
+    const candidate = record[key]
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim()
+    }
+  }
+  for (const key of ['error', 'data', 'responseBody', 'body']) {
+    const candidate = extractNestedErrorMessage(record[key], depth + 1)
+    if (candidate) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
 function classifyProbeFailure(params: {
   message: string
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
@@ -94,6 +152,10 @@ function classifyProbeFailure(params: {
     || lower.includes('unknown model')
     || lower.includes('invalid model')
     || lower.includes('not available for your account')
+    || lower.includes('rate limit')
+    || lower.includes('too many requests')
+    || lower.includes('freeusagelimit')
+    || /\b429\b/.test(lower)
   ) {
     return {
       outcome: 'unavailable',
@@ -120,11 +182,7 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
     const data = error && typeof error.data === 'object' && error.data !== null
       ? error.data as Record<string, unknown>
       : null
-    const message =
-      (typeof error?.message === 'string' && error.message.trim())
-      || (typeof data?.message === 'string' && data.message.trim())
-      || (typeof data?.error === 'string' && data.error.trim())
-      || null
+    const message = extractNestedErrorMessage(error) ?? extractNestedErrorMessage(data)
     if (message) {
       return message
     }
@@ -139,7 +197,141 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
   return null
 }
 
+function buildProbeCacheKey(params: {
+  selectedModel: string
+  projectPath?: string | null
+  prompt?: string
+  expectedOutput?: string
+}): string {
+  return [
+    params.projectPath?.trim() || '<default-project>',
+    params.selectedModel.trim(),
+    params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT,
+    params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT,
+  ].join('\u0000')
+}
+
+function cloneProbeResult(result: OpenCodeExecutionProbeResult): OpenCodeExecutionProbeResult {
+  return {
+    ...result,
+    diagnostics: [...result.diagnostics],
+  }
+}
+
+function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number {
+  if (result.outcome === 'available') {
+    return OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS
+  }
+  const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
+  if (
+    lower.includes('rate limit')
+    || lower.includes('too many requests')
+    || lower.includes('freeusagelimit')
+    || /\b429\b/.test(lower)
+  ) {
+    return OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS
+  }
+  return 0
+}
+
+function hashProbeCacheKey(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function buildPersistentProbeCacheKey(cacheKey: string, host: OpenCodeHostHandle): string {
+  return [
+    cacheKey,
+    host.profile.profileRootKey,
+    host.profile.projectBehaviorFingerprint,
+    host.profile.managedAuthFingerprint ?? 'no-auth',
+    host.profile.managedConfigFingerprint,
+    host.resolvedConfigFingerprint ?? 'no-resolved-config',
+    host.version ?? 'unknown-version',
+  ].join('\u0000')
+}
+
+function getPersistentProbeCachePaths(
+  params: {
+    cacheKey: string
+    host: OpenCodeHostHandle
+    rootDir?: string
+  },
+): PersistentProbeCachePaths {
+  const rootDir = params.rootDir?.trim()
+    || path.join(params.host.profile.profileRootPath, '.agent-teams-cache')
+  const cacheDir = path.join(rootDir, 'execution-probes')
+  const keyHash = hashProbeCacheKey(buildPersistentProbeCacheKey(params.cacheKey, params.host))
+  return {
+    cacheFilePath: path.join(cacheDir, `${keyHash}.json`),
+    lockDirPath: path.join(cacheDir, `${keyHash}.lock`),
+  }
+}
+
+function isProbeCacheFile(value: unknown): value is ProbeCacheFile {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const record = value as Record<string, unknown>
+  const result = record.result as Partial<OpenCodeExecutionProbeResult> | undefined
+  if (!result || typeof result !== 'object') {
+    return false
+  }
+  return (
+    record.version === 1
+    && typeof record.expiresAtMs === 'number'
+    && Number.isFinite(record.expiresAtMs)
+    && result.providerId === 'opencode'
+    && typeof result.modelId === 'string'
+    && (result.outcome === 'available'
+      || result.outcome === 'unavailable'
+      || result.outcome === 'not_authenticated'
+      || result.outcome === 'unknown')
+    && Array.isArray(result.diagnostics)
+  )
+}
+
+async function readPersistentProbeCache(
+  cacheFilePath: string,
+): Promise<OpenCodeExecutionProbeResult | null> {
+  try {
+    const parsed = JSON.parse(await readFile(cacheFilePath, 'utf8')) as unknown
+    if (!isProbeCacheFile(parsed)) {
+      return null
+    }
+    if (parsed.expiresAtMs <= nowMs()) {
+      await rm(cacheFilePath, { force: true }).catch(() => undefined)
+      return null
+    }
+    return cloneProbeResult(parsed.result)
+  } catch {
+    return null
+  }
+}
+
+async function writePersistentProbeCache(
+  cacheFilePath: string,
+  result: OpenCodeExecutionProbeResult,
+  ttlMs: number,
+): Promise<void> {
+  if (ttlMs <= 0) {
+    return
+  }
+  const cacheFile: ProbeCacheFile = {
+    version: 1,
+    expiresAtMs: nowMs() + ttlMs,
+    result: cloneProbeResult(result),
+  }
+  await mkdir(path.dirname(cacheFilePath), { recursive: true })
+  await writeFile(cacheFilePath, `${JSON.stringify(cacheFile)}\n`, { encoding: 'utf8' })
+}
+
 export class OpenCodeExecutionProbe {
+  private readonly inFlightProbes = new Map<string, Promise<OpenCodeExecutionProbeResult>>()
+  private readonly probeCache = new Map<
+    string,
+    { expiresAtMs: number, result: OpenCodeExecutionProbeResult }
+  >()
+
   constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
 
   private get hostManager() {
@@ -158,40 +350,282 @@ export class OpenCodeExecutionProbe {
     return this.deps.sleep ?? sleep
   }
 
+  private get persistentCacheEnabled() {
+    return this.deps.persistentCache ?? (this.deps.clientFactory == null)
+  }
+
   async probeModel(params: {
     selectedModel: string
     projectPath?: string | null
     prompt?: string
     expectedOutput?: string
   }): Promise<OpenCodeExecutionProbeResult> {
+    const cacheKey = buildProbeCacheKey(params)
+    const cached = this.probeCache.get(cacheKey)
+    if (cached && cached.expiresAtMs > nowMs()) {
+      return cloneProbeResult(cached.result)
+    }
+    if (cached) {
+      this.probeCache.delete(cacheKey)
+    }
+
+    const inFlight = this.inFlightProbes.get(cacheKey)
+    if (inFlight) {
+      return cloneProbeResult(await inFlight)
+    }
+
+    const request = this.runProbeModel({ ...params, cacheKey })
+      .then(result => {
+        const ttlMs = getProbeResultCacheTtlMs(result)
+        if (ttlMs > 0) {
+          this.probeCache.set(cacheKey, {
+            expiresAtMs: nowMs() + ttlMs,
+            result: cloneProbeResult(result),
+          })
+        }
+        return result
+      })
+      .finally(() => {
+        if (this.inFlightProbes.get(cacheKey) === request) {
+          this.inFlightProbes.delete(cacheKey)
+        }
+      })
+
+    this.inFlightProbes.set(cacheKey, request)
+    return cloneProbeResult(await request)
+  }
+
+  private async runProbeModel(params: {
+    selectedModel: string
+    projectPath?: string | null
+    prompt?: string
+    expectedOutput?: string
+    cacheKey?: string
+  }): Promise<OpenCodeExecutionProbeResult> {
     const startedAtMs = nowMs()
     const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
     const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
     const diagnostics = new Set<string>()
-    const probeTimeoutMs = Math.max(1, this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS)
-    const pollIntervalMs = Math.max(0, this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS)
+    const probeTimeoutMs = Math.max(
+      1,
+      this.deps.probeTimeoutMs ?? OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS,
+    )
+    const pollIntervalMs = Math.max(
+      0,
+      this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS,
+    )
 
     const host = await this.hostManager.ensureHost({
       projectPath: params.projectPath,
     })
 
     try {
+      const cachePaths = this.persistentCacheEnabled
+        ? getPersistentProbeCachePaths({
+          cacheKey: params.cacheKey ?? buildProbeCacheKey(params),
+          host,
+          rootDir: this.deps.persistentCacheRoot,
+        })
+        : null
+      if (cachePaths) {
+        const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
+        if (cached) {
+          return cached
+        }
+
+        const lockStaleMs = probeTimeoutMs + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS
+        const acquiredLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
+        if (!acquiredLock) {
+          const sharedResult = await this.waitForPersistentProbeResult(cachePaths, lockStaleMs)
+          if (sharedResult) {
+            return sharedResult
+          }
+
+          const retryLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
+          if (retryLock) {
+            try {
+              return await this.runProbeModelWithHost({
+                params,
+                host,
+                startedAtMs,
+                prompt,
+                expectedOutput,
+                probeTimeoutMs,
+                pollIntervalMs,
+                diagnostics,
+                cacheFilePath: cachePaths.cacheFilePath,
+              })
+            } finally {
+              await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
+                undefined
+              )
+            }
+          }
+
+          return {
+            providerId: 'opencode',
+            modelId: params.selectedModel,
+            probePrompt: prompt,
+            expectedOutput,
+            outcome: 'unknown',
+            reason: 'OpenCode selected model verification is already in progress',
+            durationMs: buildDurationMs(startedAtMs),
+            rawStatus: null,
+            durableState: 'unknown',
+            latestAssistantText: null,
+            latestAssistantPreview: null,
+            toolCallCount: 0,
+            errorCount: 0,
+            diagnostics: [
+              'OpenCode selected model verification is already in progress; retry shortly',
+            ],
+          }
+        } else {
+          try {
+            return await this.runProbeModelWithHost({
+              params,
+              host,
+              startedAtMs,
+              prompt,
+              expectedOutput,
+              probeTimeoutMs,
+              pollIntervalMs,
+              diagnostics,
+              cacheFilePath: cachePaths.cacheFilePath,
+            })
+          } finally {
+            await rm(cachePaths.lockDirPath, { recursive: true, force: true }).catch(() =>
+              undefined
+            )
+          }
+        }
+      }
+
+      return await this.runProbeModelWithHost({
+        params,
+        host,
+        startedAtMs,
+        prompt,
+        expectedOutput,
+        probeTimeoutMs,
+        pollIntervalMs,
+        diagnostics,
+        cacheFilePath: null,
+      })
+    } finally {
+      await this.hostManager.releaseHost(host.hostKey)
+    }
+  }
+
+  private async tryAcquirePersistentProbeLock(
+    cachePaths: PersistentProbeCachePaths,
+    staleMs: number,
+  ): Promise<boolean> {
+    try {
+      await mkdir(path.dirname(cachePaths.lockDirPath), { recursive: true })
+      await mkdir(cachePaths.lockDirPath)
+      return true
+    } catch (error) {
+      const code = (error as { code?: unknown }).code
+      if (code !== 'EEXIST') {
+        return false
+      }
+    }
+
+    try {
+      const lockStat = await stat(cachePaths.lockDirPath)
+      if (nowMs() - lockStat.mtimeMs > staleMs) {
+        await rm(cachePaths.lockDirPath, { recursive: true, force: true })
+        await mkdir(cachePaths.lockDirPath)
+        return true
+      }
+    } catch {
+      return false
+    }
+
+    return false
+  }
+
+  private async waitForPersistentProbeResult(
+    cachePaths: PersistentProbeCachePaths,
+    timeoutMs: number,
+  ): Promise<OpenCodeExecutionProbeResult | null> {
+    const deadlineMs = nowMs() + timeoutMs
+    while (nowMs() < deadlineMs) {
+      const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
+      if (cached) {
+        return cached
+      }
+      try {
+        await stat(cachePaths.lockDirPath)
+      } catch {
+        return null
+      }
+      await this.sleep(
+        Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, Math.max(0, deadlineMs - nowMs())),
+      )
+    }
+    return readPersistentProbeCache(cachePaths.cacheFilePath)
+  }
+
+  private async runProbeModelWithHost(input: {
+    params: {
+      selectedModel: string
+      projectPath?: string | null
+      prompt?: string
+      expectedOutput?: string
+    }
+    host: OpenCodeHostHandle
+    startedAtMs: number
+    prompt: string
+    expectedOutput: string
+    probeTimeoutMs: number
+    pollIntervalMs: number
+    diagnostics: Set<string>
+    cacheFilePath: string | null
+  }): Promise<OpenCodeExecutionProbeResult> {
+    const {
+      params,
+      host,
+      startedAtMs,
+      prompt,
+      expectedOutput,
+      probeTimeoutMs,
+      pollIntervalMs,
+      diagnostics,
+      cacheFilePath,
+    } = input
+    const finish = async (
+      result: OpenCodeExecutionProbeResult,
+    ): Promise<OpenCodeExecutionProbeResult> => {
+      if (cacheFilePath) {
+        await writePersistentProbeCache(
+          cacheFilePath,
+          result,
+          getProbeResultCacheTtlMs(result),
+        ).catch(() => undefined)
+      }
+      return result
+    }
+
+    {
       const client = this.clientFactory.create(host.baseUrl)
       const session = await client.createSession({
         title: `probe:${params.selectedModel}`,
       })
+      const probeMessage = {
+        agent: 'teammate',
+        model: parseProviderScopedModel(params.selectedModel),
+        parts: [{ type: 'text', text: prompt }],
+      }
 
       try {
-        await client.sendSessionMessage(session.id, {
-          agent: 'teammate',
-          model: parseProviderScopedModel(params.selectedModel),
-          parts: [{ type: 'text', text: prompt }],
-        })
+        await client.promptSessionAsync(session.id, probeMessage)
       } catch (error) {
         const classified = classifyProbeFailure({
           message: error instanceof Error ? error.message : String(error),
         })
-        return {
+        return finish({
           providerId: 'opencode',
           modelId: params.selectedModel,
           probePrompt: prompt,
@@ -206,7 +640,7 @@ export class OpenCodeExecutionProbe {
           toolCallCount: 0,
           errorCount: 0,
           diagnostics: Array.from(diagnostics),
-        }
+        })
       }
 
       let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
@@ -243,7 +677,7 @@ export class OpenCodeExecutionProbe {
           summary.durableState === 'idle'
           && (isProbeSuccessOutput(summary.latestAssistantText) || isProbeSuccessOutput(summary.latestAssistantPreview))
         ) {
-          return {
+          return finish({
             providerId: 'opencode',
             modelId: params.selectedModel,
             probePrompt: prompt,
@@ -258,7 +692,7 @@ export class OpenCodeExecutionProbe {
             toolCallCount: summary.toolCallCount,
             errorCount: summary.errorCount,
             diagnostics: Array.from(diagnostics),
-          }
+          })
         }
 
         const failureMessage =
@@ -284,7 +718,7 @@ export class OpenCodeExecutionProbe {
             message: failureMessage,
           })
 
-          return {
+          return finish({
             providerId: 'opencode',
             modelId: params.selectedModel,
             probePrompt: prompt,
@@ -299,11 +733,11 @@ export class OpenCodeExecutionProbe {
             toolCallCount: summary.toolCallCount,
             errorCount: summary.errorCount,
             diagnostics: Array.from(diagnostics),
-          }
+          })
         }
 
         diagnostics.add('Model verification timed out')
-        return {
+        return finish({
           providerId: 'opencode',
           modelId: params.selectedModel,
           probePrompt: prompt,
@@ -318,10 +752,8 @@ export class OpenCodeExecutionProbe {
           toolCallCount: latestToolCallCount,
           errorCount: latestErrorCount,
           diagnostics: Array.from(diagnostics),
-        }
+        })
       }
-    } finally {
-      await this.hostManager.releaseHost(host.hostKey)
     }
   }
 }

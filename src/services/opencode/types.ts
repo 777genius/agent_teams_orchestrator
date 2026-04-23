@@ -470,6 +470,7 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  runtimePid?: number
   resolvedBehaviorFingerprint: string | null
   opencodeSessionId: string
   lastCanonicalCursor: string | null

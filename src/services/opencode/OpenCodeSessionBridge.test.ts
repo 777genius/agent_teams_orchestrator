@@ -153,7 +153,7 @@ describe('OpenCodeSessionBridge', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(record).toEqual(existing)
+    expect(record).toEqual({ ...existing, runtimePid: 123 })
     expect(createSessionCalls).toBe(0)
   })
 

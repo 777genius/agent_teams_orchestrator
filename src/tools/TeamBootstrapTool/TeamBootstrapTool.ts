@@ -8,6 +8,7 @@ import { lazySchema } from '../../utils/lazySchema.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { NoopTeamBootstrapProgressSink } from '../../services/teamBootstrap/teamBootstrapEvents.js'
 import { getDeterministicBootstrapAvailabilityReason } from '../../services/teamBootstrap/teamBootstrapFeatureGate.js'
+import { normalizeBootstrapModelSelection } from '../../services/teamBootstrap/teamBootstrapModelSelection.js'
 import { runTeamBootstrap } from '../../services/teamBootstrap/teamBootstrapRunner.js'
 import { buildTeamBootstrapRequestFromSpec } from '../../services/teamBootstrap/teamBootstrapSpec.js'
 import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstrapTypes.js'
@@ -90,23 +91,26 @@ export function buildToolBootstrapSpec(
       ...(input.agent_language ? { agentLanguage: input.agent_language } : {}),
       permissionSeedTools: ['Edit', 'Write', 'NotebookEdit'],
     },
-    members: input.members.map(member => ({
-      name: member.name,
-      ...(member.role ? { role: member.role } : {}),
-      ...(member.workflow ? { workflow: member.workflow } : {}),
-      ...(member.agent_type ? { agentType: member.agent_type } : {}),
-      ...(member.provider ? { provider: member.provider } : {}),
-      ...(member.model ? { model: member.model } : {}),
-      ...(member.effort ? { effort: member.effort } : {}),
-      ...(member.cwd ? { cwd: member.cwd } : {}),
-      ...(member.use_split_pane !== undefined
-        ? { useSplitPane: member.use_split_pane }
-        : {}),
-      ...(member.plan_mode_required !== undefined
-        ? { planModeRequired: member.plan_mode_required }
-        : {}),
-      ...(member.description ? { description: member.description } : {}),
-    })),
+    members: input.members.map(member => {
+      const model = normalizeBootstrapModelSelection(member.model)
+      return {
+        name: member.name,
+        ...(member.role ? { role: member.role } : {}),
+        ...(member.workflow ? { workflow: member.workflow } : {}),
+        ...(member.agent_type ? { agentType: member.agent_type } : {}),
+        ...(member.provider ? { provider: member.provider } : {}),
+        ...(model ? { model } : {}),
+        ...(member.effort ? { effort: member.effort } : {}),
+        ...(member.cwd ? { cwd: member.cwd } : {}),
+        ...(member.use_split_pane !== undefined
+          ? { useSplitPane: member.use_split_pane }
+          : {}),
+        ...(member.plan_mode_required !== undefined
+          ? { planModeRequired: member.plan_mode_required }
+          : {}),
+        ...(member.description ? { description: member.description } : {}),
+      }
+    }),
     launch: {
       ...(input.bootstrap_timeout_ms
         ? { bootstrapTimeoutMs: input.bootstrap_timeout_ms }

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 
@@ -46,6 +49,8 @@ const host: OpenCodeHostHandle = {
 
 describe('OpenCodeExecutionProbe', () => {
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
+    let promptAsyncCount = 0
+    let sendMessageCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -96,8 +101,13 @@ describe('OpenCodeExecutionProbe', () => {
             },
           ],
           getPermissions: async () => [],
-          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
-          promptSessionAsync: async () => {},
+          sendSessionMessage: async () => {
+            sendMessageCount += 1
+            return { info: { id: 'msg-assistant-1' }, parts: [] }
+          },
+          promptSessionAsync: async () => {
+            promptAsyncCount += 1
+          },
           abortSession: async () => true,
         }),
       },
@@ -112,6 +122,8 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toBeNull()
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
+    expect(promptAsyncCount).toBe(1)
+    expect(sendMessageCount).toBe(0)
   })
 
   test('marks model auth as invalid when OpenCode returns a token refresh failure', async () => {
@@ -176,6 +188,234 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.outcome).toBe('not_authenticated')
     expect(result.reason).toContain('Token refresh failed: 401')
     expect(result.durableState).toBe('error')
+  })
+
+  test('surfaces nested provider rate-limit errors from assistant message metadata', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-error',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+                error: {
+                  name: 'AI_APICallError',
+                  data: {
+                    error: {
+                      type: 'FreeUsageLimitError',
+                      message: 'Rate limit exceeded. Please try again later.',
+                    },
+                    statusCode: 429,
+                  },
+                },
+              },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-error' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/ling-2.6-flash-free',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toBe('Rate limit exceeded. Please try again later.')
+    expect(result.durableState).toBe('error')
+  })
+
+  test('deduplicates concurrent probes and reuses a short-lived successful result', async () => {
+    let createSessionCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCount += 1
+            return { id: 'session-1' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                parentID: 'msg-user-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const input = {
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    }
+    const [first, second] = await Promise.all([
+      probe.probeModel(input),
+      probe.probeModel(input),
+    ])
+    const third = await probe.probeModel(input)
+
+    expect(first.outcome).toBe('available')
+    expect(second.outcome).toBe('available')
+    expect(third.outcome).toBe('available')
+    expect(createSessionCount).toBe(1)
+  })
+
+  test('deduplicates concurrent probes across probe instances with the persistent cache', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-probe-cache-'))
+    try {
+      let createSessionCount = 0
+      const cachedProfile: OpenCodePreparedProfile = {
+        ...profile,
+        profileRootPath: tempDir,
+        homePath: path.join(tempDir, 'home'),
+        xdgConfigHome: path.join(tempDir, 'config'),
+        xdgDataHome: path.join(tempDir, 'data'),
+        xdgCacheHome: path.join(tempDir, 'cache'),
+        managedAuthPath: path.join(tempDir, 'data/opencode/auth.json'),
+      }
+      const cachedHost: OpenCodeHostHandle = {
+        ...host,
+        profile: cachedProfile,
+      }
+      const makeProbe = () => new OpenCodeExecutionProbe({
+        persistentCache: true,
+        persistentCacheRoot: tempDir,
+        sleep: async () => new Promise(resolve => setTimeout(resolve, 1)),
+        hostManager: {
+          ensureHost: async () => cachedHost,
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfig: async () => {
+              throw new Error('not used')
+            },
+            getConfigProviders: async () => {
+              throw new Error('not used')
+            },
+            getProviders: async () => {
+              throw new Error('not used')
+            },
+            getProviderAuth: async () => {
+              throw new Error('not used')
+            },
+            listAgents: async () => {
+              throw new Error('not used')
+            },
+            getMcp: async () => {
+              throw new Error('not used')
+            },
+            createSession: async () => {
+              createSessionCount += 1
+              await new Promise(resolve => setTimeout(resolve, 20))
+              return { id: 'session-1' }
+            },
+            getSession: async () => ({ id: 'session-1' }),
+            getSessionStatus: async () => ({ 'session-1': 'idle' }),
+            getSessionMessages: async () => [
+              {
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  parentID: 'msg-user-1',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              },
+            ],
+            getPermissions: async () => [],
+            sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+            promptSessionAsync: async () => {},
+            abortSession: async () => true,
+          }),
+        },
+      })
+
+      const input = {
+        selectedModel: 'opencode/minimax-m2.5-free',
+        projectPath: '/tmp/project',
+      }
+      const [first, second] = await Promise.all([
+        makeProbe().probeModel(input),
+        makeProbe().probeModel(input),
+      ])
+      const third = await makeProbe().probeModel(input)
+
+      expect(first.outcome).toBe('available')
+      expect(second.outcome).toBe('available')
+      expect(third.outcome).toBe('available')
+      expect(createSessionCount).toBe(1)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
   })
 
   test('waits for a delayed assistant reply before deciding the probe outcome', async () => {

@@ -13,6 +13,7 @@ import {
   getMembersWithAssignedBoardWork,
   resolveBootstrapLeadName,
 } from './teamBootstrapPromptBuilder.js'
+import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
 
@@ -105,6 +106,7 @@ function normalizeMember(
   member: TeamBootstrapSpec['members'][number],
 ): NormalizedBootstrapMember {
   const isWorktreeIsolated = member.isolation === 'worktree'
+  const model = normalizeBootstrapModelSelection(member.model)
   return {
     originalName: member.name,
     displayName: member.name,
@@ -114,11 +116,11 @@ function normalizeMember(
     ...(member.workflow ? { workflow: member.workflow } : {}),
     ...(member.agentType ? { agentType: member.agentType } : {}),
     ...(member.provider ? { provider: member.provider } : {}),
-    ...(member.model ? { model: member.model } : {}),
+    ...(model ? { model } : {}),
     ...(member.effort ? { effort: member.effort } : {}),
     ...(isWorktreeIsolated ? { isolation: 'worktree' as const } : {}),
     ...(member.cwd && !isWorktreeIsolated ? { cwd: member.cwd } : {}),
-    ...(member.useSplitPane ? { useSplitPane: member.useSplitPane } : {}),
+    ...(member.useSplitPane !== undefined ? { useSplitPane: member.useSplitPane } : {}),
     ...(member.planModeRequired
       ? { planModeRequired: member.planModeRequired }
       : {}),
@@ -154,7 +156,7 @@ export function buildRequestHash(
       workflow: member.workflow ?? null,
       agentType: member.agentType ?? null,
       provider: member.provider ?? null,
-      model: member.model ?? null,
+      model: normalizeBootstrapModelSelection(member.model) ?? null,
       effort: member.effort ?? null,
       isolation: member.isolation ?? null,
       cwd: member.cwd ?? null,
