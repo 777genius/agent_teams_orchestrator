@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url'
 
 import {
   evaluateAnthropicApiSmoke,
+  runAnthropicApiKeyPromptSmoke,
   type AnthropicApiSmokeVerdict,
 } from '../src/services/runtimeBackends/anthropicApiSmoke.js'
 
@@ -37,6 +38,7 @@ async function runCliCommand(
   const result = await execa(process.execPath, [ENTRYPOINT_PATH, ...args], {
     cwd: REPO_ROOT,
     env,
+    stdin: 'ignore',
     reject: false,
     timeout: 90_000,
   })
@@ -80,19 +82,11 @@ async function main(): Promise<void> {
 
   const [authStatus, promptResult] = await Promise.all([
     runCliCommand(['auth', 'status', '--provider', 'anthropic', '--json'], env),
-    runCliCommand(
-      [
-        SMOKE_PROMPT,
-        '-p',
-        '--output-format',
-        'json',
-        '--model',
-        SMOKE_MODEL,
-        '--max-turns',
-        '1',
-      ],
-      env,
-    ),
+    runAnthropicApiKeyPromptSmoke({
+      apiKey: process.env.ANTHROPIC_API_KEY!,
+      model: SMOKE_MODEL,
+      prompt: SMOKE_PROMPT,
+    }),
   ])
 
   const report = evaluateAnthropicApiSmoke({

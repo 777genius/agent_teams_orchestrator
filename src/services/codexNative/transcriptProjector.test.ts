@@ -1,8 +1,18 @@
-import { describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 
+import { getRuntimeBoardTaskExecutionStore } from '../boardTaskActivity/RuntimeBoardTaskExecutionStore.js'
+import {
+  clearDynamicTeamContext,
+  setDynamicTeamContext,
+} from '../../utils/teammate.js'
 import { CodexNativeTranscriptProjector } from './transcriptProjector.js'
 
 describe('CodexNativeTranscriptProjector', () => {
+  beforeEach(() => {
+    getRuntimeBoardTaskExecutionStore().clearForTests()
+    clearDynamicTeamContext()
+  })
+
   test('projects assistant text and later usage into a transcript-compatible assistant message', () => {
     const projector = new CodexNativeTranscriptProjector()
 
@@ -216,6 +226,140 @@ describe('CodexNativeTranscriptProjector', () => {
           output_tokens: 2,
         },
       },
+    })
+  })
+
+  test('annotates Codex-native board lifecycle and ambient execution metadata for teammate sessions', () => {
+    setDynamicTeamContext({
+      agentId: 'alice@harbor-labs',
+      agentName: 'alice',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const projector = new CodexNativeTranscriptProjector()
+
+    projector.apply({
+      type: 'tool_call_started',
+      itemId: 'tool-start',
+      serverName: 'agent-teams',
+      toolName: 'task_start',
+      arguments: {
+        teamName: 'harbor-labs',
+        taskId: 'abcd1234',
+      },
+      status: 'in_progress',
+    })
+
+    const startResult = projector.apply({
+      type: 'tool_call_completed',
+      itemId: 'tool-start',
+      serverName: 'agent-teams',
+      toolName: 'task_start',
+      arguments: {
+        teamName: 'harbor-labs',
+        taskId: 'abcd1234',
+      },
+      status: 'completed',
+      resultText: 'started',
+      rawResult: {
+        id: '123e4567-e89b-12d3-a456-426614174000',
+        displayId: 'abcd1234',
+      },
+      errorMessage: null,
+      isError: false,
+    })
+
+    expect(startResult.appendedMessages[0]).toMatchObject({
+      type: 'user',
+      boardTaskLinks: [
+        {
+          toolUseId: 'tool-start',
+          linkKind: 'lifecycle',
+          task: {
+            ref: 'abcd1234',
+            refKind: 'display',
+            canonicalId: '123e4567-e89b-12d3-a456-426614174000',
+          },
+        },
+      ],
+      boardTaskToolActions: [
+        {
+          toolUseId: 'tool-start',
+          canonicalToolName: 'task_start',
+        },
+      ],
+    })
+
+    const assistantProjection = projector.apply({
+      type: 'assistant_text',
+      itemId: 'item-1',
+      text: 'Inspecting the task context now.',
+    })
+
+    expect(assistantProjection.appendedMessages[0]).toMatchObject({
+      type: 'assistant',
+      boardTaskLinks: [
+        {
+          linkKind: 'execution',
+          task: {
+            ref: 'abcd1234',
+            refKind: 'display',
+            canonicalId: '123e4567-e89b-12d3-a456-426614174000',
+          },
+          actorContext: {
+            relation: 'same_task',
+          },
+        },
+      ],
+    })
+
+    projector.apply({
+      type: 'tool_call_started',
+      itemId: 'tool-read',
+      serverName: 'filesystem',
+      toolName: 'read_file',
+      arguments: {
+        path: '/tmp/spec.md',
+      },
+      status: 'in_progress',
+    })
+
+    const readResult = projector.apply({
+      type: 'tool_call_completed',
+      itemId: 'tool-read',
+      serverName: 'filesystem',
+      toolName: 'read_file',
+      arguments: {
+        path: '/tmp/spec.md',
+      },
+      status: 'completed',
+      resultText: 'spec contents',
+      rawResult: {
+        content: [
+          {
+            type: 'text',
+            text: 'spec contents',
+          },
+        ],
+      },
+      errorMessage: null,
+      isError: false,
+    })
+
+    expect(readResult.appendedMessages[0]).toMatchObject({
+      type: 'user',
+      boardTaskLinks: [
+        {
+          toolUseId: 'tool-read',
+          linkKind: 'execution',
+          task: {
+            ref: 'abcd1234',
+            refKind: 'display',
+            canonicalId: '123e4567-e89b-12d3-a456-426614174000',
+          },
+        },
+      ],
     })
   })
 })

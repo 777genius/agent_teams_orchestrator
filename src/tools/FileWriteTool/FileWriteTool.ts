@@ -356,7 +356,7 @@ export const FileWriteTool = buildTool({
       })
     }
 
-    if (oldContent) {
+    if (oldContent !== null) {
       const patch = getPatchForDisplay({
         filePath: file_path,
         fileContents: oldContent,

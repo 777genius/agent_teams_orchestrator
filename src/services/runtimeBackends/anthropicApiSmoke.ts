@@ -28,6 +28,17 @@ type AnthropicPromptJson = {
   result?: string | null
 }
 
+type AnthropicMessagesResponse = {
+  content?: Array<{
+    type?: string
+    text?: string
+  }>
+  error?: {
+    type?: string
+    message?: string
+  }
+}
+
 function parseJson<T>(raw: string): T | null {
   try {
     return JSON.parse(raw) as T
@@ -79,6 +90,77 @@ function getSummaryForVerdict(verdict: AnthropicApiSmokeVerdict): string {
       return 'Anthropic accepted the API key, but rate limits blocked the request.'
     case 'runtime_error':
       return 'The Anthropic API smoke failed for a runtime reason that was not classified.'
+  }
+}
+
+export async function runAnthropicApiKeyPromptSmoke(params: {
+  apiKey: string
+  model: string
+  prompt: string
+  timeoutMs?: number
+}): Promise<{ stdout: string; stderr: string }> {
+  const timeoutMs = params.timeoutMs ?? 35_000
+  const controller = new AbortController()
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': params.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: params.model,
+        max_tokens: 16,
+        messages: [
+          {
+            role: 'user',
+            content: params.prompt,
+          },
+        ],
+      }),
+      signal: controller.signal,
+    })
+
+    const rawText = await response.text()
+    if (!response.ok) {
+      return {
+        stdout: JSON.stringify({
+          is_error: true,
+          result: rawText,
+        }),
+        stderr: '',
+      }
+    }
+
+    const parsed = parseJson<AnthropicMessagesResponse>(rawText)
+    const promptText =
+      parsed?.content?.find(block => block.type === 'text')?.text?.trim()
+      ?? null
+
+    return {
+      stdout: JSON.stringify({
+        is_error: false,
+        result: promptText,
+      }),
+      stderr: '',
+    }
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : String(error)
+    return {
+      stdout: JSON.stringify({
+        is_error: true,
+        result: errorMessage,
+      }),
+      stderr: '',
+    }
+  } finally {
+    clearTimeout(timeoutHandle)
   }
 }
 

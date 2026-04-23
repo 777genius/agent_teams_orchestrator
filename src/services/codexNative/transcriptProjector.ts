@@ -4,9 +4,15 @@ import {
   createAssistantMessage,
   createUserMessage,
 } from '../../utils/messages.js'
-import type { Message } from '../../types/message.js'
+import type { Message, UserMessage } from '../../types/message.js'
 import type { NonNullableUsage } from '../../entrypoints/sdk/coreTypes.js'
+import { getSessionId } from '../../bootstrap/state.js'
+import { getAgentId } from '../../utils/teammate.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
+import {
+  annotateAmbientBoardTaskExecutionMessage,
+  annotateBoardTaskToolResultMessage,
+} from '../boardTaskActivity/BoardTaskTranscriptProjector.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
 import {
   createCodexNativeThreadStatusMessage,
@@ -84,7 +90,9 @@ export class CodexNativeTranscriptProjector {
   ): { appendedMessages: Message[]; turnCompleted: boolean } {
     switch (event.type) {
       case 'assistant_text': {
-        const message = createAssistantMessage({ content: event.text })
+        const message = this.annotateTaskAwareMessage(
+          createAssistantMessage({ content: event.text }),
+        ) as Extract<Message, { type: 'assistant' }>
         this.lastAssistantMessage = message
         return {
           appendedMessages: [message],
@@ -92,19 +100,21 @@ export class CodexNativeTranscriptProjector {
         }
       }
       case 'tool_call_started': {
-        const toolUseMessage = createAssistantMessage({
-          content: [
-            {
-              type: 'tool_use',
-              id: event.itemId,
-              name: buildCodexNativeMcpToolName({
-                serverName: event.serverName,
-                toolName: event.toolName,
-              }),
-              input: event.arguments,
-            } as never,
-          ],
-        })
+        const toolUseMessage = this.annotateTaskAwareMessage(
+          createAssistantMessage({
+            content: [
+              {
+                type: 'tool_use',
+                id: event.itemId,
+                name: buildCodexNativeMcpToolName({
+                  serverName: event.serverName,
+                  toolName: event.toolName,
+                }),
+                input: event.arguments,
+              } as never,
+            ],
+          }),
+        ) as Extract<Message, { type: 'assistant' }>
         if (!this.lastAssistantMessage) {
           this.lastAssistantMessage = toolUseMessage
         }
@@ -114,17 +124,20 @@ export class CodexNativeTranscriptProjector {
         }
       }
       case 'tool_call_completed': {
-        const toolResultMessage = createUserMessage({
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: event.itemId,
-              content: buildCodexNativeToolResultContent(event),
-              is_error: event.isError,
-            } as never,
-          ],
-          toolUseResult: event.rawResult,
-        })
+        const toolResultMessage = this.annotateTaskAwareMessage(
+          createUserMessage({
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: event.itemId,
+                content: buildCodexNativeToolResultContent(event),
+                is_error: event.isError,
+              } as never,
+            ],
+            toolUseResult: event.rawResult,
+          }),
+          event,
+        )
         return {
           appendedMessages: [toolResultMessage],
           turnCompleted: false,
@@ -182,5 +195,35 @@ export class CodexNativeTranscriptProjector {
 
   getLastAssistantMessage(): Extract<Message, { type: 'assistant' }> | null {
     return this.lastAssistantMessage
+  }
+
+  private annotateTaskAwareMessage(
+    message: Message,
+    toolResultEvent?: Extract<CodexNativeNormalizedEvent, { type: 'tool_call_completed' }>,
+  ): Message {
+    const sessionId = getSessionId()
+    const agentId = getAgentId()
+
+    const explicitlyAnnotated =
+      toolResultEvent && message.type === 'user'
+        ? annotateBoardTaskToolResultMessage({
+            message: message as UserMessage,
+            toolName: buildCodexNativeMcpToolName({
+              serverName: toolResultEvent.serverName,
+              toolName: toolResultEvent.toolName,
+            }),
+            input: toolResultEvent.arguments,
+            result: toolResultEvent.rawResult,
+            toolUseId: toolResultEvent.itemId,
+            sessionId,
+            agentId,
+          })
+        : message
+
+    return annotateAmbientBoardTaskExecutionMessage({
+      message: explicitlyAnnotated,
+      sessionId,
+      agentId,
+    })
   }
 }
