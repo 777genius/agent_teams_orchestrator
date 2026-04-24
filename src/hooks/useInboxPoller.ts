@@ -118,9 +118,11 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 const INBOX_POLL_INTERVAL_MS = 1000
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 5000
 const ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS = 5000
+const ORDINARY_DIRECT_MESSAGE_MAX_AUTO_RECOVERY_ATTEMPTS = 1
 const BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS = 15000
 const MEMBER_BRIEFING_TOOL_NAME = 'member_briefing'
 const PREFIXED_MEMBER_BRIEFING_TOOL_NAME = 'mcp__agent-teams__member_briefing'
+const CODEX_NATIVE_EXEC_TIMEOUT_ERROR_TEXT = 'codex native exec timed out'
 
 export function isMemberBriefingToolName(name: string): boolean {
   return (
@@ -319,10 +321,85 @@ export function getOrdinaryInlineHandoffPrompt({
   ].join('\n')
 }
 
+export function extractTaskRefFromMailboxText(text: string): string | undefined {
+  const taskIdMatch = text.match(
+    /["']?\btaskId\b["']?\s*[:=]\s*["']?([a-zA-Z0-9][a-zA-Z0-9_-]{5,})["']?/,
+  )
+  if (taskIdMatch?.[1]) {
+    return taskIdMatch[1]
+  }
+
+  const hashTaskMatch = text.match(/#([a-zA-Z0-9][a-zA-Z0-9_-]{5,})/)
+  return hashTaskMatch?.[1]
+}
+
+function formatTaskRefForHuman(taskRef?: string): string {
+  if (!taskRef) {
+    return 'unknown task'
+  }
+  return taskRef.startsWith('#') ? taskRef : `#${taskRef}`
+}
+
+export function getOrdinaryRecoveryInlineHandoffPrompt({
+  from,
+  text,
+  timestamp,
+  failureDetail,
+  taskRef,
+}: {
+  from: string
+  text: string
+  timestamp: string
+  failureDetail: string
+  taskRef?: string
+}): string {
+  return [
+    'Process this queued mailbox message now.',
+    'Recovery mode after a Codex native mailbox timeout.',
+    `Sender: "${from}".`,
+    `Timestamp: "${timestamp}".`,
+    `Task reference: ${taskRef ? formatTaskRefForHuman(taskRef) : 'not found in mailbox text'}.`,
+    `Previous turn failure: ${failureDetail}`,
+    '',
+    'Do not restart from scratch.',
+    'First inspect the current task state, transcript, and working tree diff before doing more work.',
+    'If the task is already started, leave a task comment saying you are recovering after a Codex native timeout before continuing.',
+    'Complete only the missing work. If the current state is unclear, send a concise durable message to team-lead instead of guessing.',
+    '',
+    '<queued_mailbox_message>',
+    text,
+    '</queued_mailbox_message>',
+  ].join('\n')
+}
+
+export function buildCodexNativeMailboxTimeoutLeadNotificationText({
+  memberName,
+  taskRef,
+  detail,
+  final,
+}: {
+  memberName: string
+  taskRef?: string
+  detail: string
+  final: boolean
+}): string {
+  const taskText = taskRef
+    ? ` for ${formatTaskRefForHuman(taskRef)}`
+    : ''
+  if (final) {
+    return `${memberName} could not recover a Codex native mailbox turn${taskText} after timeout. Marking the mailbox row processed to avoid an infinite loop. Last error: ${detail}`
+  }
+  return `${memberName} hit a Codex native mailbox timeout${taskText}. Scheduling one recovery turn that will inspect state before continuing. Error: ${detail}`
+}
+
 type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
 type OrdinaryAttemptOutcome = 'user_send_message' | 'none'
 type OrdinaryDirectReplyFallback = {
   text: string
+}
+type OrdinaryAttemptExecutionError = {
+  type: 'api_error' | 'codex_native_timeout'
+  detail: string
 }
 type BootstrapToolDescriptor = Pick<
   Tool,
@@ -584,6 +661,73 @@ function extractAssistantText(message: AppState['messages'][number]): string {
     .join('\n\n')
 }
 
+function isCodexNativeExecTimeoutText(text: string): boolean {
+  return text.toLowerCase().includes(CODEX_NATIVE_EXEC_TIMEOUT_ERROR_TEXT)
+}
+
+export function findOrdinaryAttemptExecutionError({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): OrdinaryAttemptExecutionError | null {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return null
+  }
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    const text = extractAssistantText(message)
+    const errorDetails =
+      'errorDetails' in message && typeof message.errorDetails === 'string'
+        ? message.errorDetails
+        : undefined
+    const detail = errorDetails || text
+
+    if (detail && isCodexNativeExecTimeoutText(detail)) {
+      return {
+        type: 'codex_native_timeout',
+        detail,
+      }
+    }
+
+    if (detail && message.isApiErrorMessage === true) {
+      return {
+        type: 'api_error',
+        detail,
+      }
+    }
+
+    if (text && isCodexNativeExecTimeoutText(text)) {
+      return {
+        type: 'codex_native_timeout',
+        detail: text,
+      }
+    }
+  }
+
+  return null
+}
+
 export function findOrdinaryDirectReplyFallback({
   messages,
   submitUserMessageUuid,
@@ -671,6 +815,12 @@ type OrdinaryAttemptState = {
   status: 'in_flight' | 'cooling_down'
   timer: ReturnType<typeof setTimeout> | null
 }
+type OrdinaryRecoveryState = {
+  attemptCount: number
+  failureDetail: string
+  taskRef?: string
+  notifiedLead: boolean
+}
 
 type BootstrapProcessingAction =
   | { type: 'noop' }
@@ -682,6 +832,16 @@ type OrdinaryProcessingAction =
   | { type: 'reset_to_pending' }
   | { type: 'finalize' }
   | { type: 'schedule_cooldown' }
+  | {
+      type: 'schedule_recovery'
+      detail: string
+      taskRef?: string
+    }
+  | {
+      type: 'notify_failure'
+      detail: string
+      taskRef?: string
+    }
   | { type: 'deliver_assistant_text'; text: string }
 
 export function getBootstrapProcessingAction({
@@ -734,10 +894,12 @@ export function getOrdinaryProcessingAction({
   attempt,
   messages,
   processingOrdinaryMessage,
+  recoveryAttemptCount = 0,
 }: {
   attempt?: OrdinaryAttemptState
   messages: AppState['messages']
   processingOrdinaryMessage?: PendingInboxMirrorMessage
+  recoveryAttemptCount?: number
 }): OrdinaryProcessingAction {
   if (!processingOrdinaryMessage?.messageId) {
     return { type: 'noop' }
@@ -751,6 +913,10 @@ export function getOrdinaryProcessingAction({
     messages,
     submitUserMessageUuid: attempt.submitUserMessageUuid,
   })
+  const executionError = findOrdinaryAttemptExecutionError({
+    messages,
+    submitUserMessageUuid: attempt.submitUserMessageUuid,
+  })
   const observedPostSubmitActivity = hasAttemptObservedPostSubmitActivity({
     messages,
     submitUserMessageUuid: attempt.submitUserMessageUuid,
@@ -758,10 +924,41 @@ export function getOrdinaryProcessingAction({
   const requiresUserReply =
     processingOrdinaryMessage.from.toLowerCase() === 'user'
 
-  if (
-    outcome === 'user_send_message' ||
-    (!requiresUserReply && observedPostSubmitActivity)
-  ) {
+  if (outcome === 'user_send_message') {
+    return { type: 'finalize' }
+  }
+
+  if (attempt.status === 'in_flight' && executionError) {
+    const taskRef = extractTaskRefFromMailboxText(processingOrdinaryMessage.text)
+    if (
+      executionError.type === 'codex_native_timeout' &&
+      recoveryAttemptCount <
+        ORDINARY_DIRECT_MESSAGE_MAX_AUTO_RECOVERY_ATTEMPTS
+    ) {
+      return {
+        type: 'schedule_recovery',
+        detail: executionError.detail,
+        taskRef,
+      }
+    }
+    if (
+      executionError.type === 'codex_native_timeout' ||
+      recoveryAttemptCount > 0
+    ) {
+      return {
+        type: 'notify_failure',
+        detail: executionError.detail,
+        taskRef,
+      }
+    }
+    return { type: 'schedule_cooldown' }
+  }
+
+  if (attempt.status === 'cooling_down' && executionError) {
+    return { type: 'noop' }
+  }
+
+  if (!requiresUserReply && observedPostSubmitActivity) {
     return { type: 'finalize' }
   }
 
@@ -825,6 +1022,9 @@ export function useInboxPoller({
   const ordinaryAttemptsRef = useRef<Map<string, OrdinaryAttemptState>>(
     new Map(),
   )
+  const ordinaryRecoveryRef = useRef<Map<string, OrdinaryRecoveryState>>(
+    new Map(),
+  )
   const ordinaryFinalizationInFlightRef = useRef<Set<string>>(new Set())
   const bootstrapReadinessWaitsRef = useRef<
     Map<string, BootstrapReadinessWaitState>
@@ -845,6 +1045,7 @@ export function useInboxPoller({
         }
       }
       ordinaryAttemptsRef.current.clear()
+      ordinaryRecoveryRef.current.clear()
       for (const waitState of bootstrapReadinessWaitsRef.current.values()) {
         if (waitState.timer) {
           clearTimeout(waitState.timer)
@@ -1681,6 +1882,11 @@ export function useInboxPoller({
         ordinaryAttemptsRef.current.delete(messageId)
       }
     }
+    for (const messageId of ordinaryRecoveryRef.current.keys()) {
+      if (!activeOrdinaryMessageIds.has(messageId)) {
+        ordinaryRecoveryRef.current.delete(messageId)
+      }
+    }
     for (const [messageId, waitState] of bootstrapReadinessWaitsRef.current) {
       if (!activeBootstrapMessageIds.has(messageId)) {
         if (waitState.timer) {
@@ -1706,13 +1912,166 @@ export function useInboxPoller({
         attempt,
         messages: getMessages(),
         processingOrdinaryMessage,
+        recoveryAttemptCount:
+          ordinaryRecoveryRef.current.get(processingOrdinaryMessage.messageId)
+            ?.attemptCount ?? 0,
       })
+
+      if (processingAction.type === 'schedule_recovery' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+
+        const existingRecovery = ordinaryRecoveryRef.current.get(
+          processingOrdinaryMessage.messageId,
+        )
+        const recoveryState: OrdinaryRecoveryState = {
+          attemptCount: (existingRecovery?.attemptCount ?? 0) + 1,
+          failureDetail: processingAction.detail,
+          taskRef: processingAction.taskRef,
+          notifiedLead: existingRecovery?.notifiedLead ?? false,
+        }
+        ordinaryRecoveryRef.current.set(
+          processingOrdinaryMessage.messageId,
+          recoveryState,
+        )
+
+        const timer = setTimeout(() => {
+          ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId!)
+          setAppState(prev => ({
+            ...prev,
+            inbox: {
+              messages: prev.inbox.messages.map(message =>
+                message.messageId === processingOrdinaryMessage.messageId &&
+                message.status === 'processing'
+                  ? { ...message, status: 'pending' as const }
+                  : message,
+              ),
+            },
+          }))
+        }, ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS)
+
+        ordinaryAttemptsRef.current.set(processingOrdinaryMessage.messageId, {
+          ...attempt,
+          timer,
+          cooldownUntil: now + ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS,
+          status: 'cooling_down',
+        })
+
+        if (!recoveryState.notifiedLead && teamName) {
+          ordinaryRecoveryRef.current.set(processingOrdinaryMessage.messageId, {
+            ...recoveryState,
+            notifiedLead: true,
+          })
+          void writeToMailbox(
+            TEAM_LEAD_NAME,
+            {
+              from: agentName,
+              text: buildCodexNativeMailboxTimeoutLeadNotificationText({
+                memberName: agentName,
+                taskRef: recoveryState.taskRef,
+                detail: recoveryState.failureDetail,
+                final: false,
+              }),
+              summary: 'Codex native mailbox timeout',
+              timestamp: new Date().toISOString(),
+              color: getTeammateColor(),
+            },
+            teamName,
+          ).catch(error => {
+            logForDebugging(
+              `[InboxPoller] Failed to notify team-lead about Codex native timeout for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+            )
+          })
+        }
+        return
+      }
+
+      if (processingAction.type === 'notify_failure' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
+        ordinaryRecoveryRef.current.delete(processingOrdinaryMessage.messageId)
+        ordinaryFinalizationInFlightRef.current.add(
+          processingOrdinaryMessage.messageId,
+        )
+
+        void (async () => {
+          try {
+            if (teamName) {
+              try {
+                await writeToMailbox(
+                  TEAM_LEAD_NAME,
+                  {
+                    from: agentName,
+                    text: buildCodexNativeMailboxTimeoutLeadNotificationText({
+                      memberName: agentName,
+                      taskRef: processingAction.taskRef,
+                      detail: processingAction.detail,
+                      final: true,
+                    }),
+                    summary: 'Codex native mailbox recovery failed',
+                    timestamp: new Date().toISOString(),
+                    color: getTeammateColor(),
+                  },
+                  teamName,
+                )
+              } catch (error) {
+                logForDebugging(
+                  `[InboxPoller] Failed to notify team-lead about Codex native recovery failure for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+                )
+              }
+            }
+
+            await finalizeClaimedMessagesAsRead(
+              agentName,
+              [processingOrdinaryMessage.messageId!],
+              sessionId,
+              teamName,
+            )
+
+            const processingRowId = processingOrdinaryMessage.id
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingRowId
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } catch (error) {
+            logForDebugging(
+              `[InboxPoller] Failed to finalize ordinary mailbox row ${processingOrdinaryMessage.messageId} after Codex native recovery failure: ${String(error)}`,
+            )
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingOrdinaryMessage.id &&
+                  message.status === 'processing'
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } finally {
+            ordinaryFinalizationInFlightRef.current.delete(
+              processingOrdinaryMessage.messageId!,
+            )
+          }
+        })()
+        return
+      }
 
       if (processingAction.type === 'finalize' && attempt) {
         if (attempt.timer) {
           clearTimeout(attempt.timer)
         }
         ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
+        ordinaryRecoveryRef.current.delete(processingOrdinaryMessage.messageId)
 
         ordinaryFinalizationInFlightRef.current.add(
           processingOrdinaryMessage.messageId,
@@ -1767,6 +2126,7 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
+        ordinaryRecoveryRef.current.delete(processingOrdinaryMessage.messageId)
         ordinaryFinalizationInFlightRef.current.add(
           processingOrdinaryMessage.messageId,
         )
@@ -2089,13 +2449,25 @@ export function useInboxPoller({
           }
         }
       }
+      const ordinaryRecovery =
+        ordinaryPendingMessage?.messageId != null
+          ? ordinaryRecoveryRef.current.get(ordinaryPendingMessage.messageId)
+          : undefined
       const ordinaryPrompt =
         ordinaryPendingMessage != null
-          ? getOrdinaryInlineHandoffPrompt({
-              from: ordinaryPendingMessage.from,
-              text: ordinaryPendingMessage.text,
-              timestamp: ordinaryPendingMessage.timestamp,
-            })
+          ? ordinaryRecovery != null
+            ? getOrdinaryRecoveryInlineHandoffPrompt({
+                from: ordinaryPendingMessage.from,
+                text: ordinaryPendingMessage.text,
+                timestamp: ordinaryPendingMessage.timestamp,
+                failureDetail: ordinaryRecovery.failureDetail,
+                taskRef: ordinaryRecovery.taskRef,
+              })
+            : getOrdinaryInlineHandoffPrompt({
+                from: ordinaryPendingMessage.from,
+                text: ordinaryPendingMessage.text,
+                timestamp: ordinaryPendingMessage.timestamp,
+              })
           : null
       // The bootstrap turn is submitted through handleIncomingPrompt(), which
       // bypasses processUserInput/getAttachmentMessages. Inline the claimed

@@ -74,8 +74,19 @@ type ExecuteCodexNativeTurnDeps = {
   flushSessionStorage?: typeof flushSessionStorage
 }
 
-const DEFAULT_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS = 120_000
-const CODEX_NATIVE_MAILBOX_TIMEOUT_ENV = 'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS'
+const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 300_000
+const DEFAULT_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS = 2_700_000
+const CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS'
+const CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS'
+const CODEX_NATIVE_MAILBOX_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS'
+
+export type CodexNativeExecTimeoutPolicy = {
+  idleTimeoutMs: number | null
+  absoluteTimeoutMs: number | null
+}
 
 function isOrdinaryQueuedMailboxPrompt(prompt: string): boolean {
   return (
@@ -89,20 +100,51 @@ export function resolveCodexNativeExecTimeoutMs(
   prompt: string,
   env: NodeJS.ProcessEnv = process.env,
 ): number | null {
+  return (
+    resolveCodexNativeExecTimeoutPolicy(prompt, env)?.absoluteTimeoutMs ?? null
+  )
+}
+
+function resolveTimeoutEnvValue(
+  raw: string | undefined,
+  fallback: number | null,
+): number | null {
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return fallback
+  }
+
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+
+  const timeoutMs = Math.max(0, Math.floor(parsed))
+  return timeoutMs > 0 ? timeoutMs : null
+}
+
+export function resolveCodexNativeExecTimeoutPolicy(
+  prompt: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CodexNativeExecTimeoutPolicy | null {
   if (!isOrdinaryQueuedMailboxPrompt(prompt)) {
     return null
   }
 
-  const raw = env[CODEX_NATIVE_MAILBOX_TIMEOUT_ENV]
-  if (typeof raw === 'string' && raw.trim().length > 0) {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed)) {
-      const timeoutMs = Math.max(0, Math.floor(parsed))
-      return timeoutMs > 0 ? timeoutMs : null
-    }
-  }
+  const legacyAbsoluteTimeoutMs = resolveTimeoutEnvValue(
+    env[CODEX_NATIVE_MAILBOX_TIMEOUT_ENV],
+    DEFAULT_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS,
+  )
 
-  return DEFAULT_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS
+  return {
+    idleTimeoutMs: resolveTimeoutEnvValue(
+      env[CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_ENV],
+      DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS,
+    ),
+    absoluteTimeoutMs: resolveTimeoutEnvValue(
+      env[CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_ENV],
+      legacyAbsoluteTimeoutMs,
+    ),
+  }
 }
 
 function toCodexNativePromptText(
@@ -343,6 +385,9 @@ export async function* executeCodexNativeTurn(
     null
 
   try {
+    const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
+      resolvedPrompt.text,
+    )
     const iterator = runExec({
       prompt: resolvedPrompt.text,
       cwd: params.cwd,
@@ -358,7 +403,8 @@ export async function* executeCodexNativeTurn(
       forcedLoginMethod: getCodexForcedLoginMethod() ?? undefined,
       configOverrides: buildCodexNativeMcpConfigOverrides(),
       abortSignal: params.abortSignal,
-      timeoutMs: resolveCodexNativeExecTimeoutMs(resolvedPrompt.text),
+      idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
+      absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,
     })
 
     while (true) {

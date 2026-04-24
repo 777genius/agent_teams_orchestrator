@@ -273,7 +273,175 @@ describe('runCodexNativeExec', () => {
     ])
   })
 
-  test('terminates a hung native exec after the configured timeout', async () => {
+  test('terminates a hung native exec after the configured idle timeout', async () => {
+    const process = new FakeCodexProcess()
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        idleTimeoutMs: 1,
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    const first = await iterator.next()
+    expect(first.done).toBe(false)
+
+    setTimeout(() => {
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', null, 'SIGTERM')
+    }, 5)
+
+    try {
+      while (!(await iterator.next()).done) {
+        // Drain observations until timeout closes the fake process.
+      }
+      throw new Error('Expected timeout')
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe(
+        'Codex native exec timed out after 1ms of inactivity.',
+      )
+    }
+    expect(process.killed).toBe(true)
+    expect(process.killSignal).toBe('SIGTERM')
+  })
+
+  test('resets the configured idle timeout after stdout or stderr activity', async () => {
+    const process = new FakeCodexProcess()
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        idleTimeoutMs: 40,
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    const first = await iterator.next()
+    expect(first.done).toBe(false)
+
+    const remaining = (async () => {
+      const observed = []
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          return {
+            observed,
+            summary: next.value,
+          }
+        }
+        observed.push(next.value)
+      }
+    })()
+
+    setTimeout(() => {
+      process.stderr.write('still working\n')
+    }, 25)
+    setTimeout(() => {
+      process.stdout.write(
+        '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}\n',
+      )
+      process.stdout.write(
+        '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\n',
+      )
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', 0, null)
+    }, 55)
+
+    await expect(remaining).resolves.toMatchObject({
+      observed: [
+        {
+          type: 'normalized_event',
+          event: {
+            type: 'warning',
+            source: 'stderr',
+            text: 'still working',
+          },
+        },
+        {
+          type: 'normalized_event',
+          event: {
+            type: 'assistant_text',
+            itemId: 'item_0',
+            text: 'OK',
+          },
+        },
+        {
+          type: 'normalized_event',
+          event: {
+            type: 'usage_updated',
+          },
+        },
+        {
+          type: 'normalized_event',
+          event: {
+            type: 'turn_completed',
+          },
+        },
+      ],
+      summary: {
+        threadId: null,
+      },
+    })
+    expect(process.killed).toBe(false)
+  })
+
+  test('terminates after the absolute timeout even when output is active', async () => {
+    const process = new FakeCodexProcess()
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        idleTimeoutMs: 100,
+        absoluteTimeoutMs: 30,
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    const first = await iterator.next()
+    expect(first.done).toBe(false)
+
+    const activityHandle = setInterval(() => {
+      process.stderr.write('still working\n')
+    }, 10)
+    setTimeout(() => {
+      clearInterval(activityHandle)
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', null, 'SIGTERM')
+    }, 40)
+
+    try {
+      while (!(await iterator.next()).done) {
+        // Drain observations until timeout closes the fake process.
+      }
+      throw new Error('Expected timeout')
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe(
+        'Codex native exec timed out after 30ms.',
+      )
+    }
+    expect(process.killed).toBe(true)
+    expect(process.killSignal).toBe('SIGTERM')
+  })
+
+  test('keeps the legacy timeoutMs option as an absolute timeout cap', async () => {
     const process = new FakeCodexProcess()
     const iterator = runCodexNativeExec(
       {

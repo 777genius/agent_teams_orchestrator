@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  extractTaskRefFromMailboxText,
   findBootstrapAttemptOutcome,
+  findOrdinaryAttemptExecutionError,
   findOrdinaryDirectReplyFallback,
   findOrdinaryDirectReplyOutcome,
   getBootstrapTranscriptActivitySignature,
@@ -10,6 +12,7 @@ import {
   getOrdinaryProcessingAction,
   getBootstrapInlineHandoffPrompt,
   getOrdinaryInlineHandoffPrompt,
+  getOrdinaryRecoveryInlineHandoffPrompt,
   getOrdinaryPendingMessage,
   getBootstrapPendingMessage,
   getQueuedMailboxMetaPrompt,
@@ -19,7 +22,11 @@ import {
   shouldSkipBootstrapReadinessWait,
   shouldDeferPendingInboxDelivery,
 } from './useInboxPoller.js'
-import { createAssistantMessage, createUserMessage } from '../utils/messages.js'
+import {
+  createAssistantAPIErrorMessage,
+  createAssistantMessage,
+  createUserMessage,
+} from '../utils/messages.js'
 
 describe('useInboxPoller queued mailbox meta prompt', () => {
   test('detects bootstrap teammate mailbox instructions', () => {
@@ -932,5 +939,160 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         },
       }),
     ).toEqual({ type: 'finalize' })
+  })
+
+  test('detects Codex native timeout API error after an ordinary mailbox submit', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const timeout = createAssistantAPIErrorMessage({
+      content: 'Codex native exec timed out after 120000ms.',
+      errorDetails: 'Codex native exec timed out after 120000ms.',
+    })
+
+    expect(
+      findOrdinaryAttemptExecutionError({
+        messages: [submitted, timeout],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toEqual({
+      type: 'codex_native_timeout',
+      detail: 'Codex native exec timed out after 120000ms.',
+    })
+  })
+
+  test('lifecycle - ordinary non-user Codex timeout schedules recovery instead of finalize', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const timeout = createAssistantAPIErrorMessage({
+      content: 'Codex native exec timed out after 120000ms of inactivity.',
+      errorDetails: 'Codex native exec timed out after 120000ms of inactivity.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, timeout],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Task assigned: taskId: "545b704e"',
+        },
+      }),
+    ).toEqual({
+      type: 'schedule_recovery',
+      detail: 'Codex native exec timed out after 120000ms of inactivity.',
+      taskRef: '545b704e',
+    })
+  })
+
+  test('builds a recovery prompt with no blind restart instruction and task ref', () => {
+    const text = 'Task assigned: taskId: "545b704e"'
+    const prompt = getOrdinaryRecoveryInlineHandoffPrompt({
+      from: 'team-lead',
+      text,
+      timestamp: '2026-04-09T13:00:00.000Z',
+      failureDetail: 'Codex native exec timed out after 120000ms.',
+      taskRef: extractTaskRefFromMailboxText(text),
+    })
+
+    expect(prompt).toContain('Recovery mode after a Codex native mailbox timeout.')
+    expect(prompt).toContain('Do not restart from scratch.')
+    expect(prompt).toContain('Task reference: #545b704e.')
+    expect(prompt).toContain('<queued_mailbox_message>')
+    expect(prompt).toContain(text)
+  })
+
+  test('lifecycle - second ordinary timeout notifies failure instead of recovering again', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary recovery handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const timeout = createAssistantAPIErrorMessage({
+      content: 'Codex native exec timed out after 300000ms of inactivity.',
+      errorDetails: 'Codex native exec timed out after 300000ms of inactivity.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, timeout],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Task assigned: taskId: "545b704e"',
+        },
+        recoveryAttemptCount: 1,
+      }),
+    ).toEqual({
+      type: 'notify_failure',
+      detail: 'Codex native exec timed out after 300000ms of inactivity.',
+      taskRef: '545b704e',
+    })
+  })
+
+  test('lifecycle - recovery API error notifies failure instead of finalizing', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary recovery handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Rate limit reached.',
+      errorDetails: 'Rate limit reached.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Task assigned: taskId: "545b704e"',
+        },
+        recoveryAttemptCount: 1,
+      }),
+    ).toEqual({
+      type: 'notify_failure',
+      detail: 'Rate limit reached.',
+      taskRef: '545b704e',
+    })
   })
 })

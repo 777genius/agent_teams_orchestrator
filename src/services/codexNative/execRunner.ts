@@ -19,6 +19,8 @@ export type CodexNativeExecRunnerOptions = {
   configOverrides?: string[]
   abortSignal?: AbortSignal
   timeoutMs?: number | null
+  idleTimeoutMs?: number | null
+  absoluteTimeoutMs?: number | null
 }
 
 export type CodexNativeBinaryIdentity = {
@@ -91,6 +93,19 @@ type QueuedLine = {
 
 type CodexNativeStderrFilterState = {
   suppressAnalyticsHtmlContinuation: boolean
+}
+
+type CodexNativeExecTimeoutReason =
+  | { type: 'idle'; timeoutMs: number }
+  | { type: 'absolute'; timeoutMs: number }
+
+function normalizeTimeoutMs(timeoutMs: number | null | undefined): number | null {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
+    return null
+  }
+
+  const normalized = Math.max(0, Math.floor(timeoutMs))
+  return normalized > 0 ? normalized : null
 }
 
 export function buildCodexNativeExecArgs(
@@ -208,6 +223,7 @@ function defaultResolveVersion(executablePath: string): string | null {
 
 function createQueuedLineStream(
   process: SpawnedCodexProcess,
+  onActivity?: () => void,
 ): AsyncGenerator<QueuedLine, void, unknown> {
   const queue: QueuedLine[] = []
   let streamClosures = 0
@@ -220,6 +236,7 @@ function createQueuedLineStream(
   }
 
   const onLine = (stream: 'stdout' | 'stderr', line: string) => {
+    onActivity?.()
     queue.push({ stream, line })
     wake()
   }
@@ -313,19 +330,28 @@ export async function* runCodexNativeExec(
       stdio: ['ignore', 'pipe', 'pipe'],
     })
 
+  let recordProcessActivity: (() => void) | null = null
   const stderrLines: string[] = []
-  const queuedLines = createQueuedLineStream(child)
-  const timeoutMs =
-    typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
-      ? Math.max(0, Math.floor(options.timeoutMs))
-      : 0
-  let timedOut = false
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+  const queuedLines = createQueuedLineStream(child, () => {
+    recordProcessActivity?.()
+  })
+  const idleTimeoutMs = normalizeTimeoutMs(options.idleTimeoutMs)
+  const absoluteTimeoutMs =
+    options.absoluteTimeoutMs === undefined
+      ? normalizeTimeoutMs(options.timeoutMs)
+      : normalizeTimeoutMs(options.absoluteTimeoutMs)
+  let timeoutReason: CodexNativeExecTimeoutReason | null = null
+  let idleTimeoutHandle: ReturnType<typeof setTimeout> | null = null
+  let absoluteTimeoutHandle: ReturnType<typeof setTimeout> | null = null
   let forceKillHandle: ReturnType<typeof setTimeout> | null = null
   const clearTimeouts = () => {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle)
-      timeoutHandle = null
+    if (idleTimeoutHandle) {
+      clearTimeout(idleTimeoutHandle)
+      idleTimeoutHandle = null
+    }
+    if (absoluteTimeoutHandle) {
+      clearTimeout(absoluteTimeoutHandle)
+      absoluteTimeoutHandle = null
     }
     if (forceKillHandle) {
       clearTimeout(forceKillHandle)
@@ -333,26 +359,55 @@ export async function* runCodexNativeExec(
     }
   }
 
-  if (timeoutMs > 0) {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true
+  const terminateForTimeout = (
+    reason: CodexNativeExecTimeoutReason,
+  ): void => {
+    if (timeoutReason) {
+      return
+    }
+    timeoutReason = reason
+    try {
+      if (!child.killed) {
+        child.kill('SIGTERM')
+      }
+    } catch {
+      // Best-effort timeout cleanup.
+    }
+    forceKillHandle = setTimeout(() => {
       try {
-        if (!child.killed) {
-          child.kill('SIGTERM')
-        }
+        child.kill('SIGKILL')
       } catch {
         // Best-effort timeout cleanup.
       }
-      forceKillHandle = setTimeout(() => {
-        try {
-          child.kill('SIGKILL')
-        } catch {
-          // Best-effort timeout cleanup.
-        }
-      }, 5_000)
-      forceKillHandle.unref?.()
-    }, timeoutMs)
-    timeoutHandle.unref?.()
+    }, 5_000)
+    forceKillHandle.unref?.()
+  }
+
+  const resetIdleTimeout = (): void => {
+    if (idleTimeoutHandle) {
+      clearTimeout(idleTimeoutHandle)
+      idleTimeoutHandle = null
+    }
+    if (!idleTimeoutMs || timeoutReason) {
+      return
+    }
+    idleTimeoutHandle = setTimeout(() => {
+      terminateForTimeout({ type: 'idle', timeoutMs: idleTimeoutMs })
+    }, idleTimeoutMs)
+    idleTimeoutHandle.unref?.()
+  }
+
+  recordProcessActivity = resetIdleTimeout
+  resetIdleTimeout()
+
+  if (absoluteTimeoutMs) {
+    absoluteTimeoutHandle = setTimeout(() => {
+      terminateForTimeout({
+        type: 'absolute',
+        timeoutMs: absoluteTimeoutMs,
+      })
+    }, absoluteTimeoutMs)
+    absoluteTimeoutHandle.unref?.()
   }
 
   yield {
@@ -379,6 +434,8 @@ export async function* runCodexNativeExec(
 
   try {
     for await (const entry of queuedLines) {
+      resetIdleTimeout()
+
       if (entry.stream === 'stderr') {
         const rewrittenLine = rewriteCodexNativeStderrLine(
           entry.line,
@@ -416,8 +473,15 @@ export async function* runCodexNativeExec(
       throw spawnError
     }
 
-    if (timedOut) {
-      throw new Error(`Codex native exec timed out after ${timeoutMs}ms.`)
+    if (timeoutReason) {
+      if (timeoutReason.type === 'idle') {
+        throw new Error(
+          `Codex native exec timed out after ${timeoutReason.timeoutMs}ms of inactivity.`,
+        )
+      }
+      throw new Error(
+        `Codex native exec timed out after ${timeoutReason.timeoutMs}ms.`,
+      )
     }
 
     if (exit.code !== 0 || exit.signal) {

@@ -4,6 +4,7 @@ import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSd
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import {
   executeCodexNativeTurn,
+  resolveCodexNativeExecTimeoutPolicy,
   resolveCodexNativeExecTimeoutMs,
 } from './turnExecutor.js'
 
@@ -60,61 +61,77 @@ async function collectMessagesAndSummary(
 }
 
 describe('executeCodexNativeTurn', () => {
-  test('applies a short timeout only to ordinary queued mailbox prompts', () => {
-    expect(
-      resolveCodexNativeExecTimeoutMs(
-        [
-          'Process this queued mailbox message now.',
-          '<queued_mailbox_message>',
-          'Тут?',
-          '</queued_mailbox_message>',
-        ].join('\n'),
-        {},
-      ),
-    ).toBe(120_000)
-    expect(resolveCodexNativeExecTimeoutMs('Reply only with OK', {})).toBeNull()
-    expect(
-      resolveCodexNativeExecTimeoutMs(
-        [
-          'Process this queued mailbox message now.',
-          '<queued_mailbox_message>',
-          'Тут?',
-          '</queued_mailbox_message>',
-        ].join('\n'),
-        {
-          CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '45000',
-        },
-      ),
-    ).toBe(45_000)
-    expect(
-      resolveCodexNativeExecTimeoutMs(
-        [
-          'Process this queued mailbox message now.',
-          '<queued_mailbox_message>',
-          'Тут?',
-          '</queued_mailbox_message>',
-        ].join('\n'),
-        {
-          CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '0',
-        },
-      ),
-    ).toBeNull()
-  })
-
-  test('passes the queued mailbox timeout to native exec', async () => {
+  test('applies idle and absolute timeout policy only to ordinary queued mailbox prompts', () => {
     const prompt = [
       'Process this queued mailbox message now.',
       '<queued_mailbox_message>',
       'Тут?',
       '</queued_mailbox_message>',
     ].join('\n')
-    let observedTimeoutMs: number | null | undefined
+
+    expect(resolveCodexNativeExecTimeoutPolicy(prompt, {})).toEqual({
+      idleTimeoutMs: 300_000,
+      absoluteTimeoutMs: 2_700_000,
+    })
+    expect(resolveCodexNativeExecTimeoutPolicy('Reply only with OK', {})).toBeNull()
+    expect(
+      resolveCodexNativeExecTimeoutPolicy(prompt, {
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS: '45000',
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS: '90000',
+      }),
+    ).toEqual({
+      idleTimeoutMs: 45_000,
+      absoluteTimeoutMs: 90_000,
+    })
+    expect(
+      resolveCodexNativeExecTimeoutPolicy(prompt, {
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS: '0',
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS: '0',
+      }),
+    ).toEqual({
+      idleTimeoutMs: null,
+      absoluteTimeoutMs: null,
+    })
+  })
+
+  test('keeps legacy mailbox timeout resolver as absolute timeout compatibility', () => {
+    const prompt = [
+      'Process this queued mailbox message now.',
+      '<queued_mailbox_message>',
+      'Тут?',
+      '</queued_mailbox_message>',
+    ].join('\n')
+
+    expect(resolveCodexNativeExecTimeoutMs(prompt, {})).toBe(2_700_000)
+    expect(resolveCodexNativeExecTimeoutMs('Reply only with OK', {})).toBeNull()
+    expect(
+      resolveCodexNativeExecTimeoutMs(prompt, {
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '45000',
+      }),
+    ).toBe(45_000)
+    expect(
+      resolveCodexNativeExecTimeoutMs(prompt, {
+        CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '0',
+      }),
+    ).toBeNull()
+  })
+
+  test('passes the queued mailbox timeout policy to native exec', async () => {
+    const prompt = [
+      'Process this queued mailbox message now.',
+      '<queued_mailbox_message>',
+      'Тут?',
+      '</queued_mailbox_message>',
+    ].join('\n')
+    let observedIdleTimeoutMs: number | null | undefined
+    let observedAbsoluteTimeoutMs: number | null | undefined
     const params = baseParams({ prompt })
 
     await collectMessages(
       executeCodexNativeTurn(params, {
         runExec: async function* (options) {
-          observedTimeoutMs = options.timeoutMs
+          observedIdleTimeoutMs = options.idleTimeoutMs
+          observedAbsoluteTimeoutMs = options.absoluteTimeoutMs
           yield {
             type: 'normalized_event',
             event: {
@@ -145,7 +162,51 @@ describe('executeCodexNativeTurn', () => {
       }),
     )
 
-    expect(observedTimeoutMs).toBe(120_000)
+    expect(observedIdleTimeoutMs).toBe(300_000)
+    expect(observedAbsoluteTimeoutMs).toBe(2_700_000)
+  })
+
+  test('does not pass timeout policy to non-mailbox native exec', async () => {
+    let observedIdleTimeoutMs: number | null | undefined = undefined
+    let observedAbsoluteTimeoutMs: number | null | undefined = undefined
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        runExec: async function* (options) {
+          observedIdleTimeoutMs = options.idleTimeoutMs
+          observedAbsoluteTimeoutMs = options.absoluteTimeoutMs
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: null,
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+      }),
+    )
+
+    expect(observedIdleTimeoutMs).toBeNull()
+    expect(observedAbsoluteTimeoutMs).toBeNull()
   })
 
   test('rejects non-text prompts conservatively', async () => {
