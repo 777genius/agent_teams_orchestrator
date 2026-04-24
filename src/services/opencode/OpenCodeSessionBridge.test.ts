@@ -99,6 +99,7 @@ function buildPreviewSummary(
 describe('OpenCodeSessionBridge', () => {
   test('reuses an existing clean session record', async () => {
     let createSessionCalls = 0
+    const retainedLeases: unknown[] = []
     const existing = buildRecord()
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -110,6 +111,9 @@ describe('OpenCodeSessionBridge', () => {
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeases.push(input)
+        },
       },
       clientFactory: {
         create: () => ({
@@ -151,10 +155,47 @@ describe('OpenCodeSessionBridge', () => {
       memberName: 'alice',
       selectedModel: 'openai/gpt-5.4-mini',
       projectPath: '/tmp/project',
+      runId: 'run-1',
     })
 
     expect(record).toEqual({ ...existing, runtimePid: 123 })
     expect(createSessionCalls).toBe(0)
+    expect(retainedLeases).toEqual([
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-1',
+      },
+    ])
+  })
+
+  test('releaseSession drops the persistent host lease even after process restart', async () => {
+    const releasedLeases: unknown[] = []
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {
+          releaseHostCalls += 1
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeases.push(input)
+        },
+      },
+    })
+
+    await bridge.releaseSession(buildRecord())
+
+    expect(releasedLeases).toEqual([
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+      },
+    ])
+    expect(releaseHostCalls).toBe(0)
   })
 
   test('marks stale and creates a new session when the model changes', async () => {
