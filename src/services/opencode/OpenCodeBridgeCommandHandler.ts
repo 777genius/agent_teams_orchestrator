@@ -912,11 +912,15 @@ async function runCleanupHosts(envelope: BridgeEnvelope) {
   const staleAgeMs = typeof envelope.body.staleAgeMs === 'number'
     ? envelope.body.staleAgeMs
     : null
+  const leaseStaleAgeMs = typeof envelope.body.leaseStaleAgeMs === 'number'
+    ? envelope.body.leaseStaleAgeMs
+    : null
   const result = await openCodeHostManager.reconcilePersistentHosts({
     mode,
     reason: asString(envelope.body.reason) ?? 'manual',
     projectPath: asString(envelope.body.projectPath),
     staleAgeMs,
+    leaseStaleAgeMs,
   })
   return {
     snapshot: null,

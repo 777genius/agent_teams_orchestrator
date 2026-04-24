@@ -395,6 +395,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       reason: 'startup',
       projectPath: '/tmp/project',
       staleAgeMs: 1_000,
+      leaseStaleAgeMs: null,
     })
     if (result.ok) {
       expect(result.data.cleaned).toBe(1)

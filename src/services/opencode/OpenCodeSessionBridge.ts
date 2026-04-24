@@ -224,6 +224,12 @@ export class OpenCodeSessionBridge {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
     })
+    await this.hostManager.retainHostLease?.(record.hostKey, {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+      sessionId: record.opencodeSessionId,
+    }).catch(() => undefined)
 
     try {
       return await callback({
