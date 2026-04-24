@@ -12,6 +12,7 @@ import type { OpenCodeHostHandle, OpenCodePreparedProfile } from './types.js'
 
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
+const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 
 type ManagedHostEntry = {
   handle: OpenCodeHostHandle
@@ -81,6 +82,7 @@ export type OpenCodePersistentHostReconcileOptions = {
   reason?: 'startup' | 'shutdown' | 'manual' | string
   projectPath?: string | null
   staleAgeMs?: number | null
+  leaseStaleAgeMs?: number | null
 }
 
 export type OpenCodePersistentHostReconcileResult = {
@@ -407,16 +409,30 @@ export class OpenCodeHostManager {
       }
     }
 
-    const now = this.nowIso()
+    const nowDate = this.now()
+    const now = nowDate.toISOString()
+    const nowMs = nowDate.getTime()
     const leases = normalizePersistentHostLeases(record.leases)
     const previous = leases[leaseKey]
+    const runId = input.runId?.trim() || previous?.runId || null
+    const sessionId = input.sessionId?.trim() || previous?.sessionId || null
+    const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
+    if (
+      previous
+      && previous.runId === runId
+      && previous.sessionId === sessionId
+      && Number.isFinite(previousUpdatedAtMs)
+      && nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
+    ) {
+      return
+    }
     leases[leaseKey] = {
       leaseKey,
       teamId: input.teamId.trim(),
       laneId: input.laneId?.trim() || 'primary',
       memberName: input.memberName.trim(),
-      runId: input.runId?.trim() || null,
-      sessionId: input.sessionId?.trim() || null,
+      runId,
+      sessionId,
       createdAt: previous?.createdAt ?? now,
       updatedAt: now,
     }
@@ -851,6 +867,31 @@ export class OpenCodeHostManager {
 
     for (const [hostKey, record] of Object.entries(registry.hosts)) {
       const leases = normalizePersistentHostLeases(record.leases)
+      if (!force && typeof options.leaseStaleAgeMs === 'number' && options.leaseStaleAgeMs > 0) {
+        let droppedStaleLeaseCount = 0
+        for (const [leaseKey, lease] of Object.entries(leases)) {
+          const updatedAtMs = Date.parse(lease.updatedAt)
+          const ageMs = Number.isFinite(updatedAtMs)
+            ? nowMs - updatedAtMs
+            : Number.POSITIVE_INFINITY
+          if (ageMs > options.leaseStaleAgeMs) {
+            delete leases[leaseKey]
+            droppedStaleLeaseCount += 1
+          }
+        }
+        if (droppedStaleLeaseCount > 0) {
+          registry.hosts[hostKey] = {
+            ...record,
+            leases,
+            updatedAt: this.nowIso(),
+          }
+          record.leases = leases
+          changed = true
+          diagnostics.push(
+            `Dropped ${droppedStaleLeaseCount} stale OpenCode host lease(s) for ${hostKey}`,
+          )
+        }
+      }
       const leaseCount = Object.keys(leases).length
       const entry = this.hosts.get(hostKey)
       const projectPath = options.projectPath?.trim()

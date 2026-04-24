@@ -270,6 +270,7 @@ describe('OpenCodeHostManager', () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
     const spawned = createMockChildProcess()
+    let now = new Date('2026-04-24T10:00:00.000Z')
 
     try {
       const manager = new OpenCodeHostManager({
@@ -294,7 +295,7 @@ describe('OpenCodeHostManager', () => {
           }
           return { status: 200, data: { ok: true } }
         },
-        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        now: () => now,
         sleepMs: async () => {},
         persistentRegistryPath: registryPath,
       })
@@ -314,6 +315,24 @@ describe('OpenCodeHostManager', () => {
       expect(Object.keys(registry.hosts['host-key']?.leases ?? {})).toEqual([
         'team-a::primary::alice',
       ])
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toMatchObject({
+        updatedAt: '2026-04-24T10:00:00.000Z',
+      })
+
+      now = new Date('2026-04-24T10:00:30.000Z')
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-1',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, Record<string, unknown>> }>
+      }
+      expect(registry.hosts['host-key']?.leases?.['team-a::primary::alice']).toMatchObject({
+        updatedAt: '2026-04-24T10:00:00.000Z',
+      })
 
       await manager.releaseHostLease(handle.hostKey, {
         teamId: 'team-a',
