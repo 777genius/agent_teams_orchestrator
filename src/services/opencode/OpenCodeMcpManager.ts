@@ -32,6 +32,11 @@ const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'LANG',
   'LC_ALL',
   'CLAUDE_TEAM_CONTROL_URL',
+  'AGENT_TEAMS_MCP_CLAUDE_DIR',
+] as const
+const OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS = [
+  'CLAUDE_TEAM_CONTROL_URL',
+  'AGENT_TEAMS_MCP_CLAUDE_DIR',
 ] as const
 
 export type ResolvedAppMcpLaunchConfig = {
@@ -57,6 +62,11 @@ type OpenCodeMcpManagerDeps = {
   verifyPollMs?: number
 }
 
+type EnsureAppMcpResult = {
+  mcp: OpenCodeMcpResponse
+  summary: OpenCodeAppMcpSummary
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as Record<string, unknown>
@@ -68,17 +78,50 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
+function asStringRecord(value: unknown): Record<string, string> | null {
+  const record = asRecord(value)
+  if (!record) {
+    return null
+  }
+  const result: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    if (typeof raw !== 'string') {
+      continue
+    }
+    result[key] = raw
+  }
+  return result
+}
+
 async function defaultPathExists(targetPath: string): Promise<boolean> {
   try {
-    await Bun.file(targetPath).exists()
-    return true
+    return await Bun.file(targetPath).exists()
   } catch {
     return false
   }
 }
 
-function getWorkspaceRoot(): string {
-  return path.resolve(import.meta.dir, '../../../../')
+function getOpenCodeBridgeRepoRoot(): string {
+  return path.resolve(import.meta.dir, '../../..')
+}
+
+export function getCandidateClaudeTeamRootsForBridgeRoot(bridgeRepoRoot: string): string[] {
+  const bridgeRepoName = path.basename(bridgeRepoRoot)
+  const pairedWorktreeName = bridgeRepoName.startsWith('agent_teams_orchestrator')
+    ? `claude_team${bridgeRepoName.slice('agent_teams_orchestrator'.length)}`
+    : null
+  const candidates = [
+    pairedWorktreeName
+      ? path.resolve(path.dirname(bridgeRepoRoot), pairedWorktreeName)
+      : null,
+    path.resolve(bridgeRepoRoot, '../claude_team'),
+    path.resolve(bridgeRepoRoot, '../../claude_team'),
+  ].filter((candidate): candidate is string => typeof candidate === 'string')
+  return [...new Set(candidates)]
+}
+
+function getCandidateClaudeTeamRoots(): string[] {
+  return getCandidateClaudeTeamRootsForBridgeRoot(getOpenCodeBridgeRepoRoot())
 }
 
 function resolveNodeCommand(): string {
@@ -121,55 +164,46 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
     }
   }
 
-  const workspaceRoot = getWorkspaceRoot()
-  const builtEntry = path.join(
-    workspaceRoot,
-    'claude_team',
-    'mcp-server',
-    'dist',
-    'index.js',
-  )
-  if (await pathExists(builtEntry)) {
-    return {
-      source: 'workspace-dist',
-      config: {
-        type: 'local',
-        command: [resolveNodeCommand(), builtEntry],
-        environment: forwardedEnvironment,
-        enabled: true,
-        timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
-      },
-    }
-  }
-
-  const sourceEntry = path.join(
-    workspaceRoot,
-    'claude_team',
-    'mcp-server',
-    'src',
-    'index.ts',
-  )
-  const tsxCandidates = [
-    path.join(workspaceRoot, 'claude_team', 'mcp-server', 'node_modules', '.bin', 'tsx'),
-    path.join(workspaceRoot, 'claude_team', 'node_modules', '.bin', 'tsx'),
-    path.join(workspaceRoot, 'node_modules', '.bin', 'tsx'),
-  ]
-
-  if (await pathExists(sourceEntry)) {
-    for (const tsxBinary of tsxCandidates) {
-      if (!(await pathExists(tsxBinary))) {
-        continue
-      }
-
+  for (const claudeTeamRoot of getCandidateClaudeTeamRoots()) {
+    const builtEntry = path.join(claudeTeamRoot, 'mcp-server', 'dist', 'index.js')
+    if (await pathExists(builtEntry)) {
       return {
-        source: 'workspace-src',
+        source: 'workspace-dist',
         config: {
           type: 'local',
-          command: [tsxBinary, sourceEntry],
+          command: [resolveNodeCommand(), builtEntry],
           environment: forwardedEnvironment,
           enabled: true,
           timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
         },
+      }
+    }
+  }
+
+  for (const claudeTeamRoot of getCandidateClaudeTeamRoots()) {
+    const sourceEntry = path.join(claudeTeamRoot, 'mcp-server', 'src', 'index.ts')
+    const tsxCandidates = [
+      path.join(claudeTeamRoot, 'mcp-server', 'node_modules', '.bin', 'tsx'),
+      path.join(claudeTeamRoot, 'node_modules', '.bin', 'tsx'),
+      path.join(path.dirname(claudeTeamRoot), 'node_modules', '.bin', 'tsx'),
+    ]
+
+    if (await pathExists(sourceEntry)) {
+      for (const tsxBinary of tsxCandidates) {
+        if (!(await pathExists(tsxBinary))) {
+          continue
+        }
+
+        return {
+          source: 'workspace-src',
+          config: {
+            type: 'local',
+            command: [tsxBinary, sourceEntry],
+            environment: forwardedEnvironment,
+            enabled: true,
+            timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+          },
+        }
       }
     }
   }
@@ -204,6 +238,81 @@ function getMatchedAppMcpEntry(mcp: OpenCodeMcpResponse): {
     matchedServerName: null,
     entry: null,
   }
+}
+
+function getEntryEnvironment(entry: OpenCodeMcpStatusEntry | null): Record<string, string> | null {
+  const candidates = [
+    entry,
+    asRecord(entry?.config),
+    asRecord(entry?.server),
+    asRecord(entry?.options),
+  ]
+  for (const candidate of candidates) {
+    const environment = asStringRecord(candidate?.environment)
+    if (environment) {
+      return environment
+    }
+  }
+  return null
+}
+
+function getEntryCommand(entry: OpenCodeMcpStatusEntry | null): string[] | null {
+  const candidates = [
+    entry,
+    asRecord(entry?.config),
+    asRecord(entry?.server),
+    asRecord(entry?.options),
+  ]
+  for (const candidate of candidates) {
+    const command = candidate?.command
+    if (!Array.isArray(command)) {
+      continue
+    }
+    const normalized = command.filter((part): part is string => typeof part === 'string')
+    if (normalized.length === command.length && normalized.length > 0) {
+      return normalized
+    }
+  }
+  return null
+}
+
+function appMcpConfigMatchesRequiredRuntime(
+  entry: OpenCodeMcpStatusEntry | null,
+  desiredConfig: OpenCodeMcpServerConfig,
+): { ok: boolean; reason: string | null } {
+  const desiredEnvironment = desiredConfig.environment ?? {}
+  const desiredIdentityKeys = OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.filter(key =>
+    typeof desiredEnvironment[key] === 'string' && desiredEnvironment[key].length > 0,
+  )
+  const entryEnvironment = getEntryEnvironment(entry)
+
+  for (const key of desiredIdentityKeys) {
+    if (!entryEnvironment) {
+      return {
+        ok: false,
+        reason: `existing app MCP config does not expose environment; ${key} cannot be verified`,
+      }
+    }
+    if (entryEnvironment[key] !== desiredEnvironment[key]) {
+      return {
+        ok: false,
+        reason: `existing app MCP ${key} does not match current runtime root`,
+      }
+    }
+  }
+
+  const desiredCommand = desiredConfig.command
+  const entryCommand = getEntryCommand(entry)
+  if (desiredCommand?.length && entryCommand) {
+    if (desiredCommand.join('\0') !== entryCommand.join('\0')) {
+      return {
+        ok: false,
+        reason: 'existing app MCP command does not match current launch command',
+      }
+    }
+  }
+
+  return { ok: true, reason: null }
 }
 
 function inferMcpConnected(entry: OpenCodeMcpStatusEntry | null): boolean | null {
@@ -247,6 +356,8 @@ function inferMcpConnected(entry: OpenCodeMcpStatusEntry | null): boolean | null
 }
 
 export class OpenCodeMcpManager {
+  private readonly ensureAppMcpInFlight = new Map<string, Promise<EnsureAppMcpResult>>()
+
   constructor(private readonly deps: OpenCodeMcpManagerDeps = {}) {}
 
   private get clientFactory() {
@@ -283,16 +394,107 @@ export class OpenCodeMcpManager {
   async ensureAppMcp(params: {
     baseUrl: string
     attachIfMissing?: boolean
-  }): Promise<{
-    mcp: OpenCodeMcpResponse
-    summary: OpenCodeAppMcpSummary
-  }> {
+  }): Promise<EnsureAppMcpResult> {
+    const cacheKey = `${params.baseUrl}::${params.attachIfMissing === true ? 'attach' : 'read'}`
+    const inFlight = this.ensureAppMcpInFlight.get(cacheKey)
+    if (inFlight) {
+      return inFlight
+    }
+
+    const work = this.ensureAppMcpOnce(params).finally(() => {
+      if (this.ensureAppMcpInFlight.get(cacheKey) === work) {
+        this.ensureAppMcpInFlight.delete(cacheKey)
+      }
+    })
+    this.ensureAppMcpInFlight.set(cacheKey, work)
+    return work
+  }
+
+  private async ensureAppMcpOnce(params: {
+    baseUrl: string
+    attachIfMissing?: boolean
+  }): Promise<EnsureAppMcpResult> {
     const client = this.clientFactory.create(params.baseUrl)
     const existingMcp = await client.getMcp()
     const existingMatch = getMatchedAppMcpEntry(existingMcp)
 
     if (existingMatch.matchedServerName) {
       const connected = inferMcpConnected(existingMatch.entry)
+      let launchConfig: ResolvedAppMcpLaunchConfig | null = null
+      const shouldVerifyExistingConfig =
+        params.attachIfMissing === true
+        && OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
+          const value = (this.deps.env ?? process.env)[key]
+          return typeof value === 'string' && value.length > 0
+        })
+      if (shouldVerifyExistingConfig) {
+        launchConfig = await this.resolveLaunchConfig()
+        const compatibility = appMcpConfigMatchesRequiredRuntime(
+          existingMatch.entry,
+          launchConfig.config,
+        )
+        if (!compatibility.ok) {
+          if (typeof client.addMcp !== 'function') {
+            return {
+              mcp: existingMcp,
+              summary: {
+                serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+                matchedServerName: existingMatch.matchedServerName,
+                status: 'attach_failed',
+                connected,
+                launchSource: launchConfig.source,
+                availableServerNames: getMcpServerNames(existingMcp),
+                diagnostics: [
+                  `OpenCode app MCP server ${existingMatch.matchedServerName} is stale: ${compatibility.reason}`,
+                  'OpenCode client does not expose dynamic MCP attach support',
+                ],
+              },
+            }
+          }
+          try {
+            await client.addMcp(OPEN_CODE_APP_MCP_SERVER_NAME, launchConfig.config)
+            const refreshedMcp = await this.waitForMcpConnected(
+              client,
+              OPEN_CODE_APP_MCP_SERVER_NAME,
+            )
+            const refreshedMatch = getMatchedAppMcpEntry(refreshedMcp)
+            const refreshedConnected = inferMcpConnected(refreshedMatch.entry)
+            return {
+              mcp: refreshedMcp,
+              summary: {
+                serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+                matchedServerName: refreshedMatch.matchedServerName,
+                status: 'attached',
+                connected: refreshedConnected,
+                launchSource: launchConfig.source,
+                availableServerNames: getMcpServerNames(refreshedMcp),
+                diagnostics: refreshedConnected === true
+                  ? [`Reattached stale OpenCode app MCP server: ${compatibility.reason}`]
+                  : [
+                      `Reattached stale OpenCode app MCP server: ${compatibility.reason}`,
+                      `OpenCode app MCP server ${OPEN_CODE_APP_MCP_SERVER_NAME} did not report connected after reattach`,
+                    ],
+              },
+            }
+          } catch (error) {
+            return {
+              mcp: existingMcp,
+              summary: {
+                serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+                matchedServerName: existingMatch.matchedServerName,
+                status: 'attach_failed',
+                connected,
+                launchSource: launchConfig.source,
+                availableServerNames: getMcpServerNames(existingMcp),
+                diagnostics: [
+                  `OpenCode app MCP server ${existingMatch.matchedServerName} is stale: ${compatibility.reason}`,
+                  `OpenCode app MCP reattach failed: ${error instanceof Error ? error.message : String(error)}`,
+                ],
+              },
+            }
+          }
+        }
+      }
       if (connected !== true && params.attachIfMissing && typeof client.connectMcp === 'function') {
         try {
           await client.connectMcp(existingMatch.matchedServerName)
@@ -306,7 +508,7 @@ export class OpenCodeMcpManager {
               matchedServerName: connectedMatch.matchedServerName,
               status: refreshedConnected === true ? 'attached' : 'present',
               connected: refreshedConnected,
-              launchSource: null,
+              launchSource: launchConfig?.source ?? null,
               availableServerNames: getMcpServerNames(connectedMcp),
               diagnostics: refreshedConnected === true
                 ? []
@@ -314,6 +516,53 @@ export class OpenCodeMcpManager {
             },
           }
         } catch (error) {
+          if (typeof client.addMcp === 'function') {
+            try {
+              launchConfig ??= await this.resolveLaunchConfig()
+              await client.addMcp(OPEN_CODE_APP_MCP_SERVER_NAME, launchConfig.config)
+              const refreshedMcp = await this.waitForMcpConnected(
+                client,
+                OPEN_CODE_APP_MCP_SERVER_NAME,
+              )
+              const refreshedMatch = getMatchedAppMcpEntry(refreshedMcp)
+              const refreshedConnected = inferMcpConnected(refreshedMatch.entry)
+              return {
+                mcp: refreshedMcp,
+                summary: {
+                  serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+                  matchedServerName: refreshedMatch.matchedServerName,
+                  status: 'attached',
+                  connected: refreshedConnected,
+                  launchSource: launchConfig.source,
+                  availableServerNames: getMcpServerNames(refreshedMcp),
+                  diagnostics: refreshedConnected === true
+                    ? [
+                        `Reattached OpenCode app MCP server after connect failed: ${error instanceof Error ? error.message : String(error)}`,
+                      ]
+                    : [
+                        `Reattached OpenCode app MCP server after connect failed: ${error instanceof Error ? error.message : String(error)}`,
+                        `OpenCode app MCP server ${OPEN_CODE_APP_MCP_SERVER_NAME} did not report connected after reattach`,
+                      ],
+                },
+              }
+            } catch (reattachError) {
+              return {
+                mcp: existingMcp,
+                summary: {
+                  serverName: OPEN_CODE_APP_MCP_SERVER_NAME,
+                  matchedServerName: existingMatch.matchedServerName,
+                  status: 'attach_failed',
+                  connected,
+                  launchSource: launchConfig?.source ?? null,
+                  availableServerNames: getMcpServerNames(existingMcp),
+                  diagnostics: [
+                    `OpenCode app MCP connect failed: ${error instanceof Error ? error.message : String(error)}`,
+                    `OpenCode app MCP reattach after connect failure failed: ${reattachError instanceof Error ? reattachError.message : String(reattachError)}`,
+                  ],
+                },
+              }
+            }
+          }
           return {
             mcp: existingMcp,
             summary: {
@@ -321,7 +570,7 @@ export class OpenCodeMcpManager {
               matchedServerName: existingMatch.matchedServerName,
               status: 'attach_failed',
               connected,
-              launchSource: null,
+              launchSource: launchConfig?.source ?? null,
               availableServerNames: getMcpServerNames(existingMcp),
               diagnostics: [`OpenCode app MCP connect failed: ${error instanceof Error ? error.message : String(error)}`],
             },
@@ -336,7 +585,7 @@ export class OpenCodeMcpManager {
           matchedServerName: existingMatch.matchedServerName,
           status: 'present',
           connected,
-          launchSource: null,
+          launchSource: launchConfig?.source ?? null,
           availableServerNames: getMcpServerNames(existingMcp),
           diagnostics: [],
         },

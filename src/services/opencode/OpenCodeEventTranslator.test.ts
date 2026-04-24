@@ -146,6 +146,9 @@ describe('OpenCodeEventTranslator', () => {
 
     expect(summary.toolCallCount).toBe(1)
     expect(summary.errorCount).toBe(0)
+    expect(summary.latestAssistantMessageId).toBe('msg-assistant-tool')
+    expect(summary.latestAssistantText).toBeNull()
+    expect(summary.latestAssistantPreview).toBeNull()
     expect(summary.messages[0]?.providerId).toBe('opencode')
     expect(summary.messages[0]?.modelId).toBe('big-pickle')
     expect(summary.messages[1]?.finishReason).toBe('tool-calls')

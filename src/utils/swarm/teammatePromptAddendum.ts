@@ -1,8 +1,9 @@
 /**
  * Teammate-specific system prompt addendum.
  *
- * This is appended to the full main agent system prompt for teammates.
+ * This is appended to the full main agent system prompt for native teammates.
  * It explains visibility constraints and communication requirements.
+ * OpenCode teammates receive runtime-specific Agent Teams MCP wording from the bridge.
  */
 
 export const TEAMMATE_SYSTEM_PROMPT_ADDENDUM = `

@@ -40,6 +40,7 @@ type PersistentHostRegistryRecord = {
   profileRootKey: string
   projectPath: string
   projectBehaviorFingerprint: string
+  managedConfigFingerprint?: string | null
   baseUrl: string
   port: number
   pid: number
@@ -229,6 +230,7 @@ export class OpenCodeHostManager {
       profileRootKey: handle.profileRootKey,
       projectPath: handle.projectPath,
       projectBehaviorFingerprint: handle.projectBehaviorFingerprint,
+      managedConfigFingerprint: handle.profile.managedConfigFingerprint,
       baseUrl: handle.baseUrl,
       port: handle.port,
       pid: handle.pid,
@@ -289,6 +291,7 @@ export class OpenCodeHostManager {
       record.projectPath !== profile.projectPath
       || record.profileRootKey !== profile.profileRootKey
       || record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
+      || record.managedConfigFingerprint !== profile.managedConfigFingerprint
       || !this.isProcessAlive(record.pid)
     ) {
       await this.removePersistentHost(hostKey).catch(() => undefined)
@@ -514,7 +517,7 @@ export class OpenCodeHostManager {
     const profile = await this.prepareProfile(params.projectPath)
     const hostKey =
       params.hostKey?.trim()
-      || `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}`
+      || `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
     const existing = this.hosts.get(hostKey)
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1

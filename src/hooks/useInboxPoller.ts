@@ -120,6 +120,8 @@ const BOOTSTRAP_RETRY_COOLDOWN_MS = 5000
 const ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS = 5000
 const ORDINARY_DIRECT_MESSAGE_MAX_AUTO_RECOVERY_ATTEMPTS = 1
 const BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS = 15000
+// Native mailbox poller only. OpenCode runtime delivery is direct bridge prompt
+// relay and must not reuse SendMessage-based mailbox prompts.
 const MEMBER_BRIEFING_TOOL_NAME = 'member_briefing'
 const PREFIXED_MEMBER_BRIEFING_TOOL_NAME = 'mcp__agent-teams__member_briefing'
 const CODEX_NATIVE_EXEC_TIMEOUT_ERROR_TEXT = 'codex native exec timed out'

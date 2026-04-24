@@ -28,6 +28,10 @@ import type {
 
 const BRIDGE_SCHEMA_VERSION = 1
 const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
+const OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS = 8_000
+const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 1_500
+const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 6_000
+const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -91,14 +95,43 @@ type SendMessageCommandData = {
   diagnostics: TeamDiagnostic[]
 }
 
-const REQUIRED_AGENT_TEAMS_RUNTIME_TOOLS = [
+const REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_NAMES = [
+  'cross_team_get_outbox',
+  'cross_team_list_targets',
+  'cross_team_send',
+  'member_briefing',
+  'message_send',
+  'process_list',
+  'process_register',
+  'process_stop',
+  'process_unregister',
+  'review_approve',
+  'review_request',
+  'review_request_changes',
+  'review_start',
   'runtime_bootstrap_checkin',
   'runtime_deliver_message',
   'runtime_task_event',
   'runtime_heartbeat',
+  'task_add_comment',
+  'task_attach_comment_file',
+  'task_attach_file',
+  'task_briefing',
+  'task_complete',
+  'task_create',
+  'task_create_from_message',
+  'task_get',
+  'task_get_comment',
+  'task_link',
+  'task_list',
+  'task_set_clarification',
+  'task_set_owner',
+  'task_set_status',
+  'task_start',
+  'task_unlink',
 ] as const
 
-const REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS = REQUIRED_AGENT_TEAMS_RUNTIME_TOOLS.map(tool =>
+const REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS = REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_NAMES.map(tool =>
   `${OPEN_CODE_APP_MCP_SERVER_NAME}_${tool}`,
 )
 
@@ -160,6 +193,84 @@ function normalizeStable(value: unknown): unknown {
 
 function uniqueSortedStrings(values: Iterable<string>): string[] {
   return Array.from(new Set(Array.from(values).filter(Boolean))).sort()
+}
+
+function canonicalizeAppMcpToolId(rawName: string): string {
+  const prefixes = [
+    `mcp__${OPEN_CODE_APP_MCP_SERVER_NAME}__`,
+    'mcp__agent_teams__',
+    `${OPEN_CODE_APP_MCP_SERVER_NAME}_`,
+    'agent_teams_',
+  ]
+  const rawTrimmed = rawName.trim()
+  const proxyStripped = rawTrimmed.startsWith('proxy_') ? rawTrimmed.slice('proxy_'.length) : rawTrimmed
+  const trimmed =
+    rawTrimmed.startsWith('proxy_') && prefixes.some(prefix => proxyStripped.startsWith(prefix))
+      ? proxyStripped
+      : rawTrimmed
+  let toolName = trimmed
+  for (const prefix of prefixes) {
+    if (toolName.startsWith(prefix)) {
+      toolName = toolName.slice(prefix.length)
+      break
+    }
+  }
+  return `${OPEN_CODE_APP_MCP_SERVER_NAME}_${toolName}`
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+  const workerCount = Math.max(1, Math.min(concurrency, items.length))
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex
+      nextIndex += 1
+      results[index] = await worker(items[index]!, index)
+    }
+  }))
+  return results
+}
+
+function buildOpenCodeRuntimeIdentityBlock(input: {
+  teamName: string
+  memberName: string
+  runId: string
+  runtimeSessionId: string
+  purpose?: 'launch' | 'reminder'
+}): string {
+  const purpose = input.purpose ?? 'launch'
+  const checkinPayload = {
+    teamName: input.teamName,
+    runId: input.runId,
+    memberName: input.memberName,
+    runtimeSessionId: input.runtimeSessionId,
+  }
+  const briefingPayload = {
+    teamName: input.teamName,
+    memberName: input.memberName,
+    runtimeProvider: 'opencode',
+  }
+
+  return [
+    '<opencode_runtime_identity>',
+    'You are an OpenCode teammate managed by the desktop app.',
+    purpose === 'launch'
+      ? 'Your first app-team MCP action must be runtime bootstrap check-in.'
+      : 'Runtime identity reminder for this delivered app message. If you have not checked in for this run, call runtime_bootstrap_checkin before replying; otherwise continue.',
+    `${purpose === 'launch' ? 'Call' : 'If check-in is needed, call'} the exposed Agent Teams runtime_bootstrap_checkin tool, usually agent-teams_runtime_bootstrap_checkin or mcp__agent-teams__runtime_bootstrap_checkin, with: ${JSON.stringify(checkinPayload)}`,
+    purpose === 'launch'
+      ? 'After check-in succeeds, request your teammate rules.'
+      : 'If your teammate rules are missing or stale, request them before replying.',
+    `${purpose === 'launch' ? 'Call' : 'If briefing is needed, call'} the exposed Agent Teams member_briefing tool, usually agent-teams_member_briefing or mcp__agent-teams__member_briefing, with: ${JSON.stringify(briefingPayload)}`,
+    'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
+    'Do not use runtime_deliver_message for ordinary visible replies unless a runtime-delivery prompt explicitly provides runId/runtimeSessionId/idempotencyKey.',
+    '</opencode_runtime_identity>',
+  ].join('\n')
 }
 
 function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
@@ -332,7 +443,7 @@ async function proveAppMcpTools(
     return {
       ok: false,
       observedTools: [],
-      missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
+      missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
       diagnostics: ['OpenCode host is unavailable; app MCP tools cannot be proven'],
       route: null,
     }
@@ -365,7 +476,7 @@ async function proveAppMcpTools(
       return {
         ok: false,
         observedTools: [],
-        missingTools: [...REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS],
+        missingTools: [...REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS],
         diagnostics: [
           `Agent Teams MCP direct tools/list preflight failed: ${error instanceof Error ? error.message : String(error)}`,
           'OpenCode 1.14.19 experimental tool endpoints do not expose MCP tools, so they are not accepted as production proof.',
@@ -410,7 +521,6 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
     return (result.tools ?? [])
       .map(tool => tool.name)
       .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
-      .map(name => `${OPEN_CODE_APP_MCP_SERVER_NAME}_${name}`)
   } finally {
     await client.close().catch(() => undefined)
   }
@@ -446,11 +556,11 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 }
 
 function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolProof {
-  const observed = new Set(observedTools)
-  const missingTools = REQUIRED_AGENT_TEAMS_RUNTIME_TOOL_IDS.filter(tool => !observed.has(tool))
+  const observed = new Set(observedTools.map(canonicalizeAppMcpToolId))
+  const missingTools = REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_IDS.filter(tool => !observed.has(tool))
   return {
     ok: missingTools.length === 0,
-    observedTools: Array.from(new Set(observedTools)).sort(),
+    observedTools: Array.from(observed).sort(),
     missingTools,
     diagnostics: missingTools.length === 0
       ? []
@@ -858,6 +968,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
   await assertOpenCodeLaunchMcpReady(snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
+  const promptedMembers: Array<{ name: string; record: OpenCodeSessionRecord }> = []
 
   for (const item of membersRaw) {
     const member = asRecord(item)
@@ -875,11 +986,66 @@ async function runLaunch(envelope: BridgeEnvelope) {
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
       })
+      const runtimeIdentityBlock = buildOpenCodeRuntimeIdentityBlock({
+        teamName: teamId,
+        memberName: name,
+        runId,
+        runtimeSessionId: record.opencodeSessionId,
+      })
       await openCodeSessionBridge.promptAsync(record, {
-        text: prompt,
+        text: `${runtimeIdentityBlock}\n\n${prompt}`,
         agent: 'teammate',
       })
-      const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+      promptedMembers.push({ name, record })
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      members[name] = {
+        sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
+        launchState: 'failed',
+        ...(typeof record?.runtimePid === 'number' && record.runtimePid > 0
+          ? { runtimePid: record.runtimePid }
+          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+            ? { runtimePid: snapshot.host.pid }
+            : {}),
+        evidence: [{ kind: 'member_launch_failed', observedAt: nowIso() }],
+        diagnostics: [reason],
+      }
+      diagnostics.push(teamDiagnostic('member_launch_failed', `${name}: ${reason}`, 'error'))
+    }
+  }
+
+  const settledMembers = await mapWithConcurrency(promptedMembers, 3, async ({ name, record }) => {
+    const settleDiagnostics: TeamDiagnostic[] = []
+    await openCodeSessionBridge.observePreview(record, {
+      timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
+      idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
+    }).catch(error => {
+      settleDiagnostics.push(teamDiagnostic(
+        'member_launch_preview_timeout',
+        `${name}: ${error instanceof Error ? error.message : String(error)}`,
+        'info',
+      ))
+    })
+
+    try {
+      const reconciled = await withTimeout(
+        openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
+        OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
+      )
+      return { name, record, reconciled, diagnostics: settleDiagnostics }
+    } catch (error) {
+      settleDiagnostics.push(teamDiagnostic(
+        'member_launch_reconcile_pending',
+        `${name}: ${error instanceof Error ? error.message : String(error)}`,
+        'warning',
+      ))
+      return { name, record, reconciled: null, diagnostics: settleDiagnostics }
+    }
+  })
+
+  for (const settled of settledMembers) {
+    const { name, record, reconciled } = settled
+    if (reconciled) {
       const launchState = bridgeStateFromSummary(reconciled.summary)
       members[name] = {
         sessionId: record.opencodeSessionId,
@@ -900,21 +1066,20 @@ async function runLaunch(envelope: BridgeEnvelope) {
       diagnostics.push(
         ...reconciled.summary.diagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
       )
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
+    } else {
       members[name] = {
-        sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
-        launchState: 'failed',
-        ...(typeof record?.runtimePid === 'number' && record.runtimePid > 0
+        sessionId: record.opencodeSessionId,
+        launchState: 'created',
+        ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
           ? { runtimePid: record.runtimePid }
           : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
             ? { runtimePid: snapshot.host.pid }
             : {}),
-        evidence: [{ kind: 'member_launch_failed', observedAt: nowIso() }],
-        diagnostics: [reason],
+        evidence: [{ kind: 'member_prompt_accepted', observedAt: nowIso() }],
+        diagnostics: settled.diagnostics.map(diagnostic => diagnostic.message),
       }
-      diagnostics.push(teamDiagnostic('member_launch_failed', `${name}: ${reason}`, 'error'))
     }
+    diagnostics.push(...settled.diagnostics)
   }
 
   return {
@@ -1128,19 +1293,47 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
 
+  const runId = asString(body.runId)
+  const identityReminder = runId
+    ? buildOpenCodeRuntimeIdentityBlock({
+      teamName: teamId,
+      memberName,
+      runId,
+      runtimeSessionId: record.opencodeSessionId,
+      purpose: 'reminder',
+    })
+    : null
+
   await openCodeSessionBridge.promptAsync(record, {
-    text,
+    text: identityReminder ? `${identityReminder}\n\n${text}` : text,
     agent: asString(body.agent) ?? 'teammate',
     noReply: body.noReply === true,
   })
 
-  const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
-  const runtimePid =
-    typeof reconciled.record.runtimePid === 'number' && reconciled.record.runtimePid > 0
-      ? reconciled.record.runtimePid
-      : typeof record.runtimePid === 'number' && record.runtimePid > 0
-        ? record.runtimePid
-        : undefined
+  let runtimePid =
+    typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
+  let reconcileDiagnostics: TeamDiagnostic[] = []
+  try {
+    const reconciled = await withTimeout(
+      openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
+      OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
+    )
+    runtimePid =
+      typeof reconciled.record.runtimePid === 'number' && reconciled.record.runtimePid > 0
+        ? reconciled.record.runtimePid
+        : runtimePid
+    reconcileDiagnostics = reconciled.summary.diagnostics.map(message =>
+      teamDiagnostic('opencode_send_reconcile', message, 'info'),
+    )
+  } catch (error) {
+    reconcileDiagnostics = [
+      teamDiagnostic(
+        'opencode_send_reconcile_failed_after_prompt_accept',
+        error instanceof Error ? error.message : String(error),
+        'warning',
+      ),
+    ]
+  }
 
   return {
     snapshot,
@@ -1149,9 +1342,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       sessionId: record.opencodeSessionId,
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
-      diagnostics: reconciled.summary.diagnostics.map(message =>
-        teamDiagnostic('opencode_send_reconcile', message, 'info'),
-      ),
+      diagnostics: reconcileDiagnostics,
     },
   }
 }

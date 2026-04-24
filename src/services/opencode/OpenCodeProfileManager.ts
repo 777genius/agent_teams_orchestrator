@@ -167,6 +167,8 @@ export function buildManagedConfig(
           },
           external_directory: 'deny',
           doom_loop: 'deny',
+          'agent-teams_*': 'allow',
+          'agent_teams_*': 'allow',
         },
       },
     },

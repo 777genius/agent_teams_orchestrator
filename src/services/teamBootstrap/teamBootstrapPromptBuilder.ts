@@ -91,6 +91,8 @@ export async function buildDeterministicBootstrapMemberPrompt(params: {
   leadName?: string
   assignedWorkMembers?: Set<string>
 }): Promise<string> {
+  // Native persistent-teammate bootstrap only. OpenCode runtime identity and
+  // member_briefing(runtimeProvider: "opencode") are injected by the bridge.
   const displayName = params.spec.team.displayName?.trim() || params.spec.team.name
   const leadName = params.leadName ?? (await resolveBootstrapLeadName(params.spec))
   const agentLanguageInstruction = buildAgentLanguageInstruction(
