@@ -420,11 +420,21 @@ export class OpenCodeSessionBridge {
       projectPath: profile.projectPath,
       runId: params.runId ?? null,
     })
-    await this.sessionStore.upsert(created.record)
-    this.retainedSessionHosts.set(
-      this.buildSessionKey(created.record),
-      created.retainedHostKey,
-    )
+    try {
+      await this.sessionStore.upsert(created.record)
+      this.retainedSessionHosts.set(
+        this.buildSessionKey(created.record),
+        created.retainedHostKey,
+      )
+    } catch (error) {
+      await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
+        teamId: created.record.teamId,
+        laneId: created.record.laneId,
+        memberName: created.record.memberName,
+      }).catch(() => undefined)
+      await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
+      throw error
+    }
     return created.record
   }
 
