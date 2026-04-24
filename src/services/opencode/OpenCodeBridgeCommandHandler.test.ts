@@ -6,6 +6,7 @@ import {
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -272,6 +273,7 @@ function mockRequiredMcpTools(): void {
 
 const originalProbe = openCodeProvisioningProbe.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
+const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
@@ -313,6 +315,7 @@ afterEach(() => {
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
+  openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.promptAsync = originalPromptAsync
   openCodeSessionBridge.reconcileSession = originalReconcileSession
@@ -349,6 +352,56 @@ function createDeferred<T>() {
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  test('executes host cleanup without provisioning a readiness host', async () => {
+    let probeCalled = false
+    let cleanupInput: unknown = null
+    openCodeProvisioningProbe.probe = (async () => {
+      probeCalled = true
+      throw new Error('cleanup must not probe readiness or spawn a host')
+    }) as typeof openCodeProvisioningProbe.probe
+    openCodeHostManager.reconcilePersistentHosts = (async (input) => {
+      cleanupInput = input
+      return {
+        cleaned: 1,
+        remaining: 0,
+        hosts: [
+          {
+            hostKey: 'host-key',
+            projectPath: '/tmp/project',
+            pid: 123,
+            port: 43116,
+            action: 'disposed',
+            reason: 'stale host has no active leases during startup',
+            leaseCount: 0,
+          },
+        ],
+        diagnostics: [],
+      }
+    }) as typeof openCodeHostManager.reconcilePersistentHosts
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.cleanupHosts', {
+        reason: 'startup',
+        mode: 'stale',
+        projectPath: '/tmp/project',
+        staleAgeMs: 1_000,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeCalled).toBe(false)
+    expect(cleanupInput).toEqual({
+      mode: 'stale',
+      reason: 'startup',
+      projectPath: '/tmp/project',
+      staleAgeMs: 1_000,
+    })
+    if (result.ok) {
+      expect(result.data.cleaned).toBe(1)
+      expect(result.runtime.capabilitySnapshotId).toBeNull()
+    }
+  })
+
   test('compatibility mode without execution probe still rejects unknown raw model ids', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()

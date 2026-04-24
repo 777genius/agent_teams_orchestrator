@@ -32,7 +32,28 @@ type OpenCodeHostManagerDeps = {
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
   isProcessAlive?: (pid: number) => boolean
+  killProcess?: (pid: number, signal: NodeJS.Signals) => void
+  now?: () => Date
   persistentRegistryPath?: string | null
+}
+
+export type OpenCodeHostLeaseInput = {
+  teamId: string
+  laneId?: string | null
+  memberName: string
+  runId?: string | null
+  sessionId?: string | null
+}
+
+type PersistentHostLeaseRecord = {
+  leaseKey: string
+  teamId: string
+  laneId: string
+  memberName: string
+  runId: string | null
+  sessionId: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 type PersistentHostRegistryRecord = {
@@ -47,11 +68,41 @@ type PersistentHostRegistryRecord = {
   version: string | null
   resolvedConfigFingerprint: string | null
   updatedAt: string
+  leases?: Record<string, PersistentHostLeaseRecord>
 }
 
 type PersistentHostRegistryShape = {
   schemaVersion: 1
   hosts: Record<string, PersistentHostRegistryRecord>
+}
+
+export type OpenCodePersistentHostReconcileOptions = {
+  mode?: 'stale' | 'force'
+  reason?: 'startup' | 'shutdown' | 'manual' | string
+  projectPath?: string | null
+  staleAgeMs?: number | null
+}
+
+export type OpenCodePersistentHostReconcileResult = {
+  cleaned: number
+  remaining: number
+  hosts: Array<{
+    hostKey: string
+    projectPath: string
+    pid: number
+    port: number
+    action:
+      | 'disposed'
+      | 'removed_dead'
+      | 'kept_active'
+      | 'kept_leased'
+      | 'kept_recent'
+      | 'kept_filtered'
+      | 'failed'
+    reason: string
+    leaseCount: number
+  }>
+  diagnostics: string[]
 }
 
 function hashJson(value: unknown): string {
@@ -156,6 +207,57 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+function buildLeaseKey(input: OpenCodeHostLeaseInput): string {
+  const teamId = input.teamId.trim()
+  const laneId = input.laneId?.trim() || 'primary'
+  const memberName = input.memberName.trim()
+  if (!teamId || !memberName) {
+    throw new Error('OpenCode host lease requires teamId and memberName')
+  }
+  return `${teamId}::${laneId}::${memberName}`
+}
+
+function normalizePersistentHostLeases(
+  value: unknown,
+): Record<string, PersistentHostLeaseRecord> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {}
+  }
+
+  const leases: Record<string, PersistentHostLeaseRecord> = {}
+  for (const [key, rawLease] of Object.entries(value as Record<string, unknown>)) {
+    if (!rawLease || typeof rawLease !== 'object' || Array.isArray(rawLease)) {
+      continue
+    }
+    const lease = rawLease as Partial<PersistentHostLeaseRecord>
+    if (
+      typeof lease.teamId !== 'string'
+      || typeof lease.laneId !== 'string'
+      || typeof lease.memberName !== 'string'
+      || typeof lease.createdAt !== 'string'
+      || typeof lease.updatedAt !== 'string'
+    ) {
+      continue
+    }
+    const leaseKey = typeof lease.leaseKey === 'string' && lease.leaseKey.trim()
+      ? lease.leaseKey
+      : key
+    leases[leaseKey] = {
+      leaseKey,
+      teamId: lease.teamId,
+      laneId: lease.laneId,
+      memberName: lease.memberName,
+      runId: typeof lease.runId === 'string' && lease.runId.trim() ? lease.runId : null,
+      sessionId: typeof lease.sessionId === 'string' && lease.sessionId.trim()
+        ? lease.sessionId
+        : null,
+      createdAt: lease.createdAt,
+      updatedAt: lease.updatedAt,
+    }
+  }
+  return leases
+}
+
 export class OpenCodeHostManager {
   private readonly hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
@@ -191,6 +293,18 @@ export class OpenCodeHostManager {
     return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
   }
 
+  private killProcess(pid: number, signal: NodeJS.Signals): void {
+    ;(this.deps.killProcess ?? process.kill)(pid, signal)
+  }
+
+  private now(): Date {
+    return (this.deps.now ?? (() => new Date()))()
+  }
+
+  private nowIso(): string {
+    return this.now().toISOString()
+  }
+
   private async readPersistentRegistry(): Promise<PersistentHostRegistryShape> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
@@ -202,7 +316,18 @@ export class OpenCodeHostManager {
       if (parsed.schemaVersion !== 1 || !parsed.hosts || typeof parsed.hosts !== 'object') {
         return { schemaVersion: 1, hosts: {} }
       }
-      return { schemaVersion: 1, hosts: parsed.hosts as Record<string, PersistentHostRegistryRecord> }
+      const hosts = Object.fromEntries(
+        Object.entries(parsed.hosts as Record<string, PersistentHostRegistryRecord>).map(
+          ([hostKey, record]) => [
+            hostKey,
+            {
+              ...record,
+              leases: normalizePersistentHostLeases(record.leases),
+            },
+          ],
+        ),
+      )
+      return { schemaVersion: 1, hosts }
     } catch {
       return { schemaVersion: 1, hosts: {} }
     }
@@ -225,6 +350,7 @@ export class OpenCodeHostManager {
       return
     }
     const registry = await this.readPersistentRegistry()
+    const previous = registry.hosts[handle.hostKey]
     registry.hosts[handle.hostKey] = {
       hostKey: handle.hostKey,
       profileRootKey: handle.profileRootKey,
@@ -236,7 +362,8 @@ export class OpenCodeHostManager {
       pid: handle.pid,
       version: handle.version,
       resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
-      updatedAt: new Date().toISOString(),
+      updatedAt: this.nowIso(),
+      leases: normalizePersistentHostLeases(previous?.leases),
     }
     await this.writePersistentRegistry(registry)
   }
@@ -254,6 +381,74 @@ export class OpenCodeHostManager {
     if (Object.keys(registry.hosts).length === 0) {
       await unlink(registryPath).catch(() => undefined)
       return
+    }
+    await this.writePersistentRegistry(registry)
+  }
+
+  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return
+    }
+
+    const leaseKey = buildLeaseKey(input)
+    let registry = await this.readPersistentRegistry()
+    let record = registry.hosts[hostKey]
+    if (!record) {
+      const entry = this.hosts.get(hostKey)
+      if (!entry) {
+        return
+      }
+      await this.upsertPersistentHost(entry.handle)
+      registry = await this.readPersistentRegistry()
+      record = registry.hosts[hostKey]
+      if (!record) {
+        return
+      }
+    }
+
+    const now = this.nowIso()
+    const leases = normalizePersistentHostLeases(record.leases)
+    const previous = leases[leaseKey]
+    leases[leaseKey] = {
+      leaseKey,
+      teamId: input.teamId.trim(),
+      laneId: input.laneId?.trim() || 'primary',
+      memberName: input.memberName.trim(),
+      runId: input.runId?.trim() || null,
+      sessionId: input.sessionId?.trim() || null,
+      createdAt: previous?.createdAt ?? now,
+      updatedAt: now,
+    }
+    registry.hosts[hostKey] = {
+      ...record,
+      leases,
+      updatedAt: now,
+    }
+    await this.writePersistentRegistry(registry)
+  }
+
+  async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return
+    }
+
+    const leaseKey = buildLeaseKey(input)
+    const registry = await this.readPersistentRegistry()
+    const record = registry.hosts[hostKey]
+    if (!record) {
+      return
+    }
+    const leases = normalizePersistentHostLeases(record.leases)
+    if (!leases[leaseKey]) {
+      return
+    }
+    delete leases[leaseKey]
+    registry.hosts[hostKey] = {
+      ...record,
+      leases,
+      updatedAt: this.nowIso(),
     }
     await this.writePersistentRegistry(registry)
   }
@@ -562,26 +757,220 @@ export class OpenCodeHostManager {
     return fingerprint
   }
 
-  async disposeHost(hostKey: string): Promise<boolean> {
-    const entry = this.hosts.get(hostKey)
-    if (!entry) {
-      return false
-    }
+  private async terminatePersistentHostRecord(
+    record: PersistentHostRegistryRecord,
+    options: { force: boolean },
+  ): Promise<void> {
+    const entry = this.hosts.get(record.hostKey)
+    const baseUrl = entry?.handle.baseUrl ?? record.baseUrl
+    const pid = entry?.handle.pid ?? record.pid
 
     try {
-      await this.fetchJson(`${entry.handle.baseUrl}/global/dispose`, {
+      await this.fetchJson(`${baseUrl}/global/dispose`, {
         method: 'POST',
       })
     } catch {
       // Best effort.
     }
 
-    entry.child?.kill('SIGTERM')
-    entry.handle.state = 'disposed'
-    this.hosts.delete(hostKey)
-    this.pendingHosts.delete(hostKey)
+    if (entry?.child) {
+      entry.child.kill('SIGTERM')
+    } else if (pid > 0 && this.isProcessAlive(pid)) {
+      try {
+        this.killProcess(pid, 'SIGTERM')
+      } catch {
+        // Best effort.
+      }
+    }
+
+    if (options.force && pid > 0) {
+      await this.sleepMs(250)
+      if (this.isProcessAlive(pid)) {
+        try {
+          this.killProcess(pid, 'SIGKILL')
+        } catch {
+          // Best effort.
+        }
+      }
+    }
+
+    if (entry) {
+      entry.handle.state = 'disposed'
+    }
+    this.hosts.delete(record.hostKey)
+    this.pendingHosts.delete(record.hostKey)
+  }
+
+  async disposeHost(hostKey: string): Promise<boolean> {
+    const entry = this.hosts.get(hostKey)
+    if (!entry) {
+      return false
+    }
+
+    await this.terminatePersistentHostRecord(
+      {
+        hostKey,
+        profileRootKey: entry.handle.profileRootKey,
+        projectPath: entry.handle.projectPath,
+        projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
+        baseUrl: entry.handle.baseUrl,
+        port: entry.handle.port,
+        pid: entry.handle.pid,
+        version: entry.handle.version,
+        resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
+        updatedAt: this.nowIso(),
+        leases: {},
+      },
+      { force: false },
+    )
     await this.removePersistentHost(hostKey).catch(() => undefined)
     return true
+  }
+
+  async reconcilePersistentHosts(
+    options: OpenCodePersistentHostReconcileOptions = {},
+  ): Promise<OpenCodePersistentHostReconcileResult> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return {
+        cleaned: 0,
+        remaining: 0,
+        hosts: [],
+        diagnostics: ['OpenCode host registry is disabled'],
+      }
+    }
+
+    const registry = await this.readPersistentRegistry()
+    const hosts: OpenCodePersistentHostReconcileResult['hosts'] = []
+    const diagnostics: string[] = []
+    let cleaned = 0
+    let changed = false
+    const mode = options.mode ?? 'stale'
+    const force = mode === 'force'
+    const nowMs = this.now().getTime()
+
+    for (const [hostKey, record] of Object.entries(registry.hosts)) {
+      const leases = normalizePersistentHostLeases(record.leases)
+      const leaseCount = Object.keys(leases).length
+      const entry = this.hosts.get(hostKey)
+      const projectPath = options.projectPath?.trim()
+      if (projectPath && record.projectPath !== projectPath) {
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'kept_filtered',
+          reason: `project path does not match ${projectPath}`,
+          leaseCount,
+        })
+        continue
+      }
+
+      if (!this.isProcessAlive(record.pid)) {
+        delete registry.hosts[hostKey]
+        cleaned += 1
+        changed = true
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'removed_dead',
+          reason: 'registered host process is not alive',
+          leaseCount,
+        })
+        continue
+      }
+
+      if (!force && entry && entry.refCount > 0) {
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'kept_active',
+          reason: `host has active in-process refCount=${entry.refCount}`,
+          leaseCount,
+        })
+        continue
+      }
+
+      if (!force && leaseCount > 0) {
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'kept_leased',
+          reason: `host has ${leaseCount} active lease${leaseCount === 1 ? '' : 's'}`,
+          leaseCount,
+        })
+        continue
+      }
+
+      if (!force && typeof options.staleAgeMs === 'number' && options.staleAgeMs > 0) {
+        const updatedAtMs = Date.parse(record.updatedAt)
+        const ageMs = Number.isFinite(updatedAtMs) ? nowMs - updatedAtMs : Number.POSITIVE_INFINITY
+        if (ageMs < options.staleAgeMs) {
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'kept_recent',
+            reason: `host updated ${Math.max(0, ageMs)}ms ago`,
+            leaseCount,
+          })
+          continue
+        }
+      }
+
+      try {
+        await this.terminatePersistentHostRecord(record, { force })
+        delete registry.hosts[hostKey]
+        cleaned += 1
+        changed = true
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'disposed',
+          reason: force
+            ? `force cleanup during ${options.reason ?? 'manual'}`
+            : `stale host has no active leases during ${options.reason ?? 'manual'}`,
+          leaseCount,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        diagnostics.push(`Failed to dispose OpenCode host ${hostKey}: ${message}`)
+        hosts.push({
+          hostKey,
+          projectPath: record.projectPath,
+          pid: record.pid,
+          port: record.port,
+          action: 'failed',
+          reason: message,
+          leaseCount,
+        })
+      }
+    }
+
+    if (changed) {
+      if (Object.keys(registry.hosts).length === 0) {
+        await unlink(registryPath).catch(() => undefined)
+      } else {
+        await this.writePersistentRegistry(registry)
+      }
+    }
+
+    return {
+      cleaned,
+      remaining: Object.keys(registry.hosts).length,
+      hosts,
+      diagnostics,
+    }
   }
 
   async releaseHost(hostKey: string): Promise<void> {

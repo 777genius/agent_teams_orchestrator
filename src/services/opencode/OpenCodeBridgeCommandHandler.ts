@@ -16,6 +16,7 @@ import {
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
@@ -36,6 +37,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
   'opencode.readiness',
+  'opencode.cleanupHosts',
   'opencode.launchTeam',
   'opencode.reconcileTeam',
   'opencode.stopTeam',
@@ -905,6 +907,23 @@ async function runReadiness(envelope: BridgeEnvelope) {
   }
 }
 
+async function runCleanupHosts(envelope: BridgeEnvelope) {
+  const mode = asString(envelope.body.mode) === 'force' ? 'force' : 'stale'
+  const staleAgeMs = typeof envelope.body.staleAgeMs === 'number'
+    ? envelope.body.staleAgeMs
+    : null
+  const result = await openCodeHostManager.reconcilePersistentHosts({
+    mode,
+    reason: asString(envelope.body.reason) ?? 'manual',
+    projectPath: asString(envelope.body.projectPath),
+    staleAgeMs,
+  })
+  return {
+    snapshot: null,
+    data: result,
+  }
+}
+
 function isAppMcpConnected(snapshot: OpenCodeProvisioningSnapshot): boolean {
   return snapshot.appMcp?.connected === true ||
     snapshot.appMcp?.status === 'present' ||
@@ -985,6 +1004,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
         selectedModel: apiSelectedModel,
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
+        runId,
       })
       const runtimeIdentityBlock = buildOpenCodeRuntimeIdentityBlock({
         teamName: teamId,
@@ -1559,6 +1579,8 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
     }
     case 'opencode.readiness':
       return runReadiness(envelope)
+    case 'opencode.cleanupHosts':
+      return runCleanupHosts(envelope)
     case 'opencode.launchTeam':
       return runLaunch(envelope)
     case 'opencode.reconcileTeam':

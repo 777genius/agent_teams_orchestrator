@@ -21,6 +21,7 @@ import type {
 
 type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
+    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
@@ -111,6 +112,7 @@ export class OpenCodeSessionBridge {
     selectedModel: string
     title?: string | null
     projectPath?: string | null
+    runId?: string | null
   }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
     const host = await this.hostManager.ensureHost({
       projectPath: params.projectPath,
@@ -122,10 +124,7 @@ export class OpenCodeSessionBridge {
         title: params.title?.trim() || `${params.identity.teamId} - ${params.identity.memberName}`,
       })
       const now = buildNowIso()
-
-      return {
-        retainedHostKey: host.hostKey,
-        record: {
+      const record: OpenCodeSessionRecord = {
         teamId: params.identity.teamId,
         laneId: params.identity.laneId,
         memberName: params.identity.memberName,
@@ -146,7 +145,18 @@ export class OpenCodeSessionBridge {
         staleReason: null,
         createdAt: now,
         updatedAt: now,
-        },
+      }
+      await this.hostManager.retainHostLease?.(host.hostKey, {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+        sessionId: session.id,
+      }).catch(() => undefined)
+
+      return {
+        retainedHostKey: host.hostKey,
+        record,
       }
     } catch (error) {
       await this.hostManager.releaseHost(host.hostKey)
@@ -158,9 +168,16 @@ export class OpenCodeSessionBridge {
     return `${identity.teamId}::${identity.laneId}::${identity.memberName}`
   }
 
-  private async retainSessionHost(record: OpenCodeSessionRecord) {
+  private async retainSessionHost(record: OpenCodeSessionRecord, runId?: string | null) {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
+      await this.hostManager.retainHostLease?.(record.hostKey, {
+        teamId: record.teamId,
+        laneId: record.laneId,
+        memberName: record.memberName,
+        runId: runId ?? null,
+        sessionId: record.opencodeSessionId,
+      }).catch(() => undefined)
       return null
     }
 
@@ -168,6 +185,13 @@ export class OpenCodeSessionBridge {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
     })
+    await this.hostManager.retainHostLease?.(record.hostKey, {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+      runId: runId ?? null,
+      sessionId: record.opencodeSessionId,
+    }).catch(() => undefined)
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
     return host
   }
@@ -175,6 +199,11 @@ export class OpenCodeSessionBridge {
   async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
+    await this.hostManager.releaseHostLease?.(record.hostKey, {
+      teamId: record.teamId,
+      laneId: record.laneId,
+      memberName: record.memberName,
+    }).catch(() => undefined)
     if (!retainedHostKey) {
       return
     }
@@ -336,6 +365,7 @@ export class OpenCodeSessionBridge {
     selectedModel: string
     title?: string | null
     projectPath?: string | null
+    runId?: string | null
   }): Promise<OpenCodeSessionRecord> {
     const profile = await this.prepareProfile(params.projectPath)
     const laneId = params.laneId?.trim() || 'primary'
@@ -348,7 +378,7 @@ export class OpenCodeSessionBridge {
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
       !existing.staleReason
     ) {
-      const host = await this.retainSessionHost(existing)
+      const host = await this.retainSessionHost(existing, params.runId)
       return host?.pid && host.pid > 0 ? { ...existing, runtimePid: host.pid } : existing
     }
 
@@ -382,6 +412,7 @@ export class OpenCodeSessionBridge {
       selectedModel: params.selectedModel,
       title: params.title,
       projectPath: profile.projectPath,
+      runId: params.runId ?? null,
     })
     await this.sessionStore.upsert(created.record)
     this.retainedSessionHosts.set(

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -261,6 +261,265 @@ describe('OpenCodeHostManager', () => {
       expect(adopted.pid).toBe(created.pid)
       expect(adopted.baseUrl).toBe(created.baseUrl)
       expect(adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('persists and releases team leases for a managed host', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess()
+
+    try {
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43115,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: async (url) => {
+          if (url.endsWith('/global/health')) {
+            return { status: 200, data: { healthy: true, version: '1.4.0' } }
+          }
+          if (url.endsWith('/config')) {
+            return { status: 200, data: { server: { port: 43115 } } }
+          }
+          if (url.endsWith('/config/providers')) {
+            return { status: 200, data: { providers: [] } }
+          }
+          if (url.endsWith('/agent')) {
+            return { status: 200, data: [] }
+          }
+          if (url.endsWith('/mcp')) {
+            return { status: 200, data: {} }
+          }
+          return { status: 200, data: { ok: true } }
+        },
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const handle = await manager.ensureHost({ hostKey: 'host-key' })
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-1',
+      })
+
+      let registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(Object.keys(registry.hosts['host-key']?.leases ?? {})).toEqual([
+        'team-a::primary::alice',
+      ])
+
+      await manager.releaseHostLease(handle.hostKey, {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+      })
+      registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(registry.hosts['host-key']?.leases).toEqual({})
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup cleanup disposes stale registry hosts without active leases', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+    const disposeUrls: string[] = []
+
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-key': {
+              hostKey: 'host-key',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43116',
+              port: 43116,
+              pid: 43116,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:00:00.000Z',
+              leases: {},
+            },
+          },
+        }),
+        'utf8',
+      )
+      const manager = new OpenCodeHostManager({
+        fetchJson: async (url) => {
+          disposeUrls.push(url)
+          return { status: 200, data: { ok: true } }
+        },
+        isProcessAlive: pid => pid === 43116,
+        killProcess: (pid, signal) => {
+          killedSignals.push({ pid, signal })
+        },
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({
+        reason: 'startup',
+        mode: 'stale',
+        staleAgeMs: 1_000,
+      })
+
+      expect(result.cleaned).toBe(1)
+      expect(result.hosts[0]?.action).toBe('disposed')
+      expect(disposeUrls).toEqual(['http://127.0.0.1:43116/global/dispose'])
+      expect(killedSignals).toEqual([{ pid: 43116, signal: 'SIGTERM' }])
+      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup cleanup keeps leased registry hosts', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const killedSignals: Array<NodeJS.Signals> = []
+
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-key': {
+              hostKey: 'host-key',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43117',
+              port: 43117,
+              pid: 43117,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:00:00.000Z',
+              leases: {
+                'team-a::primary::alice': {
+                  leaseKey: 'team-a::primary::alice',
+                  teamId: 'team-a',
+                  laneId: 'primary',
+                  memberName: 'alice',
+                  runId: 'run-1',
+                  sessionId: 'session-1',
+                  createdAt: '2026-04-24T09:00:00.000Z',
+                  updatedAt: '2026-04-24T09:00:00.000Z',
+                },
+              },
+            },
+          },
+        }),
+        'utf8',
+      )
+      const manager = new OpenCodeHostManager({
+        fetchJson: async () => {
+          throw new Error('leased host should not be disposed')
+        },
+        isProcessAlive: pid => pid === 43117,
+        killProcess: (_pid, signal) => {
+          killedSignals.push(signal)
+        },
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({
+        reason: 'startup',
+        mode: 'stale',
+        staleAgeMs: 1_000,
+      })
+
+      expect(result.cleaned).toBe(0)
+      expect(result.hosts[0]?.action).toBe('kept_leased')
+      expect(killedSignals).toEqual([])
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>
+      }
+      expect(Object.keys(registry.hosts)).toEqual(['host-key'])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('shutdown cleanup force-disposes leased registry hosts', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-key': {
+              hostKey: 'host-key',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43118',
+              port: 43118,
+              pid: 43118,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:00:00.000Z',
+              leases: {
+                'team-a::primary::alice': {
+                  leaseKey: 'team-a::primary::alice',
+                  teamId: 'team-a',
+                  laneId: 'primary',
+                  memberName: 'alice',
+                  runId: 'run-1',
+                  sessionId: 'session-1',
+                  createdAt: '2026-04-24T09:00:00.000Z',
+                  updatedAt: '2026-04-24T09:00:00.000Z',
+                },
+              },
+            },
+          },
+        }),
+        'utf8',
+      )
+      const manager = new OpenCodeHostManager({
+        fetchJson: async () => ({ status: 200, data: { ok: true } }),
+        isProcessAlive: pid => pid === 43118,
+        killProcess: (pid, signal) => {
+          killedSignals.push({ pid, signal })
+        },
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({
+        reason: 'shutdown',
+        mode: 'force',
+      })
+
+      expect(result.cleaned).toBe(1)
+      expect(result.hosts[0]?.action).toBe('disposed')
+      expect(killedSignals).toEqual([
+        { pid: 43118, signal: 'SIGTERM' },
+        { pid: 43118, signal: 'SIGKILL' },
+      ])
+      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
