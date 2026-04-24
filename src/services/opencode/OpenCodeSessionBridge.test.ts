@@ -262,6 +262,92 @@ describe('OpenCodeSessionBridge', () => {
     expect(upserts).toHaveLength(1)
   })
 
+  test('releases a fresh host lease when session persistence fails', async () => {
+    const retainedLeases: unknown[] = []
+    const releasedLeases: unknown[] = []
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => {
+          throw new Error('disk write failed')
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {
+          releaseHostCalls += 1
+        },
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeases.push(input)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeases.push(input)
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-new' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(
+      bridge.ensureSession({
+        teamId: 'team-a',
+        memberName: 'alice',
+        selectedModel: 'openai/gpt-5.4-mini',
+        projectPath: '/tmp/project',
+        runId: 'run-1',
+      }),
+    ).rejects.toThrow('disk write failed')
+
+    expect(retainedLeases).toEqual([
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-new',
+      },
+    ])
+    expect(releasedLeases).toEqual([
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+      },
+    ])
+    expect(releaseHostCalls).toBe(1)
+  })
+
   test('sends provider-scoped model data when posting a message', async () => {
     const sentBodies: unknown[] = []
     const bridge = new OpenCodeSessionBridge({
