@@ -59,6 +59,12 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members).toHaveLength(1)
     expect(request.members[0]?.prompt).toContain('member_briefing')
     expect(request.members[0]?.prompt).toContain('forge-labs')
+    expect(request.members[0]?.prompt).toContain(
+      'retry tool search at most once',
+    )
+    expect(request.members[0]?.prompt).toContain(
+      'Do NOT keep searching for member_briefing',
+    )
     expect(request.members[0]?.prompt).toContain('Communicate in English')
     expect(request.members[0]?.prompt).toContain(
       'Review flow rule: review is a state transition on the SAME work task'

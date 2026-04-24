@@ -256,9 +256,12 @@ function createQueuedLineStream(
     input: stderr,
     crlfDelay: Infinity,
   })
+  const onStreamData = () => onActivity?.()
 
   stdoutInterface.on('line', line => onLine('stdout', line))
   stderrInterface.on('line', line => onLine('stderr', line))
+  stdout.on('data', onStreamData)
+  stderr.on('data', onStreamData)
   stdout.once('end', onClose)
   stderr.once('end', onClose)
   process.once('close', () => {
@@ -283,6 +286,8 @@ function createQueuedLineStream(
         }
       }
     } finally {
+      stdout.off('data', onStreamData)
+      stderr.off('data', onStreamData)
       stdoutInterface.close()
       stderrInterface.close()
     }

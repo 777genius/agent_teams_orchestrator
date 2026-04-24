@@ -397,6 +397,83 @@ describe('runCodexNativeExec', () => {
     expect(process.killed).toBe(false)
   })
 
+  test('resets the configured idle timeout on stdout bytes before a newline', async () => {
+    const process = new FakeCodexProcess()
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        idleTimeoutMs: 40,
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    const first = await iterator.next()
+    expect(first.done).toBe(false)
+
+    const remaining = (async () => {
+      const observed = []
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          return {
+            observed,
+            summary: next.value,
+          }
+        }
+        observed.push(next.value)
+      }
+    })()
+
+    setTimeout(() => {
+      process.stdout.write('partial')
+    }, 25)
+    setTimeout(() => {
+      process.stdout.write(
+        ' line\n{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}\n',
+      )
+      process.stdout.write(
+        '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\n',
+      )
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', 0, null)
+    }, 55)
+
+    const { observed, summary } = await remaining
+    expect(observed).toContainEqual({
+      type: 'normalized_event',
+      event: {
+        type: 'assistant_text',
+        itemId: 'item_0',
+        text: 'OK',
+      },
+    })
+    expect(observed).toContainEqual({
+      type: 'normalized_event',
+      event: {
+        type: 'usage_updated',
+        inputTokens: 1,
+        cachedInputTokens: 0,
+        outputTokens: 1,
+      },
+    })
+    expect(observed).toContainEqual({
+      type: 'normalized_event',
+      event: {
+        type: 'turn_completed',
+      },
+    })
+    expect(summary).toMatchObject({
+      threadId: null,
+    })
+    expect(process.killed).toBe(false)
+  })
+
   test('terminates after the absolute timeout even when output is active', async () => {
     const process = new FakeCodexProcess()
     const iterator = runCodexNativeExec(

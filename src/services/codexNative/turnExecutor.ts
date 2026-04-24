@@ -516,6 +516,19 @@ export async function* executeCodexNativeTurn(
         recordTranscriptImpl,
       })
     }
+    const assistantMessage = createAssistantAPIErrorMessage({
+      content: message,
+      errorDetails: message,
+    })
+    params.mutableMessages.push(assistantMessage)
+    params.transcriptMessages.push(assistantMessage)
+    await persistMessages(
+      params.transcriptMessages,
+      params.persistSession,
+      recordTranscriptImpl,
+    )
+    yield* normalizeMessage(assistantMessage)
+    await maybeFlush(params.persistSession, flushSessionStorageImpl)
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message,

@@ -120,7 +120,9 @@ export async function buildDeterministicBootstrapMemberPrompt(params: {
     `{ teamName: "${params.spec.team.name}", memberName: "${params.member.name}" }`,
     'If tool search shows the prefixed MCP tool name instead, use mcp__agent-teams__member_briefing.',
     'Call the MCP tool directly yourself. Do NOT run a shell command named member_briefing. Do NOT use Agent, any subagent, or a delegated helper for this bootstrap step.',
-    `If member_briefing fails, send one short natural-language message to "${leadName}" with the exact error text.`,
+    'If tool search says agent-teams is still connecting, wait briefly and retry tool search at most once.',
+    `If member_briefing is still unavailable after that one retry, send exactly one short SendMessage to "${leadName}" with the exact error text, then stop this turn and wait.`,
+    'Do NOT keep searching for member_briefing, do NOT check tasks, and do NOT send repeated status or idle messages after reporting the bootstrap failure.',
     hasAssignedBoardWork
       ? 'After member_briefing succeeds, resume your queue normally and prioritize already-assigned board work before taking new blocking work.'
       : 'After member_briefing succeeds, wait for instructions from the lead and use team mailbox/task tools normally.',

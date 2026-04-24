@@ -1090,9 +1090,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
       members,
       diagnostics,
       commandEvidence,
-      warnings: asString(body.mode) === 'dogfood'
-        ? [{ code: 'opencode_dogfood_mode', message: 'OpenCode dogfood launch mode is active.' }]
-        : [],
+      warnings: [],
     }),
   }
 }
