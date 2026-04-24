@@ -25,6 +25,7 @@ import {
 import {
   createAssistantAPIErrorMessage,
   createAssistantMessage,
+  createSystemMessage,
   createUserMessage,
 } from '../utils/messages.js'
 
@@ -63,6 +64,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
 
     expect(prompt).toContain('onboarding/bootstrap instructions')
     expect(prompt).toContain('member_briefing')
+    expect(prompt).toContain('retry tool search at most once')
     expect(prompt).not.toBe('Process the queued teammate mailbox attachment for this turn.')
   })
 
@@ -176,6 +178,8 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     expect(prompt).toContain('memberName="alice"')
     expect(prompt).toContain('<bootstrap_instructions>')
     expect(prompt).toContain('Do not explore files, inbox paths, or team config')
+    expect(prompt).toContain('retry tool search at most once')
+    expect(prompt).toContain('Do not keep searching for member_briefing')
   })
 
   test('returns null inline handoff when teammate context is incomplete', () => {
@@ -187,7 +191,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBeNull()
   })
 
-  test('skips bootstrap readiness wait when a full inline handoff prompt is available', () => {
+  test('keeps bootstrap readiness wait when a full inline handoff prompt is available but tool is deferred', () => {
     expect(
       shouldSkipBootstrapReadinessWait({
         bootstrapInstructionText:
@@ -196,7 +200,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         memberName: 'alice',
         toolCallableNow: false,
       }),
-    ).toBe(true)
+    ).toBe(false)
   })
 
   test('keeps bootstrap readiness wait when teammate context is incomplete and tool is deferred', () => {
@@ -208,6 +212,18 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         toolCallableNow: false,
       }),
     ).toBe(false)
+  })
+
+  test('skips bootstrap readiness wait when member_briefing is callable', () => {
+    expect(
+      shouldSkipBootstrapReadinessWait({
+        bootstrapInstructionText:
+          'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs","memberName":"alice"}',
+        teamName: 'harbor-labs',
+        memberName: 'alice',
+        toolCallableNow: true,
+      }),
+    ).toBe(true)
   })
 
   test('treats prefixed member_briefing as callable when tool search is off', () => {
@@ -821,6 +837,37 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'noop' })
   })
 
+  test('lifecycle - bootstrap row ignores system-only activity while waiting for meaningful progress', () => {
+    const submitted = createUserMessage({
+      content: 'bootstrap handoff',
+      isMeta: true,
+      uuid: 'bootstrap-uuid',
+    })
+    const system = createSystemMessage('Codex native thread started.', 'info')
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, system],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+        },
+      }),
+    ).toEqual({ type: 'noop' })
+  })
+
   test('lifecycle - ordinary direct row finalizes only after SendMessage to user', () => {
     const submitted = createUserMessage({
       content: 'ordinary handoff',
@@ -941,6 +988,37 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'finalize' })
   })
 
+  test('lifecycle - ordinary non-user row does not finalize on system-only activity', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const system = createSystemMessage('Codex native thread started.', 'info')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, system],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Возьми следующую задачу.',
+        },
+      }),
+    ).toEqual({ type: 'noop' })
+  })
+
   test('detects Codex native timeout API error after an ordinary mailbox submit', () => {
     const submitted = createUserMessage({
       content: 'ordinary handoff',
@@ -961,6 +1039,47 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       type: 'codex_native_timeout',
       detail: 'Codex native exec timed out after 120000ms.',
     })
+  })
+
+  test('does not classify plain assistant text that mentions a prior Codex timeout as an execution error', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content:
+        'I saw the previous Codex native exec timed out after 120000ms, checked the diff, and continued.',
+    })
+
+    expect(
+      findOrdinaryAttemptExecutionError({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBeNull()
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Task assigned: taskId: "545b704e"',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
   })
 
   test('lifecycle - ordinary non-user Codex timeout schedules recovery instead of finalize', () => {
@@ -998,6 +1117,82 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       type: 'schedule_recovery',
       detail: 'Codex native exec timed out after 120000ms of inactivity.',
       taskRef: '545b704e',
+    })
+  })
+
+  test('lifecycle - initial non-user API error notifies failure instead of finalizing or retrying', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Rate limit reached.',
+      errorDetails: 'Rate limit reached.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Task assigned: taskId: "545b704e"',
+        },
+      }),
+    ).toEqual({
+      type: 'notify_failure',
+      detail: 'Rate limit reached.',
+      reason: 'execution_failed',
+      taskRef: '545b704e',
+    })
+  })
+
+  test('lifecycle - initial user API error still relays text to the user', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Rate limit reached.',
+      errorDetails: 'Rate limit reached.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'user',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Question from user',
+        },
+      }),
+    ).toEqual({
+      type: 'deliver_assistant_text',
+      text: 'Rate limit reached.',
     })
   })
 
@@ -1053,6 +1248,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({
       type: 'notify_failure',
       detail: 'Codex native exec timed out after 300000ms of inactivity.',
+      reason: 'timeout_recovery_failed',
       taskRef: '545b704e',
     })
   })
@@ -1092,6 +1288,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({
       type: 'notify_failure',
       detail: 'Rate limit reached.',
+      reason: 'timeout_recovery_failed',
       taskRef: '545b704e',
     })
   })

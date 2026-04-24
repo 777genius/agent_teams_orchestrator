@@ -113,6 +113,16 @@ jobs:
       - name: Compile runtime
         run: bun run compile
 
+      - name: Verify compiled runtime
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./dist/cli --version
+
+      - name: Verify compiled runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\dist\cli.exe --version
+
       - name: Package runtime archive
         if: runner.os != 'Windows'
         env:

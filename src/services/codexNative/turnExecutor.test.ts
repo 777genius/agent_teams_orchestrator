@@ -209,6 +209,87 @@ describe('executeCodexNativeTurn', () => {
     expect(observedAbsoluteTimeoutMs).toBeNull()
   })
 
+  test('records an assistant API error when native execution completes without assistant output', async () => {
+    const params = baseParams({
+      persistSession: true,
+    })
+    const persistenceCalls: string[] = []
+    const messages = await collectMessages(
+      executeCodexNativeTurn(params, {
+        runExec: async function* () {
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'thread_started',
+              threadId: 'thread-empty',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: 'thread-empty',
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+        recordTranscript: async messages => {
+          const lastMessage = messages.at(-1)
+          const kind =
+            lastMessage?.type === 'assistant' && lastMessage.isApiErrorMessage
+              ? 'api-error'
+              : 'normal'
+          persistenceCalls.push(
+            `record:${lastMessage?.type ?? 'none'}:${kind}`,
+          )
+          return '' as never
+        },
+        flushSessionStorage: async () => {
+          persistenceCalls.push('flush')
+        },
+      }),
+    )
+
+    expect(messages[0]).toMatchObject({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'text',
+            text: expect.stringContaining(
+              'completed without an assistant message',
+            ),
+          },
+        ],
+      },
+    })
+    expect(messages[1]).toMatchObject({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: [expect.stringContaining('completed without an assistant message')],
+    })
+    expect(params.mutableMessages.at(-1)).toMatchObject({
+      type: 'assistant',
+      isApiErrorMessage: true,
+      errorDetails: expect.stringContaining(
+        'completed without an assistant message',
+      ),
+    })
+    expect(persistenceCalls).toContain('record:assistant:api-error')
+    expect(persistenceCalls.at(-1)).toBe('flush')
+  })
+
   test('rejects non-text prompts conservatively', async () => {
     const params = baseParams({
       prompt: [

@@ -191,6 +191,7 @@ export function getQueuedMailboxMetaPrompt({
     'Follow the attachment immediately.',
     'If it instructs member_briefing, call the MCP tool member_briefing on the agent-teams server now.',
     'Do not run a shell command named member_briefing.',
+    'If agent-teams is still connecting, wait briefly and retry tool search at most once; if member_briefing is still unavailable after that, report the exact error once to team-lead and wait.',
     'Do not ask for clarification if the attachment is present and readable.',
     'After bootstrap completes, continue with normal team mailbox and task behavior.',
   ].join(' ')
@@ -271,7 +272,9 @@ export function getBootstrapInlineHandoffPrompt({
     'If tool search shows only the prefixed MCP name, use mcp__agent-teams__member_briefing.',
     'Call the MCP tool directly yourself. Do not run a shell command named member_briefing. Do not use Agent, any subagent, or a delegated helper for this bootstrap step.',
     'Do not explore files, inbox paths, or team config before the first member_briefing attempt.',
-    'If member_briefing fails, send one short natural-language message to "team-lead" with the exact error text.',
+    'If tool search says agent-teams is still connecting, wait briefly and retry tool search at most once.',
+    'If member_briefing is still unavailable after that one retry, send exactly one short SendMessage to "team-lead" with the exact error text, then stop this turn and wait.',
+    'Do not keep searching for member_briefing, do not check tasks, and do not send repeated status or idle messages after reporting the bootstrap failure.',
     'Bootstrap instructions from team-lead:',
     '<bootstrap_instructions>',
     bootstrapInstructionText,
@@ -289,13 +292,7 @@ export function shouldSkipBootstrapReadinessWait(params: {
     return true
   }
 
-  return (
-    getBootstrapInlineHandoffPrompt({
-      bootstrapInstructionText: params.bootstrapInstructionText,
-      teamName: params.teamName,
-      memberName: params.memberName,
-    }) !== null
-  )
+  return false
 }
 
 export function getOrdinaryInlineHandoffPrompt({
@@ -390,6 +387,21 @@ export function buildCodexNativeMailboxTimeoutLeadNotificationText({
     return `${memberName} could not recover a Codex native mailbox turn${taskText} after timeout. Marking the mailbox row processed to avoid an infinite loop. Last error: ${detail}`
   }
   return `${memberName} hit a Codex native mailbox timeout${taskText}. Scheduling one recovery turn that will inspect state before continuing. Error: ${detail}`
+}
+
+export function buildMailboxExecutionFailureLeadNotificationText({
+  memberName,
+  taskRef,
+  detail,
+}: {
+  memberName: string
+  taskRef?: string
+  detail: string
+}): string {
+  const taskText = taskRef
+    ? ` for ${formatTaskRefForHuman(taskRef)}`
+    : ''
+  return `${memberName} hit a mailbox turn execution error${taskText}. Marking the mailbox row processed to avoid an infinite loop. Error: ${detail}`
 }
 
 type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
@@ -503,7 +515,9 @@ function hasAttemptObservedPostSubmitActivity({
       break
     }
 
-    return true
+    if (message.type === 'assistant') {
+      return true
+    }
   }
 
   return false
@@ -696,6 +710,10 @@ export function findOrdinaryAttemptExecutionError({
       continue
     }
 
+    if (message.isApiErrorMessage !== true) {
+      continue
+    }
+
     const text = extractAssistantText(message)
     const errorDetails =
       'errorDetails' in message && typeof message.errorDetails === 'string'
@@ -710,17 +728,10 @@ export function findOrdinaryAttemptExecutionError({
       }
     }
 
-    if (detail && message.isApiErrorMessage === true) {
+    if (detail) {
       return {
         type: 'api_error',
         detail,
-      }
-    }
-
-    if (text && isCodexNativeExecTimeoutText(text)) {
-      return {
-        type: 'codex_native_timeout',
-        detail: text,
       }
     }
   }
@@ -840,6 +851,7 @@ type OrdinaryProcessingAction =
   | {
       type: 'notify_failure'
       detail: string
+      reason: 'execution_failed' | 'timeout_recovery_failed'
       taskRef?: string
     }
   | { type: 'deliver_assistant_text'; text: string }
@@ -928,10 +940,12 @@ export function getOrdinaryProcessingAction({
     return { type: 'finalize' }
   }
 
-  if (attempt.status === 'in_flight' && executionError) {
+  if (
+    attempt.status === 'in_flight' &&
+    executionError?.type === 'codex_native_timeout'
+  ) {
     const taskRef = extractTaskRefFromMailboxText(processingOrdinaryMessage.text)
     if (
-      executionError.type === 'codex_native_timeout' &&
       recoveryAttemptCount <
         ORDINARY_DIRECT_MESSAGE_MAX_AUTO_RECOVERY_ATTEMPTS
     ) {
@@ -941,17 +955,38 @@ export function getOrdinaryProcessingAction({
         taskRef,
       }
     }
-    if (
-      executionError.type === 'codex_native_timeout' ||
-      recoveryAttemptCount > 0
-    ) {
-      return {
-        type: 'notify_failure',
-        detail: executionError.detail,
-        taskRef,
-      }
+    return {
+      type: 'notify_failure',
+      detail: executionError.detail,
+      reason: 'timeout_recovery_failed',
+      taskRef,
     }
-    return { type: 'schedule_cooldown' }
+  }
+
+  if (
+    attempt.status === 'in_flight' &&
+    executionError &&
+    recoveryAttemptCount > 0
+  ) {
+    return {
+      type: 'notify_failure',
+      detail: executionError.detail,
+      reason: 'timeout_recovery_failed',
+      taskRef: extractTaskRefFromMailboxText(processingOrdinaryMessage.text),
+    }
+  }
+
+  if (
+    attempt.status === 'in_flight' &&
+    executionError &&
+    !requiresUserReply
+  ) {
+    return {
+      type: 'notify_failure',
+      detail: executionError.detail,
+      reason: 'execution_failed',
+      taskRef: extractTaskRefFromMailboxText(processingOrdinaryMessage.text),
+    }
   }
 
   if (attempt.status === 'cooling_down' && executionError) {
@@ -1025,6 +1060,7 @@ export function useInboxPoller({
   const ordinaryRecoveryRef = useRef<Map<string, OrdinaryRecoveryState>>(
     new Map(),
   )
+  const ordinaryTerminalFailureRef = useRef<Set<string>>(new Set())
   const ordinaryFinalizationInFlightRef = useRef<Set<string>>(new Set())
   const bootstrapReadinessWaitsRef = useRef<
     Map<string, BootstrapReadinessWaitState>
@@ -1046,6 +1082,7 @@ export function useInboxPoller({
       }
       ordinaryAttemptsRef.current.clear()
       ordinaryRecoveryRef.current.clear()
+      ordinaryTerminalFailureRef.current.clear()
       for (const waitState of bootstrapReadinessWaitsRef.current.values()) {
         if (waitState.timer) {
           clearTimeout(waitState.timer)
@@ -1104,8 +1141,15 @@ export function useInboxPoller({
       const silentlyFinalizedRegularMessages = claimedRegularMessages.filter(
         message => isSilentRegularMailboxMessageForLiveContext(message),
       )
+      const terminalFailedRegularMessages = claimedRegularMessages.filter(
+        message =>
+          !isSilentRegularMailboxMessageForLiveContext(message) &&
+          ordinaryTerminalFailureRef.current.has(message.messageId),
+      )
       const actionableClaimedRegularMessages = claimedRegularMessages.filter(
-        message => !isSilentRegularMailboxMessageForLiveContext(message),
+        message =>
+          !isSilentRegularMailboxMessageForLiveContext(message) &&
+          !ordinaryTerminalFailureRef.current.has(message.messageId),
       )
 
       if (silentlyFinalizedRegularMessages.length > 0) {
@@ -1120,12 +1164,24 @@ export function useInboxPoller({
         )
       }
 
+      if (terminalFailedRegularMessages.length > 0) {
+        await finalizeClaimedMessagesAsRead(
+          agentName,
+          terminalFailedRegularMessages.map(message => message.messageId),
+          sessionId,
+          teamName,
+        )
+        logForDebugging(
+          `[InboxPoller] Suppressed ${terminalFailedRegularMessages.length} terminally failed ordinary mailbox message(s)`,
+        )
+      }
+
       if (unread.length === 0 && actionableClaimedRegularMessages.length === 0) {
         return
       }
 
       logForDebugging(
-        `[InboxPoller] Found ${unread.length} protocol unread message(s), ${actionableClaimedRegularMessages.length} actionable claimed regular message(s), and ${silentlyFinalizedRegularMessages.length} silent regular message(s)`,
+        `[InboxPoller] Found ${unread.length} protocol unread message(s), ${actionableClaimedRegularMessages.length} actionable claimed regular message(s), ${silentlyFinalizedRegularMessages.length} silent regular message(s), and ${terminalFailedRegularMessages.length} terminal failed regular message(s)`,
       )
 
       // Check for plan approval responses and transition out of plan mode if approved
@@ -1991,6 +2047,7 @@ export function useInboxPoller({
         if (attempt.timer) {
           clearTimeout(attempt.timer)
         }
+        ordinaryTerminalFailureRef.current.add(processingOrdinaryMessage.messageId)
         ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
         ordinaryRecoveryRef.current.delete(processingOrdinaryMessage.messageId)
         ordinaryFinalizationInFlightRef.current.add(
@@ -2005,13 +2062,23 @@ export function useInboxPoller({
                   TEAM_LEAD_NAME,
                   {
                     from: agentName,
-                    text: buildCodexNativeMailboxTimeoutLeadNotificationText({
-                      memberName: agentName,
-                      taskRef: processingAction.taskRef,
-                      detail: processingAction.detail,
-                      final: true,
-                    }),
-                    summary: 'Codex native mailbox recovery failed',
+                    text:
+                      processingAction.reason === 'execution_failed'
+                        ? buildMailboxExecutionFailureLeadNotificationText({
+                            memberName: agentName,
+                            taskRef: processingAction.taskRef,
+                            detail: processingAction.detail,
+                          })
+                        : buildCodexNativeMailboxTimeoutLeadNotificationText({
+                            memberName: agentName,
+                            taskRef: processingAction.taskRef,
+                            detail: processingAction.detail,
+                            final: true,
+                          }),
+                    summary:
+                      processingAction.reason === 'execution_failed'
+                        ? 'Mailbox turn execution failed'
+                        : 'Codex native mailbox recovery failed',
                     timestamp: new Date().toISOString(),
                     color: getTeammateColor(),
                   },
