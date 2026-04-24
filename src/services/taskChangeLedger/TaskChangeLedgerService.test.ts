@@ -228,7 +228,7 @@ function blobPath(blobRef: string): string {
   return join(repoDir, '.board-task-changes', 'blobs', blobRef)
 }
 
-function sha256(content: string): string {
+function sha256(content: string | Buffer): string {
   return createHash('sha256').update(content).digest('hex')
 }
 
@@ -339,6 +339,190 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(events[0]?.memberName).toBe('alice')
     expect(events[1]?.memberName).toBe('alice')
+  })
+
+  test('does not materialize binary-looking exact file tool content as text blobs', async () => {
+    const agentId = 'alice@test'
+    const beforeContent = `header${String.fromCharCode(4)}before`
+    const afterContent = `header${String.fromCharCode(5)}after`
+    openScope('task-exact-binary-looking', 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_EDIT_TOOL_NAME,
+      resultData: {
+        filePath: 'fixtures/exact.bin',
+        originalFile: beforeContent,
+        updatedFile: afterContent,
+        oldString: 'before',
+        actualNewString: 'after',
+      },
+      toolUseId: 'tool-exact-binary-looking',
+      sessionId,
+      agentId,
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(
+      bundlePath('task-exact-binary-looking'),
+    )
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files[0]?.reviewability).toBe('metadata-only')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.linesAdded).toBe(0)
+    expect(files[0]?.linesRemoved).toBe(0)
+    expect(bundle.totalLinesAdded).toBe(0)
+    expect(bundle.totalLinesRemoved).toBe(0)
+    expect(
+      ((bundle.scope as Record<string, unknown>).contributors as Array<Record<string, unknown>>)[0]
+        ?.cumulativeLinesAdded,
+    ).toBe(0)
+    expect(
+      ((bundle.scope as Record<string, unknown>).contributors as Array<Record<string, unknown>>)[0]
+        ?.cumulativeLinesRemoved,
+    ).toBe(0)
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.sha256).toBe(
+      sha256(afterContent),
+    )
+
+    const events = await readJsonl<Record<string, unknown>>(
+      eventsPath('task-exact-binary-looking'),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.before).toBeNull()
+    expect(events[0]?.after).toBeNull()
+    expect(events[0]?.linesAdded).toBe(0)
+    expect(events[0]?.linesRemoved).toBe(0)
+    expect((events[0]?.beforeState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((events[0]?.afterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+  })
+
+  test('keeps binary-looking exact creates metadata-only instead of synthetic partial-text', async () => {
+    const agentId = 'alice@test'
+    const afterContent = `created${String.fromCharCode(5)}binary`
+    openScope('task-exact-binary-create', 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'fixtures/exact-create.bin',
+        content: afterContent,
+        type: 'create',
+      },
+      toolUseId: 'tool-exact-binary-create',
+      sessionId,
+      agentId,
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-exact-binary-create'))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files[0]?.createdInTask).toBe(true)
+    expect(files[0]?.reviewability).toBe('metadata-only')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.diffStatKnown).toBe(false)
+    expect((files[0]?.latestBeforeState as Record<string, unknown>)?.exists).toBe(false)
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+  })
+
+  test('does not persist exact create when post-hook removes the created file', async () => {
+    const agentId = 'alice@test'
+    openScope('task-exact-create-hook-removed', 'work', agentId)
+    const filePath = join(repoDir, 'src', 'removed-by-hook.ts')
+
+    const written = await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath,
+        content: 'export const removed = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-exact-create-hook-removed',
+      sessionId,
+      agentId,
+      materializePostHookDiskState: true,
+    })
+
+    expect(written).toEqual([])
+    expect(await pathExists(eventsPath('task-exact-create-hook-removed'))).toBe(false)
+    expect(await pathExists(bundlePath('task-exact-create-hook-removed'))).toBe(false)
+  })
+
+  test('does not persist exact edit when post-hook restores original content', async () => {
+    const agentId = 'alice@test'
+    openScope('task-exact-edit-hook-restored', 'work', agentId)
+    const filePath = await writeRepoFile('src/restored-by-hook.ts', 'export const value = 1;\n')
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_EDIT_TOOL_NAME,
+      resultData: {
+        filePath,
+        originalFile: 'export const value = 1;\n',
+        updatedFile: 'export const value = 2;\n',
+        oldString: 'value = 1',
+        actualNewString: 'value = 2',
+      },
+      toolUseId: 'tool-exact-edit-hook-restored',
+      sessionId,
+      agentId,
+      materializePostHookDiskState: true,
+    })
+
+    expect(await pathExists(eventsPath('task-exact-edit-hook-restored'))).toBe(false)
+    expect(await pathExists(bundlePath('task-exact-edit-hook-restored'))).toBe(false)
+  })
+
+  test('downgrades a corrupted stored text blob during bundle rebuild', async () => {
+    const agentId = 'alice@test'
+    openScope('task-corrupt-blob-rebuild', 'work', agentId)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/corruptible.ts',
+        content: 'export const value = 1;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-write-corruptible',
+      sessionId,
+      agentId,
+    })
+
+    const firstEvents = await readJsonl<Record<string, unknown>>(
+      eventsPath('task-corrupt-blob-rebuild'),
+    )
+    const firstAfter = firstEvents[0]?.after as { blobRef?: string } | undefined
+    expect(firstAfter?.blobRef).toBeDefined()
+    await writeFile(blobPath(firstAfter!.blobRef!), Buffer.from([4, 5, 6, 7]))
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/trigger.ts',
+        content: 'export const trigger = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-rebuild-trigger',
+      sessionId,
+      agentId,
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(
+      bundlePath('task-corrupt-blob-rebuild'),
+    )
+    const files = bundle.files as Array<Record<string, unknown>>
+    const corruptible = files.find(
+      file => file.filePath === join(repoDir, 'src', 'corruptible.ts'),
+    )
+    expect(corruptible?.reviewability).toBe('metadata-only')
+    expect(corruptible?.contentAvailability).toBe('hash-only')
+    expect(corruptible?.diffStatKnown).toBe(false)
   })
 
   test('writes centralized ledger artifacts while preserving worktree file metadata', async () => {
@@ -627,6 +811,243 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(new Set(events.map(event => event.toolStatus))).toEqual(new Set(['succeeded']))
     expect(new Set(events.map(event => event.source))).toEqual(new Set(['shell_snapshot']))
+  })
+
+  test('does not persist shell snapshot when created file is removed before completion', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-create-delete-net-zero', 'work', agentId)
+    await writeRepoFile('README.md', '# baseline\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'touch tmp && rm tmp' },
+      toolUseId: 'tool-shell-create-delete-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('tmp.txt', 'temporary\n')
+    await unlink(join(repoDir, 'tmp.txt'))
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(await pathExists(eventsPath('task-shell-create-delete-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-create-delete-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when modified file is restored before completion', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-modify-restore-net-zero', 'work', agentId)
+    await writeRepoFile('src/restored.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit and restore src/restored.ts' },
+      toolUseId: 'tool-shell-modify-restore-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/restored.ts', 'export const value = 2;\n')
+    await writeRepoFile('src/restored.ts', 'export const value = 1;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(await pathExists(eventsPath('task-shell-modify-restore-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-modify-restore-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when git rename is moved back before completion', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-rename-back-net-zero', 'work', agentId)
+    await writeRepoFile('src/rename-back.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: {
+        command:
+          'git mv src/rename-back.ts src/temp-name.ts && git mv src/temp-name.ts src/rename-back.ts',
+      },
+      toolUseId: 'tool-shell-rename-back-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    runGit(['mv', 'src/rename-back.ts', 'src/temp-name.ts'])
+    runGit(['mv', 'src/temp-name.ts', 'src/rename-back.ts'])
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['status', '--porcelain'])).toBe('')
+    expect(await pathExists(eventsPath('task-shell-rename-back-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-rename-back-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when delete and restore returns to committed content', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-delete-restore-net-zero', 'work', agentId)
+    await writeRepoFile('src/delete-restore.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'rm src/delete-restore.ts && recreate same content' },
+      toolUseId: 'tool-shell-delete-restore-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    await unlink(join(repoDir, 'src', 'delete-restore.ts'))
+    await writeRepoFile('src/delete-restore.ts', 'export const value = 1;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['status', '--porcelain'])).toBe('')
+    expect(await pathExists(eventsPath('task-shell-delete-restore-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-delete-restore-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when file directory file rollback is net-zero', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-file-directory-file-net-zero', 'work', agentId)
+    const relativePath = 'src/path-shape.txt'
+    const absolutePath = join(repoDir, relativePath)
+    await writeRepoFile(relativePath, 'stable content\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'replace file with directory and restore file' },
+      toolUseId: 'tool-shell-file-directory-file-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    await unlink(absolutePath)
+    await mkdir(absolutePath)
+    await rm(absolutePath, { recursive: true, force: true })
+    await writeRepoFile(relativePath, 'stable content\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['status', '--porcelain'])).toBe('')
+    expect(await pathExists(eventsPath('task-shell-file-directory-file-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-file-directory-file-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when descendant commits return to the same tree', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-committed-net-zero', 'work', agentId)
+    await writeRepoFile('src/committed.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'commit edit then commit restore' },
+      toolUseId: 'tool-shell-committed-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/committed.ts', 'export const value = 2;\n')
+    await commitAll('temporary edit')
+    await writeRepoFile('src/committed.ts', 'export const value = 1;\n')
+    await commitAll('restore original content')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['diff', '--name-only', 'HEAD~2..HEAD'])).toBe('')
+    expect(runGit(['status', '--porcelain'])).toBe('')
+    expect(await pathExists(eventsPath('task-shell-committed-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-committed-net-zero'))).toBe(false)
+  })
+
+  test('does not persist shell snapshot when committed rename returns to the same tree', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-committed-rename-back-net-zero', 'work', agentId)
+    await writeRepoFile('src/committed-rename.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'commit rename then commit rename back' },
+      toolUseId: 'tool-shell-committed-rename-back-net-zero',
+      sessionId,
+      agentId,
+    })
+
+    runGit(['mv', 'src/committed-rename.ts', 'src/committed-renamed.ts'])
+    await commitAll('temporary rename')
+    runGit(['mv', 'src/committed-renamed.ts', 'src/committed-rename.ts'])
+    await commitAll('rename back')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['diff', '--name-only', 'HEAD~2..HEAD'])).toBe('')
+    expect(runGit(['status', '--porcelain'])).toBe('')
+    expect(await pathExists(eventsPath('task-shell-committed-rename-back-net-zero'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-committed-rename-back-net-zero'))).toBe(false)
+  })
+
+  test('does not attribute pre-existing dirty file when command restores the dirty baseline', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-dirty-baseline-restored', 'work', agentId)
+    await writeRepoFile('src/dirty.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+    await writeRepoFile('src/dirty.ts', 'export const userDraft = true;\n')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit dirty file and restore dirty baseline' },
+      toolUseId: 'tool-shell-dirty-baseline-restored',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/dirty.ts', 'export const agentDraft = true;\n')
+    await writeRepoFile('src/dirty.ts', 'export const userDraft = true;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(runGit(['status', '--porcelain'])).toBe('M src/dirty.ts')
+    expect(await pathExists(eventsPath('task-shell-dirty-baseline-restored'))).toBe(false)
+    expect(await pathExists(bundlePath('task-shell-dirty-baseline-restored'))).toBe(false)
+  })
+
+  test('captures only the command delta when a pre-existing dirty file changes', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-dirty-baseline-changed', 'work', agentId)
+    await writeRepoFile('src/dirty-delta.ts', 'export const value = 1;\n')
+    await commitAll('initial commit')
+    await writeRepoFile('src/dirty-delta.ts', 'export const userDraft = true;\n')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'edit dirty file from dirty baseline' },
+      toolUseId: 'tool-shell-dirty-baseline-changed',
+      sessionId,
+      agentId,
+    })
+
+    await writeRepoFile('src/dirty-delta.ts', 'export const agentDraft = true;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    const bundle = await readJson<Record<string, unknown>>(
+      bundlePath('task-shell-dirty-baseline-changed'),
+    )
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files).toHaveLength(1)
+    expect(files[0]?.filePath).toBe(join(repoDir, 'src', 'dirty-delta.ts'))
+    expect(files[0]?.latestBeforeHash).toBe(sha256('export const userDraft = true;\n'))
+    expect(files[0]?.latestAfterHash).toBe(sha256('export const agentDraft = true;\n'))
+
+    const events = await readJsonl<Record<string, unknown>>(
+      eventsPath('task-shell-dirty-baseline-changed'),
+    )
+    expect(events).toHaveLength(1)
+    const before = events[0]?.before as { blobRef?: string } | undefined
+    const after = events[0]?.after as { blobRef?: string } | undefined
+    expect(await readFile(blobPath(before!.blobRef!), 'utf8')).toBe(
+      'export const userDraft = true;\n',
+    )
+    expect(await readFile(blobPath(after!.blobRef!), 'utf8')).toBe(
+      'export const agentDraft = true;\n',
+    )
   })
 
   test('persists deferred snapshot artifacts and removes them after memory completion', async () => {
@@ -1160,8 +1581,10 @@ describe('TaskChangeLedgerService integration', () => {
   test('persists binary and too-large shell changes as metadata-only states', async () => {
     const agentId = 'alice@test'
     openScope('task-binary-large', 'work', agentId)
+    const initialBinary = Buffer.from([4, 5, 6, 7])
+    const updatedBinary = Buffer.from([5, 6, 7, 8])
 
-    await writeRepoFile('fixtures/blob.bin', Buffer.from([0, 1, 2, 3]))
+    await writeRepoFile('fixtures/blob.bin', initialBinary)
     await writeRepoFile('fixtures/large.txt', 'a'.repeat(1024 * 1024 + 8))
     await commitAll('initial commit')
 
@@ -1173,7 +1596,7 @@ describe('TaskChangeLedgerService integration', () => {
       agentId,
     })
 
-    await writeRepoFile('fixtures/blob.bin', Buffer.from([4, 0, 6, 7]))
+    await writeRepoFile('fixtures/blob.bin', updatedBinary)
     await writeRepoFile('fixtures/large.txt', 'b'.repeat(1024 * 1024 + 16))
     await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
 
@@ -1186,12 +1609,116 @@ describe('TaskChangeLedgerService integration', () => {
     expect((binaryFile?.latestAfterState as Record<string, unknown>)?.unavailableReason).toBe(
       'binary file',
     )
+    expect((binaryFile?.latestBeforeState as Record<string, unknown>)?.sha256).toBe(
+      sha256(initialBinary),
+    )
+    expect((binaryFile?.latestAfterState as Record<string, unknown>)?.sha256).toBe(
+      sha256(updatedBinary),
+    )
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath('task-binary-large'))
+    const binaryEvent = events.find(
+      event => event.filePath === join(repoDir, 'fixtures', 'blob.bin'),
+    )
+    expect(binaryEvent?.before).toBeNull()
+    expect(binaryEvent?.after).toBeNull()
+    expect((binaryEvent?.beforeState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((binaryEvent?.beforeState as Record<string, unknown>)?.sha256).toBe(
+      sha256(initialBinary),
+    )
+    expect((binaryEvent?.afterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((binaryEvent?.afterState as Record<string, unknown>)?.sha256).toBe(
+      sha256(updatedBinary),
+    )
 
     expect(largeFile?.reviewability).toBe('metadata-only')
     expect(largeFile?.contentAvailability).toBe('metadata-only')
     expect(
       String((largeFile?.latestAfterState as Record<string, unknown>)?.unavailableReason),
     ).toContain('ledger limit')
+  })
+
+  test('keeps committed binary deletes with spaced filenames hash-only without text blobs', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-binary-delete', 'work', agentId)
+    const relativePath = 'fixtures/deleted binary sample.bin'
+    const initialBinary = Buffer.from([4, 5, 6, 7])
+    await writeRepoFile(relativePath, initialBinary)
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'rm weird binary filename' },
+      toolUseId: 'tool-shell-binary-delete',
+      sessionId,
+      agentId,
+    })
+
+    await unlink(join(repoDir, relativePath))
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-shell-binary-delete'))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files).toHaveLength(1)
+    expect(files[0]?.filePath).toBe(join(repoDir, relativePath))
+    expect(files[0]?.deletedInTask).toBe(true)
+    expect(files[0]?.reviewability).toBe('metadata-only')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.diffStatKnown).toBe(false)
+    expect((files[0]?.latestBeforeState as Record<string, unknown>)?.sha256).toBe(
+      sha256(initialBinary),
+    )
+    expect((files[0]?.latestBeforeState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.exists).toBe(false)
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath('task-shell-binary-delete'))
+    expect(events).toHaveLength(1)
+    expect(events[0]?.operation).toBe('delete')
+    expect(events[0]?.before).toBeNull()
+    expect(events[0]?.after).toBeNull()
+    expect((events[0]?.beforeState as Record<string, unknown>)?.sha256).toBe(
+      sha256(initialBinary),
+    )
+  })
+
+  test('keeps shell binary creates metadata-only instead of synthetic partial-text', async () => {
+    const agentId = 'alice@test'
+    openScope('task-shell-binary-create', 'work', agentId)
+    await writeRepoFile('README.md', '# baseline\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'create binary file' },
+      toolUseId: 'tool-shell-binary-create',
+      sessionId,
+      agentId,
+    })
+
+    const finalBinary = Buffer.from([5, 6, 7, 8])
+    await writeRepoFile('fixtures/created.bin', finalBinary)
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-shell-binary-create'))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files).toHaveLength(1)
+    expect(files[0]?.createdInTask).toBe(true)
+    expect(files[0]?.reviewability).toBe('metadata-only')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.diffStatKnown).toBe(false)
+    expect((files[0]?.latestBeforeState as Record<string, unknown>)?.exists).toBe(false)
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.sha256).toBe(
+      sha256(finalBinary),
+    )
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
   })
 
   test('emits notices only when multiple active scopes are open for the same actor', async () => {
@@ -1269,6 +1796,100 @@ describe('TaskChangeLedgerService integration', () => {
     expect(after?.blobRef).toBeDefined()
     const storedAfter = await readFile(blobPath(after!.blobRef!), 'utf8')
     expect(storedAfter).toBe('const value = 1;\n')
+  })
+
+  test('stores metadata-only final state when post-hook mutation leaves binary content', async () => {
+    const agentId = 'alice@test'
+    openScope('task-post-hook-binary', 'work', agentId)
+    const filePath = await writeRepoFile('src/post-hook-binary.bin', 'before\n')
+    const finalBinary = Buffer.from([5, 6, 7, 8])
+
+    await writeFile(filePath, finalBinary)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_EDIT_TOOL_NAME,
+      resultData: {
+        filePath,
+        originalFile: 'before\n',
+        updatedFile: 'after\n',
+        oldString: 'before',
+        actualNewString: 'after',
+      },
+      toolUseId: 'tool-post-hook-binary',
+      sessionId,
+      agentId,
+      materializePostHookDiskState: true,
+    })
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath('task-post-hook-binary'))
+    expect(events).toHaveLength(1)
+    expect(events[0]?.confidence).toBe('high')
+    expect(events[0]?.oldString).toBeUndefined()
+    expect(events[0]?.newString).toBeUndefined()
+    expect(events[0]?.after).toBeNull()
+    expect((events[0]?.afterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'binary file',
+    )
+    expect((events[0]?.afterState as Record<string, unknown>)?.sha256).toBe(sha256(finalBinary))
+    expect((events[0]?.warnings as string[])[0]).toContain(
+      'PostToolUse hooks left final disk content unavailable',
+    )
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-post-hook-binary'))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files[0]?.reviewability).toBe('partial-text')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.diffStatKnown).toBe(false)
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.sha256).toBe(
+      sha256(finalBinary),
+    )
+  })
+
+  test('stores metadata-only final state when post-hook leaves a non-regular file', async () => {
+    const agentId = 'alice@test'
+    openScope('task-post-hook-directory', 'work', agentId)
+    const filePath = await writeRepoFile('src/post-hook-directory.txt', 'before\n')
+    await rm(filePath)
+    await mkdir(filePath)
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_EDIT_TOOL_NAME,
+      resultData: {
+        filePath,
+        originalFile: 'before\n',
+        updatedFile: 'after\n',
+        oldString: 'before',
+        actualNewString: 'after',
+      },
+      toolUseId: 'tool-post-hook-directory',
+      sessionId,
+      agentId,
+      materializePostHookDiskState: true,
+    })
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath('task-post-hook-directory'))
+    expect(events).toHaveLength(1)
+    expect(events[0]?.confidence).toBe('high')
+    expect(events[0]?.oldString).toBeUndefined()
+    expect(events[0]?.newString).toBeUndefined()
+    expect(events[0]?.after).toBeNull()
+    expect((events[0]?.afterState as Record<string, unknown>)?.exists).toBe(true)
+    expect((events[0]?.afterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'not a regular file',
+    )
+    expect((events[0]?.warnings as string[])[0]).toContain(
+      'PostToolUse hooks left final disk content unavailable',
+    )
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath('task-post-hook-directory'))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files).toHaveLength(1)
+    expect(files[0]?.reviewability).toBe('partial-text')
+    expect(files[0]?.contentAvailability).toBe('hash-only')
+    expect(files[0]?.diffStatKnown).toBe(false)
+    expect((files[0]?.latestAfterState as Record<string, unknown>)?.unavailableReason).toBe(
+      'not a regular file',
+    )
   })
 
   test('writes partial freshness when bundle materialization fails', async () => {

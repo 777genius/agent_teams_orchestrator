@@ -33,17 +33,29 @@ describe('team bootstrap partial-failure policy', () => {
       deriveBootstrapTerminalStatus({
         continueOnPartialFailure: false,
         failedMembersCount: 0,
+        registeredMembersCount: 0,
       }),
     ).toBe('completed')
   })
 
-  test('returns partial_success when partial failures are allowed', () => {
+  test('returns partial_success when partial failures are allowed and at least one teammate registered', () => {
     expect(
       deriveBootstrapTerminalStatus({
         continueOnPartialFailure: true,
         failedMembersCount: 1,
+        registeredMembersCount: 1,
       }),
     ).toBe('partial_success')
+  })
+
+  test('returns failed when every teammate failed even if partial failures are allowed', () => {
+    expect(
+      deriveBootstrapTerminalStatus({
+        continueOnPartialFailure: true,
+        failedMembersCount: 2,
+        registeredMembersCount: 0,
+      }),
+    ).toBe('failed')
   })
 
   test('returns failed when partial failures are not allowed', () => {
@@ -51,6 +63,7 @@ describe('team bootstrap partial-failure policy', () => {
       deriveBootstrapTerminalStatus({
         continueOnPartialFailure: false,
         failedMembersCount: 2,
+        registeredMembersCount: 1,
       }),
     ).toBe('failed')
   })

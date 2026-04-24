@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'crypto'
+import { spawn } from 'child_process'
 import { constants as fsConstants } from 'fs'
 import {
   access,
@@ -1065,6 +1066,9 @@ async function buildContentRef(
 
   const sizeBytes = byteLength(content)
   const hash = sha256(content)
+  if (looksBinary(content)) {
+    return null
+  }
   if (sizeBytes > MAX_TEXT_BLOB_BYTES) {
     return null
   }
@@ -1083,6 +1087,7 @@ function contentStateFromTextContent(content: string): ContentStateRef {
     exists: true,
     sha256: sha256(content),
     sizeBytes,
+    ...(looksBinary(content) ? { unavailableReason: 'binary file' } : {}),
     ...(sizeBytes > MAX_TEXT_BLOB_BYTES
       ? { unavailableReason: `content exceeds ${MAX_TEXT_BLOB_BYTES} byte ledger limit` }
       : {}),
@@ -1155,7 +1160,12 @@ function countLineChanges(beforeContent: string | null, afterContent: string | n
 } {
   const before = beforeContent ?? ''
   const after = afterContent ?? ''
-  if (byteLength(before) > MAX_TEXT_BLOB_BYTES || byteLength(after) > MAX_TEXT_BLOB_BYTES) {
+  if (
+    byteLength(before) > MAX_TEXT_BLOB_BYTES ||
+    byteLength(after) > MAX_TEXT_BLOB_BYTES ||
+    looksBinary(before) ||
+    looksBinary(after)
+  ) {
     return { added: 0, removed: 0 }
   }
   let added = 0
@@ -1169,6 +1179,15 @@ function countLineChanges(beforeContent: string | null, afterContent: string | n
     }
   }
   return { added, removed }
+}
+
+function canUseSnippetLineStats(change: ExactFileChange): boolean {
+  return (
+    (change.beforeContent === null || !looksBinary(change.beforeContent)) &&
+    (change.afterContent === null || !looksBinary(change.afterContent)) &&
+    (change.beforeState?.unavailableReason === undefined || change.beforeState.exists === false) &&
+    (change.afterState?.unavailableReason === undefined || change.afterState.exists === false)
+  )
 }
 
 function buildEventId(event: Omit<TaskChangeEventV1, 'eventId'>): string {
@@ -1340,7 +1359,7 @@ async function readContentTextFromRef(
     return null
   }
   try {
-    return await readFile(join(getLedgerDir(projectDir), 'blobs', ref.blobRef), 'utf8')
+    return decodeTextBuffer(await readFile(join(getLedgerDir(projectDir), 'blobs', ref.blobRef)))
   } catch {
     return null
   }
@@ -1545,10 +1564,16 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     ])
     const baselineText = deriveSideText('before', firstEvent, baselineRawText)
     const finalText = deriveSideText('after', lastEvent, finalRawText)
+    const baselineHasReviewText =
+      baselineRawText !== null ||
+      (firstEvent.operation === 'create' && finalRawText !== null)
+    const finalHasReviewText =
+      finalRawText !== null ||
+      (lastEvent.operation === 'delete' && baselineRawText !== null)
     const reviewability =
-      baselineText !== null && finalText !== null
+      baselineHasReviewText && finalHasReviewText
         ? 'full-text'
-        : baselineText !== null || finalText !== null
+        : baselineHasReviewText || finalHasReviewText
           ? 'partial-text'
           : 'metadata-only'
     const contentAvailability =
@@ -2001,10 +2026,12 @@ async function persistEvents(changes: ExactFileChange[], params: {
       operation,
       'after',
     )
-    const lineStats = countLineChanges(
-      change.oldString ?? change.beforeContent,
-      change.newString ?? change.afterContent,
-    )
+    const lineStats = canUseSnippetLineStats(change)
+      ? countLineChanges(
+          change.oldString ?? change.beforeContent,
+          change.newString ?? change.afterContent,
+        )
+      : { added: 0, removed: 0 }
     const eventBase: Omit<TaskChangeEventV1, 'eventId'> = {
       schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
       taskId: params.scope.taskId,
@@ -2203,9 +2230,15 @@ async function materializePostHookDiskState(
     if (diskState.unavailableReason) {
       materialized.push({
         ...change,
+        afterContent: null,
+        afterState: contentStateFromShellSource(diskState),
+        operation: operationForPostHookDiskState(change, diskState),
+        confidence: change.confidence === 'exact' ? 'high' : change.confidence,
+        oldString: undefined,
+        newString: undefined,
         warnings: [
           ...(change.warnings ?? []),
-          `PostToolUse disk validation skipped for ${displayRelativePath(filePath, workspaceRoot)}: ${diskState.unavailableReason}.`,
+          `PostToolUse hooks left final disk content unavailable for ${displayRelativePath(filePath, workspaceRoot)}: ${diskState.unavailableReason}.`,
         ],
       })
       continue
@@ -2234,6 +2267,19 @@ async function materializePostHookDiskState(
     })
   }
   return materialized
+}
+
+function operationForPostHookDiskState(
+  change: ExactFileChange,
+  diskState: ShellSnapshotFile,
+): TaskChangeOperation {
+  if (diskState.exists === false) {
+    return 'delete'
+  }
+  if (change.operation) {
+    return change.operation
+  }
+  return change.beforeContent === null ? 'create' : 'modify'
 }
 
 export async function captureTaskChangeToolResult(params: {
@@ -2331,11 +2377,26 @@ async function getGitStatusPathResult(gitRoot: string) {
 }
 
 function looksBinary(content: string): boolean {
-  return content.includes('\0')
+  for (let index = 0; index < content.length; index += 1) {
+    const code = content.charCodeAt(index)
+    if (code === 0 || code === 0xfffd || code < 9 || (code > 13 && code < 32)) {
+      return true
+    }
+  }
+  return false
 }
 
 function bufferLooksBinary(content: Buffer): boolean {
-  return content.includes(0)
+  for (const byte of content) {
+    if (byte === 0 || byte < 9 || (byte > 13 && byte < 32)) {
+      return true
+    }
+  }
+  return !Buffer.from(content.toString('utf8'), 'utf8').equals(content)
+}
+
+function decodeTextBuffer(content: Buffer): string | null {
+  return bufferLooksBinary(content) ? null : content.toString('utf8')
 }
 
 async function readSmallTextFile(filePath: string): Promise<ShellSnapshotFile> {
@@ -2362,7 +2423,8 @@ async function readSmallTextFile(filePath: string): Promise<ShellSnapshotFile> {
     }
     const content = await readFile(filePath)
     const contentFingerprint = sha256(content)
-    if (bufferLooksBinary(content)) {
+    const decoded = decodeTextBuffer(content)
+    if (decoded === null) {
       return {
         content: null,
         exists: true,
@@ -2373,7 +2435,7 @@ async function readSmallTextFile(filePath: string): Promise<ShellSnapshotFile> {
       }
     }
     return {
-      content: content.toString('utf8'),
+      content: decoded,
       exists: true,
       sha256: contentFingerprint,
       sizeBytes: fileStat.size,
@@ -2426,14 +2488,11 @@ async function readGitBlob(
     }
   }
 
-  const result = await execFileNoThrowWithCwd('git', ['show', objectSpec], {
-    cwd: gitRoot,
-    timeout: GIT_TIMEOUT_MS,
-    preserveOutputOnError: false,
-    maxBuffer: MAX_TEXT_BLOB_BYTES,
-    stripFinalNewline: false,
-  })
-  if (result.code !== 0) {
+  const result = await readGitBlobBuffer(
+    gitRoot,
+    objectId ? ['cat-file', '-p', objectId] : ['show', objectSpec],
+  )
+  if (result.code !== 0 || result.content === null) {
     return objectId || sizeResult.code === 0
       ? {
           content: null,
@@ -2444,22 +2503,71 @@ async function readGitBlob(
         }
       : { content: null, exists: false, fingerprint: 'missing' }
   }
-  if (looksBinary(result.stdout)) {
+  const contentSha256 = sha256(result.content)
+  const decoded = decodeTextBuffer(result.content)
+  if (decoded === null) {
     return {
       content: null,
       exists: true,
+      sha256: contentSha256,
       sizeBytes: Number.isFinite(size) ? size : undefined,
       unavailableReason: 'binary file',
-      fingerprint: fingerprint ?? sha256(result.stdout),
+      fingerprint: fingerprint ?? contentSha256,
     }
   }
   return {
-    content: result.stdout,
+    content: decoded,
     exists: true,
-    sha256: sha256(result.stdout),
-    sizeBytes: Number.isFinite(size) ? size : byteLength(result.stdout),
-    fingerprint: fingerprint ?? sha256(result.stdout),
+    sha256: contentSha256,
+    sizeBytes: Number.isFinite(size) ? size : byteLength(decoded),
+    fingerprint: fingerprint ?? contentSha256,
   }
+}
+
+async function readGitBlobBuffer(
+  gitRoot: string,
+  args: string[],
+): Promise<{ content: Buffer | null; code: number }> {
+  return new Promise(resolve => {
+    const child = spawn('git', args, {
+      cwd: gitRoot,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+
+    const settle = (content: Buffer | null, code: number) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      resolve({ content, code })
+    }
+
+    timer = setTimeout(() => {
+      child.kill('SIGTERM')
+      settle(null, 1)
+    }, GIT_TIMEOUT_MS)
+    timer.unref()
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (settled) {
+        return
+      }
+      totalBytes += chunk.length
+      if (totalBytes > MAX_TEXT_BLOB_BYTES) {
+        child.kill('SIGTERM')
+        settle(null, 1)
+        return
+      }
+      chunks.push(chunk)
+    })
+    child.on('error', () => settle(null, 1))
+    child.on('close', code => settle(Buffer.concat(chunks), code ?? 1))
+  })
 }
 
 function contentStateFromShellSource(source: ShellSnapshotFile): ContentStateRef {

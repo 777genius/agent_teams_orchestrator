@@ -102,15 +102,20 @@ export function assertBootstrapTimeoutBudget(params: {
 export function deriveBootstrapTerminalStatus(params: {
   continueOnPartialFailure: boolean
   failedMembersCount: number
+  registeredMembersCount: number
 }): TeamBootstrapSummary['terminalStatus'] {
   if (params.failedMembersCount <= 0) {
     return 'completed'
   }
-  return params.continueOnPartialFailure ? 'partial_success' : 'failed'
+  if (!params.continueOnPartialFailure || params.registeredMembersCount <= 0) {
+    return 'failed'
+  }
+  return 'partial_success'
 }
 
-function buildStrictPartialFailureReason(params: {
+function buildBootstrapFailureReason(params: {
   teamName: string
+  continueOnPartialFailure: boolean
   failedMembers: Array<{ name: string; reason: string }>
 }): string {
   const preview = params.failedMembers
@@ -121,9 +126,12 @@ function buildStrictPartialFailureReason(params: {
     params.failedMembers.length > 3
       ? ` (+${params.failedMembers.length - 3} more)`
       : ''
+  const policyReason = params.continueOnPartialFailure
+    ? 'no teammates were registered'
+    : 'continueOnPartialFailure=false'
   return preview.length > 0
-    ? `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false. ${preview}${suffix}`
-    : `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and continueOnPartialFailure=false.`
+    ? `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and ${policyReason}. ${preview}${suffix}`
+    : `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and ${policyReason}.`
 }
 
 function seedBootstrapPermissionRules(params: {
@@ -258,6 +266,7 @@ function buildSummary(params: {
     terminalStatus: deriveBootstrapTerminalStatus({
       continueOnPartialFailure: params.request.continueOnPartialFailure,
       failedMembersCount: params.failedMembers.length,
+      registeredMembersCount: params.registeredMembers.length,
     }),
   }
 }
@@ -541,8 +550,9 @@ export async function runTeamBootstrap(params: {
       },
     })
     if (summary.terminalStatus === 'failed') {
-      const reason = buildStrictPartialFailureReason({
+      const reason = buildBootstrapFailureReason({
         teamName: params.request.teamName,
+        continueOnPartialFailure: params.request.continueOnPartialFailure,
         failedMembers: summary.failedMembers,
       })
       await stateStore.setTerminal(
