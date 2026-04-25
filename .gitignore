@@ -1,7 +1,9 @@
 node_modules/
 dist/
-cli
-cli-dev
+/cli
+/cli.cmd
+/cli-dev
+/cli-dev.cmd
 openclaw/
 competitors/*/.venv/
 competitors/*/.pytest_cache/
