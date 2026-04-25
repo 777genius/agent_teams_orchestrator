@@ -3,6 +3,7 @@ import { PassThrough, type Readable } from 'node:stream'
 import readline from 'node:readline'
 
 import type { CodexForcedLoginMethod } from '../runtimeBackends/codexBackendResolver.js'
+import { killProcessTree } from '../../utils/processKill.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
 
@@ -372,7 +373,9 @@ export async function* runCodexNativeExec(
     }
     timeoutReason = reason
     try {
-      if (!child.killed) {
+      if (!child.killed && child.pid) {
+        killProcessTree(child.pid, 'SIGTERM')
+      } else if (!child.killed) {
         child.kill('SIGTERM')
       }
     } catch {
@@ -380,7 +383,11 @@ export async function* runCodexNativeExec(
     }
     forceKillHandle = setTimeout(() => {
       try {
-        child.kill('SIGKILL')
+        if (child.pid) {
+          killProcessTree(child.pid, 'SIGKILL')
+        } else {
+          child.kill('SIGKILL')
+        }
       } catch {
         // Best-effort timeout cleanup.
       }

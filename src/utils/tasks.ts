@@ -13,6 +13,7 @@ import { createSignal } from './signal.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import { getTeamName } from './teammate.js'
 import { getTeammateContext } from './teammateContext.js'
+import { safeWindowsPathSegment } from './windowsReservedNames.js'
 
 // Listeners for task list updates (used for immediate UI refresh in same process)
 const tasksUpdated = createSignal()
@@ -215,7 +216,7 @@ export function getTaskListId(): string {
  * Only allows alphanumeric characters, hyphens, and underscores.
  */
 export function sanitizePathComponent(input: string): string {
-  return input.replace(/[^a-zA-Z0-9_-]/g, '-')
+  return safeWindowsPathSegment(input.replace(/[^a-zA-Z0-9_-]/g, '-'))
 }
 
 export function getTasksDir(taskListId: string): string {
@@ -715,7 +716,7 @@ export type AgentStatus = {
  * Sanitizes a name for use in file paths
  */
 function sanitizeName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()
+  return safeWindowsPathSegment(name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase())
 }
 
 /**

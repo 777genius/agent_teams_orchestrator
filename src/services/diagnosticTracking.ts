@@ -1,4 +1,5 @@
 import figures from 'figures'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { logError } from 'src/utils/log.js'
 import { callIdeRpc } from '../services/mcp/client.js'
 import type { MCPServerConnection } from '../services/mcp/types.js'
@@ -76,9 +77,16 @@ export class DiagnosticTrackingService {
   }
 
   private normalizeFileUri(fileUri: string): string {
+    if (fileUri.startsWith('file://')) {
+      try {
+        return normalizePathForComparison(fileURLToPath(fileUri))
+      } catch {
+        return normalizePathForComparison(fileUri.slice('file://'.length))
+      }
+    }
+
     // Remove our protocol prefixes
     const protocolPrefixes = [
-      'file://',
       '_claude_fs_right:',
       '_claude_fs_left:',
     ]
@@ -146,7 +154,7 @@ export class DiagnosticTrackingService {
     try {
       const result = await callIdeRpc(
         'getDiagnostics',
-        { uri: `file://${filePath}` },
+        { uri: pathToFileURL(filePath).href },
         this.mcpClient,
       )
       const diagnosticFile = this.parseDiagnosticResult(result)[0]

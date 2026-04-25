@@ -112,6 +112,9 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       sleepMs: async () => {},
+      killProcess: (_pid, signal) => {
+        spawned.killedSignals.push(signal)
+      },
       persistentRegistryPath: null,
     })
 

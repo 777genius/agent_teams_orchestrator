@@ -13,6 +13,7 @@ import {
 } from 'fs/promises'
 import { tmpdir } from 'os'
 import { extname, join } from 'path'
+import { pathToFileURL } from 'url'
 import type { Command } from '../commands.js'
 import { queryWithModel } from '../services/api/claude.js'
 import {
@@ -3069,7 +3070,7 @@ const usageReport: Command = {
       { collectRemote },
     )
 
-    let reportUrl = `file://${htmlPath}`
+    let reportUrl = pathToFileURL(htmlPath).href
     let uploadHint = ''
 
     if (process.env.USER_TYPE === 'ant') {
@@ -3092,7 +3093,7 @@ const usageReport: Command = {
         })
       } catch {
         // Upload failed - fall back to local file and show upload command
-        reportUrl = `file://${htmlPath}`
+        reportUrl = pathToFileURL(htmlPath).href
         uploadHint = `\nAutomatic upload failed. Are you on the boron namespace? Try \`use-bo\` and ensure you've run \`sso\`.
 To share, run: ff cp ${htmlPath} ${s3Path}
 Then access at: ${s3Url}`

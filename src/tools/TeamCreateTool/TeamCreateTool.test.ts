@@ -136,4 +136,26 @@ describe('TeamCreateTool', () => {
     const teamFile = await readTeamFileAsync('codex-safe-fallback')
     expect(teamFile?.members[0]?.model).toBe('gpt-5.4')
   })
+
+  test('rejects Windows reserved team names before creating team files', async () => {
+    const result = await TeamCreateTool.validateInput?.(
+      {
+        team_name: 'con',
+      },
+      {} as never,
+    )
+
+    expect(result?.result).toBe(false)
+    await expect(
+      TeamCreateTool.call(
+        {
+          team_name: 'con',
+        },
+        {
+          getAppState: () => ({ teamContext: undefined }) as AppState,
+          setAppState: () => {},
+        } as never,
+      ),
+    ).rejects.toThrow('reserved on Windows')
+  })
 })

@@ -6,6 +6,7 @@ import { getCwd } from '../../utils/cwd.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { NoopTeamBootstrapProgressSink } from '../../services/teamBootstrap/teamBootstrapEvents.js'
 import { getDeterministicBootstrapAvailabilityReason } from '../../services/teamBootstrap/teamBootstrapFeatureGate.js'
 import { normalizeBootstrapModelSelection } from '../../services/teamBootstrap/teamBootstrapModelSelection.js'
@@ -30,18 +31,37 @@ const memberSchema = z.strictObject({
 })
 
 const inputSchema = lazySchema(() =>
-  z.strictObject({
-    mode: z.enum(['create', 'launch']).default('create'),
-    team_name: z.string().trim().min(1),
-    display_name: z.string().trim().min(1).optional(),
-    description: z.string().trim().optional(),
-    color: z.string().trim().min(1).optional(),
-    cwd: z.string().trim().min(1).optional(),
-    agent_language: z.string().trim().min(1).optional(),
-    continue_on_partial_failure: z.boolean().optional(),
-    bootstrap_timeout_ms: z.number().int().positive().max(120_000).optional(),
-    members: z.array(memberSchema).min(1).max(8),
-  }),
+  z
+    .strictObject({
+      mode: z.enum(['create', 'launch']).default('create'),
+      team_name: z.string().trim().min(1),
+      display_name: z.string().trim().min(1).optional(),
+      description: z.string().trim().optional(),
+      color: z.string().trim().min(1).optional(),
+      cwd: z.string().trim().min(1).optional(),
+      agent_language: z.string().trim().min(1).optional(),
+      continue_on_partial_failure: z.boolean().optional(),
+      bootstrap_timeout_ms: z.number().int().positive().max(120_000).optional(),
+      members: z.array(memberSchema).min(1).max(8),
+    })
+    .superRefine((input, ctx) => {
+      if (isWindowsReservedBasename(input.team_name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['team_name'],
+          message: `team_name "${input.team_name}" is reserved on Windows`,
+        })
+      }
+      for (const [index, member] of input.members.entries()) {
+        if (isWindowsReservedBasename(member.name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['members', index, 'name'],
+            message: `Member name "${member.name}" is reserved on Windows`,
+          })
+        }
+      }
+    }),
 )
 
 type InputSchema = ReturnType<typeof inputSchema>

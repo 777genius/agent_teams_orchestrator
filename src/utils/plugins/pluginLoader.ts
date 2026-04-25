@@ -84,6 +84,7 @@ import type { HooksSettings } from '../settings/types.js'
 import { SettingsSchema } from '../settings/types.js'
 import { jsonParse, jsonStringify } from '../slowOperations.js'
 import { getAddDirEnabledPlugins } from './addDirPluginSettings.js'
+import { safeWindowsPathSegment } from '../windowsReservedNames.js'
 import { verifyAndDemote } from './dependencyResolver.js'
 import { classifyFetchError, logPluginFetch } from './fetchTelemetry.js'
 import { checkGitAvailable } from './gitAvailability.js'
@@ -142,16 +143,14 @@ export function getVersionedCachePathIn(
   version: string,
 ): string {
   const { name: pluginName, marketplace } = parsePluginIdentifier(pluginId)
-  const sanitizedMarketplace = (marketplace || 'unknown').replace(
-    /[^a-zA-Z0-9\-_]/g,
-    '-',
+  const sanitizedMarketplace = safeWindowsPathSegment(
+    (marketplace || 'unknown').replace(/[^a-zA-Z0-9\-_]/g, '-'),
   )
-  const sanitizedPlugin = (pluginName || pluginId).replace(
-    /[^a-zA-Z0-9\-_]/g,
-    '-',
+  const sanitizedPlugin = safeWindowsPathSegment(
+    (pluginName || pluginId).replace(/[^a-zA-Z0-9\-_]/g, '-'),
   )
   // Sanitize version to prevent path traversal attacks
-  const sanitizedVersion = version.replace(/[^a-zA-Z0-9\-_.]/g, '-')
+  const sanitizedVersion = safeWindowsPathSegment(version.replace(/[^a-zA-Z0-9\-_.]/g, '-'))
   return join(
     baseDir,
     'cache',
@@ -1078,7 +1077,7 @@ export async function cachePlugin(
     }
   }
 
-  const finalName = manifest.name.replace(/[^a-zA-Z0-9-_]/g, '-')
+  const finalName = safeWindowsPathSegment(manifest.name.replace(/[^a-zA-Z0-9-_]/g, '-'))
   const finalPath = join(cachePath, finalName)
 
   if (await pathExists(finalPath)) {

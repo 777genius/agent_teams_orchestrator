@@ -1,6 +1,6 @@
 import { open } from 'fs/promises'
 import * as path from 'path'
-import { pathToFileURL } from 'url'
+import { fileURLToPath, pathToFileURL } from 'url'
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -536,17 +536,15 @@ function countUniqueFiles(locations: Location[]): number {
  * Extracts a file path from a file:// URI, decoding percent-encoded characters.
  */
 function uriToFilePath(uri: string): string {
-  let filePath = uri.replace(/^file:\/\//, '')
-  // On Windows, file:///C:/path becomes /C:/path — strip the leading slash
-  if (/^\/[A-Za-z]:/.test(filePath)) {
-    filePath = filePath.slice(1)
-  }
   try {
-    filePath = decodeURIComponent(filePath)
+    return uri.startsWith('file://') ? fileURLToPath(uri) : decodeURIComponent(uri)
   } catch {
-    // Use un-decoded path if malformed
+    try {
+      return decodeURIComponent(uri.replace(/^file:\/\//, ''))
+    } catch {
+      return uri.replace(/^file:\/\//, '')
+    }
   }
-  return filePath
 }
 
 /**

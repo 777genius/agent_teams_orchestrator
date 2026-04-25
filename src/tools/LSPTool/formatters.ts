@@ -1,4 +1,5 @@
 import { relative } from 'path'
+import { fileURLToPath } from 'node:url'
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -21,7 +22,7 @@ import { plural } from '../../utils/stringUtils.js'
  * Handles URI decoding and gracefully falls back to un-decoded path if malformed.
  * Only uses relative paths when shorter and not starting with ../../
  */
-function formatUri(uri: string | undefined, cwd?: string): string {
+export function formatUri(uri: string | undefined, cwd?: string): string {
   // Handle undefined/null URIs - this indicates malformed LSP data
   if (!uri) {
     // NOTE: This should ideally be caught earlier with proper error logging
@@ -33,20 +34,13 @@ function formatUri(uri: string | undefined, cwd?: string): string {
     return '<unknown location>'
   }
 
-  // Remove file:// protocol if present
-  // On Windows, file:///C:/path becomes /C:/path after replacing file://
-  // We need to strip the leading slash for Windows drive-letter paths
-  let filePath = uri.replace(/^file:\/\//, '')
-  if (/^\/[A-Za-z]:/.test(filePath)) {
-    filePath = filePath.slice(1)
-  }
-
-  // Decode URI encoding - handle malformed URIs gracefully
+  let filePath = uri
   try {
-    filePath = decodeURIComponent(filePath)
+    filePath = uri.startsWith('file://') ? fileURLToPath(uri) : decodeURIComponent(uri)
   } catch (error) {
     // Log for debugging but continue with un-decoded path
     const errorMsg = errorMessage(error)
+    filePath = uri.replace(/^file:\/\//, '')
     logForDebugging(
       `Failed to decode LSP URI '${uri}': ${errorMsg}. Using un-decoded path: ${filePath}`,
       { level: 'warn' },

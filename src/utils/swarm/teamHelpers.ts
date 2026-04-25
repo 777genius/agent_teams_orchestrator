@@ -14,6 +14,7 @@ import { getAgentName, getTeamName, isTeammate } from '../teammate.js'
 import { hasWorktreeChanges, removeAgentWorktree } from '../worktree.js'
 import { type BackendType, isPaneBackend } from './backends/types.js'
 import { TEAM_LEAD_NAME } from './constants.js'
+import { safeWindowsPathSegment } from '../windowsReservedNames.js'
 
 export const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -125,7 +126,7 @@ export type Output = SpawnTeamOutput
  * Replaces all non-alphanumeric characters with hyphens and lowercases.
  */
 export function sanitizeName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()
+  return safeWindowsPathSegment(name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase())
 }
 
 /**

@@ -14,6 +14,7 @@ import {
   resolveBootstrapLeadName,
 } from './teamBootstrapPromptBuilder.js'
 import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
+import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
 
@@ -68,11 +69,23 @@ const bootstrapSpecSchema = z.strictObject({
     })
     .optional(),
 }).superRefine((spec, ctx) => {
+  if (isWindowsReservedBasename(spec.team.name)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['team', 'name'],
+      message: `Team name "${spec.team.name}" is reserved on Windows`,
+    })
+  }
+
   const seenNormalizedNames = new Map<string, number>()
   for (const [index, member] of spec.members.entries()) {
     const trimmedName = member.name.trim()
     const loweredName = trimmedName.toLowerCase()
-    if (loweredName === 'team-lead' || loweredName === 'user') {
+    if (
+      loweredName === 'team-lead' ||
+      loweredName === 'user' ||
+      isWindowsReservedBasename(trimmedName)
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['members', index, 'name'],
