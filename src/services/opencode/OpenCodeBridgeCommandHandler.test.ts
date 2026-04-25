@@ -1252,6 +1252,86 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('prepends runtime identity to realistic OpenCode launch prompts without native SendMessage routing', async () => {
+    const prompts: Array<{ memberName: string; text: string; agent: string }> = []
+    const realisticTeamContext = [
+      'Team launch context: verify OpenCode runtime messaging in a production desktop app.',
+      'Members must preserve taskRefs, avoid idle acknowledgements, and use Agent Teams MCP.',
+      'Known failure modes include plain assistant replies, fake #00000000 task labels, and peer relay drops.',
+    ].join('\n')
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+        runtimePid: input.memberName === 'bob' ? 801 : 802,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async (record, input) => {
+      prompts.push({
+        memberName: record.memberName,
+        text: input.text,
+        agent: input.agent ?? '',
+      })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: `msg-${record.memberName}-ready`,
+        latestAssistantText: `${record.memberName} ready`,
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-realistic-contract',
+        laneId: 'primary',
+        teamId: 'team-realistic',
+        teamName: 'team-realistic',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [
+          {
+            name: 'bob',
+            role: 'Developer',
+            prompt: `${realisticTeamContext}\nWorkflow: own direct app runtime delivery.`,
+          },
+          {
+            name: 'jack',
+            role: 'Reviewer',
+            prompt: `${realisticTeamContext}\nWorkflow: verify OpenCode peer relay.`,
+          },
+        ],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(prompts).toHaveLength(2)
+    for (const prompt of prompts) {
+      expect(prompt.agent).toBe('teammate')
+      expect(prompt.text).toContain('<opencode_runtime_identity>')
+      expect(prompt.text).toContain('agent-teams_runtime_bootstrap_checkin')
+      expect(prompt.text).toContain('agent-teams_member_briefing')
+      expect(prompt.text).toContain('"runtimeProvider":"opencode"')
+      expect(prompt.text).toContain('agent-teams_message_send')
+      expect(prompt.text).toContain('Do not use SendMessage.')
+      expect(prompt.text).toContain('Known failure modes include plain assistant replies')
+      expect(prompt.text).not.toContain('Call SendMessage')
+      expect(prompt.text).not.toContain('Use SendMessage')
+      expect(prompt.text).not.toContain('"laneId"')
+      expect(prompt.text.indexOf('<opencode_runtime_identity>')).toBeLessThan(
+        prompt.text.indexOf('Team launch context:')
+      )
+    }
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.jack?.launchState).toBe('confirmed_alive')
+  })
+
   test('keeps OpenCode peers visible when one launch member prompt delivery fails', async () => {
     const ensureInputs: string[] = []
     const promptAttempts: string[] = []

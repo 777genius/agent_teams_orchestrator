@@ -494,6 +494,59 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(custom?.actions[0]?.enabled).toBe(false)
   })
 
+  test('rejects non-api provider connects before OpenCode auth writes', async () => {
+    let setProviderAuthCalled = false
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          availableProviders: ['custom-ai'],
+          models: ['custom-ai/model-a'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'custom-ai', name: 'Custom AI', models: { 'model-a': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'custom-ai', name: 'Custom AI' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async () => {
+            setProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'custom-ai',
+      apiKey: 'sk-test-secret',
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('unsupported-auth-method')
+    expect(setProviderAuthCalled).toBe(false)
+    expect(authWrites).toEqual([])
+  })
+
   test('shows forget only when the OpenCode server doc advertises auth delete', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -580,9 +633,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
-  test('persists accepted OpenCode auth writes into the managed auth store before re-probing', async () => {
+  test('persists accepted OpenCode auth writes into the managed auth store after live provider evidence', async () => {
     const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
     const probeCalls: Array<{ bypassCache: boolean | undefined }> = []
+    let authApplied = false
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async (_projectPath, options) => {
@@ -616,11 +670,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
           getConfigProviders: async () => ({ providers: [], default: {} }),
           getProviders: async () => ({
             all: [{ id: 'openrouter', name: 'OpenRouter' }],
-            connected: [],
+            connected: authApplied ? ['openrouter'] : [],
             default: {},
           }),
           getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
-          setProviderAuth: async () => true,
+          setProviderAuth: async () => {
+            authApplied = true
+            return true
+          },
         }),
       },
       authStore: {
@@ -784,6 +841,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
   })
 
   test('treats OpenCode auth writes without connected provider evidence as failures', async () => {
+    let deleteCalled = false
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory({
@@ -802,9 +861,18 @@ describe('OpenCodeProviderManagementAdapter', () => {
           getProviders: async () => ({ all: [], connected: [], default: {} }),
           getProviderAuth: async () => ({}),
           setProviderAuth: async () => true,
+          deleteProviderAuth: async () => {
+            deleteCalled = true
+            return true
+          },
         }),
       },
-      authStore: authStore(),
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
     })
 
     const result = await adapter.connectWithApiKey({
@@ -817,6 +885,64 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (result.ok) return
     expect(result.error.code).toBe('auth-failed')
     expect(result.error.message).not.toContain('sk-test-secret')
+    expect(deleteCalled).toBe(true)
+    expect(authWrites).toEqual([])
+  })
+
+  test('does not persist API keys when OpenCode only reports environment-owned evidence', async () => {
+    let deleteCalled = false
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [{
+            id: 'openrouter',
+            authHint: 'api',
+            source: 'environment',
+          }],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/moonshotai/kimi-k2:free'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          setProviderAuth: async () => true,
+          deleteProviderAuth: async () => {
+            deleteCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      apiKey: 'sk-test-secret',
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('auth-failed')
+    expect(deleteCalled).toBe(true)
+    expect(authWrites).toEqual([])
   })
 
   test('guards forget behind OpenCode auth delete capability', async () => {

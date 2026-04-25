@@ -1722,6 +1722,34 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
 
+        const [configProvidersResult, providersResult, providerAuthResult] = await Promise.all([
+          safeRead(() => client.getConfigProviders()),
+          safeRead(() => client.getProviders()),
+          safeRead(() => client.getProviderAuth()),
+        ])
+        const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+        const providers = providersResult.ok ? providersResult.value : null
+        const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
+        const knownProviderIds = getKnownProviderIds({
+          inventory,
+          configProviders,
+          providers,
+        })
+        const authMethods = normalizeAuthMethods(providerAuth?.[providerId])
+        const curatedApiBootstrap = SEEDED_API_BOOTSTRAP_PROVIDER_IDS.has(providerId)
+        if (!knownProviderIds.has(providerId) && !curatedApiBootstrap) {
+          return providerManagementError(
+            'provider-missing',
+            `OpenCode provider ${providerId} was not found in the live catalog`,
+          )
+        }
+        if (!canConnectWithApiKey(providerId, authMethods)) {
+          return providerManagementError(
+            'unsupported-auth-method',
+            `OpenCode did not advertise API-key auth for provider ${providerId}`,
+          )
+        }
+
         const authApplied = await client.setProviderAuth(providerId, {
           type: 'api',
           key: apiKey,
@@ -1730,6 +1758,36 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           return providerManagementError(
             'auth-failed',
             `OpenCode did not apply API-key auth for provider ${providerId}`,
+          )
+        }
+
+        const providerEvidenceView = await readLiveView({
+          inventory,
+          host,
+          client,
+          diagnostics: [
+            ...inventory.diagnostics,
+            ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
+            ...(providersResult.ok ? [] : [providersResult.message]),
+            ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
+          ],
+        })
+        const providerEvidence = findProviderConnection(providerEvidenceView, providerId)
+        if (!providerEvidence) {
+          await client.deleteProviderAuth?.(providerId).catch(() => undefined)
+          return providerManagementError(
+            'provider-missing',
+            `OpenCode did not return provider ${providerId} after connecting`,
+          )
+        }
+        if (
+          providerEvidence.state !== 'connected' ||
+          !providerEvidence.ownership.includes('managed')
+        ) {
+          await client.deleteProviderAuth?.(providerId).catch(() => undefined)
+          return providerManagementError(
+            'auth-failed',
+            `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
           )
         }
 
@@ -1753,7 +1811,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             `OpenCode did not return provider ${providerId} after connecting`,
           )
         }
-        if (provider.state !== 'connected' && !provider.ownership.includes('managed')) {
+        if (provider.state !== 'connected' || !provider.ownership.includes('managed')) {
           return providerManagementError(
             'auth-failed',
             `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,

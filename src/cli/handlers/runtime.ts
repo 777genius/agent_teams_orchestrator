@@ -911,7 +911,7 @@ export async function runtimeProvidersSetDefault(opts: {
     providerId: opts.provider?.trim(),
     modelId: opts.model?.trim(),
     projectPath: opts.projectPath?.trim() || null,
-    probe: true,
+    probe: opts.probe === true,
   })
 
   if (result.ok) {
