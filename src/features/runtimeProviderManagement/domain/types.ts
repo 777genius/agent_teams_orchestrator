@@ -25,6 +25,59 @@ export type ProviderOwnership =
 
 export type ProviderAuthMethod = 'api' | 'oauth' | 'wellknown'
 
+export type ProviderSetupMethod = 'api' | 'oauth' | 'manual'
+
+export type ProviderSetupPromptType = 'text' | 'select'
+
+export type ProviderSetupPromptOption = {
+  label: string
+  value: string
+  hint: string | null
+}
+
+export type ProviderSetupPromptCondition = {
+  key: string
+  op: string
+  value: string
+}
+
+export type ProviderSetupPrompt = {
+  key: string
+  type: ProviderSetupPromptType
+  label: string
+  placeholder: string | null
+  required: boolean
+  secret: boolean
+  options: readonly ProviderSetupPromptOption[]
+  when: ProviderSetupPromptCondition | null
+}
+
+export type ProviderSetupFormSource =
+  | 'opencode-auth'
+  | 'curated'
+  | 'oauth'
+  | 'manual'
+
+export type ProviderSetupForm = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+  displayName: string
+  method: ProviderSetupMethod
+  supported: boolean
+  title: string
+  description: string | null
+  submitLabel: string
+  disabledReason: string | null
+  source: ProviderSetupFormSource
+  secret: {
+    key: 'key'
+    label: string
+    placeholder: string | null
+    required: boolean
+  } | null
+  prompts: readonly ProviderSetupPrompt[]
+}
+
 export type ProviderActionId =
   | 'connect'
   | 'use'
@@ -195,6 +248,19 @@ export type ConnectProviderApiKeyInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
   apiKey: string
+} & ProjectScopedProviderManagementInput
+
+export type LoadProviderSetupFormInput = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+} & ProjectScopedProviderManagementInput
+
+export type ConnectProviderInput = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+  method: ProviderSetupMethod
+  apiKey?: string | null
+  metadata?: Record<string, string> | null
 } & ProjectScopedProviderManagementInput
 
 export type ProviderSelectionInput = {

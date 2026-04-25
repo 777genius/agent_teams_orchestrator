@@ -3,10 +3,12 @@ export {
   isRuntimeProviderManagementEnabled,
 } from './application/featureGate.js'
 export { connectProviderWithApiKey } from './application/connectProviderWithApiKey.js'
+export { connectProvider } from './application/connectProvider.js'
 export { forgetManagedProvider } from './application/forgetManagedProvider.js'
 export { loadProviderDirectory } from './application/loadProviderDirectory.js'
 export { loadProviderModels } from './application/loadProviderModels.js'
 export { loadProviderManagementView } from './application/loadProviderManagementView.js'
+export { loadProviderSetupForm } from './application/loadProviderSetupForm.js'
 export { setProviderDefaultModel } from './application/setProviderDefaultModel.js'
 export { testProviderModel } from './application/testProviderModel.js'
 export {
@@ -16,6 +18,8 @@ export {
 export { ProviderManagementDialog } from './ui/ProviderManagementDialog.js'
 export type {
   ConnectProviderApiKeyInput,
+  ConnectProviderInput,
+  LoadProviderSetupFormInput,
   LoadProviderDirectoryInput,
   LoadProviderModelsInput,
   ProviderActionDescriptor,
@@ -32,6 +36,12 @@ export type {
   ProviderModelAvailability,
   ProviderModelTestResult,
   ProviderSelectionInput,
+  ProviderSetupForm,
+  ProviderSetupMethod,
+  ProviderSetupPrompt,
+  ProviderSetupPromptCondition,
+  ProviderSetupPromptOption,
+  ProviderSetupPromptType,
   RuntimeProviderModel,
   RuntimeProviderModelsView,
   SetDefaultModelInput,

@@ -72,12 +72,56 @@ describe('resolveOpenCodeProviderScopedModel', () => {
     ).toBe('openrouter/qwen/qwen3-coder')
   })
 
+  test('validates provider-scoped ids discovered only by the live provider catalog', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'openrouter/qwen/qwen3-coder',
+        snapshot({
+          providers: {
+            all: [
+              {
+                id: 'openrouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            default: {},
+            connected: ['openrouter'],
+          },
+        }),
+      ),
+    ).toBe('openrouter/qwen/qwen3-coder')
+  })
+
   test('resolves raw ids from the OpenCode models inventory when unique', () => {
     expect(
       resolveOpenCodeProviderScopedModel(
         'qwen/qwen3-coder',
         snapshot({
           models: ['openrouter/qwen/qwen3-coder'],
+        }),
+      ),
+    ).toBe('openrouter/qwen/qwen3-coder')
+  })
+
+  test('resolves raw ids discovered only by the live provider catalog', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'qwen/qwen3-coder',
+        snapshot({
+          providers: {
+            all: [
+              {
+                id: 'openrouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            default: {},
+            connected: ['openrouter'],
+          },
         }),
       ),
     ).toBe('openrouter/qwen/qwen3-coder')
@@ -129,6 +173,49 @@ describe('resolveOpenCodeProviderScopedModel', () => {
 
   test('uses OpenCode default metadata for raw ids', () => {
     expect(resolveOpenCodeProviderScopedModel('big-pickle', snapshot())).toBe('opencode/big-pickle')
+  })
+
+  test('uses live provider default metadata for raw ids', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'google/gemini-3-pro-preview',
+        snapshot({
+          providers: {
+            all: [],
+            default: {
+              openrouter: 'google/gemini-3-pro-preview',
+            },
+            connected: ['openrouter'],
+          },
+        }),
+      ),
+    ).toBe('openrouter/google/gemini-3-pro-preview')
+  })
+
+  test('ignores missing default metadata while resolving raw ids', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'qwen/qwen3-coder',
+        snapshot({
+          configProviders: {
+            providers: [],
+            default: undefined,
+          },
+          providers: {
+            all: [
+              {
+                id: 'openrouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            default: undefined,
+            connected: ['openrouter'],
+          },
+        }),
+      ),
+    ).toBe('openrouter/qwen/qwen3-coder')
   })
 
   test('uses a unique catalog match for raw ids', () => {

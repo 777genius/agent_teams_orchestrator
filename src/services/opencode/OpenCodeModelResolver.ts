@@ -40,6 +40,27 @@ function getConfigProviderModelMatches(
   return dedupeModelMatches(matches)
 }
 
+function getLiveProviderModelMatches(
+  snapshot: OpenCodeProvisioningSnapshot,
+  rawModelId: string,
+): Array<{ providerId: string; modelId: string }> {
+  const matches: Array<{ providerId: string; modelId: string }> = []
+
+  for (const provider of snapshot.providers?.all ?? []) {
+    const providerId = asString(provider.id)
+    const models = asRecord(provider.models)
+    if (!providerId || !models) {
+      continue
+    }
+
+    if (Object.prototype.hasOwnProperty.call(models, rawModelId)) {
+      matches.push({ providerId, modelId: rawModelId })
+    }
+  }
+
+  return dedupeModelMatches(matches)
+}
+
 function dedupeModelMatches(
   matches: Array<{ providerId: string; modelId: string }>,
 ): Array<{ providerId: string; modelId: string }> {
@@ -58,14 +79,19 @@ function getDefaultProviderMatch(
   snapshot: OpenCodeProvisioningSnapshot,
   rawModelId: string,
 ): { providerId: string; modelId: string } | null {
-  const defaults = asRecord(snapshot.configProviders?.default)
-  if (!defaults) {
-    return null
-  }
+  const defaultSources = [
+    asRecord(snapshot.configProviders?.default),
+    asRecord(snapshot.providers?.default),
+  ]
 
-  for (const [providerId, modelId] of Object.entries(defaults)) {
-    if (asString(modelId) === rawModelId) {
-      return { providerId, modelId: rawModelId }
+  for (const defaults of defaultSources) {
+    if (!defaults) {
+      continue
+    }
+    for (const [providerId, modelId] of Object.entries(defaults)) {
+      if (asString(modelId) === rawModelId) {
+        return { providerId, modelId: rawModelId }
+      }
     }
   }
 
@@ -101,7 +127,19 @@ function hasProviderScopedModel(
       continue
     }
     const models = asRecord(provider.models)
-    return Boolean(models && Object.prototype.hasOwnProperty.call(models, modelId))
+    if (models && Object.prototype.hasOwnProperty.call(models, modelId)) {
+      return true
+    }
+  }
+
+  for (const provider of snapshot.providers?.all ?? []) {
+    if (asString(provider.id) !== providerId) {
+      continue
+    }
+    const models = asRecord(provider.models)
+    if (models && Object.prototype.hasOwnProperty.call(models, modelId)) {
+      return true
+    }
   }
   return false
 }
@@ -172,7 +210,10 @@ export function resolveOpenCodeProviderScopedModel(
     return formatScopedModel(defaultMatch.providerId, defaultMatch.modelId)
   }
 
-  const matches = getConfigProviderModelMatches(snapshot, trimmed)
+  const matches = dedupeModelMatches([
+    ...getConfigProviderModelMatches(snapshot, trimmed),
+    ...getLiveProviderModelMatches(snapshot, trimmed),
+  ])
   if (matches.length === 1 && matches[0]) {
     return formatScopedModel(matches[0].providerId, matches[0].modelId)
   }

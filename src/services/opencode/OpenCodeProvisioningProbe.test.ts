@@ -251,6 +251,7 @@ describe('OpenCodeProvisioningProbe', () => {
 
     const snapshot = await probe.probe('/tmp/project')
     expect(snapshot.diagnostics.some(item => item.includes('missing from live host'))).toBe(true)
+    expect(snapshot.providers?.connected).toEqual(['anthropic', 'openai'])
     expect(snapshot.diagnostics.some(item => item.includes('Managed default agent mismatch'))).toBe(true)
     expect(snapshot.diagnostics.some(item => item.includes('Managed teammate primary agent is missing'))).toBe(true)
     expect(snapshot.diagnostics.some(item => item.includes('agent-teams MCP attach failed'))).toBe(true)

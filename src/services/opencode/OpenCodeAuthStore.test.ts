@@ -92,6 +92,31 @@ describe('OpenCodeAuthStore', () => {
     expect(JSON.parse(await readFile(authPath, 'utf8'))).toEqual({})
   })
 
+  test('writes API auth metadata for prompted provider setup', async () => {
+    const authPath = path.join(tempDir, 'data', 'opencode', 'auth.json')
+
+    await upsertOpenCodeApiAuthCredential({
+      authPath,
+      providerId: 'cloudflare-ai-gateway',
+      apiKey: 'cf-secret',
+      metadata: {
+        accountId: 'account-123',
+        gatewayId: 'gateway-123',
+      },
+    })
+
+    expect(JSON.parse(await readFile(authPath, 'utf8'))).toEqual({
+      'cloudflare-ai-gateway': {
+        type: 'api',
+        key: 'cf-secret',
+        metadata: {
+          accountId: 'account-123',
+          gatewayId: 'gateway-123',
+        },
+      },
+    })
+  })
+
   test('reports whether managed auth includes all local source entries', () => {
     expect(
       doesOpenCodeAuthStoreIncludeSource({

@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import type { OpenCodeConnectedProvider } from './types.js'
+import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
 type OpenCodeAuthEntry = Record<string, unknown>
 type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
@@ -105,23 +105,46 @@ export async function upsertOpenCodeApiAuthCredential(input: {
   authPath: string
   providerId: string
   apiKey: string
+  metadata?: Record<string, string> | null
 }): Promise<void> {
-  const providerId = normalizeProviderId(input.providerId)
+  await upsertOpenCodeApiAuth(input.authPath, input.providerId, {
+    type: 'api',
+    key: input.apiKey,
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  })
+}
+
+export async function upsertOpenCodeApiAuth(
+  authPath: string,
+  rawProviderId: string,
+  auth: OpenCodeApiAuthInput,
+): Promise<void> {
+  const providerId = normalizeProviderId(rawProviderId)
   if (!providerId) {
     throw new Error('OpenCode provider id is invalid')
   }
 
-  const apiKey = input.apiKey.trim()
+  const apiKey = auth.key.trim()
   if (!apiKey) {
     throw new Error('OpenCode API key is required')
   }
 
-  const authStore = await readOpenCodeAuthStore(input.authPath)
+  const metadata: Record<string, string> = {}
+  for (const [key, value] of Object.entries(auth.metadata ?? {})) {
+    const normalizedKey = key.trim()
+    const normalizedValue = value.trim()
+    if (normalizedKey && normalizedValue) {
+      metadata[normalizedKey] = normalizedValue
+    }
+  }
+
+  const authStore = await readOpenCodeAuthStore(authPath)
   authStore[providerId] = {
     type: 'api',
     key: apiKey,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   }
-  await writeOpenCodeAuthStore(input.authPath, authStore)
+  await writeOpenCodeAuthStore(authPath, authStore)
 }
 
 export async function removeOpenCodeAuthCredential(input: {

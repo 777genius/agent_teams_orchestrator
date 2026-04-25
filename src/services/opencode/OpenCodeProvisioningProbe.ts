@@ -155,6 +155,10 @@ export class OpenCodeProvisioningProbe {
         inventory.connectedProviders.map(provider => provider.id),
       )
       const hostConnectedProviders = uniqueSorted(providers.connected ?? [])
+      const connectedProviders = uniqueSorted([
+        ...hostConnectedProviders,
+        ...inventoryConnectedProviders,
+      ])
 
       if (host.state !== 'healthy') {
         diagnostics.push(`OpenCode host state is ${host.state}`)
@@ -208,7 +212,10 @@ export class OpenCodeProvisioningProbe {
         host: cloneHost(host),
         config,
         configProviders,
-        providers,
+        providers: {
+          ...providers,
+          connected: connectedProviders,
+        },
         providerAuth,
         agents,
         mcp: appMcp.mcp,

@@ -310,10 +310,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.entries.map(entry => entry.providerId)).toEqual(['deepseek'])
     expect(result.value.entries[0]).toMatchObject({
       displayName: 'DeepSeek',
-      setupKind: 'available-readonly',
+      setupKind: 'connect-api-key',
       modelCount: 1,
       sources: ['opencode-provider'],
       sourceLabel: 'OpenCode catalog',
+      metadata: {
+        supportedInlineAuth: true,
+      },
     })
     expect(JSON.stringify(result.value)).not.toContain('sk-test-secret')
     expect(result.value.diagnostics.join('\n')).toContain('Skipped 2 malformed OpenCode provider row(s)')
@@ -365,6 +368,55 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
     expect(result.value.entries.find(entry =>
       entry.providerId === 'cloudflare-workers-ai')?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('orders connectable directory providers before read-only available providers', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['clarifai', 'cloudflare-ai-gateway'],
+          models: ['clarifai/claude-sonnet-4-5', 'cloudflare-ai-gateway/claude-sonnet-4-5'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              { id: 'clarifai', name: 'Clarifai', models: { 'claude-sonnet-4-5': {} } },
+              {
+                id: 'cloudflare-ai-gateway',
+                name: 'Cloudflare AI Gateway',
+                models: { 'claude-sonnet-4-5': {} },
+              },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'cloudflare-ai-gateway': [{ type: 'api' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'cl',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries.map(entry => entry.providerId)).toEqual([
+      'cloudflare-ai-gateway',
+      'clarifai',
+    ])
   })
 
   test('keeps model-id search working from the cached provider directory', async () => {
@@ -545,6 +597,266 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.error.code).toBe('unsupported-auth-method')
     expect(setProviderAuthCalled).toBe(false)
     expect(authWrites).toEqual([])
+  })
+
+  test('loads setup forms from OpenCode auth prompts', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          availableProviders: ['cloudflare-ai-gateway'],
+          models: ['cloudflare-ai-gateway/claude-sonnet-4-5'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'cloudflare-ai-gateway', name: 'Cloudflare AI Gateway' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'cloudflare-ai-gateway': [{
+              type: 'api',
+              label: 'Gateway API token',
+              prompts: [
+                {
+                  type: 'text',
+                  key: 'accountId',
+                  message: 'Enter your Cloudflare Account ID',
+                  placeholder: 'account-id',
+                },
+                {
+                  type: 'text',
+                  key: 'gatewayId',
+                  message: 'Enter your Cloudflare AI Gateway ID',
+                  placeholder: 'gateway-id',
+                },
+              ],
+            }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadSetupForm({
+      runtimeId: 'opencode',
+      providerId: 'cloudflare-ai-gateway',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value).toMatchObject({
+      providerId: 'cloudflare-ai-gateway',
+      method: 'api',
+      supported: true,
+      source: 'opencode-auth',
+      secret: {
+        label: 'Gateway API token',
+      },
+    })
+    expect(result.value.prompts.map(prompt => prompt.key)).toEqual(['accountId', 'gatewayId'])
+  })
+
+  test('loads curated setup forms for documented catalog providers without provider auth schema', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          availableProviders: ['openrouter'],
+          models: ['openrouter/openai/gpt-oss-20b:free'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadSetupForm({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value).toMatchObject({
+      providerId: 'openrouter',
+      method: 'api',
+      supported: true,
+      source: 'curated',
+      secret: {
+        label: 'API key',
+      },
+    })
+  })
+
+  test('connects prompted API auth with metadata and persists the full app-managed auth shape', async () => {
+    const authBodies: unknown[] = []
+    const authWrites: Array<{ authPath: string; providerId: string; auth: unknown }> = []
+    let authApplied = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory(options?.bypassCache
+          ? {
+              connectedProviders: [{
+                id: 'cloudflare-ai-gateway',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              }],
+              availableProviders: ['cloudflare-ai-gateway'],
+              models: ['cloudflare-ai-gateway/claude-sonnet-4-5'],
+            }
+          : {
+              connectedProviders: [],
+              availableProviders: ['cloudflare-ai-gateway'],
+              models: ['cloudflare-ai-gateway/claude-sonnet-4-5'],
+            }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'cloudflare-ai-gateway', name: 'Cloudflare AI Gateway' }],
+            connected: authApplied ? ['cloudflare-ai-gateway'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'cloudflare-ai-gateway': [{
+              type: 'api',
+              label: 'Gateway API token',
+              prompts: [
+                { type: 'text', key: 'accountId', message: 'Account ID' },
+                { type: 'text', key: 'gatewayId', message: 'Gateway ID' },
+              ],
+            }],
+          }),
+          setProviderAuth: async (_providerId, body) => {
+            authBodies.push(body)
+            authApplied = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    const result = await adapter.connectProvider({
+      runtimeId: 'opencode',
+      providerId: 'cloudflare-ai-gateway',
+      method: 'api',
+      apiKey: 'cf-secret',
+      metadata: {
+        accountId: 'account-123',
+        gatewayId: 'gateway-123',
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(authBodies).toEqual([{
+      type: 'api',
+      key: 'cf-secret',
+      metadata: {
+        accountId: 'account-123',
+        gatewayId: 'gateway-123',
+      },
+    }])
+    expect(authWrites.map(write => write.auth)).toEqual(authBodies.concat(authBodies))
+  })
+
+  test('rolls back OpenCode and mirrored auth when app-managed persistence fails', async () => {
+    let deleteCalled = false
+    const removedAuthPaths: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [{
+            id: 'openrouter',
+            authHint: 'api',
+            source: 'credentials',
+            credentialScopes: ['managed'],
+          }],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/moonshotai/kimi-k2:free'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'openrouter', name: 'OpenRouter', models: { 'moonshotai/kimi-k2:free': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          setProviderAuth: async () => true,
+          deleteProviderAuth: async () => {
+            deleteCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async input => {
+          if (input.authPath.endsWith('/data/opencode/auth.json')) {
+            throw new Error('managed auth write failed')
+          }
+        },
+        removeCredential: async input => {
+          removedAuthPaths.push(input.authPath)
+        },
+      },
+    })
+
+    const result = await adapter.connectProvider({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      method: 'api',
+      apiKey: 'sk-test-secret',
+      metadata: {},
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('auth-failed')
+    expect(result.error.message).not.toContain('sk-test-secret')
+    expect(deleteCalled).toBe(true)
+    expect(removedAuthPaths).toEqual([
+      '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+      '/tmp/profile/data/opencode/auth.json',
+    ])
   })
 
   test('shows forget only when the OpenCode server doc advertises auth delete', async () => {
@@ -776,7 +1088,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
   test('redacts API keys from connect failures', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
-        probe: async () => inventory(),
+        probe: async () => inventory({
+          availableProviders: ['openrouter'],
+          models: ['openrouter/moonshotai/kimi-k2:free'],
+        }),
       },
       hostManager: {
         ensureHost: async () => host(),
@@ -785,7 +1100,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       clientFactory: {
         create: () => ({
           getConfigProviders: async () => ({ providers: [], default: {} }),
-          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
           getProviderAuth: async () => ({}),
           setProviderAuth: async () => {
             throw new Error('failed for sk-test-secret')
@@ -811,7 +1130,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
   test('treats false OpenCode auth writes as connect failures', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
-        probe: async () => inventory(),
+        probe: async () => inventory({
+          availableProviders: ['openrouter'],
+          models: ['openrouter/moonshotai/kimi-k2:free'],
+        }),
       },
       hostManager: {
         ensureHost: async () => host(),
@@ -820,7 +1142,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       clientFactory: {
         create: () => ({
           getConfigProviders: async () => ({ providers: [], default: {} }),
-          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
           getProviderAuth: async () => ({}),
           setProviderAuth: async () => false,
         }),
@@ -838,6 +1164,52 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (result.ok) return
     expect(result.error.code).toBe('auth-failed')
     expect(result.error.message).not.toContain('sk-test-secret')
+  })
+
+  test('rejects seeded curated providers absent from the live catalog before OpenCode auth writes', async () => {
+    let setProviderAuthCalled = false
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          availableProviders: [],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async () => {
+            setProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      apiKey: 'sk-test-secret',
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('provider-missing')
+    expect(setProviderAuthCalled).toBe(false)
+    expect(authWrites).toEqual([])
   })
 
   test('treats OpenCode auth writes without connected provider evidence as failures', async () => {
@@ -858,8 +1230,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
       clientFactory: {
         create: () => ({
           getConfigProviders: async () => ({ providers: [], default: {} }),
-          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
           getProviderAuth: async () => ({}),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
           setProviderAuth: async () => true,
           deleteProviderAuth: async () => {
             deleteCalled = true
@@ -917,6 +1294,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
             default: {},
           }),
           getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
           setProviderAuth: async () => true,
           deleteProviderAuth: async () => {
             deleteCalled = true

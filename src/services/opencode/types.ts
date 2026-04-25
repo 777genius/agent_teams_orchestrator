@@ -92,9 +92,31 @@ export type OpenCodeConfigResponse = {
   permission?: Record<string, unknown>
 }
 
+export type OpenCodeProviderAuthPromptOption = {
+  label?: string
+  value?: string
+  hint?: string
+}
+
+export type OpenCodeProviderAuthPromptCondition = {
+  key?: string
+  op?: string
+  value?: string
+}
+
+export type OpenCodeProviderAuthPrompt = {
+  type?: string
+  key?: string
+  message?: string
+  placeholder?: string
+  options?: OpenCodeProviderAuthPromptOption[]
+  when?: OpenCodeProviderAuthPromptCondition
+}
+
 export type OpenCodeProviderAuthMethod = {
   type?: string
   label?: string
+  prompts?: OpenCodeProviderAuthPrompt[]
 }
 
 export type OpenCodeApiAuthInput = {

@@ -4225,6 +4225,29 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersDirectory(opts);
   });
+  runtimeProviders.command('setup-form').description('Return the managed setup form for a nested runtime provider').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    projectPath?: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersSetupForm
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersSetupForm(opts);
+  });
+  runtimeProviders.command('connect').description('Connect a nested runtime provider using setup JSON from stdin').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--stdin-json', 'Read the setup payload from stdin').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    projectPath?: string;
+    stdinJson?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersConnect
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersConnect(opts);
+  });
   runtimeProviders.command('connect-api-key').description('Connect a nested runtime provider using an API key from stdin').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--stdin-key', 'Read the API key from stdin').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     provider: string;

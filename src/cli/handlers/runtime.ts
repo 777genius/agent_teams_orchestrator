@@ -10,13 +10,16 @@ import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionSto
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import {
   connectProviderWithApiKey,
+  connectProvider,
   forgetManagedProvider,
   loadProviderDirectory,
   loadProviderModels,
   loadProviderManagementView,
+  loadProviderSetupForm,
   openCodeProviderManagementAdapter,
   setProviderDefaultModel,
   testProviderModel,
+  type ConnectProviderInput,
   type ProviderConnection,
   type ProviderDirectoryFilter,
   type ProviderDirectoryView,
@@ -24,6 +27,7 @@ import {
   type ProviderManagementRuntimeId,
   type ProviderManagementView,
   type ProviderModelTestResult,
+  type ProviderSetupForm,
   type RuntimeProviderModelsView,
 } from '../../features/runtimeProviderManagement/index.js'
 import type {
@@ -636,6 +640,17 @@ async function readStdinSecret(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8').trim()
 }
 
+async function readStdinJsonObject(): Promise<Record<string, unknown> | null> {
+  const raw = await readStdinSecret()
+  if (!raw) {
+    return null
+  }
+  const parsed = JSON.parse(raw) as unknown
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : null
+}
+
 function writeProviderManagementViewResponse(
   runtimeId: RuntimeProviderManagementTarget,
   view: ProviderManagementView | null,
@@ -671,6 +686,19 @@ function writeProviderManagementProviderResponse(
     schemaVersion: 1,
     runtimeId,
     ...(provider ? { provider } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function writeProviderManagementSetupFormResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  setupForm: ProviderSetupForm | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(setupForm ? { setupForm } : {}),
     ...(error ? { error } : {}),
   }, null, 2) + '\n')
 }
@@ -776,6 +804,132 @@ export async function runtimeProvidersDirectory(opts: {
   }
 
   writeProviderManagementDirectoryResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersSetupForm(opts: {
+  runtime?: string
+  provider: string
+  projectPath?: string
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await loadProviderSetupForm(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId: opts.provider?.trim(),
+    projectPath: opts.projectPath?.trim() || null,
+  })
+
+  if (result.ok) {
+    writeProviderManagementSetupFormResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementSetupFormResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+function normalizeConnectProviderPayload(input: {
+  runtimeId: RuntimeProviderManagementTarget
+  providerId: string
+  projectPath?: string | null
+  payload: Record<string, unknown>
+}): ConnectProviderInput {
+  const method = typeof input.payload.method === 'string'
+    ? input.payload.method.trim()
+    : 'api'
+  if (method !== 'api' && method !== 'oauth' && method !== 'manual') {
+    throw new Error(`Unsupported provider setup method: ${method || '(empty)'}`)
+  }
+  const apiKey = typeof input.payload.apiKey === 'string'
+    ? input.payload.apiKey
+    : typeof input.payload.key === 'string'
+      ? input.payload.key
+      : null
+  const metadata: Record<string, string> = {}
+  const rawMetadata = input.payload.metadata
+  if (rawMetadata && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata)) {
+    for (const [key, value] of Object.entries(rawMetadata)) {
+      if (typeof value === 'string') {
+        metadata[key] = value
+      }
+    }
+  }
+
+  return {
+    runtimeId: input.runtimeId,
+    providerId: input.providerId,
+    method,
+    apiKey,
+    metadata,
+    projectPath: input.projectPath,
+  }
+}
+
+export async function runtimeProvidersConnect(opts: {
+  runtime?: string
+  provider: string
+  projectPath?: string
+  stdinJson?: boolean
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const providerId = opts.provider?.trim()
+
+  if (!opts.stdinJson) {
+    writeProviderManagementProviderResponse(
+      runtimeId,
+      null,
+      authRequiredError('Provider setup payload must be supplied through --stdin-json'),
+    )
+    process.exit(1)
+  }
+
+  let payload: Record<string, unknown> | null = null
+  try {
+    payload = await readStdinJsonObject()
+  } catch {
+    writeProviderManagementProviderResponse(
+      runtimeId,
+      null,
+      authRequiredError('Provider setup payload from stdin is not valid JSON'),
+    )
+    process.exit(1)
+  }
+  if (!payload) {
+    writeProviderManagementProviderResponse(
+      runtimeId,
+      null,
+      authRequiredError('Provider setup payload from stdin is empty'),
+    )
+    process.exit(1)
+  }
+
+  let connectInput: ConnectProviderInput
+  try {
+    connectInput = normalizeConnectProviderPayload({
+      runtimeId,
+      providerId,
+      projectPath: opts.projectPath?.trim() || null,
+      payload,
+    })
+  } catch (error) {
+    writeProviderManagementProviderResponse(runtimeId, null, {
+      code: 'unsupported-auth-method',
+      message: error instanceof Error ? error.message : 'Unsupported provider setup method',
+      recoverable: true,
+    })
+    process.exit(1)
+  }
+
+  const result = await connectProvider(openCodeProviderManagementAdapter, connectInput)
+
+  if (result.ok) {
+    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementProviderResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
