@@ -8,6 +8,7 @@ import {
   buildManagedConfig,
   buildManagedConfigFingerprint,
   collectProjectBehaviorMetadata,
+  OpenCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -97,6 +98,21 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         timeout: 8000,
       },
     })
+  })
+
+  test('exposes a stable global auth path even before the auth file exists', () => {
+    const previousXdgDataHome = process.env.XDG_DATA_HOME
+    process.env.XDG_DATA_HOME = tempDir
+    try {
+      const manager = new OpenCodeProfileManager()
+      expect(manager.getGlobalAuthPath()).toBe(path.join(tempDir, 'opencode', 'auth.json'))
+    } finally {
+      if (previousXdgDataHome === undefined) {
+        delete process.env.XDG_DATA_HOME
+      } else {
+        process.env.XDG_DATA_HOME = previousXdgDataHome
+      }
+    }
   })
 
   test('keeps managed config fingerprint stable across volatile app MCP environment values', async () => {

@@ -50,3 +50,4 @@ working OpenCode inventory, host, profile, and diagnostics services.
 ## Documents
 
 - Frontend plan: `frontend.md`
+- Phase 4 provider directory plan: `provider-directory-phase-4.md`

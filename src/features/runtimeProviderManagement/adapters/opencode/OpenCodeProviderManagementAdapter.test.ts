@@ -24,6 +24,7 @@ function inventory(
       xdgConfigHome: '/tmp/profile/config',
       xdgDataHome: '/tmp/profile/data',
       xdgCacheHome: '/tmp/profile/cache',
+      globalAuthPath: '/Users/test/.local/share/opencode/auth.json',
       managedAuthPath: '/tmp/profile/data/opencode/auth.json',
       sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
       sourceAuthFingerprint: 'source-auth',
@@ -177,6 +178,42 @@ describe('OpenCodeProviderManagementAdapter', () => {
       recommended: true,
     })
     expect(openrouter?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('loads the provider view from the selected project profile', async () => {
+    const probeCalls: Array<string | null | undefined> = []
+    const ensureHostCalls: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (projectPath) => {
+          probeCalls.push(projectPath)
+          return inventory({ projectPath: projectPath ?? '/tmp/project' })
+        },
+      },
+      hostManager: {
+        ensureHost: async ({ projectPath }) => {
+          ensureHostCalls.push(projectPath)
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView({
+      runtimeId: 'opencode',
+      projectPath: '/tmp/selected-project',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probeCalls).toEqual(['/tmp/selected-project'])
+    expect(ensureHostCalls).toEqual(['/tmp/selected-project'])
   })
 
   test('does not invent API-key connect for unknown providers without advertised API auth', async () => {
@@ -522,6 +559,71 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (result.ok) return
     expect(result.error.code).toBe('unsupported-action')
     expect(deleteCalled).toBe(false)
+  })
+
+  test('forget removes credentials from global auth and every managed profile auth store', async () => {
+    const removedAuthPaths: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory(options?.bypassCache
+          ? {
+              connectedProviders: [],
+              availableProviders: ['openrouter'],
+              models: [],
+            }
+          : {
+              connectedProviders: [{
+                id: 'openrouter',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed', 'local'],
+              }],
+              availableProviders: ['openrouter'],
+              models: ['openrouter/moonshotai/kimi-k2:free'],
+            }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          deleteProviderAuth: async () => true,
+        }),
+      },
+      authStore: {
+        upsertApiKey: async () => {},
+        removeCredential: async input => {
+          removedAuthPaths.push(input.authPath)
+        },
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [
+          '/tmp/profile/data/opencode/auth.json',
+          '/tmp/other-profile/data/opencode/auth.json',
+        ],
+      },
+    })
+
+    const result = await adapter.forgetManagedCredential({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(removedAuthPaths).toEqual([
+      '/Users/test/.local/share/opencode/auth.json',
+      '/tmp/profile/data/opencode/auth.json',
+      '/tmp/other-profile/data/opencode/auth.json',
+    ])
   })
 
   test('marks the runtime degraded when the managed host cannot start', async () => {
