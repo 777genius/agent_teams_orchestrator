@@ -219,6 +219,13 @@ function expectOpenCodeIdentityPrompt(input: {
   expect(input.text).toContain(`"runId":"${input.runId}"`)
   expect(input.text).toContain(`"runtimeSessionId":"${input.runtimeSessionId}"`)
   expect(input.text).toContain(input.originalPrompt)
+  if (input.text.includes('Your first app-team MCP action must be runtime bootstrap check-in.')) {
+    expect(input.text).toContain('Launch bootstrap is a silent attach')
+    expect(input.text).toContain('stop this turn immediately')
+    expect(input.text).toContain('stay idle silently')
+  } else {
+    expect(input.text).toContain('Do not send unrelated readiness')
+  }
   expect(input.text).not.toContain('"laneId"')
 }
 

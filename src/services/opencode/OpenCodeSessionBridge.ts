@@ -727,11 +727,71 @@ export class OpenCodeSessionBridge {
     summary: OpenCodeSessionReconcileSummary
     logProjection: OpenCodeLogProjection
   }> {
-    const reconciled = await this.reconcileSession(record, options)
+    let reconciled = await this.reconcileSession(record, options)
+    if (reconciled.summary.reconcileOutcome === 'stale') {
+      try {
+        reconciled = await this.readStaleSessionMessagesForLogProjection(record, {
+          limit: options.limit,
+          staleReason: reconciled.summary.staleReason ?? record.staleReason ?? 'stale_session',
+          profileAuthState: reconciled.summary.profileAuthState,
+          diagnostics: reconciled.summary.diagnostics,
+        })
+      } catch (error) {
+        reconciled.summary.diagnostics.push(
+          `OpenCode stale session log read failed - ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+
     return {
       ...reconciled,
       logProjection: this.logProjector.projectSummary(reconciled.summary),
     }
+  }
+
+  private async readStaleSessionMessagesForLogProjection(
+    record: OpenCodeSessionRecord,
+    options: {
+      limit?: number
+      staleReason: string
+      profileAuthState: OpenCodeAuthState | null
+      diagnostics: string[]
+    },
+  ): Promise<{
+    record: OpenCodeSessionRecord
+    summary: OpenCodeSessionReconcileSummary
+  }> {
+    return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
+      const client = this.clientFactory.create(baseUrl)
+      const diagnostics = [...options.diagnostics]
+      let rawStatus: OpenCodeSessionStatus | null = null
+      try {
+        const statusMap = await client.getSessionStatus()
+        rawStatus = statusMap[record.opencodeSessionId] ?? null
+      } catch (error) {
+        diagnostics.push(
+          `OpenCode stale session status unavailable during log projection - ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+
+      const summary = this.eventTranslator.reconcileSessionMessages({
+        sessionId: record.opencodeSessionId,
+        rawStatus,
+        messages: await client.getSessionMessages(record.opencodeSessionId, options.limit),
+      })
+      summary.reconcileOutcome = 'stale'
+      summary.staleReason = options.staleReason
+      summary.profileAuthState = options.profileAuthState
+      summary.diagnostics.unshift(
+        `OpenCode session is stale (${options.staleReason}); reading historical messages for log projection only`,
+      )
+      summary.diagnostics.push(...diagnostics)
+
+      return {
+        record: runtimePid ? { ...record, runtimePid } : record,
+        summary,
+      }
+    })
   }
 }
 

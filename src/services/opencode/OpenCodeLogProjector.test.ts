@@ -164,6 +164,68 @@ describe('OpenCodeLogProjector', () => {
     ])
   })
 
+  test('truncates huge tool-result payloads in projected log messages', () => {
+    const hugeOutput = 'x'.repeat(9_000)
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 1,
+        toolCallCount: 1,
+        messages: [
+          {
+            id: 'msg-assistant-huge-output',
+            parentId: 'msg-user-1',
+            role: 'assistant',
+            agent: 'teammate',
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 101,
+            completedAt: 110,
+            text: '',
+            reasoningText: '',
+            previewText: null,
+            partTypes: ['tool'],
+            reasoningPartCount: 0,
+            toolCalls: [
+              {
+                callId: 'call_huge',
+                toolName: 'agent-teams_member_briefing',
+                title: 'Member briefing',
+                status: 'completed',
+                input: {},
+                output: hugeOutput,
+                outputText: hugeOutput,
+                outputPreview: hugeOutput.slice(0, 120),
+                startedAt: 102,
+                completedAt: 109,
+                isError: false,
+              },
+            ],
+            contentBlocks: [
+              {
+                type: 'tool_use',
+                id: 'call_huge',
+                name: 'agent-teams_member_briefing',
+                status: 'completed',
+                input: {},
+                startedAt: 102,
+                completedAt: 109,
+              },
+            ],
+            finishReason: 'stop',
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    const synthetic = projection.messages.find(message => message.uuid.endsWith('::tool_results'))
+    expect(synthetic?.toolResults[0]?.content).toContain(
+      '[truncated 1000 chars from OpenCode tool result]',
+    )
+  })
+
   test('projects assistant runtime errors into synthetic system log messages', () => {
     const projection = projector.projectSummary(
       buildSummary({

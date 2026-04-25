@@ -269,6 +269,17 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
       ? 'After check-in succeeds, request your teammate rules.'
       : 'If your teammate rules are missing or stale, request them before replying.',
     `${purpose === 'launch' ? 'Call' : 'If briefing is needed, call'} the exposed Agent Teams member_briefing tool, usually agent-teams_member_briefing or mcp__agent-teams__member_briefing, with: ${JSON.stringify(briefingPayload)}`,
+    ...(purpose === 'launch'
+      ? [
+          'Launch bootstrap is a silent attach, not a user/team conversation turn.',
+          'After runtime_bootstrap_checkin and member_briefing both succeed, stop this turn immediately and wait for app-delivered messages or actionable task assignments.',
+          'Do not call task_briefing, message_send, or cross_team_send just to announce readiness, say understood, report no tasks, or ask for work.',
+          'If the briefing says there are no actionable tasks, stay idle silently.',
+        ]
+      : [
+          'Only send a visible message when you are replying to this delivered app message or reporting real task/blocker/result context.',
+          'Do not send unrelated readiness, understood, idle, or no-task acknowledgements.',
+        ]),
     'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
     'Do not use runtime_deliver_message for ordinary visible replies unless a runtime-delivery prompt explicitly provides runId/runtimeSessionId/idempotencyKey.',
     '</opencode_runtime_identity>',

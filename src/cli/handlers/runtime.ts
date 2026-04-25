@@ -13,7 +13,7 @@ import type {
   RuntimeProviderStatus,
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 
@@ -403,12 +403,45 @@ function printOpenCodeSessionPreview(result: Awaited<ReturnType<typeof openCodeS
   }
 }
 
+async function resolveOpenCodeSessionRecordForCli(opts: {
+  team: string
+  member: string
+  lane?: string
+}) {
+  const laneId = opts.lane?.trim()
+  if (laneId) {
+    const record = await openCodeSessionStore.get(opts.team, laneId, opts.member)
+    if (!record) {
+      throw new Error(`No stored OpenCode session record for ${opts.team}/${laneId}/${opts.member}`)
+    }
+    return record
+  }
+
+  const records = (await openCodeSessionStore.list()).filter(record =>
+    record.teamId === opts.team && record.memberName === opts.member
+  )
+
+  if (records.length > 1) {
+    throw new Error(
+      `Multiple OpenCode session records exist for ${opts.team}/${opts.member}; pass --lane to select one`,
+    )
+  }
+
+  const record = records[0]
+  if (!record) {
+    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member}`)
+  }
+
+  return record
+}
+
 export async function runtimeReconcile(opts: {
   json?: boolean
   text?: boolean
   provider?: RuntimeProviderTarget
   team: string
   member: string
+  lane?: string
   limit?: number
 }): Promise<void> {
   const provider = opts.provider ?? 'all'
@@ -416,10 +449,7 @@ export async function runtimeReconcile(opts: {
     throw new Error(`runtime reconcile is currently only implemented for OpenCode, received "${provider}"`)
   }
 
-  const record = await openCodeSessionStore.get(opts.team, opts.member)
-  if (!record) {
-    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member}`)
-  }
+  const record = await resolveOpenCodeSessionRecordForCli(opts)
 
   const result = await openCodeSessionBridge.reconcileSession(record, {
     limit: typeof opts.limit === 'number' ? opts.limit : undefined,
@@ -444,6 +474,7 @@ export async function runtimePreview(opts: {
   provider?: RuntimeProviderTarget
   team: string
   member: string
+  lane?: string
   timeout?: number
   idleTimeout?: number
 }): Promise<void> {
@@ -452,10 +483,7 @@ export async function runtimePreview(opts: {
     throw new Error(`runtime preview is currently only implemented for OpenCode, received "${provider}"`)
   }
 
-  const record = await openCodeSessionStore.get(opts.team, opts.member)
-  if (!record) {
-    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member}`)
-  }
+  const record = await resolveOpenCodeSessionRecordForCli(opts)
 
   const result = await openCodeSessionBridge.observePreview(record, {
     timeoutMs: typeof opts.timeout === 'number' ? opts.timeout : undefined,
@@ -481,17 +509,17 @@ export async function runtimeTranscript(opts: {
   provider?: RuntimeProviderTarget
   team: string
   member: string
+  lane?: string
   limit?: number
+  projectionOnly?: boolean
+  output?: string
 }): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
     throw new Error(`runtime transcript is currently only implemented for OpenCode, received "${provider}"`)
   }
 
-  const record = await openCodeSessionStore.get(opts.team, opts.member)
-  if (!record) {
-    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member}`)
-  }
+  const record = await resolveOpenCodeSessionRecordForCli(opts)
 
   const result = await openCodeSessionBridge.projectLogMessages(record, {
     limit: typeof opts.limit === 'number' ? opts.limit : undefined,
@@ -503,7 +531,7 @@ export async function runtimeTranscript(opts: {
       `  projected log messages: ${String(result.logProjection.projectedMessageCount)} (${String(result.logProjection.syntheticMessageCount)} synthetic)\n`,
     )
   } else {
-    process.stdout.write(jsonStringify({
+    const payload = jsonStringify({
       schemaVersion: 1,
       providerId: 'opencode',
       transcript: {
@@ -515,11 +543,16 @@ export async function runtimeTranscript(opts: {
         errorCount: result.summary.errorCount,
         latestAssistantText: result.summary.latestAssistantText,
         latestAssistantPreview: result.summary.latestAssistantPreview,
-        messages: result.summary.messages,
+        messages: opts.projectionOnly ? [] : result.summary.messages,
         diagnostics: result.summary.diagnostics,
         logProjection: result.logProjection,
       },
-    }, null, 2) + '\n')
+    }, null, 2) + '\n'
+    if (opts.output?.trim()) {
+      await writeFile(opts.output.trim(), payload, 'utf8')
+    } else {
+      process.stdout.write(payload)
+    }
   }
 
   process.exit(0)

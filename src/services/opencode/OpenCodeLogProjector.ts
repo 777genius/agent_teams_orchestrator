@@ -11,6 +11,8 @@ import type {
 
 type OpenCodeLogProjectorClock = () => number
 
+const MAX_PROJECTED_TOOL_RESULT_TEXT_CHARS = 8_000
+
 function asFiniteTimestamp(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
@@ -44,9 +46,18 @@ function buildModelRef(message: OpenCodeCanonicalMessage): string | undefined {
   return message.modelId ?? undefined
 }
 
+function truncateProjectedToolResultText(value: string): string {
+  if (value.length <= MAX_PROJECTED_TOOL_RESULT_TEXT_CHARS) {
+    return value
+  }
+
+  const omitted = value.length - MAX_PROJECTED_TOOL_RESULT_TEXT_CHARS
+  return `${value.slice(0, MAX_PROJECTED_TOOL_RESULT_TEXT_CHARS)}\n...[truncated ${omitted} chars from OpenCode tool result]`
+}
+
 function stringifyToolResultContent(value: unknown): string | OpenCodeProjectedLogContentBlock[] {
   if (typeof value === 'string') {
-    return value
+    return truncateProjectedToolResultText(value)
   }
 
   if (Array.isArray(value)) {
@@ -59,7 +70,7 @@ function stringifyToolResultContent(value: unknown): string | OpenCodeProjectedL
         && 'text' in item
         && typeof item.text === 'string'
       ) {
-        return [{ type: 'text', text: item.text }]
+        return [{ type: 'text', text: truncateProjectedToolResultText(item.text) }]
       }
       return []
     })
@@ -73,9 +84,9 @@ function stringifyToolResultContent(value: unknown): string | OpenCodeProjectedL
   }
 
   try {
-    return JSON.stringify(value, null, 2)
+    return truncateProjectedToolResultText(JSON.stringify(value, null, 2))
   } catch {
-    return String(value)
+    return truncateProjectedToolResultText(String(value))
   }
 }
 

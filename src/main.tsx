@@ -4219,12 +4219,13 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeVerifyModel(opts);
   });
-  runtime.command('reconcile').description('Reconcile a stored provider-backed session against durable runtime state').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  runtime.command('reconcile').description('Reconcile a stored provider-backed session against durable runtime state').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').option('--lane <laneId>', 'Lane identifier used in the stored session record when multiple lanes share a member name').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
     provider?: 'opencode' | 'all';
     team: string;
     member: string;
+    lane?: string;
     limit?: number;
   }) => {
     const {
@@ -4232,12 +4233,15 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeReconcile(opts);
   });
-  runtime.command('transcript').description('Project a stored provider-backed session into canonical transcript items').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  runtime.command('transcript').description('Project a stored provider-backed session into canonical transcript items').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').option('--lane <laneId>', 'Lane identifier used in the stored session record when multiple lanes share a member name').option('--projection-only', 'Omit raw canonical messages and return only the log projection payload').option('--output <path>', 'Write JSON output to a file instead of stdout').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--limit <count>', 'Limit session messages fetch to the latest N entries').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
     provider?: 'opencode' | 'all';
     team: string;
     member: string;
+    lane?: string;
+    projectionOnly?: boolean;
+    output?: string;
     limit?: number;
   }) => {
     const {
@@ -4245,12 +4249,13 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeTranscript(opts);
   });
-  runtime.command('preview').description('Observe a stored provider-backed session through the OpenCode SSE preview stream').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--timeout <ms>', 'Maximum preview observation time in milliseconds').argParser(Number)).addOption(new Option('--idle-timeout <ms>', 'Stop preview observation after this much inactivity').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  runtime.command('preview').description('Observe a stored provider-backed session through the OpenCode SSE preview stream').requiredOption('--team <teamId>', 'Team identifier used in the stored session record').requiredOption('--member <memberName>', 'Member name used in the stored session record').option('--lane <laneId>', 'Lane identifier used in the stored session record when multiple lanes share a member name').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).addOption(new Option('--timeout <ms>', 'Maximum preview observation time in milliseconds').argParser(Number)).addOption(new Option('--idle-timeout <ms>', 'Stop preview observation after this much inactivity').argParser(Number)).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;
     provider?: 'opencode' | 'all';
     team: string;
     member: string;
+    lane?: string;
     timeout?: number;
     idleTimeout?: number;
   }) => {

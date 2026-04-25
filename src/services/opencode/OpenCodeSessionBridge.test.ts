@@ -947,6 +947,95 @@ describe('OpenCodeSessionBridge', () => {
     )
   })
 
+  test('projects historical log messages for stale sessions without reusing durable state', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const staleMarks: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'updated'
+        },
+        markStale: async (_teamId, _laneId, _memberName, staleReason) => {
+          staleMarks.push(staleReason)
+          return buildRecord({ staleReason })
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-stale-log-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'What happened on task #1?' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-stale-log-1',
+                role: 'assistant',
+                parentID: 'msg-user-stale-log-1',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'Historical answer' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const staleReason = 'resolved_behavior_changed:old->new'
+    const result = await bridge.projectLogMessages(buildRecord({ staleReason }))
+
+    expect(result.summary.reconcileOutcome).toBe('stale')
+    expect(result.summary.staleReason).toBe(staleReason)
+    expect(result.summary.messageCount).toBe(2)
+    expect(result.summary.latestAssistantText).toBe('Historical answer')
+    expect(result.summary.diagnostics[0]).toContain(
+      'reading historical messages for log projection only',
+    )
+    expect(result.logProjection.projectedMessageCount).toBe(2)
+    expect(upserts).toEqual([])
+    expect(staleMarks).toEqual([])
+  })
+
   test('observes preview without mutating durable session state', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const bridge = new OpenCodeSessionBridge({
