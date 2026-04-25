@@ -544,14 +544,16 @@ function psQuote(s: string): string {
  * metacharacters (& | < > ^) to cmd.exe interpretation = command injection.
  *
  * Strategy: strip " from the input (it cannot be safely represented in a
- * cmd.exe double-quoted string). Escape % as %% to prevent environment
- * variable expansion (%PATH% etc.) which cmd.exe performs even inside
- * double quotes. Trailing backslashes are still doubled because the
- * *child process* (claude.exe) uses CommandLineToArgvW, where a trailing
- * \ before our closing " would eat the close-quote.
+ * cmd.exe double-quoted string). Keep % outside quoted chunks and escape it
+ * as ^% because cmd.exe expands %%PATH%% back to %PATH% before execution.
+ * Trailing backslashes are still doubled because the child process uses
+ * CommandLineToArgvW, where a trailing \ before our closing " would eat the
+ * close-quote.
  */
-function cmdQuote(arg: string): string {
-  const stripped = arg.replace(/"/g, '').replace(/%/g, '%%')
-  const escaped = stripped.replace(/(\\+)$/, '$1$1')
-  return `"${escaped}"`
+export function cmdQuote(arg: string): string {
+  const stripped = arg.replace(/"/g, '')
+  return stripped
+    .split('%')
+    .map(chunk => `"${chunk.replace(/(\\+)$/, '$1$1')}"`)
+    .join('^%')
 }

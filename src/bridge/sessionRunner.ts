@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'child_process'
+import { type ChildProcess, execFile, spawn } from 'child_process'
 import { createWriteStream, type WriteStream } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
@@ -15,6 +15,46 @@ import type {
 
 const MAX_ACTIVITIES = 10
 const MAX_STDERR_LINES = 10
+
+export function buildWindowsTaskkillArgs(
+  pid: number,
+  force = false,
+): string[] {
+  return force
+    ? ['/T', '/F', '/PID', String(pid)]
+    : ['/T', '/PID', String(pid)]
+}
+
+function getWindowsTaskkillPath(): string {
+  return join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+}
+
+function killWindowsProcessTree(
+  child: ChildProcess,
+  force: boolean,
+  onDebug: (msg: string) => void,
+): void {
+  const pid = child.pid
+  if (!pid) {
+    child.kill()
+    return
+  }
+
+  execFile(
+    getWindowsTaskkillPath(),
+    buildWindowsTaskkillArgs(pid, force),
+    { windowsHide: true },
+    error => {
+      if (!error) return
+      onDebug(
+        `[bridge:session] taskkill failed for pid=${pid}: ${error.message}`,
+      )
+      if (!child.killed) {
+        child.kill()
+      }
+    },
+  )
+}
 
 /**
  * Sanitize a session ID for use in file names.
@@ -346,6 +386,7 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
       const activities: SessionActivity[] = []
       let currentActivity: SessionActivity | null = null
       const lastStderr: string[] = []
+      let sigtermSent = false
       let sigkillSent = false
       let firstUserMessageSeen = false
 
@@ -489,13 +530,13 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
           return currentActivity
         },
         kill(): void {
-          if (!child.killed) {
+          if (!sigtermSent && !child.killed) {
+            sigtermSent = true
             deps.onDebug(
               `[bridge:session] Sending SIGTERM to sessionId=${opts.sessionId} pid=${child.pid}`,
             )
-            // On Windows, child.kill('SIGTERM') throws; use default signal.
             if (process.platform === 'win32') {
-              child.kill()
+              killWindowsProcessTree(child, false, deps.onDebug)
             } else {
               child.kill('SIGTERM')
             }
@@ -510,7 +551,7 @@ export function createSessionSpawner(deps: SessionSpawnerDeps): SessionSpawner {
               `[bridge:session] Sending SIGKILL to sessionId=${opts.sessionId} pid=${child.pid}`,
             )
             if (process.platform === 'win32') {
-              child.kill()
+              killWindowsProcessTree(child, true, deps.onDebug)
             } else {
               child.kill('SIGKILL')
             }

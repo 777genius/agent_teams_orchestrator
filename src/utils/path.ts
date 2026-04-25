@@ -60,7 +60,10 @@ export function expandPath(path: string, baseDir?: string): string {
     return homedir().normalize('NFC')
   }
 
-  if (trimmedPath.startsWith('~/')) {
+  if (
+    trimmedPath.startsWith('~/') ||
+    (getPlatform() === 'windows' && trimmedPath.startsWith('~\\'))
+  ) {
     return join(homedir(), trimmedPath.slice(2)).normalize('NFC')
   }
 

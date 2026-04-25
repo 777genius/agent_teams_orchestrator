@@ -15,6 +15,7 @@ import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
 import { logError } from '../../utils/log.js'
 import { subprocessEnv } from '../../utils/subprocessEnv.js'
+import { whichSync } from '../../utils/which.js'
 /**
  * LSP client interface.
  */
@@ -38,6 +39,22 @@ export type LSPClient = {
     handler: (params: TParams) => TResult | Promise<TResult>,
   ) => void
   stop: () => Promise<void>
+}
+
+function isPathLikeCommand(command: string): boolean {
+  return (
+    command.includes('/') ||
+    command.includes('\\') ||
+    /^[A-Za-z]:/.test(command)
+  )
+}
+
+export function resolveLspSpawnCommand(command: string): string {
+  if (process.platform !== 'win32' || isPathLikeCommand(command)) {
+    return command
+  }
+
+  return whichSync(command) ?? command
 }
 
 /**
@@ -94,8 +111,9 @@ export function createLSPClient(
       },
     ): Promise<void> {
       try {
+        const resolvedCommand = resolveLspSpawnCommand(command)
         // 1. Spawn LSP server process
-        process = spawn(command, args, {
+        process = spawn(resolvedCommand, args, {
           stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...subprocessEnv(), ...options?.env },
           cwd: options?.cwd,

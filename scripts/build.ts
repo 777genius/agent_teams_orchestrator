@@ -168,6 +168,7 @@ const externals = [
   '@ant/*',
   'audio-capture-napi',
   'image-processor-napi',
+  'keytar',
   'modifiers-napi',
   'url-handler-napi',
 ]
@@ -325,6 +326,32 @@ exec "$BUN_BIN" "$TARGET" "$@"
 
   writeFileSync(launcherPath, launcher)
   chmodSync(launcherPath, 0o755)
+
+  if (process.platform === 'win32') {
+    const cmdTargetPath = targetRelativePath.replaceAll('/', '\\')
+    const cmdLauncher = `@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+set "TARGET=%SCRIPT_DIR%${cmdTargetPath}"
+
+set "attempts=0"
+:wait_for_target
+if exist "%TARGET%" goto run_target
+if "%attempts%"=="50" goto missing_target
+set /a attempts+=1
+ping -n 2 127.0.0.1 >nul
+goto wait_for_target
+
+:missing_target
+echo Runtime bundle not found after waiting: %TARGET% 1>&2
+exit /b 127
+
+:run_target
+bun "%TARGET%" %*
+exit /b %ERRORLEVEL%
+`
+    writeFileSync(`${launcherPath}.cmd`, cmdLauncher)
+  }
 }
 
 function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {

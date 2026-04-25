@@ -28,6 +28,18 @@ export function validateUuid(maybeUuid: unknown): UUID | null {
   return uuidRegex.test(maybeUuid) ? (maybeUuid as UUID) : null
 }
 
+function isWindowsAbsolutePathLike(name: string): boolean {
+  const slashPath = name.replace(/\\/g, '/')
+  return /^[A-Za-z]:\//.test(slashPath) || slashPath.startsWith('//')
+}
+
+function normalizeWindowsPathForStorageKey(name: string): string {
+  if (!isWindowsAbsolutePathLike(name)) {
+    return name
+  }
+  return name.replace(/\\/g, '/').toLowerCase()
+}
+
 // ---------------------------------------------------------------------------
 // JSON string field extraction — no full parse, works on truncated lines
 // ---------------------------------------------------------------------------
@@ -309,12 +321,15 @@ function simpleHash(str: string): string {
  * @returns A safe name (e.g., '-Users-foo-my-project' or 'plugin-name-server')
  */
 export function sanitizePath(name: string): string {
-  const sanitized = name.replace(/[^a-zA-Z0-9]/g, '-')
+  const normalized = normalizeWindowsPathForStorageKey(name)
+  const sanitized = normalized.replace(/[^a-zA-Z0-9]/g, '-')
   if (sanitized.length <= MAX_SANITIZED_LENGTH) {
     return sanitized
   }
   const hash =
-    typeof Bun !== 'undefined' ? Bun.hash(name).toString(36) : simpleHash(name)
+    typeof Bun !== 'undefined'
+      ? Bun.hash(normalized).toString(36)
+      : simpleHash(normalized)
   return `${sanitized.slice(0, MAX_SANITIZED_LENGTH)}-${hash}`
 }
 
@@ -362,15 +377,34 @@ export async function findProjectDir(
     // Exact match failed — for short paths this means no sessions exist.
     // For long paths, try prefix matching to handle hash mismatches.
     const sanitized = sanitizePath(projectPath)
+    const projectsDir = getProjectsDir()
+    const isWindowsPath = isWindowsAbsolutePathLike(projectPath)
+    if (isWindowsPath) {
+      try {
+        const dirents = await readdir(projectsDir, { withFileTypes: true })
+        const caseInsensitiveMatch = dirents.find(
+          d => d.isDirectory() && d.name.toLowerCase() === sanitized,
+        )
+        if (caseInsensitiveMatch) {
+          return join(projectsDir, caseInsensitiveMatch.name)
+        }
+      } catch {
+        return undefined
+      }
+    }
     if (sanitized.length <= MAX_SANITIZED_LENGTH) {
       return undefined
     }
     const prefix = sanitized.slice(0, MAX_SANITIZED_LENGTH)
-    const projectsDir = getProjectsDir()
+    const normalizedPrefix = isWindowsPath ? prefix.toLowerCase() : prefix
     try {
       const dirents = await readdir(projectsDir, { withFileTypes: true })
       const match = dirents.find(
-        d => d.isDirectory() && d.name.startsWith(prefix + '-'),
+        d =>
+          d.isDirectory() &&
+          (isWindowsPath
+            ? d.name.toLowerCase().startsWith(normalizedPrefix + '-')
+            : d.name.startsWith(prefix + '-')),
       )
       return match ? join(projectsDir, match.name) : undefined
     } catch {

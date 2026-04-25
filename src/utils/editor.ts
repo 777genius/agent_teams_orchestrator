@@ -36,6 +36,63 @@ const PLUS_N_EDITORS = /\b(vi|vim|nvim|nano|emacs|pico|micro|helix|hx)\b/
 // VS Code and forks use -g file:line. subl uses bare file:line (no -g).
 const VSCODE_FAMILY = new Set(['code', 'cursor', 'windsurf', 'codium'])
 
+function splitEditorCommand(editor: string): string[] {
+  const parts: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+
+  for (let i = 0; i < editor.length; i++) {
+    const char = editor.charAt(i)
+    if ((char === '"' || char === "'") && quote === null) {
+      quote = char
+      continue
+    }
+    if (char === quote) {
+      quote = null
+      continue
+    }
+    if (/\s/.test(char) && quote === null) {
+      if (current) {
+        parts.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += char
+  }
+
+  if (current) {
+    parts.push(current)
+  }
+  return parts.length > 0 ? parts : [editor]
+}
+
+function cmdQuote(arg: string): string {
+  const stripped = arg.replace(/"/g, '')
+  return stripped
+    .split('%')
+    .map(chunk => `"${chunk.replace(/(\\+)$/g, '$1$1')}"`)
+    .join('^%')
+}
+
+function cmdToken(arg: string): string {
+  const stripped = arg.replace(/"/g, '')
+  return /^[A-Za-z0-9_./:=+-]+$/.test(stripped) ? stripped : cmdQuote(stripped)
+}
+
+export function buildWindowsEditorCommand(
+  editorParts: string[],
+  args: string[],
+): string {
+  const [command = '', ...editorArgs] = editorParts
+  if (command.toLowerCase() === 'start') {
+    return ['start', '""', ...editorArgs.map(cmdToken), ...args.map(cmdQuote)].join(
+      ' ',
+    )
+  }
+  return [...editorParts, ...args].map(cmdQuote).join(' ')
+}
+
 /**
  * Classify the editor as GUI or not. Returns the matched GUI family name
  * for goto-line argv selection, or undefined for terminal editors.
@@ -47,7 +104,7 @@ const VSCODE_FAMILY = new Set(['code', 'cursor', 'windsurf', 'codium'])
  * 'code' → matches.
  */
 export function classifyGuiEditor(editor: string): string | undefined {
-  const base = basename(editor.split(' ')[0] ?? '')
+  const base = basename(splitEditorCommand(editor)[0] ?? '')
   return GUI_EDITORS.find(g => base.includes(g))
 }
 
@@ -88,7 +145,7 @@ export function openFileInExternalEditor(
   // Spawn the user's actual binary (preserves code-insiders, abs paths, etc.).
   // Split into binary + extra args so multi-word values like 'start /wait
   // notepad' or 'code --wait' propagate all tokens to spawn.
-  const parts = editor.split(' ')
+  const parts = splitEditorCommand(editor)
   const base = parts[0] ?? editor
   const editorArgs = parts.slice(1)
   const guiFamily = classifyGuiEditor(editor)
@@ -102,8 +159,10 @@ export function openFileInExternalEditor(
       // CreateProcess can't execute .cmd/.bat directly. Assemble quoted command
       // string; cmd.exe doesn't expand $() or backticks inside double quotes.
       // Quote each arg so paths with spaces survive the shell join.
-      const gotoStr = gotoArgv.map(a => `"${a}"`).join(' ')
-      child = spawn(`${editor} ${gotoStr}`, { ...detachedOpts, shell: true })
+      child = spawn(buildWindowsEditorCommand(parts, gotoArgv), {
+        ...detachedOpts,
+        shell: true,
+      })
     } else {
       // POSIX: argv array with no shell — injection-safe. shell: true would
       // expand $() / backticks inside double quotes, and filePath is
@@ -136,8 +195,8 @@ export function openFileInExternalEditor(
       // shell: true joins args unquoted, so assemble the command string with
       // explicit quoting ourselves (matching promptEditor.ts:74). spawnSync
       // returns errors in .error rather than throwing.
-      const lineArg = useGotoLine ? `+${line} ` : ''
-      result = spawnSync(`${editor} ${lineArg}"${filePath}"`, {
+      const fileArgs = useGotoLine ? [`+${line}`, filePath] : [filePath]
+      result = spawnSync(buildWindowsEditorCommand(parts, fileArgs), {
         ...syncOpts,
         shell: true,
       })
