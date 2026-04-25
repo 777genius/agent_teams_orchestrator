@@ -8,7 +8,7 @@
  */
 
 import { feature } from 'bun:bundle'
-import { join, relative } from 'path'
+import { isAbsolute, join, relative } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -195,7 +195,7 @@ async function executeBYOCPersistence(
     }))
     .filter(({ relativePath }) => {
       // Security: skip files that resolve outside the outputs directory
-      if (relativePath.startsWith('..')) {
+      if (!isOutputRelativePathInside(relativePath)) {
         logDebug(`Skipping file outside outputs directory: ${relativePath}`)
         return false
       }
@@ -237,6 +237,10 @@ async function executeBYOCPersistence(
     files: persistedFiles,
     failed: failedFiles,
   }
+}
+
+export function isOutputRelativePathInside(relativePath: string): boolean {
+  return !relativePath.startsWith('..') && !isAbsolute(relativePath)
 }
 
 /**
