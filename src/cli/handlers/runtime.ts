@@ -11,12 +11,15 @@ import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/Op
 import {
   connectProviderWithApiKey,
   forgetManagedProvider,
+  loadProviderDirectory,
   loadProviderModels,
   loadProviderManagementView,
   openCodeProviderManagementAdapter,
   setProviderDefaultModel,
   testProviderModel,
   type ProviderConnection,
+  type ProviderDirectoryFilter,
+  type ProviderDirectoryView,
   type ProviderManagementError,
   type ProviderManagementRuntimeId,
   type ProviderManagementView,
@@ -32,6 +35,15 @@ import { readFile, writeFile } from 'node:fs/promises'
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
+
+const PROVIDER_DIRECTORY_FILTERS = new Set<string>([
+  'all',
+  'connected',
+  'configured',
+  'connectable',
+  'manual',
+  'has-models',
+])
 
 function formatValue(value: string | null | undefined, fallback = 'none'): string {
   return value && value.length > 0 ? value : fallback
@@ -607,6 +619,15 @@ function normalizeProviderManagementRuntime(
   return normalized
 }
 
+function normalizeProviderDirectoryFilter(
+  filter: string | null | undefined,
+): ProviderDirectoryFilter | null {
+  const normalized = filter?.trim()
+  return normalized && PROVIDER_DIRECTORY_FILTERS.has(normalized)
+    ? normalized as ProviderDirectoryFilter
+    : null
+}
+
 async function readStdinSecret(): Promise<string> {
   const chunks: Buffer[] = []
   for await (const chunk of process.stdin) {
@@ -624,6 +645,19 @@ function writeProviderManagementViewResponse(
     schemaVersion: 1,
     runtimeId,
     ...(view ? { view } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function writeProviderManagementDirectoryResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  directory: ProviderDirectoryView | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(directory ? { directory } : {}),
     ...(error ? { error } : {}),
   }, null, 2) + '\n')
 }
@@ -712,6 +746,36 @@ export async function runtimeProvidersView(opts: {
   }
 
   writeProviderManagementViewResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersDirectory(opts: {
+  runtime?: string
+  projectPath?: string
+  query?: string
+  filter?: string
+  limit?: number
+  cursor?: string
+  refresh?: boolean
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await loadProviderDirectory(openCodeProviderManagementAdapter, {
+    runtimeId,
+    projectPath: opts.projectPath?.trim() || null,
+    query: opts.query?.trim() || null,
+    filter: normalizeProviderDirectoryFilter(opts.filter),
+    limit: opts.limit ?? null,
+    cursor: opts.cursor?.trim() || null,
+    refresh: opts.refresh === true,
+  })
+
+  if (result.ok) {
+    writeProviderManagementDirectoryResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementDirectoryResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 

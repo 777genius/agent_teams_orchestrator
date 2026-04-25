@@ -16,6 +16,7 @@ import {
 } from './OpenCodeMcpManager.js'
 import {
   doesOpenCodeAuthStoreIncludeSource,
+  mergeOpenCodeAuthStores,
   readOpenCodeAuthStore,
   syncOpenCodeManagedAuthStore,
 } from './OpenCodeAuthStore.js'
@@ -299,7 +300,7 @@ export class OpenCodeProfileManager {
   }
 
   getGlobalAuthPath(): string {
-    return this.getSourceAuthPath()
+    return path.join(this.paths.data, 'opencode', 'auth.json')
   }
 
   async listManagedAuthPaths(): Promise<string[]> {
@@ -360,7 +361,7 @@ export class OpenCodeProfileManager {
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const globalAuthPath = this.getGlobalAuthPath()
-    const sourceAuthPath = globalAuthPath
+    const sourceAuthPath = this.getSourceAuthPath()
 
     await Promise.all([
       mkdir(homePath, { recursive: true }),
@@ -369,7 +370,11 @@ export class OpenCodeProfileManager {
       mkdir(xdgCacheHome, { recursive: true }),
     ])
 
+    const globalAuthExists = await fileExists(globalAuthPath)
     const sourceAuthExists = await fileExists(sourceAuthPath)
+    const globalAuthFingerprint = globalAuthExists
+      ? await readFingerprint(globalAuthPath)
+      : null
     const sourceAuthFingerprint = sourceAuthExists
       ? await readFingerprint(sourceAuthPath)
       : null
@@ -379,24 +384,39 @@ export class OpenCodeProfileManager {
         managedAuthPath,
       })
     }
+    if (globalAuthExists && globalAuthFingerprint) {
+      await syncOpenCodeManagedAuthStore({
+        sourceAuthPath: globalAuthPath,
+        managedAuthPath,
+      })
+    }
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
     const authState = await (async () => {
       if (!managedAuthFingerprint) {
         return 'missing' as const
       }
-      if (!sourceAuthFingerprint) {
+      const authSourcePaths = [
+        ...(sourceAuthFingerprint ? [sourceAuthPath] : []),
+        ...(globalAuthFingerprint ? [globalAuthPath] : []),
+      ]
+      if (authSourcePaths.length === 0) {
         return 'ok' as const
       }
       try {
-        return doesOpenCodeAuthStoreIncludeSource({
-          source: await readOpenCodeAuthStore(sourceAuthPath),
-          managed: await readOpenCodeAuthStore(managedAuthPath),
-        })
+        const managed = await readOpenCodeAuthStore(managedAuthPath)
+        let expectedAuth: Awaited<ReturnType<typeof readOpenCodeAuthStore>> = {}
+        for (const authSourcePath of authSourcePaths) {
+          expectedAuth = mergeOpenCodeAuthStores({
+            source: await readOpenCodeAuthStore(authSourcePath),
+            managed: expectedAuth,
+          })
+        }
+        return doesOpenCodeAuthStoreIncludeSource({ source: expectedAuth, managed })
           ? 'ok' as const
           : 'stale' as const
       } catch {
-        return sourceAuthFingerprint === managedAuthFingerprint ? 'ok' as const : 'stale' as const
+        return 'stale' as const
       }
     })()
 

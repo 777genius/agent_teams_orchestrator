@@ -242,19 +242,29 @@ export class OpenCodeInventoryService {
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
+    const globalAuthProviderIds = new Set(
+      (profile.globalAuthPath
+        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(() => [])
+        : []
+      ).map(provider => provider.id),
+    )
     const sourceAuthProviderIds = new Set(
       (profile.sourceAuthPath
         ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
         : []
       ).map(provider => provider.id),
     )
+    const credentialScopesForProvider = (providerId: string): Array<'managed' | 'local'> => {
+      const scopes: Array<'managed' | 'local'> = []
+      if (globalAuthProviderIds.has(providerId)) scopes.push('managed')
+      if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
+      return scopes.length > 0 ? scopes : ['managed']
+    }
     const managedAuthProviders = (
       await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
     ).map(provider => ({
       ...provider,
-      credentialScopes: sourceAuthProviderIds.has(provider.id)
-        ? ['managed', 'local'] as Array<'managed' | 'local'>
-        : ['managed'] as Array<'managed' | 'local'>,
+      credentialScopes: credentialScopesForProvider(provider.id),
     }))
     const cliConnectedProviders = providerParse.connectedProviders.map(provider => {
       if (provider.source !== 'credentials') {
@@ -262,10 +272,7 @@ export class OpenCodeInventoryService {
       }
       return {
         ...provider,
-        credentialScopes: [
-          'managed' as const,
-          ...(sourceAuthProviderIds.has(provider.id) ? ['local' as const] : []),
-        ],
+        credentialScopes: credentialScopesForProvider(provider.id),
       }
     })
     const connectedProviders = mergeConnectedProviders([

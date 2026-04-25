@@ -100,12 +100,15 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
   })
 
-  test('exposes a stable global auth path even before the auth file exists', () => {
+  test('exposes an app-owned global auth path separate from the real OpenCode auth store', () => {
     const previousXdgDataHome = process.env.XDG_DATA_HOME
     process.env.XDG_DATA_HOME = tempDir
     try {
       const manager = new OpenCodeProfileManager()
-      expect(manager.getGlobalAuthPath()).toBe(path.join(tempDir, 'opencode', 'auth.json'))
+      const realOpenCodeAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+      const globalAuthPath = manager.getGlobalAuthPath()
+      expect(globalAuthPath).not.toBe(realOpenCodeAuthPath)
+      expect(globalAuthPath.endsWith(path.join('opencode', 'auth.json'))).toBe(true)
     } finally {
       if (previousXdgDataHome === undefined) {
         delete process.env.XDG_DATA_HOME

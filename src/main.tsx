@@ -4210,6 +4210,21 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersView(opts);
   });
+  runtimeProviders.command('directory').description('Return the full nested runtime provider directory').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--query <query>', 'Filter provider ids, labels, auth methods, and known model ids').addOption(new Option('--filter <filter>', 'Directory filter').choices(['all', 'connected', 'configured', 'connectable', 'manual', 'has-models'])).addOption(new Option('--limit <count>', 'Maximum providers to return').argParser(Number)).option('--cursor <cursor>', 'Pagination cursor').option('--refresh', 'Bypass provider directory cache').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    projectPath?: string;
+    query?: string;
+    filter?: string;
+    limit?: number;
+    cursor?: string;
+    refresh?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersDirectory
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersDirectory(opts);
+  });
   runtimeProviders.command('connect-api-key').description('Connect a nested runtime provider using an API key from stdin').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--stdin-key', 'Read the API key from stdin').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     provider: string;

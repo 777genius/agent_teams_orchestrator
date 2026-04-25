@@ -1,8 +1,10 @@
 import type {
   ConnectProviderApiKeyInput,
+  LoadProviderDirectoryInput,
   LoadProviderManagementViewInput,
   LoadProviderModelsInput,
   ProviderConnection,
+  ProviderDirectoryView,
   ProviderManagementResult,
   ProviderManagementView,
   ProviderModelTestResult,
@@ -19,6 +21,12 @@ export interface ProviderManagementQueryPort {
   loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>>
+}
+
+export interface ProviderManagementDirectoryQueryPort {
+  loadDirectory(
+    input: LoadProviderDirectoryInput,
+  ): Promise<ProviderManagementResult<ProviderDirectoryView>>
 }
 
 export interface ProviderManagementCommandPort {

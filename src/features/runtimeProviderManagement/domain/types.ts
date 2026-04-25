@@ -90,6 +90,64 @@ export type ProviderConnection = {
   detail: string | null
 }
 
+export type ProviderDirectoryFilter =
+  | 'all'
+  | 'connected'
+  | 'configured'
+  | 'connectable'
+  | 'manual'
+  | 'has-models'
+
+export type ProviderSetupKind =
+  | 'connected'
+  | 'connect-api-key'
+  | 'configure-manually'
+  | 'requires-environment'
+  | 'available-readonly'
+  | 'unsupported'
+
+export type ProviderDirectorySource =
+  | 'opencode-provider'
+  | 'config-provider'
+  | 'inventory'
+  | 'seed'
+
+export type ProviderDirectoryEntry = {
+  providerId: string
+  displayName: string
+  state: ProviderConnectionState
+  setupKind: ProviderSetupKind
+  ownership: readonly ProviderOwnership[]
+  recommended: boolean
+  modelCount: number | null
+  authMethods: readonly ProviderAuthMethod[]
+  defaultModelId: string | null
+  sources: readonly ProviderDirectorySource[]
+  sourceLabel: string | null
+  providerSource: string | null
+  detail: string | null
+  actions: readonly ProviderActionDescriptor[]
+  metadata: {
+    hasKnownModels: boolean
+    requiresManualConfig: boolean
+    supportedInlineAuth: boolean
+  }
+}
+
+export type ProviderDirectoryView = {
+  runtimeId: ProviderManagementRuntimeId
+  totalCount: number
+  returnedCount: number
+  query: string | null
+  filter: ProviderDirectoryFilter
+  limit: number
+  cursor: string | null
+  nextCursor: string | null
+  entries: readonly ProviderDirectoryEntry[]
+  diagnostics: readonly string[]
+  fetchedAt: string
+}
+
 export type ProviderManagementView = {
   runtimeId: ProviderManagementRuntimeId
   title: string
@@ -171,4 +229,13 @@ export type LoadProviderModelsInput = {
   providerId: string
   query?: string | null
   limit?: number | null
+} & ProjectScopedProviderManagementInput
+
+export type LoadProviderDirectoryInput = {
+  runtimeId: ProviderManagementRuntimeId
+  query?: string | null
+  filter?: ProviderDirectoryFilter | null
+  limit?: number | null
+  cursor?: string | null
+  refresh?: boolean | null
 } & ProjectScopedProviderManagementInput

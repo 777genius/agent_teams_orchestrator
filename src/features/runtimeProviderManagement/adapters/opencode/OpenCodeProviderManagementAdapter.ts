@@ -26,6 +26,7 @@ import type {
 import { isRecommendedProvider, sortProviderConnections } from '../../domain/providerOrdering.js'
 import type {
   ConnectProviderApiKeyInput,
+  LoadProviderDirectoryInput,
   LoadProviderModelsInput,
   LoadProviderManagementViewInput,
   LocalAuthState,
@@ -33,6 +34,10 @@ import type {
   ProviderActionDescriptor,
   ProviderAuthMethod,
   ProviderConnection,
+  ProviderDirectoryEntry,
+  ProviderDirectoryFilter,
+  ProviderDirectorySource,
+  ProviderDirectoryView,
   ProviderManagementErrorCode,
   ProviderManagementResult,
   ProviderManagementRuntimeId,
@@ -49,6 +54,7 @@ import type {
 } from '../../domain/types.js'
 import type {
   ProviderManagementCommandPort,
+  ProviderManagementDirectoryQueryPort,
   ProviderManagementQueryPort,
 } from '../../ports/ProviderManagementPorts.js'
 
@@ -122,6 +128,14 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
 
 const SEEDED_PROVIDER_IDS = ['openrouter', 'opencode'] as const
 const SEEDED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>(SEEDED_PROVIDER_IDS)
+const DEFAULT_DIRECTORY_LIMIT = 50
+const MAX_DIRECTORY_LIMIT = 100
+const DIRECTORY_CACHE_TTL_MS = 30_000
+
+type ProviderDirectoryCacheEntry = {
+  expiresAt: number
+  value: ProviderDirectoryView
+}
 
 type OpenCodeProviderManagementCapabilities = {
   deleteAuth: boolean
@@ -143,6 +157,38 @@ function asString(value: unknown): string | null {
 
 function normalizeQuery(value: string | null | undefined): string {
   return value?.trim().toLowerCase() ?? ''
+}
+
+function normalizeDirectoryFilter(
+  value: ProviderDirectoryFilter | null | undefined,
+): ProviderDirectoryFilter {
+  const normalized = value?.trim()
+  switch (normalized) {
+    case 'connected':
+    case 'configured':
+    case 'connectable':
+    case 'manual':
+    case 'has-models':
+      return normalized
+    default:
+      return 'all'
+  }
+}
+
+function normalizeDirectoryLimit(value: number | null | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_DIRECTORY_LIMIT
+  }
+  const normalized = Math.floor(value)
+  if (normalized <= 0) {
+    return DEFAULT_DIRECTORY_LIMIT
+  }
+  return Math.min(normalized, MAX_DIRECTORY_LIMIT)
+}
+
+function normalizeDirectoryCursor(value: string | null | undefined): number {
+  const normalized = Number.parseInt(value?.trim() ?? '', 10)
+  return Number.isFinite(normalized) && normalized > 0 ? normalized : 0
 }
 
 function normalizeProviderId(value: string | null | undefined): string | null {
@@ -199,6 +245,18 @@ function redactSecret(message: string, secret: string | null | undefined): strin
   return message.split(trimmedSecret).join('[redacted]')
 }
 
+function redactDiagnostic(message: string): string {
+  return message
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted]')
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, '$1[redacted]')
+    .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"']+/gi, '$1[redacted]')
+    .slice(0, 1_600)
+}
+
+function redactDiagnostics(messages: readonly string[]): string[] {
+  return messages.map(redactDiagnostic).filter(Boolean)
+}
+
 function getProviderDisplayName(providerId: string, entry?: OpenCodeProviderListEntry): string {
   const name = asString(entry?.name)
   return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? providerId
@@ -241,6 +299,7 @@ function getConnectedProviderMap(
 function getModelCounts(
   inventory: OpenCodeInventorySnapshot,
   configProviders: OpenCodeConfigProvidersResponse | null,
+  providers?: OpenCodeProviderResponse | null,
 ): Map<string, number> {
   const counts = new Map<string, number>()
 
@@ -253,6 +312,15 @@ function getModelCounts(
   }
 
   for (const provider of configProviders?.providers ?? []) {
+    const providerId = normalizeProviderId(provider.id)
+    const models = asRecord(provider.models)
+    if (!providerId || !models) {
+      continue
+    }
+    counts.set(providerId, Math.max(counts.get(providerId) ?? 0, Object.keys(models).length))
+  }
+
+  for (const provider of providers?.all ?? []) {
     const providerId = normalizeProviderId(provider.id)
     const models = asRecord(provider.models)
     if (!providerId || !models) {
@@ -332,6 +400,20 @@ function getKnownProviderIds(input: {
   return providerIds
 }
 
+function countMalformedProviderRows(input: {
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): number {
+  let count = 0
+  for (const provider of input.providers?.all ?? []) {
+    if (!normalizeProviderId(provider.id)) count += 1
+  }
+  for (const provider of input.configProviders?.providers ?? []) {
+    if (!normalizeProviderId(provider.id)) count += 1
+  }
+  return count
+}
+
 function normalizeAuthMethods(
   methods: readonly OpenCodeProviderAuthMethod[] | undefined,
 ): ProviderAuthMethod[] {
@@ -361,7 +443,7 @@ function getOwnership(input: {
       return input.connectedProvider.credentialScopes
         .filter(scope => scope === 'managed' || scope === 'local')
     }
-    return input.inventory.profile?.sourceAuthPath ? ['managed', 'local'] : ['managed']
+    return ['managed']
   }
 
   if (input.connected) {
@@ -369,6 +451,22 @@ function getOwnership(input: {
   }
 
   return []
+}
+
+function getConnectedProviderDetail(ownership: readonly ProviderOwnership[]): string {
+  if (ownership.includes('env')) {
+    return 'Connected via OpenCode environment credential'
+  }
+  if (ownership.includes('managed') && ownership.includes('local')) {
+    return 'Connected via app-managed and local OpenCode credentials'
+  }
+  if (ownership.includes('managed')) {
+    return 'Connected via app-managed OpenCode credential'
+  }
+  if (ownership.includes('local')) {
+    return 'Connected via local OpenCode credential'
+  }
+  return 'Connected in the OpenCode runtime'
 }
 
 function getDefaultModelForProvider(
@@ -474,7 +572,7 @@ function providerAction(
 function buildProviderActions(input: {
   providerId: string
   connected: boolean
-  modelCount: number
+  modelCount: number | null
   authMethods: readonly ProviderAuthMethod[]
   ownership: readonly ProviderOwnership[]
   capabilities: OpenCodeProviderManagementCapabilities
@@ -505,8 +603,12 @@ function buildProviderActions(input: {
   }
 
   const actions: ProviderActionDescriptor[] = []
+  const hasModels = input.modelCount !== 0
+  const noModelsReason = input.modelCount === 0
+    ? 'No models reported for this provider'
+    : null
 
-  if (input.modelCount > 0) {
+  if (hasModels) {
     actions.push(providerAction({
       id: 'use',
       label: 'Use',
@@ -520,16 +622,16 @@ function buildProviderActions(input: {
     providerAction({
       id: 'test',
       label: 'Test',
-      enabled: input.modelCount > 0,
-      disabledReason: input.modelCount > 0 ? null : 'No models reported for this provider',
+      enabled: hasModels,
+      disabledReason: noModelsReason,
       requiresSecret: false,
       ownershipScope: 'runtime',
     }),
     providerAction({
       id: 'set-default',
       label: 'Set default',
-      enabled: input.modelCount > 0,
-      disabledReason: input.modelCount > 0 ? null : 'No models reported for this provider',
+      enabled: hasModels,
+      disabledReason: noModelsReason,
       requiresSecret: false,
       ownershipScope: 'runtime',
     }),
@@ -556,7 +658,7 @@ function buildProviderConnections(input: {
   capabilities: OpenCodeProviderManagementCapabilities
 }): ProviderConnection[] {
   const connectedProviders = getConnectedProviderMap(input.inventory, input.providers)
-  const modelCounts = getModelCounts(input.inventory, input.configProviders)
+  const modelCounts = getModelCounts(input.inventory, input.configProviders, input.providers)
   const entries = getProviderEntries(input.configProviders, input.providers)
   const providerIds = getKnownProviderIds(input)
 
@@ -595,7 +697,7 @@ function buildProviderConnections(input: {
         capabilities: input.capabilities,
       }),
       detail: connected
-        ? 'Connected via app-managed OpenCode credential'
+        ? getConnectedProviderDetail(ownership)
         : modelCount > 0
           ? 'Provider is visible in the OpenCode model catalog'
           : null,
@@ -603,6 +705,329 @@ function buildProviderConnections(input: {
   }
 
   return sortProviderConnections(connections)
+}
+
+function collectProviderDirectorySources(input: {
+  providerId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): ProviderDirectorySource[] {
+  const sources = new Set<ProviderDirectorySource>()
+  if ((SEEDED_PROVIDER_IDS as readonly string[]).includes(input.providerId)) {
+    sources.add('seed')
+  }
+  if (
+    input.inventory.availableProviders.some(providerId => normalizeProviderId(providerId) === input.providerId) ||
+    input.inventory.connectedProviders.some(provider => normalizeProviderId(provider.id) === input.providerId)
+  ) {
+    sources.add('inventory')
+  }
+  if (input.configProviders?.providers?.some(provider => normalizeProviderId(provider.id) === input.providerId)) {
+    sources.add('config-provider')
+  }
+  if (
+    input.providers?.all?.some(provider => normalizeProviderId(provider.id) === input.providerId) ||
+    input.providers?.connected?.some(providerId => normalizeProviderId(providerId) === input.providerId)
+  ) {
+    sources.add('opencode-provider')
+  }
+  return Array.from(sources)
+}
+
+function getProviderSourceLabel(sources: readonly ProviderDirectorySource[]): string | null {
+  if (sources.includes('config-provider')) return 'configured'
+  if (sources.includes('opencode-provider')) return 'OpenCode catalog'
+  if (sources.includes('inventory')) return 'inventory'
+  if (sources.includes('seed')) return 'seeded fallback'
+  return null
+}
+
+function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): string | null {
+  const source = asString(entry?.source)
+  return source ? source.slice(0, 80) : null
+}
+
+function getProviderModelIdsFromEntry(
+  providerId: string,
+  entry: OpenCodeProviderListEntry | undefined,
+): string[] {
+  const models = asRecord(entry?.models)
+  if (!models) {
+    return []
+  }
+  return Object.keys(models)
+    .map(modelId => modelId.trim())
+    .filter(Boolean)
+    .map(modelId => `${providerId}/${modelId}`)
+}
+
+function getProviderSetupKind(input: {
+  connected: boolean
+  providerId: string
+  modelCount: number | null
+  authMethods: readonly ProviderAuthMethod[]
+}): ProviderDirectoryEntry['setupKind'] {
+  if (input.connected) {
+    return 'connected'
+  }
+  if (canConnectWithApiKey(input.providerId, input.authMethods)) {
+    return 'connect-api-key'
+  }
+  if (input.authMethods.length > 0) {
+    return 'configure-manually'
+  }
+  if (input.modelCount !== null && input.modelCount > 0) {
+    return 'available-readonly'
+  }
+  return 'requires-environment'
+}
+
+function buildProviderDirectoryActions(input: {
+  providerId: string
+  connected: boolean
+  modelCount: number | null
+  authMethods: readonly ProviderAuthMethod[]
+  ownership: readonly ProviderOwnership[]
+  capabilities: OpenCodeProviderManagementCapabilities
+  setupKind: ProviderDirectoryEntry['setupKind']
+}): ProviderActionDescriptor[] {
+  if (input.setupKind === 'available-readonly' || input.setupKind === 'requires-environment') {
+    return [
+      providerAction({
+        id: 'configure',
+        label: input.setupKind === 'requires-environment' ? 'Requires environment' : 'Configure manually',
+        enabled: false,
+        disabledReason: 'OpenCode did not advertise an app-managed API-key setup flow for this provider',
+        requiresSecret: false,
+        ownershipScope: 'runtime',
+      }),
+    ]
+  }
+
+  return buildProviderActions(input)
+}
+
+function providerDirectoryEntryMatchesQuery(
+  entry: ProviderDirectoryEntry,
+  modelIds: readonly string[],
+  query: string,
+): boolean {
+  if (!query) {
+    return true
+  }
+  return [
+    entry.providerId,
+    entry.displayName,
+    entry.detail ?? '',
+    entry.setupKind,
+    entry.sourceLabel ?? '',
+    entry.providerSource ?? '',
+    ...entry.authMethods,
+    ...modelIds,
+  ].some(value => value.toLowerCase().includes(query))
+}
+
+function providerDirectoryEntryMatchesFilter(
+  entry: ProviderDirectoryEntry,
+  filter: ProviderDirectoryFilter,
+): boolean {
+  switch (filter) {
+    case 'connected':
+      return entry.state === 'connected'
+    case 'configured':
+      return entry.sources.includes('config-provider')
+    case 'connectable':
+      return entry.setupKind === 'connect-api-key'
+    case 'manual':
+      return (
+        entry.setupKind === 'configure-manually' ||
+        entry.setupKind === 'requires-environment' ||
+        entry.setupKind === 'unsupported'
+      )
+    case 'has-models':
+      return entry.modelCount !== null && entry.modelCount > 0
+    case 'all':
+      return true
+  }
+}
+
+function sortProviderDirectoryEntries(
+  entries: readonly ProviderDirectoryEntry[],
+): ProviderDirectoryEntry[] {
+  return [...entries].sort((left, right) => {
+    const leftRecommended = isRecommendedProvider(left.providerId) ? 0 : 1
+    const rightRecommended = isRecommendedProvider(right.providerId) ? 0 : 1
+    if (leftRecommended !== rightRecommended) return leftRecommended - rightRecommended
+
+    if (left.state !== right.state) {
+      if (left.state === 'connected') return -1
+      if (right.state === 'connected') return 1
+      if (left.setupKind === 'connect-api-key') return -1
+      if (right.setupKind === 'connect-api-key') return 1
+    }
+
+    return left.displayName.localeCompare(right.displayName)
+  })
+}
+
+function buildProviderDirectory(input: {
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+  providerAuth: Record<string, OpenCodeProviderAuthMethod[]> | null
+  capabilities?: OpenCodeProviderManagementCapabilities
+  diagnostics: readonly string[]
+  query?: string | null
+  filter?: ProviderDirectoryFilter | null
+  limit?: number | null
+  cursor?: string | null
+}): ProviderDirectoryView {
+  const capabilities = input.capabilities ?? EMPTY_CAPABILITIES
+  const connectedProviders = getConnectedProviderMap(input.inventory, input.providers)
+  const modelCounts = getModelCounts(input.inventory, input.configProviders, input.providers)
+  const entries = getProviderEntries(input.configProviders, input.providers)
+  const providerIds = getKnownProviderIds(input)
+  const query = normalizeQuery(input.query)
+  const filter = normalizeDirectoryFilter(input.filter)
+  const limit = input.limit === Number.MAX_SAFE_INTEGER
+    ? Number.MAX_SAFE_INTEGER
+    : normalizeDirectoryLimit(input.limit)
+  const offset = normalizeDirectoryCursor(input.cursor)
+  const malformedProviderRows = countMalformedProviderRows({
+    configProviders: input.configProviders,
+    providers: input.providers,
+  })
+  const directoryEntries: ProviderDirectoryEntry[] = []
+
+  for (const providerId of providerIds) {
+    const entry = entries.get(providerId)
+    const connectedProvider = connectedProviders.get(providerId)
+    const connected = connectedProviders.has(providerId)
+    const modelCount = modelCounts.has(providerId) ? modelCounts.get(providerId)! : null
+    const authMethods = normalizeAuthMethods(input.providerAuth?.[providerId])
+    const ownership = getOwnership({
+      connected,
+      connectedProvider,
+      inventory: input.inventory,
+    })
+    const setupKind = getProviderSetupKind({
+      connected,
+      providerId,
+      modelCount,
+      authMethods,
+    })
+    const state: ProviderConnection['state'] = connected
+      ? 'connected'
+      : modelCount !== null && modelCount > 0
+        ? 'available'
+        : 'not-connected'
+    const sources = collectProviderDirectorySources({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
+    const modelIds = getProviderModelIdsFromEntry(providerId, entry)
+    const directoryEntry: ProviderDirectoryEntry = {
+      providerId,
+      displayName: getProviderDisplayName(providerId, entry),
+      state,
+      setupKind,
+      ownership,
+      recommended: isRecommendedProvider(providerId),
+      modelCount,
+      authMethods,
+      defaultModelId: getDefaultModelForProvider(providerId, input.inventory, input.configProviders),
+      sources,
+      sourceLabel: getProviderSourceLabel(sources),
+      providerSource: getProviderSourceValue(entry),
+      detail: connected
+        ? 'Connected in the app-managed OpenCode profile'
+        : setupKind === 'connect-api-key'
+          ? 'OpenCode advertises API-key auth for this provider'
+          : modelCount !== null && modelCount > 0
+            ? 'Models are visible, but no connected credential was reported'
+            : 'Inline setup is not supported for this provider yet',
+      actions: buildProviderDirectoryActions({
+        providerId,
+        connected,
+        modelCount,
+        authMethods,
+        ownership,
+        capabilities,
+        setupKind,
+      }),
+      metadata: {
+        hasKnownModels: modelCount !== null && modelCount > 0,
+        requiresManualConfig: setupKind === 'configure-manually' || setupKind === 'requires-environment',
+        supportedInlineAuth: setupKind === 'connect-api-key',
+      },
+    }
+
+    if (
+      providerDirectoryEntryMatchesQuery(directoryEntry, modelIds, query) &&
+      providerDirectoryEntryMatchesFilter(directoryEntry, filter)
+    ) {
+      directoryEntries.push(directoryEntry)
+    }
+  }
+
+  const sortedEntries = sortProviderDirectoryEntries(directoryEntries)
+  const returnedEntries = limit === Number.MAX_SAFE_INTEGER
+    ? sortedEntries.slice(offset)
+    : sortedEntries.slice(offset, offset + limit)
+  const nextOffset = offset + returnedEntries.length
+
+  return {
+    runtimeId: 'opencode',
+    totalCount: sortedEntries.length,
+    returnedCount: returnedEntries.length,
+    query: query || null,
+    filter,
+    limit,
+    cursor: input.cursor?.trim() || null,
+    nextCursor: nextOffset < sortedEntries.length ? String(nextOffset) : null,
+    entries: returnedEntries,
+    diagnostics: redactDiagnostics([
+      ...input.diagnostics,
+      ...(malformedProviderRows > 0
+        ? [`Skipped ${malformedProviderRows} malformed OpenCode provider row(s)`]
+        : []),
+    ]),
+    fetchedAt: new Date().toISOString(),
+  }
+}
+
+function filterAndPageProviderDirectory(input: {
+  directory: ProviderDirectoryView
+  query?: string | null
+  filter?: ProviderDirectoryFilter | null
+  limit?: number | null
+  cursor?: string | null
+}): ProviderDirectoryView {
+  const query = normalizeQuery(input.query)
+  const filter = normalizeDirectoryFilter(input.filter)
+  const limit = normalizeDirectoryLimit(input.limit)
+  const offset = normalizeDirectoryCursor(input.cursor)
+  const matchingEntries = input.directory.entries.filter(entry =>
+    providerDirectoryEntryMatchesQuery(entry, [], query) &&
+    providerDirectoryEntryMatchesFilter(entry, filter)
+  )
+  const returnedEntries = matchingEntries.slice(offset, offset + limit)
+  const nextOffset = offset + returnedEntries.length
+
+  return {
+    ...input.directory,
+    totalCount: matchingEntries.length,
+    returnedCount: returnedEntries.length,
+    query: query || null,
+    filter,
+    limit,
+    cursor: input.cursor?.trim() || null,
+    nextCursor: nextOffset < matchingEntries.length ? String(nextOffset) : null,
+    entries: returnedEntries,
+  }
 }
 
 function buildView(input: {
@@ -830,8 +1255,50 @@ function buildProviderModelTestResult(input: {
   }
 }
 
-export class OpenCodeProviderManagementAdapter implements ProviderManagementQueryPort, ProviderManagementCommandPort {
+export class OpenCodeProviderManagementAdapter implements ProviderManagementQueryPort, ProviderManagementDirectoryQueryPort, ProviderManagementCommandPort {
+  private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
+
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
+
+  private getDirectoryCacheKey(input: {
+    runtimeId: ProviderManagementRuntimeId
+    inventory: OpenCodeInventorySnapshot
+    host: OpenCodeHostHandle | null
+  }): string {
+    return [
+      input.runtimeId,
+      input.inventory.projectPath,
+      input.host?.version ?? input.inventory.version ?? 'unknown-version',
+      input.inventory.profile?.profileRootKey ?? 'missing-profile',
+      input.host?.resolvedConfigFingerprint ??
+        input.inventory.profile?.managedConfigFingerprint ??
+        input.inventory.profile?.projectBehaviorFingerprint ??
+        'missing-config',
+    ].join('|')
+  }
+
+  private readDirectoryCache(cacheKey: string): ProviderDirectoryView | null {
+    const entry = this.directoryCache.get(cacheKey)
+    if (!entry) {
+      return null
+    }
+    if (entry.expiresAt <= Date.now()) {
+      this.directoryCache.delete(cacheKey)
+      return null
+    }
+    return entry.value
+  }
+
+  private writeDirectoryCache(cacheKey: string, value: ProviderDirectoryView): void {
+    this.directoryCache.set(cacheKey, {
+      expiresAt: Date.now() + DIRECTORY_CACHE_TTL_MS,
+      value,
+    })
+  }
+
+  private invalidateDirectoryCache(): void {
+    this.directoryCache.clear()
+  }
 
   private getAuthStore() {
     return this.deps.authStore ?? {
@@ -977,6 +1444,138 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
   }
 
+  async loadDirectory(
+    input: LoadProviderDirectoryInput,
+  ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
+    if (input.runtimeId !== 'opencode') {
+      return providerManagementError(
+        'unsupported-runtime',
+        `Provider management is not available for ${input.runtimeId}`,
+        false,
+      )
+    }
+
+    const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+    const inventory = await inventoryService.probe(input.projectPath)
+
+    if (!inventory.detected) {
+      return {
+        ok: true,
+        value: buildProviderDirectory({
+          inventory,
+          configProviders: null,
+          providers: null,
+          providerAuth: null,
+          diagnostics: inventory.diagnostics,
+          query: input.query,
+          filter: input.filter,
+          limit: input.limit,
+          cursor: input.cursor,
+        } as Parameters<typeof buildProviderDirectory>[0]),
+      }
+    }
+
+    const hostManager = this.deps.hostManager ?? openCodeHostManager
+    const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
+    let host: OpenCodeHostHandle | null = null
+
+    try {
+      host = await hostManager.ensureHost({ projectPath: inventory.projectPath })
+      const cacheKey = this.getDirectoryCacheKey({
+        runtimeId: input.runtimeId,
+        inventory,
+        host,
+      })
+      if (!input.refresh) {
+        const cached = this.readDirectoryCache(cacheKey)
+        if (cached) {
+          return {
+            ok: true,
+            value: filterAndPageProviderDirectory({
+              directory: cached,
+              query: input.query,
+              filter: input.filter,
+              limit: input.limit,
+              cursor: input.cursor,
+            }),
+          }
+        }
+      }
+
+      const client = clientFactory.create(host.baseUrl)
+      const serverDocRead = client.getServerDoc
+        ? safeRead(() => client.getServerDoc!())
+        : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeServerDocResponse | null>)
+      const [
+        configProvidersResult,
+        providersResult,
+        providerAuthResult,
+        serverDocResult,
+      ] = await Promise.all([
+        safeRead(() => client.getConfigProviders()),
+        safeRead(() => client.getProviders()),
+        safeRead(() => client.getProviderAuth()),
+        serverDocRead,
+      ])
+      const diagnostics = [
+        ...inventory.diagnostics,
+        ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
+        ...(providersResult.ok ? [] : [providersResult.message]),
+        ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
+        ...(serverDocResult.ok ? [] : [serverDocResult.message]),
+      ]
+      const uncachedDirectory = buildProviderDirectory({
+        inventory,
+        configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
+        providers: providersResult.ok ? providersResult.value : null,
+        providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+        capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
+        diagnostics,
+        query: null,
+        filter: 'all',
+        limit: Number.MAX_SAFE_INTEGER,
+        cursor: null,
+      })
+      this.writeDirectoryCache(cacheKey, uncachedDirectory)
+
+      return {
+        ok: true,
+        value: buildProviderDirectory({
+          inventory,
+          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
+          providers: providersResult.ok ? providersResult.value : null,
+          providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+          capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
+          diagnostics,
+          query: input.query,
+          filter: input.filter,
+          limit: input.limit,
+          cursor: input.cursor,
+        }),
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        ok: true,
+        value: buildProviderDirectory({
+          inventory,
+          configProviders: null,
+          providers: null,
+          providerAuth: null,
+          diagnostics: [...inventory.diagnostics, message],
+          query: input.query,
+          filter: input.filter,
+          limit: input.limit,
+          cursor: input.cursor,
+        }),
+      }
+    } finally {
+      if (host) {
+        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+      }
+    }
+  }
+
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
@@ -1079,6 +1678,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         const authStore = this.getAuthStore()
         await authStore.upsertApiKey({ authPath: globalAuthPath, providerId, apiKey })
         await authStore.upsertApiKey({ authPath: managedAuthPath, providerId, apiKey })
+        this.invalidateDirectoryCache()
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,
         })
@@ -1141,7 +1741,6 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
         const authPaths = new Set<string>()
         if (inventory.profile?.globalAuthPath) authPaths.add(inventory.profile.globalAuthPath)
-        if (inventory.profile?.sourceAuthPath) authPaths.add(inventory.profile.sourceAuthPath)
         if (inventory.profile?.managedAuthPath) authPaths.add(inventory.profile.managedAuthPath)
         for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
           authPaths.add(authPath)
@@ -1150,6 +1749,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         for (const authPath of authPaths) {
           await authStore.removeCredential({ authPath, providerId })
         }
+        this.invalidateDirectoryCache()
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,
         })

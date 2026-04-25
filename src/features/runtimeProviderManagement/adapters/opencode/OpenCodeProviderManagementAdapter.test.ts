@@ -24,7 +24,7 @@ function inventory(
       xdgConfigHome: '/tmp/profile/config',
       xdgDataHome: '/tmp/profile/data',
       xdgCacheHome: '/tmp/profile/cache',
-      globalAuthPath: '/Users/test/.local/share/opencode/auth.json',
+      globalAuthPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
       managedAuthPath: '/tmp/profile/data/opencode/auth.json',
       sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
       sourceAuthFingerprint: 'source-auth',
@@ -33,7 +33,12 @@ function inventory(
       env: {},
     },
     connectedProviders: [
-      { id: 'openai', authHint: 'oauth', source: 'credentials' },
+      {
+        id: 'openai',
+        authHint: 'oauth',
+        source: 'credentials',
+        credentialScopes: ['managed', 'local'],
+      },
     ],
     availableProviders: ['openai'],
     models: ['openai/gpt-5.4-mini'],
@@ -163,6 +168,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(openai).toMatchObject({
       state: 'connected',
       ownership: ['managed', 'local'],
+      detail: 'Connected via app-managed and local OpenCode credentials',
       modelCount: 1,
     })
     expect(openai?.actions.map(action => action.id)).toEqual([
@@ -178,6 +184,176 @@ describe('OpenCodeProviderManagementAdapter', () => {
       recommended: true,
     })
     expect(openrouter?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('labels environment-connected providers without claiming app-managed credentials', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [
+            { id: 'openai', authHint: 'OPENAI_API_KEY', source: 'environment' },
+          ],
+          availableProviders: ['openai'],
+          models: ['openai/gpt-5.4-mini'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'openai', name: 'OpenAI', models: { 'gpt-5.4-mini': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openai', name: 'OpenAI' }],
+            connected: ['openai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openai: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const openai = result.value.providers.find(provider => provider.providerId === 'openai')
+    expect(openai).toMatchObject({
+      state: 'connected',
+      ownership: ['env'],
+      detail: 'Connected via OpenCode environment credential',
+    })
+    expect(openai?.actions.map(action => action.id)).not.toContain('forget')
+  })
+
+  test('loads a sanitized paged provider directory from the live OpenCode catalog', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/google/gemini-3-flash-preview'],
+          diagnostics: ['authorization: Bearer sk-test-secret'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              { id: 'openrouter', name: 'OpenRouter', source: 'configured', models: { 'google/gemini-3-flash-preview': {} } },
+              { id: 'bad provider id', name: 'Bad Provider' },
+            ],
+            default: {
+              openrouter: 'google/gemini-3-flash-preview',
+            },
+          }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                source: 'models.dev',
+                models: {
+                  'google/gemini-3-flash-preview': {
+                    headers: { authorization: 'Bearer sk-test-secret' },
+                  },
+                },
+              },
+              { id: 'deepseek', name: 'DeepSeek', source: 'models.dev', models: { 'deepseek-chat': {} } },
+              { id: '', name: 'Malformed' },
+            ],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            openrouter: [{ type: 'api' }],
+          }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'deep',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries.map(entry => entry.providerId)).toEqual(['deepseek'])
+    expect(result.value.entries[0]).toMatchObject({
+      displayName: 'DeepSeek',
+      setupKind: 'available-readonly',
+      modelCount: 1,
+      sources: ['opencode-provider'],
+      sourceLabel: 'OpenCode catalog',
+    })
+    expect(JSON.stringify(result.value)).not.toContain('sk-test-secret')
+    expect(result.value.diagnostics.join('\n')).toContain('Skipped 2 malformed OpenCode provider row(s)')
+  })
+
+  test('directory exposes connectable providers only when API auth is supported', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['custom-provider'],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              { id: 'custom-provider', name: 'Custom Provider' },
+              { id: 'cloudflare-workers-ai', name: 'Cloudflare Workers AI' },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'cloudflare-workers-ai': [{ type: 'api' }],
+            'custom-provider': [{ type: 'oauth' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      filter: 'connectable',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries.map(entry => entry.providerId)).toEqual([
+      'opencode',
+      'openrouter',
+      'cloudflare-workers-ai',
+    ])
+    expect(result.value.entries.find(entry =>
+      entry.providerId === 'cloudflare-workers-ai')?.actions.map(action => action.id)).toEqual(['connect'])
   })
 
   test('loads the provider view from the selected project profile', async () => {
@@ -401,7 +577,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toEqual([
       {
-        authPath: '/Users/test/.local/share/opencode/auth.json',
+        authPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
         providerId: 'openrouter',
         apiKey: 'sk-test-secret',
       },
@@ -620,7 +796,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     expect(removedAuthPaths).toEqual([
-      '/Users/test/.local/share/opencode/auth.json',
+      '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
       '/tmp/profile/data/opencode/auth.json',
       '/tmp/other-profile/data/opencode/auth.json',
     ])
