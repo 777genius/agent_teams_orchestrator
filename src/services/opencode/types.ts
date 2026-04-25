@@ -28,6 +28,7 @@ export type OpenCodePreparedProfile = {
   xdgConfigHome: string
   xdgDataHome: string
   xdgCacheHome: string
+  globalAuthPath?: string
   managedAuthPath: string
   sourceAuthPath: string | null
   sourceAuthFingerprint: string | null

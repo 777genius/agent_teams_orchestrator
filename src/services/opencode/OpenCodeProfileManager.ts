@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import envPaths from 'env-paths'
+import type { Dirent } from 'node:fs'
 
 import { getCwd } from '../../utils/cwd.js'
 import {
@@ -297,6 +298,25 @@ export class OpenCodeProfileManager {
     return path.join(xdgDataHome, 'opencode', 'auth.json')
   }
 
+  getGlobalAuthPath(): string {
+    return this.getSourceAuthPath()
+  }
+
+  async listManagedAuthPaths(): Promise<string[]> {
+    const profilesRootPath = path.join(this.paths.data, 'opencode', 'profiles')
+    let entries: Dirent[]
+    try {
+      entries = await readdir(profilesRootPath, { withFileTypes: true })
+    } catch {
+      return []
+    }
+
+    return entries
+      .filter(entry => entry.isDirectory())
+      .map(entry => path.join(profilesRootPath, entry.name, 'data', 'opencode', 'auth.json'))
+      .sort((left, right) => left.localeCompare(right))
+  }
+
   private getProjectPath(projectPath?: string | null): string {
     return path.resolve(projectPath?.trim() || getCwd())
   }
@@ -339,7 +359,8 @@ export class OpenCodeProfileManager {
     const xdgDataHome = path.join(profileRootPath, 'data')
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
-    const sourceAuthPath = this.getSourceAuthPath()
+    const globalAuthPath = this.getGlobalAuthPath()
+    const sourceAuthPath = globalAuthPath
 
     await Promise.all([
       mkdir(homePath, { recursive: true }),
@@ -391,6 +412,7 @@ export class OpenCodeProfileManager {
       xdgConfigHome,
       xdgDataHome,
       xdgCacheHome,
+      globalAuthPath,
       managedAuthPath,
       sourceAuthPath: sourceAuthExists ? sourceAuthPath : null,
       sourceAuthFingerprint,

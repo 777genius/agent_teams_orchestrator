@@ -1,9 +1,9 @@
 import type {
   ConnectProviderApiKeyInput,
+  LoadProviderManagementViewInput,
   LoadProviderModelsInput,
   ProviderConnection,
   ProviderManagementResult,
-  ProviderManagementRuntimeId,
   ProviderManagementView,
   ProviderModelTestResult,
   ProviderSelectionInput,
@@ -14,7 +14,7 @@ import type {
 
 export interface ProviderManagementQueryPort {
   loadView(
-    runtimeId: ProviderManagementRuntimeId,
+    input: LoadProviderManagementViewInput,
   ): Promise<ProviderManagementResult<ProviderManagementView>>
   loadModels(
     input: LoadProviderModelsInput,

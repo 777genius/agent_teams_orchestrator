@@ -125,29 +125,37 @@ export type RuntimeProviderModelsView = {
   diagnostics: readonly string[]
 }
 
+export type ProjectScopedProviderManagementInput = {
+  projectPath?: string | null
+}
+
+export type LoadProviderManagementViewInput = ProjectScopedProviderManagementInput & {
+  runtimeId: ProviderManagementRuntimeId
+}
+
 export type ConnectProviderApiKeyInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
   apiKey: string
-}
+} & ProjectScopedProviderManagementInput
 
 export type ProviderSelectionInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
-}
+} & ProjectScopedProviderManagementInput
 
 export type SetDefaultModelInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
   modelId: string
   probe?: boolean
-}
+} & ProjectScopedProviderManagementInput
 
 export type TestProviderModelInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
   modelId: string
-}
+} & ProjectScopedProviderManagementInput
 
 export type ProviderModelTestResult = {
   providerId: string
@@ -163,4 +171,4 @@ export type LoadProviderModelsInput = {
   providerId: string
   query?: string | null
   limit?: number | null
-}
+} & ProjectScopedProviderManagementInput

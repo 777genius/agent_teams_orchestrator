@@ -8,6 +8,7 @@ import {
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import { openCodeInventoryService } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
+import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { setOpenCodeManagedDefaultModel } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import type {
   OpenCodeApiAuthInput,
@@ -26,6 +27,7 @@ import { isRecommendedProvider, sortProviderConnections } from '../../domain/pro
 import type {
   ConnectProviderApiKeyInput,
   LoadProviderModelsInput,
+  LoadProviderManagementViewInput,
   LocalAuthState,
   ManagedProfileState,
   ProviderActionDescriptor,
@@ -89,6 +91,9 @@ type OpenCodeProviderManagementAdapterDeps = {
       authPath: string
       providerId: string
     }): Promise<void>
+  }
+  profileManager?: {
+    listManagedAuthPaths(): Promise<string[]>
   }
   executionProbe?: {
     probeModel(input: {
@@ -590,7 +595,7 @@ function buildProviderConnections(input: {
         capabilities: input.capabilities,
       }),
       detail: connected
-        ? 'Connected in the app-managed OpenCode profile'
+        ? 'Connected via app-managed OpenCode credential'
         : modelCount > 0
           ? 'Provider is visible in the OpenCode model catalog'
           : null,
@@ -845,8 +850,13 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
   }
 
+  private getProfileManager() {
+    return this.deps.profileManager ?? openCodeProfileManager
+  }
+
   private async withManagedOpenCodeClient<T>(
     runtimeId: ProviderManagementRuntimeId,
+    projectPath: string | null | undefined,
     run: (input: {
       inventory: OpenCodeInventorySnapshot
       inventoryService: OpenCodeInventoryServiceLike
@@ -867,7 +877,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe()
+    const inventory = await inventoryService.probe(projectPath)
 
     if (!inventory.detected) {
       return providerManagementError(
@@ -898,21 +908,22 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
   }
 
   async loadView(
-    runtimeId: ProviderManagementRuntimeId,
+    input: LoadProviderManagementViewInput | ProviderManagementRuntimeId,
   ): Promise<ProviderManagementResult<ProviderManagementView>> {
-    if (runtimeId !== 'opencode') {
+    const request = typeof input === 'string' ? { runtimeId: input } : input
+    if (request.runtimeId !== 'opencode') {
       return {
         ok: false,
         error: {
           code: 'unsupported-runtime',
-          message: `Provider management is not available for ${runtimeId}`,
+          message: `Provider management is not available for ${request.runtimeId}`,
           recoverable: false,
         },
       }
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe()
+    const inventory = await inventoryService.probe(request.projectPath)
 
     if (!inventory.detected) {
       return {
@@ -976,6 +987,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
+      input.projectPath,
       async ({ inventory, client }) => {
         const [configProvidersResult, providersResult] = await Promise.all([
           safeRead(() => client.getConfigProviders()),
@@ -1030,6 +1042,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
+      input.projectPath,
       async ({ inventory, inventoryService, host, client }) => {
         if (!client.setProviderAuth) {
           return providerManagementError(
@@ -1037,11 +1050,18 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             'This OpenCode runtime does not support app-managed API-key auth',
           )
         }
-        const authPath = inventory.profile?.managedAuthPath
-        if (!authPath) {
+        const managedAuthPath = inventory.profile?.managedAuthPath
+        const globalAuthPath = inventory.profile?.globalAuthPath ?? inventory.profile?.sourceAuthPath
+        if (!managedAuthPath) {
           return providerManagementError(
             'runtime-unhealthy',
             'OpenCode managed profile auth store is unavailable',
+          )
+        }
+        if (!globalAuthPath) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode global auth store path is unavailable',
           )
         }
 
@@ -1056,11 +1076,9 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
 
-        await this.getAuthStore().upsertApiKey({
-          authPath,
-          providerId,
-          apiKey,
-        })
+        const authStore = this.getAuthStore()
+        await authStore.upsertApiKey({ authPath: globalAuthPath, providerId, apiKey })
+        await authStore.upsertApiKey({ authPath: managedAuthPath, providerId, apiKey })
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,
         })
@@ -1102,6 +1120,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
+      input.projectPath,
       async ({ inventory, inventoryService, host, client }) => {
         const serverDoc = client.getServerDoc ? await client.getServerDoc() : null
         const capabilities = getCapabilities(serverDoc)
@@ -1120,12 +1139,16 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
 
-        const authPath = inventory.profile?.managedAuthPath
-        if (authPath) {
-          await this.getAuthStore().removeCredential({
-            authPath,
-            providerId,
-          })
+        const authPaths = new Set<string>()
+        if (inventory.profile?.globalAuthPath) authPaths.add(inventory.profile.globalAuthPath)
+        if (inventory.profile?.sourceAuthPath) authPaths.add(inventory.profile.sourceAuthPath)
+        if (inventory.profile?.managedAuthPath) authPaths.add(inventory.profile.managedAuthPath)
+        for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
+          authPaths.add(authPath)
+        }
+        const authStore = this.getAuthStore()
+        for (const authPath of authPaths) {
+          await authStore.removeCredential({ authPath, providerId })
         }
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,
@@ -1179,6 +1202,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
+      input.projectPath,
       async ({ inventory, inventoryService, host, client }) => {
         const [configProvidersResult, providersResult] = await Promise.all([
           safeRead(() => client.getConfigProviders()),
@@ -1281,6 +1305,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
+      input.projectPath,
       async ({ inventory, client }) => {
         const configProvidersResult = await safeRead(() => client.getConfigProviders())
         const providersResult = await safeRead(() => client.getProviders())

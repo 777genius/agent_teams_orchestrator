@@ -364,6 +364,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toEqual([
       {
+        authPath: '/Users/test/.local/share/opencode/auth.json',
+        providerId: 'openrouter',
+        apiKey: 'sk-test-secret',
+      },
+      {
         authPath: '/tmp/profile/data/opencode/auth.json',
         providerId: 'openrouter',
         apiKey: 'sk-test-secret',

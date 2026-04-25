@@ -692,11 +692,15 @@ function compactProviderManagementView(view: ProviderManagementView): ProviderMa
 
 export async function runtimeProvidersView(opts: {
   runtime?: string
+  projectPath?: string
   json?: boolean
   compact?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
-  const result = await loadProviderManagementView(openCodeProviderManagementAdapter, runtimeId)
+  const result = await loadProviderManagementView(openCodeProviderManagementAdapter, {
+    runtimeId,
+    projectPath: opts.projectPath?.trim() || null,
+  })
 
   if (result.ok) {
     writeProviderManagementViewResponse(
@@ -714,6 +718,7 @@ export async function runtimeProvidersView(opts: {
 export async function runtimeProvidersConnectApiKey(opts: {
   runtime?: string
   provider: string
+  projectPath?: string
   stdinKey?: boolean
   json?: boolean
 }): Promise<void> {
@@ -743,6 +748,7 @@ export async function runtimeProvidersConnectApiKey(opts: {
     runtimeId,
     providerId,
     apiKey,
+    projectPath: opts.projectPath?.trim() || null,
   })
 
   if (result.ok) {
@@ -757,12 +763,14 @@ export async function runtimeProvidersConnectApiKey(opts: {
 export async function runtimeProvidersForget(opts: {
   runtime?: string
   provider: string
+  projectPath?: string
   json?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   const result = await forgetManagedProvider(openCodeProviderManagementAdapter, {
     runtimeId,
     providerId: opts.provider?.trim(),
+    projectPath: opts.projectPath?.trim() || null,
   })
 
   if (result.ok) {
@@ -777,6 +785,7 @@ export async function runtimeProvidersForget(opts: {
 export async function runtimeProvidersModels(opts: {
   runtime?: string
   provider: string
+  projectPath?: string
   query?: string
   limit?: number
   json?: boolean
@@ -785,6 +794,7 @@ export async function runtimeProvidersModels(opts: {
   const result = await loadProviderModels(openCodeProviderManagementAdapter, {
     runtimeId,
     providerId: opts.provider?.trim(),
+    projectPath: opts.projectPath?.trim() || null,
     query: opts.query?.trim() || null,
     limit: opts.limit ?? null,
   })
@@ -802,6 +812,7 @@ export async function runtimeProvidersTestModel(opts: {
   runtime?: string
   provider: string
   model: string
+  projectPath?: string
   json?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
@@ -809,6 +820,7 @@ export async function runtimeProvidersTestModel(opts: {
     runtimeId,
     providerId: opts.provider?.trim(),
     modelId: opts.model?.trim(),
+    projectPath: opts.projectPath?.trim() || null,
   })
 
   if (result.ok) {
@@ -824,6 +836,7 @@ export async function runtimeProvidersSetDefault(opts: {
   runtime?: string
   provider: string
   model: string
+  projectPath?: string
   probe?: boolean
   compact?: boolean
   json?: boolean
@@ -833,6 +846,7 @@ export async function runtimeProvidersSetDefault(opts: {
     runtimeId,
     providerId: opts.provider?.trim(),
     modelId: opts.model?.trim(),
+    projectPath: opts.projectPath?.trim() || null,
     probe: true,
   })
 

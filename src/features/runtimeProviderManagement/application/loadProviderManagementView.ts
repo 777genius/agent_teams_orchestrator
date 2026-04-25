@@ -1,13 +1,13 @@
 import type {
+  LoadProviderManagementViewInput,
   ProviderManagementResult,
-  ProviderManagementRuntimeId,
   ProviderManagementView,
 } from '../domain/types.js'
 import type { ProviderManagementQueryPort } from '../ports/ProviderManagementPorts.js'
 
 export async function loadProviderManagementView(
   port: ProviderManagementQueryPort,
-  runtimeId: ProviderManagementRuntimeId,
+  input: LoadProviderManagementViewInput,
 ): Promise<ProviderManagementResult<ProviderManagementView>> {
-  return port.loadView(runtimeId)
+  return port.loadView(input)
 }
