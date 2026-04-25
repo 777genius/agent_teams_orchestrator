@@ -4198,6 +4198,74 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeStatus(opts);
   });
+  const runtimeProviders = runtime.command('providers').description('Manage nested runtime providers').configureHelp(createSortedHelpConfig());
+  runtimeProviders.command('view').description('Return nested runtime provider management state').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).option('--json', 'Output as JSON (default)').option('--compact', 'Omit unavailable manual-only providers').action(async (opts: {
+    runtime?: 'opencode';
+    json?: boolean;
+    compact?: boolean;
+  }) => {
+    const {
+      runtimeProvidersView
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersView(opts);
+  });
+  runtimeProviders.command('connect-api-key').description('Connect a nested runtime provider using an API key from stdin').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--stdin-key', 'Read the API key from stdin').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    stdinKey?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersConnectApiKey
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersConnectApiKey(opts);
+  });
+  runtimeProviders.command('forget').description('Forget an app-managed nested runtime provider credential').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersForget
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersForget(opts);
+  });
+  runtimeProviders.command('models').description('Return lazy nested provider models').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--query <query>', 'Filter model ids and labels').addOption(new Option('--limit <count>', 'Maximum models to return').argParser(Number)).option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    query?: string;
+    limit?: number;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersModels
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersModels(opts);
+  });
+  runtimeProviders.command('test-model').description('Run an execution probe for a nested provider model').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    model: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersTestModel
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersTestModel(opts);
+  });
+  runtimeProviders.command('set-default').description('Set an app-managed OpenCode default model after a live probe').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').option('--probe', 'Run a blocking model probe before saving').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    model: string;
+    probe?: boolean;
+    compact?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersSetDefault
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersSetDefault(opts);
+  });
   runtime.command('verify').description('Run a live runtime verification probe for provider-backed hosts').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;

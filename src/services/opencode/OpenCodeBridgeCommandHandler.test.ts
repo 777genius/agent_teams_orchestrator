@@ -210,8 +210,6 @@ function expectOpenCodeIdentityPrompt(input: {
   runId: string
   originalPrompt: string
 }): void {
-  expect(input.text).toContain('agent-teams_runtime_bootstrap_checkin')
-  expect(input.text).toContain('agent-teams_member_briefing')
   expect(input.text).toContain('agent-teams_message_send')
   expect(input.text).toContain('"runtimeProvider":"opencode"')
   expect(input.text).toContain(`"teamName":"${input.teamName}"`)
@@ -220,10 +218,15 @@ function expectOpenCodeIdentityPrompt(input: {
   expect(input.text).toContain(`"runtimeSessionId":"${input.runtimeSessionId}"`)
   expect(input.text).toContain(input.originalPrompt)
   if (input.text.includes('Your first app-team MCP action must be runtime bootstrap check-in.')) {
+    expect(input.text).toContain('agent-teams_runtime_bootstrap_checkin')
+    expect(input.text).toContain('agent-teams_member_briefing')
     expect(input.text).toContain('Launch bootstrap is a silent attach')
     expect(input.text).toContain('stop this turn immediately')
     expect(input.text).toContain('stay idle silently')
   } else {
+    expect(input.text).not.toContain('If check-in is needed')
+    expect(input.text).toContain('do not call runtime_bootstrap_checkin just to answer')
+    expect(input.text).toContain('Do not call member_briefing just to answer')
     expect(input.text).toContain('Do not send unrelated readiness')
   }
   expect(input.text).not.toContain('"laneId"')

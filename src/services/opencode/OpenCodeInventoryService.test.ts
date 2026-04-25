@@ -13,6 +13,10 @@ describe('OpenCodeInventoryService parsers', () => {
 │
 ●  OpenAI oauth
 │
+●  OpenRouter api
+│
+●  Cloudflare Workers AI
+│
 └  1 credentials
 
 ┌  Environment
@@ -29,6 +33,16 @@ describe('OpenCodeInventoryService parsers', () => {
       {
         id: 'openai',
         authHint: 'oauth',
+        source: 'credentials',
+      },
+      {
+        id: 'openrouter',
+        authHint: 'api',
+        source: 'credentials',
+      },
+      {
+        id: 'cloudflare-workers-ai',
+        authHint: null,
         source: 'credentials',
       },
       {

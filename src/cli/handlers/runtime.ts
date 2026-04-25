@@ -8,6 +8,21 @@ import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvi
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+import {
+  connectProviderWithApiKey,
+  forgetManagedProvider,
+  loadProviderModels,
+  loadProviderManagementView,
+  openCodeProviderManagementAdapter,
+  setProviderDefaultModel,
+  testProviderModel,
+  type ProviderConnection,
+  type ProviderManagementError,
+  type ProviderManagementRuntimeId,
+  type ProviderManagementView,
+  type ProviderModelTestResult,
+  type RuntimeProviderModelsView,
+} from '../../features/runtimeProviderManagement/index.js'
 import type {
   RuntimeProviderId,
   RuntimeProviderStatus,
@@ -16,6 +31,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { readFile, writeFile } from 'node:fs/promises'
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
+type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 
 function formatValue(value: string | null | undefined, fallback = 'none'): string {
   return value && value.length > 0 ? value : fallback
@@ -567,4 +583,256 @@ export async function runtimeOpenCodeCommand(opts: {
   const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
   process.stdout.write(jsonStringify(result) + '\n')
   process.exit(0)
+}
+
+function normalizeProviderManagementRuntime(
+  runtime: string | null | undefined,
+): RuntimeProviderManagementTarget {
+  const normalized = runtime?.trim() || 'opencode'
+  if (normalized !== 'opencode') {
+    throw new Error(`runtime providers is currently only implemented for OpenCode, received "${normalized}"`)
+  }
+  return normalized
+}
+
+async function readStdinSecret(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+  }
+  return Buffer.concat(chunks).toString('utf8').trim()
+}
+
+function writeProviderManagementViewResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  view: ProviderManagementView | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(view ? { view } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function writeProviderManagementProviderResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  provider: ProviderConnection | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(provider ? { provider } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function writeProviderManagementModelsResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  models: RuntimeProviderModelsView | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(models ? { models } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function writeProviderManagementModelTestResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  result: ProviderModelTestResult | null,
+  error: ProviderManagementError | null,
+): void {
+  process.stdout.write(jsonStringify({
+    schemaVersion: 1,
+    runtimeId,
+    ...(result ? { result } : {}),
+    ...(error ? { error } : {}),
+  }, null, 2) + '\n')
+}
+
+function authRequiredError(message: string): ProviderManagementError {
+  return {
+    code: 'auth-required',
+    message,
+    recoverable: true,
+  }
+}
+
+function compactProviderManagementView(view: ProviderManagementView): ProviderManagementView {
+  return {
+    ...view,
+    providers: view.providers.filter(provider => {
+      if (provider.state === 'connected' || provider.recommended) {
+        return true
+      }
+
+      return provider.actions.some(action =>
+        action.enabled && (action.id === 'connect' || action.id === 'forget')
+      )
+    }),
+  }
+}
+
+export async function runtimeProvidersView(opts: {
+  runtime?: string
+  json?: boolean
+  compact?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await loadProviderManagementView(openCodeProviderManagementAdapter, runtimeId)
+
+  if (result.ok) {
+    writeProviderManagementViewResponse(
+      runtimeId,
+      opts.compact ? compactProviderManagementView(result.value) : result.value,
+      null,
+    )
+    process.exit(0)
+  }
+
+  writeProviderManagementViewResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersConnectApiKey(opts: {
+  runtime?: string
+  provider: string
+  stdinKey?: boolean
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const providerId = opts.provider?.trim()
+
+  if (!opts.stdinKey) {
+    writeProviderManagementProviderResponse(
+      runtimeId,
+      null,
+      authRequiredError('API key must be supplied through --stdin-key'),
+    )
+    process.exit(1)
+  }
+
+  const apiKey = await readStdinSecret()
+  if (!apiKey) {
+    writeProviderManagementProviderResponse(
+      runtimeId,
+      null,
+      authRequiredError('API key from stdin is empty'),
+    )
+    process.exit(1)
+  }
+
+  const result = await connectProviderWithApiKey(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId,
+    apiKey,
+  })
+
+  if (result.ok) {
+    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementProviderResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersForget(opts: {
+  runtime?: string
+  provider: string
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await forgetManagedProvider(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId: opts.provider?.trim(),
+  })
+
+  if (result.ok) {
+    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementProviderResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersModels(opts: {
+  runtime?: string
+  provider: string
+  query?: string
+  limit?: number
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await loadProviderModels(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId: opts.provider?.trim(),
+    query: opts.query?.trim() || null,
+    limit: opts.limit ?? null,
+  })
+
+  if (result.ok) {
+    writeProviderManagementModelsResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementModelsResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersTestModel(opts: {
+  runtime?: string
+  provider: string
+  model: string
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await testProviderModel(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId: opts.provider?.trim(),
+    modelId: opts.model?.trim(),
+  })
+
+  if (result.ok) {
+    writeProviderManagementModelTestResponse(runtimeId, result.value, null)
+    process.exit(0)
+  }
+
+  writeProviderManagementModelTestResponse(runtimeId, null, result.error)
+  process.exit(1)
+}
+
+export async function runtimeProvidersSetDefault(opts: {
+  runtime?: string
+  provider: string
+  model: string
+  probe?: boolean
+  compact?: boolean
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  const result = await setProviderDefaultModel(openCodeProviderManagementAdapter, {
+    runtimeId,
+    providerId: opts.provider?.trim(),
+    modelId: opts.model?.trim(),
+    probe: true,
+  })
+
+  if (result.ok) {
+    writeProviderManagementViewResponse(
+      runtimeId,
+      opts.compact ? compactProviderManagementView(result.value) : result.value,
+      null,
+    )
+    process.exit(0)
+  }
+
+  writeProviderManagementViewResponse(runtimeId, null, result.error)
+  process.exit(1)
 }

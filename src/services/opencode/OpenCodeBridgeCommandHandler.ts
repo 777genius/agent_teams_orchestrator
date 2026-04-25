@@ -280,12 +280,16 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
     'You are an OpenCode teammate managed by the desktop app.',
     purpose === 'launch'
       ? 'Your first app-team MCP action must be runtime bootstrap check-in.'
-      : 'Runtime identity reminder for this delivered app message. If you have not checked in for this run, call runtime_bootstrap_checkin before replying; otherwise continue.',
-    `${purpose === 'launch' ? 'Call' : 'If check-in is needed, call'} the exposed Agent Teams runtime_bootstrap_checkin tool, usually agent-teams_runtime_bootstrap_checkin or mcp__agent-teams__runtime_bootstrap_checkin, with: ${JSON.stringify(checkinPayload)}`,
+      : 'Runtime identity reminder for this delivered app message. This session is already attached by the app; do not call runtime_bootstrap_checkin just to answer this delivered message unless the app explicitly asks you to re-check in.',
+    purpose === 'launch'
+      ? `Call the exposed Agent Teams runtime_bootstrap_checkin tool, usually agent-teams_runtime_bootstrap_checkin or mcp__agent-teams__runtime_bootstrap_checkin, with: ${JSON.stringify(checkinPayload)}`
+      : `Attached runtime context: ${JSON.stringify(checkinPayload)}`,
     purpose === 'launch'
       ? 'After check-in succeeds, request your teammate rules.'
-      : 'If your teammate rules are missing or stale, request them before replying.',
-    `${purpose === 'launch' ? 'Call' : 'If briefing is needed, call'} the exposed Agent Teams member_briefing tool, usually agent-teams_member_briefing or mcp__agent-teams__member_briefing, with: ${JSON.stringify(briefingPayload)}`,
+      : 'Do not call member_briefing just to answer this delivered message unless the app explicitly asks you to refresh teammate rules.',
+    purpose === 'launch'
+      ? `Call the exposed Agent Teams member_briefing tool, usually agent-teams_member_briefing or mcp__agent-teams__member_briefing, with: ${JSON.stringify(briefingPayload)}`
+      : `Attached teammate context: ${JSON.stringify(briefingPayload)}`,
     ...(purpose === 'launch'
       ? [
           'Launch bootstrap is a silent attach, not a user/team conversation turn.',
@@ -294,6 +298,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
           'If the briefing says there are no actionable tasks, stay idle silently.',
         ]
       : [
+          'For this delivered app message, prioritize the requested visible reply through message_send.',
           'Only send a visible message when you are replying to this delivered app message or reporting real task/blocker/result context.',
           'Do not send unrelated readiness, understood, idle, or no-task acknowledgements.',
         ]),

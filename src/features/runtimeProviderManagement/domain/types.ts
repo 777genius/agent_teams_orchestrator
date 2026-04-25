@@ -25,20 +25,37 @@ export type ProviderOwnership =
 
 export type ProviderAuthMethod = 'api' | 'oauth' | 'wellknown'
 
-export type ProviderPrimaryAction =
+export type ProviderActionId =
   | 'connect'
   | 'use'
   | 'test'
+  | 'set-default'
   | 'forget'
+  | 'configure'
   | 'unignore'
+
+export type ProviderActionOwnershipScope =
+  | ProviderOwnership
+  | 'runtime'
+
+export type ProviderActionDescriptor = {
+  id: ProviderActionId
+  label: string
+  enabled: boolean
+  disabledReason: string | null
+  requiresSecret: boolean
+  ownershipScope: ProviderActionOwnershipScope
+}
 
 export type ProviderManagementErrorCode =
   | 'unsupported-runtime'
+  | 'unsupported-action'
   | 'runtime-missing'
   | 'runtime-unhealthy'
   | 'provider-missing'
   | 'auth-required'
   | 'auth-failed'
+  | 'model-missing'
   | 'model-test-failed'
   | 'unsupported-auth-method'
 
@@ -69,7 +86,7 @@ export type ProviderConnection = {
   modelCount: number
   defaultModelId: string | null
   authMethods: readonly ProviderAuthMethod[]
-  primaryAction: ProviderPrimaryAction | null
+  actions: readonly ProviderActionDescriptor[]
   detail: string | null
 }
 
@@ -80,6 +97,31 @@ export type ProviderManagementView = {
   providers: readonly ProviderConnection[]
   defaultModel: string | null
   fallbackModel: string | null
+  diagnostics: readonly string[]
+}
+
+export type ProviderModelAvailability =
+  | 'available'
+  | 'unavailable'
+  | 'not-authenticated'
+  | 'unknown'
+  | 'untested'
+
+export type RuntimeProviderModel = {
+  modelId: string
+  providerId: string
+  displayName: string
+  sourceLabel: string
+  free: boolean
+  default: boolean
+  availability: ProviderModelAvailability
+}
+
+export type RuntimeProviderModelsView = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+  models: readonly RuntimeProviderModel[]
+  defaultModelId: string | null
   diagnostics: readonly string[]
 }
 
@@ -98,6 +140,7 @@ export type SetDefaultModelInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
   modelId: string
+  probe?: boolean
 }
 
 export type TestProviderModelInput = {
@@ -110,5 +153,14 @@ export type ProviderModelTestResult = {
   providerId: string
   modelId: string
   ok: boolean
+  availability: ProviderModelAvailability
   message: string
+  diagnostics: readonly string[]
+}
+
+export type LoadProviderModelsInput = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+  query?: string | null
+  limit?: number | null
 }

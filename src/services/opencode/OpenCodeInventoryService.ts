@@ -3,6 +3,7 @@ import stripAnsi from 'strip-ansi'
 
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getCwd } from '../../utils/cwd.js'
+import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
 import type {
@@ -15,6 +16,10 @@ import type {
 
 const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 const OPEN_CODE_CACHE_TTL_MS = 10_000
+
+type OpenCodeInventoryProbeOptions = {
+  bypassCache?: boolean
+}
 
 type CacheEntry = {
   expiresAt: number
@@ -30,6 +35,39 @@ function getTrimmedNonEmptyLines(output: string): string[] {
     .split(/\r?\n/g)
     .map(line => line.trim())
     .filter(Boolean)
+}
+
+function parseOpenCodeConnectedProviderLine(
+  rawEntry: string,
+): { provider: string; authHint: string | null } | null {
+  const trimmed = rawEntry.trim()
+  if (!trimmed) {
+    return null
+  }
+
+  const parts = trimmed.split(/\s+/g)
+  const lastToken = parts[parts.length - 1]
+  if (!lastToken) {
+    return { provider: trimmed, authHint: null }
+  }
+
+  const lowerLastToken = lastToken.toLowerCase()
+  const isAuthHint =
+    lowerLastToken === 'api'
+    || lowerLastToken === 'oauth'
+    || (
+      /^[A-Z0-9_:-]+$/.test(lastToken)
+      && (lastToken.includes('_') || lastToken.includes(':'))
+    )
+
+  if (!isAuthHint || parts.length === 1) {
+    return { provider: trimmed, authHint: null }
+  }
+
+  return {
+    provider: parts.slice(0, -1).join(' '),
+    authHint: lowerLastToken,
+  }
 }
 
 export function parseOpenCodeModelsOutput(output: string): string[] {
@@ -68,16 +106,14 @@ export function parseOpenCodeProvidersOutput(output: string): {
     }
 
     const rawEntry = trimmed.slice(1).trim()
-    const match = /^(?<provider>[A-Za-z0-9 _-]+?)(?:\s+(?<authHint>[A-Z0-9_:-]+|oauth))?$/.exec(
-      rawEntry,
-    )
-    if (!match?.groups?.provider) {
+    const parsed = parseOpenCodeConnectedProviderLine(rawEntry)
+    if (!parsed?.provider) {
       continue
     }
 
     connectedProviders.push({
-      id: normalizeProviderId(match.groups.provider),
-      authHint: match.groups.authHint?.trim().toLowerCase() ?? null,
+      id: normalizeProviderId(parsed.provider),
+      authHint: parsed.authHint,
       source: currentSource,
     })
   }
@@ -86,6 +122,39 @@ export function parseOpenCodeProvidersOutput(output: string): {
     authStorePath,
     connectedProviders,
   }
+}
+
+function mergeConnectedProviders(
+  providers: readonly OpenCodeConnectedProvider[],
+): OpenCodeConnectedProvider[] {
+  const merged = new Map<string, OpenCodeConnectedProvider>()
+
+  for (const provider of providers) {
+    const providerId = normalizeProviderId(provider.id)
+    if (!providerId) {
+      continue
+    }
+
+    const key = `${provider.source}:${providerId}`
+    const existing = merged.get(key)
+    const credentialScopes = provider.source === 'credentials'
+      ? Array.from(new Set([
+        ...(existing?.credentialScopes ?? []),
+        ...(provider.credentialScopes ?? []),
+      ]))
+      : []
+    merged.set(key, {
+      id: providerId,
+      authHint: provider.authHint ?? existing?.authHint ?? null,
+      source: provider.source,
+      ...(credentialScopes.length > 0 ? { credentialScopes } : {}),
+    })
+  }
+
+  return Array.from(merged.values()).sort((left, right) => {
+    const sourceSort = left.source.localeCompare(right.source)
+    return sourceSort !== 0 ? sourceSort : left.id.localeCompare(right.id)
+  })
 }
 
 export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSummary[] {
@@ -129,11 +198,14 @@ export class OpenCodeInventoryService {
     })
   }
 
-  async probe(projectPath?: string | null): Promise<OpenCodeInventorySnapshot> {
+  async probe(
+    projectPath?: string | null,
+    options: OpenCodeInventoryProbeOptions = {},
+  ): Promise<OpenCodeInventorySnapshot> {
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
     const cacheKey = resolvedProjectPath
     const cached = this.cache.get(cacheKey)
-    if (cached && cached.expiresAt > Date.now()) {
+    if (!options.bypassCache && cached && cached.expiresAt > Date.now()) {
       return cached.snapshot
     }
 
@@ -170,12 +242,42 @@ export class OpenCodeInventoryService {
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
+    const sourceAuthProviderIds = new Set(
+      (profile.sourceAuthPath
+        ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
+        : []
+      ).map(provider => provider.id),
+    )
+    const managedAuthProviders = (
+      await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
+    ).map(provider => ({
+      ...provider,
+      credentialScopes: sourceAuthProviderIds.has(provider.id)
+        ? ['managed', 'local'] as Array<'managed' | 'local'>
+        : ['managed'] as Array<'managed' | 'local'>,
+    }))
+    const cliConnectedProviders = providerParse.connectedProviders.map(provider => {
+      if (provider.source !== 'credentials') {
+        return provider
+      }
+      return {
+        ...provider,
+        credentialScopes: [
+          'managed' as const,
+          ...(sourceAuthProviderIds.has(provider.id) ? ['local' as const] : []),
+        ],
+      }
+    })
+    const connectedProviders = mergeConnectedProviders([
+      ...cliConnectedProviders,
+      ...managedAuthProviders,
+    ])
     const models = modelsResult.code === 0 ? parseOpenCodeModelsOutput(modelsResult.stdout) : []
     const agents = agentsResult.code === 0 ? parseOpenCodeAgentListOutput(agentsResult.stdout) : []
 
     const availableProviders = Array.from(
       new Set([
-        ...providerParse.connectedProviders.map(provider => provider.id),
+        ...connectedProviders.map(provider => provider.id),
         ...models.map(model => model.split('/')[0]?.trim().toLowerCase()).filter(Boolean),
       ]),
     ).sort()
@@ -209,7 +311,7 @@ export class OpenCodeInventoryService {
       version,
       projectPath: resolvedProjectPath,
       profile,
-      connectedProviders: providerParse.connectedProviders,
+      connectedProviders,
       availableProviders,
       models,
       agents,

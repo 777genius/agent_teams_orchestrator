@@ -220,7 +220,7 @@ async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
 
   return {
     providerId: 'opencode',
-    displayName: 'OpenCode',
+    displayName: 'OpenCode (75+ LLM providers)',
     supported: snapshot.detected,
     authenticated,
     authMethod: authenticated ? 'opencode_managed' : null,

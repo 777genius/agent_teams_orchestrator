@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import envPaths from 'env-paths'
@@ -13,6 +13,14 @@ import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
+import {
+  doesOpenCodeAuthStoreIncludeSource,
+  readOpenCodeAuthStore,
+  syncOpenCodeManagedAuthStore,
+} from './OpenCodeAuthStore.js'
+import {
+  readOpenCodeManagedRuntimePreferences,
+} from './OpenCodeManagedPreferences.js'
 import type { OpenCodeMcpServerConfig, OpenCodePreparedProfile } from './types.js'
 
 function hashString(value: string): string {
@@ -140,7 +148,10 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
 
 export function buildManagedConfig(
   appMcpConfig?: OpenCodeMcpServerConfig | null,
-  options: { allowAutoUpdate?: boolean } = {},
+  options: {
+    allowAutoUpdate?: boolean
+    defaultModelId?: string | null
+  } = {},
 ): Record<string, unknown> {
   const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
@@ -178,6 +189,11 @@ export function buildManagedConfig(
 
   if (options.allowAutoUpdate !== true) {
     config.autoupdate = false
+  }
+
+  const defaultModelId = options.defaultModelId?.trim()
+  if (defaultModelId) {
+    config.model = defaultModelId
   }
 
   if (appMcpConfig) {
@@ -241,18 +257,20 @@ export class OpenCodeProfileManager {
   async prepareProfile(projectPath?: string | null): Promise<OpenCodePreparedProfile> {
     const resolvedProjectPath = this.getProjectPath(projectPath)
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
-    const { projectBehaviorFingerprint, behaviorSources } =
-      await collectProjectBehaviorMetadata(resolvedProjectPath)
-    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
-      allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
-    })
-    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const profileRootPath = path.join(
       this.paths.data,
       'opencode',
       'profiles',
       profileRootKey,
     )
+    const { projectBehaviorFingerprint, behaviorSources } =
+      await collectProjectBehaviorMetadata(resolvedProjectPath)
+    const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
+    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
+      allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
+      defaultModelId: managedRuntimePreferences.defaultModelId,
+    })
+    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')
     const xdgConfigHome = path.join(profileRootPath, 'config')
     const xdgDataHome = path.join(profileRootPath, 'data')
@@ -271,18 +289,32 @@ export class OpenCodeProfileManager {
     const sourceAuthFingerprint = sourceAuthExists
       ? await readFingerprint(sourceAuthPath)
       : null
-    const managedAuthFingerprintBefore = await readFingerprint(managedAuthPath)
-
-    if (
-      sourceAuthExists &&
-      sourceAuthFingerprint &&
-      sourceAuthFingerprint !== managedAuthFingerprintBefore
-    ) {
-      const sourceAuthContent = await readFile(sourceAuthPath, 'utf8')
-      await writeFile(managedAuthPath, sourceAuthContent, 'utf8')
+    if (sourceAuthExists && sourceAuthFingerprint) {
+      await syncOpenCodeManagedAuthStore({
+        sourceAuthPath,
+        managedAuthPath,
+      })
     }
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
+    const authState = await (async () => {
+      if (!managedAuthFingerprint) {
+        return 'missing' as const
+      }
+      if (!sourceAuthFingerprint) {
+        return 'ok' as const
+      }
+      try {
+        return doesOpenCodeAuthStoreIncludeSource({
+          source: await readOpenCodeAuthStore(sourceAuthPath),
+          managed: await readOpenCodeAuthStore(managedAuthPath),
+        })
+          ? 'ok' as const
+          : 'stale' as const
+      } catch {
+        return sourceAuthFingerprint === managedAuthFingerprint ? 'ok' as const : 'stale' as const
+      }
+    })()
 
     return {
       projectPath: resolvedProjectPath,
@@ -300,11 +332,7 @@ export class OpenCodeProfileManager {
       sourceAuthPath: sourceAuthExists ? sourceAuthPath : null,
       sourceAuthFingerprint,
       managedAuthFingerprint,
-      authState: !managedAuthFingerprint
-        ? 'missing'
-        : !sourceAuthFingerprint || sourceAuthFingerprint === managedAuthFingerprint
-          ? 'ok'
-          : 'stale',
+      authState,
       env: applyOpenCodeAutoUpdatePolicy({
         ...process.env,
         HOME: homePath,

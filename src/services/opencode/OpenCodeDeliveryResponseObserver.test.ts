@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 
 import { observeOpenCodeDeliveryResponse } from './OpenCodeDeliveryResponseObserver.js'
 
@@ -51,6 +52,48 @@ function summary(messages: OpenCodeCanonicalMessage[], rawStatus: OpenCodeSessio
       [...messages].reverse().find(item => item.role === 'assistant')?.previewText ?? null,
     replyPendingSinceMessageId: null,
     messages,
+    diagnostics: [],
+  }
+}
+
+function relayWorksJackFixtureSummary(): OpenCodeSessionReconcileSummary {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL('./fixtures/relay-works-10-jack-canonical-transcript.json', import.meta.url),
+      'utf8',
+    ),
+  ) as {
+    transcript: {
+      sessionId: string
+      durableState?: OpenCodeSessionReconcileSummary['durableState']
+      messageCount: number
+      toolCallCount: number
+      errorCount: number
+      messages: OpenCodeCanonicalMessage[]
+    }
+  }
+  return {
+    sessionId: fixture.transcript.sessionId,
+    reconcileOutcome: 'reconciled',
+    rawStatus: 'idle',
+    durableState: fixture.transcript.durableState ?? 'idle',
+    staleReason: null,
+    profileAuthState: null,
+    pendingPermissionRequestIds: [],
+    messageCount: fixture.transcript.messageCount,
+    toolCallCount: fixture.transcript.toolCallCount,
+    errorCount: fixture.transcript.errorCount,
+    lastCanonicalCursor: fixture.transcript.messages.at(-1)?.id ?? null,
+    latestUserMessageId:
+      [...fixture.transcript.messages].reverse().find(item => item.role === 'user')?.id ?? null,
+    latestAssistantMessageId:
+      [...fixture.transcript.messages].reverse().find(item => item.role === 'assistant')?.id ?? null,
+    latestAssistantText:
+      [...fixture.transcript.messages].reverse().find(item => item.role === 'assistant')?.text ?? null,
+    latestAssistantPreview:
+      [...fixture.transcript.messages].reverse().find(item => item.role === 'assistant')?.previewText ?? null,
+    replyPendingSinceMessageId: null,
+    messages: fixture.transcript.messages,
     diagnostics: [],
   }
 }
@@ -149,5 +192,377 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.state).toBe('responded_non_visible_tool')
     expect(observed.toolCallNames).toContain('task_start')
   })
-})
 
+  test('normalizes plain message_send as a visible reply and reports missing relay correlation', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-4',
+      summary: summary([
+        message({
+          id: 'user-4',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-4". Please reply.',
+        }),
+        message({
+          id: 'assistant-4',
+          role: 'assistant',
+          parentId: 'user-4',
+          toolCalls: [
+            {
+              callId: 'tool-plain-message-send',
+              toolName: 'message_send',
+              title: null,
+              status: 'completed',
+              input: { to: 'user', from: 'jack', text: 'Done.' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.visibleReplyCorrelation).toBe('direct_child_message_send')
+    expect(observed.visibleReplyMissingRelayOfMessageId).toBe(true)
+    expect(observed.reason).toBe('visible_reply_missing_relayOfMessageId')
+  })
+
+  test('does not count bootstrap-only tool calls as delivery response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-5',
+      summary: summary([
+        message({
+          id: 'user-5',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-5". Please answer.',
+        }),
+        message({
+          id: 'assistant-5',
+          role: 'assistant',
+          parentId: 'user-5',
+          toolCalls: [
+            {
+              callId: 'tool-bootstrap',
+              toolName: 'agent-teams_member_briefing',
+              title: null,
+              status: 'completed',
+              input: { teamName: 'team-a', memberName: 'jack' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('empty_assistant_turn')
+    expect(observed.toolCallNames).toContain('member_briefing')
+  })
+
+  test('does not mark errored message_send as a visible reply', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-6',
+      summary: summary([
+        message({
+          id: 'user-6',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-6". Please reply.',
+        }),
+        message({
+          id: 'assistant-6',
+          role: 'assistant',
+          parentId: 'user-6',
+          toolCalls: [
+            {
+              callId: 'tool-message-error',
+              toolName: 'mcp__agent-teams__message_send',
+              title: null,
+              status: 'errored',
+              input: { relayOfMessageId: 'msg-inbound-6' },
+              output: null,
+              outputText: 'tool failed',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: true,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('meaningful_tool_call_failed')
+  })
+
+  test('treats multiple retry prompts with the same inbound message id as one logical delivery', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-retry',
+      summary: summary([
+        message({
+          id: 'user-retry-1',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-retry". Please reply.',
+        }),
+        message({
+          id: 'assistant-retry-1',
+          role: 'assistant',
+          parentId: 'user-retry-1',
+        }),
+        message({
+          id: 'user-retry-2',
+          role: 'user',
+          text: 'Retry attempt for inbound app messageId "msg-inbound-retry".',
+        }),
+        message({
+          id: 'assistant-retry-2',
+          role: 'assistant',
+          parentId: 'user-retry-2',
+          toolCalls: [
+            {
+              callId: 'tool-retry-visible',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'completed',
+              input: { relayOfMessageId: 'msg-inbound-retry' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.deliveredUserMessageId).toBe('user-retry-2')
+    expect(observed.visibleReplyCorrelation).toBe('relayOfMessageId')
+  })
+
+  test('classifies plain assistant text as response proof with diagnostic reason', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-plain-text',
+      summary: summary([
+        message({
+          id: 'user-plain',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-plain-text". Please answer.',
+        }),
+        message({
+          id: 'assistant-plain',
+          role: 'assistant',
+          parentId: 'user-plain',
+          text: 'Я проверил контекст и отвечаю без tool call.',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_plain_text')
+    expect(observed.visibleReplyCorrelation).toBe('plain_assistant_text')
+    expect(observed.reason).toBe('assistant_replied_with_plain_text')
+  })
+
+  test('keeps accepted delivery pending while OpenCode is still busy', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-busy',
+      summary: summary([
+        message({
+          id: 'user-busy',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-busy". Please answer.',
+        }),
+      ], 'busy'),
+    })
+
+    expect(observed.state).toBe('pending')
+    expect(observed.deliveredUserMessageId).toBe('user-busy')
+    expect(observed.reason).toBe('assistant_response_pending')
+  })
+
+  test('classifies pending OpenCode permissions as permission blocked before prompt inspection', () => {
+    const blocked = summary([
+      message({
+        id: 'user-permission',
+        role: 'user',
+        text: 'The inbound app messageId is "msg-permission". Please answer.',
+      }),
+    ])
+    blocked.pendingPermissionRequestIds = ['perm-1']
+
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-permission',
+      summary: blocked,
+    })
+
+    expect(observed.state).toBe('permission_blocked')
+    expect(observed.reason).toBe('pending_permission_request')
+  })
+
+  test('classifies stale session reconciliation as session stale without inspecting prompts', () => {
+    const stale = summary([
+      message({
+        id: 'user-stale',
+        role: 'user',
+        text: 'The inbound app messageId is "msg-stale". Please answer.',
+      }),
+    ])
+    stale.reconcileOutcome = 'stale'
+    stale.staleReason = 'runtime_session_not_current'
+
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-stale',
+      summary: stale,
+    })
+
+    expect(observed.state).toBe('session_stale')
+    expect(observed.reason).toBe('runtime_session_not_current')
+  })
+
+  test('reports limited history prompt misses as needing full history', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-missing-from-window',
+      summary: summary([
+        message({
+          id: 'assistant-latest-only',
+          role: 'assistant',
+          text: 'Latest assistant turn, but the delivered user prompt was outside this window.',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('prompt_not_indexed')
+    expect(observed.needsFullHistory).toBe(true)
+    expect(observed.reason).toBe('delivered_prompt_anchor_not_found_in_limited_history')
+  })
+
+  test('uses pre-prompt cursor fallback when inbound id is absent from model-visible text', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-redacted-from-text',
+      prePromptCursor: 'cursor-before-delivery',
+      summary: summary([
+        message({
+          id: 'cursor-before-delivery',
+          role: 'assistant',
+          text: 'Previous assistant turn.',
+        }),
+        message({
+          id: 'user-after-cursor',
+          role: 'user',
+          text: 'Runtime delivery prompt without the explicit app id in this transcript.',
+        }),
+        message({
+          id: 'assistant-after-cursor',
+          role: 'assistant',
+          parentId: 'user-after-cursor',
+          toolCalls: [
+            {
+              callId: 'tool-cursor-fallback-reply',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'completed',
+              input: { to: 'user', from: 'jack', text: 'Done.' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.deliveredUserMessageId).toBe('user-after-cursor')
+    expect(observed.visibleReplyCorrelation).toBe('direct_child_message_send')
+    expect(observed.needsFullHistory).toBeUndefined()
+  })
+
+  test('does not guess a delivered prompt when cursor fallback has multiple user candidates', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-ambiguous-window',
+      prePromptCursor: 'cursor-ambiguous',
+      summary: summary([
+        message({
+          id: 'cursor-ambiguous',
+          role: 'assistant',
+          text: 'Previous assistant turn.',
+        }),
+        message({
+          id: 'user-candidate-1',
+          role: 'user',
+          text: 'First user after cursor.',
+        }),
+        message({
+          id: 'user-candidate-2',
+          role: 'user',
+          text: 'Second user after cursor.',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('prompt_not_indexed')
+    expect(observed.needsFullHistory).toBe(false)
+    expect(observed.reason).toBe('delivered_prompt_anchor_not_found')
+  })
+
+  test('real fixture matches delivered prompt by inbound message id instead of latest user', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'a999f8e3-f0e9-407d-8680-ec9be463ea24',
+      summary: relayWorksJackFixtureSummary(),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.deliveredUserMessageId).toBe('msg_dc123cfdc001AwmMcHowBQfmTb')
+    expect(observed.assistantMessageId).toBe('msg_dc123cfe4001kQOibIEKsAG5I4')
+    expect(observed.visibleReplyCorrelation).toBe('direct_child_message_send')
+    expect(observed.visibleReplyMissingRelayOfMessageId).toBe(true)
+  })
+
+  test('real fixture inspects all assistant children and ignores an earlier errored message_send', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'c1727b0c-5a77-4f40-9b93-abb74e201640',
+      summary: relayWorksJackFixtureSummary(),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.assistantMessageId).toBe('msg_dc1248923001BzYeYGHFXmJq6O')
+    expect(observed.toolCallNames).toContain('message_send')
+    expect(observed.reason).toBe('visible_reply_missing_relayOfMessageId')
+  })
+
+  test('real fixture treats task and lowercase execution tools as non-visible response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'e4b37382-41eb-4ce9-8419-765995a15ae0',
+      summary: relayWorksJackFixtureSummary(),
+    })
+
+    expect(observed.state).toBe('responded_non_visible_tool')
+    expect(observed.deliveredUserMessageId).toBe('msg_dc12e6ed90011tbp3EYfTvMlYa')
+    expect(observed.toolCallNames).toContain('task_get')
+    expect(observed.toolCallNames).toContain('read')
+  })
+
+  test('real fixture does not count an errored task tool as delivery success', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: '1bcb39f2-464e-416e-b38c-5410220bb88e',
+      summary: relayWorksJackFixtureSummary(),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.toolCallNames).toContain('task_add_comment')
+    expect(observed.reason).toBe('meaningful_tool_call_failed')
+  })
+})

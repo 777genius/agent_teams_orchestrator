@@ -3,6 +3,59 @@ import { describe, expect, test } from 'bun:test'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
 describe('OpenCodeClientFactory permissions API', () => {
+  test('sets provider API auth through the OpenCode auth endpoint', async () => {
+    const requests: Array<{ url: string; method: string | undefined; body: unknown }> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (input, init) => {
+        requests.push({
+          url: String(input),
+          method: init?.method,
+          body: JSON.parse(String(init?.body ?? '{}')),
+        })
+        return new Response('true', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await expect(factory.create('http://127.0.0.1:4096').setProviderAuth(
+      'openrouter',
+      { type: 'api', key: 'sk-test' },
+    )).resolves.toBe(true)
+
+    expect(requests).toEqual([{
+      url: 'http://127.0.0.1:4096/auth/openrouter',
+      method: 'PUT',
+      body: { type: 'api', key: 'sk-test' },
+    }])
+  })
+
+  test('deletes provider auth through the OpenCode auth endpoint', async () => {
+    const requests: Array<{ url: string; method: string | undefined }> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (input, init) => {
+        requests.push({
+          url: String(input),
+          method: init?.method,
+        })
+        return new Response('true', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await expect(factory.create('http://127.0.0.1:4096').deleteProviderAuth(
+      'openrouter',
+    )).resolves.toBe(true)
+
+    expect(requests).toEqual([{
+      url: 'http://127.0.0.1:4096/auth/openrouter',
+      method: 'DELETE',
+    }])
+  })
+
   test('lists pending permissions from the SDK v2 endpoint without trailing slash', async () => {
     const paths: string[] = []
     const factory = new OpenCodeClientFactory({

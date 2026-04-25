@@ -1,0 +1,163 @@
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+import type { OpenCodeConnectedProvider } from './types.js'
+
+type OpenCodeAuthEntry = Record<string, unknown>
+type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function normalizeProviderId(value: string): string | null {
+  const normalized = value.trim().toLowerCase()
+  return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
+}
+
+async function readOptionalJson(filePath: string): Promise<unknown | null> {
+  try {
+    const raw = await readFile(filePath, 'utf8')
+    if (!raw.trim()) {
+      return {}
+    }
+    return JSON.parse(raw) as unknown
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return null
+    }
+    throw error
+  }
+}
+
+export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeAuthStore> {
+  const parsed = await readOptionalJson(filePath)
+  if (!parsed) {
+    return {}
+  }
+
+  const record = asRecord(parsed)
+  if (!record) {
+    throw new Error(`OpenCode auth store is not a JSON object: ${filePath}`)
+  }
+
+  const authStore: OpenCodeAuthStore = {}
+  for (const [rawProviderId, rawEntry] of Object.entries(record)) {
+    const providerId = normalizeProviderId(rawProviderId)
+    const entry = asRecord(rawEntry)
+    if (!providerId || !entry) {
+      continue
+    }
+    authStore[providerId] = { ...entry }
+  }
+  return authStore
+}
+
+async function writeOpenCodeAuthStore(filePath: string, authStore: OpenCodeAuthStore): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true })
+  const tempPath = path.join(
+    path.dirname(filePath),
+    `.auth.json.${process.pid}.${Date.now()}.tmp`,
+  )
+  await writeFile(tempPath, `${JSON.stringify(authStore, null, 2)}\n`, 'utf8')
+  await rename(tempPath, filePath)
+}
+
+export function mergeOpenCodeAuthStores(input: {
+  source: OpenCodeAuthStore
+  managed: OpenCodeAuthStore
+}): OpenCodeAuthStore {
+  return {
+    ...input.managed,
+    ...input.source,
+  }
+}
+
+export function doesOpenCodeAuthStoreIncludeSource(input: {
+  source: OpenCodeAuthStore
+  managed: OpenCodeAuthStore
+}): boolean {
+  for (const [providerId, sourceEntry] of Object.entries(input.source)) {
+    const managedEntry = input.managed[providerId]
+    if (!managedEntry || JSON.stringify(managedEntry) !== JSON.stringify(sourceEntry)) {
+      return false
+    }
+  }
+  return true
+}
+
+export async function syncOpenCodeManagedAuthStore(input: {
+  sourceAuthPath: string
+  managedAuthPath: string
+}): Promise<void> {
+  const source = await readOpenCodeAuthStore(input.sourceAuthPath)
+  const managed = await readOpenCodeAuthStore(input.managedAuthPath)
+  const merged = mergeOpenCodeAuthStores({ source, managed })
+
+  if (JSON.stringify(merged) !== JSON.stringify(managed)) {
+    await writeOpenCodeAuthStore(input.managedAuthPath, merged)
+  }
+}
+
+export async function upsertOpenCodeApiAuthCredential(input: {
+  authPath: string
+  providerId: string
+  apiKey: string
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+
+  const apiKey = input.apiKey.trim()
+  if (!apiKey) {
+    throw new Error('OpenCode API key is required')
+  }
+
+  const authStore = await readOpenCodeAuthStore(input.authPath)
+  authStore[providerId] = {
+    type: 'api',
+    key: apiKey,
+  }
+  await writeOpenCodeAuthStore(input.authPath, authStore)
+}
+
+export async function removeOpenCodeAuthCredential(input: {
+  authPath: string
+  providerId: string
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+
+  const authStore = await readOpenCodeAuthStore(input.authPath)
+  if (!(providerId in authStore)) {
+    return
+  }
+  delete authStore[providerId]
+  await writeOpenCodeAuthStore(input.authPath, authStore)
+}
+
+export async function readOpenCodeAuthProviderSummaries(
+  authPath: string | null | undefined,
+  credentialScopes?: Array<'managed' | 'local'>,
+): Promise<OpenCodeConnectedProvider[]> {
+  if (!authPath) {
+    return []
+  }
+
+  const authStore = await readOpenCodeAuthStore(authPath)
+  return Object.entries(authStore)
+    .map(([providerId, entry]) => ({
+      id: providerId,
+      authHint: typeof entry.type === 'string' && entry.type.trim()
+        ? entry.type.trim().toLowerCase()
+        : null,
+      source: 'credentials' as const,
+      ...(credentialScopes ? { credentialScopes } : {}),
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id))
+}

@@ -192,6 +192,7 @@ export type ProviderManagementError = {
     | 'runtime-missing'
     | 'runtime-unhealthy'
     | 'provider-missing'
+    | 'unsupported-action'
     | 'auth-required'
     | 'auth-failed'
     | 'model-test-failed'
@@ -251,8 +252,17 @@ type ProviderConnection = {
   modelCount: number
   defaultModelId: string | null
   authMethods: Array<'api' | 'oauth' | 'wellknown'>
-  primaryAction: 'connect' | 'use' | 'test' | 'forget' | 'unignore' | null
+  actions: ProviderActionDescriptor[]
   detail: string | null
+}
+
+type ProviderActionDescriptor = {
+  id: 'connect' | 'use' | 'test' | 'set-default' | 'forget' | 'configure' | 'unignore'
+  label: string
+  enabled: boolean
+  disabledReason: string | null
+  requiresSecret: boolean
+  ownershipScope: ProviderOwnership | 'runtime'
 }
 
 type ProviderOwnership = 'managed' | 'local' | 'env' | 'project'
@@ -264,12 +274,11 @@ MVP:
 
 - Connect OpenRouter with API key to managed OpenCode profile.
 - Connect OpenCode Zen with API key to managed OpenCode profile.
-- Connect any API-key provider exposed by OpenCode catalog.
-- Test selected provider/model.
-- Set default model for OpenCode team launches.
-- Ignore local/env/project provider in managed profile.
-- Forget only app-managed provider auth.
-- Resync local OpenCode auth into managed profile.
+- Connect any provider that OpenCode advertises with `api` auth.
+- Show `Configure manually` for custom providers without advertised API auth.
+- Forget only app-managed provider auth when `/doc` advertises
+  `DELETE /auth/{providerID}`.
+- Keep test, default model, ignore, and resync as later-phase actions.
 
 Non-goals:
 
@@ -324,9 +333,10 @@ Phase 1 - Read-only popup:
 Phase 2 - Managed API-key connect:
 
 - Add API-key form.
-- Add OpenCode auth set/remove adapter methods.
-- Add managed ownership metadata.
-- Add forget/ignore behavior.
+- Add OpenCode `PUT /auth/{providerID}` adapter method.
+- Add capability-gated `DELETE /auth/{providerID}` adapter method.
+- Replace `primaryAction` with action descriptors.
+- Add managed ownership metadata and secret-clearing UI state.
 
 Phase 3 - Model default and test:
 
@@ -338,9 +348,9 @@ Phase 3 - Model default and test:
 ## Validation
 
 - Unit tests for view-model normalization and ownership precedence.
-- Unit tests for available primary actions per ownership/source.
+- Unit tests for available action descriptors per ownership/source.
 - UI tests for loading, ready, missing CLI, no auth, ignored provider, and
   failed test states.
 - Adapter tests that verify managed connect calls the managed OpenCode host only.
 - Manual check with `opencode providers list`, `opencode models`, and OpenCode
-  server `/provider`, `/provider/auth`, `/config/providers`.
+  server `/provider`, `/provider/auth`, `/config/providers`, and `/doc`.

@@ -1,5 +1,6 @@
 import type {
   OpenCodeAgentResponse,
+  OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
   OpenCodeConfigResponse,
   OpenCodeMessage,
@@ -8,6 +9,7 @@ import type {
   OpenCodePendingPermission,
   OpenCodeProviderAuthMethod,
   OpenCodeProviderResponse,
+  OpenCodeServerDocResponse,
   OpenCodeSessionStatus,
   OpenCodeSessionSummary,
 } from './types.js'
@@ -17,6 +19,9 @@ export type OpenCodeClient = {
   getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
+  getServerDoc(): Promise<OpenCodeServerDocResponse>
+  setProviderAuth(providerId: string, body: OpenCodeApiAuthInput): Promise<boolean>
+  deleteProviderAuth(providerId: string): Promise<boolean>
   listAgents(): Promise<OpenCodeAgentResponse[]>
   getMcp(): Promise<OpenCodeMcpResponse>
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
@@ -148,6 +153,16 @@ export class OpenCodeClientFactory {
       getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
       getProviders: () => request<OpenCodeProviderResponse>('/provider'),
       getProviderAuth: () => request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
+      getServerDoc: () => request<OpenCodeServerDocResponse>('/doc'),
+      setProviderAuth: (providerId, body) =>
+        request<boolean>(`/auth/${encodeURIComponent(providerId)}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }),
+      deleteProviderAuth: providerId =>
+        request<boolean>(`/auth/${encodeURIComponent(providerId)}`, {
+          method: 'DELETE',
+        }),
       listAgents: () => request<OpenCodeAgentResponse[]>('/agent'),
       getMcp: () => request<OpenCodeMcpResponse>('/mcp'),
       addMcp: (name, config) =>

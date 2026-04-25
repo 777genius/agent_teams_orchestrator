@@ -1,5 +1,6 @@
 import type {
   ConnectProviderApiKeyInput,
+  LoadProviderModelsInput,
   ProviderConnection,
   ProviderManagementResult,
   ProviderManagementRuntimeId,
@@ -8,12 +9,16 @@ import type {
   ProviderSelectionInput,
   SetDefaultModelInput,
   TestProviderModelInput,
+  RuntimeProviderModelsView,
 } from '../domain/types.js'
 
 export interface ProviderManagementQueryPort {
   loadView(
     runtimeId: ProviderManagementRuntimeId,
   ): Promise<ProviderManagementResult<ProviderManagementView>>
+  loadModels(
+    input: LoadProviderModelsInput,
+  ): Promise<ProviderManagementResult<RuntimeProviderModelsView>>
 }
 
 export interface ProviderManagementCommandPort {

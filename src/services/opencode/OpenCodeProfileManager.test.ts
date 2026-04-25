@@ -163,4 +163,13 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       }).OPENCODE_DISABLE_AUTOUPDATE,
     ).toBeUndefined()
   })
+
+  test('adds an app-managed default model only when explicitly configured', () => {
+    const managedConfig = buildManagedConfig(null, {
+      defaultModelId: 'openrouter/openai/gpt-oss-20b:free',
+    })
+
+    expect(managedConfig.model).toBe('openrouter/openai/gpt-oss-20b:free')
+    expect(buildManagedConfig().model).toBeUndefined()
+  })
 })

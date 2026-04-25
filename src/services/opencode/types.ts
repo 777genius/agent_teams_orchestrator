@@ -45,6 +45,7 @@ export type OpenCodeConnectedProvider = {
   id: string
   authHint: string | null
   source: OpenCodeAuthSource
+  credentialScopes?: Array<'managed' | 'local'>
 }
 
 export type OpenCodeAgentSummary = {
@@ -83,6 +84,16 @@ export type OpenCodeConfigResponse = {
 export type OpenCodeProviderAuthMethod = {
   type?: string
   label?: string
+}
+
+export type OpenCodeApiAuthInput = {
+  type: 'api'
+  key: string
+  metadata?: Record<string, string>
+}
+
+export type OpenCodeServerDocResponse = {
+  paths?: Record<string, Record<string, unknown>>
 }
 
 export type OpenCodeMcpServerConfig = {
