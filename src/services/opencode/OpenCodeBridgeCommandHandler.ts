@@ -626,10 +626,13 @@ function readinessData(
   requireSelectedModel: boolean,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
-  const models = snapshot.configProviders?.providers
-    ?.flatMap(provider => Object.keys(asRecord(provider.models) ?? {}).map(model => `${provider.id}/${model}`))
-    .filter((model): model is string => Boolean(model))
-    ?? []
+  const models = Array.from(new Set([
+    ...(snapshot.configProviders?.providers
+      ?.flatMap(provider => Object.keys(asRecord(provider.models) ?? {}).map(model => `${provider.id}/${model}`))
+      .filter((model): model is string => Boolean(model))
+      ?? []),
+    ...(snapshot.models ?? []),
+  ])).sort()
   const appMcpConnected = snapshot.appMcp?.connected === true || snapshot.appMcp?.status === 'present' || snapshot.appMcp?.status === 'attached'
   const requiredToolsPresent = appMcpConnected && toolProof.ok
   const diagnostics = [

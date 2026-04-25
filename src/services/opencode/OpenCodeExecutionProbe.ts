@@ -20,6 +20,8 @@ const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
 const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 2 * 60_000
 const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
 const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
+const OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT = 512
+const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
@@ -405,6 +407,7 @@ export class OpenCodeExecutionProbe {
     const startedAtMs = nowMs()
     const prompt = params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT
     const expectedOutput = params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT
+    parseProviderScopedModel(params.selectedModel)
     const diagnostics = new Set<string>()
     const probeTimeoutMs = Math.max(
       1,
@@ -417,6 +420,15 @@ export class OpenCodeExecutionProbe {
 
     const host = await this.hostManager.ensureHost({
       projectPath: params.projectPath,
+      profileOptions: {
+        modelOutputLimitOverrides: [
+          {
+            modelId: params.selectedModel,
+            outputTokens: OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
+            contextTokens: OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT,
+          },
+        ],
+      },
     })
 
     try {

@@ -8,7 +8,11 @@ import envPaths from 'env-paths'
 import { sleep } from '../../utils/sleep.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
-import type { OpenCodeHostHandle, OpenCodePreparedProfile } from './types.js'
+import type {
+  OpenCodeHostHandle,
+  OpenCodePrepareProfileOptions,
+  OpenCodePreparedProfile,
+} from './types.js'
 
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
@@ -27,7 +31,10 @@ type FetchJsonResult = {
 }
 
 type OpenCodeHostManagerDeps = {
-  prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
+  prepareProfile?: (
+    projectPath?: string | null,
+    options?: OpenCodePrepareProfileOptions
+  ) => Promise<OpenCodePreparedProfile>
   allocateLoopbackPort?: () => Promise<number>
   fetchJson?: (url: string, init?: RequestInit) => Promise<FetchJsonResult>
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
@@ -267,10 +274,13 @@ export class OpenCodeHostManager {
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
 
-  private async prepareProfile(projectPath?: string | null): Promise<OpenCodePreparedProfile> {
+  private async prepareProfile(
+    projectPath?: string | null,
+    options?: OpenCodePrepareProfileOptions,
+  ): Promise<OpenCodePreparedProfile> {
     const prepareProfile = this.deps.prepareProfile
       ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
-    return prepareProfile(projectPath)
+    return prepareProfile(projectPath, options)
   }
 
   private async fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
@@ -724,8 +734,9 @@ export class OpenCodeHostManager {
   async ensureHost(params: {
     projectPath?: string | null
     hostKey?: string | null
+    profileOptions?: OpenCodePrepareProfileOptions
   } = {}): Promise<OpenCodeHostHandle> {
-    const profile = await this.prepareProfile(params.projectPath)
+    const profile = await this.prepareProfile(params.projectPath, params.profileOptions)
     const hostKey =
       params.hostKey?.trim()
       || `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`

@@ -236,6 +236,48 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 TARGET="$SCRIPT_DIR/${targetRelativePath}"
 
+augment_launcher_path() {
+  local bun_dir=""
+  if [[ -n "\${BUN_INSTALL:-}" ]]; then
+    bun_dir="$BUN_INSTALL/bin"
+  elif [[ -n "\${HOME:-}" ]]; then
+    bun_dir="$HOME/.bun/bin"
+  fi
+
+  if [[ -n "$bun_dir" ]]; then
+    export PATH="$bun_dir:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  else
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  fi
+}
+
+resolve_bun() {
+  if [[ -n "\${BUN_INSTALL:-}" && -x "$BUN_INSTALL/bin/bun" ]]; then
+    printf '%s\\n' "$BUN_INSTALL/bin/bun"
+    return 0
+  fi
+
+  if [[ -x "\${HOME:-}/.bun/bin/bun" ]]; then
+    printf '%s\\n' "\${HOME:-}/.bun/bin/bun"
+    return 0
+  fi
+
+  if command -v bun >/dev/null 2>&1; then
+    command -v bun
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/bun /usr/local/bin/bun; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "Bun runtime was not found. Install Bun or add it to PATH before running this launcher." >&2
+  return 127
+}
+
 wait_for_target() {
   local attempts=0
   while [[ ! -f "$TARGET" && "$attempts" -lt 50 ]]; do
@@ -249,12 +291,15 @@ wait_for_target() {
   fi
 }
 
+augment_launcher_path
+wait_for_target
+BUN_BIN="$(resolve_bun)" || exit $?
+
 if [[ "\${1-}" == "runtime" && "\${2-}" == "status" ]]; then
   for arg in "$@"; do
     if [[ "$arg" == "--json" ]]; then
-      wait_for_target
       RAW_OUTPUT="$(
-        bun "$TARGET" "$@" 2> >(cat >&2)
+        "$BUN_BIN" "$TARGET" "$@" 2> >(cat >&2)
       )"
       RAW_OUTPUT="$RAW_OUTPUT" node <<'EOF'
 const raw = process.env.RAW_OUTPUT ?? ''
@@ -275,8 +320,7 @@ EOF
   done
 fi
 
-wait_for_target
-exec bun "$TARGET" "$@"
+exec "$BUN_BIN" "$TARGET" "$@"
 `
 
   writeFileSync(launcherPath, launcher)

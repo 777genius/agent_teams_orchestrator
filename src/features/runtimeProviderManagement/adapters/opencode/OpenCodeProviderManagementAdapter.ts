@@ -790,8 +790,12 @@ function buildProviderModelsView(input: {
   }
 }
 
-function providerIsConnected(inventory: OpenCodeInventorySnapshot, providerId: string): boolean {
-  return inventory.connectedProviders.some(provider => normalizeProviderId(provider.id) === providerId)
+function providerIsConnected(input: {
+  inventory: OpenCodeInventorySnapshot
+  providers: OpenCodeProviderResponse | null
+  providerId: string
+}): boolean {
+  return getConnectedProviderMap(input.inventory, input.providers).has(input.providerId)
 }
 
 function mapProbeOutcomeToAvailability(
@@ -1176,22 +1180,25 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       async ({ inventory, inventoryService, host, client }) => {
-        if (!providerIsConnected(inventory, providerId)) {
+        const [configProvidersResult, providersResult] = await Promise.all([
+          safeRead(() => client.getConfigProviders()),
+          safeRead(() => client.getProviders()),
+        ])
+        const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+        const providers = providersResult.ok ? providersResult.value : null
+
+        if (!providerIsConnected({ inventory, providers, providerId })) {
           return providerManagementError(
             'auth-required',
             `Provider ${providerId} must be connected before setting a default model`,
           )
         }
 
-        const [configProvidersResult, providersResult] = await Promise.all([
-          safeRead(() => client.getConfigProviders()),
-          safeRead(() => client.getProviders()),
-        ])
         const modelsView = buildProviderModelsView({
           providerId,
           inventory,
-          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-          providers: providersResult.ok ? providersResult.value : null,
+          configProviders,
+          providers,
         })
         if (!modelsView.models.some(model => model.modelId === modelId)) {
           return providerManagementError(
@@ -1275,20 +1282,23 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       async ({ inventory, client }) => {
-        if (!providerIsConnected(inventory, providerId)) {
+        const configProvidersResult = await safeRead(() => client.getConfigProviders())
+        const providersResult = await safeRead(() => client.getProviders())
+        const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+        const providers = providersResult.ok ? providersResult.value : null
+
+        if (!providerIsConnected({ inventory, providers, providerId })) {
           return providerManagementError(
             'auth-required',
             `Provider ${providerId} must be connected before testing a model`,
           )
         }
 
-        const configProvidersResult = await safeRead(() => client.getConfigProviders())
-        const providersResult = await safeRead(() => client.getProviders())
         const modelsView = buildProviderModelsView({
           providerId,
           inventory,
-          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-          providers: providersResult.ok ? providersResult.value : null,
+          configProviders,
+          providers,
         })
         if (!modelsView.models.some(model => model.modelId === modelId)) {
           return providerManagementError(

@@ -5,7 +5,11 @@ import path from 'node:path'
 
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 
-import type { OpenCodeHostHandle, OpenCodePreparedProfile } from './types.js'
+import type {
+  OpenCodeHostHandle,
+  OpenCodePrepareProfileOptions,
+  OpenCodePreparedProfile,
+} from './types.js'
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
@@ -51,9 +55,16 @@ describe('OpenCodeExecutionProbe', () => {
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
     let promptAsyncCount = 0
     let sendMessageCount = 0
+    let ensureHostInput: {
+      projectPath?: string | null
+      profileOptions?: OpenCodePrepareProfileOptions
+    } | null = null
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async input => {
+          ensureHostInput = input
+          return host
+        },
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -124,6 +135,18 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.latestAssistantText).toBe('PONG')
     expect(promptAsyncCount).toBe(1)
     expect(sendMessageCount).toBe(0)
+    expect(ensureHostInput).toEqual({
+      projectPath: '/tmp/project',
+      profileOptions: {
+        modelOutputLimitOverrides: [
+          {
+            modelId: 'opencode/big-pickle',
+            outputTokens: 512,
+            contextTokens: 32_000,
+          },
+        ],
+      },
+    })
   })
 
   test('marks model auth as invalid when OpenCode returns a token refresh failure', async () => {

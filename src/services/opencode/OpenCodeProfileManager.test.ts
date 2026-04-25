@@ -172,4 +172,29 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(managedConfig.model).toBe('openrouter/openai/gpt-oss-20b:free')
     expect(buildManagedConfig().model).toBeUndefined()
   })
+
+  test('can cap a provider-scoped model output limit in managed config overrides', () => {
+    const managedConfig = buildManagedConfig(null, {
+      modelOutputLimitOverrides: [
+        {
+          modelId: 'openrouter/anthropic/claude-3.5-haiku',
+          outputTokens: 512,
+          contextTokens: 32_000,
+        },
+      ],
+    })
+
+    expect(managedConfig.provider).toEqual({
+      openrouter: {
+        models: {
+          'anthropic/claude-3.5-haiku': {
+            limit: {
+              context: 32_000,
+              output: 512,
+            },
+          },
+        },
+      },
+    })
+  })
 })

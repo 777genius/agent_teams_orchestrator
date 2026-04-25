@@ -6,6 +6,16 @@ export type OpenCodeAuthState = 'ok' | 'missing' | 'stale'
 
 export type OpenCodeHostState = 'starting' | 'healthy' | 'degraded' | 'disposed'
 
+export type OpenCodeModelOutputLimitOverride = {
+  modelId: string
+  outputTokens: number
+  contextTokens?: number
+}
+
+export type OpenCodePrepareProfileOptions = {
+  modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
+}
+
 export type OpenCodePreparedProfile = {
   projectPath: string
   profileRootKey: string
@@ -162,6 +172,7 @@ export type OpenCodeProvisioningSnapshot = {
   detected: boolean
   hostHealthy: boolean
   projectPath: string
+  models?: string[]
   profile: OpenCodePreparedProfile | null
   host: OpenCodeHostHandle | null
   config: OpenCodeConfigResponse | null

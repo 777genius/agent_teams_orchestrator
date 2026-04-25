@@ -29,7 +29,29 @@ function getConfigProviderModelMatches(
     }
   }
 
-  return matches
+  for (const model of snapshot.models ?? []) {
+    const scoped = splitProviderScopedModel(model)
+    if (!scoped || scoped.modelId !== rawModelId) {
+      continue
+    }
+    matches.push(scoped)
+  }
+
+  return dedupeModelMatches(matches)
+}
+
+function dedupeModelMatches(
+  matches: Array<{ providerId: string; modelId: string }>,
+): Array<{ providerId: string; modelId: string }> {
+  const seen = new Set<string>()
+  return matches.filter(match => {
+    const key = formatScopedModel(match.providerId, match.modelId)
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 }
 
 function getDefaultProviderMatch(
@@ -68,6 +90,11 @@ function hasProviderScopedModel(
   providerId: string,
   modelId: string,
 ): boolean {
+  const scopedModel = formatScopedModel(providerId, modelId)
+  if ((snapshot.models ?? []).includes(scopedModel)) {
+    return true
+  }
+
   const providers = snapshot.configProviders?.providers ?? []
   for (const provider of providers) {
     if (asString(provider.id) !== providerId) {
@@ -109,6 +136,13 @@ function getKnownProviderIds(snapshot: OpenCodeProvisioningSnapshot): Set<string
 
   for (const providerId of Object.keys(asRecord(snapshot.providers?.default) ?? {})) {
     providerIds.add(providerId)
+  }
+
+  for (const model of snapshot.models ?? []) {
+    const scoped = splitProviderScopedModel(model)
+    if (scoped) {
+      providerIds.add(scoped.providerId)
+    }
   }
 
   return providerIds

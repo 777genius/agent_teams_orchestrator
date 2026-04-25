@@ -21,7 +21,11 @@ import {
 import {
   readOpenCodeManagedRuntimePreferences,
 } from './OpenCodeManagedPreferences.js'
-import type { OpenCodeMcpServerConfig, OpenCodePreparedProfile } from './types.js'
+import type {
+  OpenCodeMcpServerConfig,
+  OpenCodePrepareProfileOptions,
+  OpenCodePreparedProfile,
+} from './types.js'
 
 function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -29,6 +33,36 @@ function hashString(value: string): string {
 
 function hashBuffer(value: Buffer): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function parseProviderScopedModelId(value: string): {
+  providerId: string
+  modelId: string
+} | null {
+  const trimmed = value.trim()
+  const separatorIndex = trimmed.indexOf('/')
+  if (separatorIndex <= 0 || separatorIndex >= trimmed.length - 1) {
+    return null
+  }
+
+  return {
+    providerId: trimmed.slice(0, separatorIndex),
+    modelId: trimmed.slice(separatorIndex + 1),
+  }
+}
+
+function normalizePositiveInteger(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null
+  }
+  const normalized = Math.floor(value)
+  return normalized > 0 ? normalized : null
 }
 
 async function readFingerprint(filePath: string): Promise<string | null> {
@@ -151,6 +185,7 @@ export function buildManagedConfig(
   options: {
     allowAutoUpdate?: boolean
     defaultModelId?: string | null
+    modelOutputLimitOverrides?: OpenCodePrepareProfileOptions['modelOutputLimitOverrides']
   } = {},
 ): Record<string, unknown> {
   const config: Record<string, unknown> = {
@@ -194,6 +229,30 @@ export function buildManagedConfig(
   const defaultModelId = options.defaultModelId?.trim()
   if (defaultModelId) {
     config.model = defaultModelId
+  }
+
+  for (const override of options.modelOutputLimitOverrides ?? []) {
+    const parsedModel = parseProviderScopedModelId(override.modelId)
+    const outputTokens = normalizePositiveInteger(override.outputTokens)
+    if (!parsedModel || outputTokens === null) {
+      continue
+    }
+
+    const contextTokens = normalizePositiveInteger(override.contextTokens)
+      ?? Math.max(outputTokens, 32_000)
+    const providerConfig = { ...asRecord(asRecord(config.provider)[parsedModel.providerId]) }
+    const models = { ...asRecord(providerConfig.models) }
+    const modelConfig = { ...asRecord(models[parsedModel.modelId]) }
+    modelConfig.limit = {
+      context: contextTokens,
+      output: outputTokens,
+    }
+    models[parsedModel.modelId] = modelConfig
+    providerConfig.models = models
+    config.provider = {
+      ...asRecord(config.provider),
+      [parsedModel.providerId]: providerConfig,
+    }
   }
 
   if (appMcpConfig) {
@@ -254,7 +313,10 @@ export class OpenCodeProfileManager {
     }
   }
 
-  async prepareProfile(projectPath?: string | null): Promise<OpenCodePreparedProfile> {
+  async prepareProfile(
+    projectPath?: string | null,
+    options: OpenCodePrepareProfileOptions = {},
+  ): Promise<OpenCodePreparedProfile> {
     const resolvedProjectPath = this.getProjectPath(projectPath)
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
     const profileRootPath = path.join(
@@ -269,6 +331,7 @@ export class OpenCodeProfileManager {
     const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
       allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
       defaultModelId: managedRuntimePreferences.defaultModelId,
+      modelOutputLimitOverrides: options.modelOutputLimitOverrides,
     })
     const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')

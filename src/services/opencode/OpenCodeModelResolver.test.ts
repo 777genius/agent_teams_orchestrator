@@ -61,6 +61,28 @@ describe('resolveOpenCodeProviderScopedModel', () => {
     )
   })
 
+  test('validates provider-scoped ids discovered by the OpenCode models inventory', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'openrouter/qwen/qwen3-coder',
+        snapshot({
+          models: ['openrouter/qwen/qwen3-coder'],
+        }),
+      ),
+    ).toBe('openrouter/qwen/qwen3-coder')
+  })
+
+  test('resolves raw ids from the OpenCode models inventory when unique', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'qwen/qwen3-coder',
+        snapshot({
+          models: ['openrouter/qwen/qwen3-coder'],
+        }),
+      ),
+    ).toBe('openrouter/qwen/qwen3-coder')
+  })
+
   test('resolves raw catalog ids that contain slashes when the first segment is not a provider', () => {
     expect(resolveOpenCodeProviderScopedModel('moonshotai/kimi-k2', snapshot())).toBe(
       'openrouter/moonshotai/kimi-k2',

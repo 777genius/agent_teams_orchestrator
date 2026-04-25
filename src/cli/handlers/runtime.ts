@@ -581,8 +581,20 @@ export async function runtimeOpenCodeCommand(opts: {
   const raw = await readFile(opts.input, 'utf8')
   const envelope = JSON.parse(raw) as unknown
   const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
-  process.stdout.write(jsonStringify(result) + '\n')
+  await writeStdoutAndDrain(jsonStringify(result) + '\n')
   process.exit(0)
+}
+
+function writeStdoutAndDrain(payload: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(payload, error => {
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve()
+    })
+  })
 }
 
 function normalizeProviderManagementRuntime(

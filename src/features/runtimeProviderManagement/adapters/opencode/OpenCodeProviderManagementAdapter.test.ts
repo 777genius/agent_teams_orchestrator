@@ -731,6 +731,75 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toBe('openrouter/openai/gpt-oss-20b:free')
   })
 
+  test('tests models when live OpenCode server reports the provider as connected', async () => {
+    let probedModel: string | null = null
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['opencode'],
+          models: ['opencode/nemotron-3-super-free'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'opencode',
+                name: 'OpenCode Zen',
+                models: { 'nemotron-3-super-free': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'opencode', name: 'OpenCode Zen' }],
+            connected: ['opencode'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ opencode: [{ type: 'api' }] }),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModel = input.selectedModel
+          return {
+            providerId: 'opencode',
+            modelId: input.selectedModel,
+            probePrompt: 'Output only the single word PONG.',
+            expectedOutput: 'PONG',
+            outcome: 'available',
+            reason: null,
+            durationMs: 10,
+            rawStatus: null,
+            durableState: 'idle',
+            latestAssistantText: 'PONG',
+            latestAssistantPreview: 'PONG',
+            toolCallCount: 0,
+            errorCount: 0,
+            diagnostics: [],
+          }
+        },
+      },
+    })
+
+    const result = await adapter.testModel({
+      runtimeId: 'opencode',
+      providerId: 'opencode',
+      modelId: 'opencode/nemotron-3-super-free',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probedModel).toBe('opencode/nemotron-3-super-free')
+    if (!result.ok) return
+    expect(result.value.availability).toBe('available')
+  })
+
   test('does not save the app-managed default when the probe fails', async () => {
     let wrote = false
     const adapter = new OpenCodeProviderManagementAdapter({
