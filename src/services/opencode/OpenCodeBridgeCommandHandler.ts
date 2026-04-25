@@ -19,6 +19,10 @@ import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import {
+  observeOpenCodeDeliveryResponse,
+  type OpenCodeDeliveryResponseObservation,
+} from './OpenCodeDeliveryResponseObserver.js'
 
 import type {
   OpenCodePendingPermission,
@@ -33,6 +37,7 @@ const OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS = 8_000
 const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 1_500
 const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 6_000
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
+const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -42,6 +47,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.reconcileTeam',
   'opencode.stopTeam',
   'opencode.sendMessage',
+  'opencode.observeMessageDelivery',
   'opencode.answerPermission',
   'opencode.listRuntimePermissions',
   'opencode.getRuntimeTranscript',
@@ -94,6 +100,17 @@ type SendMessageCommandData = {
   sessionId?: string
   memberName: string
   runtimePid?: number
+  prePromptCursor?: string | null
+  responseObservation?: OpenCodeDeliveryResponseObservation
+  diagnostics: TeamDiagnostic[]
+}
+
+type ObserveMessageDeliveryCommandData = {
+  observed: boolean
+  sessionId?: string
+  memberName: string
+  runtimePid?: number
+  responseObservation: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
 }
 
@@ -340,6 +357,20 @@ function teamDiagnostic(
   severity: TeamDiagnostic['severity'] = 'info',
 ): TeamDiagnostic {
   return { code, message, severity }
+}
+
+function reconcileFailedObservation(message: string): OpenCodeDeliveryResponseObservation {
+  return {
+    state: 'reconcile_failed',
+    deliveredUserMessageId: null,
+    assistantMessageId: null,
+    toolCallNames: [],
+    visibleMessageToolCallId: null,
+    visibleReplyMessageId: null,
+    visibleReplyCorrelation: null,
+    latestAssistantPreview: null,
+    reason: message,
+  }
 }
 
 function success<TData>(
@@ -1325,6 +1356,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
+  const prePromptCursor = record.lastCanonicalCursor ?? null
 
   const runId = asString(body.runId)
   const identityReminder = runId
@@ -1346,6 +1378,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   let runtimePid =
     typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
   let reconcileDiagnostics: TeamDiagnostic[] = []
+  let responseObservation: OpenCodeDeliveryResponseObservation | undefined
   try {
     const reconciled = await withTimeout(
       openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
@@ -1358,14 +1391,21 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     reconcileDiagnostics = reconciled.summary.diagnostics.map(message =>
       teamDiagnostic('opencode_send_reconcile', message, 'info'),
     )
+    responseObservation = observeOpenCodeDeliveryResponse({
+      inboundMessageId: asString(body.messageId),
+      prePromptCursor,
+      summary: reconciled.summary,
+    })
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
     reconcileDiagnostics = [
       teamDiagnostic(
         'opencode_send_reconcile_failed_after_prompt_accept',
-        error instanceof Error ? error.message : String(error),
+        message,
         'warning',
       ),
     ]
+    responseObservation = reconcileFailedObservation(message)
   }
 
   return {
@@ -1375,7 +1415,99 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       sessionId: record.opencodeSessionId,
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
+      prePromptCursor,
+      ...(responseObservation ? { responseObservation } : {}),
       diagnostics: reconcileDiagnostics,
+    },
+  }
+}
+
+async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
+  snapshot: OpenCodeProvisioningSnapshot
+  data: ObserveMessageDeliveryCommandData
+}> {
+  const body = envelope.body
+  const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const laneId = asString(body.laneId)
+  const memberName = asString(body.memberName)
+  const messageId = asString(body.messageId)
+  if (!teamId || !laneId || !memberName || !messageId) {
+    throw new Error(
+      'opencode.observeMessageDelivery requires teamId/teamName, laneId, memberName and messageId',
+    )
+  }
+
+  const snapshot = await openCodeProvisioningProbe.probe(
+    asString(body.projectPath) ?? envelope.cwd,
+  )
+  validateOpenCodeBridgeStateChangingPreconditions({
+    body,
+    runtime: createRuntimePreconditionSnapshot(snapshot),
+  })
+  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
+  if (!record) {
+    throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
+  }
+
+  let runtimePid =
+    typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
+  const diagnostics: TeamDiagnostic[] = []
+  let responseObservation: OpenCodeDeliveryResponseObservation
+  try {
+    const limited = await withTimeout(
+      openCodeSessionBridge.reconcileSession(record, { limit: 80 }),
+      OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
+    )
+    runtimePid =
+      typeof limited.record.runtimePid === 'number' && limited.record.runtimePid > 0
+        ? limited.record.runtimePid
+        : runtimePid
+    diagnostics.push(
+      ...limited.summary.diagnostics.map(message =>
+        teamDiagnostic('opencode_observe_reconcile', message, 'info'),
+      ),
+    )
+    responseObservation = observeOpenCodeDeliveryResponse({
+      inboundMessageId: messageId,
+      prePromptCursor: asString(body.prePromptCursor),
+      summary: limited.summary,
+    })
+
+    if (responseObservation.needsFullHistory === true) {
+      const full = await withTimeout(
+        openCodeSessionBridge.reconcileSession(limited.record),
+        OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
+      )
+      runtimePid =
+        typeof full.record.runtimePid === 'number' && full.record.runtimePid > 0
+          ? full.record.runtimePid
+          : runtimePid
+      diagnostics.push(
+        ...full.summary.diagnostics.map(message =>
+          teamDiagnostic('opencode_observe_full_reconcile', message, 'info'),
+        ),
+      )
+      responseObservation = observeOpenCodeDeliveryResponse({
+        inboundMessageId: messageId,
+        prePromptCursor: asString(body.prePromptCursor),
+        summary: full.summary,
+      })
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    diagnostics.push(teamDiagnostic('opencode_observe_reconcile_failed', message, 'warning'))
+    responseObservation = reconcileFailedObservation(message)
+  }
+
+  return {
+    snapshot,
+    data: {
+      observed: true,
+      sessionId: record.opencodeSessionId,
+      memberName,
+      ...(runtimePid ? { runtimePid } : {}),
+      responseObservation,
+      diagnostics,
     },
   }
 }
@@ -1604,6 +1736,8 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runStop(envelope)
     case 'opencode.sendMessage':
       return runSendMessage(envelope)
+    case 'opencode.observeMessageDelivery':
+      return runObserveMessageDelivery(envelope)
     case 'opencode.answerPermission':
       return runAnswerPermission(envelope)
     case 'opencode.listRuntimePermissions':
