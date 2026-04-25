@@ -135,6 +135,7 @@ const DIRECTORY_CACHE_TTL_MS = 30_000
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
   value: ProviderDirectoryView
+  modelIdsByProviderId: Record<string, string[]>
 }
 
 type OpenCodeProviderManagementCapabilities = {
@@ -473,30 +474,43 @@ function getDefaultModelForProvider(
   providerId: string,
   inventory: OpenCodeInventorySnapshot,
   configProviders: OpenCodeConfigProvidersResponse | null,
+  providers: OpenCodeProviderResponse | null,
 ): string | null {
   const managedDefault = asString(inventory.profile?.managedConfig?.model)
   if (managedDefault?.startsWith(`${providerId}/`)) {
     return managedDefault
   }
 
-  const modelId = asString(configProviders?.default?.[providerId])
-  return modelId ? `${providerId}/${modelId}` : null
+  const modelId =
+    asString(configProviders?.default?.[providerId]) ??
+    asString(providers?.default?.[providerId])
+  if (!modelId) {
+    return null
+  }
+  return modelId.startsWith(`${providerId}/`) ? modelId : `${providerId}/${modelId}`
 }
 
 function getDefaultModel(
   inventory: OpenCodeInventorySnapshot,
   configProviders: OpenCodeConfigProvidersResponse | null,
+  providers: OpenCodeProviderResponse | null,
 ): string | null {
   const managedDefault = asString(inventory.profile?.managedConfig?.model)
   if (managedDefault) {
     return managedDefault
   }
 
-  for (const [providerId, modelId] of Object.entries(configProviders?.default ?? {})) {
+  const defaults = {
+    ...(providers?.default ?? {}),
+    ...(configProviders?.default ?? {}),
+  }
+  for (const [providerId, modelId] of Object.entries(defaults)) {
     const normalizedProviderId = normalizeProviderId(providerId)
     const normalizedModelId = asString(modelId)
     if (normalizedProviderId && normalizedModelId) {
-      return `${normalizedProviderId}/${normalizedModelId}`
+      return normalizedModelId.startsWith(`${normalizedProviderId}/`)
+        ? normalizedModelId
+        : `${normalizedProviderId}/${normalizedModelId}`
     }
   }
   return null
@@ -686,7 +700,12 @@ function buildProviderConnections(input: {
       ownership,
       recommended: isRecommendedProvider(providerId),
       modelCount,
-      defaultModelId: getDefaultModelForProvider(providerId, input.inventory, input.configProviders),
+      defaultModelId: getDefaultModelForProvider(
+        providerId,
+        input.inventory,
+        input.configProviders,
+        input.providers,
+      ),
       authMethods,
       actions: buildProviderActions({
         providerId,
@@ -746,20 +765,6 @@ function getProviderSourceLabel(sources: readonly ProviderDirectorySource[]): st
 function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): string | null {
   const source = asString(entry?.source)
   return source ? source.slice(0, 80) : null
-}
-
-function getProviderModelIdsFromEntry(
-  providerId: string,
-  entry: OpenCodeProviderListEntry | undefined,
-): string[] {
-  const models = asRecord(entry?.models)
-  if (!models) {
-    return []
-  }
-  return Object.keys(models)
-    .map(modelId => modelId.trim())
-    .filter(Boolean)
-    .map(modelId => `${providerId}/${modelId}`)
 }
 
 function getProviderSetupKind(input: {
@@ -928,7 +933,12 @@ function buildProviderDirectory(input: {
       configProviders: input.configProviders,
       providers: input.providers,
     })
-    const modelIds = getProviderModelIdsFromEntry(providerId, entry)
+    const modelIds = collectProviderModelIds({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
     const directoryEntry: ProviderDirectoryEntry = {
       providerId,
       displayName: getProviderDisplayName(providerId, entry),
@@ -938,12 +948,17 @@ function buildProviderDirectory(input: {
       recommended: isRecommendedProvider(providerId),
       modelCount,
       authMethods,
-      defaultModelId: getDefaultModelForProvider(providerId, input.inventory, input.configProviders),
+      defaultModelId: getDefaultModelForProvider(
+        providerId,
+        input.inventory,
+        input.configProviders,
+        input.providers,
+      ),
       sources,
       sourceLabel: getProviderSourceLabel(sources),
       providerSource: getProviderSourceValue(entry),
       detail: connected
-        ? 'Connected in the app-managed OpenCode profile'
+        ? getConnectedProviderDetail(ownership)
         : setupKind === 'connect-api-key'
           ? 'OpenCode advertises API-key auth for this provider'
           : modelCount !== null && modelCount > 0
@@ -1001,6 +1016,7 @@ function buildProviderDirectory(input: {
 
 function filterAndPageProviderDirectory(input: {
   directory: ProviderDirectoryView
+  modelIdsByProviderId?: Record<string, readonly string[]> | null
   query?: string | null
   filter?: ProviderDirectoryFilter | null
   limit?: number | null
@@ -1011,7 +1027,11 @@ function filterAndPageProviderDirectory(input: {
   const limit = normalizeDirectoryLimit(input.limit)
   const offset = normalizeDirectoryCursor(input.cursor)
   const matchingEntries = input.directory.entries.filter(entry =>
-    providerDirectoryEntryMatchesQuery(entry, [], query) &&
+    providerDirectoryEntryMatchesQuery(
+      entry,
+      input.modelIdsByProviderId?.[entry.providerId] ?? [],
+      query,
+    ) &&
     providerDirectoryEntryMatchesFilter(entry, filter)
   )
   const returnedEntries = matchingEntries.slice(offset, offset + limit)
@@ -1068,7 +1088,7 @@ function buildView(input: {
       localAuth: getLocalAuthState(input.inventory),
     },
     providers: providerConnections,
-    defaultModel: getDefaultModel(input.inventory, input.configProviders),
+    defaultModel: getDefaultModel(input.inventory, input.configProviders, input.providers),
     fallbackModel: getFallbackModel(input.inventory),
     diagnostics: input.diagnostics,
   }
@@ -1126,6 +1146,7 @@ function collectProviderModelIds(input: {
   providerId: string
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
 }): string[] {
   const modelIds = new Set<string>()
   const prefix = `${input.providerId}/`
@@ -1147,7 +1168,34 @@ function collectProviderModelIds(input: {
     }
   }
 
+  const liveProvider = input.providers?.all?.find(provider =>
+    normalizeProviderId(provider.id) === input.providerId)
+  const liveModels = asRecord(liveProvider?.models)
+  for (const modelId of Object.keys(liveModels ?? {})) {
+    const normalizedModelId = modelId.trim()
+    if (normalizedModelId) {
+      modelIds.add(`${input.providerId}/${normalizedModelId}`)
+    }
+  }
+
   return Array.from(modelIds).sort((left, right) => left.localeCompare(right))
+}
+
+function buildProviderDirectoryModelSearchIndex(input: {
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): Record<string, string[]> {
+  const modelIdsByProviderId: Record<string, string[]> = {}
+  for (const providerId of getKnownProviderIds(input)) {
+    modelIdsByProviderId[providerId] = collectProviderModelIds({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
+  }
+  return modelIdsByProviderId
 }
 
 function providerModelMatchesQuery(model: RuntimeProviderModel, query: string): boolean {
@@ -1195,6 +1243,7 @@ function buildProviderModelsView(input: {
     input.providerId,
     input.inventory,
     input.configProviders,
+    input.providers,
   )
   const query = normalizeQuery(input.query)
   const limit = normalizePositiveLimit(input.limit)
@@ -1202,6 +1251,7 @@ function buildProviderModelsView(input: {
     providerId: input.providerId,
     inventory: input.inventory,
     configProviders: input.configProviders,
+    providers: input.providers,
   })
     .map(modelId => buildRuntimeProviderModel({
       providerId: input.providerId,
@@ -1277,7 +1327,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     ].join('|')
   }
 
-  private readDirectoryCache(cacheKey: string): ProviderDirectoryView | null {
+  private readDirectoryCache(cacheKey: string): ProviderDirectoryCacheEntry | null {
     const entry = this.directoryCache.get(cacheKey)
     if (!entry) {
       return null
@@ -1286,13 +1336,18 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       this.directoryCache.delete(cacheKey)
       return null
     }
-    return entry.value
+    return entry
   }
 
-  private writeDirectoryCache(cacheKey: string, value: ProviderDirectoryView): void {
+  private writeDirectoryCache(
+    cacheKey: string,
+    value: ProviderDirectoryView,
+    modelIdsByProviderId: Record<string, string[]>,
+  ): void {
     this.directoryCache.set(cacheKey, {
       expiresAt: Date.now() + DIRECTORY_CACHE_TTL_MS,
       value,
+      modelIdsByProviderId,
     })
   }
 
@@ -1471,7 +1526,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           filter: input.filter,
           limit: input.limit,
           cursor: input.cursor,
-        } as Parameters<typeof buildProviderDirectory>[0]),
+        }),
       }
     }
 
@@ -1492,7 +1547,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           return {
             ok: true,
             value: filterAndPageProviderDirectory({
-              directory: cached,
+              directory: cached.value,
+              modelIdsByProviderId: cached.modelIdsByProviderId,
               query: input.query,
               filter: input.filter,
               limit: input.limit,
@@ -1524,29 +1580,31 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
         ...(serverDocResult.ok ? [] : [serverDocResult.message]),
       ]
-      const uncachedDirectory = buildProviderDirectory({
+      const directorySource = {
         inventory,
         configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
         providers: providersResult.ok ? providersResult.value : null,
         providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
         capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
         diagnostics,
+      }
+      const uncachedDirectory = buildProviderDirectory({
+        ...directorySource,
         query: null,
         filter: 'all',
         limit: Number.MAX_SAFE_INTEGER,
         cursor: null,
       })
-      this.writeDirectoryCache(cacheKey, uncachedDirectory)
+      this.writeDirectoryCache(
+        cacheKey,
+        uncachedDirectory,
+        buildProviderDirectoryModelSearchIndex(directorySource),
+      )
 
       return {
         ok: true,
         value: buildProviderDirectory({
-          inventory,
-          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-          providers: providersResult.ok ? providersResult.value : null,
-          providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
-          capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
-          diagnostics,
+          ...directorySource,
           query: input.query,
           filter: input.filter,
           limit: input.limit,
@@ -1650,7 +1708,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
         const managedAuthPath = inventory.profile?.managedAuthPath
-        const globalAuthPath = inventory.profile?.globalAuthPath ?? inventory.profile?.sourceAuthPath
+        const globalAuthPath = inventory.profile?.globalAuthPath
         if (!managedAuthPath) {
           return providerManagementError(
             'runtime-unhealthy',
@@ -1856,6 +1914,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
         await this.getManagedPreferences().setDefaultModel(profileRootPath, modelId)
+        this.invalidateDirectoryCache()
 
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,

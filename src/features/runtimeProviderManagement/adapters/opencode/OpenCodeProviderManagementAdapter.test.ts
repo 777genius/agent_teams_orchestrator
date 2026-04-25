@@ -228,6 +228,17 @@ describe('OpenCodeProviderManagementAdapter', () => {
       detail: 'Connected via OpenCode environment credential',
     })
     expect(openai?.actions.map(action => action.id)).not.toContain('forget')
+
+    const directoryResult = await adapter.loadDirectory({ runtimeId: 'opencode' })
+
+    expect(directoryResult.ok).toBe(true)
+    if (!directoryResult.ok) return
+    const directoryOpenai = directoryResult.value.entries.find(entry => entry.providerId === 'openai')
+    expect(directoryOpenai).toMatchObject({
+      state: 'connected',
+      ownership: ['env'],
+      detail: 'Connected via OpenCode environment credential',
+    })
   })
 
   test('loads a sanitized paged provider directory from the live OpenCode catalog', async () => {
@@ -354,6 +365,59 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
     expect(result.value.entries.find(entry =>
       entry.providerId === 'cloudflare-workers-ai')?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('keeps model-id search working from the cached provider directory', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['gateway'],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'gateway',
+                name: 'Gateway',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const unfiltered = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      limit: 10,
+    })
+    expect(unfiltered.ok).toBe(true)
+    if (!unfiltered.ok) return
+    expect(unfiltered.value.entries.map(entry => entry.providerId)).toContain('gateway')
+
+    const cachedSearch = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'qwen3-coder',
+      limit: 10,
+    })
+
+    expect(cachedSearch.ok).toBe(true)
+    if (!cachedSearch.ok) return
+    expect(cachedSearch.value.entries.map(entry => entry.providerId)).toEqual(['gateway'])
   })
 
   test('loads the provider view from the selected project profile', async () => {
@@ -597,6 +661,59 @@ describe('OpenCodeProviderManagementAdapter', () => {
       modelCount: 1,
       ownership: ['managed'],
     })
+  })
+
+  test('refuses API-key connect when the app-owned global auth path is unavailable', async () => {
+    let setProviderAuthCalled = false
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          profile: {
+            ...inventory().profile!,
+            globalAuthPath: undefined,
+          },
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          setProviderAuth: async () => {
+            setProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      apiKey: 'sk-test-secret',
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('runtime-unhealthy')
+    expect(result.error.message).toContain('global auth store path')
+    expect(setProviderAuthCalled).toBe(false)
+    expect(authWrites).toEqual([])
   })
 
   test('redacts API keys from connect failures', async () => {
@@ -921,6 +1038,114 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('loads provider-scoped models reported only by the live provider catalog', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      query: 'qwen3-coder',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models.map(model => model.modelId)).toEqual([
+      'openrouter/qwen/qwen3-coder',
+    ])
+  })
+
+  test('uses live provider defaults when managed config has no default model', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                },
+              },
+            ],
+            connected: ['openrouter'],
+            default: {
+              openrouter: 'qwen/qwen3-coder',
+            },
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModel).toBe('openrouter/qwen/qwen3-coder')
+    expect(
+      result.value.providers.find(provider => provider.providerId === 'openrouter')?.defaultModelId,
+    ).toBe('openrouter/qwen/qwen3-coder')
+  })
+
   test('sets an app-managed OpenCode default only after a successful probe', async () => {
     const writes: Array<{ profileRootPath: string; modelId: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -1012,6 +1237,93 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(
       result.value.providers.find(provider => provider.providerId === 'openrouter')?.defaultModelId,
     ).toBe('openrouter/openai/gpt-oss-20b:free')
+  })
+
+  test('invalidates the provider directory cache after changing the default model', async () => {
+    let managedDefaultModel: string | null = null
+    const buildInventory = () => inventory({
+      connectedProviders: [
+        {
+          id: 'openrouter',
+          authHint: 'api',
+          source: 'credentials',
+          credentialScopes: ['managed'],
+        },
+      ],
+      availableProviders: ['openrouter'],
+      models: [],
+      profile: {
+        ...inventory().profile!,
+        managedConfig: managedDefaultModel ? { model: managedDefaultModel } : {},
+      },
+    })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => buildInventory(),
+      },
+      hostManager: {
+        ensureHost: async () => ({
+          ...host(),
+          profile: buildInventory().profile!,
+        }),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'old-model': {},
+                  'new-model': {},
+                },
+              },
+            ],
+            connected: ['openrouter'],
+            default: {
+              openrouter: 'old-model',
+            },
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+      managedPreferences: {
+        setDefaultModel: async (_profileRootPath, modelId) => {
+          managedDefaultModel = modelId
+        },
+      },
+    })
+
+    const firstDirectory = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      limit: 10,
+    })
+    expect(firstDirectory.ok).toBe(true)
+    if (!firstDirectory.ok) return
+    expect(
+      firstDirectory.value.entries.find(entry => entry.providerId === 'openrouter')?.defaultModelId,
+    ).toBe('openrouter/old-model')
+
+    const setDefaultResult = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      modelId: 'openrouter/new-model',
+      probe: false,
+    })
+    expect(setDefaultResult.ok).toBe(true)
+
+    const secondDirectory = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      limit: 10,
+    })
+    expect(secondDirectory.ok).toBe(true)
+    if (!secondDirectory.ok) return
+    expect(
+      secondDirectory.value.entries.find(entry => entry.providerId === 'openrouter')?.defaultModelId,
+    ).toBe('openrouter/new-model')
   })
 
   test('tests models when live OpenCode server reports the provider as connected', async () => {
