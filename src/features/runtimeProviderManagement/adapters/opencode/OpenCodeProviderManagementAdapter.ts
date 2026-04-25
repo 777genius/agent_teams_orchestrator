@@ -1,6 +1,5 @@
 import {
   openCodeClientFactory,
-  type OpenCodeClient,
 } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import { openCodeInventoryService } from '../../../../services/opencode/OpenCodeInventoryService.js'
@@ -34,7 +33,15 @@ type OpenCodeHostManagerLike = Pick<
   'ensureHost' | 'releaseHost'
 >
 
-type OpenCodeClientFactoryLike = Pick<typeof openCodeClientFactory, 'create'>
+type OpenCodeProviderManagementClient = {
+  getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
+  getProviders(): Promise<OpenCodeProviderResponse>
+  getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
+}
+
+type OpenCodeClientFactoryLike = {
+  create(baseUrl: string): OpenCodeProviderManagementClient
+}
 
 type OpenCodeProviderManagementAdapterDeps = {
   inventoryService?: OpenCodeInventoryServiceLike
@@ -276,10 +283,12 @@ function getLocalAuthState(inventory: OpenCodeInventorySnapshot): LocalAuthState
 function getRuntimeState(input: {
   inventory: OpenCodeInventorySnapshot
   host: OpenCodeHostHandle | null
+  hostStartError: string | null
   connectedProviderCount: number
   diagnostics: readonly string[]
 }): ProviderRuntimeState {
   if (!input.inventory.detected) return 'needs-setup'
+  if (input.hostStartError) return 'degraded'
   if (input.host && input.host.state !== 'healthy') return 'degraded'
   if (input.connectedProviderCount === 0) return 'needs-auth'
   if (input.diagnostics.length > 0 && input.inventory.models.length === 0) return 'degraded'
@@ -355,6 +364,7 @@ function buildView(input: {
   providers: OpenCodeProviderResponse | null
   providerAuth: Record<string, OpenCodeProviderAuthMethod[]> | null
   diagnostics: readonly string[]
+  hostStartError?: string | null
 }): ProviderManagementView {
   const providerConnections = buildProviderConnections({
     inventory: input.inventory,
@@ -373,6 +383,7 @@ function buildView(input: {
       state: getRuntimeState({
         inventory: input.inventory,
         host: input.host,
+        hostStartError: input.hostStartError ?? null,
         connectedProviderCount,
         diagnostics: input.diagnostics,
       }),
@@ -428,7 +439,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     try {
       host = await hostManager.ensureHost({ projectPath: inventory.projectPath })
-      const client: OpenCodeClient = clientFactory.create(host.baseUrl)
+      const client = clientFactory.create(host.baseUrl)
       const [configProvidersResult, providersResult, providerAuthResult] = await Promise.all([
         safeRead(() => client.getConfigProviders()),
         safeRead(() => client.getProviders()),
@@ -464,11 +475,12 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           providers: null,
           providerAuth: null,
           diagnostics: [...inventory.diagnostics, message],
+          hostStartError: host ? null : message,
         }),
       }
     } finally {
       if (host) {
-        await hostManager.releaseHost(host.hostKey)
+        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
       }
     }
   }
