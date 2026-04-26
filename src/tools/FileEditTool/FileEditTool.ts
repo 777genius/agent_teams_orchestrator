@@ -1,4 +1,5 @@
 import { dirname, isAbsolute, sep } from 'path'
+import { pathToFileURL } from 'node:url'
 import { logEvent } from 'src/services/analytics/index.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import { diagnosticTracker } from '../../services/diagnosticTracking.js'
@@ -494,7 +495,7 @@ export const FileEditTool = buildTool({
     const lspManager = getLspServerManager()
     if (lspManager) {
       // Clear previously delivered diagnostics so new ones will be shown
-      clearDeliveredDiagnosticsForFile(`file://${absoluteFilePath}`)
+      clearDeliveredDiagnosticsForFile(pathToFileURL(absoluteFilePath).href)
       // didChange: Content has been modified
       lspManager
         .changeFile(absoluteFilePath, updatedFile)

@@ -72,7 +72,7 @@ function getClipboardCommands() {
     win32: {
       checkImage:
         'powershell -NoProfile -Command "(Get-Clipboard -Format Image) -ne $null"',
-      saveImage: `powershell -NoProfile -Command "$img = Get-Clipboard -Format Image; if ($img) { $img.Save('${screenshotPath.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png) }"`,
+      saveImage: `powershell -NoProfile -Command "$img = Get-Clipboard -Format Image; if ($img) { $img.Save(${quotePowerShellSingleQuotedString(screenshotPath)}, [System.Drawing.Imaging.ImageFormat]::Png) }"`,
       getPath: 'powershell -NoProfile -Command "Get-Clipboard"',
       deleteFile: `del /f "${screenshotPath}"`,
     },
@@ -82,6 +82,10 @@ function getClipboardCommands() {
     commands: commands[platform] || commands.linux,
     screenshotPath,
   }
+}
+
+export function quotePowerShellSingleQuotedString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
 }
 
 export type ImageWithDimensions = {

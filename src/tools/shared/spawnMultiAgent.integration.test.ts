@@ -39,85 +39,95 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
   it(
     'cleans up the registered in-process task if durable registration fails after spawn',
     async () => {
-    const registryModulePath = new URL(
-      '../../utils/swarm/backends/registry.js',
-      import.meta.url,
-    ).href
-    const registryModule = await import(registryModulePath)
-    mock.module(registryModulePath, () => ({
-      ...registryModule,
-      isInProcessEnabled: () => true,
-    }))
+      const registryModulePath = new URL(
+        '../../utils/swarm/backends/registry.js',
+        import.meta.url,
+      ).href
+      const registryModule = await import(registryModulePath)
+      mock.module(registryModulePath, () => ({
+        ...registryModule,
+        isInProcessEnabled: () => true,
+      }))
 
-    const teamHelpersModulePath = new URL(
-      '../../utils/swarm/teamHelpers.js',
-      import.meta.url,
-    ).href
-    const teamHelpersModule = await import(teamHelpersModulePath)
-    mock.module(teamHelpersModulePath, () => ({
-      ...teamHelpersModule,
-      updateTeamFileAsync: async () => ({ status: 'missing' as const, teamFile: null }),
-    }))
+      const teamHelpersModulePath = new URL(
+        '../../utils/swarm/teamHelpers.js',
+        import.meta.url,
+      ).href
+      const teamHelpersModule = await import(teamHelpersModulePath)
+      const teamHelpersMock = {
+        ...teamHelpersModule,
+        updateTeamFileAsync: async () => ({
+          status: 'missing' as const,
+          teamFile: null,
+        }),
+      }
+      mock.module(teamHelpersModulePath, () => teamHelpersMock)
+      mock.module('src/utils/swarm/teamHelpers.js', () => teamHelpersMock)
 
-    const spawnModulePath = new URL('./spawnMultiAgent.js', import.meta.url).href
-    const { spawnTeammate } = await import(spawnModulePath)
+      const spawnModulePath = new URL(
+        './spawnMultiAgent.ts?spawnMultiAgentCleanupTest',
+        import.meta.url,
+      ).href
+      const { spawnTeammate } = await import(spawnModulePath)
 
-    let appState = {
-      abortController: new AbortController(),
-      messages: [],
-      tasks: {},
-      mainLoopModel: null,
-      toolPermissionContext: getEmptyToolPermissionContext(),
-      inbox: { messages: [] },
-      teamContext: undefined,
-    } as unknown as AppState
+      let appState = {
+        abortController: new AbortController(),
+        messages: [],
+        tasks: {},
+        mainLoopModel: null,
+        toolPermissionContext: getEmptyToolPermissionContext(),
+        inbox: { messages: [] },
+        teamContext: undefined,
+      } as unknown as AppState
 
-    const toolUseContext = {
-      options: {
-        commands: [],
-        debug: false,
-        mainLoopModel: 'test-model',
-        tools: [],
-        verbose: false,
-        thinkingConfig: { type: 'disabled' as const },
-        mcpClients: [],
-        mcpResources: {},
-        isNonInteractiveSession: false,
-        agentDefinitions: { activeAgents: [], definitions: [], errors: [] },
-      },
-      abortController: new AbortController(),
-      toolUseId: 'tool-use-1',
-      readFileState: new Map(),
-      getAppState: () => appState,
-      setAppState: (updater: (prev: AppState) => AppState) => {
-        appState = updater(appState)
-      },
-    } as unknown as ToolUseContext
-
-    await expect(
-      spawnTeammate(
-        {
-          name: 'alice',
-          prompt: 'Bootstrap and wait for work',
-          team_name: 'atlas-hq',
+      const toolUseContext = {
+        options: {
+          commands: [],
+          debug: false,
+          mainLoopModel: 'test-model',
+          tools: [],
+          verbose: false,
+          thinkingConfig: { type: 'disabled' as const },
+          mcpClients: [],
+          mcpResources: {},
+          isNonInteractiveSession: false,
+          agentDefinitions: { activeAgents: [], definitions: [], errors: [] },
         },
-        toolUseContext,
-      ),
-    ).rejects.toThrow('Team "atlas-hq" does not exist. Call spawnTeam first to create the team.')
+        abortController: new AbortController(),
+        toolUseId: 'tool-use-1',
+        readFileState: new Map(),
+        getAppState: () => appState,
+        setAppState: (updater: (prev: AppState) => AppState) => {
+          appState = updater(appState)
+        },
+      } as unknown as ToolUseContext
 
-    const taskEntries = Object.values(appState.tasks)
-    expect(taskEntries).toHaveLength(1)
-    expect(taskEntries[0]).toMatchObject({
-      type: 'in_process_teammate',
-      status: 'killed',
-    })
+      await expect(
+        spawnTeammate(
+          {
+            name: 'alice',
+            prompt: 'Bootstrap and wait for work',
+            team_name: 'atlas-hq',
+          },
+          toolUseContext,
+        ),
+      ).rejects.toThrow(
+        'Team "atlas-hq" does not exist. Call spawnTeam first to create the team.',
+      )
 
-    expect(appState.teamContext?.teammates).not.toHaveProperty(
-      'alice@atlas-hq',
-    )
-    expect(appState.teamContext?.teammates).toHaveProperty(
-      'team-lead@atlas-hq',
-    )
+      const taskEntries = Object.values(appState.tasks)
+      expect(taskEntries).toHaveLength(1)
+      expect(taskEntries[0]).toMatchObject({
+        type: 'in_process_teammate',
+        status: 'killed',
+      })
+
+      expect(appState.teamContext?.teammates).not.toHaveProperty(
+        'alice@atlas-hq',
+      )
+      expect(appState.teamContext?.teammates).toHaveProperty(
+        'team-lead@atlas-hq',
+      )
     },
     15000,
   )

@@ -1,11 +1,46 @@
 import { describe, expect, it } from 'bun:test'
+import { readFile, rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { getFlagSettingsInline, setFlagSettingsInline } from '../../bootstrap/state.js'
 
 import {
+  buildPaneLauncherCommand,
   buildInheritedEnvVars,
   shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
 } from './spawnUtils.js'
+
+function unquoteLauncherPath(launcher: string): string {
+  const prefix = 'sh '
+  expect(launcher.startsWith(prefix)).toBe(true)
+
+  const quotedPath = launcher.slice(prefix.length)
+  if (quotedPath.startsWith("'") && quotedPath.endsWith("'")) {
+    return quotedPath.slice(1, -1).replace(/'\\''/g, "'")
+  }
+
+  return quotedPath.replace(/\\ /g, ' ')
+}
+
+describe('buildPaneLauncherCommand', () => {
+  it('uses portable POSIX sh for pane teammate launch scripts', async () => {
+    const launcher = await buildPaneLauncherCommand("printf 'ok\\n'")
+    const scriptPath = unquoteLauncherPath(launcher)
+
+    try {
+      expect(launcher.startsWith('sh ')).toBe(true)
+      expect(launcher).not.toContain('zsh')
+      expect(scriptPath.endsWith('launch.sh')).toBe(true)
+
+      const script = await readFile(scriptPath, 'utf8')
+      expect(script.startsWith('#!/bin/sh\n')).toBe(true)
+      expect(script).toContain("printf 'ok\\n'")
+      expect(script).not.toContain('#!/bin/zsh')
+    } finally {
+      await rm(dirname(scriptPath), { recursive: true, force: true })
+    }
+  })
+})
 
 describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
   it('clears an unapproved custom API key for pane-spawned teammates', () => {

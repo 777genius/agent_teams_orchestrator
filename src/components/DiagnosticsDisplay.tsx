@@ -1,5 +1,6 @@
 import { c as _c } from "react/compiler-runtime";
 import { relative } from 'path';
+import { fileURLToPath } from 'node:url';
 import React from 'react';
 import { Box, Text } from '../ink.js';
 import { DiagnosticTrackingService } from '../services/diagnosticTracking.js';
@@ -14,6 +15,17 @@ type DiagnosticsDisplayProps = {
   attachment: DiagnosticsAttachment;
   verbose: boolean;
 };
+export function diagnosticUriToPath(uri: string): string {
+  const withoutClaudeFsRight = uri.replace(/^_claude_fs_right:/, '');
+  if (withoutClaudeFsRight.startsWith('file://')) {
+    try {
+      return fileURLToPath(withoutClaudeFsRight);
+    } catch {
+      return withoutClaudeFsRight;
+    }
+  }
+  return withoutClaudeFsRight;
+}
 export function DiagnosticsDisplay(t0) {
   const $ = _c(14);
   const {
@@ -84,7 +96,7 @@ export function DiagnosticsDisplay(t0) {
   }
 }
 function _temp3(file_0, fileIndex) {
-  return <React.Fragment key={fileIndex}><MessageResponse><Text dimColor={true} wrap="wrap"><Text bold={true}>{relative(getCwd(), file_0.uri.replace("file://", "").replace("_claude_fs_right:", ""))}</Text>{" "}<Text dimColor={true}>{file_0.uri.startsWith("file://") ? "(file://)" : file_0.uri.startsWith("_claude_fs_right:") ? "(claude_fs_right)" : `(${file_0.uri.split(":")[0]})`}</Text>:</Text></MessageResponse>{file_0.diagnostics.map(_temp2)}</React.Fragment>;
+  return <React.Fragment key={fileIndex}><MessageResponse><Text dimColor={true} wrap="wrap"><Text bold={true}>{relative(getCwd(), diagnosticUriToPath(file_0.uri))}</Text>{" "}<Text dimColor={true}>{file_0.uri.startsWith("file://") ? "(file://)" : file_0.uri.startsWith("_claude_fs_right:") ? "(claude_fs_right)" : `(${file_0.uri.split(":")[0]})`}</Text>:</Text></MessageResponse>{file_0.diagnostics.map(_temp2)}</React.Fragment>;
 }
 function _temp2(diagnostic, diagIndex) {
   return <MessageResponse key={diagIndex}><Text dimColor={true} wrap="wrap">{"  "}{DiagnosticTrackingService.getSeveritySymbol(diagnostic.severity)}{" [Line "}{diagnostic.range.start.line + 1}:{diagnostic.range.start.character + 1}{"] "}{diagnostic.message}{diagnostic.code ? ` [${diagnostic.code}]` : ""}{diagnostic.source ? ` (${diagnostic.source})` : ""}</Text></MessageResponse>;

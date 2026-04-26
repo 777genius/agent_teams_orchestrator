@@ -18,6 +18,7 @@ import { getClaudeConfigHomeDir, isEnvTruthy } from '../envUtils.js'
 import { errorMessage, isFsInaccessible } from '../errors.js'
 import { formatFileSize } from '../format.js'
 import { expandTilde } from '../permissions/pathValidation.js'
+import { safeWindowsPathSegment } from '../windowsReservedNames.js'
 
 const PLUGINS_DIR = 'plugins'
 const COWORK_PLUGINS_DIR = 'cowork_plugins'
@@ -91,7 +92,7 @@ export function getPluginSeedDirs(): string[] {
 
 function sanitizePluginId(pluginId: string): string {
   // Same character class as the install-cache sanitizer (pluginLoader.ts)
-  return pluginId.replace(/[^a-zA-Z0-9\-_]/g, '-')
+  return safeWindowsPathSegment(pluginId.replace(/[^a-zA-Z0-9\-_]/g, '-'))
 }
 
 /** Pure path — no mkdir. For display (e.g. uninstall dialog). */

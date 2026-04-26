@@ -2,6 +2,7 @@ import { z } from 'zod/v4'
 import { HooksSchema } from '../../schemas/hooks.js'
 import { McpServerConfigSchema } from '../../services/mcp/types.js'
 import { lazySchema } from '../lazySchema.js'
+import { isWindowsReservedBasename } from '../windowsReservedNames.js'
 
 /**
  * First-layer defense against official marketplace impersonation.
@@ -221,6 +222,9 @@ const MarketplaceNameSchema = lazySchema(() =>
       message:
         'Marketplace name cannot contain spaces. Use kebab-case (e.g., "my-marketplace")',
     })
+    .refine(name => !isWindowsReservedBasename(name), {
+      message: 'Marketplace name is reserved on Windows',
+    })
     .refine(
       name =>
         !name.includes('/') &&
@@ -279,6 +283,9 @@ const PluginManifestMetadataSchema = lazySchema(() =>
       .refine(name => !name.includes(' '), {
         message:
           'Plugin name cannot contain spaces. Use kebab-case (e.g., "my-plugin")',
+      })
+      .refine(name => !isWindowsReservedBasename(name), {
+        message: 'Plugin name is reserved on Windows',
       })
       .describe(
         'Unique identifier for the plugin, used for namespacing (prefer kebab-case)',
@@ -1189,6 +1196,9 @@ const SettingsMarketplacePluginSchema = lazySchema(() =>
           message:
             'Plugin name cannot contain spaces. Use kebab-case (e.g., "my-plugin")',
         })
+        .refine(name => !isWindowsReservedBasename(name), {
+          message: 'Plugin name is reserved on Windows',
+        })
         .describe('Plugin name as it appears in the target repository'),
       source: PluginSourceSchema().describe(
         'Where to fetch the plugin from. Must be a remote source — relative ' +
@@ -1261,6 +1271,9 @@ export const PluginMarketplaceEntrySchema = lazySchema(() =>
         .refine(name => !name.includes(' '), {
           message:
             'Plugin name cannot contain spaces. Use kebab-case (e.g., "my-plugin")',
+        })
+        .refine(name => !isWindowsReservedBasename(name), {
+          message: 'Plugin name is reserved on Windows',
         })
         .describe('Unique identifier matching the plugin name'),
       source: PluginSourceSchema().describe('Where to fetch the plugin from'),

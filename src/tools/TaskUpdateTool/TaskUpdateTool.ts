@@ -26,6 +26,7 @@ import {
   getTeamName,
 } from '../../utils/teammate.js'
 import { writeToMailbox } from '../../utils/teammateMailbox.js'
+import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { VERIFICATION_AGENT_TYPE } from '../AgentTool/constants.js'
 import { TASK_UPDATE_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, PROMPT } from './prompt.js'
@@ -33,9 +34,12 @@ import { DESCRIPTION, PROMPT } from './prompt.js'
 const inputSchema = lazySchema(() => {
   // Extended status schema that includes 'deleted' as a special action
   const TaskUpdateStatusSchema = TaskStatusSchema().or(z.literal('deleted'))
+  const TaskIdSchema = z.string().refine(id => !isWindowsReservedBasename(id), {
+    message: 'taskId is reserved on Windows',
+  })
 
   return z.strictObject({
-    taskId: z.string().describe('The ID of the task to update'),
+    taskId: TaskIdSchema.describe('The ID of the task to update'),
     subject: z.string().optional().describe('New subject for the task'),
     description: z.string().optional().describe('New description for the task'),
     activeForm: z
@@ -48,11 +52,11 @@ const inputSchema = lazySchema(() => {
       'New status for the task',
     ),
     addBlocks: z
-      .array(z.string())
+      .array(TaskIdSchema)
       .optional()
       .describe('Task IDs that this task blocks'),
     addBlockedBy: z
-      .array(z.string())
+      .array(TaskIdSchema)
       .optional()
       .describe('Task IDs that block this task'),
     owner: z.string().optional().describe('New owner for the task'),

@@ -35,6 +35,7 @@ import {
   resetTaskList,
   setLeaderTeamName,
 } from '../../utils/tasks.js'
+import { assertNotWindowsReservedBasename, isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { generateWordSlug } from '../../utils/words.js'
 import { TEAM_CREATE_TOOL_NAME } from './constants.js'
 import { getPrompt } from './prompt.js'
@@ -107,6 +108,13 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
         errorCode: 9,
       }
     }
+    if (isWindowsReservedBasename(input.team_name)) {
+      return {
+        result: false,
+        message: `team_name "${input.team_name}" is reserved on Windows`,
+        errorCode: 9,
+      }
+    }
     return { result: true }
   },
 
@@ -134,6 +142,7 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
   async call(input, context) {
     const { setAppState, getAppState } = context
     const { team_name, description: _description, agent_type } = input
+    assertNotWindowsReservedBasename(team_name, 'team_name')
 
     // Check if already in a team - restrict to one team per leader
     const appState = getAppState()

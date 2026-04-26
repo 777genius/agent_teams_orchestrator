@@ -1,11 +1,9 @@
-import { execa } from 'execa'
-import { execSync_DEPRECATED } from './execSyncWrapper.js'
+import { execa, execaSync } from 'execa'
 
 async function whichNodeAsync(command: string): Promise<string | null> {
   if (process.platform === 'win32') {
     // On Windows, use where.exe and return the first result
-    const result = await execa(`where.exe ${command}`, {
-      shell: true,
+    const result = await execa('where.exe', [command], {
       stderr: 'ignore',
       reject: false,
     })
@@ -19,8 +17,7 @@ async function whichNodeAsync(command: string): Promise<string | null> {
   // On POSIX systems (macOS, Linux, WSL), use which
   // Cross-platform safe: Windows is handled above
   // eslint-disable-next-line custom-rules/no-cross-platform-process-issues
-  const result = await execa(`which ${command}`, {
-    shell: true,
+  const result = await execa('which', [command], {
     stderr: 'ignore',
     reject: false,
   })
@@ -33,11 +30,14 @@ async function whichNodeAsync(command: string): Promise<string | null> {
 function whichNodeSync(command: string): string | null {
   if (process.platform === 'win32') {
     try {
-      const result = execSync_DEPRECATED(`where.exe ${command}`, {
-        encoding: 'utf-8',
+      const result = execaSync('where.exe', [command], {
         stdio: ['ignore', 'pipe', 'ignore'],
+        reject: false,
       })
-      const output = result.toString().trim()
+      if (result.exitCode !== 0 || !result.stdout) {
+        return null
+      }
+      const output = result.stdout.trim()
       return output.split(/\r?\n/)[0] || null
     } catch {
       return null
@@ -45,11 +45,14 @@ function whichNodeSync(command: string): string | null {
   }
 
   try {
-    const result = execSync_DEPRECATED(`which ${command}`, {
-      encoding: 'utf-8',
+    const result = execaSync('which', [command], {
       stdio: ['ignore', 'pipe', 'ignore'],
+      reject: false,
     })
-    return result.toString().trim() || null
+    if (result.exitCode !== 0 || !result.stdout) {
+      return null
+    }
+    return result.stdout.trim() || null
   } catch {
     return null
   }

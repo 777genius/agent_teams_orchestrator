@@ -32,7 +32,7 @@ function isDevMode(): boolean {
  * Format: claude://resume?session={sessionId}&cwd={cwd}
  * In dev mode: claude-dev://resume?session={sessionId}&cwd={cwd}
  */
-function buildDesktopDeepLink(sessionId: string): string {
+export function buildDesktopDeepLink(sessionId: string): string {
   const protocol = isDevMode() ? 'claude-dev' : 'claude'
   const url = new URL(`${protocol}://resume`)
   url.searchParams.set('session', sessionId)
@@ -165,7 +165,7 @@ export async function getDesktopInstallStatus(): Promise<DesktopInstallStatus> {
  * Opens a deep link URL using the platform-specific mechanism.
  * Returns true if the command succeeded, false otherwise.
  */
-async function openDeepLink(deepLinkUrl: string): Promise<boolean> {
+export async function openDeepLink(deepLinkUrl: string): Promise<boolean> {
   const platform = process.platform
   logForDebugging(`Opening deep link: ${deepLinkUrl}`)
 
@@ -186,17 +186,22 @@ async function openDeepLink(deepLinkUrl: string): Promise<boolean> {
     const { code } = await execFileNoThrow('xdg-open', [deepLinkUrl])
     return code === 0
   } else if (platform === 'win32') {
-    // On Windows, use cmd /c start to open URLs
-    const { code } = await execFileNoThrow('cmd', [
-      '/c',
-      'start',
-      '',
-      deepLinkUrl,
-    ])
+    const { command, args } = buildWindowsDeepLinkOpenCommand(deepLinkUrl)
+    const { code } = await execFileNoThrow(command, args)
     return code === 0
   }
 
   return false
+}
+
+export function buildWindowsDeepLinkOpenCommand(deepLinkUrl: string): {
+  command: string
+  args: string[]
+} {
+  return {
+    command: 'rundll32.exe',
+    args: ['url.dll,FileProtocolHandler', deepLinkUrl],
+  }
 }
 
 /**

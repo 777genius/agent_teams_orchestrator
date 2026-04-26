@@ -7,12 +7,18 @@ import {
   isTodoV2Enabled,
   TaskStatusSchema,
 } from '../../utils/tasks.js'
+import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { TASK_GET_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, PROMPT } from './prompt.js'
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
-    taskId: z.string().describe('The ID of the task to retrieve'),
+    taskId: z
+      .string()
+      .refine(id => !isWindowsReservedBasename(id), {
+        message: 'taskId is reserved on Windows',
+      })
+      .describe('The ID of the task to retrieve'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>

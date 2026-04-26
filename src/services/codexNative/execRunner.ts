@@ -1,8 +1,10 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
 import { PassThrough, type Readable } from 'node:stream'
 import readline from 'node:readline'
 
 import type { CodexForcedLoginMethod } from '../runtimeBackends/codexBackendResolver.js'
+import { killProcessTree } from '../../utils/processKill.js'
+import { spawnPortableCli, spawnSyncPortableCli } from '../../utils/portableCli.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
 
@@ -63,6 +65,8 @@ type SpawnedCodexProcess = Pick<
   ChildProcess,
   | 'stdout'
   | 'stderr'
+  | 'stdin'
+  | 'pid'
   | 'once'
   | 'removeAllListeners'
   | 'kill'
@@ -78,7 +82,7 @@ type CodexNativeExecRunnerDeps = {
       cwd: string
       env: NodeJS.ProcessEnv
       signal?: AbortSignal
-      stdin: 'ignore'
+      stdin: 'pipe'
       stdout: 'pipe'
       stderr: 'pipe'
     },
@@ -141,7 +145,7 @@ export function buildCodexNativeExecArgs(
     args.push('--add-dir', directory)
   }
 
-  args.push(options.prompt)
+  args.push('-')
   return args
 }
 
@@ -211,7 +215,7 @@ function rewriteCodexNativeStderrLine(
 }
 
 function defaultResolveVersion(executablePath: string): string | null {
-  const result = spawnSync(executablePath, ['--version'], {
+  const result = spawnSyncPortableCli(executablePath, ['--version'], {
     encoding: 'utf8',
   })
   if (result.status !== 0) {
@@ -324,18 +328,27 @@ export async function* runCodexNativeExec(
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
-      stdin: 'ignore',
+      stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
     }) ??
-    spawn(executablePath, buildCodexNativeExecArgs(options), {
+    spawnPortableCli(executablePath, buildCodexNativeExecArgs(options), {
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
 
   let recordProcessActivity: (() => void) | null = null
+  let stdinError: Error | null = null
+  if (child.stdin) {
+    child.stdin.once('error', error => {
+      stdinError = error instanceof Error ? error : new Error(String(error))
+    })
+    child.stdin.end(options.prompt)
+  } else {
+    stdinError = new Error('Codex native exec stdin is unavailable.')
+  }
   const stderrLines: string[] = []
   const queuedLines = createQueuedLineStream(child, () => {
     recordProcessActivity?.()
@@ -372,7 +385,9 @@ export async function* runCodexNativeExec(
     }
     timeoutReason = reason
     try {
-      if (!child.killed) {
+      if (!child.killed && child.pid) {
+        killProcessTree(child.pid, 'SIGTERM')
+      } else if (!child.killed) {
         child.kill('SIGTERM')
       }
     } catch {
@@ -380,7 +395,11 @@ export async function* runCodexNativeExec(
     }
     forceKillHandle = setTimeout(() => {
       try {
-        child.kill('SIGKILL')
+        if (child.pid) {
+          killProcessTree(child.pid, 'SIGKILL')
+        } else {
+          child.kill('SIGKILL')
+        }
       } catch {
         // Best-effort timeout cleanup.
       }
@@ -476,6 +495,9 @@ export async function* runCodexNativeExec(
 
     if (spawnError) {
       throw spawnError
+    }
+    if (stdinError) {
+      throw stdinError
     }
 
     if (timeoutReason) {

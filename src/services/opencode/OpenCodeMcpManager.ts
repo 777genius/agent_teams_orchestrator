@@ -107,16 +107,24 @@ function getOpenCodeBridgeRepoRoot(): string {
 
 export function getCandidateClaudeTeamRootsForBridgeRoot(bridgeRepoRoot: string): string[] {
   const bridgeRepoName = path.basename(bridgeRepoRoot)
-  const pairedWorktreeName = bridgeRepoName.startsWith('agent_teams_orchestrator')
-    ? `claude_team${bridgeRepoName.slice('agent_teams_orchestrator'.length)}`
+  const pairedWorktreeSuffix = bridgeRepoName.startsWith('agent_teams_orchestrator')
+    ? bridgeRepoName.slice('agent_teams_orchestrator'.length)
     : null
+  const pairedWorktreeNames = pairedWorktreeSuffix === null
+    ? []
+    : [
+        `claude_team${pairedWorktreeSuffix}`,
+        `claude_agent_teams_ui${pairedWorktreeSuffix}`,
+      ]
   const candidates = [
-    pairedWorktreeName
-      ? path.resolve(path.dirname(bridgeRepoRoot), pairedWorktreeName)
-      : null,
+    ...pairedWorktreeNames.map(name =>
+      path.resolve(path.dirname(bridgeRepoRoot), name),
+    ),
+    path.resolve(bridgeRepoRoot, '../claude_agent_teams_ui'),
     path.resolve(bridgeRepoRoot, '../claude_team'),
+    path.resolve(bridgeRepoRoot, '../../claude_agent_teams_ui'),
     path.resolve(bridgeRepoRoot, '../../claude_team'),
-  ].filter((candidate): candidate is string => typeof candidate === 'string')
+  ]
   return [...new Set(candidates)]
 }
 
@@ -126,6 +134,40 @@ function getCandidateClaudeTeamRoots(): string[] {
 
 function resolveNodeCommand(): string {
   return Bun.which('node') ?? 'node'
+}
+
+function getTsxBinaryCandidates(claudeTeamRoot: string): string[] {
+  const candidates = [
+    path.join(claudeTeamRoot, 'mcp-server', 'node_modules', '.bin', 'tsx'),
+    path.join(claudeTeamRoot, 'node_modules', '.bin', 'tsx'),
+    path.join(path.dirname(claudeTeamRoot), 'node_modules', '.bin', 'tsx'),
+  ]
+
+  if (process.platform !== 'win32') {
+    return candidates
+  }
+
+  return candidates.flatMap(candidate => [`${candidate}.cmd`, candidate])
+}
+
+async function buildTsxSourceCommand(
+  tsxBinary: string,
+  sourceEntry: string,
+  pathExists: (targetPath: string) => Promise<boolean>,
+): Promise<string[]> {
+  const tsxCliEntry = path.resolve(
+    path.dirname(tsxBinary),
+    '..',
+    'tsx',
+    'dist',
+    'cli.mjs',
+  )
+
+  if (await pathExists(tsxCliEntry)) {
+    return [resolveNodeCommand(), tsxCliEntry, sourceEntry]
+  }
+
+  return [tsxBinary, sourceEntry]
 }
 
 function buildForwardedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -182,11 +224,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
 
   for (const claudeTeamRoot of getCandidateClaudeTeamRoots()) {
     const sourceEntry = path.join(claudeTeamRoot, 'mcp-server', 'src', 'index.ts')
-    const tsxCandidates = [
-      path.join(claudeTeamRoot, 'mcp-server', 'node_modules', '.bin', 'tsx'),
-      path.join(claudeTeamRoot, 'node_modules', '.bin', 'tsx'),
-      path.join(path.dirname(claudeTeamRoot), 'node_modules', '.bin', 'tsx'),
-    ]
+    const tsxCandidates = getTsxBinaryCandidates(claudeTeamRoot)
 
     if (await pathExists(sourceEntry)) {
       for (const tsxBinary of tsxCandidates) {
@@ -198,7 +236,11 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
           source: 'workspace-src',
           config: {
             type: 'local',
-            command: [tsxBinary, sourceEntry],
+            command: await buildTsxSourceCommand(
+              tsxBinary,
+              sourceEntry,
+              pathExists,
+            ),
             environment: forwardedEnvironment,
             enabled: true,
             timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,

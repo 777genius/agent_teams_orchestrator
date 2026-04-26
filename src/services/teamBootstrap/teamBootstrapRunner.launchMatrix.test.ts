@@ -4,10 +4,14 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { PROVIDER_DEFAULT_MODEL_SELECTION } from "./teamBootstrapModelSelection.js";
-import type { TeamBootstrapRequest } from "./teamBootstrapTypes.js";
+import type {
+  TeamBootstrapRequest,
+  TeamBootstrapResult,
+} from "./teamBootstrapTypes.js";
 
 type SpawnInput = Record<string, unknown>;
 type DuplicateReason = "already_running" | "bootstrap_pending";
+type FailedTeamBootstrapResult = Extract<TeamBootstrapResult, { ok: false }>;
 
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 const SAFE_E2E_TIMEOUT_MS = 15_000;
@@ -39,29 +43,41 @@ describe("team bootstrap launch matrix safe e2e", () => {
     createTeamFailure = null;
     registerSpawnedMembers = false;
 
-    const teamHelpers = await import("src/utils/swarm/teamHelpers.js");
-    mock.module("src/utils/swarm/teamHelpers.js", () => ({
-      ...teamHelpers,
-      readTeamFileAsync: async () =>
+    const buildMockTeamFile = () => ({
+      name: "atlas-hq",
+      leadAgentId: "team-lead@atlas-hq",
+      leadSessionId: "lead-session",
+      members: [
+        { name: "team-lead", agentId: "team-lead@atlas-hq" },
+        ...[...registeredMemberNames].map((name) => ({
+          name,
+          agentId: `${name}@atlas-hq`,
+        })),
+      ],
+    });
+    const { __setTeamBootstrapRunnerDepsForTests } = await import(
+      "./teamBootstrapRunner.js"
+    );
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: (async () =>
         teamConfigExists
-          ? {
-              name: "atlas-hq",
-              leadAgentId: "team-lead@atlas-hq",
-              leadSessionId: "lead-session",
-              members: [
-                { name: "team-lead", agentId: "team-lead@atlas-hq" },
-                ...[...registeredMemberNames].map((name) => ({
-                  name,
-                  agentId: `${name}@atlas-hq`,
-                })),
-              ],
-            }
-          : null,
-      unregisterTeamForSessionCleanup: () => {},
-    }));
-
-    mock.module("src/tools/shared/spawnMultiAgent.js", () => ({
-      spawnTeammate: async (input: SpawnInput) => {
+          ? buildMockTeamFile()
+          : null) as never,
+      updateTeamFileAsync: (async (
+        _teamName: string,
+        updater: (teamFile: ReturnType<typeof buildMockTeamFile>) => unknown,
+      ) => {
+        const previousTeamFile = buildMockTeamFile();
+        const updateResult = updater(previousTeamFile) as
+          | { changed?: boolean; teamFile?: ReturnType<typeof buildMockTeamFile> }
+          | undefined;
+        return {
+          status: updateResult?.changed === false ? "unchanged" : "updated",
+          teamFile: updateResult?.teamFile ?? previousTeamFile,
+        };
+      }) as never,
+      unregisterTeamForSessionCleanup: (() => {}) as never,
+      spawnTeammate: (async (input: SpawnInput) => {
         spawnInputs.push(input);
         const name = String(input.name);
         const failure = spawnFailures.get(name);
@@ -96,24 +112,23 @@ describe("team bootstrap launch matrix safe e2e", () => {
             spawned: true,
           },
         };
-      },
-    }));
-
-    mock.module("src/tools/TeamCreateTool/TeamCreateTool.js", () => ({
-      TeamCreateTool: {
-        call: async (input: Record<string, unknown>) => {
-          createTeamCalls.push(input);
-          if (createTeamFailure) {
-            throw new Error(createTeamFailure);
-          }
-          teamConfigExists = true;
-          return { data: { team_name: "atlas-hq" } };
-        },
-      },
-    }));
+      }) as never,
+      teamCreateCall: (async (input: Record<string, unknown>) => {
+        createTeamCalls.push(input);
+        if (createTeamFailure) {
+          throw new Error(createTeamFailure);
+        }
+        teamConfigExists = true;
+        return { data: { team_name: "atlas-hq" } };
+      }) as never,
+    });
   }, SAFE_E2E_TIMEOUT_MS);
 
   afterEach(async () => {
+    const { __setTeamBootstrapRunnerDepsForTests } = await import(
+      "./teamBootstrapRunner.js"
+    );
+    __setTeamBootstrapRunnerDepsForTests(null);
     mock.restore();
     mock.clearAllMocks();
     if (originalClaudeConfigDir === undefined) {
@@ -664,13 +679,14 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected missing launch team config to fail");
       }
-      expect(result.error).toContain("team config does not exist");
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain("team config does not exist");
       expect(
         events.items.some((item) => item.type === "member_spawn_started"),
       ).toBe(false);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -704,13 +720,14 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected create team failure");
       }
-      expect(result.error).toContain("TeamCreateTool failed to persist config");
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain("TeamCreateTool failed to persist config");
       expect(
         events.items.some((item) => item.type === "member_spawn_started"),
       ).toBe(false);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -992,11 +1009,12 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected strict mixed primary lane failure");
       }
-      expect(result.error).toContain(
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain(
         "alice: Teammate was not registered in config.json",
       );
-      expect(result.error).not.toContain("bob");
-      expect(result.error).not.toContain("jack");
+      expect(failure.error).not.toContain("bob");
+      expect(failure.error).not.toContain("jack");
       expect(result.summary?.terminalStatus).toBe("failed");
       expect(result.summary?.expectedMembers).toEqual(["alice"]);
       expect(result.summary?.registeredMembers).toEqual(["bob", "jack"]);
@@ -1009,7 +1027,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       ]);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1226,6 +1244,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected all-provider spawn failure");
       }
+      const failure = result as FailedTeamBootstrapResult;
       expect(result.summary?.terminalStatus).toBe("failed");
       expect(result.summary?.registeredMembers).toEqual([]);
       expect(result.summary?.failedMembers).toEqual([
@@ -1233,11 +1252,11 @@ describe("team bootstrap launch matrix safe e2e", () => {
         { name: "bob", reason: "Codex native runtime unavailable" },
         { name: "zoe", reason: "Gemini pane failed to start" },
       ]);
-      expect(result.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were registered");
       expect(events.completedEvents).toEqual([]);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1273,11 +1292,12 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected strict bootstrap failure");
       }
-      expect(result.error).toContain("bob: Codex native runtime unavailable");
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain("bob: Codex native runtime unavailable");
       expect(result.summary?.registeredMembers).toEqual(["alice", "zoe"]);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1411,6 +1431,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected bootstrap-pending duplicate audit failure");
       }
+      const failure = result as FailedTeamBootstrapResult;
       expect(result.summary?.terminalStatus).toBe("failed");
       expect(result.summary?.registeredMembers).toEqual([]);
       expect(result.summary?.failedMembers).toEqual([
@@ -1431,9 +1452,9 @@ describe("team bootstrap launch matrix safe e2e", () => {
       expect(events.completedEvents).toEqual([]);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
-      expect(result.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were registered");
     },
     SAFE_E2E_TIMEOUT_MS,
   );
@@ -1459,6 +1480,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected already-running duplicate audit failure");
       }
+      const failure = result as FailedTeamBootstrapResult;
       expect(result.summary?.terminalStatus).toBe("failed");
       expect(result.summary?.registeredMembers).toEqual([]);
       expect(result.summary?.failedMembers).toEqual([
@@ -1479,9 +1501,9 @@ describe("team bootstrap launch matrix safe e2e", () => {
       expect(events.completedEvents).toEqual([]);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
-      expect(result.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were registered");
     },
     SAFE_E2E_TIMEOUT_MS,
   );
@@ -1509,7 +1531,8 @@ describe("team bootstrap launch matrix safe e2e", () => {
           "expected strict bootstrap-pending duplicate audit failure",
         );
       }
-      expect(result.error).toContain(
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain(
         "bob: Teammate was not registered in config.json",
       );
       expect(result.summary?.terminalStatus).toBe("failed");
@@ -1531,7 +1554,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       });
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1600,7 +1623,8 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected timeout before member spawn");
       }
-      expect(result.error).toContain('before spawning teammate "alice"');
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain('before spawning teammate "alice"');
       expect(events.items).toContainEqual({
         type: "phase",
         phase: "spawning_members",
@@ -1610,7 +1634,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       ).toBe(false);
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1646,7 +1670,8 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected timeout after partial spawn");
       }
-      expect(result.error).toContain('before spawning teammate "bob"');
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain('before spawning teammate "bob"');
       expect(events.items).toContainEqual({
         type: "member_spawn_started",
         memberName: "alice",
@@ -1664,7 +1689,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       );
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1871,12 +1896,13 @@ describe("team bootstrap launch matrix safe e2e", () => {
       if (result.ok) {
         throw new Error("expected strict bootstrap failure");
       }
-      expect(result.error).toContain(
+      const failure = result as FailedTeamBootstrapResult;
+      expect(failure.error).toContain(
         "bob: Teammate was not registered in config.json",
       );
       expect(events.items).toContainEqual({
         type: "failed",
-        reason: result.error,
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,

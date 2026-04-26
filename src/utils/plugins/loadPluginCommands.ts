@@ -1,5 +1,5 @@
 import memoize from 'lodash-es/memoize.js'
-import { basename, dirname, join } from 'path'
+import { basename, dirname, isAbsolute, join, relative } from 'path'
 import { getInlinePlugins, getSessionId } from '../../bootstrap/state.js'
 import type { Command } from '../../types/command.js'
 import { getPluginErrorMessage } from '../../types/plugin.js'
@@ -54,10 +54,22 @@ function isSkillFile(filePath: string): boolean {
   return /^skill\.md$/i.test(basename(filePath))
 }
 
+function getNamespaceFromDirectory(directory: string, baseDir: string): string {
+  const relativePath = relative(baseDir, directory)
+  if (
+    !relativePath ||
+    relativePath.startsWith('..') ||
+    isAbsolute(relativePath)
+  ) {
+    return ''
+  }
+  return relativePath.split(/[/\\]+/).filter(Boolean).join(':')
+}
+
 /**
  * Get command name from file path, handling both regular files and skills
  */
-function getCommandNameFromFile(
+export function getCommandNameFromFile(
   filePath: string,
   baseDir: string,
   pluginName: string,
@@ -70,11 +82,7 @@ function getCommandNameFromFile(
     const parentOfSkillDir = dirname(skillDirectory)
     const commandBaseName = basename(skillDirectory)
 
-    // Build namespace from parent of skill directory
-    const relativePath = parentOfSkillDir.startsWith(baseDir)
-      ? parentOfSkillDir.slice(baseDir.length).replace(/^\//, '')
-      : ''
-    const namespace = relativePath ? relativePath.split('/').join(':') : ''
+    const namespace = getNamespaceFromDirectory(parentOfSkillDir, baseDir)
 
     return namespace
       ? `${pluginName}:${namespace}:${commandBaseName}`
@@ -84,11 +92,7 @@ function getCommandNameFromFile(
     const fileDirectory = dirname(filePath)
     const commandBaseName = basename(filePath).replace(/\.md$/, '')
 
-    // Build namespace from file directory
-    const relativePath = fileDirectory.startsWith(baseDir)
-      ? fileDirectory.slice(baseDir.length).replace(/^\//, '')
-      : ''
-    const namespace = relativePath ? relativePath.split('/').join(':') : ''
+    const namespace = getNamespaceFromDirectory(fileDirectory, baseDir)
 
     return namespace
       ? `${pluginName}:${namespace}:${commandBaseName}`

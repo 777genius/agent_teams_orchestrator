@@ -13,6 +13,10 @@ import {
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
 
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, '/')
+}
+
 describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
 
@@ -51,7 +55,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const second = await collectProjectBehaviorMetadata(tempDir)
     const managedConfig = buildManagedConfig()
 
-    expect(first.behaviorSources).toEqual([
+    expect(first.behaviorSources.map(normalizePath)).toEqual([
       '.opencode/package.json',
       '.opencode/plugins/team-hooks.ts',
       'opencode.json',

@@ -110,6 +110,7 @@ import {
   type TeammateMessage,
   writeToMailbox,
 } from '../../utils/teammateMailbox.js'
+import { assertNotWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import { isCustomAgent } from '../AgentTool/loadAgentsDir.js'
 import {
@@ -909,6 +910,8 @@ async function handleSpawnSplitPane(
       'team_name is required for spawn operation. Either provide team_name in input or call spawnTeam first to establish team context.',
     )
   }
+  assertNotWindowsReservedBasename(teamName, 'team_name')
+  assertNotWindowsReservedBasename(name, 'name')
 
   // Persistent team teammates must keep their canonical identity. Duplicate
   // requests are handled before we get here; a legitimate respawn must reuse

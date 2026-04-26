@@ -44,7 +44,7 @@ import {
   getConditionalRulesForCwdLevelDirectory,
   type MemoryFileInfo,
 } from './claudemd.js'
-import { dirname, parse, relative, resolve } from 'path'
+import { dirname, isAbsolute, parse, relative, resolve } from 'path'
 import { getCwd } from 'src/utils/cwd.js'
 import { getViewedTeammateTask } from '../state/selectors.js'
 import { logError } from './log.js'
@@ -1671,12 +1671,16 @@ export function getDirectoriesToProcess(
 ): { nestedDirs: string[]; cwdLevelDirs: string[] } {
   // Build list of directories from original CWD to targetPath's directory
   const targetDir = dirname(resolve(targetPath))
+  const normalizedOriginalCwd = normalizeDirectoryForContainment(originalCwd)
   const nestedDirs: string[] = []
   let currentDir = targetDir
 
   // Walk up from target directory to original CWD
-  while (currentDir !== originalCwd && currentDir !== parse(currentDir).root) {
-    if (currentDir.startsWith(originalCwd)) {
+  while (
+    normalizeDirectoryForContainment(currentDir) !== normalizedOriginalCwd &&
+    currentDir !== parse(currentDir).root
+  ) {
+    if (isDirectoryInside(originalCwd, currentDir)) {
       nestedDirs.push(currentDir)
     }
     currentDir = dirname(currentDir)
@@ -1698,6 +1702,18 @@ export function getDirectoriesToProcess(
   cwdLevelDirs.reverse()
 
   return { nestedDirs, cwdLevelDirs }
+}
+
+function normalizeDirectoryForContainment(directory: string): string {
+  const normalized = resolve(directory)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function isDirectoryInside(parentDir: string, childDir: string): boolean {
+  const from = normalizeDirectoryForContainment(parentDir)
+  const to = normalizeDirectoryForContainment(childDir)
+  const rel = relative(from, to)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
 }
 
 /**

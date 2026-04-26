@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -7,6 +7,8 @@ import envPaths from 'env-paths'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { sleep } from '../../utils/sleep.js'
+import { killProcessTree } from '../../utils/processKill.js'
+import { spawnPortableCli } from '../../utils/portableCli.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
 import type {
@@ -334,7 +336,11 @@ export class OpenCodeHostManager {
   }
 
   private killProcess(pid: number, signal: NodeJS.Signals): void {
-    ;(this.deps.killProcess ?? process.kill)(pid, signal)
+    if (this.deps.killProcess) {
+      this.deps.killProcess(pid, signal)
+      return
+    }
+    killProcessTree(pid, signal)
   }
 
   private now(): Date {
@@ -695,7 +701,7 @@ export class OpenCodeHostManager {
       return this.deps.spawnHostProcess(profile, port)
     }
 
-    return spawn(
+    return spawnPortableCli(
       Bun.which('opencode') ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
       {
@@ -797,7 +803,11 @@ export class OpenCodeHostManager {
       handle.state = 'degraded'
       diagnostics.push(error instanceof Error ? error.message : String(error))
       this.hosts.delete(hostKey)
-      child.kill('SIGTERM')
+      if (child.pid) {
+        this.killProcess(child.pid, 'SIGTERM')
+      } else {
+        child.kill('SIGTERM')
+      }
       throw error
     }
   }
@@ -872,7 +882,11 @@ export class OpenCodeHostManager {
     }
 
     if (entry?.child) {
-      entry.child.kill('SIGTERM')
+      if (entry.child.pid) {
+        this.killProcess(entry.child.pid, 'SIGTERM')
+      } else {
+        entry.child.kill('SIGTERM')
+      }
     } else if (pid > 0 && this.isProcessAlive(pid)) {
       try {
         this.killProcess(pid, 'SIGTERM')

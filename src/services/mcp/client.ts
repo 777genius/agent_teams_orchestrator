@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { pathToFileURL } from 'node:url'
 import type {
   Base64ImageSource,
   ContentBlockParam,
@@ -88,6 +89,7 @@ import {
 import { WebSocketTransport } from '../../utils/mcpWebSocketTransport.js'
 import { memoizeWithLRU } from '../../utils/memoize.js'
 import { getWebSocketTLSOptions } from '../../utils/mtls.js'
+import { killProcessTree } from '../../utils/processKill.js'
 import {
   getProxyFetchOptions,
   getWebSocketProxyAgent,
@@ -1022,7 +1024,7 @@ export const connectToServer = memoize(
         return {
           roots: [
             {
-              uri: `file://${getOriginalCwd()}`,
+              uri: pathToFileURL(getOriginalCwd()).href,
             },
           ],
         }
@@ -1437,7 +1439,7 @@ export const connectToServer = memoize(
         // For stdio transports, explicitly terminate the child process with proper signals
         // NOTE: StdioClientTransport.close() only sends an abort signal, but many MCP servers
         // (especially Docker containers) need explicit SIGINT/SIGTERM signals to trigger graceful shutdown
-        if (serverRef.type === 'stdio') {
+        if (serverRef.type === 'stdio' || !serverRef.type) {
           try {
             const stdioTransport = transport as StdioClientTransport
             const childPid = stdioTransport.pid
@@ -1447,7 +1449,7 @@ export const connectToServer = memoize(
 
               // First try SIGINT (like Ctrl+C)
               try {
-                process.kill(childPid, 'SIGINT')
+                killProcessTree(childPid, 'SIGINT')
               } catch (error) {
                 logMCPDebug(name, `Error sending SIGINT: ${error}`)
                 return
@@ -1501,7 +1503,7 @@ export const connectToServer = memoize(
                         'SIGINT failed, sending SIGTERM to MCP server process',
                       )
                       try {
-                        process.kill(childPid, 'SIGTERM')
+                        killProcessTree(childPid, 'SIGTERM')
                       } catch (termError) {
                         logMCPDebug(name, `Error sending SIGTERM: ${termError}`)
                         resolved = true
@@ -1532,7 +1534,7 @@ export const connectToServer = memoize(
                           'SIGTERM failed, sending SIGKILL to MCP server process',
                         )
                         try {
-                          process.kill(childPid, 'SIGKILL')
+                          killProcessTree(childPid, 'SIGKILL')
                         } catch (killError) {
                           logMCPDebug(
                             name,

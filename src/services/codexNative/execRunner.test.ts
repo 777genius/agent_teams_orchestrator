@@ -8,6 +8,7 @@ import {
 } from './execRunner.js'
 
 class FakeCodexProcess extends EventEmitter {
+  stdin = new PassThrough()
   stdout = new PassThrough()
   stderr = new PassThrough()
   killed = false
@@ -44,7 +45,7 @@ describe('buildCodexNativeExecArgs', () => {
       '-C',
       '/tmp/demo',
       '--ephemeral',
-      'Reply only with OK',
+      '-',
     ])
   })
 
@@ -75,7 +76,7 @@ describe('buildCodexNativeExecArgs', () => {
       '/tmp/demo-2',
       '--add-dir',
       '/tmp/demo-3',
-      'Inspect the repo and summarize it.',
+      '-',
     ])
   })
 
@@ -98,7 +99,7 @@ describe('buildCodexNativeExecArgs', () => {
       'gpt-5.4',
       '-c',
       'model_reasoning_effort="xhigh"',
-      'Reply only with OK',
+      '-',
     ])
   })
 
@@ -126,7 +127,7 @@ describe('buildCodexNativeExecArgs', () => {
       'mcp_servers.agent-teams.command="/usr/local/bin/node"',
       '-c',
       'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
-      'Reply only with OK',
+      '-',
     ])
   })
 })
@@ -135,6 +136,11 @@ describe('runCodexNativeExec', () => {
   test('yields binary identity first and streams normalized stdout and stderr events', async () => {
     const process = new FakeCodexProcess()
     const spawnProcess = mock(() => process)
+    const stdinChunks: string[] = []
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', chunk => {
+      stdinChunks.push(String(chunk))
+    })
 
     const iterator = runCodexNativeExec(
       {
@@ -172,16 +178,17 @@ describe('runCodexNativeExec', () => {
         '-C',
         '/tmp/demo',
         '--ephemeral',
-        'Reply only with OK',
+        '-',
       ],
       expect.objectContaining({
         cwd: '/tmp/demo',
-        stdin: 'ignore',
+        stdin: 'pipe',
         env: expect.objectContaining({
           CODEX_API_KEY: 'sk-codex',
         }),
       }),
     )
+    expect(stdinChunks.join('')).toBe('Reply only with OK')
 
     const remaining = (async () => {
       const observed = []

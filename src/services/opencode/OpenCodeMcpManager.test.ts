@@ -1,10 +1,15 @@
 import { describe, expect, test } from 'bun:test'
+import path from 'node:path'
 
 import {
   getCandidateClaudeTeamRootsForBridgeRoot,
   OpenCodeMcpManager,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
+
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, '/')
+}
 
 describe('OpenCodeMcpManager', () => {
   test('treats an existing app MCP server as present without reattaching', async () => {
@@ -42,7 +47,14 @@ describe('OpenCodeMcpManager', () => {
 
   test('reattaches an existing app MCP server when the forced Claude root changed', async () => {
     let addCalls = 0
-    let currentMcp = {
+    let currentMcp: Record<
+      string,
+      {
+        connected: boolean
+        command?: string[]
+        environment?: Record<string, string>
+      }
+    > = {
       'agent-teams': {
         connected: true,
         command: ['node', '/tmp/agent-teams-mcp.js'],
@@ -309,7 +321,7 @@ describe('OpenCodeMcpManager', () => {
     expect(result.source).toBe('env-override')
     expect(result.config).toMatchObject({
       type: 'local',
-      command: ['/usr/local/bin/node', '/tmp/agent-teams-mcp.js'],
+      command: ['/usr/local/bin/node', path.resolve('/tmp/agent-teams-mcp.js')],
       enabled: true,
       timeout: 8000,
       environment: {
@@ -323,12 +335,58 @@ describe('OpenCodeMcpManager', () => {
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
 
+  test('resolves workspace source MCP launch through node and the tsx CLI entrypoint', async () => {
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {},
+      pathExists: async targetPath => {
+        const normalized = normalizePath(targetPath)
+        return (
+          normalized.endsWith('/mcp-server/src/index.ts') ||
+          normalized.endsWith('/mcp-server/node_modules/.bin/tsx') ||
+          normalized.endsWith('/mcp-server/node_modules/.bin/tsx.cmd') ||
+          normalized.endsWith('/mcp-server/node_modules/tsx/dist/cli.mjs')
+        )
+      },
+    })
+
+    const command = result.config.command ?? []
+
+    expect(result.source).toBe('workspace-src')
+    expect(command.length).toBe(3)
+    expect(['node', 'node.exe']).toContain(
+      path.basename(command[0]!).toLowerCase(),
+    )
+    expect(
+      normalizePath(command[1]!).endsWith(
+        '/mcp-server/node_modules/tsx/dist/cli.mjs',
+      ),
+    ).toBe(true)
+    expect(
+      normalizePath(command[2]!).endsWith('/mcp-server/src/index.ts'),
+    ).toBe(true)
+  })
+
   test('orders the paired claude_team worktree before the main repo fallback', () => {
     const roots = getCandidateClaudeTeamRootsForBridgeRoot(
       '/repo/_worktrees/agent_teams_orchestrator_opencode_semantic_messaging',
     )
+    const normalizedRoots = roots.map(normalizePath)
 
-    expect(roots[0]).toBe('/repo/_worktrees/claude_team_opencode_semantic_messaging')
-    expect(roots).toContain('/repo/claude_team')
+    expect(
+      normalizedRoots[0].endsWith(
+        '/repo/_worktrees/claude_team_opencode_semantic_messaging',
+      ),
+    ).toBe(true)
+    expect(
+      normalizedRoots[1].endsWith(
+        '/repo/_worktrees/claude_agent_teams_ui_opencode_semantic_messaging',
+      ),
+    ).toBe(true)
+    expect(
+      normalizedRoots.some(root => root.endsWith('/repo/claude_agent_teams_ui')),
+    ).toBe(true)
+    expect(normalizedRoots.some(root => root.endsWith('/repo/claude_team'))).toBe(
+      true,
+    )
   })
 })

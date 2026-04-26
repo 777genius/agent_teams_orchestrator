@@ -80,6 +80,24 @@ describe('TeamBootstrapTool.validateInput', () => {
     expect(parsed.error.message).toContain('Invalid option')
   })
 
+  test('rejects Windows reserved team and member names', () => {
+    expect(
+      TeamBootstrapTool.inputSchema.safeParse({
+        mode: 'create',
+        team_name: 'con',
+        members: [{ name: 'alice' }],
+      }).success,
+    ).toBe(false)
+
+    expect(
+      TeamBootstrapTool.inputSchema.safeParse({
+        mode: 'create',
+        team_name: 'atlas-hq',
+        members: [{ name: 'NUL.txt' }],
+      }).success,
+    ).toBe(false)
+  })
+
   test('disables the hidden tool when deterministic bootstrap kill switch is active', () => {
     process.env.CLAUDE_ENABLE_TEAM_BOOTSTRAP_TOOL = '1'
     process.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
