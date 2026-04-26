@@ -4,6 +4,7 @@ import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
+import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -29,6 +30,7 @@ type OpenCodeSessionBridgeDeps = {
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   logProjector?: Pick<typeof openCodeLogProjector, 'projectSummary'>
+  offlineReader?: Pick<typeof openCodeOfflineSessionReader, 'readSession'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
   prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
 }
@@ -113,6 +115,10 @@ export class OpenCodeSessionBridge {
 
   private get logProjector() {
     return this.deps.logProjector ?? openCodeLogProjector
+  }
+
+  private get offlineReader() {
+    return this.deps.offlineReader ?? openCodeOfflineSessionReader
   }
 
   private async prepareProfile(projectPath?: string | null) {
@@ -789,6 +795,14 @@ export class OpenCodeSessionBridge {
         reconciled.summary.diagnostics.push(
           `OpenCode stale session log read failed - ${error instanceof Error ? error.message : String(error)}`,
         )
+        const offline = await this.readOfflineSessionMessagesForLogProjection(record, {
+          staleReason: reconciled.summary.staleReason ?? record.staleReason ?? 'stale_session',
+          profileAuthState: reconciled.summary.profileAuthState,
+          diagnostics: reconciled.summary.diagnostics,
+        })
+        if (offline) {
+          reconciled = offline
+        }
       }
     }
 
@@ -841,6 +855,36 @@ export class OpenCodeSessionBridge {
         summary,
       }
     })
+  }
+
+  private async readOfflineSessionMessagesForLogProjection(
+    record: OpenCodeSessionRecord,
+    options: {
+      staleReason: string
+      profileAuthState: OpenCodeAuthState | null
+      diagnostics: string[]
+    },
+  ): Promise<{
+    record: OpenCodeSessionRecord
+    summary: OpenCodeSessionReconcileSummary
+  } | null> {
+    const offline = await this.offlineReader.readSession(record)
+    if (!offline || offline.messages.length === 0) {
+      return null
+    }
+    const summary = this.eventTranslator.reconcileSessionMessages({
+      sessionId: record.opencodeSessionId,
+      rawStatus: record.lastKnownRawStatus as OpenCodeSessionStatus | null,
+      messages: offline.messages,
+    })
+    summary.reconcileOutcome = 'stale'
+    summary.staleReason = options.staleReason
+    summary.profileAuthState = options.profileAuthState
+    summary.diagnostics.unshift(
+      `OpenCode session is stale (${options.staleReason}); recovered historical messages from local SQLite store`,
+    )
+    summary.diagnostics.push(...options.diagnostics, ...offline.diagnostics)
+    return { record, summary }
   }
 }
 

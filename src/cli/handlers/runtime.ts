@@ -8,6 +8,7 @@ import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvi
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+import { openCodeLedgerBridgeService } from '../../services/opencode/OpenCodeLedgerBridgeService.js'
 import {
   connectProviderWithApiKey,
   connectProvider,
@@ -598,6 +599,45 @@ export async function runtimeOpenCodeCommand(opts: {
   const envelope = JSON.parse(raw) as unknown
   const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
   await writeStdoutAndDrain(jsonStringify(result) + '\n')
+  process.exit(0)
+}
+
+export async function runtimeOpenCodeLedgerBackfill(opts: {
+  json?: boolean
+  team: string
+  task?: string
+  taskDisplayId?: string
+  member?: string
+  lane?: string
+  projectDir?: string
+  workspaceRoot?: string
+  deliveryContext?: string
+  attributionMode?: string
+  dryRun?: boolean
+  output?: string
+}): Promise<void> {
+  const result = await openCodeLedgerBridgeService.backfill({
+    teamName: opts.team,
+    taskId: opts.task,
+    taskDisplayId: opts.taskDisplayId,
+    memberName: opts.member,
+    laneId: opts.lane,
+    projectDir: opts.projectDir,
+    workspaceRoot: opts.workspaceRoot,
+    deliveryContextPath: opts.deliveryContext,
+    attributionMode: opts.attributionMode === 'strict-delivery' ? 'strict-delivery' : 'compatible',
+    dryRun: opts.dryRun === true,
+  })
+  const payload = jsonStringify({
+    schemaVersion: 1,
+    providerId: 'opencode',
+    result,
+  }, null, 2) + '\n'
+  if (opts.output?.trim()) {
+    await writeFile(opts.output.trim(), payload, 'utf8')
+  } else {
+    process.stdout.write(payload)
+  }
   process.exit(0)
 }
 
