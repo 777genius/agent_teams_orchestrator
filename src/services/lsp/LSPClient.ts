@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from 'child_process'
+import { type ChildProcess } from 'child_process'
 import {
   createMessageConnection,
   type MessageConnection,
@@ -14,6 +14,8 @@ import type {
 import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
 import { logError } from '../../utils/log.js'
+import { spawnPortableCli } from '../../utils/portableCli.js'
+import { killProcessTree } from '../../utils/processKill.js'
 import { subprocessEnv } from '../../utils/subprocessEnv.js'
 import { whichSync } from '../../utils/which.js'
 /**
@@ -113,7 +115,7 @@ export function createLSPClient(
       try {
         const resolvedCommand = resolveLspSpawnCommand(command)
         // 1. Spawn LSP server process
-        process = spawn(resolvedCommand, args, {
+        process = spawnPortableCli(resolvedCommand, args, {
           stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...subprocessEnv(), ...options?.env },
           cwd: options?.cwd,
@@ -433,7 +435,7 @@ export function createLSPClient(
           }
 
           try {
-            process.kill()
+            killProcessTree(process.pid)
           } catch (error) {
             // Process might already be dead, which is fine
             logForDebugging(

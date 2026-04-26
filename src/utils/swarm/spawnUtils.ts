@@ -415,9 +415,9 @@ export async function buildPaneLauncherCommand(
   command: string,
 ): Promise<string> {
   const scriptDir = await mkdtemp(join(tmpdir(), 'claude-teammate-spawn-'))
-  const scriptPath = join(scriptDir, 'launch.zsh')
+  const scriptPath = join(scriptDir, 'launch.sh')
   const script = [
-    '#!/bin/zsh',
+    '#!/bin/sh',
     `SCRIPT_PATH=${quote([scriptPath])}`,
     `SCRIPT_DIR=${quote([scriptDir])}`,
     'cleanup_spawn_script() {',
@@ -431,7 +431,7 @@ export async function buildPaneLauncherCommand(
 
   await writeFile(scriptPath, script, { mode: 0o700 })
 
-  return `zsh ${quote([scriptPath])}`
+  return `sh ${quote([scriptPath])}`
 }
 
 function extractExitSentinelCode(output: string): number | null {

@@ -128,6 +128,40 @@ function resolveNodeCommand(): string {
   return Bun.which('node') ?? 'node'
 }
 
+function getTsxBinaryCandidates(claudeTeamRoot: string): string[] {
+  const candidates = [
+    path.join(claudeTeamRoot, 'mcp-server', 'node_modules', '.bin', 'tsx'),
+    path.join(claudeTeamRoot, 'node_modules', '.bin', 'tsx'),
+    path.join(path.dirname(claudeTeamRoot), 'node_modules', '.bin', 'tsx'),
+  ]
+
+  if (process.platform !== 'win32') {
+    return candidates
+  }
+
+  return candidates.flatMap(candidate => [`${candidate}.cmd`, candidate])
+}
+
+async function buildTsxSourceCommand(
+  tsxBinary: string,
+  sourceEntry: string,
+  pathExists: (targetPath: string) => Promise<boolean>,
+): Promise<string[]> {
+  const tsxCliEntry = path.resolve(
+    path.dirname(tsxBinary),
+    '..',
+    'tsx',
+    'dist',
+    'cli.mjs',
+  )
+
+  if (await pathExists(tsxCliEntry)) {
+    return [resolveNodeCommand(), tsxCliEntry, sourceEntry]
+  }
+
+  return [tsxBinary, sourceEntry]
+}
+
 function buildForwardedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
   const forwarded: Record<string, string> = {}
   for (const key of OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST) {
@@ -182,11 +216,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
 
   for (const claudeTeamRoot of getCandidateClaudeTeamRoots()) {
     const sourceEntry = path.join(claudeTeamRoot, 'mcp-server', 'src', 'index.ts')
-    const tsxCandidates = [
-      path.join(claudeTeamRoot, 'mcp-server', 'node_modules', '.bin', 'tsx'),
-      path.join(claudeTeamRoot, 'node_modules', '.bin', 'tsx'),
-      path.join(path.dirname(claudeTeamRoot), 'node_modules', '.bin', 'tsx'),
-    ]
+    const tsxCandidates = getTsxBinaryCandidates(claudeTeamRoot)
 
     if (await pathExists(sourceEntry)) {
       for (const tsxBinary of tsxCandidates) {
@@ -198,7 +228,11 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
           source: 'workspace-src',
           config: {
             type: 'local',
-            command: [tsxBinary, sourceEntry],
+            command: await buildTsxSourceCommand(
+              tsxBinary,
+              sourceEntry,
+              pathExists,
+            ),
             environment: forwardedEnvironment,
             enabled: true,
             timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
