@@ -107,16 +107,24 @@ function getOpenCodeBridgeRepoRoot(): string {
 
 export function getCandidateClaudeTeamRootsForBridgeRoot(bridgeRepoRoot: string): string[] {
   const bridgeRepoName = path.basename(bridgeRepoRoot)
-  const pairedWorktreeName = bridgeRepoName.startsWith('agent_teams_orchestrator')
-    ? `claude_team${bridgeRepoName.slice('agent_teams_orchestrator'.length)}`
+  const pairedWorktreeSuffix = bridgeRepoName.startsWith('agent_teams_orchestrator')
+    ? bridgeRepoName.slice('agent_teams_orchestrator'.length)
     : null
+  const pairedWorktreeNames = pairedWorktreeSuffix === null
+    ? []
+    : [
+        `claude_team${pairedWorktreeSuffix}`,
+        `claude_agent_teams_ui${pairedWorktreeSuffix}`,
+      ]
   const candidates = [
-    pairedWorktreeName
-      ? path.resolve(path.dirname(bridgeRepoRoot), pairedWorktreeName)
-      : null,
+    ...pairedWorktreeNames.map(name =>
+      path.resolve(path.dirname(bridgeRepoRoot), name),
+    ),
+    path.resolve(bridgeRepoRoot, '../claude_agent_teams_ui'),
     path.resolve(bridgeRepoRoot, '../claude_team'),
+    path.resolve(bridgeRepoRoot, '../../claude_agent_teams_ui'),
     path.resolve(bridgeRepoRoot, '../../claude_team'),
-  ].filter((candidate): candidate is string => typeof candidate === 'string')
+  ]
   return [...new Set(candidates)]
 }
 

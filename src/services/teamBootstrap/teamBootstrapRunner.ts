@@ -33,6 +33,45 @@ import type {
   TeamBootstrapSummary,
 } from './teamBootstrapTypes.js'
 
+type TeamCreateCall = (
+  input: {
+    team_name: string
+    description?: string
+    agent_type?: string
+  },
+  context: ToolUseContext,
+) => Promise<unknown>
+
+export type TeamBootstrapRunnerDeps = {
+  readTeamFileAsync: typeof readTeamFileAsync
+  updateTeamFileAsync: typeof updateTeamFileAsync
+  unregisterTeamForSessionCleanup: typeof unregisterTeamForSessionCleanup
+  spawnTeammate: typeof spawnTeammate
+  teamCreateCall: TeamCreateCall
+}
+
+let testDeps: Partial<TeamBootstrapRunnerDeps> | null = null
+
+export function __setTeamBootstrapRunnerDepsForTests(
+  deps: Partial<TeamBootstrapRunnerDeps> | null,
+): void {
+  testDeps = deps
+}
+
+function getTeamBootstrapRunnerDeps(): TeamBootstrapRunnerDeps {
+  return {
+    readTeamFileAsync: testDeps?.readTeamFileAsync ?? readTeamFileAsync,
+    updateTeamFileAsync: testDeps?.updateTeamFileAsync ?? updateTeamFileAsync,
+    unregisterTeamForSessionCleanup:
+      testDeps?.unregisterTeamForSessionCleanup ?? unregisterTeamForSessionCleanup,
+    spawnTeammate: testDeps?.spawnTeammate ?? spawnTeammate,
+    teamCreateCall:
+      testDeps?.teamCreateCall
+      ?? ((input, context) =>
+        (TeamCreateTool.call as unknown as TeamCreateCall)(input, context)),
+  }
+}
+
 export function shouldCreateTeamForBootstrap(params: {
   mode: TeamBootstrapRequest['mode']
   attachState: 'already_attached' | 'attached_existing' | 'missing'
@@ -167,20 +206,24 @@ function seedBootstrapPermissionRules(params: {
 async function ensureLeaderAttachedToTeam(
   request: TeamBootstrapRequest,
   context: ToolUseContext,
+  deps: Pick<
+    TeamBootstrapRunnerDeps,
+    'readTeamFileAsync' | 'updateTeamFileAsync' | 'unregisterTeamForSessionCleanup'
+  >,
 ): Promise<'already_attached' | 'attached_existing' | 'missing'> {
   const currentTeamName = context.getAppState().teamContext?.teamName
   if (currentTeamName === request.teamName) {
-    unregisterTeamForSessionCleanup(request.teamName)
+    deps.unregisterTeamForSessionCleanup(request.teamName)
     setLeaderTeamName(sanitizeName(request.teamName))
     return 'already_attached'
   }
 
-  const existingTeam = await readTeamFileAsync(request.teamName)
+  const existingTeam = await deps.readTeamFileAsync(request.teamName)
   if (!existingTeam) {
     return 'missing'
   }
 
-  await updateTeamFileAsync(request.teamName, teamFile => {
+  await deps.updateTeamFileAsync(request.teamName, teamFile => {
     const nextMembers = teamFile.members.map(member =>
       member.agentId === teamFile.leadAgentId
         ? {
@@ -208,7 +251,7 @@ async function ensureLeaderAttachedToTeam(
     }
   })
 
-  const refreshedTeam = (await readTeamFileAsync(request.teamName)) ?? existingTeam
+  const refreshedTeam = (await deps.readTeamFileAsync(request.teamName)) ?? existingTeam
   const teamFilePath = getTeamFilePath(request.teamName)
   setLeaderTeamName(sanitizeName(request.teamName))
   context.setAppState(prev => ({
@@ -281,6 +324,7 @@ export async function runTeamBootstrap(params: {
 }): Promise<TeamBootstrapResult> {
   const now = params.now ?? (() => Date.now())
   const monotonicNow = params.monotonicNow ?? (() => performance.now())
+  const deps = getTeamBootstrapRunnerDeps()
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   const runtimeIdentity = getCurrentTeamBootstrapRuntimeIdentity()
   const timeoutStartedAt = monotonicNow()
@@ -334,6 +378,7 @@ export async function runTeamBootstrap(params: {
         const attachState = await ensureLeaderAttachedToTeam(
           params.request,
           params.context,
+          deps,
         )
         const shouldCreateTeam = shouldCreateTeamForBootstrap({
           mode: params.request.mode,
@@ -348,7 +393,7 @@ export async function runTeamBootstrap(params: {
           await emitBootstrapProgressSafely('phase_changed:creating_team', () =>
             params.emit.phaseChanged('creating_team'),
           )
-          await TeamCreateTool.call(
+          await deps.teamCreateCall(
             {
               team_name: params.request.teamName,
               ...(params.request.description
@@ -358,7 +403,7 @@ export async function runTeamBootstrap(params: {
             params.context,
           )
         }
-        unregisterTeamForSessionCleanup(params.request.teamName)
+        deps.unregisterTeamForSessionCleanup(params.request.teamName)
         await emitBootstrapProgressSafely('team_created', () =>
           params.emit.teamCreated(reusedExistingTeam),
         )
@@ -386,7 +431,7 @@ export async function runTeamBootstrap(params: {
             assertTimeoutBudget(
               `before staggered spawn delay for teammate "${member.displayName}"`,
             )
-            await sleep(spawnDelayMs, undefined, { unref: true })
+            await sleep(spawnDelayMs)
             assertTimeoutBudget(
               `after staggered spawn delay for teammate "${member.displayName}"`,
             )
@@ -402,7 +447,7 @@ export async function runTeamBootstrap(params: {
           try {
             assertPrimaryBootstrapProviderSupported(member)
             const model = normalizeBootstrapModelSelection(member.model)
-            const result = await spawnTeammate(
+            const result = await deps.spawnTeammate(
               {
                 name: member.displayName,
                 prompt: member.prompt,
@@ -512,7 +557,7 @@ export async function runTeamBootstrap(params: {
         )
         assertTimeoutBudget('before auditing bootstrap truth')
         await validateWorkspace('before auditing bootstrap truth')
-        const teamFile = await readTeamFileAsync(params.request.teamName)
+        const teamFile = await deps.readTeamFileAsync(params.request.teamName)
         const registeredMemberNames = new Set(
           (teamFile?.members ?? [])
             .map(member => member.name?.trim())
@@ -579,9 +624,11 @@ export async function runTeamBootstrap(params: {
       },
       now,
     )
+    const terminalSuccessStatus =
+      summary.terminalStatus === 'partial_success' ? 'partial_success' : 'completed'
     await emitBootstrapProgressSafely('completed', () =>
       params.emit.completed({
-        status: summary.terminalStatus,
+        status: terminalSuccessStatus,
         expectedMembers: summary.expectedMembers,
         registeredMembers: summary.registeredMembers,
         failedMembers: summary.failedMembers,

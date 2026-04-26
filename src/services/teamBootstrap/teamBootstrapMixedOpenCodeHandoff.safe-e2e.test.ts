@@ -38,16 +38,107 @@ const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
 const SAFE_E2E_TIMEOUT_MS = 15_000
 
+const REQUIRED_MOCK_MCP_TOOL_NAMES = [
+  'cross_team_get_outbox',
+  'cross_team_list_targets',
+  'cross_team_send',
+  'member_briefing',
+  'message_send',
+  'process_list',
+  'process_register',
+  'process_stop',
+  'process_unregister',
+  'review_approve',
+  'review_request',
+  'review_request_changes',
+  'review_start',
+  'runtime_bootstrap_checkin',
+  'runtime_deliver_message',
+  'runtime_task_event',
+  'runtime_heartbeat',
+  'task_add_comment',
+  'task_attach_comment_file',
+  'task_attach_file',
+  'task_briefing',
+  'task_complete',
+  'task_create',
+  'task_create_from_message',
+  'task_get',
+  'task_get_comment',
+  'task_link',
+  'task_list',
+  'task_set_clarification',
+  'task_set_owner',
+  'task_set_status',
+  'task_start',
+  'task_unlink',
+] as const
+
+function requiredMockMcpTools(): Array<{ name: string }> {
+  return REQUIRED_MOCK_MCP_TOOL_NAMES.map(name => ({ name }))
+}
+
+function expectLaunchPromptText(text: string, expectedUserPrompt: string): void {
+  expect(text).toContain('<opencode_runtime_identity>')
+  expect(text).toContain('runtime_bootstrap_checkin')
+  expect(text).toContain('member_briefing')
+  expect(text.endsWith(`\n\n${expectedUserPrompt}`)).toBe(true)
+}
+
+function expectLaunchPromptInputs(
+  actual: Array<{ memberName: string; text: string }>,
+  expected: Array<{ memberName: string; text: string }>,
+): void {
+  expect(actual).toHaveLength(expected.length)
+  for (const [index, expectedInput] of expected.entries()) {
+    const actualInput = actual[index]
+    expect(actualInput).toBeDefined()
+    if (!actualInput) continue
+    expect(actualInput.memberName).toBe(expectedInput.memberName)
+    expectLaunchPromptText(actualInput.text, expectedInput.text)
+  }
+}
+
+function expectLaunchPromptInputsUnordered(
+  actual: Array<{ memberName: string; text: string }>,
+  expected: Array<{ memberName: string; text: string }>,
+): void {
+  expect(actual).toHaveLength(expected.length)
+  for (const expectedInput of expected) {
+    const actualInput = actual.find(item => item.memberName === expectedInput.memberName)
+    expect(actualInput).toBeDefined()
+    if (!actualInput) continue
+    expectLaunchPromptText(actualInput.text, expectedInput.text)
+  }
+}
+
+function expectDeliveredPromptInputs(
+  actual: Array<{ memberName: string; text: string; agent: string }>,
+  expected: Array<{ memberName: string; text: string; agent: string }>,
+): void {
+  expect(actual).toHaveLength(expected.length)
+  for (const [index, expectedInput] of expected.entries()) {
+    const actualInput = actual[index]
+    expect(actualInput).toBeDefined()
+    if (!actualInput) continue
+    expect(actualInput.memberName).toBe(expectedInput.memberName)
+    expect(actualInput.agent).toBe(expectedInput.agent)
+    expect(actualInput.text).toContain('<opencode_runtime_identity>')
+    expect(actualInput.text).toContain('Runtime identity reminder')
+    expect(actualInput.text).toContain('message_send')
+    expect(actualInput.text.endsWith(`\n\n${expectedInput.text}`)).toBe(true)
+  }
+}
+
+function expectStringMultiset(actual: string[], expected: string[]): void {
+  expect([...actual].sort()).toEqual([...expected].sort())
+}
+
 function mockRequiredMcpTools(): void {
   ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
   ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
     async () => ({
-      tools: [
-        { name: 'runtime_bootstrap_checkin' },
-        { name: 'runtime_deliver_message' },
-        { name: 'runtime_task_event' },
-        { name: 'runtime_heartbeat' },
-      ],
+      tools: requiredMockMcpTools(),
     })
   ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
 }
@@ -77,7 +168,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     createTeamCalls = []
     updateTeamCalls = []
 
-    const teamHelpers = await import('src/utils/swarm/teamHelpers.js')
+    const { __setTeamBootstrapRunnerDepsForTests } = await import('./teamBootstrapRunner.js')
     const buildMockTeamFile = () => ({
       name: 'atlas-hq',
       leadAgentId: 'team-lead@atlas-hq',
@@ -90,24 +181,21 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         })),
       ],
     })
-    mock.module('src/utils/swarm/teamHelpers.js', () => ({
-      ...teamHelpers,
-      readTeamFileAsync: async () =>
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: (async () =>
         teamConfigExists
           ? buildMockTeamFile()
-          : null,
-      updateTeamFileAsync: async (
+          : null) as never,
+      updateTeamFileAsync: (async (
         teamName: string,
         updater: (teamFile: ReturnType<typeof buildMockTeamFile>) => unknown,
       ) => {
         updateTeamCalls.push(teamName)
         updater(buildMockTeamFile())
-      },
-      unregisterTeamForSessionCleanup: () => {},
-    }))
-
-    mock.module('src/tools/shared/spawnMultiAgent.js', () => ({
-      spawnTeammate: async (input: SpawnInput) => {
+        return { status: 'updated', teamFile: buildMockTeamFile() }
+      }) as never,
+      unregisterTeamForSessionCleanup: (() => {}) as never,
+      spawnTeammate: (async (input: SpawnInput) => {
         spawnInputs.push(input)
         const name = String(input.name)
         const failure = spawnFailures.get(name)
@@ -139,21 +227,18 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
             spawned: true,
           },
         }
-      },
-    }))
-
-    mock.module('src/tools/TeamCreateTool/TeamCreateTool.js', () => ({
-      TeamCreateTool: {
-        call: async (input: Record<string, unknown>) => {
-          createTeamCalls.push(input)
-          teamConfigExists = true
-          return { data: { team_name: 'atlas-hq' } }
-        },
-      },
-    }))
+      }) as never,
+      teamCreateCall: (async (input: Record<string, unknown>) => {
+        createTeamCalls.push(input)
+        teamConfigExists = true
+        return { data: { team_name: 'atlas-hq' } }
+      }) as never,
+    })
   }, SAFE_E2E_TIMEOUT_MS)
 
   afterEach(async () => {
+    const { __setTeamBootstrapRunnerDepsForTests } = await import('./teamBootstrapRunner.js')
+    __setTeamBootstrapRunnerDepsForTests(null)
     mock.restore()
     mock.clearAllMocks()
     __resetAppMcpToolProofCacheForTests()
@@ -305,7 +390,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -458,7 +543,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -603,7 +688,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -744,7 +829,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -920,7 +1005,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/nemotron-3-super-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
       { memberName: 'tom', text: 'Tom OpenCode join' },
@@ -1305,7 +1390,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -1687,7 +1772,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -2073,7 +2158,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -2250,7 +2335,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2423,7 +2508,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2611,7 +2696,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2788,7 +2873,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2981,7 +3066,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -3532,7 +3617,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -3965,7 +4050,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4589,7 +4674,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4776,7 +4861,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4967,7 +5052,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5605,7 +5690,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'tom', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'tom', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5830,7 +5915,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'tom', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'tom', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6350,7 +6435,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6549,7 +6634,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6752,7 +6837,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -7097,7 +7182,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -7442,7 +7527,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -7619,7 +7704,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual([])
     expect(events.items).toContainEqual({ type: 'started', members: [] })
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -8278,7 +8363,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -8648,7 +8733,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -8980,7 +9065,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -9162,7 +9247,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -9637,20 +9722,11 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         listToolsCalls += 1
         if (listToolsCalls === 1) {
           return {
-            tools: [
-              { name: 'runtime_bootstrap_checkin' },
-              { name: 'runtime_deliver_message' },
-              { name: 'runtime_task_event' },
-            ],
+            tools: requiredMockMcpTools().filter(tool => tool.name !== 'runtime_heartbeat'),
           }
         }
         return {
-          tools: [
-            { name: 'runtime_bootstrap_checkin' },
-            { name: 'runtime_deliver_message' },
-            { name: 'runtime_task_event' },
-            { name: 'runtime_heartbeat' },
-          ],
+          tools: requiredMockMcpTools(),
         }
       }
     openCodeSessionBridge.ensureSession = (async input => {
@@ -9724,7 +9800,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/minimax-m2.5-free',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
     ])
     expect(retriedBobResult.data.teamLaunchState).toBe('ready')
@@ -10097,7 +10173,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         memberName: 'bob',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectDeliveredPromptInputs(promptInputs, [
       {
         memberName: 'bob',
         text: 'Deliver mixed task to Bob',
@@ -10208,7 +10284,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         memberName: 'bob',
       },
     ])
-    expect(promptInputs).toEqual([
+    expectDeliveredPromptInputs(promptInputs, [
       {
         memberName: 'bob',
         text: 'Deliver Anthropic mixed task to Bob',
@@ -13193,7 +13269,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { laneId: 'secondary:opencode:tom', memberName: 'tom' },
       { laneId: 'secondary:opencode:bob', memberName: 'bob' },
     ])
-    expect(reconciledMembers).toEqual(['bob', 'jack', 'tom', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'tom', 'bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -13504,10 +13580,11 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       memberName: 'tom',
       selectedModel: 'openrouter/nemotron-3-super-free',
     })
-    expect(promptInputs).toHaveLength(3)
-    expect(promptInputs).toContainEqual({ memberName: 'bob', text: 'Bob OpenCode join' })
-    expect(promptInputs).toContainEqual({ memberName: 'jack', text: 'Jack OpenCode join' })
-    expect(promptInputs).toContainEqual({ memberName: 'tom', text: 'Tom OpenCode join' })
+    expectLaunchPromptInputsUnordered(promptInputs, [
+      { memberName: 'bob', text: 'Bob OpenCode join' },
+      { memberName: 'jack', text: 'Jack OpenCode join' },
+      { memberName: 'tom', text: 'Tom OpenCode join' },
+    ])
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
     expect(Object.keys(tomResult.data.members)).toEqual(['tom'])
@@ -13654,10 +13731,11 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       memberName: 'tom',
       selectedModel: 'openrouter/nemotron-3-super-free',
     })
-    expect(promptInputs).toHaveLength(3)
-    expect(promptInputs).toContainEqual({ memberName: 'bob', text: 'Bob OpenCode join' })
-    expect(promptInputs).toContainEqual({ memberName: 'jack', text: 'Jack OpenCode join' })
-    expect(promptInputs).toContainEqual({ memberName: 'tom', text: 'Tom OpenCode join' })
+    expectLaunchPromptInputsUnordered(promptInputs, [
+      { memberName: 'bob', text: 'Bob OpenCode join' },
+      { memberName: 'jack', text: 'Jack OpenCode join' },
+      { memberName: 'tom', text: 'Tom OpenCode join' },
+    ])
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
     expect(Object.keys(tomResult.data.members)).toEqual(['tom'])

@@ -47,7 +47,14 @@ describe('OpenCodeMcpManager', () => {
 
   test('reattaches an existing app MCP server when the forced Claude root changed', async () => {
     let addCalls = 0
-    let currentMcp = {
+    let currentMcp: Record<
+      string,
+      {
+        connected: boolean
+        command?: string[]
+        environment?: Record<string, string>
+      }
+    > = {
       'agent-teams': {
         connected: true,
         command: ['node', '/tmp/agent-teams-mcp.js'],
@@ -369,6 +376,14 @@ describe('OpenCodeMcpManager', () => {
       normalizedRoots[0].endsWith(
         '/repo/_worktrees/claude_team_opencode_semantic_messaging',
       ),
+    ).toBe(true)
+    expect(
+      normalizedRoots[1].endsWith(
+        '/repo/_worktrees/claude_agent_teams_ui_opencode_semantic_messaging',
+      ),
+    ).toBe(true)
+    expect(
+      normalizedRoots.some(root => root.endsWith('/repo/claude_agent_teams_ui')),
     ).toBe(true)
     expect(normalizedRoots.some(root => root.endsWith('/repo/claude_team'))).toBe(
       true,
