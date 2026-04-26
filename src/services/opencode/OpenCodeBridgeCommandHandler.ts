@@ -23,6 +23,7 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
+import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 
 import type {
   OpenCodePendingPermission,
@@ -51,6 +52,7 @@ const SUPPORTED_COMMANDS = [
   'opencode.answerPermission',
   'opencode.listRuntimePermissions',
   'opencode.getRuntimeTranscript',
+  'opencode.backfillTaskLedger',
   'opencode.recoverDeliveryJournal',
 ] as const
 
@@ -1791,6 +1793,23 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runListPermissions(envelope)
     case 'opencode.getRuntimeTranscript':
       return runTranscript(envelope)
+    case 'opencode.backfillTaskLedger': {
+      const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+      const result = await openCodeLedgerBridgeService.backfill({
+        teamId: asString(envelope.body.teamId) ?? undefined,
+        teamName: asString(envelope.body.teamName) ?? asString(envelope.body.teamId) ?? '',
+        taskId: asString(envelope.body.taskId) ?? undefined,
+        taskDisplayId: asString(envelope.body.taskDisplayId) ?? undefined,
+        memberName: asString(envelope.body.memberName) ?? undefined,
+        laneId: asString(envelope.body.laneId) ?? undefined,
+        projectDir: asString(envelope.body.projectDir) ?? undefined,
+        workspaceRoot: asString(envelope.body.workspaceRoot) ?? undefined,
+        deliveryContextPath: asString(envelope.body.deliveryContextPath) ?? undefined,
+        attributionMode: asString(envelope.body.attributionMode) === 'strict-delivery' ? 'strict-delivery' : 'compatible',
+        dryRun: envelope.body.dryRun === true,
+      })
+      return { snapshot, data: result }
+    }
     case 'opencode.commandStatus': {
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
       return {

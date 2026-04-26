@@ -6,9 +6,9 @@ Date: 2026-04-26
 
 Chosen direction: **keep OpenCode `snapshot: false`, build our own OpenCode Ledger Bridge from completed `write` / `edit` toolparts**.
 
-Rating after this hardening pass: 🎯 9.4   🛡️ 9.6   🧠 8.8
+Rating after this hardening pass: 🎯 9.5   🛡️ 9.6   🧠 9.0
 
-Expected scope: roughly **2500-4700 LOC** including tests and fixtures. The increase is mostly from the platform path adapter, SQLite snapshot-read discipline, trigger state machine tests, text availability matrix, immutable import policy, source fingerprint invalidation, explicit project-dir tests, desktop bridge-contract tests, OpenCode delivery-context tests, and fixture coverage for stale OpenCode sessions.
+Expected scope: roughly **2800-5400 LOC** including tests and fixtures. The increase is mostly from the platform path adapter, SQLite snapshot-read discipline, bounded JSON row handling, trigger state machine tests, text availability matrix, immutable import policy, source fingerprint invalidation, workspace identity gates, explicit project-dir tests, desktop bridge-contract tests, OpenCode delivery-context tests, and fixture coverage for stale OpenCode sessions.
 
 The goal is to make OpenCode teammate file changes visible through the same Task Change Ledger path used by the rest of the app. OpenCode SQLite is only an input/recovery source. The UI should continue reading `.board-task-changes/**` through `TaskChangeLedgerReader`, and review/apply/reject should continue using strict ledger-native semantics.
 
@@ -288,6 +288,21 @@ These are the parts with the lowest certainty. The implementation should treat t
 12. **Partial multi-task import failure** - 🎯 8.7   🛡️ 9.2   🧠 7.0 - roughly 120-260 LOC.
     Weakness: one task's import can fail after another task from the same backfill command succeeded. Fix: import atomically per task under the task ledger lock, return partial outcome with per-task counts, and rely on source-key idempotency for retry.
 
+13. **Workspace identity mismatch** - 🎯 8.8   🛡️ 9.7   🧠 7.2 - roughly 180-380 LOC.
+    Weakness: the same team name can theoretically point at a different project later, while old OpenCode session records still exist. Fix: automatic UI backfill requires the OpenCode record `projectPath` to match the current log-source workspace identity, after platform-aware normalization and optional Git/head metadata checks. Mismatches become diagnostics or manual dry-run only.
+
+14. **Oversized SQLite JSON before parsing** - 🎯 8.6   🛡️ 9.3   🧠 7.0 - roughly 160-340 LOC.
+    Weakness: the `part.data` JSON can contain full file contents, so blindly parsing every row can create CPU/memory spikes. Fix: query `length(data)` first, cap row size and total bytes, parse only candidate rows when possible, and degrade oversized write rows to metadata-only only when file path/content status can still be safely extracted.
+
+15. **Cross-session ordering** - 🎯 8.3   🛡️ 9.1   🧠 8.0 - roughly 180-420 LOC.
+    Weakness: multiple OpenCode sessions for the same member/lane can contain writes to the same file. Fix: reconstruct state per session by default. Do not carry file state across sessions unless a future source proves continuity. Historical ordering across sessions is for display only, not for reconstructing before-content.
+
+16. **Read-trigger side effects** - 🎯 8.7   🛡️ 9.2   🧠 6.8 - roughly 140-300 LOC.
+    Weakness: opening Changes normally feels read-only, but backfill writes ledger artifacts. Fix: feature flag, capability gate, bounded timeout, count-only diagnostics, and a manual retry/debug path. Failed recovery must fall back to the old read path without changing non-OpenCode tasks.
+
+17. **Stale absolute paths in ledger** - 🎯 8.5   🛡️ 9.3   🧠 6.2 - roughly 120-260 LOC.
+    Weakness: imported historical file paths can point to a workspace that was moved or deleted. Fix: automatic import requires the workspace root to exist and match current team context. Manual dry-run can report stale paths, but v1 should not write reviewable file events to dead roots.
+
 ## Privacy and Diagnostics Contract
 
 The bridge reads local OpenCode storage and task delivery metadata, so diagnostics must stay conservative.
@@ -340,10 +355,13 @@ type OpenCodeBackfillSourceFingerprint = {
   teamName: string
   taskId?: string
   projectDir: string
+  workspaceIdentityHash?: string
   sessionStoreMtimeMs?: number
   sessionStoreSizeBytes?: number
   sqliteDbMtimeMs?: number
   sqliteDbSizeBytes?: number
+  sqliteWalMtimeMs?: number
+  sqliteWalSizeBytes?: number
   deliveryContextGeneration?: string
   logSourceGeneration?: string
 }
@@ -383,6 +401,28 @@ await importTaskChangeLedgerEvents({
 ```
 
 If this contract is wrong, the CLI may successfully create ledger artifacts that the desktop UI never sees. Tests must assert this directly by writing into a temp `projectDir` that differs from `workspaceRoot`.
+
+### Workspace Identity Contract
+
+This is separate from the storage root contract. `projectDir` decides where ledger artifacts live. `workspaceRoot` decides which real files review actions will mutate. OpenCode session records also contain `record.projectPath`. Automatic UI backfill must prove these point at the same current workspace.
+
+Required automatic-backfill checks:
+
+- `record.projectPath` is absolute.
+- `record.projectPath` exists on disk.
+- `record.projectPath` matches the current team/log-source workspace root after platform-aware normalization.
+- If both paths exist, compare `realpath` results as an additional guard.
+- If the directory is a Git repo, include `git rev-parse --show-toplevel` and `HEAD` in debug-only diagnostics/fingerprint when cheap. Do not require Git for non-Git projects.
+- If the workspace is a teammate worktree, use the worktree root as `workspaceRoot`, not the leader repo root.
+- If the team context has no trustworthy workspace root, automatic backfill must skip and return `unsafe-input` or `no-workspace-identity`.
+
+Manual CLI behavior:
+
+- `--dry-run` may inspect stale records and report what would be imported.
+- Non-dry-run manual import should require explicit `--project-dir` and either `--workspace-root` or a validated session record project path.
+- If the path no longer exists, manual non-dry-run should refuse by default. A future explicit `--allow-stale-paths` could import metadata-only diagnostics, but v1 should not add it.
+
+Why this is strict: a stale OpenCode session-store entry from another project with the same team/member names must never create Changes rows that apply/reject against the wrong workspace.
 
 ## Identity and Lane Contract
 
@@ -494,6 +534,8 @@ SQLite safety defaults:
 - Never run `VACUUM`, checkpoint, migration, or write pragmas.
 - Treat `SQLITE_BUSY`, missing DB, missing WAL, corrupt DB, and schema drift as diagnostics.
 - Cap read volume: for example max 20,000 messages, 80,000 parts, 256 KiB prompt text scanned per parent message, 4 MiB total tool input content per import batch before degrading to metadata-only.
+- Cap raw row `data` length before JSON parse. Query `length(data)` with each row and skip or degrade rows above the per-row limit.
+- Prefer two-stage reads for change backfill: first fetch lightweight ids/timestamps/tool names when possible, then fetch full `data` only for candidate messages/parts needed for attribution and write/edit reconstruction.
 - Sort by `time_created asc, id asc`; observed `time_created`/`time_updated` are Unix milliseconds.
 - Do not rely on SQLite rowid, because it is not part of the contract.
 - Close the DB handle before deleting any temp fixture directory, especially on Windows.
@@ -531,6 +573,16 @@ Schema drift handling:
 - If multiple sessions share a profile and rows cannot be scoped to the requested session, return diagnostics and skip import.
 - Capture a DB stat fingerprint before and after the read transaction. If size/mtime changes during the read but the transaction succeeds, keep the snapshot result and include a warning count. If the transaction cannot start, skip import.
 
+Bounded JSON strategy:
+
+1. Read candidate row ids using `session_id`, `time_created`, `id`, `message_id`, and `length(data)`.
+2. Reject rows above the absolute raw JSON limit before `JSON.parse`.
+3. Parse parent user messages only up to the prompt scan cap.
+4. Parse assistant/tool parts only if they are candidate tool rows for `write` or `edit`.
+5. For oversized `write` rows, do not parse the huge content just to extract a diff. If the row cannot be parsed within limits, emit diagnostic and skip rather than risking a memory spike.
+
+This means some enormous OpenCode writes may not appear in v1. That is better than making task rendering block or crash.
+
 ## New Components
 
 ### 1. OpenCodeOfflineSessionReader
@@ -563,12 +615,15 @@ import type { OpenCodeMessage, OpenCodeSessionRecord } from './types.js'
 
 const MAX_OPENCODE_MESSAGES_PER_SESSION = 20_000
 const MAX_OPENCODE_PARTS_PER_SESSION = 80_000
+const MAX_OPENCODE_MESSAGE_JSON_BYTES = 256 * 1024
+const MAX_OPENCODE_PART_JSON_BYTES = 2 * 1024 * 1024
 
 type OpenCodeSqliteMessageRow = {
   id: string
   session_id: string
   time_created: number
   time_updated: number
+  dataLengthBytes: number
   data: string
 }
 
@@ -578,6 +633,7 @@ type OpenCodeSqlitePartRow = {
   session_id: string
   time_created: number
   time_updated: number
+  dataLengthBytes: number
   data: string
 }
 
@@ -614,21 +670,32 @@ export class OpenCodeOfflineSessionReader {
     }
 
     const db = new Database(dbPath, { readonly: true })
+    let transactionOpen = false
     try {
       db.exec('PRAGMA query_only = ON')
       db.exec('PRAGMA busy_timeout = 1000')
       this.assertSchema(db)
+      db.exec('BEGIN')
+      transactionOpen = true
       const rawMessages = db.query(
-        'select id, session_id, time_created, time_updated, data from message where session_id = ? order by time_created asc, id asc',
+        'select id, session_id, time_created, time_updated, length(data) as dataLengthBytes, data from message where session_id = ? order by time_created asc, id asc',
       ).all(record.opencodeSessionId) as OpenCodeSqliteMessageRow[]
       const rawParts = db.query(
-        'select id, message_id, session_id, time_created, time_updated, data from part where session_id = ? order by time_created asc, id asc',
+        'select id, message_id, session_id, time_created, time_updated, length(data) as dataLengthBytes, data from part where session_id = ? order by time_created asc, id asc',
       ).all(record.opencodeSessionId) as OpenCodeSqlitePartRow[]
+      db.exec('COMMIT')
+      transactionOpen = false
       if (rawMessages.length > MAX_OPENCODE_MESSAGES_PER_SESSION) {
         throw new Error(`OpenCode SQLite message cap exceeded for ${record.opencodeSessionId}`)
       }
       if (rawParts.length > MAX_OPENCODE_PARTS_PER_SESSION) {
         throw new Error(`OpenCode SQLite part cap exceeded for ${record.opencodeSessionId}`)
+      }
+      if (rawMessages.some(row => row.dataLengthBytes > MAX_OPENCODE_MESSAGE_JSON_BYTES)) {
+        throw new Error(`OpenCode SQLite message row cap exceeded for ${record.opencodeSessionId}`)
+      }
+      if (rawParts.some(row => row.dataLengthBytes > MAX_OPENCODE_PART_JSON_BYTES)) {
+        throw new Error(`OpenCode SQLite part row cap exceeded for ${record.opencodeSessionId}`)
       }
 
       return {
@@ -640,6 +707,13 @@ export class OpenCodeOfflineSessionReader {
         diagnostics: [],
       }
     } finally {
+      if (transactionOpen) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          // Best-effort cleanup before closing the read-only handle.
+        }
+      }
       db.close()
     }
   }
@@ -1518,7 +1592,7 @@ export class OpenCodeLedgerBridgeService {
     taskId?: string
     taskDisplayId?: string
     memberName?: string
-    projectPath?: string
+    workspaceRoot?: string
     projectDir?: string
     deliveryContextPath?: string
     dryRun?: boolean
@@ -1542,6 +1616,16 @@ export class OpenCodeLedgerBridgeService {
     }
 
     for (const record of records) {
+      const workspace = await this.validateWorkspaceIdentity({
+        record,
+        workspaceRoot: params.workspaceRoot,
+        dryRun: params.dryRun === true,
+      })
+      if (!workspace.ok) {
+        result.skippedEvents += 1
+        result.diagnostics.push(workspace.diagnostic)
+        continue
+      }
       const offline = await this.offlineReader.readSession(record)
       if (!offline) {
         result.diagnostics.push(`No OpenCode SQLite history for ${record.memberName}/${record.opencodeSessionId}`)
@@ -1573,7 +1657,7 @@ export class OpenCodeLedgerBridgeService {
           scope: buildRecoveredScope(taskId),
           sessionId: record.opencodeSessionId,
           memberName: record.memberName,
-          workspaceRoot: record.projectPath,
+          workspaceRoot: workspace.workspaceRoot,
           toolStatus: 'succeeded',
           changes: changes.map(toLedgerExactFileChange),
         })
@@ -1593,6 +1677,9 @@ Backfill guardrails:
 
 - Reject relative `projectDir`.
 - Reject relative `workspaceRoot`.
+- Automatic UI backfill must pass the current workspace root from desktop/log-source context.
+- Validate `record.projectPath` against `workspaceRoot` before reading SQLite rows for that record.
+- If `record.projectPath` does not match the current workspace identity, skip the record with `unsafe-input`.
 - Validate `teamId/teamName`: if both are present and differ, fail closed.
 - Reject session records whose `projectPath` is absent.
 - Filter records by `teamName`, `memberName`, `laneId`, and `taskId` before reading large SQLite payloads when possible.
@@ -1702,6 +1789,7 @@ type OpenCodeBackfillTaskLedgerCommandBody = {
   memberName?: string
   laneId?: string
   projectDir: string
+  workspaceRoot?: string
   deliveryContextPath?: string
   dryRun?: boolean
 }
@@ -1716,7 +1804,7 @@ This should be a regular bridge command handled by `bridge.execute`, not `execut
 Also add a manual command:
 
 ```bash
-./cli-dev runtime opencode-ledger-backfill --json --team vector-room-10000 --task 131aea9a --project-dir /path/to/claude-project-dir
+./cli-dev runtime opencode-ledger-backfill --json --team vector-room-10000 --task 131aea9a --project-dir /path/to/claude-project-dir --workspace-root /path/to/workspace
 ```
 
 Optional args:
@@ -1726,11 +1814,14 @@ Optional args:
 - `--task-display-id`
 - `--member`
 - `--project-dir`
+- `--workspace-root`
 - `--delivery-context`
 - `--dry-run`
 - `--output`
 
 `--project-dir` is required when desktop invokes the command. It is optional only for manual CLI usage, where the command can fall back to `CLAUDE_CODE_TASK_LEDGER_PROJECT_DIR` or the current session project dir. The command should reject relative `--project-dir` values.
+
+`--workspace-root` is required for automatic desktop invocation. Manual non-dry-run should require it unless a single validated OpenCode session record supplies `projectPath`. The command should reject relative `--workspace-root` values.
 
 `--delivery-context` is optional and should point to a small desktop-generated JSON file, not the whole team directory. It can include prompt-delivery ledger records for the requested team/member/task. The CLI must treat it as untrusted input and validate the schema.
 
@@ -1819,6 +1910,7 @@ interface OpenCodeLedgerBackfillPort {
     taskId: string
     taskDisplayId?: string
     projectDir: string
+    workspaceRoot: string
     memberName?: string
     laneId?: string
     deliveryContextPath?: string
@@ -1835,6 +1927,7 @@ interface OpenCodeLedgerBackfillPort {
 - The port should check the bridge handshake/accepted commands once and cache the result for a short TTL. If `opencode.backfillTaskLedger` is not accepted, it must return a skipped result rather than trying the command.
 - Use task metadata owner and runtime roster metadata to pass `memberName/laneId` when known. If not known, omit them and let orchestrator scan records strictly.
 - Pass `projectDir` from `TeamMemberLogsFinder.getLogSourceWatchContext()` to the bridge command. Do not infer it from the target repo path.
+- Pass `workspaceRoot` from the same log-source/team context. Do not let orchestrator infer it from a stale OpenCode session record during automatic UI backfill.
 - Pass `taskDisplayId` when available so the orchestrator can safely match constrained `#displayId` follow-up prompts for a single requested task.
 - Optionally write a temp delivery-context JSON containing relevant prompt-delivery records and pass it via `--delivery-context`.
 - Retry ledger read once after backfill.
@@ -1858,6 +1951,9 @@ ledger has OpenCode import marker/manual-only file event
 
 summaryOnly + no file events + OpenCode session evidence + no negative cache
   -> enqueue one backfill, return current result immediately
+
+no trustworthy workspaceRoot or workspace identity mismatch
+  -> do not backfill automatically, set short unsafe-input cache, keep current result
 
 detail + no file events + OpenCode session evidence + no negative cache
   -> await one bounded backfill, invalidate cache, retry ledger once
@@ -2432,6 +2528,8 @@ Work:
   - profileRootKey traversal or absolute path is rejected before DB open.
   - rows are scoped by `session_id`; ambiguous unscoped rows are skipped.
   - DB stat fingerprint changing during a successful read records a warning but keeps the transaction snapshot.
+  - raw row `data` length cap is enforced before JSON parse.
+  - oversized part rows are skipped with diagnostic instead of being parsed.
   - missing table/column returns diagnostics instead of throwing through UI.
   - row caps stop oversized sessions with diagnostics.
   - malformed SQLite rows are skipped with diagnostics.
@@ -2548,6 +2646,8 @@ Tests:
 - repeated import with changed reconstruction classification still skips by source key.
 - improved fixture with same source key returns `duplicates-only` and does not mutate old journal lines.
 - explicit `projectDir` writes artifacts outside `workspaceRoot`.
+- automatic import rejects workspace identity mismatch between desktop `workspaceRoot` and OpenCode `record.projectPath`.
+- automatic import rejects missing/deleted `workspaceRoot`; dry-run reports diagnostics only.
 - explicit Windows-style `projectDir` metadata is preserved and desktop can read the generated bundle fixture.
 - source import key duplicate detection treats `C:\Repo\File.ts` and `c:\repo\file.ts` as the same Windows file but preserves the original event path.
 - artifact filenames are hash/safe-encoded for Windows reserved names and long ids.
@@ -2601,6 +2701,8 @@ Tests:
 - malformed DB rows return diagnostics, no crash.
 - temp `projectDir` differs from `workspaceRoot`, and desktop-readable artifacts are written to `projectDir`.
 - CLI rejects relative `--project-dir`.
+- CLI rejects relative `--workspace-root`.
+- automatic desktop bridge body includes both `projectDir` and `workspaceRoot`.
 - CLI accepts `--project-dir` containing spaces when passed as argv/envelope.
 - CLI accepts Windows-style paths in fixture tests without using host `path` incorrectly.
 - temp delivery context uses `os.tmpdir()` and is deleted in `finally`.
@@ -2653,6 +2755,7 @@ Tests:
 - deterministic no-history/no-attribution result sets short negative cache.
 - source fingerprint change invalidates negative cache.
 - manual refresh bypasses negative cache for the current task.
+- unsafe workspace identity result does not show a fake Changes button.
 - backfill is skipped when bridge handshake does not advertise `opencode.backfillTaskLedger`.
 - task owner/lane metadata is passed when available.
 - no OpenCode session records means no backfill attempt.
@@ -2741,7 +2844,10 @@ Fixtures to create:
 - `opencode-folder-name-not-task-attribution.json`
 - `opencode-multi-task-parent-prompt-skipped.json`
 - `opencode-malformed-json-row.json`
+- `opencode-oversized-json-row-skipped.json`
 - `opencode-project-dir-differs-from-workspace-root.json`
+- `opencode-workspace-identity-mismatch-rejected.json`
+- `opencode-workspace-root-missing-dry-run-only.json`
 - `opencode-same-timestamp-toolparts.json`
 - `opencode-oversized-toolpart-content.json`
 - `opencode-truncated-toolpart-no-hash.json`
@@ -2835,6 +2941,8 @@ Minimum bar:
 - Offline logs fallback covered by tests.
 - Reconstructor covered by real minimized fixtures.
 - SQLite reader uses a consistent read transaction and validates profileRootKey containment.
+- SQLite reader caps raw JSON row sizes before parse.
+- Automatic backfill validates workspace identity before writing any ledger events.
 - Reconstructor uses platform path adapter and comparison-key state tracking.
 - Text availability matrix is enforced for exact, unknown-before, large, binary, and truncated content.
 - Ledger import idempotent.
@@ -2847,6 +2955,7 @@ Minimum bar:
 - Desktop lazy trigger cannot loop forever on zero-event results.
 - Negative cache invalidates on source fingerprint changes.
 - Historical imported changes remain visible even when current disk has moved on; review handles that as conflict.
+- Workspace identity mismatch fails closed and does not create fake Changes presence.
 - No changes to non-OpenCode agent paths.
 - Windows-style path fixtures pass on non-Windows CI through the bridge path adapter.
 - Native `windows-latest` smoke passes for path, CRLF, safe artifact names, and bridge argv handling.
@@ -2868,18 +2977,21 @@ Estimated readiness after implementation:
 - Multi-task prompts without a single-task proof are intentionally skipped, even if a human could infer ownership from file names.
 - V1 does not upgrade old imported events in place. Future enrichment needs an explicit supersede contract.
 - Negative cache can still delay recovery briefly after OpenCode data changes if filesystem mtimes are coarse, so manual refresh must bypass it.
+- Very large OpenCode JSON rows may be skipped rather than parsed. This can miss huge writes until a future streaming/snapshot source exists.
+- Automatic UI backfill skips stale/moved workspaces. Manual dry-run can diagnose them, but v1 does not create reviewable events for dead absolute paths.
 
 ## Recommended Final Sequence
 
-1. Implement `OpenCodeOfflineSessionReader`.
+1. Implement `OpenCodeOfflineSessionReader` with transaction, session scoping, profile containment, and raw row caps.
 2. Wire it as fallback in `OpenCodeSessionBridge.projectLogMessages`.
-3. Implement the platform path adapter and Windows/CRLF fixtures.
-4. Implement dry-run reconstructor and fixtures.
-5. Add explicit ledger import API.
-6. Implement `OpenCodeLedgerBridgeService`.
-7. Add `opencode.backfillTaskLedger` bridge command.
-8. Add manual CLI wrapper for debugging.
-9. Add desktop lazy trigger with summary enqueue/detail blocking.
-10. Run e2e on `signal-ops-10` and `vector-room-10000`.
-11. Run native Windows CI smoke.
-12. Only then consider optional `snapshot: true` for future OpenCode teams as opt-in.
+3. Implement workspace identity validation.
+4. Implement the platform path adapter and Windows/CRLF fixtures.
+5. Implement dry-run reconstructor and fixtures.
+6. Add explicit ledger import API.
+7. Implement `OpenCodeLedgerBridgeService`.
+8. Add `opencode.backfillTaskLedger` bridge command.
+9. Add manual CLI wrapper for debugging.
+10. Add desktop lazy trigger with summary enqueue/detail blocking and source fingerprint cache invalidation.
+11. Run e2e on `signal-ops-10` and `vector-room-10000`.
+12. Run native Windows CI smoke.
+13. Only then consider optional `snapshot: true` for future OpenCode teams as opt-in.

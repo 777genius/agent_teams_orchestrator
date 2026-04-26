@@ -1036,6 +1036,100 @@ describe('OpenCodeSessionBridge', () => {
     expect(staleMarks).toEqual([])
   })
 
+  test('recovers stale session log projection from offline SQLite when live history read fails', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'updated',
+        markStale: async () => buildRecord({ staleReason: 'resolved_behavior_changed' }),
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => {
+            throw new Error('live history unavailable')
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      offlineReader: {
+        readSession: async () => ({
+          source: 'opencode-sqlite',
+          dbPath: '/tmp/state.db',
+          dbFingerprint: { dbMtimeMs: 1, dbSizeBytes: 1 },
+          rawMessages: [],
+          rawParts: [],
+          messages: [
+            {
+              info: {
+                id: 'msg-user-offline-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'offline prompt' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-offline-1',
+                role: 'assistant',
+                parentID: 'msg-user-offline-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'Offline recovered answer' }],
+            },
+          ],
+          diagnostics: ['offline row cap ok'],
+        }),
+      },
+    })
+
+    const result = await bridge.projectLogMessages(
+      buildRecord({ staleReason: 'resolved_behavior_changed' }),
+    )
+
+    expect(result.summary.reconcileOutcome).toBe('stale')
+    expect(result.summary.messageCount).toBe(2)
+    expect(result.summary.latestAssistantText).toBe('Offline recovered answer')
+    expect(result.summary.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('recovered historical messages from local SQLite store'),
+        expect.stringContaining('live history unavailable'),
+        'offline row cap ok',
+      ]),
+    )
+    expect(result.logProjection.projectedMessageCount).toBe(2)
+  })
+
   test('observes preview without mutating durable session state', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const bridge = new OpenCodeSessionBridge({

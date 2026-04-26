@@ -72,9 +72,9 @@ const DEFERRED_SHELL_SNAPSHOT_RECOVERY_WARNING =
 const DEFERRED_SHELL_SNAPSHOT_MEMORY_ONLY_WARNING =
   'Task change ledger could not persist deferred shell snapshot; recovery is memory-only.'
 
-type TaskChangeConfidence = 'exact' | 'high' | 'medium' | 'low' | 'ambiguous'
-type TaskChangeOperation = 'create' | 'modify' | 'delete'
-type TaskChangeSource =
+export type TaskChangeConfidence = 'exact' | 'high' | 'medium' | 'low' | 'ambiguous'
+export type TaskChangeOperation = 'create' | 'modify' | 'delete'
+export type TaskChangeSource =
   | 'file_edit'
   | 'file_write'
   | 'notebook_edit'
@@ -82,9 +82,11 @@ type TaskChangeSource =
   | 'shell_snapshot'
   | 'powershell_snapshot'
   | 'post_tool_hook_snapshot'
+  | 'opencode_toolpart_write'
+  | 'opencode_toolpart_edit'
 export type TaskChangeToolStatus = 'succeeded' | 'failed' | 'killed' | 'backgrounded'
 
-type ResolvedTaskScope = {
+export type ResolvedTaskScope = {
   taskId: string
   task: BoardTaskLocator
   phase: BoardTaskPhase
@@ -143,6 +145,17 @@ type TaskChangeEventV1 = {
   replaceAll?: boolean
   structuredPatch?: unknown
   warnings?: string[]
+  sourceRuntime?: 'opencode'
+  sourceProvider?: 'opencode'
+  sourceSessionId?: string
+  sourcePartId?: string
+  sourceMessageId?: string
+  parentUserMessageId?: string
+  attributionMethod?: 'parent-taskrefs-exact' | 'delivery-ledger-taskrefs' | 'requested-task-marker'
+  sourceImportKey?: string
+  importedAt?: string
+  importBatchId?: string
+  importSchemaVersion?: 1
 }
 
 type TaskChangeNoticeV1 = {
@@ -294,7 +307,7 @@ type JournalReadResult<T> = {
   recovered: boolean
 }
 
-type ExactFileChange = {
+export type ExactFileChange = {
   filePath: string
   beforeContent: string | null
   afterContent: string | null
@@ -309,6 +322,20 @@ type ExactFileChange = {
   replaceAll?: boolean
   structuredPatch?: unknown
   warnings?: string[]
+}
+
+export type ImportedOpenCodeFileChange = ExactFileChange & {
+  source: Extract<TaskChangeSource, 'opencode_toolpart_write' | 'opencode_toolpart_edit'>
+  toolUseId: string
+  timestamp: string
+  sourceImportKey: string
+  sourceRuntime?: 'opencode'
+  sourceSessionId?: string
+  sourcePartId?: string
+  sourceMessageId?: string
+  parentUserMessageId?: string
+  attributionMethod?: TaskChangeEventV1['attributionMethod']
+  importBatchId?: string
 }
 
 type ShellSnapshotFile = {
@@ -2097,6 +2124,198 @@ async function persistEvents(changes: ExactFileChange[], params: {
       },
     })
   })
+}
+
+function buildImportedEventId(sourceImportKey: string): string {
+  return `opencode-import-${sha256(sourceImportKey).slice(0, 32)}`
+}
+
+async function readExistingSourceImportKeys(taskId: string, projectDir: string): Promise<Set<string>> {
+  const existing = await readTaskEvents(taskId, projectDir)
+  const keys = new Set<string>()
+  for (const event of existing.entries) {
+    if (event.sourceImportKey) {
+      keys.add(event.sourceImportKey)
+      continue
+    }
+    if (event.sourceRuntime && event.sourceSessionId && event.sourcePartId) {
+      keys.add([
+        event.sourceRuntime,
+        event.sourceSessionId,
+        event.sourcePartId,
+        normalizeLedgerPathForKey(event.filePath),
+      ].join('\0'))
+    }
+  }
+  return keys
+}
+
+export async function importTaskChangeLedgerEvents(params: {
+  projectDir?: string
+  scope: ResolvedTaskScope
+  sessionId: string
+  agentId?: AgentId
+  memberName?: string
+  workspaceRoot: string
+  toolStatus: TaskChangeToolStatus
+  changes: ImportedOpenCodeFileChange[]
+}): Promise<{
+  importedFilePaths: string[]
+  importedEventCount: number
+  skippedDuplicateCount: number
+  skippedUnsafeCount: number
+  diagnostics: string[]
+}> {
+  const projectDir = params.projectDir && isAbsolute(params.projectDir)
+    ? params.projectDir
+    : getLedgerProjectDir()
+  const diagnostics: string[] = []
+  if (!isAbsolute(params.workspaceRoot)) {
+    return {
+      importedFilePaths: [],
+      importedEventCount: 0,
+      skippedDuplicateCount: 0,
+      skippedUnsafeCount: params.changes.length,
+      diagnostics: ['OpenCode ledger import skipped because workspaceRoot is not absolute.'],
+    }
+  }
+
+  const existingSourceKeys = await readExistingSourceImportKeys(params.scope.taskId, projectDir)
+  const importedFilePaths: string[] = []
+  let skippedDuplicateCount = 0
+  let skippedUnsafeCount = 0
+  const events: TaskChangeEventV1[] = []
+  const worktreeMetadata = getLedgerWorktreeMetadata(params.workspaceRoot)
+  const importedAt = new Date().toISOString()
+
+  for (const change of params.changes) {
+    if (existingSourceKeys.has(change.sourceImportKey)) {
+      skippedDuplicateCount += 1
+      continue
+    }
+    const filePath = normalizeFilePath(change.filePath, params.workspaceRoot)
+    if (!isSameOrDescendantPath(filePath, params.workspaceRoot)) {
+      skippedUnsafeCount += 1
+      diagnostics.push(`OpenCode ledger import skipped outside-workspace path ${filePath}.`)
+      continue
+    }
+    if (change.beforeContent !== null && change.afterContent !== null) {
+      if (sha256(change.beforeContent) === sha256(change.afterContent)) {
+        skippedUnsafeCount += 1
+        continue
+      }
+    }
+    const before = await buildContentRef(change.beforeContent, projectDir)
+    const after = await buildContentRef(change.afterContent, projectDir)
+    const operation = change.operation ??
+      operationForContents(change.beforeContent, change.afterContent)
+    const beforeState = defaultStateForSide(
+      change.beforeState,
+      before,
+      change.beforeContent,
+      operation,
+      'before',
+    )
+    const afterState = defaultStateForSide(
+      change.afterState,
+      after,
+      change.afterContent,
+      operation,
+      'after',
+    )
+    const lineStats = canUseSnippetLineStats(change)
+      ? countLineChanges(
+          change.oldString ?? change.beforeContent,
+          change.newString ?? change.afterContent,
+        )
+      : { added: 0, removed: 0 }
+    const eventBase: Omit<TaskChangeEventV1, 'eventId'> = {
+      schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
+      taskId: params.scope.taskId,
+      taskRef: params.scope.task.ref,
+      taskRefKind: params.scope.task.refKind,
+      phase: params.scope.phase,
+      executionSeq: params.scope.executionSeq,
+      sessionId: params.sessionId,
+      ...(params.agentId ? { agentId: params.agentId } : {}),
+      ...(params.memberName ? { memberName: params.memberName } : {}),
+      toolUseId: change.toolUseId,
+      source: change.source,
+      operation,
+      confidence: change.confidence,
+      workspaceRoot: params.workspaceRoot,
+      ...worktreeMetadata,
+      filePath,
+      relativePath: displayRelativePath(filePath, params.workspaceRoot),
+      timestamp: change.timestamp,
+      toolStatus: params.toolStatus,
+      before,
+      after,
+      ...(beforeState ? { beforeState } : {}),
+      ...(afterState ? { afterState } : {}),
+      ...(change.relation ? { relation: change.relation } : {}),
+      linesAdded: lineStats.added,
+      linesRemoved: lineStats.removed,
+      ...(change.oldString !== undefined ? { oldString: change.oldString } : {}),
+      ...(change.newString !== undefined ? { newString: change.newString } : {}),
+      ...(change.replaceAll !== undefined ? { replaceAll: change.replaceAll } : {}),
+      ...(change.structuredPatch !== undefined
+        ? { structuredPatch: change.structuredPatch }
+        : {}),
+      ...(change.warnings?.length || worktreeMetadata.dirtyLeaderWarning
+        ? {
+            warnings: [
+              ...(change.warnings ?? []),
+              ...(worktreeMetadata.dirtyLeaderWarning
+                ? [worktreeMetadata.dirtyLeaderWarning]
+                : []),
+            ],
+          }
+        : {}),
+      sourceRuntime: 'opencode',
+      sourceProvider: 'opencode',
+      ...(change.sourceSessionId ? { sourceSessionId: change.sourceSessionId } : {}),
+      ...(change.sourcePartId ? { sourcePartId: change.sourcePartId } : {}),
+      ...(change.sourceMessageId ? { sourceMessageId: change.sourceMessageId } : {}),
+      ...(change.parentUserMessageId ? { parentUserMessageId: change.parentUserMessageId } : {}),
+      ...(change.attributionMethod ? { attributionMethod: change.attributionMethod } : {}),
+      sourceImportKey: change.sourceImportKey,
+      importedAt,
+      ...(change.importBatchId ? { importBatchId: change.importBatchId } : {}),
+      importSchemaVersion: 1,
+    }
+    events.push({
+      ...eventBase,
+      eventId: buildImportedEventId(change.sourceImportKey),
+    })
+    existingSourceKeys.add(change.sourceImportKey)
+    importedFilePaths.push(filePath)
+  }
+
+  if (events.length > 0) {
+    await enqueueTaskWrite(params.scope.taskId, async () => {
+      await runTaskLedgerWrite({
+        scope: params.scope,
+        sessionId: params.sessionId,
+        agentId: params.agentId,
+        toolUseId: events[0]?.toolUseId ?? 'opencode-import',
+        projectDir,
+        write: async () => {
+          for (const event of events) {
+            await appendEvent(event, projectDir)
+          }
+        },
+      })
+    })
+  }
+
+  return {
+    importedFilePaths,
+    importedEventCount: events.length,
+    skippedDuplicateCount,
+    skippedUnsafeCount,
+    diagnostics,
+  }
 }
 
 function getStringField(record: unknown, key: string): string | undefined {

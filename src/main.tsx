@@ -4385,6 +4385,25 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeOpenCodeCommand(opts);
   });
+  runtime.command('opencode-ledger-backfill').description('Recover OpenCode write/edit toolparts into the task change ledger').requiredOption('--team <teamName>', 'Team identifier used in stored OpenCode sessions').option('--task <taskId>', 'Canonical task id to recover').option('--task-display-id <displayId>', 'Short task display id for constrained marker fallback').option('--member <memberName>', 'Member name filter').option('--lane <laneId>', 'Lane identifier filter').option('--project-dir <path>', 'Claude project dir where task change artifacts are written').option('--workspace-root <path>', 'Workspace root that recovered file paths must belong to').option('--delivery-context <path>', 'Optional desktop-generated delivery context JSON').addOption(new Option('--attribution-mode <mode>', 'Attribution mode: compatible or strict-delivery').choices(['compatible', 'strict-delivery'])).option('--dry-run', 'Inspect recoverable events without writing ledger artifacts').option('--output <path>', 'Write JSON output to a file instead of stdout').option('--json', 'Output as JSON').action(async (opts: {
+    json?: boolean;
+    team: string;
+    task?: string;
+    taskDisplayId?: string;
+    member?: string;
+    lane?: string;
+    projectDir?: string;
+    workspaceRoot?: string;
+    deliveryContext?: string;
+    attributionMode?: string;
+    dryRun?: boolean;
+    output?: string;
+  }) => {
+    const {
+      runtimeOpenCodeLedgerBackfill
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeOpenCodeLedgerBackfill(opts);
+  });
 
   /**
    * Helper function to handle marketplace command errors consistently.
