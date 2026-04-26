@@ -1,6 +1,5 @@
-import { spawnSync } from 'node:child_process'
-
 import { getFlagSettingsInline } from '../../bootstrap/state.js'
+import { spawnSyncPortableCli } from '../../utils/portableCli.js'
 import type { CodexRuntimeBackendId } from './types.js'
 
 export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
@@ -107,7 +106,7 @@ export function detectCodexCliLoginState(
   let nextValue: CodexCliLoginState = 'unknown'
 
   try {
-    const result = spawnSync(codexExecutable, ['login', 'status'], {
+    const result = spawnSyncPortableCli(codexExecutable, ['login', 'status'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })

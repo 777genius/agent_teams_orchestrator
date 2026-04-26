@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -7,6 +7,7 @@ import envPaths from 'env-paths'
 
 import { sleep } from '../../utils/sleep.js'
 import { killProcessTree } from '../../utils/processKill.js'
+import { spawnPortableCli } from '../../utils/portableCli.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
 import type { OpenCodeHostHandle, OpenCodePreparedProfile } from './types.js'
@@ -619,7 +620,7 @@ export class OpenCodeHostManager {
       return this.deps.spawnHostProcess(profile, port)
     }
 
-    return spawn(
+    return spawnPortableCli(
       Bun.which('opencode') ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
       {
