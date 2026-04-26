@@ -4,7 +4,10 @@ import path from 'node:path'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  createOpenCodePreflightHostLeaseInput,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -25,6 +28,7 @@ const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
+    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
@@ -430,6 +434,10 @@ export class OpenCodeExecutionProbe {
         ],
       },
     })
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      `model-probe-${params.selectedModel}`,
+    )
+    await this.hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
 
     try {
       const cachePaths = this.persistentCacheEnabled
@@ -525,6 +533,7 @@ export class OpenCodeExecutionProbe {
         cacheFilePath: null,
       })
     } finally {
+      await this.hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       await this.hostManager.releaseHost(host.hostKey)
     }
   }

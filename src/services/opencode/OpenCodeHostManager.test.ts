@@ -7,7 +7,10 @@ import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
 
-import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+  OpenCodeHostManager,
+} from './OpenCodeHostManager.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
 
@@ -533,6 +536,108 @@ describe('OpenCodeHostManager', () => {
         hosts: Record<string, unknown>
       }
       expect(Object.keys(registry.hosts)).toEqual(['host-key'])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup cleanup drops stale preflight leases without touching team leases', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const disposedUrls: string[] = []
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-preflight': {
+              hostKey: 'host-preflight',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43120',
+              port: 43120,
+              pid: 43120,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:59:30.000Z',
+              leases: {
+                [`${OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID}::preflight::readiness`]: {
+                  leaseKey: `${OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID}::preflight::readiness`,
+                  teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+                  laneId: 'preflight',
+                  memberName: 'readiness',
+                  runId: null,
+                  sessionId: null,
+                  createdAt: '2026-04-24T09:50:00.000Z',
+                  updatedAt: '2026-04-24T09:55:00.000Z',
+                },
+              },
+            },
+            'host-team': {
+              hostKey: 'host-team',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43121',
+              port: 43121,
+              pid: 43121,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:59:30.000Z',
+              leases: {
+                'team-a::primary::alice': {
+                  leaseKey: 'team-a::primary::alice',
+                  teamId: 'team-a',
+                  laneId: 'primary',
+                  memberName: 'alice',
+                  runId: 'run-1',
+                  sessionId: 'session-1',
+                  createdAt: '2026-04-24T09:50:00.000Z',
+                  updatedAt: '2026-04-24T09:50:00.000Z',
+                },
+              },
+            },
+          },
+        }),
+        'utf8',
+      )
+      const manager = new OpenCodeHostManager({
+        fetchJson: async (url) => {
+          disposedUrls.push(url)
+          return { status: 200, data: { ok: true } }
+        },
+        isProcessAlive: pid => pid === 43120 || pid === 43121,
+        killProcess: (pid, signal) => {
+          killedSignals.push({ pid, signal })
+        },
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({
+        reason: 'startup',
+        mode: 'stale',
+        staleAgeMs: 5 * 60_000,
+        leaseStaleAgeMs: null,
+        preflightLeaseStaleAgeMs: 2 * 60_000,
+      })
+
+      const byHost = new Map(result.hosts.map(host => [host.hostKey, host]))
+      expect(result.cleaned).toBe(1)
+      expect(byHost.get('host-preflight')?.action).toBe('disposed')
+      expect(byHost.get('host-preflight')?.leaseCount).toBe(0)
+      expect(byHost.get('host-team')?.action).toBe('kept_leased')
+      expect(disposedUrls).toEqual(['http://127.0.0.1:43120/global/dispose'])
+      expect(killedSignals).toEqual([{ pid: 43120, signal: 'SIGTERM' }])
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>
+      }
+      expect(Object.keys(registry.hosts)).toEqual(['host-team'])
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

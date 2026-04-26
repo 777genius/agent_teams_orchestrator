@@ -965,12 +965,16 @@ async function runCleanupHosts(envelope: BridgeEnvelope) {
   const leaseStaleAgeMs = typeof envelope.body.leaseStaleAgeMs === 'number'
     ? envelope.body.leaseStaleAgeMs
     : null
+  const preflightLeaseStaleAgeMs = typeof envelope.body.preflightLeaseStaleAgeMs === 'number'
+    ? envelope.body.preflightLeaseStaleAgeMs
+    : null
   const result = await openCodeHostManager.reconcilePersistentHosts({
     mode,
     reason: asString(envelope.body.reason) ?? 'manual',
     projectPath: asString(envelope.body.projectPath),
     staleAgeMs,
     leaseStaleAgeMs,
+    preflightLeaseStaleAgeMs,
   })
   return {
     snapshot: null,
@@ -1340,6 +1344,7 @@ async function runStop(envelope: BridgeEnvelope) {
         projectPath,
         staleAgeMs: 0,
         leaseStaleAgeMs: null,
+        preflightLeaseStaleAgeMs: null,
       })
       if (cleanup.cleaned > 0) {
         diagnostics.push({
@@ -1403,7 +1408,109 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
-  const prePromptCursor = record.lastCanonicalCursor ?? null
+  let deliveryRecord = record
+  let mcpRuntimePid: number | undefined
+  const mcpDiagnostics: TeamDiagnostic[] = []
+  const initialMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
+    attachIfMissing: true,
+  })
+  if (initialMcpReady.ok) {
+    mcpRuntimePid = initialMcpReady.runtimePid
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        initialMcpReady.status === 'attached'
+          ? 'opencode_send_mcp_reattached'
+          : 'opencode_send_mcp_ready',
+        initialMcpReady.status === 'attached'
+          ? 'OpenCode app MCP was reattached before message delivery.'
+          : 'OpenCode app MCP is connected for message delivery.',
+        'info',
+      ),
+    )
+    mcpDiagnostics.push(
+      ...initialMcpReady.diagnostics.map(message =>
+        teamDiagnostic('opencode_send_mcp_ready_detail', message, 'info'),
+      ),
+    )
+  } else {
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        'opencode_send_mcp_unavailable',
+        [
+          `OpenCode app MCP was not connected before message delivery (status=${initialMcpReady.status}, connected=${String(initialMcpReady.connected)}).`,
+          ...initialMcpReady.diagnostics,
+        ].join(' '),
+        'warning',
+      ),
+    )
+    await openCodeSessionStore.markStale(teamId, laneId, memberName, 'app_mcp_unavailable')
+    deliveryRecord = await openCodeSessionBridge.ensureSession({
+      teamId,
+      laneId,
+      memberName,
+      selectedModel: record.selectedModel,
+      projectPath: record.projectPath,
+      runId: asString(body.runId),
+    })
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        'opencode_send_session_recreated_after_mcp_failure',
+        'Recreated OpenCode session after app MCP was unavailable on the stored session.',
+        'warning',
+      ),
+    )
+    const recreatedMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
+      attachIfMissing: true,
+    })
+    if (!recreatedMcpReady.ok) {
+      const diagnostics = [
+        ...mcpDiagnostics,
+        teamDiagnostic(
+          'opencode_send_mcp_unavailable',
+          [
+            `OpenCode app MCP unavailable for ${teamId}/${laneId}/${memberName} after session recreate`,
+            `(status=${recreatedMcpReady.status}, connected=${String(recreatedMcpReady.connected)}).`,
+            ...recreatedMcpReady.diagnostics,
+          ].join(' '),
+          'error',
+        ),
+      ]
+      return {
+        snapshot,
+        data: {
+          accepted: false,
+          sessionId: deliveryRecord.opencodeSessionId,
+          memberName,
+          ...(typeof deliveryRecord.runtimePid === 'number' && deliveryRecord.runtimePid > 0
+            ? { runtimePid: deliveryRecord.runtimePid }
+            : {}),
+          prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
+          responseObservation: reconcileFailedObservation(
+            diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
+          ),
+          diagnostics,
+        },
+      }
+    }
+    mcpRuntimePid = recreatedMcpReady.runtimePid
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        recreatedMcpReady.status === 'attached'
+          ? 'opencode_send_mcp_reattached'
+          : 'opencode_send_mcp_ready',
+        recreatedMcpReady.status === 'attached'
+          ? 'OpenCode app MCP was reattached on the recreated session before message delivery.'
+          : 'OpenCode app MCP is connected on the recreated session for message delivery.',
+        'info',
+      ),
+    )
+    mcpDiagnostics.push(
+      ...recreatedMcpReady.diagnostics.map(message =>
+        teamDiagnostic('opencode_send_mcp_ready_detail', message, 'info'),
+      ),
+    )
+  }
+  const prePromptCursor = deliveryRecord.lastCanonicalCursor ?? null
 
   const runId = asString(body.runId)
   const identityReminder = runId
@@ -1411,33 +1518,38 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       teamName: teamId,
       memberName,
       runId,
-      runtimeSessionId: record.opencodeSessionId,
+      runtimeSessionId: deliveryRecord.opencodeSessionId,
       purpose: 'reminder',
     })
     : null
 
-  await openCodeSessionBridge.promptAsync(record, {
+  await openCodeSessionBridge.promptAsync(deliveryRecord, {
     text: identityReminder ? `${identityReminder}\n\n${text}` : text,
     agent: asString(body.agent) ?? 'teammate',
     noReply: body.noReply === true,
   })
 
   let runtimePid =
-    typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
-  let reconcileDiagnostics: TeamDiagnostic[] = []
+    typeof deliveryRecord.runtimePid === 'number' && deliveryRecord.runtimePid > 0
+      ? deliveryRecord.runtimePid
+      : mcpRuntimePid
+  let reconcileDiagnostics: TeamDiagnostic[] = mcpDiagnostics
   let responseObservation: OpenCodeDeliveryResponseObservation | undefined
   try {
     const reconciled = await withTimeout(
-      openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
+      openCodeSessionBridge.reconcileSession(deliveryRecord, { limit: 50 }),
       OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
     )
     runtimePid =
       typeof reconciled.record.runtimePid === 'number' && reconciled.record.runtimePid > 0
         ? reconciled.record.runtimePid
         : runtimePid
-    reconcileDiagnostics = reconciled.summary.diagnostics.map(message =>
-      teamDiagnostic('opencode_send_reconcile', message, 'info'),
-    )
+    reconcileDiagnostics = [
+      ...mcpDiagnostics,
+      ...reconciled.summary.diagnostics.map(message =>
+        teamDiagnostic('opencode_send_reconcile', message, 'info'),
+      ),
+    ]
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: asString(body.messageId),
       prePromptCursor,
@@ -1446,6 +1558,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     reconcileDiagnostics = [
+      ...mcpDiagnostics,
       teamDiagnostic(
         'opencode_send_reconcile_failed_after_prompt_accept',
         message,
@@ -1459,7 +1572,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     snapshot,
     data: {
       accepted: true,
-      sessionId: record.opencodeSessionId,
+      sessionId: deliveryRecord.opencodeSessionId,
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
       prePromptCursor,

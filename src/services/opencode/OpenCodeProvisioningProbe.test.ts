@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 
 import type {
@@ -70,6 +71,8 @@ const host: OpenCodeHostHandle = {
 describe('OpenCodeProvisioningProbe', () => {
   test('collects live host verification details', async () => {
     let releaseCalls = 0
+    const retainedLeaseTeamIds: string[] = []
+    const releasedLeaseTeamIds: string[] = []
     let createCalls = 0
     let refreshCalls = 0
 
@@ -82,6 +85,12 @@ describe('OpenCodeProvisioningProbe', () => {
         refreshResolvedConfigFingerprint: async () => {
           refreshCalls += 1
           return 'resolved-fingerprint'
+        },
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeaseTeamIds.push(input.teamId)
         },
         releaseHost: async () => {
           releaseCalls += 1
@@ -176,6 +185,8 @@ describe('OpenCodeProvisioningProbe', () => {
     expect(snapshot.appMcp?.status).toBe('present')
     expect(createCalls).toBe(1)
     expect(refreshCalls).toBe(0)
+    expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releaseCalls).toBe(1)
   })
 

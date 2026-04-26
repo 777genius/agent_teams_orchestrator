@@ -1,5 +1,8 @@
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  createOpenCodePreflightHostLeaseInput,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 
@@ -14,6 +17,7 @@ type OpenCodeProvisioningProbeDeps = {
     typeof openCodeHostManager,
     'ensureHost' | 'releaseHost' | 'refreshResolvedConfigFingerprint'
   >
+    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
 }
@@ -97,10 +101,12 @@ export class OpenCodeProvisioningProbe {
     const mcpManager = this.deps.mcpManager ?? openCodeMcpManager
 
     let host
+    const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
     try {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
       })
+      await hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
     } catch (error) {
       const diagnostics = [
         ...inventory.diagnostics,
@@ -259,6 +265,7 @@ export class OpenCodeProvisioningProbe {
       })
       return snapshot
     } finally {
+      await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
       await hostManager.releaseHost(host.hostKey)
     }
   }

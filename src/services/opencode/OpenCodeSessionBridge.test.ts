@@ -198,6 +198,117 @@ describe('OpenCodeSessionBridge', () => {
     expect(releaseHostCalls).toBe(0)
   })
 
+  test('ensureSessionAppMcpReady verifies app MCP on the session host', async () => {
+    const ensureCalls: Array<{ baseUrl: string; attachIfMissing?: boolean }> = []
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async input => {
+          expect(input).toEqual({ projectPath: '/tmp/project', hostKey: 'host-key' })
+          return host
+        },
+        releaseHost: async () => {
+          releaseHostCalls += 1
+        },
+        retainHostLease: async () => {},
+      },
+      mcpManager: {
+        ensureAppMcp: async input => {
+          ensureCalls.push(input)
+          return {
+            mcp: {},
+            summary: {
+              serverName: 'agent-teams',
+              matchedServerName: 'agent-teams',
+              status: 'present',
+              connected: true,
+              launchSource: 'workspace-src',
+              availableServerNames: ['agent-teams'],
+              diagnostics: [],
+            },
+          }
+        },
+      },
+    })
+
+    const result = await bridge.ensureSessionAppMcpReady(buildRecord(), {
+      attachIfMissing: true,
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      runtimePid: 123,
+      status: 'present',
+      connected: true,
+      diagnostics: [],
+    })
+    expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }])
+    expect(releaseHostCalls).toBe(1)
+  })
+
+  test('ensureSessionAppMcpReady returns blocking state when app MCP cannot attach', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      mcpManager: {
+        ensureAppMcp: async () => ({
+          mcp: {},
+          summary: {
+            serverName: 'agent-teams',
+            matchedServerName: null,
+            status: 'attach_failed',
+            connected: null,
+            launchSource: 'workspace-src',
+            availableServerNames: [],
+            diagnostics: ['connect failed'],
+          },
+        }),
+      },
+    })
+
+    const result = await bridge.ensureSessionAppMcpReady(buildRecord(), {
+      attachIfMissing: true,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      runtimePid: 123,
+      status: 'attach_failed',
+      connected: null,
+      diagnostics: ['connect failed'],
+    })
+  })
+
+  test('ensureSessionAppMcpReady converts MCP probe exceptions into blocking state', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      mcpManager: {
+        ensureAppMcp: async () => {
+          throw new Error('mcp endpoint unavailable')
+        },
+      },
+    })
+
+    const result = await bridge.ensureSessionAppMcpReady(buildRecord(), {
+      attachIfMissing: true,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      runtimePid: 123,
+      status: 'attach_failed',
+      connected: null,
+      diagnostics: ['OpenCode app MCP readiness check failed: mcp endpoint unavailable'],
+    })
+  })
+
   test('marks stale and creates a new session when the model changes', async () => {
     const staleReasons: string[] = []
     const upserts: OpenCodeSessionRecord[] = []

@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 
 import type {
@@ -55,6 +56,8 @@ describe('OpenCodeExecutionProbe', () => {
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
     let promptAsyncCount = 0
     let sendMessageCount = 0
+    const retainedLeaseTeamIds: string[] = []
+    const releasedLeaseTeamIds: string[] = []
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -64,6 +67,12 @@ describe('OpenCodeExecutionProbe', () => {
         ensureHost: async input => {
           ensureHostInput = input
           return host
+        },
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeaseTeamIds.push(input.teamId)
         },
         releaseHost: async () => {},
       },
@@ -135,6 +144,8 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.latestAssistantText).toBe('PONG')
     expect(promptAsyncCount).toBe(1)
     expect(sendMessageCount).toBe(0)
+    expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(ensureHostInput).toEqual({
       projectPath: '/tmp/project',
       profileOptions: {

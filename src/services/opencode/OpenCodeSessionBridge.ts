@@ -2,6 +2,7 @@ import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
+import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -9,6 +10,7 @@ import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
 import type {
   OpenCodeAuthState,
+  OpenCodeAppMcpStatus,
   OpenCodeLogProjection,
   OpenCodeMessage,
   OpenCodePreparedProfile,
@@ -24,6 +26,7 @@ type OpenCodeSessionBridgeDeps = {
     & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
+  mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   logProjector?: Pick<typeof openCodeLogProjector, 'projectSummary'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
@@ -34,6 +37,14 @@ type SessionIdentity = {
   teamId: string
   laneId: string
   memberName: string
+}
+
+export type OpenCodeSessionAppMcpReadyResult = {
+  ok: boolean
+  runtimePid?: number
+  status: OpenCodeAppMcpStatus
+  connected: boolean | null
+  diagnostics: string[]
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -86,6 +97,10 @@ export class OpenCodeSessionBridge {
 
   private get clientFactory() {
     return this.deps.clientFactory ?? openCodeClientFactory
+  }
+
+  private get mcpManager() {
+    return this.deps.mcpManager ?? openCodeMcpManager
   }
 
   private get eventTranslator() {
@@ -210,6 +225,40 @@ export class OpenCodeSessionBridge {
 
     this.retainedSessionHosts.delete(sessionKey)
     await this.hostManager.releaseHost(retainedHostKey)
+  }
+
+  async ensureSessionAppMcpReady(
+    record: OpenCodeSessionRecord,
+    options: { attachIfMissing?: boolean } = {},
+  ): Promise<OpenCodeSessionAppMcpReadyResult> {
+    return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
+      let result: Awaited<ReturnType<typeof openCodeMcpManager.ensureAppMcp>>
+      try {
+        result = await this.mcpManager.ensureAppMcp({
+          baseUrl,
+          attachIfMissing: options.attachIfMissing === true,
+        })
+      } catch (error) {
+        return {
+          ok: false,
+          ...(runtimePid && runtimePid > 0 ? { runtimePid } : {}),
+          status: 'attach_failed',
+          connected: null,
+          diagnostics: [
+            `OpenCode app MCP readiness check failed: ${error instanceof Error ? error.message : String(error)}`,
+          ],
+        }
+      }
+      const ok = result.summary.connected === true
+        && (result.summary.status === 'present' || result.summary.status === 'attached')
+      return {
+        ok,
+        ...(runtimePid && runtimePid > 0 ? { runtimePid } : {}),
+        status: result.summary.status,
+        connected: result.summary.connected,
+        diagnostics: result.summary.diagnostics,
+      }
+    })
   }
 
   private async withSessionHost<T>(

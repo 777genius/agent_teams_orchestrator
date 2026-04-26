@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
@@ -18,6 +18,8 @@ import type {
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
+export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
+const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
   retries: {
     retries: 30,
@@ -98,6 +100,7 @@ export type OpenCodePersistentHostReconcileOptions = {
   projectPath?: string | null
   staleAgeMs?: number | null
   leaseStaleAgeMs?: number | null
+  preflightLeaseStaleAgeMs?: number | null
 }
 
 export type OpenCodePersistentHostReconcileResult = {
@@ -232,6 +235,23 @@ function buildLeaseKey(input: OpenCodeHostLeaseInput): string {
     throw new Error('OpenCode host lease requires teamId and memberName')
   }
   return `${teamId}::${laneId}::${memberName}`
+}
+
+export function createOpenCodePreflightHostLeaseInput(scope: string): OpenCodeHostLeaseInput {
+  const normalizedScope =
+    scope.trim().replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96)
+    || 'probe'
+  return {
+    teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+    laneId: OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID,
+    memberName: `${normalizedScope}-${process.pid}-${randomUUID()}`,
+    runId: null,
+    sessionId: null,
+  }
+}
+
+function isOpenCodePreflightHostLease(lease: PersistentHostLeaseRecord): boolean {
+  return lease.teamId === OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID
 }
 
 function normalizePersistentHostLeases(
@@ -919,29 +939,49 @@ export class OpenCodeHostManager {
     }
 
     return this.withPersistentRegistryLock(async () => {
-    const registry = await this.readPersistentRegistryUnlocked()
-    const hosts: OpenCodePersistentHostReconcileResult['hosts'] = []
-    const diagnostics: string[] = []
-    let cleaned = 0
-    let changed = false
-    const mode = options.mode ?? 'stale'
-    const force = mode === 'force'
-    const nowMs = this.now().getTime()
+      const registry = await this.readPersistentRegistryUnlocked()
+      const hosts: OpenCodePersistentHostReconcileResult['hosts'] = []
+      const diagnostics: string[] = []
+      let cleaned = 0
+      let changed = false
+      const mode = options.mode ?? 'stale'
+      const force = mode === 'force'
+      const nowMs = this.now().getTime()
 
-    for (const [hostKey, record] of Object.entries(registry.hosts)) {
-      const leases = normalizePersistentHostLeases(record.leases)
-      if (!force && typeof options.leaseStaleAgeMs === 'number' && options.leaseStaleAgeMs > 0) {
+      for (const [hostKey, record] of Object.entries(registry.hosts)) {
+        const leases = normalizePersistentHostLeases(record.leases)
         let droppedStaleLeaseCount = 0
-        for (const [leaseKey, lease] of Object.entries(leases)) {
-          const updatedAtMs = Date.parse(lease.updatedAt)
-          const ageMs = Number.isFinite(updatedAtMs)
-            ? nowMs - updatedAtMs
-            : Number.POSITIVE_INFINITY
-          if (ageMs > options.leaseStaleAgeMs) {
-            delete leases[leaseKey]
-            droppedStaleLeaseCount += 1
+        const dropStaleLeases = (
+          staleAgeMs: number | null | undefined,
+          predicate: (lease: PersistentHostLeaseRecord) => boolean,
+        ): number => {
+          if (force || typeof staleAgeMs !== 'number' || staleAgeMs <= 0) {
+            return 0
           }
+          let dropped = 0
+          for (const [leaseKey, lease] of Object.entries(leases)) {
+            if (!predicate(lease)) {
+              continue
+            }
+            const updatedAtMs = Date.parse(lease.updatedAt)
+            const ageMs = Number.isFinite(updatedAtMs)
+              ? nowMs - updatedAtMs
+              : Number.POSITIVE_INFINITY
+            if (ageMs > staleAgeMs) {
+              delete leases[leaseKey]
+              dropped += 1
+            }
+          }
+          return dropped
         }
+
+        const preflightDropped = dropStaleLeases(
+          options.preflightLeaseStaleAgeMs,
+          isOpenCodePreflightHostLease,
+        )
+        const genericDropped = dropStaleLeases(options.leaseStaleAgeMs, () => true)
+        droppedStaleLeaseCount = preflightDropped + genericDropped
+
         if (droppedStaleLeaseCount > 0) {
           registry.hosts[hostKey] = {
             ...record,
@@ -954,127 +994,131 @@ export class OpenCodeHostManager {
             `Dropped ${droppedStaleLeaseCount} stale OpenCode host lease(s) for ${hostKey}`,
           )
         }
-      }
-      const leaseCount = Object.keys(leases).length
-      const entry = this.hosts.get(hostKey)
-      const projectPath = options.projectPath?.trim()
-      if (projectPath && record.projectPath !== projectPath) {
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'kept_filtered',
-          reason: `project path does not match ${projectPath}`,
-          leaseCount,
-        })
-        continue
-      }
-
-      if (!this.isProcessAlive(record.pid)) {
-        delete registry.hosts[hostKey]
-        cleaned += 1
-        changed = true
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'removed_dead',
-          reason: 'registered host process is not alive',
-          leaseCount,
-        })
-        continue
-      }
-
-      if (!force && entry && entry.refCount > 0) {
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'kept_active',
-          reason: `host has active in-process refCount=${entry.refCount}`,
-          leaseCount,
-        })
-        continue
-      }
-
-      if (!force && leaseCount > 0) {
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'kept_leased',
-          reason: `host has ${leaseCount} active lease${leaseCount === 1 ? '' : 's'}`,
-          leaseCount,
-        })
-        continue
-      }
-
-      if (!force && typeof options.staleAgeMs === 'number' && options.staleAgeMs > 0) {
-        const updatedAtMs = Date.parse(record.updatedAt)
-        const ageMs = Number.isFinite(updatedAtMs) ? nowMs - updatedAtMs : Number.POSITIVE_INFINITY
-        if (ageMs < options.staleAgeMs) {
+        const leaseCount = Object.keys(leases).length
+        const entry = this.hosts.get(hostKey)
+        const projectPath = options.projectPath?.trim()
+        if (projectPath && record.projectPath !== projectPath) {
           hosts.push({
             hostKey,
             projectPath: record.projectPath,
             pid: record.pid,
             port: record.port,
-            action: 'kept_recent',
-            reason: `host updated ${Math.max(0, ageMs)}ms ago`,
+            action: 'kept_filtered',
+            reason: `project path does not match ${projectPath}`,
             leaseCount,
           })
           continue
         }
+
+        if (!this.isProcessAlive(record.pid)) {
+          delete registry.hosts[hostKey]
+          cleaned += 1
+          changed = true
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'removed_dead',
+            reason: 'registered host process is not alive',
+            leaseCount,
+          })
+          continue
+        }
+
+        if (!force && entry && entry.refCount > 0) {
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'kept_active',
+            reason: `host has active in-process refCount=${entry.refCount}`,
+            leaseCount,
+          })
+          continue
+        }
+
+        if (!force && leaseCount > 0) {
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'kept_leased',
+            reason: `host has ${leaseCount} active lease${leaseCount === 1 ? '' : 's'}`,
+            leaseCount,
+          })
+          continue
+        }
+
+        if (
+          !force
+          && droppedStaleLeaseCount === 0
+          && typeof options.staleAgeMs === 'number'
+          && options.staleAgeMs > 0
+        ) {
+          const updatedAtMs = Date.parse(record.updatedAt)
+          const ageMs = Number.isFinite(updatedAtMs) ? nowMs - updatedAtMs : Number.POSITIVE_INFINITY
+          if (ageMs < options.staleAgeMs) {
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'kept_recent',
+              reason: `host updated ${Math.max(0, ageMs)}ms ago`,
+              leaseCount,
+            })
+            continue
+          }
+        }
+
+        try {
+          await this.terminatePersistentHostRecord(record, { force })
+          delete registry.hosts[hostKey]
+          cleaned += 1
+          changed = true
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'disposed',
+            reason: force
+              ? `force cleanup during ${options.reason ?? 'manual'}`
+              : `stale host has no active leases during ${options.reason ?? 'manual'}`,
+            leaseCount,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          diagnostics.push(`Failed to dispose OpenCode host ${hostKey}: ${message}`)
+          hosts.push({
+            hostKey,
+            projectPath: record.projectPath,
+            pid: record.pid,
+            port: record.port,
+            action: 'failed',
+            reason: message,
+            leaseCount,
+          })
+        }
       }
 
-      try {
-        await this.terminatePersistentHostRecord(record, { force })
-        delete registry.hosts[hostKey]
-        cleaned += 1
-        changed = true
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'disposed',
-          reason: force
-            ? `force cleanup during ${options.reason ?? 'manual'}`
-            : `stale host has no active leases during ${options.reason ?? 'manual'}`,
-          leaseCount,
-        })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        diagnostics.push(`Failed to dispose OpenCode host ${hostKey}: ${message}`)
-        hosts.push({
-          hostKey,
-          projectPath: record.projectPath,
-          pid: record.pid,
-          port: record.port,
-          action: 'failed',
-          reason: message,
-          leaseCount,
-        })
+      if (changed) {
+        if (Object.keys(registry.hosts).length === 0) {
+          await unlink(registryPath).catch(() => undefined)
+        } else {
+          await this.writePersistentRegistryUnlocked(registry)
+        }
       }
-    }
 
-    if (changed) {
-      if (Object.keys(registry.hosts).length === 0) {
-        await unlink(registryPath).catch(() => undefined)
-      } else {
-        await this.writePersistentRegistryUnlocked(registry)
+      return {
+        cleaned,
+        remaining: Object.keys(registry.hosts).length,
+        hosts,
+        diagnostics,
       }
-    }
-
-    return {
-      cleaned,
-      remaining: Object.keys(registry.hosts).length,
-      hosts,
-      diagnostics,
-    }
     })
   }
 

@@ -157,6 +157,111 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.visibleReplyMissingRelayOfMessageId).toBe(false)
   })
 
+  test('extracts visible reply ids from completed message_send output', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-output',
+      summary: summary([
+        message({
+          id: 'user-output',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-output". Please reply.',
+        }),
+        message({
+          id: 'assistant-output',
+          role: 'assistant',
+          parentId: 'user-output',
+          toolCalls: [
+            {
+              callId: 'tool-output',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'completed',
+              input: {},
+              output: {
+                deliveredToInbox: true,
+                message: {
+                  messageId: 'reply-output-1',
+                  relayOfMessageId: 'msg-inbound-output',
+                },
+              },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.visibleReplyMessageId).toBe('reply-output-1')
+    expect(observed.visibleReplyCorrelation).toBe('relayOfMessageId')
+    expect(observed.reason).toBeNull()
+  })
+
+  test('prefers later completed message_send over earlier MCP connection errors', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-late-success',
+      summary: summary([
+        message({
+          id: 'user-late-success',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-late-success". Please reply.',
+        }),
+        message({
+          id: 'assistant-late-error',
+          role: 'assistant',
+          parentId: 'user-late-success',
+          toolCalls: [
+            {
+              callId: 'tool-error',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'errored',
+              input: { relayOfMessageId: 'msg-inbound-late-success' },
+              output: null,
+              outputText: 'Not connected',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: true,
+            },
+          ],
+        }),
+        message({
+          id: 'assistant-late-success',
+          role: 'assistant',
+          parentId: 'user-late-success',
+          toolCalls: [
+            {
+              callId: 'tool-success',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'completed',
+              input: { relayOfMessageId: 'msg-inbound-late-success' },
+              output: {
+                deliveredToInbox: true,
+                messageId: 'reply-late-success',
+              },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_visible_message')
+    expect(observed.assistantMessageId).toBe('assistant-late-success')
+    expect(observed.visibleReplyMessageId).toBe('reply-late-success')
+    expect(observed.reason).toBeNull()
+  })
+
   test('classifies task tool as non-visible response proof', () => {
     const observed = observeOpenCodeDeliveryResponse({
       inboundMessageId: 'msg-inbound-3',

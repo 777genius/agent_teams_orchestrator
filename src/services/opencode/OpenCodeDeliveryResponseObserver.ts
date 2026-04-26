@@ -114,9 +114,58 @@ function isRunningTool(tool: OpenCodeCanonicalToolCall): boolean {
   return tool.status === 'running'
 }
 
-function getRelayOfMessageId(tool: OpenCodeCanonicalToolCall): string | null {
-  const value = tool.input?.relayOfMessageId
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function parseJsonRecord(value: string | null | undefined): Record<string, unknown> | null {
+  if (!value?.trim()) return null
+  try {
+    return asRecord(JSON.parse(value))
+  } catch {
+    return null
+  }
+}
+
+function getNestedRecord(
+  value: Record<string, unknown> | null,
+  key: string,
+): Record<string, unknown> | null {
+  return value ? asRecord(value[key]) : null
+}
+
+function getTrimmedString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function getMessageSendOutputRecord(
+  tool: OpenCodeCanonicalToolCall,
+): Record<string, unknown> | null {
+  return asRecord(tool.output) ?? parseJsonRecord(tool.outputText)
+}
+
+function getMessageSendOutputMessage(
+  tool: OpenCodeCanonicalToolCall,
+): Record<string, unknown> | null {
+  return getNestedRecord(getMessageSendOutputRecord(tool), 'message')
+}
+
+function getRelayOfMessageId(tool: OpenCodeCanonicalToolCall): string | null {
+  return (
+    getTrimmedString(tool.input?.relayOfMessageId)
+    ?? getTrimmedString(getMessageSendOutputMessage(tool)?.relayOfMessageId)
+  )
+}
+
+function getVisibleReplyMessageId(tool: OpenCodeCanonicalToolCall): string | null {
+  const output = getMessageSendOutputRecord(tool)
+  return (
+    getTrimmedString(output?.messageId)
+    ?? getTrimmedString(output?.id)
+    ?? getTrimmedString(getMessageSendOutputMessage(tool)?.messageId)
+  )
 }
 
 function findDeliveredUserMessages(input: ObserveOpenCodeDeliveryResponseInput): {
@@ -250,6 +299,7 @@ function classifyChildren(input: {
 
       if (normalizedName === 'message_send') {
         const relayOfMessageId = getRelayOfMessageId(tool)
+        const visibleReplyMessageId = getVisibleReplyMessageId(tool)
         const matchedRelay =
           relayOfMessageId != null
           && input.inboundMessageId != null
@@ -260,6 +310,7 @@ function classifyChildren(input: {
           assistantMessageId: child.id,
           toolCallNames: [...observedToolNames],
           visibleMessageToolCallId: tool.callId,
+          visibleReplyMessageId,
           visibleReplyCorrelation: matchedRelay ? 'relayOfMessageId' : 'direct_child_message_send',
           visibleReplyMissingRelayOfMessageId: !matchedRelay,
           latestAssistantPreview: messagePreview(child),
@@ -389,4 +440,3 @@ export function observeOpenCodeDeliveryResponse(
 
   return best ?? buildObservation({ state: 'not_observed', reason: 'no_delivery_observation' })
 }
-
