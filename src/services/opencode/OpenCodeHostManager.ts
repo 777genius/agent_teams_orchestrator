@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import envPaths from 'env-paths'
 
+import * as lockfile from '../../utils/lockfile.js'
 import { sleep } from '../../utils/sleep.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
@@ -17,6 +18,13 @@ import type {
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
+const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
+  retries: {
+    retries: 30,
+    minTimeout: 5,
+    maxTimeout: 100,
+  },
+}
 
 type ManagedHostEntry = {
   handle: OpenCodeHostHandle
@@ -318,6 +326,10 @@ export class OpenCodeHostManager {
   }
 
   private async readPersistentRegistry(): Promise<PersistentHostRegistryShape> {
+    return this.readPersistentRegistryUnlocked()
+  }
+
+  private async readPersistentRegistryUnlocked(): Promise<PersistentHostRegistryShape> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return { schemaVersion: 1, hosts: {} }
@@ -345,25 +357,22 @@ export class OpenCodeHostManager {
     }
   }
 
-  private async writePersistentRegistry(registry: PersistentHostRegistryShape): Promise<void> {
+  private async writePersistentRegistryUnlocked(registry: PersistentHostRegistryShape): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return
     }
     await mkdir(path.dirname(registryPath), { recursive: true })
-    const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`
+    const tempPath = `${registryPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
     await writeFile(tempPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
     await rename(tempPath, registryPath)
   }
 
-  private async upsertPersistentHost(handle: OpenCodeHostHandle): Promise<void> {
-    const registryPath = this.persistentRegistryPath
-    if (!registryPath || handle.pid <= 0) {
-      return
-    }
-    const registry = await this.readPersistentRegistry()
-    const previous = registry.hosts[handle.hostKey]
-    registry.hosts[handle.hostKey] = {
+  private buildPersistentHostRecord(
+    handle: OpenCodeHostHandle,
+    previous?: PersistentHostRegistryRecord,
+  ): PersistentHostRegistryRecord {
+    return {
       hostKey: handle.hostKey,
       profileRootKey: handle.profileRootKey,
       projectPath: handle.projectPath,
@@ -377,7 +386,47 @@ export class OpenCodeHostManager {
       updatedAt: this.nowIso(),
       leases: normalizePersistentHostLeases(previous?.leases),
     }
-    await this.writePersistentRegistry(registry)
+  }
+
+  private async ensurePersistentRegistryLockFile(): Promise<string | null> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return null
+    }
+    await mkdir(path.dirname(registryPath), { recursive: true })
+    const lockPath = `${registryPath}.lock`
+    await writeFile(lockPath, '', { flag: 'a' })
+    return lockPath
+  }
+
+  private async withPersistentRegistryLock<T>(callback: () => Promise<T>): Promise<T> {
+    const lockPath = await this.ensurePersistentRegistryLockFile()
+    if (!lockPath) {
+      return callback()
+    }
+
+    let release: (() => Promise<void>) | undefined
+    try {
+      release = await lockfile.lock(lockPath, PERSISTENT_REGISTRY_LOCK_OPTIONS)
+      return await callback()
+    } finally {
+      if (release) {
+        await release()
+      }
+    }
+  }
+
+  private async upsertPersistentHost(handle: OpenCodeHostHandle): Promise<void> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath || handle.pid <= 0) {
+      return
+    }
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      const previous = registry.hosts[handle.hostKey]
+      registry.hosts[handle.hostKey] = this.buildPersistentHostRecord(handle, previous)
+      await this.writePersistentRegistryUnlocked(registry)
+    })
   }
 
   private async removePersistentHost(hostKey: string): Promise<void> {
@@ -385,16 +434,18 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
-    const registry = await this.readPersistentRegistry()
-    if (!registry.hosts[hostKey]) {
-      return
-    }
-    delete registry.hosts[hostKey]
-    if (Object.keys(registry.hosts).length === 0) {
-      await unlink(registryPath).catch(() => undefined)
-      return
-    }
-    await this.writePersistentRegistry(registry)
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      if (!registry.hosts[hostKey]) {
+        return
+      }
+      delete registry.hosts[hostKey]
+      if (Object.keys(registry.hosts).length === 0) {
+        await unlink(registryPath).catch(() => undefined)
+        return
+      }
+      await this.writePersistentRegistryUnlocked(registry)
+    })
   }
 
   async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
@@ -403,55 +454,53 @@ export class OpenCodeHostManager {
       return
     }
 
-    const leaseKey = buildLeaseKey(input)
-    let registry = await this.readPersistentRegistry()
-    let record = registry.hosts[hostKey]
-    if (!record) {
-      const entry = this.hosts.get(hostKey)
-      if (!entry) {
-        return
-      }
-      await this.upsertPersistentHost(entry.handle)
-      registry = await this.readPersistentRegistry()
-      record = registry.hosts[hostKey]
+    await this.withPersistentRegistryLock(async () => {
+      const leaseKey = buildLeaseKey(input)
+      const registry = await this.readPersistentRegistryUnlocked()
+      let record = registry.hosts[hostKey]
       if (!record) {
+        const entry = this.hosts.get(hostKey)
+        if (!entry) {
+          return
+        }
+        record = this.buildPersistentHostRecord(entry.handle)
+        registry.hosts[hostKey] = record
+      }
+
+      const nowDate = this.now()
+      const now = nowDate.toISOString()
+      const nowMs = nowDate.getTime()
+      const leases = normalizePersistentHostLeases(record.leases)
+      const previous = leases[leaseKey]
+      const runId = input.runId?.trim() || previous?.runId || null
+      const sessionId = input.sessionId?.trim() || previous?.sessionId || null
+      const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
+      if (
+        previous
+        && previous.runId === runId
+        && previous.sessionId === sessionId
+        && Number.isFinite(previousUpdatedAtMs)
+        && nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
+      ) {
         return
       }
-    }
-
-    const nowDate = this.now()
-    const now = nowDate.toISOString()
-    const nowMs = nowDate.getTime()
-    const leases = normalizePersistentHostLeases(record.leases)
-    const previous = leases[leaseKey]
-    const runId = input.runId?.trim() || previous?.runId || null
-    const sessionId = input.sessionId?.trim() || previous?.sessionId || null
-    const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
-    if (
-      previous
-      && previous.runId === runId
-      && previous.sessionId === sessionId
-      && Number.isFinite(previousUpdatedAtMs)
-      && nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
-    ) {
-      return
-    }
-    leases[leaseKey] = {
-      leaseKey,
-      teamId: input.teamId.trim(),
-      laneId: input.laneId?.trim() || 'primary',
-      memberName: input.memberName.trim(),
-      runId,
-      sessionId,
-      createdAt: previous?.createdAt ?? now,
-      updatedAt: now,
-    }
-    registry.hosts[hostKey] = {
-      ...record,
-      leases,
-      updatedAt: now,
-    }
-    await this.writePersistentRegistry(registry)
+      leases[leaseKey] = {
+        leaseKey,
+        teamId: input.teamId.trim(),
+        laneId: input.laneId?.trim() || 'primary',
+        memberName: input.memberName.trim(),
+        runId,
+        sessionId,
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      }
+      registry.hosts[hostKey] = {
+        ...record,
+        leases,
+        updatedAt: now,
+      }
+      await this.writePersistentRegistryUnlocked(registry)
+    })
   }
 
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
@@ -460,23 +509,25 @@ export class OpenCodeHostManager {
       return
     }
 
-    const leaseKey = buildLeaseKey(input)
-    const registry = await this.readPersistentRegistry()
-    const record = registry.hosts[hostKey]
-    if (!record) {
-      return
-    }
-    const leases = normalizePersistentHostLeases(record.leases)
-    if (!leases[leaseKey]) {
-      return
-    }
-    delete leases[leaseKey]
-    registry.hosts[hostKey] = {
-      ...record,
-      leases,
-      updatedAt: this.nowIso(),
-    }
-    await this.writePersistentRegistry(registry)
+    await this.withPersistentRegistryLock(async () => {
+      const leaseKey = buildLeaseKey(input)
+      const registry = await this.readPersistentRegistryUnlocked()
+      const record = registry.hosts[hostKey]
+      if (!record) {
+        return
+      }
+      const leases = normalizePersistentHostLeases(record.leases)
+      if (!leases[leaseKey]) {
+        return
+      }
+      delete leases[leaseKey]
+      registry.hosts[hostKey] = {
+        ...record,
+        leases,
+        updatedAt: this.nowIso(),
+      }
+      await this.writePersistentRegistryUnlocked(registry)
+    })
   }
 
   private async checkHealthyHostOnce(baseUrl: string): Promise<{ version: string | null } | null> {
@@ -867,7 +918,8 @@ export class OpenCodeHostManager {
       }
     }
 
-    const registry = await this.readPersistentRegistry()
+    return this.withPersistentRegistryLock(async () => {
+    const registry = await this.readPersistentRegistryUnlocked()
     const hosts: OpenCodePersistentHostReconcileResult['hosts'] = []
     const diagnostics: string[] = []
     let cleaned = 0
@@ -1013,7 +1065,7 @@ export class OpenCodeHostManager {
       if (Object.keys(registry.hosts).length === 0) {
         await unlink(registryPath).catch(() => undefined)
       } else {
-        await this.writePersistentRegistry(registry)
+        await this.writePersistentRegistryUnlocked(registry)
       }
     }
 
@@ -1023,6 +1075,7 @@ export class OpenCodeHostManager {
       hosts,
       diagnostics,
     }
+    })
   }
 
   async releaseHost(hostKey: string): Promise<void> {

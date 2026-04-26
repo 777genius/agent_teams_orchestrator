@@ -1310,21 +1310,60 @@ async function runStop(envelope: BridgeEnvelope) {
     record => record.teamId === teamId && record.laneId === laneId,
   )
   const members: Record<string, { sessionId?: string; stopped: boolean; diagnostics: string[] }> = {}
+  const diagnostics: TeamDiagnostic[] = []
   for (const record of records) {
     let stopped = false
-    const diagnostics: string[] = []
+    const memberDiagnostics: string[] = []
     try {
       stopped = await openCodeSessionBridge.abort(record)
       await openCodeSessionBridge.releaseSession(record)
     } catch (error) {
-      diagnostics.push(error instanceof Error ? error.message : String(error))
+      memberDiagnostics.push(error instanceof Error ? error.message : String(error))
     }
     members[record.memberName] = {
       sessionId: record.opencodeSessionId,
       stopped,
-      diagnostics,
+      diagnostics: memberDiagnostics,
     }
   }
+
+  const cleanupProjectPaths = new Set(
+    records
+      .map(record => record.projectPath.trim())
+      .filter(projectPath => projectPath.length > 0),
+  )
+  for (const projectPath of cleanupProjectPaths) {
+    try {
+      const cleanup = await openCodeHostManager.reconcilePersistentHosts({
+        mode: 'stale',
+        reason: 'stopTeam',
+        projectPath,
+        staleAgeMs: 0,
+        leaseStaleAgeMs: null,
+      })
+      if (cleanup.cleaned > 0) {
+        diagnostics.push({
+          code: 'opencode_host_cleanup',
+          severity: 'info',
+          message: `Disposed ${cleanup.cleaned} OpenCode host${cleanup.cleaned === 1 ? '' : 's'} without active leases for ${projectPath}`,
+        })
+      }
+      for (const message of cleanup.diagnostics) {
+        diagnostics.push({
+          code: 'opencode_host_cleanup_warning',
+          severity: 'warning',
+          message,
+        })
+      }
+    } catch (error) {
+      diagnostics.push({
+        code: 'opencode_host_cleanup_failed',
+        severity: 'warning',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
   return {
     snapshot,
     data: {
@@ -1332,7 +1371,7 @@ async function runStop(envelope: BridgeEnvelope) {
       stopped: Object.values(members).every(member => member.stopped),
       members,
       warnings: [],
-      diagnostics: [],
+      diagnostics,
       ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
       manifestHighWatermark: commandEvidence.manifestHighWatermark,
       runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,

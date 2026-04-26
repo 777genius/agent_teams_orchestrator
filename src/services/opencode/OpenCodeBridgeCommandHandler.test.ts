@@ -300,6 +300,12 @@ const originalClientClose = Client.prototype.close
 
 beforeEach(() => {
   mockRequiredMcpTools()
+  openCodeHostManager.reconcilePersistentHosts = (async () => ({
+    cleaned: 0,
+    remaining: 0,
+    hosts: [],
+    diagnostics: [],
+  })) as typeof openCodeHostManager.reconcilePersistentHosts
   openCodeSessionBridge.observePreview = (async record => ({
     record,
     summary: {
@@ -3454,6 +3460,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('stops only the addressed lane', async () => {
     const abortedMembers: string[] = []
     const releasedMembers: string[] = []
+    let cleanupInput: unknown = null
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
@@ -3466,6 +3473,25 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeSessionBridge.releaseSession = (async record => {
       releasedMembers.push(record.memberName)
     }) as typeof openCodeSessionBridge.releaseSession
+    openCodeHostManager.reconcilePersistentHosts = (async (input) => {
+      cleanupInput = input
+      return {
+        cleaned: 1,
+        remaining: 0,
+        hosts: [
+          {
+            hostKey: 'host-key',
+            projectPath: '/tmp/project',
+            pid: 43116,
+            port: 43116,
+            action: 'disposed',
+            reason: 'stale host has no active leases during stopTeam',
+            leaseCount: 0,
+          },
+        ],
+        diagnostics: [],
+      }
+    }) as typeof openCodeHostManager.reconcilePersistentHosts
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.stopTeam', {
@@ -3479,6 +3505,22 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.ok).toBe(true)
     expect(abortedMembers).toEqual(['alice'])
     expect(releasedMembers).toEqual(['alice'])
+    expect(cleanupInput).toEqual({
+      mode: 'stale',
+      reason: 'stopTeam',
+      projectPath: '/tmp/project',
+      staleAgeMs: 0,
+      leaseStaleAgeMs: null,
+    })
+    if (result.ok) {
+      expect(result.data.diagnostics).toEqual([
+        {
+          code: 'opencode_host_cleanup',
+          severity: 'info',
+          message: 'Disposed 1 OpenCode host without active leases for /tmp/project',
+        },
+      ])
+    }
   })
 
   test('keeps stop failures isolated to the addressed mixed OpenCode secondary lane', async () => {

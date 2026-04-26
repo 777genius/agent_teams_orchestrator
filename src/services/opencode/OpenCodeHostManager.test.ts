@@ -348,6 +348,67 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
+  test('preserves concurrent lease updates across short-lived CLI processes', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+
+    try {
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-key': {
+              hostKey: 'host-key',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43115',
+              port: 43115,
+              pid: 43115,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T10:00:00.000Z',
+              leases: {},
+            },
+          },
+        }),
+        'utf8',
+      )
+      const createManager = () => new OpenCodeHostManager({
+        now: () => new Date('2026-04-24T10:01:00.000Z'),
+        persistentRegistryPath: registryPath,
+      })
+
+      await Promise.all([
+        createManager().retainHostLease('host-key', {
+          teamId: 'team-a',
+          laneId: 'primary',
+          memberName: 'alice',
+          runId: 'run-1',
+          sessionId: 'session-alice',
+        }),
+        createManager().retainHostLease('host-key', {
+          teamId: 'team-a',
+          laneId: 'primary',
+          memberName: 'bob',
+          runId: 'run-1',
+          sessionId: 'session-bob',
+        }),
+      ])
+
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { leases?: Record<string, unknown> }>
+      }
+      expect(Object.keys(registry.hosts['host-key']?.leases ?? {}).sort()).toEqual([
+        'team-a::primary::alice',
+        'team-a::primary::bob',
+      ])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('startup cleanup disposes stale registry hosts without active leases', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
