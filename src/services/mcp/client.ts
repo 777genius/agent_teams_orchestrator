@@ -1439,7 +1439,7 @@ export const connectToServer = memoize(
         // For stdio transports, explicitly terminate the child process with proper signals
         // NOTE: StdioClientTransport.close() only sends an abort signal, but many MCP servers
         // (especially Docker containers) need explicit SIGINT/SIGTERM signals to trigger graceful shutdown
-        if (serverRef.type === 'stdio') {
+        if (serverRef.type === 'stdio' || !serverRef.type) {
           try {
             const stdioTransport = transport as StdioClientTransport
             const childPid = stdioTransport.pid
