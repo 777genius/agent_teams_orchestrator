@@ -2840,10 +2840,13 @@ Minimum bar:
 - Ledger import idempotent.
 - Ledger import writes journal, bundle, and freshness consistently under writer lock.
 - Repeated backfill is idempotent by `sourceImportKey`, even if operation classification changes later.
+- Import upgrade path is explicitly immutable in v1; no silent rewrite of old journal lines.
 - Existing ledger tests still pass.
 - Desktop lazy trigger is guarded and OpenCode-only.
 - Desktop summary calls do not block on OpenCode SQLite scans.
 - Desktop lazy trigger cannot loop forever on zero-event results.
+- Negative cache invalidates on source fingerprint changes.
+- Historical imported changes remain visible even when current disk has moved on; review handles that as conflict.
 - No changes to non-OpenCode agent paths.
 - Windows-style path fixtures pass on non-Windows CI through the bridge path adapter.
 - Native `windows-latest` smoke passes for path, CRLF, safe artifact names, and bridge argv handling.
@@ -2862,6 +2865,9 @@ Estimated readiness after implementation:
 - External writer between OpenCode event and review causes strict conflict.
 - SQLite schema drift can disable recovery until reader is updated.
 - If no taskRefs/task tools exist, attribution must be skipped.
+- Multi-task prompts without a single-task proof are intentionally skipped, even if a human could infer ownership from file names.
+- V1 does not upgrade old imported events in place. Future enrichment needs an explicit supersede contract.
+- Negative cache can still delay recovery briefly after OpenCode data changes if filesystem mtimes are coarse, so manual refresh must bypass it.
 
 ## Recommended Final Sequence
 
