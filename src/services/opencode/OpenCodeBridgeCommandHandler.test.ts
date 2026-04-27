@@ -1554,6 +1554,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.bob?.launchState).toBe('failed')
     expect(result.data.members.bob?.runtimePid).toBe(123)
+    expect(result.data.members.bob?.evidence.map(item => item.kind)).toEqual([
+      'member_session_recorded',
+    ])
     expect(result.data.diagnostics).toEqual([
       {
         code: 'member_reconcile',
@@ -3764,6 +3767,88 @@ describe('OpenCodeBridgeCommandHandler', () => {
       code: 'opencode_send_mcp_reattached',
       message: 'OpenCode app MCP was reattached before message delivery.',
       severity: 'info',
+    })
+  })
+
+  test('recreates stale OpenCode session before sending a message', async () => {
+    const promptCalls: Array<{ sessionId: string; text: string }> = []
+    const staleRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-stale',
+      lastCanonicalCursor: 'cursor-stale',
+      staleReason: 'resolved_behavior_changed:old->new',
+    })
+    const freshRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-fresh',
+      lastCanonicalCursor: 'cursor-fresh',
+      runtimePid: 654,
+    })
+    let ensureSessionCalls = 0
+    const mcpCheckedSessionIds: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => staleRecord) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      expect(input).toMatchObject({
+        teamId: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: staleRecord.selectedModel,
+        projectPath: staleRecord.projectPath,
+        runId: 'run-stale-send',
+      })
+      return freshRecord
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      mcpCheckedSessionIds.push(record.opencodeSessionId)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async (sessionRecord, input) => {
+      promptCalls.push({
+        sessionId: sessionRecord.opencodeSessionId,
+        text: input.text,
+      })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-stale-send',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello fresh bob',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureSessionCalls).toBe(1)
+    expect(mcpCheckedSessionIds).toEqual(['session-bob-fresh'])
+    expect(promptCalls).toEqual([{ sessionId: 'session-bob-fresh', text: expect.stringContaining('hello fresh bob') }])
+    expect(result.data.sessionId).toBe('session-bob-fresh')
+    expect(result.data.prePromptCursor).toBe('cursor-fresh')
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'opencode_send_session_recreated_after_stale_record',
+      message:
+        'Recreated OpenCode session before message delivery because the stored session was stale (resolved_behavior_changed:old->new).',
+      severity: 'warning',
     })
   })
 

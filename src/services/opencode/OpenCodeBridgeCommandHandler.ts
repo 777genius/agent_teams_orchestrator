@@ -725,10 +725,11 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
   const evidence = [
     { kind: 'member_session_recorded', observedAt },
   ]
+  const failed = Boolean(summary.staleReason) || summary.errorCount > 0
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
-  if (summary.latestAssistantMessageId) {
+  if (!failed && summary.latestAssistantMessageId) {
     evidence.push({ kind: 'bootstrap_confirmed', observedAt })
     evidence.push({ kind: 'member_ready', observedAt })
   }
@@ -1410,9 +1411,27 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
+  const runId = asString(body.runId)
   let deliveryRecord = record
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
+  if (record.staleReason) {
+    deliveryRecord = await openCodeSessionBridge.ensureSession({
+      teamId,
+      laneId,
+      memberName,
+      selectedModel: record.selectedModel,
+      projectPath: record.projectPath,
+      runId,
+    })
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        'opencode_send_session_recreated_after_stale_record',
+        `Recreated OpenCode session before message delivery because the stored session was stale (${record.staleReason}).`,
+        'warning',
+      ),
+    )
+  }
   const initialMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
     attachIfMissing: true,
   })
@@ -1514,7 +1533,6 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   }
   const prePromptCursor = deliveryRecord.lastCanonicalCursor ?? null
 
-  const runId = asString(body.runId)
   const identityReminder = runId
     ? buildOpenCodeRuntimeIdentityBlock({
       teamName: teamId,
