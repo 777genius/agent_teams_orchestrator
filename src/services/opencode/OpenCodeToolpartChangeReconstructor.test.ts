@@ -11,6 +11,8 @@ import type {
 const workspaceRoot = '/repo'
 const parentTaskPrompt =
   'Please implement #abc12345. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]'
+const retryParentTaskPrompt =
+  `${parentTaskPrompt}\nThe inbound app messageId is "app-message-1".\nInclude relayOfMessageId="app-message-1" in that message_send call.`
 
 function messageRow(id: string, data: Record<string, unknown>, time = 1000): OpenCodeSqliteMessageRow {
   return {
@@ -382,6 +384,44 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.diagnostics).toContain(
       'OpenCode toolpart part-write-1 skipped because no strict delivery record matched its parent message.',
     )
+  })
+
+  test('strict delivery mode imports retry prompts matched by inbound app message id', () => {
+    const result = reconstruct(
+      [],
+      {
+        attributionMode: 'strict-delivery',
+        requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        deliveryContext: deliveryContext({
+          inboxMessageId: 'app-message-1',
+          deliveredUserMessageId: 'user-original',
+        }),
+        rawMessages: [
+          messageRow('user-retry-2', { id: 'user-retry-2' }, 900),
+          messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-retry-2' }, 1000),
+        ],
+        rawParts: [
+          partRow('user-part-retry-2', 'user-retry-2', { type: 'text', text: retryParentTaskPrompt }, 900),
+          toolPart({
+            id: 'part-write-1',
+            tool: 'write',
+            filePath: path.join(workspaceRoot, 'src/new.ts'),
+            content: 'export const value = 1;\n',
+            exists: false,
+          }),
+        ],
+      },
+    )
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      taskId: 'task-1',
+      attributionMethod: 'delivery-ledger-taskrefs',
+      parentUserMessageId: 'user-retry-2',
+      relativePath: 'src/new.ts',
+    })
   })
 
   test('strict delivery mode rejects mismatched session delivery records', () => {

@@ -114,6 +114,10 @@ type ReconstructedFileState = {
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
 const TASK_REFS_MARKER = 'include taskRefs exactly:'
+const INBOUND_APP_MESSAGE_ID_PATTERNS = [
+  /The inbound app messageId is "([^"]+)"/g,
+  /relayOfMessageId="([^"]+)"/g,
+]
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -232,6 +236,19 @@ function extractDeliveredTaskRefs(text: string): OpenCodeTaskRef[] {
   } catch {
     return []
   }
+}
+
+function extractInboundAppMessageIds(text: string): Set<string> {
+  const ids = new Set<string>()
+  for (const pattern of INBOUND_APP_MESSAGE_ID_PATTERNS) {
+    pattern.lastIndex = 0
+    for (const match of text.matchAll(pattern)) {
+      if (typeof match[1] === 'string' && match[1].length > 0) {
+        ids.add(match[1])
+      }
+    }
+  }
+  return ids
 }
 
 function getTextFromParts(parts: Record<string, unknown>[]): string {
@@ -627,10 +644,15 @@ export class OpenCodeToolpartChangeReconstructor {
     diagnostics: string[]
   }): TaskContextResolution {
     const attributionMode = input.params.attributionMode ?? 'compatible'
+    const parentParts = input.toolpart.parentUserMessageId
+      ? input.partsByMessageId.get(input.toolpart.parentUserMessageId) ?? []
+      : []
+    const parentText = getTextFromParts(parentParts)
     if (attributionMode === 'strict-delivery') {
       const deliveryRefs = this.lookupStrictDeliveryRefs({
         deliveryContext: input.params.deliveryContext,
         parentUserMessageId: input.toolpart.parentUserMessageId,
+        parentText,
         teamName: input.params.teamName,
         memberName: input.params.memberName,
         sessionId: input.params.sessionId,
@@ -651,10 +673,6 @@ export class OpenCodeToolpartChangeReconstructor {
       return { type: 'skipped' }
     }
 
-    const parentParts = input.toolpart.parentUserMessageId
-      ? input.partsByMessageId.get(input.toolpart.parentUserMessageId) ?? []
-      : []
-    const parentText = getTextFromParts(parentParts)
     const exactRefs = extractDeliveredTaskRefs(parentText).filter(ref => ref.teamName === input.params.teamName)
     if (exactRefs.length === 1) {
       return {
@@ -720,6 +738,7 @@ export class OpenCodeToolpartChangeReconstructor {
   private lookupStrictDeliveryRefs(input: {
     deliveryContext: OpenCodeDeliveryContextV1 | null | undefined
     parentUserMessageId: string | undefined
+    parentText: string
     teamName: string
     memberName: string
     sessionId: string
@@ -730,6 +749,8 @@ export class OpenCodeToolpartChangeReconstructor {
       return []
     }
     const refs: OpenCodeTaskRef[] = []
+    const parentTaskRefs = extractDeliveredTaskRefs(input.parentText)
+    const parentAppMessageIds = extractInboundAppMessageIds(input.parentText)
     for (const record of input.deliveryContext.records) {
       if (record.memberName !== input.memberName) {
         continue
@@ -740,10 +761,16 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!record.runtimeSessionId || record.runtimeSessionId !== input.sessionId) {
         continue
       }
-      if (
-        record.deliveredUserMessageId !== input.parentUserMessageId &&
-        record.inboxMessageId !== input.parentUserMessageId
-      ) {
+      const matchesDirectMessageId =
+        record.deliveredUserMessageId === input.parentUserMessageId ||
+        record.inboxMessageId === input.parentUserMessageId
+      const matchesRetryPrompt =
+        Boolean(record.inboxMessageId && parentAppMessageIds.has(record.inboxMessageId)) &&
+        parentTaskRefs.some(ref =>
+          ref.teamName === input.teamName &&
+          ref.taskId === input.requestedTask?.taskId
+        )
+      if (!matchesDirectMessageId && !matchesRetryPrompt) {
         continue
       }
       refs.push(
