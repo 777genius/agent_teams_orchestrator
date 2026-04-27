@@ -251,6 +251,18 @@ function extractInboundAppMessageIds(text: string): Set<string> {
   return ids
 }
 
+function getSingleRequestedTeamRef(
+  refs: OpenCodeTaskRef[],
+  teamName: string,
+  taskId: string,
+): OpenCodeTaskRef | null {
+  const teamRefs = refs.filter(ref => ref.teamName === teamName)
+  if (teamRefs.length !== 1 || teamRefs[0]?.taskId !== taskId) {
+    return null
+  }
+  return teamRefs[0]
+}
+
 function getTextFromParts(parts: Record<string, unknown>[]): string {
   return parts.map(part => asString(part.text) ?? '').filter(Boolean).join('\n')
 }
@@ -751,6 +763,11 @@ export class OpenCodeToolpartChangeReconstructor {
     const refs: OpenCodeTaskRef[] = []
     const parentTaskRefs = extractDeliveredTaskRefs(input.parentText)
     const parentAppMessageIds = extractInboundAppMessageIds(input.parentText)
+    const parentRetryTaskRef = getSingleRequestedTeamRef(
+      parentTaskRefs,
+      input.teamName,
+      input.requestedTask.taskId,
+    )
     for (const record of input.deliveryContext.records) {
       if (record.memberName !== input.memberName) {
         continue
@@ -761,24 +778,24 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!record.runtimeSessionId || record.runtimeSessionId !== input.sessionId) {
         continue
       }
+      const recordTaskRef = getSingleRequestedTeamRef(
+        record.taskRefs,
+        input.teamName,
+        input.requestedTask.taskId,
+      )
+      if (!recordTaskRef) {
+        continue
+      }
       const matchesDirectMessageId =
         record.deliveredUserMessageId === input.parentUserMessageId ||
         record.inboxMessageId === input.parentUserMessageId
       const matchesRetryPrompt =
         Boolean(record.inboxMessageId && parentAppMessageIds.has(record.inboxMessageId)) &&
-        parentTaskRefs.some(ref =>
-          ref.teamName === input.teamName &&
-          ref.taskId === input.requestedTask?.taskId
-        )
+        Boolean(parentRetryTaskRef)
       if (!matchesDirectMessageId && !matchesRetryPrompt) {
         continue
       }
-      refs.push(
-        ...record.taskRefs.filter(ref =>
-          ref.teamName === input.teamName &&
-          ref.taskId === input.requestedTask?.taskId
-        ),
-      )
+      refs.push(recordTaskRef)
     }
     return refs
   }
