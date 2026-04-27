@@ -114,6 +114,10 @@ type ReconstructedFileState = {
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
 const TASK_REFS_MARKER = 'include taskRefs exactly:'
+const OPENCODE_APP_DELIVERY_START = '<opencode_app_message_delivery>'
+const OPENCODE_APP_DELIVERY_END = '</opencode_app_message_delivery>'
+const OPENCODE_DELIVERY_CONTEXT_START = '<opencode_delivery_context>'
+const OPENCODE_DELIVERY_CONTEXT_END = '</opencode_delivery_context>'
 const INBOUND_APP_MESSAGE_ID_PATTERNS = [
   /The inbound app messageId is "([^"]+)"/g,
   /relayOfMessageId="([^"]+)"/g,
@@ -210,6 +214,19 @@ function readJsonArrayAfter(text: string, startIndex: number): string | null {
   return null
 }
 
+function getOpenCodeAppDeliveryBlockText(text: string): string {
+  const start = text.indexOf(OPENCODE_APP_DELIVERY_START)
+  if (start < 0) {
+    return text
+  }
+  const contentStart = start + OPENCODE_APP_DELIVERY_START.length
+  const end = text.indexOf(OPENCODE_APP_DELIVERY_END, contentStart)
+  if (end < 0) {
+    return text.slice(contentStart)
+  }
+  return text.slice(contentStart, end)
+}
+
 function isValidTaskRef(value: unknown): value is OpenCodeTaskRef {
   const record = asRecord(value)
   return (
@@ -236,6 +253,60 @@ function extractDeliveredTaskRefs(text: string): OpenCodeTaskRef[] {
   } catch {
     return []
   }
+}
+
+function extractStructuredDeliveryTaskRefs(input: {
+  text: string
+  teamName: string
+  memberName: string
+  laneId?: string | null
+  inboxMessageId: string | null | undefined
+  requestedTask: OpenCodeTaskRef
+}): OpenCodeTaskRef[] {
+  const refs: OpenCodeTaskRef[] = []
+  let cursor = 0
+  while (cursor < input.text.length) {
+    const start = input.text.indexOf(OPENCODE_DELIVERY_CONTEXT_START, cursor)
+    if (start < 0) {
+      break
+    }
+    const jsonStart = start + OPENCODE_DELIVERY_CONTEXT_START.length
+    const end = input.text.indexOf(OPENCODE_DELIVERY_CONTEXT_END, jsonStart)
+    if (end < 0) {
+      break
+    }
+    cursor = end + OPENCODE_DELIVERY_CONTEXT_END.length
+    const raw = input.text.slice(jsonStart, end).trim()
+    if (raw.length === 0 || byteLength(raw) > 16 * 1024) {
+      continue
+    }
+    const record = safeParseJsonRecord(raw)
+    if (
+      record?.schemaVersion !== 1 ||
+      record.kind !== 'opencode-delivery-context' ||
+      record.teamName !== input.teamName ||
+      record.memberName !== input.memberName ||
+      record.inboundMessageId !== input.inboxMessageId
+    ) {
+      continue
+    }
+    const markerLaneId = asString(record.laneId)
+    if (input.laneId && markerLaneId !== input.laneId) {
+      continue
+    }
+    const markerTaskRefs = Array.isArray(record.taskRefs)
+      ? record.taskRefs.filter(isValidTaskRef)
+      : []
+    const taskRef = getSingleRequestedTeamRef(
+      markerTaskRefs,
+      input.teamName,
+      input.requestedTask.taskId,
+    )
+    if (taskRef) {
+      refs.push(taskRef)
+    }
+  }
+  return refs
 }
 
 function extractInboundAppMessageIds(text: string): Set<string> {
@@ -761,8 +832,9 @@ export class OpenCodeToolpartChangeReconstructor {
       return []
     }
     const refs: OpenCodeTaskRef[] = []
-    const parentTaskRefs = extractDeliveredTaskRefs(input.parentText)
-    const parentAppMessageIds = extractInboundAppMessageIds(input.parentText)
+    const parentDeliveryBlockText = getOpenCodeAppDeliveryBlockText(input.parentText)
+    const parentTaskRefs = extractDeliveredTaskRefs(parentDeliveryBlockText)
+    const parentAppMessageIds = extractInboundAppMessageIds(parentDeliveryBlockText)
     const parentRetryTaskRef = getSingleRequestedTeamRef(
       parentTaskRefs,
       input.teamName,
@@ -786,13 +858,22 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!recordTaskRef) {
         continue
       }
+      const structuredDeliveryRefs = extractStructuredDeliveryTaskRefs({
+        text: parentDeliveryBlockText,
+        teamName: input.teamName,
+        memberName: input.memberName,
+        laneId: input.laneId,
+        inboxMessageId: record.inboxMessageId,
+        requestedTask: input.requestedTask,
+      })
       const matchesDirectMessageId =
         record.deliveredUserMessageId === input.parentUserMessageId ||
         record.inboxMessageId === input.parentUserMessageId
       const matchesRetryPrompt =
         Boolean(record.inboxMessageId && parentAppMessageIds.has(record.inboxMessageId)) &&
         Boolean(parentRetryTaskRef)
-      if (!matchesDirectMessageId && !matchesRetryPrompt) {
+      const matchesStructuredRetryPrompt = structuredDeliveryRefs.length === 1
+      if (!matchesDirectMessageId && !matchesRetryPrompt && !matchesStructuredRetryPrompt) {
         continue
       }
       refs.push(recordTaskRef)
