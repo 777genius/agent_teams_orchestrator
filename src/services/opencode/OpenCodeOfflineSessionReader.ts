@@ -309,8 +309,17 @@ export class OpenCodeOfflineSessionReader {
         continue
       }
       const state = asRecord(parsed.state)
+      if (!state) {
+        diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state.`)
+        supported = false
+        continue
+      }
+      const status = asString(state.status)?.toLowerCase()
+      if (status && status !== 'completed') {
+        continue
+      }
       const input = asRecord(state?.input)
-      if (!state || !input || !asString(input.filePath)) {
+      if (!input || !asString(input.filePath)) {
         diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state/input/filePath.`)
         supported = false
       }

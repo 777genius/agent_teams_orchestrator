@@ -61,7 +61,7 @@ async function collectMessagesAndSummary(
 }
 
 describe('executeCodexNativeTurn', () => {
-  test('applies idle and absolute timeout policy only to ordinary queued mailbox prompts', () => {
+  test('applies mailbox timeout policy to ordinary queued mailbox prompts', () => {
     const prompt = [
       'Process this queued mailbox message now.',
       '<queued_mailbox_message>',
@@ -73,7 +73,6 @@ describe('executeCodexNativeTurn', () => {
       idleTimeoutMs: 300_000,
       absoluteTimeoutMs: 2_700_000,
     })
-    expect(resolveCodexNativeExecTimeoutPolicy('Reply only with OK', {})).toBeNull()
     expect(
       resolveCodexNativeExecTimeoutPolicy(prompt, {
         CLAUDE_CODE_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS: '45000',
@@ -94,6 +93,31 @@ describe('executeCodexNativeTurn', () => {
     })
   })
 
+  test('applies direct timeout policy to non-mailbox prompts', () => {
+    expect(resolveCodexNativeExecTimeoutPolicy('Reply only with OK', {})).toEqual({
+      idleTimeoutMs: 900_000,
+      absoluteTimeoutMs: 3_600_000,
+    })
+    expect(
+      resolveCodexNativeExecTimeoutPolicy('Reply only with OK', {
+        CLAUDE_CODE_CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_MS: '120000',
+        CLAUDE_CODE_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS: '600000',
+      }),
+    ).toEqual({
+      idleTimeoutMs: 120_000,
+      absoluteTimeoutMs: 600_000,
+    })
+    expect(
+      resolveCodexNativeExecTimeoutPolicy('Reply only with OK', {
+        CLAUDE_CODE_CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_MS: '0',
+        CLAUDE_CODE_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS: '0',
+      }),
+    ).toEqual({
+      idleTimeoutMs: null,
+      absoluteTimeoutMs: null,
+    })
+  })
+
   test('keeps legacy mailbox timeout resolver as absolute timeout compatibility', () => {
     const prompt = [
       'Process this queued mailbox message now.',
@@ -103,7 +127,9 @@ describe('executeCodexNativeTurn', () => {
     ].join('\n')
 
     expect(resolveCodexNativeExecTimeoutMs(prompt, {})).toBe(2_700_000)
-    expect(resolveCodexNativeExecTimeoutMs('Reply only with OK', {})).toBeNull()
+    expect(resolveCodexNativeExecTimeoutMs('Reply only with OK', {})).toBe(
+      3_600_000,
+    )
     expect(
       resolveCodexNativeExecTimeoutMs(prompt, {
         CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '45000',
@@ -114,6 +140,11 @@ describe('executeCodexNativeTurn', () => {
         CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS: '0',
       }),
     ).toBeNull()
+    expect(
+      resolveCodexNativeExecTimeoutMs('Reply only with OK', {
+        CLAUDE_CODE_CODEX_NATIVE_DIRECT_TURN_TIMEOUT_MS: '60000',
+      }),
+    ).toBe(60_000)
   })
 
   test('passes the queued mailbox timeout policy to native exec', async () => {
@@ -166,7 +197,7 @@ describe('executeCodexNativeTurn', () => {
     expect(observedAbsoluteTimeoutMs).toBe(2_700_000)
   })
 
-  test('does not pass timeout policy to non-mailbox native exec', async () => {
+  test('passes direct timeout policy to non-mailbox native exec', async () => {
     let observedIdleTimeoutMs: number | null | undefined = undefined
     let observedAbsoluteTimeoutMs: number | null | undefined = undefined
 
@@ -205,8 +236,8 @@ describe('executeCodexNativeTurn', () => {
       }),
     )
 
-    expect(observedIdleTimeoutMs).toBeNull()
-    expect(observedAbsoluteTimeoutMs).toBeNull()
+    expect(observedIdleTimeoutMs).toBe(900_000)
+    expect(observedAbsoluteTimeoutMs).toBe(3_600_000)
   })
 
   test('records an assistant API error when native execution completes without assistant output', async () => {

@@ -590,10 +590,18 @@ export class OpenCodeToolpartChangeReconstructor {
         continue
       }
       const state = asRecord(data.state)
+      if (!state) {
+        diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state.`)
+        continue
+      }
+      const status = asString(state.status)?.toLowerCase() ?? 'unknown'
+      if (status !== 'completed') {
+        continue
+      }
       const input = asRecord(state?.input)
       const metadata = asRecord(state?.metadata)
       const filePath = asString(input?.filePath)
-      if (!state || !input || !filePath) {
+      if (!input || !filePath) {
         diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input/filePath.`)
         continue
       }
@@ -604,7 +612,7 @@ export class OpenCodeToolpartChangeReconstructor {
         parentUserMessageId: asString(assistantMessage?.parentID),
         tool,
         callId: asString(data.callID) ?? undefined,
-        status: asString(state.status)?.toLowerCase() ?? 'unknown',
+        status,
         filePath,
         content: asStringValue(input.content) ?? undefined,
         oldString: asStringValue(input.oldString) ?? undefined,

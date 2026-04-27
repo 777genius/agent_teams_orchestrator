@@ -76,12 +76,20 @@ type ExecuteCodexNativeTurnDeps = {
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 300_000
 const DEFAULT_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS = 2_700_000
+const DEFAULT_CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_MS = 900_000
+const DEFAULT_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS = 3_600_000
 const CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS'
 const CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS'
 const CODEX_NATIVE_MAILBOX_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_MAILBOX_TURN_TIMEOUT_MS'
+const CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_MS'
+const CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS'
+const CODEX_NATIVE_DIRECT_TIMEOUT_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_DIRECT_TURN_TIMEOUT_MS'
 
 export type CodexNativeExecTimeoutPolicy = {
   idleTimeoutMs: number | null
@@ -126,22 +134,36 @@ export function resolveCodexNativeExecTimeoutPolicy(
   prompt: string,
   env: NodeJS.ProcessEnv = process.env,
 ): CodexNativeExecTimeoutPolicy | null {
-  if (!isOrdinaryQueuedMailboxPrompt(prompt)) {
-    return null
+  if (isOrdinaryQueuedMailboxPrompt(prompt)) {
+    const legacyAbsoluteTimeoutMs = resolveTimeoutEnvValue(
+      env[CODEX_NATIVE_MAILBOX_TIMEOUT_ENV],
+      DEFAULT_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS,
+    )
+
+    return {
+      idleTimeoutMs: resolveTimeoutEnvValue(
+        env[CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_ENV],
+        DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS,
+      ),
+      absoluteTimeoutMs: resolveTimeoutEnvValue(
+        env[CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_ENV],
+        legacyAbsoluteTimeoutMs,
+      ),
+    }
   }
 
   const legacyAbsoluteTimeoutMs = resolveTimeoutEnvValue(
-    env[CODEX_NATIVE_MAILBOX_TIMEOUT_ENV],
-    DEFAULT_CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_MS,
+    env[CODEX_NATIVE_DIRECT_TIMEOUT_ENV],
+    DEFAULT_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS,
   )
 
   return {
     idleTimeoutMs: resolveTimeoutEnvValue(
-      env[CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_ENV],
-      DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS,
+      env[CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_ENV],
+      DEFAULT_CODEX_NATIVE_DIRECT_IDLE_TIMEOUT_MS,
     ),
     absoluteTimeoutMs: resolveTimeoutEnvValue(
-      env[CODEX_NATIVE_MAILBOX_ABSOLUTE_TIMEOUT_ENV],
+      env[CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_ENV],
       legacyAbsoluteTimeoutMs,
     ),
   }

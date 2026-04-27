@@ -325,6 +325,38 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes[0]?.sourceTool).toBe('write')
   })
 
+  test('ignores errored write toolparts with empty invalid input without dropping later completed writes', () => {
+    const result = reconstruct([
+      partRow(
+        'part-write-invalid',
+        'assistant-1',
+        {
+          type: 'tool',
+          tool: 'write',
+          callID: 'call-part-write-invalid',
+          state: {
+            status: 'error',
+            input: {},
+            error: 'The write tool was called with invalid arguments.',
+          },
+        },
+        950,
+      ),
+      toolPart({
+        id: 'part-write-1',
+        tool: 'write',
+        filePath: path.join(workspaceRoot, 'src/new.ts'),
+        content: 'export const value = 1;\n',
+        exists: false,
+        time: 1000,
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]?.sourcePartId).toBe('part-write-1')
+  })
+
   test('downgrades first write to an existing file to manual-only modify evidence', () => {
     const result = reconstruct([
       toolPart({

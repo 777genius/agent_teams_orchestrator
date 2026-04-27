@@ -82,6 +82,7 @@ type CodexNativeExecRunnerDeps = {
       cwd: string
       env: NodeJS.ProcessEnv
       signal?: AbortSignal
+      detached?: boolean
       stdin: 'pipe'
       stdout: 'pipe'
       stderr: 'pipe'
@@ -225,9 +226,31 @@ function defaultResolveVersion(executablePath: string): string | null {
   return version.length > 0 ? version : null
 }
 
+function terminateCodexNativeProcessGroup(
+  pid: number | undefined,
+  signal: NodeJS.Signals,
+): boolean {
+  if (!pid || !Number.isFinite(pid) || pid <= 1) {
+    return false
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal)
+      return true
+    } catch {
+      // Fall back to the direct process if the group is already gone or was not
+      // spawned as a POSIX process-group leader.
+    }
+  }
+
+  killProcessTree(pid, signal)
+  return true
+}
+
 function createQueuedLineStream(
   process: SpawnedCodexProcess,
-  onActivity?: () => void,
+  onStdoutActivity?: () => void,
 ): AsyncGenerator<QueuedLine, void, unknown> {
   const queue: QueuedLine[] = []
   let streamClosures = 0
@@ -240,7 +263,9 @@ function createQueuedLineStream(
   }
 
   const onLine = (stream: 'stdout' | 'stderr', line: string) => {
-    onActivity?.()
+    if (stream === 'stdout') {
+      onStdoutActivity?.()
+    }
     queue.push({ stream, line })
     wake()
   }
@@ -260,12 +285,11 @@ function createQueuedLineStream(
     input: stderr,
     crlfDelay: Infinity,
   })
-  const onStreamData = () => onActivity?.()
+  const onStdoutData = () => onStdoutActivity?.()
 
   stdoutInterface.on('line', line => onLine('stdout', line))
   stderrInterface.on('line', line => onLine('stderr', line))
-  stdout.on('data', onStreamData)
-  stderr.on('data', onStreamData)
+  stdout.on('data', onStdoutData)
   stdout.once('end', onClose)
   stderr.once('end', onClose)
   process.once('close', () => {
@@ -290,8 +314,7 @@ function createQueuedLineStream(
         }
       }
     } finally {
-      stdout.off('data', onStreamData)
-      stderr.off('data', onStreamData)
+      stdout.off('data', onStdoutData)
       stdoutInterface.close()
       stderrInterface.close()
     }
@@ -328,6 +351,7 @@ export async function* runCodexNativeExec(
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
+      detached: process.platform !== 'win32',
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
@@ -336,6 +360,7 @@ export async function* runCodexNativeExec(
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
@@ -359,6 +384,7 @@ export async function* runCodexNativeExec(
       ? normalizeTimeoutMs(options.timeoutMs)
       : normalizeTimeoutMs(options.absoluteTimeoutMs)
   let timeoutReason: CodexNativeExecTimeoutReason | null = null
+  let childClosed = false
   let idleTimeoutHandle: ReturnType<typeof setTimeout> | null = null
   let absoluteTimeoutHandle: ReturnType<typeof setTimeout> | null = null
   let forceKillHandle: ReturnType<typeof setTimeout> | null = null
@@ -377,6 +403,32 @@ export async function* runCodexNativeExec(
     }
   }
 
+  const terminateChildProcessGroup = (signal: NodeJS.Signals): void => {
+    if (childClosed) {
+      return
+    }
+    try {
+      if (
+        !child.killed &&
+        !terminateCodexNativeProcessGroup(child.pid, signal)
+      ) {
+        child.kill(signal)
+      }
+    } catch {
+      // Best-effort process cleanup.
+    }
+  }
+
+  const scheduleForceKill = (): void => {
+    if (forceKillHandle || childClosed) {
+      return
+    }
+    forceKillHandle = setTimeout(() => {
+      terminateChildProcessGroup('SIGKILL')
+    }, 5_000)
+    forceKillHandle.unref?.()
+  }
+
   const terminateForTimeout = (
     reason: CodexNativeExecTimeoutReason,
   ): void => {
@@ -384,27 +436,8 @@ export async function* runCodexNativeExec(
       return
     }
     timeoutReason = reason
-    try {
-      if (!child.killed && child.pid) {
-        killProcessTree(child.pid, 'SIGTERM')
-      } else if (!child.killed) {
-        child.kill('SIGTERM')
-      }
-    } catch {
-      // Best-effort timeout cleanup.
-    }
-    forceKillHandle = setTimeout(() => {
-      try {
-        if (child.pid) {
-          killProcessTree(child.pid, 'SIGKILL')
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Best-effort timeout cleanup.
-      }
-    }, 5_000)
-    forceKillHandle.unref?.()
+    terminateChildProcessGroup('SIGTERM')
+    scheduleForceKill()
   }
 
   const resetIdleTimeout = (): void => {
@@ -424,6 +457,16 @@ export async function* runCodexNativeExec(
   recordProcessActivity = resetIdleTimeout
   resetIdleTimeout()
 
+  const onAbort = () => {
+    terminateChildProcessGroup('SIGTERM')
+    scheduleForceKill()
+  }
+  if (options.abortSignal?.aborted) {
+    onAbort()
+  } else {
+    options.abortSignal?.addEventListener('abort', onAbort, { once: true })
+  }
+
   if (absoluteTimeoutMs) {
     absoluteTimeoutHandle = setTimeout(() => {
       terminateForTimeout({
@@ -432,11 +475,6 @@ export async function* runCodexNativeExec(
       })
     }, absoluteTimeoutMs)
     absoluteTimeoutHandle.unref?.()
-  }
-
-  yield {
-    type: 'binary_identity',
-    identity,
   }
 
   let threadId: string | null = null
@@ -451,15 +489,19 @@ export async function* runCodexNativeExec(
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     resolve => {
       child.once('close', (code, signal) => {
+        childClosed = true
         resolve({ code, signal })
       })
     },
   )
 
   try {
-    for await (const entry of queuedLines) {
-      resetIdleTimeout()
+    yield {
+      type: 'binary_identity',
+      identity,
+    }
 
+    for await (const entry of queuedLines) {
       if (entry.stream === 'stderr') {
         const rewrittenLine = rewriteCodexNativeStderrLine(
           entry.line,
@@ -533,5 +575,10 @@ export async function* runCodexNativeExec(
     }
   } finally {
     clearTimeouts()
+    options.abortSignal?.removeEventListener('abort', onAbort)
+    if (!childClosed) {
+      terminateChildProcessGroup('SIGTERM')
+      scheduleForceKill()
+    }
   }
 }
