@@ -151,7 +151,7 @@ type TaskChangeEventV1 = {
   sourcePartId?: string
   sourceMessageId?: string
   parentUserMessageId?: string
-  attributionMethod?: 'delivery-ledger-taskrefs'
+  attributionMethod?: 'parent-taskrefs-exact' | 'delivery-ledger-taskrefs' | 'requested-task-marker'
   sourceImportKey?: string
   importedAt?: string
   importBatchId?: string
