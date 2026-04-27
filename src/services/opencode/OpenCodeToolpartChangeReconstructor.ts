@@ -170,15 +170,15 @@ function isFullTextAvailable(content: string | undefined, truncated: boolean | u
   )
 }
 
-function getOpenCodeAppDeliveryBlockText(text: string): string {
+function getOpenCodeAppDeliveryBlockText(text: string): string | null {
   const start = text.indexOf(OPENCODE_APP_DELIVERY_START)
   if (start < 0) {
-    return text
+    return null
   }
   const contentStart = start + OPENCODE_APP_DELIVERY_START.length
   const end = text.indexOf(OPENCODE_APP_DELIVERY_END, contentStart)
   if (end < 0) {
-    return text.slice(contentStart)
+    return null
   }
   return text.slice(contentStart, end)
 }
@@ -695,14 +695,16 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!recordTaskRef) {
         continue
       }
-      const structuredDeliveryRefs = extractStructuredDeliveryTaskRefs({
-        text: parentDeliveryBlockText,
-        teamName: input.teamName,
-        memberName: input.memberName,
-        laneId: input.laneId,
-        inboxMessageId: record.inboxMessageId,
-        requestedTask: input.requestedTask,
-      })
+      const structuredDeliveryRefs = parentDeliveryBlockText
+        ? extractStructuredDeliveryTaskRefs({
+            text: parentDeliveryBlockText,
+            teamName: input.teamName,
+            memberName: input.memberName,
+            laneId: input.laneId,
+            inboxMessageId: record.inboxMessageId,
+            requestedTask: input.requestedTask,
+          })
+        : []
       const matchesDirectMessageId =
         record.deliveredUserMessageId === input.parentUserMessageId ||
         record.inboxMessageId === input.parentUserMessageId

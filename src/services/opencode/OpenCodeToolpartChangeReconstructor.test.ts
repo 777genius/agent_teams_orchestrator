@@ -555,6 +555,92 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     )
   })
 
+  test('strict delivery mode ignores structured markers when the generated delivery block is missing', () => {
+    const result = reconstruct(
+      [],
+      {
+        attributionMode: 'strict-delivery',
+        requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        deliveryContext: deliveryContext({
+          inboxMessageId: 'app-message-1',
+          deliveredUserMessageId: 'user-original',
+        }),
+        rawMessages: [
+          messageRow('user-retry-2', { id: 'user-retry-2' }, 900),
+          messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-retry-2' }, 1000),
+        ],
+        rawParts: [
+          partRow(
+            'user-part-retry-2',
+            'user-retry-2',
+            {
+              type: 'text',
+              text:
+                '<opencode_delivery_context>{"schemaVersion":1,"kind":"opencode-delivery-context","teamName":"team-a","memberName":"bob","laneId":"primary","inboundMessageId":"app-message-1","taskRefs":[{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]}</opencode_delivery_context>',
+            },
+            900,
+          ),
+          toolPart({
+            id: 'part-write-1',
+            tool: 'write',
+            filePath: path.join(workspaceRoot, 'src/new.ts'),
+            content: 'export const value = 1;\n',
+            exists: false,
+          }),
+        ],
+      },
+    )
+
+    expect(result.changes).toHaveLength(0)
+    expect(result.notices).toEqual([])
+    expect(result.diagnostics).toContain(
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
+    )
+  })
+
+  test('strict delivery mode ignores structured markers in malformed generated delivery blocks', () => {
+    const result = reconstruct(
+      [],
+      {
+        attributionMode: 'strict-delivery',
+        requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        deliveryContext: deliveryContext({
+          inboxMessageId: 'app-message-1',
+          deliveredUserMessageId: 'user-original',
+        }),
+        rawMessages: [
+          messageRow('user-retry-2', { id: 'user-retry-2' }, 900),
+          messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-retry-2' }, 1000),
+        ],
+        rawParts: [
+          partRow(
+            'user-part-retry-2',
+            'user-retry-2',
+            {
+              type: 'text',
+              text:
+                '<opencode_app_message_delivery>\n<opencode_delivery_context>{"schemaVersion":1,"kind":"opencode-delivery-context","teamName":"team-a","memberName":"bob","laneId":"primary","inboundMessageId":"app-message-1","taskRefs":[{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]}</opencode_delivery_context>',
+            },
+            900,
+          ),
+          toolPart({
+            id: 'part-write-1',
+            tool: 'write',
+            filePath: path.join(workspaceRoot, 'src/new.ts'),
+            content: 'export const value = 1;\n',
+            exists: false,
+          }),
+        ],
+      },
+    )
+
+    expect(result.changes).toHaveLength(0)
+    expect(result.notices).toEqual([])
+    expect(result.diagnostics).toContain(
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
+    )
+  })
+
   test('strict delivery mode rejects retry prompts with multiple task refs', () => {
     const result = reconstruct(
       [],
