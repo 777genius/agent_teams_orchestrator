@@ -236,7 +236,7 @@ describe('OpenCode Ledger Bridge live e2e', () => {
       `Create ${SMOKE_FILE} in the current workspace with exactly: export const liveSmoke = 1;`,
       `Then edit ${SMOKE_FILE} so the content is exactly: export const liveSmoke = 2;`,
       `Do not create any other files.`,
-      `include taskRefs exactly: [{"taskId":"${TASK_ID}","displayId":"${TASK_DISPLAY_ID}","teamName":"${TEAM_NAME}"}]`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
     ].join('\n')
 
     const run = runOpenCode([

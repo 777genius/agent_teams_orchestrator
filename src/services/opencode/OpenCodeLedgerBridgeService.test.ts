@@ -84,6 +84,28 @@ function partRow(
   }
 }
 
+function structuredDeliveryPrompt(inboundMessageId: string): string {
+  return [
+    '<opencode_app_message_delivery>',
+    `<opencode_delivery_context>${JSON.stringify({
+      schemaVersion: 1,
+      kind: 'opencode-delivery-context',
+      teamName: 'team-a',
+      memberName: 'bob',
+      laneId: 'primary',
+      inboundMessageId,
+      taskRefs: [
+        { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+      ],
+    })}</opencode_delivery_context>`,
+    '</opencode_app_message_delivery>',
+    '',
+    '<opencode_inbound_app_message>',
+    'Build it.',
+    '</opencode_inbound_app_message>',
+  ].join('\n')
+}
+
 function offlineFixture(): OpenCodeOfflineSessionReadResult {
   const toolData = {
     type: 'tool',
@@ -112,8 +134,7 @@ function offlineFixture(): OpenCodeOfflineSessionReadResult {
         'user-part-1',
         'user-1',
         {
-          text:
-            'Build it. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]',
+          text: structuredDeliveryPrompt('user-1'),
         },
         900,
       ),
@@ -172,6 +193,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
     })
 
     expect(result.outcome).toBe('imported')
@@ -189,7 +211,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       sourceSessionId: 'session-1',
       sourcePartId: 'tool-part-1',
       parentUserMessageId: 'user-1',
-      attributionMethod: 'parent-taskrefs-exact',
+      attributionMethod: 'delivery-ledger-taskrefs',
       relativePath: 'src/opencode.ts',
     })
   })
@@ -202,8 +224,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           'user-part-1',
           'user-1',
           {
-            text:
-              'Build it. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]',
+            text: structuredDeliveryPrompt('user-1'),
           },
           900,
         ),
@@ -240,6 +261,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
     })
 
     expect(result.outcome).toBe('imported')
@@ -290,6 +312,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
     })
 
     expect(result.outcome).toBe('unsafe-input')
@@ -408,6 +431,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
     })
 
     expect(result.outcome).toBe('skipped-capability')
@@ -445,6 +469,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
     })
 
     expect(result.outcome).toBe('imported')

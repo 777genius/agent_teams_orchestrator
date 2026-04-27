@@ -186,13 +186,36 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
       );
     `)
 
-    const exactTaskPrompt =
-      'Implement task #abc12345. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"fixture-team"}]'
-    const ambiguousPrompt =
-      'Implement two tasks. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"fixture-team"},{"taskId":"task-2","displayId":"def67890","teamName":"fixture-team"}]'
+    const deliveryPrompt = (
+      inboundMessageId: string,
+      memberName: string,
+      taskRefs = [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' }],
+    ) => [
+      '<opencode_app_message_delivery>',
+      `<opencode_delivery_context>${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'opencode-delivery-context',
+        teamName: 'fixture-team',
+        memberName,
+        laneId: `secondary:opencode:${memberName}`,
+        inboundMessageId,
+        taskRefs,
+      })}</opencode_delivery_context>`,
+      '</opencode_app_message_delivery>',
+      '',
+      '<opencode_inbound_app_message>',
+      'Implement the assigned task.',
+      '</opencode_inbound_app_message>',
+    ].join('\n')
+    const bobTaskPrompt = deliveryPrompt('bob-user-1', 'bob')
+    const tomTaskPrompt = deliveryPrompt('tom-user-1', 'tom')
+    const ambiguousPrompt = deliveryPrompt('amb-user-1', 'sam', [
+      { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
+      { taskId: 'task-2', displayId: 'def67890', teamName: 'fixture-team' },
+    ])
 
     insertMessage(db, { id: 'bob-user-1', sessionId: 'session-bob', time: 900, data: messageData('bob-user-1') })
-    insertPart(db, { id: 'bob-user-part-1', messageId: 'bob-user-1', sessionId: 'session-bob', time: 900, data: userTextPart(exactTaskPrompt) })
+    insertPart(db, { id: 'bob-user-part-1', messageId: 'bob-user-1', sessionId: 'session-bob', time: 900, data: userTextPart(bobTaskPrompt) })
     insertMessage(db, { id: 'bob-assistant-1', sessionId: 'session-bob', time: 1_000, data: messageData('bob-assistant-1', 'bob-user-1') })
     insertPart(db, {
       id: 'bob-write-index',
@@ -245,7 +268,7 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
     })
 
     insertMessage(db, { id: 'tom-user-1', sessionId: 'session-tom', time: 2_000, data: messageData('tom-user-1') })
-    insertPart(db, { id: 'tom-user-part-1', messageId: 'tom-user-1', sessionId: 'session-tom', time: 2_000, data: userTextPart(exactTaskPrompt) })
+    insertPart(db, { id: 'tom-user-part-1', messageId: 'tom-user-1', sessionId: 'session-tom', time: 2_000, data: userTextPart(tomTaskPrompt) })
     insertMessage(db, { id: 'tom-assistant-1', sessionId: 'session-tom', time: 2_100, data: messageData('tom-assistant-1', 'tom-user-1') })
     insertPart(db, {
       id: 'tom-write-index-existing',

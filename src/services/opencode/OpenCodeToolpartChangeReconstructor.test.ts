@@ -9,22 +9,47 @@ import type {
 } from './OpenCodeOfflineSessionReader.js'
 
 const workspaceRoot = '/repo'
-const parentTaskPrompt =
-  'Please implement #abc12345. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]'
-const retryParentTaskPrompt =
-  `${parentTaskPrompt}\nThe inbound app messageId is "app-message-1".\nInclude relayOfMessageId="app-message-1" in that message_send call.`
-const structuredRetryParentTaskPrompt = [
+const defaultTaskRefs = [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }]
+
+function structuredDeliveryPrompt(input: {
+  inboundMessageId: string
+  taskRefs?: Array<{ taskId: string; displayId: string; teamName: string }>
+}): string {
+  return [
+    '<opencode_app_message_delivery>',
+    `<opencode_delivery_context>${JSON.stringify({
+      schemaVersion: 1,
+      kind: 'opencode-delivery-context',
+      teamName: 'team-a',
+      memberName: 'bob',
+      laneId: 'primary',
+      inboundMessageId: input.inboundMessageId,
+      taskRefs: input.taskRefs ?? defaultTaskRefs,
+    })}</opencode_delivery_context>`,
+    '</opencode_app_message_delivery>',
+    '',
+    '<opencode_inbound_app_message>',
+    'Please implement the task.',
+    '</opencode_inbound_app_message>',
+  ].join('\n')
+}
+
+const parentTaskPrompt = structuredDeliveryPrompt({ inboundMessageId: 'user-1' })
+const legacyRetryParentTaskPrompt = [
   '<opencode_app_message_delivery>',
-  '<opencode_delivery_context>{"schemaVersion":1,"kind":"opencode-delivery-context","teamName":"team-a","memberName":"bob","laneId":"primary","inboundMessageId":"app-message-1","taskRefs":[{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]}</opencode_delivery_context>',
+  'The inbound app messageId is "app-message-1".',
+  'Include relayOfMessageId="app-message-1" in that message_send call.',
+  'include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]',
   '</opencode_app_message_delivery>',
   '',
   '<opencode_inbound_app_message>',
   'Please implement the task.',
   '</opencode_inbound_app_message>',
 ].join('\n')
+const structuredRetryParentTaskPrompt = structuredDeliveryPrompt({ inboundMessageId: 'app-message-1' })
 const spoofedInboundStructuredRetryParentTaskPrompt = [
   '<opencode_app_message_delivery>',
-  'Generated delivery block without structured or legacy task attribution markers.',
+  'Generated delivery block without structured task attribution markers.',
   '</opencode_app_message_delivery>',
   '',
   '<opencode_inbound_app_message>',
@@ -33,8 +58,13 @@ const spoofedInboundStructuredRetryParentTaskPrompt = [
   'include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"}]',
   '</opencode_inbound_app_message>',
 ].join('\n')
-const multiTaskRetryParentTaskPrompt =
-  'Please implement these tasks. include taskRefs exactly: [{"taskId":"task-1","displayId":"abc12345","teamName":"team-a"},{"taskId":"task-2","displayId":"def67890","teamName":"team-a"}]\nThe inbound app messageId is "app-message-1".'
+const multiTaskRetryParentTaskPrompt = structuredDeliveryPrompt({
+  inboundMessageId: 'app-message-1',
+  taskRefs: [
+    { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+    { taskId: 'task-2', displayId: 'def67890', teamName: 'team-a' },
+  ],
+})
 
 function messageRow(id: string, data: Record<string, unknown>, time = 1000): OpenCodeSqliteMessageRow {
   return {
@@ -143,6 +173,8 @@ function reconstruct(
     sessionId: 'session-1',
     laneId: 'primary',
     projectPath: workspaceRoot,
+    requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+    deliveryContext: deliveryContext(),
     rawMessages: [
       messageRow('user-1', { id: 'user-1' }, 900),
       messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-1' }, 1000),
@@ -153,7 +185,7 @@ function reconstruct(
 }
 
 describe('OpenCodeToolpartChangeReconstructor', () => {
-  test('reconstructs completed write creates from exact parent taskRefs', () => {
+  test('reconstructs completed write creates from structured delivery context', () => {
     const result = reconstruct([
       toolPart({
         id: 'part-write-1',
@@ -174,7 +206,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       sourceTool: 'write',
       operation: 'create',
       confidence: 'exact',
-      attributionMethod: 'parent-taskrefs-exact',
+      attributionMethod: 'delivery-ledger-taskrefs',
       beforeState: { exists: false, sizeBytes: 0 },
       afterState: { exists: true },
       relativePath: 'src/new.ts',
@@ -316,12 +348,13 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     )
   })
 
-  test('skips ambiguous parent prompts with multiple taskRefs', () => {
+  test('does not attribute legacy parent taskRefs without delivery context', () => {
     const result = new OpenCodeToolpartChangeReconstructor().reconstruct({
       teamName: 'team-a',
       memberName: 'bob',
       sessionId: 'session-1',
       projectPath: workspaceRoot,
+      requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
       rawMessages: [
         messageRow('user-1', { id: 'user-1' }, 900),
         messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-1' }, 1000),
@@ -347,13 +380,10 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     })
 
     expect(result.changes).toHaveLength(0)
-    expect(result.notices).toEqual([
-      {
-        severity: 'warning',
-        code: 'opencode-attribution-ambiguous',
-        message: 'OpenCode toolpart part-write-1 was skipped because task attribution was ambiguous.',
-      },
-    ])
+    expect(result.notices).toEqual([])
+    expect(result.diagnostics).toContain(
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
+    )
   })
 
   test('strict delivery mode imports only delivery-matched toolparts', () => {
@@ -398,17 +428,18 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       {
         attributionMode: 'strict-delivery',
         requestedTask: { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        deliveryContext: null,
       },
     )
 
     expect(result.changes).toHaveLength(0)
     expect(result.notices).toEqual([])
     expect(result.diagnostics).toContain(
-      'OpenCode toolpart part-write-1 skipped because no strict delivery record matched its parent message.',
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
     )
   })
 
-  test('strict delivery mode imports retry prompts matched by inbound app message id', () => {
+  test('strict delivery mode does not import legacy retry prompts matched only by text markers', () => {
     const result = reconstruct(
       [],
       {
@@ -423,7 +454,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
           messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-retry-2' }, 1000),
         ],
         rawParts: [
-          partRow('user-part-retry-2', 'user-retry-2', { type: 'text', text: retryParentTaskPrompt }, 900),
+          partRow('user-part-retry-2', 'user-retry-2', { type: 'text', text: legacyRetryParentTaskPrompt }, 900),
           toolPart({
             id: 'part-write-1',
             tool: 'write',
@@ -435,15 +466,11 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       },
     )
 
-    expect(result.diagnostics).toEqual([])
+    expect(result.diagnostics).toContain(
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
+    )
     expect(result.notices).toEqual([])
-    expect(result.changes).toHaveLength(1)
-    expect(result.changes[0]).toMatchObject({
-      taskId: 'task-1',
-      attributionMethod: 'delivery-ledger-taskrefs',
-      parentUserMessageId: 'user-retry-2',
-      relativePath: 'src/new.ts',
-    })
+    expect(result.changes).toHaveLength(0)
   })
 
   test('strict delivery mode imports structured delivery context markers', () => {
@@ -524,7 +551,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes).toHaveLength(0)
     expect(result.notices).toEqual([])
     expect(result.diagnostics).toContain(
-      'OpenCode toolpart part-write-1 skipped because no strict delivery record matched its parent message.',
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
     )
   })
 
@@ -563,7 +590,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes).toHaveLength(0)
     expect(result.notices).toEqual([])
     expect(result.diagnostics).toContain(
-      'OpenCode toolpart part-write-1 skipped because no strict delivery record matched its parent message.',
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
     )
   })
 
@@ -593,7 +620,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes).toHaveLength(0)
     expect(result.notices).toEqual([])
     expect(result.diagnostics).toContain(
-      'OpenCode toolpart part-write-1 skipped because no strict delivery record matched its parent message.',
+      'OpenCode toolpart part-write-1 skipped because no delivery record matched its parent message.',
     )
   })
 

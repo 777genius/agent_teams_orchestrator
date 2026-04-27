@@ -67,10 +67,7 @@ export type ReconstructedOpenCodeToolChange = {
   }
   operation: 'create' | 'modify'
   confidence: 'exact' | 'high'
-  attributionMethod:
-    | 'parent-taskrefs-exact'
-    | 'delivery-ledger-taskrefs'
-    | 'requested-task-marker'
+  attributionMethod: 'delivery-ledger-taskrefs'
   oldString?: string
   newString?: string
   warnings?: string[]
@@ -113,15 +110,10 @@ type ReconstructedFileState = {
 }
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
-const TASK_REFS_MARKER = 'include taskRefs exactly:'
 const OPENCODE_APP_DELIVERY_START = '<opencode_app_message_delivery>'
 const OPENCODE_APP_DELIVERY_END = '</opencode_app_message_delivery>'
 const OPENCODE_DELIVERY_CONTEXT_START = '<opencode_delivery_context>'
 const OPENCODE_DELIVERY_CONTEXT_END = '</opencode_delivery_context>'
-const INBOUND_APP_MESSAGE_ID_PATTERNS = [
-  /The inbound app messageId is "([^"]+)"/g,
-  /relayOfMessageId="([^"]+)"/g,
-]
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -178,42 +170,6 @@ function isFullTextAvailable(content: string | undefined, truncated: boolean | u
   )
 }
 
-function readJsonArrayAfter(text: string, startIndex: number): string | null {
-  const openIndex = text.indexOf('[', startIndex)
-  if (openIndex < 0) {
-    return null
-  }
-  let depth = 0
-  let inString = false
-  let escaped = false
-  for (let index = openIndex; index < text.length; index += 1) {
-    const char = text[index]
-    if (inString) {
-      if (escaped) {
-        escaped = false
-      } else if (char === '\\') {
-        escaped = true
-      } else if (char === '"') {
-        inString = false
-      }
-      continue
-    }
-    if (char === '"') {
-      inString = true
-      continue
-    }
-    if (char === '[') {
-      depth += 1
-    } else if (char === ']') {
-      depth -= 1
-      if (depth === 0) {
-        return text.slice(openIndex, index + 1)
-      }
-    }
-  }
-  return null
-}
-
 function getOpenCodeAppDeliveryBlockText(text: string): string {
   const start = text.indexOf(OPENCODE_APP_DELIVERY_START)
   if (start < 0) {
@@ -236,23 +192,6 @@ function isValidTaskRef(value: unknown): value is OpenCodeTaskRef {
     record.teamName.length > 0 &&
     (record.displayId === undefined || typeof record.displayId === 'string')
   )
-}
-
-function extractDeliveredTaskRefs(text: string): OpenCodeTaskRef[] {
-  const index = text.indexOf(TASK_REFS_MARKER)
-  if (index < 0) {
-    return []
-  }
-  const arrayText = readJsonArrayAfter(text, index + TASK_REFS_MARKER.length)
-  if (!arrayText) {
-    return []
-  }
-  try {
-    const parsed = JSON.parse(arrayText) as unknown
-    return Array.isArray(parsed) ? parsed.filter(isValidTaskRef) : []
-  } catch {
-    return []
-  }
 }
 
 function extractStructuredDeliveryTaskRefs(input: {
@@ -309,19 +248,6 @@ function extractStructuredDeliveryTaskRefs(input: {
   return refs
 }
 
-function extractInboundAppMessageIds(text: string): Set<string> {
-  const ids = new Set<string>()
-  for (const pattern of INBOUND_APP_MESSAGE_ID_PATTERNS) {
-    pattern.lastIndex = 0
-    for (const match of text.matchAll(pattern)) {
-      if (typeof match[1] === 'string' && match[1].length > 0) {
-        ids.add(match[1])
-      }
-    }
-  }
-  return ids
-}
-
 function getSingleRequestedTeamRef(
   refs: OpenCodeTaskRef[],
   teamName: string,
@@ -365,24 +291,6 @@ function buildSourceImportKey(params: {
   normalizedPath: NormalizedOpenCodeFilePath
 }): string {
   return ['opencode', params.sessionId, params.partId, params.normalizedPath.comparisonKey].join('\0')
-}
-
-function parentPromptReferencesRequestedTask(text: string, requested: OpenCodeTaskRef): boolean {
-  if (text.includes(requested.taskId)) {
-    return true
-  }
-  if (!requested.displayId) {
-    return false
-  }
-  const taskMarkers = Array.from(text.matchAll(/(^|[^\w])#([a-zA-Z0-9][a-zA-Z0-9_-]{2,64})\b/g))
-    .map(match => match[2])
-  if (taskMarkers.length === 0) {
-    return false
-  }
-  if (taskMarkers.some(marker => marker !== requested.displayId)) {
-    return false
-  }
-  return taskMarkers.includes(requested.displayId)
 }
 
 export class OpenCodeToolpartChangeReconstructor {
@@ -726,57 +634,20 @@ export class OpenCodeToolpartChangeReconstructor {
     }
     diagnostics: string[]
   }): TaskContextResolution {
-    const attributionMode = input.params.attributionMode ?? 'compatible'
     const parentParts = input.toolpart.parentUserMessageId
       ? input.partsByMessageId.get(input.toolpart.parentUserMessageId) ?? []
       : []
     const parentText = getTextFromParts(parentParts)
-    if (attributionMode === 'strict-delivery') {
-      const deliveryRefs = this.lookupStrictDeliveryRefs({
-        deliveryContext: input.params.deliveryContext,
-        parentUserMessageId: input.toolpart.parentUserMessageId,
-        parentText,
-        teamName: input.params.teamName,
-        memberName: input.params.memberName,
-        sessionId: input.params.sessionId,
-        laneId: input.params.laneId,
-        requestedTask: input.params.requestedTask,
-      })
-      if (deliveryRefs.length === 1) {
-        return {
-          type: 'matched',
-          context: { taskRef: deliveryRefs[0], method: 'delivery-ledger-taskrefs' },
-        }
-      }
-      if (deliveryRefs.length > 1) {
-        input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} strict delivery context contained multiple matching task refs.`)
-      } else {
-        input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} skipped because no strict delivery record matched its parent message.`)
-      }
-      return { type: 'skipped' }
-    }
-
-    const exactRefs = extractDeliveredTaskRefs(parentText).filter(ref => ref.teamName === input.params.teamName)
-    if (exactRefs.length === 1) {
-      return {
-        type: 'matched',
-        context: { taskRef: exactRefs[0], method: 'parent-taskrefs-exact' },
-      }
-    }
-    if (exactRefs.length > 1) {
-      input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} parent prompt contained multiple task refs.`)
-      return {
-        type: 'skipped',
-        notice: {
-          severity: 'warning',
-          code: 'opencode-attribution-ambiguous',
-          message: `OpenCode toolpart ${input.toolpart.partId} was skipped because task attribution was ambiguous.`,
-        },
-      }
-    }
-
-    const deliveryRefs = this.lookupDeliveryRefs(input.params.deliveryContext, input.toolpart.parentUserMessageId)
-      .filter(ref => ref.teamName === input.params.teamName)
+    const deliveryRefs = this.lookupStrictDeliveryRefs({
+      deliveryContext: input.params.deliveryContext,
+      parentUserMessageId: input.toolpart.parentUserMessageId,
+      parentText,
+      teamName: input.params.teamName,
+      memberName: input.params.memberName,
+      sessionId: input.params.sessionId,
+      laneId: input.params.laneId,
+      requestedTask: input.params.requestedTask,
+    })
     if (deliveryRefs.length === 1) {
       return {
         type: 'matched',
@@ -784,38 +655,11 @@ export class OpenCodeToolpartChangeReconstructor {
       }
     }
     if (deliveryRefs.length > 1) {
-      input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} delivery context contained multiple task refs.`)
-      return {
-        type: 'skipped',
-        notice: {
-          severity: 'warning',
-          code: 'opencode-attribution-ambiguous',
-          message: `OpenCode toolpart ${input.toolpart.partId} was skipped because task attribution was ambiguous.`,
-        },
-      }
+      input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} delivery context contained multiple matching task refs.`)
+    } else {
+      input.diagnostics.push(`OpenCode toolpart ${input.toolpart.partId} skipped because no delivery record matched its parent message.`)
     }
-
-    if (
-      input.params.requestedTask &&
-      parentPromptReferencesRequestedTask(parentText, input.params.requestedTask)
-    ) {
-      return {
-        type: 'matched',
-        context: {
-          taskRef: input.params.requestedTask,
-          method: 'requested-task-marker',
-          warning: 'OpenCode follow-up prompt referenced the requested task but did not include exact taskRefs JSON.',
-        },
-      }
-    }
-    return {
-      type: 'skipped',
-      notice: {
-        severity: 'warning',
-        code: 'opencode-attribution-ambiguous',
-        message: `OpenCode toolpart ${input.toolpart.partId} was skipped because task attribution was ambiguous.`,
-      },
-    }
+    return { type: 'skipped' }
   }
 
   private lookupStrictDeliveryRefs(input: {
@@ -833,13 +677,6 @@ export class OpenCodeToolpartChangeReconstructor {
     }
     const refs: OpenCodeTaskRef[] = []
     const parentDeliveryBlockText = getOpenCodeAppDeliveryBlockText(input.parentText)
-    const parentTaskRefs = extractDeliveredTaskRefs(parentDeliveryBlockText)
-    const parentAppMessageIds = extractInboundAppMessageIds(parentDeliveryBlockText)
-    const parentRetryTaskRef = getSingleRequestedTeamRef(
-      parentTaskRefs,
-      input.teamName,
-      input.requestedTask.taskId,
-    )
     for (const record of input.deliveryContext.records) {
       if (record.memberName !== input.memberName) {
         continue
@@ -869,35 +706,11 @@ export class OpenCodeToolpartChangeReconstructor {
       const matchesDirectMessageId =
         record.deliveredUserMessageId === input.parentUserMessageId ||
         record.inboxMessageId === input.parentUserMessageId
-      const matchesRetryPrompt =
-        Boolean(record.inboxMessageId && parentAppMessageIds.has(record.inboxMessageId)) &&
-        Boolean(parentRetryTaskRef)
       const matchesStructuredRetryPrompt = structuredDeliveryRefs.length === 1
-      if (!matchesDirectMessageId && !matchesRetryPrompt && !matchesStructuredRetryPrompt) {
+      if (!matchesDirectMessageId && !matchesStructuredRetryPrompt) {
         continue
       }
       refs.push(recordTaskRef)
-    }
-    return refs
-  }
-
-  private lookupDeliveryRefs(
-    deliveryContext: OpenCodeDeliveryContextV1 | null | undefined,
-    parentUserMessageId: string | undefined,
-  ): OpenCodeTaskRef[] {
-    if (!deliveryContext || !parentUserMessageId) {
-      return []
-    }
-    const refs: OpenCodeTaskRef[] = []
-    for (const record of deliveryContext.records) {
-      if (
-        record.deliveredUserMessageId === parentUserMessageId ||
-        record.inboxMessageId === parentUserMessageId ||
-        record.prePromptCursor === parentUserMessageId ||
-        record.postPromptCursor === parentUserMessageId
-      ) {
-        refs.push(...record.taskRefs)
-      }
     }
     return refs
   }
