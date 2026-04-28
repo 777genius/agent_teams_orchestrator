@@ -91,13 +91,6 @@ export type SnapshotProbeInput = {
   opencodeVersion?: string
 }
 
-export type SnapshotBoundaryReadInput = {
-  workspaceRoot: string
-  sessionId: string
-  boundary: OpenCodeSnapshotBoundary
-  touchedRelativePaths: string[]
-}
-
 export type SnapshotSessionEvidenceInput = {
   workspaceRoot: string
   sessionRecord: OpenCodeSessionRecord
@@ -125,20 +118,4 @@ export function normalizeOpenCodeEvidencePipelineMode(value: unknown): OpenCodeE
     value === 'snapshot-auto'
     ? value
     : DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE
-}
-
-export function isCapturedSnapshotBoundary(
-  boundary: OpenCodeSnapshotBoundary | null | undefined,
-): boundary is OpenCodeSnapshotBoundary & {
-  captureStatus: 'captured'
-  preDeliverySnapshotHash: string
-  postDeliverySnapshotHash: string
-} {
-  return (
-    boundary?.captureStatus === 'captured' &&
-    typeof boundary.preDeliverySnapshotHash === 'string' &&
-    boundary.preDeliverySnapshotHash.length > 0 &&
-    typeof boundary.postDeliverySnapshotHash === 'string' &&
-    boundary.postDeliverySnapshotHash.length > 0
-  )
 }
