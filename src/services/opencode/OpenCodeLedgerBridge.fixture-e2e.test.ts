@@ -972,4 +972,90 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       totalFiles: 2,
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
+    const cliDev = cliDevCommand()
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot')
+    const projectDir = path.join(tempDir, 'claude-project-cli-snapshot')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = spawnSync(
+      cliDev.command,
+      [
+        ...cliDev.prefixArgs,
+        'runtime',
+        'opencode-ledger-backfill',
+        '--json',
+        '--team',
+        'fixture-team',
+        '--task',
+        'task-1',
+        '--task-display-id',
+        'abc12345',
+        '--project-dir',
+        projectDir,
+        '--workspace-root',
+        workspaceRoot,
+        '--delivery-context',
+        deliveryContext.deliveryContextPath,
+        '--delivery-context-hash',
+        deliveryContext.deliveryContextHash,
+        '--attribution-mode',
+        'strict-delivery',
+      ],
+      {
+        cwd: process.cwd(),
+        env: childEnvForHome(homeDir),
+        encoding: 'utf8',
+      },
+    )
+
+    expect(cli.status).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        scannedSessions: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 5,
+      scannedSessions: 2,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const snapshotOnlyEdit = events.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(snapshotOnlyEdit).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/snapshot-only.js',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+      snapshotSource: 'opencode',
+    })
+    expect(snapshotOnlyEdit?.snapshotId).toBeTruthy()
+    expect((snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 })
