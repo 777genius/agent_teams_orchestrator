@@ -135,6 +135,30 @@ describe('codexBackendResolver', () => {
     })
   })
 
+  test('resolves to codex-native when host forces chatgpt mode and login state is unknown (app-server may own session)', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
+      chatgptLoginState: 'unknown',
+      settingsInline: {
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: 'codex-native',
+      authenticated: true,
+      authMethod: 'oauth_token',
+      canLoginFromUi: false,
+      statusMessage: 'Codex native runtime ready',
+    })
+  })
+
   test('does not mark pinned ChatGPT auth as ready when codex login is inactive', () => {
     const result = resolveCodexRuntimeSelection({
       env: {},
