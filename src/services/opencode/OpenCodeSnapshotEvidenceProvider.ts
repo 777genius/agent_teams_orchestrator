@@ -85,6 +85,27 @@ function groupChangesByWindow(input: SnapshotSessionEvidenceInput, diagnostics: 
   return result
 }
 
+function appendPatchHintDiagnostics(
+  input: SnapshotSessionEvidenceInput,
+  window: SnapshotSessionEvidenceInput['offline']['snapshotWindows'][number],
+  touchedRelativePaths: string[],
+  diagnostics: string[],
+): void {
+  const patchRelativeFiles = new Set(
+    input.offline.patchParts
+      .filter(part => part.messageId === window.messageId && part.hash === window.fromSnapshot)
+      .flatMap(part => part.relativeFiles),
+  )
+  if (patchRelativeFiles.size === 0) {
+    return
+  }
+  for (const relativePath of touchedRelativePaths) {
+    if (!patchRelativeFiles.has(relativePath)) {
+      diagnostics.push(`snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path ${relativePath}; using raw snapshot diff as path proof.`)
+    }
+  }
+}
+
 export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshotEvidenceProvider {
   readonly adapterVersion = ADAPTER_VERSION
 
@@ -147,6 +168,7 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
       const touchedRelativePaths = [...new Set(changes
         .map(change => normalizeOpenCodeSnapshotRelativePath(change.relativePath))
         .filter((relativePath): relativePath is string => !!relativePath))]
+      appendPatchHintDiagnostics(input, window, touchedRelativePaths, diagnostics)
       const read = await this.gitStoreReader.read({
         profileRootKey: input.sessionRecord.profileRootKey,
         projectId: identity.projectId,
