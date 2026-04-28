@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
+import { lstat, readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 import {
@@ -7,6 +7,14 @@ import {
   type ImportedOpenCodeFileChange,
 } from '../taskChangeLedger/TaskChangeLedgerService.js'
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
+import {
+  normalizeOpenCodeEvidencePipelineMode,
+  type OpenCodeEvidencePipelineMode,
+  type OpenCodeSnapshotBoundary,
+  type OpenCodeSnapshotCaptureStatus,
+  type OpenCodeSnapshotEvidenceProvider,
+} from './OpenCodeChangeEvidence.js'
+import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
@@ -38,8 +46,14 @@ export type OpenCodeLedgerBridgeBackfillResult = {
   workspaceRoot?: string
   dryRun: boolean
   attributionMode: OpenCodeLedgerAttributionMode
+  evidenceMode: OpenCodeEvidencePipelineMode
   scannedSessions: number
   scannedToolparts: number
+  strictWindowCandidateCount?: number
+  openCodeDbFingerprint?: string
+  deliveryLedgerFingerprint?: string
+  snapshotShapeFingerprint?: string
+  retryAfterReason?: string
   candidateEvents: number
   importedEvents: number
   skippedEvents: number
@@ -59,6 +73,7 @@ type BackfillParams = {
   workspaceRoot?: string
   deliveryContextPath?: string
   attributionMode?: OpenCodeLedgerAttributionMode
+  evidenceMode?: OpenCodeEvidencePipelineMode
   dryRun?: boolean
 }
 
@@ -75,6 +90,58 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function asBoundedString(value: unknown, maxBytes: number): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || Buffer.byteLength(value, 'utf8') > maxBytes) {
+    return undefined
+  }
+  return value
+}
+
+function asSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function asSnapshotCaptureStatus(value: unknown): OpenCodeSnapshotCaptureStatus | undefined {
+  return value === 'captured' ||
+    value === 'pending' ||
+    value === 'snapshot-disabled' ||
+    value === 'unsupported-shape' ||
+    value === 'capture-failed' ||
+    value === 'not-terminal' ||
+    value === 'not-configured'
+    ? value
+    : undefined
+}
+
+function normalizeSnapshotBoundary(value: unknown): OpenCodeSnapshotBoundary | null {
+  const record = asRecord(value)
+  const captureStatus = asSnapshotCaptureStatus(record?.captureStatus)
+  if (!record || record.schemaVersion !== 1 || !captureStatus) {
+    return null
+  }
+  const rawDiagnostics = Array.isArray(record.diagnostics) ? record.diagnostics : []
+  return {
+    schemaVersion: 1,
+    captureStatus,
+    ...(asBoundedString(record.preDeliverySnapshotHash, 256)
+      ? { preDeliverySnapshotHash: asBoundedString(record.preDeliverySnapshotHash, 256) }
+      : {}),
+    ...(asBoundedString(record.postDeliverySnapshotHash, 256)
+      ? { postDeliverySnapshotHash: asBoundedString(record.postDeliverySnapshotHash, 256) }
+      : {}),
+    ...(asSafeInteger(record.snapshotAdapterVersion) !== undefined
+      ? { snapshotAdapterVersion: asSafeInteger(record.snapshotAdapterVersion) }
+      : {}),
+    ...(asBoundedString(record.opencodeVersion, 128)
+      ? { opencodeVersion: asBoundedString(record.opencodeVersion, 128) }
+      : {}),
+    diagnostics: rawDiagnostics
+      .map(item => asBoundedString(item, 512))
+      .filter((item): item is string => !!item)
+      .slice(0, 20),
+  }
 }
 
 function isTaskRef(value: unknown): value is OpenCodeTaskRef {
@@ -112,6 +179,7 @@ function normalizeDeliveryContext(value: unknown): OpenCodeDeliveryContextV1 | n
       observedAssistantMessageId: asString(itemRecord.observedAssistantMessageId) ?? null,
       prePromptCursor: asString(itemRecord.prePromptCursor) ?? null,
       postPromptCursor: asString(itemRecord.postPromptCursor) ?? null,
+      snapshotBoundary: normalizeSnapshotBoundary(itemRecord.snapshotBoundary),
       taskRefs,
     })
   }
@@ -150,6 +218,10 @@ function toLedgerChange(change: ReconstructedOpenCodeToolChange): ImportedOpenCo
     oldString: change.oldString,
     newString: change.newString,
     warnings: change.warnings,
+    evidenceProof: change.evidenceProof,
+    evidenceDiagnostics: change.evidenceDiagnostics,
+    snapshotId: change.snapshotId,
+    snapshotSource: change.snapshotSource,
     toolUseId: change.toolUseId,
     timestamp: change.timestamp,
     sourceImportKey: change.sourceImportKey,
@@ -166,6 +238,24 @@ function sha256Buffer(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex')
 }
 
+function sha256String(content: string): string {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+function sqliteFingerprintToString(fingerprint: {
+  dbMtimeMs: number
+  dbSizeBytes: number
+  walMtimeMs?: number
+  walSizeBytes?: number
+}): string {
+  return [
+    fingerprint.dbMtimeMs,
+    fingerprint.dbSizeBytes,
+    fingerprint.walMtimeMs ?? 0,
+    fingerprint.walSizeBytes ?? 0,
+  ].join(':')
+}
+
 function looksBinary(content: Buffer): boolean {
   return content.includes(0)
 }
@@ -179,7 +269,16 @@ async function readMetadataOnlyDiskState(filePath: string): Promise<{
   warning?: string
 }> {
   try {
-    const fileStat = await stat(filePath)
+    const fileStat = await lstat(filePath)
+    if (fileStat.isSymbolicLink()) {
+      return {
+        afterState: {
+          exists: true,
+          unavailableReason: 'opencode-path-symlink-unresolved',
+        },
+        warning: 'OpenCode metadata-only capture found a symlink path; review is manual-only.',
+      }
+    }
     if (!fileStat.isFile()) {
       return {
         afterState: {
@@ -353,15 +452,85 @@ function matchesStrictDeliveryRecord(
   )
 }
 
+function getSnapshotBoundaryForRecord(
+  deliveryContext: OpenCodeDeliveryContextV1 | null,
+  record: OpenCodeSessionRecord,
+): OpenCodeSnapshotBoundary | null {
+  for (const deliveryRecord of deliveryContext?.records ?? []) {
+    if (
+      deliveryRecord.memberName === record.memberName &&
+      deliveryRecord.laneId === record.laneId &&
+      deliveryRecord.runtimeSessionId === record.opencodeSessionId
+    ) {
+      return deliveryRecord.snapshotBoundary ?? null
+    }
+  }
+  return null
+}
+
+function validateCandidateBatch(
+  changes: ReconstructedOpenCodeToolChange[],
+  diagnostics: string[],
+): ReconstructedOpenCodeToolChange[] {
+  const sourceKeyIdentities = new Map<string, string>()
+  const unsafeSourceKeys = new Set<string>()
+  const lowerPathIdentities = new Map<string, string>()
+  const unsafeLowerPathKeys = new Set<string>()
+
+  for (const change of changes) {
+    const identity = [
+      change.sessionId,
+      change.sourcePartId,
+      change.sourceTool,
+      change.filePath,
+    ].join('\0')
+    const existingIdentity = sourceKeyIdentities.get(change.sourceImportKey)
+    if (existingIdentity && existingIdentity !== identity) {
+      unsafeSourceKeys.add(change.sourceImportKey)
+    } else {
+      sourceKeyIdentities.set(change.sourceImportKey, identity)
+    }
+
+    const lowerPathKey = [
+      change.sessionId,
+      change.relativePath.toLowerCase(),
+    ].join('\0')
+    const existingRelativePath = lowerPathIdentities.get(lowerPathKey)
+    if (existingRelativePath && existingRelativePath !== change.relativePath) {
+      unsafeLowerPathKeys.add(lowerPathKey)
+    } else {
+      lowerPathIdentities.set(lowerPathKey, change.relativePath)
+    }
+  }
+
+  if (unsafeSourceKeys.size > 0) {
+    diagnostics.push(`OpenCode evidence skipped ${unsafeSourceKeys.size} sourceImportKey collision(s).`)
+  }
+  if (unsafeLowerPathKeys.size > 0) {
+    diagnostics.push(`OpenCode evidence skipped ${unsafeLowerPathKeys.size} case-colliding path group(s).`)
+  }
+
+  return changes.filter(change => {
+    const lowerPathKey = [
+      change.sessionId,
+      change.relativePath.toLowerCase(),
+    ].join('\0')
+    return !unsafeSourceKeys.has(change.sourceImportKey) && !unsafeLowerPathKeys.has(lowerPathKey)
+  })
+}
+
 export class OpenCodeLedgerBridgeService {
   constructor(
     private readonly sessionStore: SessionStorePort = openCodeSessionStore,
     private readonly offlineReader = openCodeOfflineSessionReader,
     private readonly reconstructor = new OpenCodeToolpartChangeReconstructor(),
+    private readonly evidenceEnricher = new OpenCodeChangeEvidenceEnricher(),
+    private readonly snapshotEvidenceProvider?: OpenCodeSnapshotEvidenceProvider,
   ) {}
 
   async backfill(params: BackfillParams): Promise<OpenCodeLedgerBridgeBackfillResult> {
     const attributionMode = normalizeAttributionMode(params.attributionMode)
+    const evidenceMode = normalizeOpenCodeEvidencePipelineMode(params.evidenceMode)
     const result: OpenCodeLedgerBridgeBackfillResult = {
       schemaVersion: 1,
       providerId: 'opencode',
@@ -371,6 +540,7 @@ export class OpenCodeLedgerBridgeService {
       ...(params.workspaceRoot ? { workspaceRoot: params.workspaceRoot } : {}),
       dryRun: params.dryRun === true,
       attributionMode,
+      evidenceMode,
       scannedSessions: 0,
       scannedToolparts: 0,
       candidateEvents: 0,
@@ -403,7 +573,9 @@ export class OpenCodeLedgerBridgeService {
       }
     }
 
-    const deliveryContext = await this.readOptionalDeliveryContext(params.deliveryContextPath, result.diagnostics)
+    const deliveryContextRead = await this.readOptionalDeliveryContext(params.deliveryContextPath, result.diagnostics)
+    const deliveryContext = deliveryContextRead.context
+    result.deliveryLedgerFingerprint = deliveryContextRead.fingerprint
     let strictDeliveryRecords: StrictDeliveryRecord[] = []
     if (attributionMode === 'strict-delivery') {
       if (!params.taskId) {
@@ -494,6 +666,7 @@ export class OpenCodeLedgerBridgeService {
         result.diagnostics.push(`No OpenCode SQLite history for ${record.memberName}/${record.opencodeSessionId}.`)
         continue
       }
+      result.openCodeDbFingerprint ??= sqliteFingerprintToString(offline.dbFingerprint)
       if (offline.historyShape === 'unsupported') {
         result.outcome = 'skipped-capability'
         result.diagnostics.push(...offline.diagnostics)
@@ -519,8 +692,23 @@ export class OpenCodeLedgerBridgeService {
       })
       result.diagnostics.push(...reconstructed.diagnostics)
       result.notices.push(...reconstructed.notices)
+      const evidenceMetadata: { snapshotShapeFingerprint?: string } = {}
+      const enrichedChanges = await this.evidenceEnricher.enrich({
+        changes: reconstructed.changes,
+        workspaceRoot,
+        sessionRecord: record,
+        evidenceMode,
+        snapshotBoundary: getSnapshotBoundaryForRecord(deliveryContext, record),
+        snapshotProvider: this.snapshotEvidenceProvider,
+        evidenceMetadata,
+        diagnostics: result.diagnostics,
+      }).catch(error => {
+        result.diagnostics.push(`OpenCode evidence enrichment failed; using metadata-only fallback - ${error instanceof Error ? error.message : String(error)}`)
+        return reconstructed.changes
+      })
+      result.snapshotShapeFingerprint ??= evidenceMetadata.snapshotShapeFingerprint
       const materializedChanges = await materializeMetadataOnlyChanges(
-        reconstructed.changes,
+        enrichedChanges,
         result.diagnostics,
       )
       if (materializedChanges.length === 0) {
@@ -532,7 +720,15 @@ export class OpenCodeLedgerBridgeService {
           continue
         }
         result.candidateEvents += changes.length
+        if (attributionMode === 'strict-delivery') {
+          result.strictWindowCandidateCount = (result.strictWindowCandidateCount ?? 0) + changes.length
+        }
+        const safeChanges = validateCandidateBatch(changes, result.diagnostics)
+        result.skippedEvents += changes.length - safeChanges.length
         if (params.dryRun === true) {
+          continue
+        }
+        if (safeChanges.length === 0) {
           continue
         }
         const imported = await importTaskChangeLedgerEvents({
@@ -547,7 +743,7 @@ export class OpenCodeLedgerBridgeService {
           memberName: record.memberName,
           workspaceRoot,
           toolStatus: 'succeeded',
-          changes: changes.map(change => ({
+          changes: safeChanges.map(change => ({
             ...toLedgerChange(change),
             importBatchId,
           })),
@@ -615,24 +811,27 @@ export class OpenCodeLedgerBridgeService {
   private async readOptionalDeliveryContext(
     deliveryContextPath: string | undefined,
     diagnostics: string[],
-  ): Promise<OpenCodeDeliveryContextV1 | null> {
+  ): Promise<{ context: OpenCodeDeliveryContextV1 | null; fingerprint?: string }> {
     if (!deliveryContextPath) {
-      return null
+      return { context: null }
     }
     try {
       const raw = await readFile(deliveryContextPath, 'utf8')
       if (Buffer.byteLength(raw, 'utf8') > 512 * 1024) {
         diagnostics.push('OpenCode delivery context exceeded size cap.')
-        return null
+        return { context: null }
       }
       const parsed = normalizeDeliveryContext(JSON.parse(raw) as unknown)
       if (!parsed) {
         diagnostics.push('OpenCode delivery context failed schema validation.')
       }
-      return parsed
+      return {
+        context: parsed,
+        fingerprint: sha256String(raw),
+      }
     } catch (error) {
       diagnostics.push(`OpenCode delivery context read failed - ${error instanceof Error ? error.message : String(error)}`)
-      return null
+      return { context: null }
     }
   }
 }

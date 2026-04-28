@@ -326,7 +326,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     )
   })
 
-  test('captures apply_patch toolparts as metadata-only manual-review evidence', () => {
+  test('captures apply_patch Add File as exact create and other operations as metadata-only evidence', () => {
     const result = reconstruct([
       applyPatchToolPart({
         id: 'part-apply-patch',
@@ -359,13 +359,13 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
         sourceTool: 'apply_patch',
         operation: 'create',
         relativePath: 'src/new.ts',
-        confidence: 'medium',
+        confidence: 'exact',
       },
       {
         sourceTool: 'apply_patch',
         operation: 'create',
         relativePath: 'src/with space.ts',
-        confidence: 'medium',
+        confidence: 'exact',
       },
       {
         sourceTool: 'apply_patch',
@@ -382,10 +382,22 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     ])
     expect(result.changes[0]).toMatchObject({
       beforeContent: null,
-      afterContent: null,
+      afterContent: 'export const created = true;\n',
       beforeState: {
         exists: false,
-        unavailableReason: 'gitless-before-content-unavailable',
+        sizeBytes: 0,
+      },
+      afterState: {
+        exists: true,
+        sizeBytes: 29,
+      },
+    })
+    expect(result.changes[2]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-apply-patch-before-content-unavailable',
       },
       afterState: {
         exists: true,
@@ -404,7 +416,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
 
     expect(result.changes).toHaveLength(0)
     expect(result.diagnostics).toContain(
-      'OpenCode apply_patch toolpart part-apply-patch-unknown skipped because no supported Add/Update/Delete File markers were found.',
+      'OpenCode apply_patch toolpart part-apply-patch-unknown skipped because patch did not use the supported Begin/End markers.',
     )
   })
 

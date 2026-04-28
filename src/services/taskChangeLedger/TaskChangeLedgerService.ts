@@ -154,6 +154,11 @@ type TaskChangeEventV1 = {
   parentUserMessageId?: string
   attributionMethod?: 'parent-taskrefs-exact' | 'delivery-ledger-taskrefs' | 'requested-task-marker'
   sourceImportKey?: string
+  evidenceProof?: string
+  evidenceDiagnostics?: string[]
+  evidenceWarnings?: string[]
+  snapshotId?: string
+  snapshotSource?: 'opencode'
   importedAt?: string
   importBatchId?: string
   importSchemaVersion?: 1
@@ -336,6 +341,11 @@ export type ImportedOpenCodeFileChange = ExactFileChange & {
   sourceMessageId?: string
   parentUserMessageId?: string
   attributionMethod?: TaskChangeEventV1['attributionMethod']
+  evidenceProof?: string
+  evidenceDiagnostics?: string[]
+  evidenceWarnings?: string[]
+  snapshotId?: string
+  snapshotSource?: 'opencode'
   importBatchId?: string
 }
 
@@ -2281,6 +2291,11 @@ export async function importTaskChangeLedgerEvents(params: {
       ...(change.parentUserMessageId ? { parentUserMessageId: change.parentUserMessageId } : {}),
       ...(change.attributionMethod ? { attributionMethod: change.attributionMethod } : {}),
       sourceImportKey: change.sourceImportKey,
+      ...(change.evidenceProof ? { evidenceProof: change.evidenceProof } : {}),
+      ...(change.evidenceDiagnostics?.length ? { evidenceDiagnostics: change.evidenceDiagnostics } : {}),
+      ...(change.evidenceWarnings?.length ? { evidenceWarnings: change.evidenceWarnings } : {}),
+      ...(change.snapshotId ? { snapshotId: change.snapshotId } : {}),
+      ...(change.snapshotSource ? { snapshotSource: change.snapshotSource } : {}),
       importedAt,
       ...(change.importBatchId ? { importBatchId: change.importBatchId } : {}),
       importSchemaVersion: 1,

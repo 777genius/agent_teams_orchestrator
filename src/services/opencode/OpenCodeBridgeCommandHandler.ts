@@ -25,6 +25,7 @@ import {
 } from './OpenCodeDeliveryResponseObserver.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 
+import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodePendingPermission,
   OpenCodeProvisioningSnapshot,
@@ -103,6 +104,7 @@ type SendMessageCommandData = {
   memberName: string
   runtimePid?: number
   prePromptCursor?: string | null
+  snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation?: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
 }
@@ -112,6 +114,7 @@ type ObserveMessageDeliveryCommandData = {
   sessionId?: string
   memberName: string
   runtimePid?: number
+  snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
 }
@@ -339,6 +342,42 @@ function createRuntimePreconditionSnapshot(snapshot?: OpenCodeProvisioningSnapsh
     ...createRuntimeSnapshot(snapshot),
     runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
     activeRunId: null,
+  }
+}
+
+function isTerminalForSnapshotBoundary(observation: OpenCodeDeliveryResponseObservation): boolean {
+  return observation.state === 'responded_visible_message' ||
+    observation.state === 'responded_plain_text' ||
+    observation.state === 'responded_tool_call' ||
+    observation.state === 'responded_non_visible_tool' ||
+    observation.state === 'tool_error'
+}
+
+function buildSnapshotBoundaryStatus(input: {
+  snapshot: OpenCodeProvisioningSnapshot
+  responseObservation: OpenCodeDeliveryResponseObservation
+}): OpenCodeSnapshotBoundary {
+  const snapshotEnabled = input.snapshot.config?.snapshot === true ||
+    input.snapshot.profile?.managedConfig?.snapshot === true
+  if (!snapshotEnabled) {
+    return {
+      schemaVersion: 1,
+      captureStatus: 'snapshot-disabled',
+      ...(input.snapshot.host?.version ? { opencodeVersion: input.snapshot.host.version } : {}),
+    }
+  }
+  if (!isTerminalForSnapshotBoundary(input.responseObservation)) {
+    return {
+      schemaVersion: 1,
+      captureStatus: 'not-terminal',
+      ...(input.snapshot.host?.version ? { opencodeVersion: input.snapshot.host.version } : {}),
+    }
+  }
+  return {
+    schemaVersion: 1,
+    captureStatus: 'not-configured',
+    ...(input.snapshot.host?.version ? { opencodeVersion: input.snapshot.host.version } : {}),
+    diagnostics: ['OpenCode snapshot boundary capture provider is not configured for production use.'],
   }
 }
 
@@ -885,6 +924,9 @@ async function runReadiness(envelope: BridgeEnvelope) {
         executionOutcome,
         skippedAppMcpToolProof(),
         requireSelectedModel,
+      )
+      const responseObservation = reconcileFailedObservation(
+        diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
       )
       return {
         snapshot,
@@ -1496,6 +1538,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
           'error',
         ),
       ]
+      const responseObservation = reconcileFailedObservation(
+        diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
+      )
       return {
         snapshot,
         data: {
@@ -1506,9 +1551,8 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
             ? { runtimePid: deliveryRecord.runtimePid }
             : {}),
           prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
-          responseObservation: reconcileFailedObservation(
-            diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
-          ),
+          snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
+          responseObservation,
           diagnostics,
         },
       }
@@ -1596,7 +1640,12 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
       prePromptCursor,
-      ...(responseObservation ? { responseObservation } : {}),
+      ...(responseObservation
+        ? {
+            snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
+            responseObservation,
+          }
+        : {}),
       diagnostics: reconcileDiagnostics,
     },
   }
@@ -1686,6 +1735,7 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
       sessionId: record.opencodeSessionId,
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
+      snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
       responseObservation,
       diagnostics,
     },
@@ -1926,6 +1976,7 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runTranscript(envelope)
     case 'opencode.backfillTaskLedger': {
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
+      const evidenceMode = asString(envelope.body.evidenceMode)
       const result = await openCodeLedgerBridgeService.backfill({
         teamId: asString(envelope.body.teamId) ?? undefined,
         teamName: asString(envelope.body.teamName) ?? asString(envelope.body.teamId) ?? '',
@@ -1937,6 +1988,13 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
         workspaceRoot: asString(envelope.body.workspaceRoot) ?? undefined,
         deliveryContextPath: asString(envelope.body.deliveryContextPath) ?? undefined,
         attributionMode: asString(envelope.body.attributionMode) === 'strict-delivery' ? 'strict-delivery' : 'compatible',
+        evidenceMode: evidenceMode === 'off' ||
+          evidenceMode === 'metadata-only' ||
+          evidenceMode === 'chain-only' ||
+          evidenceMode === 'snapshot-probe' ||
+          evidenceMode === 'snapshot-auto'
+          ? evidenceMode
+          : undefined,
         dryRun: envelope.body.dryRun === true,
       })
       return { snapshot, data: result }

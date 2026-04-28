@@ -4,7 +4,15 @@ import {
   normalizeOpenCodeFilePath,
   type NormalizedOpenCodeFilePath,
 } from './OpenCodeBridgePath.js'
+import {
+  parseOpenCodeApplyPatchEvidence,
+  type OpenCodeApplyPatchHunk,
+} from './OpenCodeApplyPatchEvidenceParser.js'
 
+import type {
+  OpenCodeEvidenceProof,
+  OpenCodeSnapshotBoundary,
+} from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodeSqliteMessageRow,
   OpenCodeSqlitePartRow,
@@ -31,6 +39,7 @@ export type OpenCodeDeliveryContextV1 = {
     observedAssistantMessageId?: string | null
     prePromptCursor?: string | null
     postPromptCursor?: string | null
+    snapshotBoundary?: OpenCodeSnapshotBoundary | null
     taskRefs: OpenCodeTaskRef[]
   }>
 }
@@ -70,7 +79,13 @@ export type ReconstructedOpenCodeToolChange = {
   attributionMethod: 'delivery-ledger-taskrefs'
   oldString?: string
   newString?: string
+  patchBeforeContent?: string
+  patchUpdateHunks?: OpenCodeApplyPatchHunk[]
   warnings?: string[]
+  evidenceProof?: OpenCodeEvidenceProof
+  evidenceDiagnostics?: string[]
+  snapshotId?: string
+  snapshotSource?: 'opencode'
   timestamp: string
 }
 
@@ -108,11 +123,6 @@ type ReconstructedFileState = {
   text: string | null
   textAvailability: 'full-text' | 'metadata-only' | 'unavailable'
   exists: boolean
-}
-
-type ParsedApplyPatchPath = {
-  filePath: string
-  operation: 'create' | 'modify' | 'delete'
 }
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
@@ -299,45 +309,6 @@ function buildSourceImportKey(params: {
   return ['opencode', params.sessionId, params.partId, params.normalizedPath.comparisonKey].join('\0')
 }
 
-function parseApplyPatchTouchedPaths(patch: string, partId: string, diagnostics: string[]): ParsedApplyPatchPath[] {
-  const byPath = new Map<string, ParsedApplyPatchPath & { ambiguous?: true }>()
-  for (const rawLine of patch.split(/\r?\n/)) {
-    const line = rawLine.trimEnd()
-    const marker =
-      line.startsWith('*** Add File: ')
-        ? { operation: 'create' as const, filePath: line.slice('*** Add File: '.length).trim() }
-        : line.startsWith('*** Delete File: ')
-          ? { operation: 'delete' as const, filePath: line.slice('*** Delete File: '.length).trim() }
-          : line.startsWith('*** Update File: ')
-            ? { operation: 'modify' as const, filePath: line.slice('*** Update File: '.length).trim() }
-            : null
-    if (!marker) {
-      continue
-    }
-    if (!marker.filePath || marker.filePath.includes('\0')) {
-      diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped an empty or unsafe patch path.`)
-      continue
-    }
-    const existing = byPath.get(marker.filePath)
-    if (existing?.ambiguous) {
-      continue
-    }
-    if (existing) {
-      if (existing.operation !== marker.operation) {
-        byPath.set(marker.filePath, { ...existing, ambiguous: true })
-        diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped ambiguous lifecycle markers for ${marker.filePath}.`)
-      }
-      continue
-    }
-    byPath.set(marker.filePath, marker)
-  }
-  const changes = [...byPath.values()].filter((change): change is ParsedApplyPatchPath => change.ambiguous !== true)
-  if (changes.length === 0) {
-    diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped because no supported Add/Update/Delete File markers were found.`)
-  }
-  return changes
-}
-
 export class OpenCodeToolpartChangeReconstructor {
   reconstruct(params: {
     teamName: string
@@ -420,7 +391,7 @@ export class OpenCodeToolpartChangeReconstructor {
           diagnostics.push(`OpenCode apply_patch toolpart ${toolpart.partId} skipped because patch text was unavailable.`)
           continue
         }
-        const touchedPaths = parseApplyPatchTouchedPaths(toolpart.patch, toolpart.partId, diagnostics)
+        const touchedPaths = parseOpenCodeApplyPatchEvidence(toolpart.patch, toolpart.partId, diagnostics)
         for (const touchedPath of touchedPaths) {
           const normalizedPath = normalizeOpenCodeFilePath({
             projectPath: params.projectPath,
@@ -430,9 +401,18 @@ export class OpenCodeToolpartChangeReconstructor {
             diagnostics.push(normalizedPath.diagnostic)
             continue
           }
+          const afterContent = touchedPath.operation === 'create' && typeof touchedPath.afterContent === 'string'
+            ? touchedPath.afterContent
+            : null
+          const patchBeforeContent = touchedPath.operation === 'delete' && typeof touchedPath.beforeContent === 'string'
+            ? touchedPath.beforeContent
+            : undefined
+          const patchUpdateHunks = touchedPath.operation === 'modify' && touchedPath.updateHunks?.length
+            ? touchedPath.updateHunks
+            : undefined
           fileStates.set(normalizedPath.comparisonKey, {
-            text: null,
-            textAvailability: 'metadata-only',
+            text: afterContent,
+            textAvailability: afterContent === null ? 'metadata-only' : 'full-text',
             exists: touchedPath.operation !== 'delete',
           })
           changes.push({
@@ -456,25 +436,32 @@ export class OpenCodeToolpartChangeReconstructor {
             filePath: normalizedPath.absolutePath,
             relativePath: normalizedPath.relativePath,
             beforeContent: null,
-            afterContent: null,
+            afterContent,
             operation: touchedPath.operation,
-            confidence: 'medium',
+            confidence: afterContent !== null ? 'exact' : 'medium',
             attributionMethod: taskContext.method,
+            ...(patchBeforeContent !== undefined ? { patchBeforeContent } : {}),
+            ...(patchUpdateHunks ? { patchUpdateHunks } : {}),
             beforeState: {
               exists: touchedPath.operation === 'create' ? false : true,
-              unavailableReason: touchedPath.operation === 'create'
-                ? 'gitless-before-content-unavailable'
-                : 'opencode-apply-patch-before-content-unavailable',
+              ...(touchedPath.operation === 'create'
+                ? { sizeBytes: 0 }
+                : { unavailableReason: 'opencode-apply-patch-before-content-unavailable' }),
             },
-            afterState: {
-              exists: touchedPath.operation !== 'delete',
-              unavailableReason: touchedPath.operation === 'delete'
-                ? 'opencode-apply-patch-delete-after-state-unverified'
-                : 'opencode-apply-patch-final-content-unavailable',
-            },
+            afterState: afterContent !== null
+              ? contentStateForText(afterContent)
+              : {
+                  exists: touchedPath.operation !== 'delete',
+                  unavailableReason: touchedPath.operation === 'delete'
+                    ? 'opencode-apply-patch-delete-after-state-unverified'
+                    : 'opencode-apply-patch-final-content-unavailable',
+                },
+            evidenceProof: afterContent !== null ? 'inverse-apply-patch-chain' : 'metadata-only-fallback',
             timestamp: toolpart.timestamp,
             warnings: [
-              'OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.',
+              ...(afterContent === null
+                ? ['OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.']
+                : []),
               ...(taskContext.warning ? [taskContext.warning] : []),
             ],
           })
