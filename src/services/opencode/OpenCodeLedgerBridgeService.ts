@@ -712,7 +712,11 @@ export class OpenCodeLedgerBridgeService {
           result.strictWindowCandidateCount = (result.strictWindowCandidateCount ?? 0) + changes.length
         }
         const safeChanges = validateCandidateBatch(changes, result.diagnostics)
-        result.skippedEvents += changes.length - safeChanges.length
+        const skippedUnsafeBeforeImport = changes.length - safeChanges.length
+        result.skippedEvents += skippedUnsafeBeforeImport
+        if (skippedUnsafeBeforeImport > 0) {
+          result.outcome = 'unsafe-input'
+        }
         if (params.dryRun === true) {
           continue
         }
@@ -738,6 +742,9 @@ export class OpenCodeLedgerBridgeService {
         })
         result.importedEvents += imported.importedEventCount
         result.skippedEvents += imported.skippedDuplicateCount + imported.skippedUnsafeCount
+        if (imported.skippedUnsafeCount > 0) {
+          result.outcome = 'unsafe-input'
+        }
         result.diagnostics.push(...imported.diagnostics)
       }
     }
@@ -753,11 +760,11 @@ export class OpenCodeLedgerBridgeService {
     if (result.dryRun && result.candidateEvents > 0) {
       return 'manual-only'
     }
-    if (result.candidateEvents > 0 && result.skippedEvents > 0) {
-      return 'duplicates-only'
-    }
     if (result.outcome === 'unsafe-input' || result.outcome === 'skipped-capability' || result.outcome === 'transient-error') {
       return result.outcome
+    }
+    if (result.candidateEvents > 0 && result.skippedEvents > 0) {
+      return 'duplicates-only'
     }
     if (result.scannedSessions === 0) {
       return result.outcome === 'unsafe-input' ? 'unsafe-input' : 'no-history'

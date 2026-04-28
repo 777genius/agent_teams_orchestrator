@@ -9,6 +9,7 @@ import { OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE } from './OpenCodeOfflineSessio
 import { OpenCodeToolpartChangeReconstructor } from './OpenCodeToolpartChangeReconstructor.js'
 
 import type { OpenCodeSnapshotBoundary, OpenCodeSnapshotEvidenceFile, OpenCodeSnapshotEvidenceProvider } from './OpenCodeChangeEvidence.js'
+import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
 import type {
   OpenCodeOfflineSessionReadResult,
   OpenCodeSqliteMessageRow,
@@ -265,6 +266,37 @@ function withSnapshotWindow(
       left.message_id.localeCompare(right.message_id) ||
       left.id.localeCompare(right.id)
     ),
+  }
+}
+
+function reconstructedChange(overrides: Partial<ReconstructedOpenCodeToolChange> = {}): ReconstructedOpenCodeToolChange {
+  const relativePath = overrides.relativePath ?? 'src/opencode.ts'
+  const filePath = overrides.filePath ?? path.join(workspaceRoot, relativePath)
+  return {
+    taskId: 'task-1',
+    taskRef: 'task-1',
+    taskRefKind: 'canonical',
+    teamName: 'team-a',
+    memberName: 'bob',
+    sessionId: 'session-1',
+    parentUserMessageId: 'user-1',
+    assistantMessageId: 'assistant-1',
+    toolUseId: 'tool-part-1',
+    sourcePartId: 'tool-part-1',
+    sourceMessageId: 'assistant-1',
+    sourceTool: 'write',
+    sourceImportKey: `opencode\0session-1\0tool-part-1\0${relativePath}`,
+    filePath,
+    relativePath,
+    beforeContent: null,
+    afterContent: 'export const value = 1;\n',
+    beforeState: { exists: false, sizeBytes: 0 },
+    afterState: { exists: true, sizeBytes: 24 },
+    operation: 'create',
+    confidence: 'exact',
+    attributionMethod: 'delivery-ledger-taskrefs',
+    timestamp: '2026-03-01T10:00:00.000Z',
+    ...overrides,
   }
 }
 
@@ -953,6 +985,47 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(result.diagnostics).toContain('OpenCode evidence skipped 1 case-colliding path group(s).')
   })
 
+  test('fails closed on sourceImportKey collisions with different file identity', async () => {
+    const sourceImportKey = 'opencode\0session-1\0tool-part-1\0src/opencode.ts'
+    const changes = [
+      reconstructedChange({ sourceImportKey }),
+      reconstructedChange({
+        sourceImportKey,
+        filePath: path.join(workspaceRoot, 'src/other.ts'),
+        relativePath: 'src/other.ts',
+        afterContent: 'export const other = 1;\n',
+        afterState: { exists: true, sizeBytes: 24 },
+      }),
+    ]
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      {
+        reconstruct: () => ({
+          changes,
+          notices: [],
+          diagnostics: [],
+        }),
+      } as unknown as OpenCodeToolpartChangeReconstructor,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('unsafe-input')
+    expect(result.candidateEvents).toBe(2)
+    expect(result.importedEvents).toBe(0)
+    expect(result.skippedEvents).toBe(2)
+    expect(result.diagnostics).toContain('OpenCode evidence skipped 1 sourceImportKey collision(s).')
+  })
+
   test('downgrades apply_patch delete evidence when final disk state still exists', async () => {
     await writeFile(
       path.join(workspaceRoot, 'src/still-here.ts'),
@@ -1160,6 +1233,36 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(result.outcome).toBe('skipped-capability')
     expect(result.importedEvents).toBe(0)
     expect(result.diagnostics).toContain(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: missing part.data`)
+  })
+
+  test('treats partial SQLite history caps as diagnostic-only without importing unproven files', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => ({
+          ...offlineFixture(),
+          rawMessages: [],
+          rawParts: [],
+          messages: [],
+          diagnostics: ['OpenCode SQLite part cap exceeded for session-1.'],
+        }),
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.scannedSessions).toBe(1)
+    expect(result.scannedToolparts).toBe(0)
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.diagnostics).toContain('OpenCode SQLite part cap exceeded for session-1.')
   })
 
   test('reports imported when at least one session imports even if another session is unsupported', async () => {
