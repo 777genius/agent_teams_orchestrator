@@ -267,6 +267,35 @@ export class OpenCodeChangeEvidenceEnricher {
         continue
       }
       const localReplacements = new Map<string, ReconstructedOpenCodeToolChange>()
+      if (
+        changes.length === 1 &&
+        changes[0]?.sourceTool === 'write' &&
+        changes[0].operation === snapshotAnchor.operation &&
+        typeof snapshotAnchor.beforeContent === 'string' &&
+        typeof snapshotAnchor.afterContent === 'string' &&
+        (
+          changes[0].afterContent === null ||
+          changes[0].afterContent === snapshotAnchor.afterContent
+        )
+      ) {
+        const change = changes[0]
+        replacements.set(change.sourceImportKey, {
+          ...change,
+          beforeContent: snapshotAnchor.beforeContent,
+          afterContent: snapshotAnchor.afterContent,
+          beforeState: contentStateForText(snapshotAnchor.beforeContent),
+          afterState: contentStateForText(snapshotAnchor.afterContent),
+          confidence: 'high',
+          evidenceProof: 'opencode-snapshot',
+          snapshotId: snapshotAnchor.snapshotId,
+          snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
+          warnings: [
+            ...(change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
+            ...(snapshotAnchor.warnings ?? []),
+          ],
+        })
+        continue
+      }
       let verifiedFullPathChain = true
       for (let index = changes.length - 1; index >= 0; index -= 1) {
         const change = changes[index]

@@ -181,6 +181,55 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
+  test('upgrades write overwrites when session snapshot proves full before and after text', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [
+        change({
+          sourceTool: 'write',
+          beforeContent: null,
+          afterContent: 'export const value = 2;\n',
+          beforeState: {
+            exists: true,
+            unavailableReason: 'opencode-before-content-unavailable',
+          },
+          afterState: {
+            exists: true,
+            sha256: 'after-hash',
+            sizeBytes: 24,
+          },
+          operation: 'modify',
+          warnings: [
+            'OpenCode write overwrote an existing file before the bridge had a known baseline; reject is manual-only.',
+          ],
+        }),
+      ],
+      evidenceMode: 'snapshot-auto',
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'modify',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        snapshotId: 'snapshot-proof',
+      }),
+      diagnostics,
+    })
+
+    expect(diagnostics).toEqual([])
+    expect(result[0]).toMatchObject({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotId: 'snapshot-proof',
+      snapshotSource: 'opencode',
+      warnings: [],
+    })
+  })
+
   test('does not use snapshot evidence without SQLite snapshot windows', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
