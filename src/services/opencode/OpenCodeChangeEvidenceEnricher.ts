@@ -266,6 +266,8 @@ export class OpenCodeChangeEvidenceEnricher {
         }
         continue
       }
+      const localReplacements = new Map<string, ReconstructedOpenCodeToolChange>()
+      let verifiedFullPathChain = true
       for (let index = changes.length - 1; index >= 0; index -= 1) {
         const change = changes[index]
         if (!change) {
@@ -273,6 +275,7 @@ export class OpenCodeChangeEvidenceEnricher {
         }
         if (change.beforeContent !== null && change.afterContent !== null) {
           if (change.afterContent !== anchorAfter) {
+            verifiedFullPathChain = false
             break
           }
           anchorAfter = change.beforeContent
@@ -281,6 +284,7 @@ export class OpenCodeChangeEvidenceEnricher {
         if (change.sourceTool === 'apply_patch' && change.operation === 'modify') {
           const before = reverseApplyPatchUpdateFromAfter(change, anchorAfter)
           if (!before) {
+            verifiedFullPathChain = false
             break
           }
           const upgraded: ReconstructedOpenCodeToolChange = {
@@ -298,11 +302,12 @@ export class OpenCodeChangeEvidenceEnricher {
               ...(snapshotAnchor.warnings ?? []),
             ],
           }
-          replacements.set(change.sourceImportKey, upgraded)
+          localReplacements.set(change.sourceImportKey, upgraded)
           anchorAfter = before
           continue
         }
         if (change.sourceTool !== 'edit' || change.beforeContent !== null || change.afterContent !== null) {
+          verifiedFullPathChain = false
           break
         }
         const reversed = reverseEditFromAfter({
@@ -311,6 +316,7 @@ export class OpenCodeChangeEvidenceEnricher {
           newString: change.newString,
         })
         if (!reversed) {
+          verifiedFullPathChain = false
           break
         }
         const upgraded: ReconstructedOpenCodeToolChange = {
@@ -328,8 +334,15 @@ export class OpenCodeChangeEvidenceEnricher {
             ...(snapshotAnchor.warnings ?? []),
           ],
         }
-        replacements.set(change.sourceImportKey, upgraded)
+        localReplacements.set(change.sourceImportKey, upgraded)
         anchorAfter = reversed.before
+      }
+      if (!verifiedFullPathChain) {
+        params.diagnostics.push(`snapshot-window-path-ambiguous: ${relativePath} had a same-window toolpart chain that could not be fully verified.`)
+        continue
+      }
+      for (const [sourceImportKey, replacement] of localReplacements) {
+        replacements.set(sourceImportKey, replacement)
       }
     }
 

@@ -362,6 +362,7 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   dbPath: string
   workspaceRoot: string
   includeSnapshotOnlyEdit?: boolean
+  includeUnattributedSnapshotFile?: boolean
 }): Promise<{ fromSnapshot: string; toSnapshot: string; gitDir: string }> {
   const profileDataDir = path.dirname(input.dbPath)
   const gitDir = path.join(profileDataDir, 'snapshot', SNAPSHOT_PROJECT_ID, hashFast(input.workspaceRoot))
@@ -373,12 +374,19 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
     await writeFile(path.join(input.workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 1;\n', 'utf8')
   }
+  if (input.includeUnattributedSnapshotFile) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'formatter-only.js'), 'export const formatted = 1;\n', 'utf8')
+  }
   const fromSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
   await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
   await writeFile(path.join(input.workspaceRoot, '227', 'index.html'), '<main>v1</main>\n', 'utf8')
   await writeFile(path.join(input.workspaceRoot, '227', 'state.js'), 'export const step = 2;\n', 'utf8')
   if (input.includeSnapshotOnlyEdit) {
     await writeFile(path.join(input.workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 2;\n', 'utf8')
+  }
+  if (input.includeUnattributedSnapshotFile) {
+    await writeFile(path.join(input.workspaceRoot, '227', 'formatter-only.js'), 'export const formatted = 2;\n', 'utf8')
   }
   const toSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
 
@@ -652,6 +660,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       dbPath,
       workspaceRoot,
       includeSnapshotOnlyEdit: true,
+      includeUnattributedSnapshotFile: true,
     })
     await stat(snapshotStore.gitDir)
     const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
@@ -680,8 +689,12 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
     expect(result.importedEvents).toBe(5)
     expect(result.diagnostics.join('\n')).toContain('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
+    expect(result.diagnostics.join('\n')).toContain(
+      'snapshot-path-not-touched: 227/formatter-only.js was present in snapshot diff but not in toolpart touched paths.',
+    )
 
     const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events.some(event => event.relativePath === '227/formatter-only.js')).toBe(false)
     const snapshotOnlyEdit = events.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
     expect(snapshotOnlyEdit).toMatchObject({
       source: 'opencode_toolpart_edit',
@@ -698,6 +711,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
 
     const bundle = await readTaskChangeBundle(projectDir, 'task-1')
     const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.some(file => file.relativePath === '227/formatter-only.js')).toBe(false)
     const snapshotOnlyFile = files.find(file => file.relativePath === '227/snapshot-only.js')
     expect(snapshotOnlyFile).toMatchObject({
       latestOperation: 'modify',

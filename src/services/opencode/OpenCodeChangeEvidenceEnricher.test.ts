@@ -281,6 +281,40 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     ])
   })
 
+  test('does not snapshot-upgrade a same-path chain unless every toolpart verifies', async () => {
+    const diagnostics: string[] = []
+    const first = change({
+      sourcePartId: 'part-edit-1',
+      sourceImportKey: 'opencode\0session-1\0part-edit-1\0/repo/src/file.ts',
+      oldString: 'missing = 1',
+      newString: 'missing = 2',
+    })
+    const second = change({
+      sourcePartId: 'part-edit-2',
+      sourceImportKey: 'opencode\0session-1\0part-edit-2\0/repo/src/file.ts',
+      oldString: 'value = 2',
+      newString: 'value = 3',
+    })
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [first, second],
+      evidenceMode: 'snapshot-auto',
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      diagnostics,
+    })
+
+    expect(result.map(item => item.evidenceProof)).toEqual([
+      'metadata-only-fallback',
+      'metadata-only-fallback',
+    ])
+    expect(result.every(item => item.beforeContent === null && item.afterContent === null)).toBe(true)
+    expect(diagnostics).toContain(
+      'snapshot-window-path-ambiguous: src/file.ts had a same-window toolpart chain that could not be fully verified.',
+    )
+  })
+
   test('keeps ambiguous inverse edit metadata-only', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
