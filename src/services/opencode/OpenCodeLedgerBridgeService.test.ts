@@ -305,6 +305,31 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
+  test('counts duplicate OpenCode imports once without appending a second event', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+    )
+    const request = {
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+    }
+
+    const first = await service.backfill(request)
+    const second = await service.backfill(request)
+
+    expect(first.importedEvents).toBe(1)
+    expect(second.outcome).toBe('duplicates-only')
+    expect(second.importedEvents).toBe(0)
+    expect(second.skippedEvents).toBe(1)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    expect((await readFile(eventFile, 'utf8')).trim().split('\n')).toHaveLength(1)
+  })
+
   test('imports edit-only OpenCode toolparts as manual-review metadata instead of dropping them', async () => {
     await writeFile(
       path.join(workspaceRoot, 'src/existing.ts'),
@@ -395,7 +420,100 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
-  test('uses captured snapshot boundary to upgrade strict edit evidence through provider abstraction', async () => {
+  test('ignores status-only snapshot boundary when SQLite snapshot windows are missing', async () => {
+    const afterPath = path.join(workspaceRoot, 'src/existing.ts')
+    await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
+    const editFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-edit-existing',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'edit',
+            callID: 'call-edit-existing',
+            state: {
+              status: 'completed',
+              input: {
+                filePath: afterPath,
+                oldString: 'value = 1',
+                newString: 'value = 2',
+              },
+              metadata: { exists: true, truncated: false },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    let snapshotProviderCalled = false
+    const provider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        return { supported: true, shapeFingerprint: 'shape-v1', adapterVersion: 1 }
+      },
+      async readSessionEvidence() {
+        snapshotProviderCalled = true
+        return {
+          supported: true,
+          shapeFingerprint: 'shape-v1',
+          adapterVersion: 1,
+          files: [{ relativePath: 'src/existing.ts', afterContent: 'export const value = 2;\n' }],
+        }
+      },
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => editFixture },
+      new OpenCodeToolpartChangeReconstructor(),
+      new OpenCodeChangeEvidenceEnricher(),
+      provider,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext({
+        snapshotBoundary: {
+          schemaVersion: 1,
+          captureStatus: 'captured',
+          preDeliverySnapshotHash: 'pre',
+          postDeliverySnapshotHash: 'post',
+        },
+      }),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(snapshotProviderCalled).toBe(false)
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    expect(result.snapshotShapeFingerprint).toBeUndefined()
+    expect(result.diagnostics).toContain('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
+      before: null,
+      after: null,
+    })
+  })
+
+  test('uses SQLite snapshot windows to upgrade strict edit evidence through provider abstraction', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
     const editFixture = withSnapshotWindow({
@@ -445,16 +563,8 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
-        snapshotBoundary: {
-          schemaVersion: 1,
-          captureStatus: 'captured',
-          preDeliverySnapshotHash: 'pre',
-          postDeliverySnapshotHash: 'post',
-        },
-      }),
+      deliveryContextPath: await writeDeliveryContext(),
       attributionMode: 'strict-delivery',
-      evidenceMode: 'snapshot-auto',
     })
 
     expect(result.outcome).toBe('imported')
@@ -474,7 +584,7 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(event.after).toMatchObject({ sizeBytes: 24 })
   })
 
-  test('uses captured snapshot boundary to upgrade apply_patch update evidence through verified hunks', async () => {
+  test('uses SQLite snapshot windows to upgrade apply_patch update evidence through verified hunks', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
     const patchFixture = withSnapshotWindow({
@@ -528,16 +638,8 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
-        snapshotBoundary: {
-          schemaVersion: 1,
-          captureStatus: 'captured',
-          preDeliverySnapshotHash: 'pre',
-          postDeliverySnapshotHash: 'post',
-        },
-      }),
+      deliveryContextPath: await writeDeliveryContext(),
       attributionMode: 'strict-delivery',
-      evidenceMode: 'snapshot-auto',
     })
 
     expect(result.outcome).toBe('imported')
