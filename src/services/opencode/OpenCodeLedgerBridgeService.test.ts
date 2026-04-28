@@ -924,6 +924,67 @@ describe('OpenCodeLedgerBridgeService', () => {
     )
   })
 
+  test('keeps OpenCode backfill diagnostics free of prompt and raw patch content', async () => {
+    const promptSecret = 'PROMPT_SECRET_SHOULD_NOT_LEAK'
+    const patchSecret = 'PATCH_SECRET_SHOULD_NOT_LEAK'
+    const patchFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: promptSecret,
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-apply-patch-secret',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: 'call-apply-patch-secret',
+            state: {
+              status: 'completed',
+              input: {
+                patch: [
+                  '*** Begin Patch',
+                  '*** Update File: src/secret.ts',
+                  '@@',
+                  patchSecret,
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => patchFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.diagnostics.some(item => item.includes('unsupported hunk lines'))).toBe(true)
+    const serializedDiagnostics = JSON.stringify(result.diagnostics)
+    expect(serializedDiagnostics).not.toContain(promptSecret)
+    expect(serializedDiagnostics).not.toContain(patchSecret)
+  })
+
   test('materializes apply_patch binary and large final states as manual-only metadata', async () => {
     await writeFile(path.join(workspaceRoot, 'src/blob.bin'), Buffer.from([0, 1, 2, 3]))
     await writeFile(path.join(workspaceRoot, 'src/large.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8')
