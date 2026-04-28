@@ -194,7 +194,7 @@ export function buildManagedConfig(
     $schema: 'https://opencode.ai/config.json',
     default_agent: 'teammate',
     share: 'disabled',
-    snapshot: false,
+    snapshot: true,
     agent: {
       teammate: {
         mode: 'primary',

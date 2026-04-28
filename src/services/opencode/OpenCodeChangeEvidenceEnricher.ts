@@ -321,7 +321,12 @@ export class OpenCodeChangeEvidenceEnricher {
           afterState: contentStateForText(anchorAfter),
           confidence: 'high',
           evidenceProof: 'inverse-edit-chain',
-          warnings: (change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
+          snapshotId: snapshotAnchor.snapshotId,
+          snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
+          warnings: [
+            ...(change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
+            ...(snapshotAnchor.warnings ?? []),
+          ],
         }
         replacements.set(change.sourceImportKey, upgraded)
         anchorAfter = reversed.before

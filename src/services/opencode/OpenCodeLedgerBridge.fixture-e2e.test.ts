@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,6 +9,8 @@ import path from 'node:path'
 import { OpenCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
+import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -15,6 +18,7 @@ let tempDir = ''
 let homeDir = ''
 let previousHome: string | undefined
 const LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS = 15_000
+const SNAPSHOT_PROJECT_ID = 'project-fixture'
 
 class FixtureOpenCodeOfflineSessionReader extends OpenCodeOfflineSessionReader {
   constructor(private readonly dbPath: string) {
@@ -77,6 +81,21 @@ function messageData(id: string, parentID?: string): Record<string, unknown> {
   return parentID ? { id, parentID } : { id }
 }
 
+function hashFast(value: string): string {
+  return createHash('sha1').update(value).digest('hex')
+}
+
+function runGit(args: string[], cwd: string): string {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+  })
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`)
+  }
+  return result.stdout.trim()
+}
+
 function userTextPart(text: string): Record<string, unknown> {
   return { type: 'text', text }
 }
@@ -133,6 +152,13 @@ function editToolPart(input: {
   }
 }
 
+function snapshotStepPart(kind: 'step-start' | 'step-finish', snapshot: string): Record<string, unknown> {
+  return {
+    type: kind,
+    snapshot,
+  }
+}
+
 function insertMessage(db: Database, input: {
   id: string
   sessionId: string
@@ -170,6 +196,16 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
   const db = new Database(dbPath)
   try {
     db.exec(`
+      create table project (
+        id text primary key,
+        worktree text,
+        vcs text
+      );
+      create table session (
+        id text primary key,
+        project_id text,
+        directory text
+      );
       create table message (
         id text primary key,
         session_id text not null,
@@ -186,6 +222,18 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
         data text not null
       );
     `)
+    db.query('insert into project (id, worktree, vcs) values (?, ?, ?)').run(
+      SNAPSHOT_PROJECT_ID,
+      workspaceRoot,
+      'git',
+    )
+    for (const sessionId of ['session-bob', 'session-tom', 'session-ambiguous']) {
+      db.query('insert into session (id, project_id, directory) values (?, ?, ?)').run(
+        sessionId,
+        SNAPSHOT_PROJECT_ID,
+        workspaceRoot,
+      )
+    }
 
     const deliveryPrompt = (
       inboundMessageId: string,
@@ -303,6 +351,78 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
     db.close()
   }
   return dbPath
+}
+
+function writeSnapshotTree(gitDir: string, workspaceRoot: string): string {
+  runGit(['--git-dir', gitDir, '--work-tree', workspaceRoot, 'add', '--all'], tempDir)
+  return runGit(['--git-dir', gitDir, '--work-tree', workspaceRoot, 'write-tree'], tempDir)
+}
+
+async function createOpenCodeSnapshotGitStoreFixture(input: {
+  dbPath: string
+  workspaceRoot: string
+  includeSnapshotOnlyEdit?: boolean
+}): Promise<{ fromSnapshot: string; toSnapshot: string; gitDir: string }> {
+  const profileDataDir = path.dirname(input.dbPath)
+  const gitDir = path.join(profileDataDir, 'snapshot', SNAPSHOT_PROJECT_ID, hashFast(input.workspaceRoot))
+  await mkdir(gitDir, { recursive: true })
+  runGit(['--git-dir', gitDir, '--work-tree', input.workspaceRoot, 'init'], tempDir)
+  runGit(['--git-dir', gitDir, '--work-tree', input.workspaceRoot, 'config', 'core.autocrlf', 'false'], tempDir)
+
+  if (input.includeSnapshotOnlyEdit) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 1;\n', 'utf8')
+  }
+  const fromSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
+  await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+  await writeFile(path.join(input.workspaceRoot, '227', 'index.html'), '<main>v1</main>\n', 'utf8')
+  await writeFile(path.join(input.workspaceRoot, '227', 'state.js'), 'export const step = 2;\n', 'utf8')
+  if (input.includeSnapshotOnlyEdit) {
+    await writeFile(path.join(input.workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 2;\n', 'utf8')
+  }
+  const toSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
+
+  const db = new Database(input.dbPath)
+  try {
+    insertPart(db, {
+      id: '000-step-start',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 995,
+      data: snapshotStepPart('step-start', fromSnapshot),
+    })
+    insertPart(db, {
+      id: 'zzz-step-finish',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_095,
+      data: snapshotStepPart('step-finish', toSnapshot),
+    })
+  } finally {
+    db.close()
+  }
+
+  return { fromSnapshot, toSnapshot, gitDir }
+}
+
+async function insertSnapshotOnlyEditToolpart(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-edit-snapshot-only',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_025,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'snapshot-only.js'),
+        oldString: 'snapshot = 1',
+        newString: 'snapshot = 2',
+        callID: 'call-bob-edit-snapshot-only',
+      }),
+    })
+  } finally {
+    db.close()
+  }
 }
 
 async function createFixtureSessionStore(dataDir: string, workspaceRoot: string): Promise<OpenCodeSessionStore> {
@@ -517,6 +637,88 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(duplicateResult.outcome).toBe('duplicates-only')
     expect(duplicateResult.importedEvents).toBe(0)
     expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(4)
+  })
+
+  test('imports source-driven OpenCode snapshot evidence from SQLite step windows and snapshot git store', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-snapshot')
+    const projectDir = path.join(tempDir, 'claude-project-snapshot')
+    const dataDir = path.join(tempDir, 'fixture-data-snapshot')
+    const deliveryContextPath = await createFixtureDeliveryContext(path.join(tempDir, 'delivery-context-snapshot.json'))
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    const snapshotStore = await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+    })
+    await stat(snapshotStore.gitDir)
+    const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
+    const offlineReader = new FixtureOpenCodeOfflineSessionReader(dbPath)
+    const bridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      offlineReader,
+      undefined,
+      undefined,
+      new OpenCodeSnapshotEvidenceProviderService(
+        new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+      ),
+    )
+
+    const result = await bridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
+    expect(result.importedEvents).toBe(5)
+    expect(result.diagnostics.join('\n')).toContain('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const snapshotOnlyEdit = events.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(snapshotOnlyEdit).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+      operation: 'modify',
+      beforeState: { exists: true },
+      afterState: { exists: true },
+    })
+    expect(snapshotOnlyEdit?.snapshotId).toBeTruthy()
+    expect(snapshotOnlyEdit?.snapshotSource).toBe('opencode')
+    expect((snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    const snapshotOnlyFile = files.find(file => file.relativePath === '227/snapshot-only.js')
+    expect(snapshotOnlyFile).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: false,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256,
+    })
+
+    const duplicateResult = await bridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      attributionMode: 'strict-delivery',
+    })
+    expect(duplicateResult.outcome).toBe('duplicates-only')
+    expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(5)
   })
 
   test('CLI command recovers the same SQLite fixture through the public runtime entrypoint', async () => {

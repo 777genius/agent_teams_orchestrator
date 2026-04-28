@@ -19,7 +19,7 @@ const profile: OpenCodePreparedProfile = {
     default_agent: 'teammate',
     share: 'disabled',
     autoupdate: false,
-    snapshot: false,
+    snapshot: true,
   },
   managedConfigFingerprint: 'managed-config-v1',
   homePath: '/tmp/profile-root/home',
