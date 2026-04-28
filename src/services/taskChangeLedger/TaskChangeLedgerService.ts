@@ -2233,11 +2233,18 @@ type ExistingSourceImportProjection = {
   operation: TaskChangeOperation
 }
 
+function isOpenCodeLedgerEvent(event: TaskChangeEventV1): boolean {
+  return (
+    event.sourceRuntime === 'opencode' ||
+    event.sourceProvider === 'opencode' ||
+    event.source === 'opencode_toolpart_write' ||
+    event.source === 'opencode_toolpart_edit' ||
+    event.source === 'opencode_toolpart_apply_patch'
+  )
+}
+
 function sourceImportKeyForEvent(event: TaskChangeEventV1): string | null {
-  if (
-    event.sourceImportKey &&
-    (event.sourceRuntime === 'opencode' || event.sourceImportKey.startsWith('opencode\0'))
-  ) {
+  if (event.sourceImportKey && isOpenCodeLedgerEvent(event)) {
     return event.sourceImportKey
   }
   if (event.sourceRuntime && event.sourceSessionId && event.sourcePartId) {
