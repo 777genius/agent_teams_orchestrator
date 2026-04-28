@@ -9,7 +9,7 @@ import {
 } from '../taskChangeLedger/TaskChangeLedgerService.js'
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import {
-  normalizeOpenCodeEvidencePipelineMode,
+  DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE,
   type OpenCodeEvidencePipelineMode,
   type OpenCodeSnapshotBoundary,
   type OpenCodeSnapshotCaptureStatus,
@@ -538,7 +538,7 @@ export class OpenCodeLedgerBridgeService {
 
   async backfill(params: BackfillParams): Promise<OpenCodeLedgerBridgeBackfillResult> {
     const attributionMode = normalizeAttributionMode(params.attributionMode)
-    const evidenceMode = normalizeOpenCodeEvidencePipelineMode(params.evidenceMode)
+    const evidenceMode = DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE
     const result: OpenCodeLedgerBridgeBackfillResult = {
       schemaVersion: 1,
       providerId: 'opencode',
