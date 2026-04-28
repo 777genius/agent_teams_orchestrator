@@ -427,7 +427,7 @@ function collectStrictDeliveryRecords(
     if (params.laneId && record.laneId !== params.laneId) {
       continue
     }
-    if (!record.laneId || !record.runtimeSessionId) {
+    if (!record.laneId) {
       continue
     }
     if (!record.deliveredUserMessageId && !record.inboxMessageId) {
@@ -445,11 +445,19 @@ function collectStrictDeliveryRecords(
 function matchesStrictDeliveryRecord(
   record: OpenCodeSessionRecord,
   deliveryRecords: StrictDeliveryRecord[],
+  allRecords: OpenCodeSessionRecord[],
 ): boolean {
   return deliveryRecords.some(deliveryRecord =>
     deliveryRecord.memberName === record.memberName &&
     deliveryRecord.laneId === record.laneId &&
-    deliveryRecord.runtimeSessionId === record.opencodeSessionId
+    (
+      deliveryRecord.runtimeSessionId
+        ? deliveryRecord.runtimeSessionId === record.opencodeSessionId
+        : allRecords.filter(candidate =>
+          candidate.memberName === record.memberName &&
+          candidate.laneId === record.laneId
+        ).length === 1
+    )
   )
 }
 
@@ -612,7 +620,7 @@ export class OpenCodeLedgerBridgeService {
       return true
     }))
     if (attributionMode === 'strict-delivery') {
-      records = records.filter(record => matchesStrictDeliveryRecord(record, strictDeliveryRecords))
+      records = records.filter(record => matchesStrictDeliveryRecord(record, strictDeliveryRecords, records))
       if (records.length === 0) {
         return {
           ...result,

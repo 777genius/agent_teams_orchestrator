@@ -807,7 +807,7 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!record.laneId || !input.laneId || record.laneId !== input.laneId) {
         continue
       }
-      if (!record.runtimeSessionId || record.runtimeSessionId !== input.sessionId) {
+      if (record.runtimeSessionId && record.runtimeSessionId !== input.sessionId) {
         continue
       }
       const recordTaskRef = getSingleRequestedTeamRef(

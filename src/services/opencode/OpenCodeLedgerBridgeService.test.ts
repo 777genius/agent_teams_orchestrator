@@ -162,6 +162,7 @@ async function writeDeliveryContext(overrides: Partial<{
   snapshotBoundary: OpenCodeSnapshotBoundary | Record<string, unknown> | null
 }> = {}): Promise<string> {
   const filePath = path.join(tempDir, 'delivery-context.json')
+  const hasRuntimeSessionIdOverride = Object.prototype.hasOwnProperty.call(overrides, 'runtimeSessionId')
   await writeFile(
     filePath,
     `${JSON.stringify({
@@ -172,7 +173,7 @@ async function writeDeliveryContext(overrides: Partial<{
         {
           memberName: overrides.memberName ?? 'bob',
           laneId: overrides.laneId ?? 'primary',
-          runtimeSessionId: overrides.runtimeSessionId ?? 'session-1',
+          runtimeSessionId: hasRuntimeSessionIdOverride ? overrides.runtimeSessionId : 'session-1',
           inboxMessageId: overrides.inboxMessageId ?? 'user-1',
           deliveredUserMessageId: overrides.deliveredUserMessageId ?? null,
           observedAssistantMessageId: null,
@@ -1238,6 +1239,71 @@ describe('OpenCodeLedgerBridgeService', () => {
       attributionMethod: 'delivery-ledger-taskrefs',
       sourcePartId: 'tool-part-1',
     })
+  })
+
+  test('strict delivery backfill imports with missing runtime session id when parent message id matches', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: null }),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      sourceSessionId: 'session-1',
+      parentUserMessageId: 'user-1',
+      attributionMethod: 'delivery-ledger-taskrefs',
+      sourcePartId: 'tool-part-1',
+    })
+  })
+
+  test('strict delivery backfill skips missing runtime session id when member lane has multiple sessions', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      {
+        list: async () => [
+          sessionRecord(),
+          sessionRecord({ opencodeSessionId: 'session-2' }),
+        ],
+      },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: null }),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no stored OpenCode session matching the delivery context.',
+    )
   })
 
   test('strict delivery backfill does not fall back to parent taskRefs without delivery context', async () => {
