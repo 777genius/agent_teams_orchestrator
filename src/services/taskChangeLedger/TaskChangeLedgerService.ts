@@ -1524,14 +1524,15 @@ function projectTaskChangeEventsForSummary(events: TaskChangeEventV1[]): {
     const groupKey = buildSummaryGroupKey(event)
     rawCountByGroupKey.set(groupKey, (rawCountByGroupKey.get(groupKey) ?? 0) + 1)
 
-    if (!event.sourceImportKey) {
+    const sourceImportKey = sourceImportKeyForEvent(event)
+    if (!sourceImportKey) {
       passthrough.push({ event, index })
       return
     }
     const rank = evidenceRankForEvent(event)
-    const existing = selectedBySourceKey.get(event.sourceImportKey)
+    const existing = selectedBySourceKey.get(sourceImportKey)
     if (!existing || rank >= existing.rank) {
-      selectedBySourceKey.set(event.sourceImportKey, { event, index, rank })
+      selectedBySourceKey.set(sourceImportKey, { event, index, rank })
     }
   })
 
@@ -2233,7 +2234,10 @@ type ExistingSourceImportProjection = {
 }
 
 function sourceImportKeyForEvent(event: TaskChangeEventV1): string | null {
-  if (event.sourceImportKey) {
+  if (
+    event.sourceImportKey &&
+    (event.sourceRuntime === 'opencode' || event.sourceImportKey.startsWith('opencode\0'))
+  ) {
     return event.sourceImportKey
   }
   if (event.sourceRuntime && event.sourceSessionId && event.sourcePartId) {

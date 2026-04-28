@@ -461,6 +461,71 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(1)
   })
 
+  test('does not project non-OpenCode rows that accidentally carry sourceImportKey', async () => {
+    const taskId = 'task-non-opencode-source-import-key'
+    openScope(taskId)
+    await mkdir(dirname(eventsPath(taskId)), { recursive: true })
+    const timestamp = '2026-04-26T10:00:00.000Z'
+    const manualBase = {
+      schemaVersion: 1,
+      taskId,
+      taskRef: taskId,
+      taskRefKind: 'canonical',
+      phase: 'work',
+      executionSeq: 0,
+      sessionId,
+      toolUseId: 'manual-tool',
+      source: 'Edit',
+      operation: 'modify',
+      confidence: 'medium',
+      workspaceRoot: repoDir,
+      timestamp,
+      toolStatus: 'succeeded',
+      before: null,
+      after: null,
+      beforeState: { exists: true, unavailableReason: 'test-before-unavailable' },
+      afterState: { exists: true, unavailableReason: 'test-after-unavailable' },
+      sourceImportKey: 'shared-non-opencode-key',
+    }
+    await writeFile(
+      eventsPath(taskId),
+      [
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-a',
+          filePath: join(repoDir, 'src', 'manual-a.ts'),
+          relativePath: 'src/manual-a.ts',
+        }),
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-b',
+          filePath: join(repoDir, 'src', 'manual-b.ts'),
+          relativePath: 'src/manual-b.ts',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    )
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/trigger.ts',
+        content: 'export const trigger = 1;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-non-opencode-source-import-key-trigger',
+      sessionId,
+      agentId: 'alice@test',
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(new Set(files.map(file => file.relativePath))).toEqual(
+      new Set(['src/manual-a.ts', 'src/manual-b.ts', 'src/trigger.ts']),
+    )
+    expect(bundle.projectedEventCount).toBeUndefined()
+  })
+
   test('captures exact write create and rewrite into bundle v2 without storing events[]', async () => {
     const agentId = 'alice@test'
     openScope('task-write', 'work', agentId)
