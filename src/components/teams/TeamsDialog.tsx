@@ -548,13 +548,17 @@ function _temp(prev) {
 async function killTeammate(paneId: string, backendType: BackendType | undefined, teamName: string, teammateId: string, teammateName: string, setAppState: (f: (prev: AppState) => AppState) => void): Promise<void> {
   // Kill the pane using the backend that created it (handles -s / -L flags correctly).
   // Wrapped in try/catch so cleanup (removeMemberFromTeam, unassignTeammateTasks,
-  // setAppState) always runs — matches useInboxPoller.ts error isolation.
+  // setAppState) always runs - matches useInboxPoller.ts error isolation.
   if (backendType === 'process' || paneId.trim().startsWith('process:')) {
-    const killed = await killProcessBackendRuntime(paneId, {
-      expectedAgentId: teammateId,
-      teamName,
-    });
-    logForDebugging(`[TeamsDialog] Killed process runtime ${paneId}: ${killed}`);
+    try {
+      const killed = await killProcessBackendRuntime(paneId, {
+        expectedAgentId: teammateId,
+        teamName,
+      });
+      logForDebugging(`[TeamsDialog] Killed process runtime ${paneId}: ${killed}`);
+    } catch (error) {
+      logForDebugging(`[TeamsDialog] Failed to kill process runtime ${paneId}: ${error}`);
+    }
   } else if (backendType && isPaneBackend(backendType)) {
     try {
       // Use ensureBackendsRegistered (not detectAndGetBackend) — this process may

@@ -372,6 +372,7 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.worktreeBaseWorkspaceRoot === b.worktreeBaseWorkspaceRoot &&
     a.worktreeDirtyWarning === b.worktreeDirtyWarning &&
     a.sessionId === b.sessionId &&
+    a.runtimePid === b.runtimePid &&
     a.backendType === b.backendType &&
     a.isActive === b.isActive &&
     a.mode === b.mode &&

@@ -27,20 +27,11 @@ function commandHasFlagValue(
   expectedValue: string,
 ): boolean {
   const tokens = parseArguments(command)
-  const hasTokenMatch = tokens.some(
+  return tokens.some(
     (token, index) =>
       (token === flag && tokens[index + 1] === expectedValue) ||
       token === `${flag}=${expectedValue}`,
   )
-  if (hasTokenMatch) {
-    return true
-  }
-
-  const escapedFlag = flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const escapedValue = expectedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(
-    `${escapedFlag}(?:=|\\s+)["']?${escapedValue}["']?(?:\\s|$)`,
-  ).test(command)
 }
 
 export function isProcessBackendCommandForTeammate(

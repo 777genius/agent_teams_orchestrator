@@ -36,6 +36,7 @@ describe('getTeammateStatuses', () => {
           name: 'atlas-hq',
           createdAt: 0,
           leadAgentId: 'team-lead@atlas-hq',
+          hiddenPaneIds: ['process:4242'],
           members: [
             {
               agentId: 'team-lead@atlas-hq',
@@ -59,7 +60,7 @@ describe('getTeammateStatuses', () => {
               agentId: 'bob@atlas-hq',
               name: 'bob',
               joinedAt: 2,
-              tmuxPaneId: 'process:4343',
+              tmuxPaneId: '  process:4343  ',
               runtimePid: 4343,
               cwd: '/tmp/project',
               subscriptions: [],
@@ -103,6 +104,7 @@ describe('getTeammateStatuses', () => {
         agentId: 'alice@atlas-hq',
         backendType: 'process',
         tmuxPaneId: 'process:4242',
+        isHidden: true,
       }),
       expect.objectContaining({
         agentId: 'bob@atlas-hq',

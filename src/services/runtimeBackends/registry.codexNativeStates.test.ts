@@ -226,4 +226,39 @@ describe('codex-native registry rollout states', () => {
       shim.cleanup()
     }
   }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
+
+  test('rechecks ChatGPT login status when the detected codex binary path changes', async () => {
+    const firstShim = createLoggedInCodexShim()
+    const secondShim = createLoggedInCodexShim()
+    try {
+      const firstCodex = await loadCodexStatus({
+        codexApiKey: null,
+        openAiApiKey: null,
+        nativeBinaryPath: firstShim.binaryPath,
+        settingsInline: {
+          codex: {
+            forced_login_method: 'chatgpt',
+          },
+        },
+      })
+      const secondCodex = await loadCodexStatus({
+        codexApiKey: null,
+        openAiApiKey: null,
+        nativeBinaryPath: secondShim.binaryPath,
+        settingsInline: {
+          codex: {
+            forced_login_method: 'chatgpt',
+          },
+        },
+      })
+
+      expect(firstCodex?.resolvedBackendId).toBe('codex-native')
+      expect(firstCodex?.authMethod).toBe('oauth_token')
+      expect(secondCodex?.resolvedBackendId).toBe('codex-native')
+      expect(secondCodex?.authMethod).toBe('oauth_token')
+    } finally {
+      firstShim.cleanup()
+      secondShim.cleanup()
+    }
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 })

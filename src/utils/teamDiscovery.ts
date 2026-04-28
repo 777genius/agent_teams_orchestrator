@@ -77,10 +77,10 @@ export function getTeammateStatuses(teamName: string): TeammateStatus[] {
       prompt: member.prompt,
       status,
       color: member.color,
-      tmuxPaneId: member.tmuxPaneId,
+      tmuxPaneId: paneId,
       cwd: member.cwd,
       worktreePath: member.worktreePath,
-      isHidden: hiddenPaneIds.has(member.tmuxPaneId),
+      isHidden: hiddenPaneIds.has(paneId),
       backendType,
       mode: member.mode,
     })

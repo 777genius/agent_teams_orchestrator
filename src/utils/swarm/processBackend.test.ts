@@ -28,6 +28,20 @@ describe('processBackend', () => {
         'alpha',
       ),
     ).toBe(false)
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name alpha --agent-id bob@alpha-extra',
+        'bob@alpha',
+        'alpha',
+      ),
+    ).toBe(false)
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name=alpha --agent-id=bob@alpha',
+        'bob@alpha',
+        'alpha',
+      ),
+    ).toBe(true)
   })
 
   it('fails closed when kill identity is incomplete', async () => {

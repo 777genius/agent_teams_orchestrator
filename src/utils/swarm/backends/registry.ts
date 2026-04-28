@@ -338,6 +338,42 @@ function getTeammateMode(): 'auto' | 'tmux' | 'in-process' {
   return getTeammateModeFromSnapshot()
 }
 
+export function resolveInProcessEnabled(params: {
+  mode: 'auto' | 'tmux' | 'in-process'
+  isNonInteractiveSession: boolean
+  forceProcessTeammates: string | undefined
+  inProcessFallbackActive: boolean
+  insideTmux: boolean
+  inITerm2: boolean
+}): boolean {
+  if (params.isNonInteractiveSession) {
+    if (params.mode === 'in-process') {
+      return true
+    }
+    if (isEnvTruthy(params.forceProcessTeammates)) {
+      return false
+    }
+    if (params.inProcessFallbackActive) {
+      return true
+    }
+    return true
+  }
+
+  if (params.mode === 'in-process') {
+    return true
+  }
+  if (params.mode === 'tmux') {
+    return false
+  }
+  if (isEnvTruthy(params.forceProcessTeammates)) {
+    return false
+  }
+  if (params.inProcessFallbackActive) {
+    return true
+  }
+  return !params.insideTmux && !params.inITerm2
+}
+
 /**
  * Checks if in-process teammate execution is enabled.
  *
@@ -352,47 +388,55 @@ function getTeammateMode(): 'auto' | 'tmux' | 'in-process' {
  */
 export function isInProcessEnabled(): boolean {
   const mode = getTeammateMode()
+  const isNonInteractiveSession = getIsNonInteractiveSession()
+  const forceProcessTeammates = process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
+  const insideTmux = isNonInteractiveSession ? false : isInsideTmuxSync()
+  const inITerm2 = isNonInteractiveSession ? false : isInITerm2()
+  const enabled = resolveInProcessEnabled({
+    mode,
+    isNonInteractiveSession,
+    forceProcessTeammates,
+    inProcessFallbackActive,
+    insideTmux,
+    inITerm2,
+  })
 
   // Force in-process mode for non-interactive sessions (-p mode), except for
   // app-managed team runtimes that explicitly set a narrow backend override.
   // This avoids changing broader SDK/auth semantics just to prefer pane-based
   // teammates for persistent desktop teams.
-  if (getIsNonInteractiveSession()) {
+  if (isNonInteractiveSession) {
     if (mode === 'in-process') {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: true (non-interactive session, explicit in-process mode)',
       )
-      return true
+      return enabled
     }
-    if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
+    if (isEnvTruthy(forceProcessTeammates)) {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: false (forced process teammates for non-interactive session)',
       )
-      return false
+      return enabled
     }
     if (inProcessFallbackActive) {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: true (non-interactive session, fallback after pane backend unavailable)',
       )
-      return true
+      return enabled
     }
     logForDebugging(
       '[BackendRegistry] isInProcessEnabled: true (non-interactive session)',
     )
-    return true
+    return enabled
   }
 
-  let enabled: boolean
-  if (mode === 'in-process') {
-    enabled = true
-  } else if (mode === 'tmux') {
-    enabled = false
-  } else if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
+  if (mode === 'auto' && isEnvTruthy(forceProcessTeammates)) {
     logForDebugging(
       '[BackendRegistry] isInProcessEnabled: false (forced process teammates in auto mode)',
     )
-    return false
-  } else {
+    return enabled
+  }
+  if (mode === 'auto') {
     // 'auto' mode - if a prior spawn fell back to in-process because no pane
     // backend was available, stay in-process (scoped to auto mode only so a
     // mid-session Settings change to explicit 'tmux' still takes effect).
@@ -400,17 +444,12 @@ export function isInProcessEnabled(): boolean {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: true (fallback after pane backend unavailable)',
       )
-      return true
+      return enabled
     }
-    // Check if a pane backend environment is available
-    // If inside tmux or iTerm2, use pane backend; otherwise use in-process
-    const insideTmux = isInsideTmuxSync()
-    const inITerm2 = isInITerm2()
-    enabled = !insideTmux && !inITerm2
   }
 
   logForDebugging(
-    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${isInsideTmuxSync()}, inITerm2=${isInITerm2()})`,
+    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${insideTmux}, inITerm2=${inITerm2})`,
   )
   return enabled
 }

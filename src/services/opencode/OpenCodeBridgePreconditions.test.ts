@@ -46,6 +46,40 @@ describe('OpenCodeBridgePreconditions', () => {
     ).toThrow('capability snapshot precondition mismatch')
   })
 
+  test('accepts matching laneId preconditions for state-changing commands', () => {
+    expect(() =>
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: {
+          laneId: 'secondary:opencode:alice',
+          preconditions: preconditions({
+            laneId: 'secondary:opencode:alice',
+          }),
+        },
+        runtime: {
+          capabilitySnapshotId: 'cap-1',
+          runtimeStoreManifestHighWatermark: 0,
+        },
+      }),
+    ).not.toThrow()
+  })
+
+  test('rejects mismatched laneId preconditions for state-changing commands', () => {
+    expect(() =>
+      validateOpenCodeBridgeStateChangingPreconditions({
+        body: {
+          laneId: 'secondary:opencode:alice',
+          preconditions: preconditions({
+            laneId: 'secondary:opencode:bob',
+          }),
+        },
+        runtime: {
+          capabilitySnapshotId: 'cap-1',
+          runtimeStoreManifestHighWatermark: 0,
+        },
+      }),
+    ).toThrow('expected laneId precondition does not match command laneId')
+  })
+
   test('rejects stale runtime manifest high watermarks', () => {
     expect(() =>
       validateOpenCodeBridgeStateChangingPreconditions({
