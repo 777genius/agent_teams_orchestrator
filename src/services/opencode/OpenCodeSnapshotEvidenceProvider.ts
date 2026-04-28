@@ -147,7 +147,7 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
     if (!identity || !identity.snapshotEvidenceSupported || !identity.projectId || !identity.directory || !identity.project?.worktree) {
       return {
         supported: false,
-        code: 'snapshot-boundary-unavailable',
+        code: 'snapshot-session-unavailable',
         diagnostics: [
           ...diagnostics,
           ...(identity?.unsupportedReasons ?? ['snapshot-project-identity-missing']).map(reason =>
@@ -162,14 +162,14 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
     })) {
       return {
         supported: false,
-        code: 'snapshot-boundary-unavailable',
+        code: 'snapshot-session-unavailable',
         diagnostics: ['snapshot-project-worktree-mismatch: workspace root does not match OpenCode project worktree.'],
       }
     }
     if (input.offline.snapshotWindows.length === 0) {
       return {
         supported: false,
-        code: 'snapshot-boundary-unavailable',
+        code: 'snapshot-session-unavailable',
         diagnostics: ['snapshot-window-missing: OpenCode SQLite history has no paired snapshot windows.'],
       }
     }

@@ -81,7 +81,7 @@ export type OpenCodeSnapshotEvidenceResult =
     }
   | {
       supported: false
-      code: 'unsupported-opencode-snapshot-shape' | 'snapshot-boundary-unavailable' | 'snapshot-provider-unavailable'
+      code: 'unsupported-opencode-snapshot-shape' | 'snapshot-session-unavailable' | 'snapshot-provider-unavailable'
       diagnostics: string[]
     }
 

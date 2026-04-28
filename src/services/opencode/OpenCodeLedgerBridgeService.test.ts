@@ -707,7 +707,7 @@ describe('OpenCodeLedgerBridgeService', () => {
         providerCalled = true
         return {
           supported: false,
-          code: 'snapshot-boundary-unavailable',
+          code: 'snapshot-session-unavailable',
           diagnostics: ['snapshot-gitdir-missing: fixture snapshot gitdir does not exist.'],
         }
       },
