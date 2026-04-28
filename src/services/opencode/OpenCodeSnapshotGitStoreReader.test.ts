@@ -9,6 +9,7 @@ import {
   OpenCodeSnapshotGitStoreReader,
   parseOpenCodeSnapshotNumstatZ,
   parseOpenCodeSnapshotRawDiffZ,
+  validateOpenCodeSnapshotGitStoreArgs,
 } from './OpenCodeSnapshotGitStoreReader.js'
 
 let tempDir = ''
@@ -346,5 +347,27 @@ describe('OpenCode snapshot raw parsers', () => {
     expect(parsed.get('binary.bin')).toEqual({ additions: 0, deletions: 0, binary: true })
     expect(parsed.has('../bad.txt')).toBe(false)
     expect(diagnostics.join('\n')).toContain('snapshot-numstat-unsafe-path')
+  })
+
+  test('allows only read-only snapshot git commands', () => {
+    const prefix = [
+      '-c',
+      'core.autocrlf=false',
+      '-c',
+      'core.longpaths=true',
+      '--git-dir',
+      '/snapshot/gitdir',
+      '--work-tree',
+      '/worktree',
+    ]
+
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'diff', '--no-ext-diff', '--raw'])).toBeNull()
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'cat-file', '--batch'])).toBeNull()
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'cat-file', '--batch-check'])).toBeNull()
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'add', '--all'])).toContain('git add is not allowed')
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'write-tree'])).toContain('git write-tree is not allowed')
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'gc', '--prune=now'])).toContain('git gc is not allowed')
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'diff', '--raw'])).toContain('must include --no-ext-diff')
+    expect(validateOpenCodeSnapshotGitStoreArgs([...prefix, 'cat-file', '-p', 'HEAD'])).toContain('must use batch mode')
   })
 })

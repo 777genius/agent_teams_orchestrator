@@ -359,12 +359,51 @@ export function parseOpenCodeSnapshotNumstatZ(buffer: Buffer, diagnostics: strin
   return result
 }
 
+export function validateOpenCodeSnapshotGitStoreArgs(args: string[]): string | null {
+  let index = 0
+  while (index < args.length) {
+    const arg = args[index]
+    if (arg === '-c') {
+      index += 2
+      continue
+    }
+    if (arg === '--git-dir' || arg === '--work-tree') {
+      index += 2
+      continue
+    }
+    if (!arg || arg.startsWith('-')) {
+      return `snapshot-git-command-unsupported: unsupported git global option ${arg ?? '<empty>'}.`
+    }
+    if (arg === 'diff') {
+      return args.includes('--no-ext-diff')
+        ? null
+        : 'snapshot-git-command-unsupported: snapshot git diff must include --no-ext-diff.'
+    }
+    if (arg === 'cat-file') {
+      return args.includes('--batch') || args.includes('--batch-check')
+        ? null
+        : 'snapshot-git-command-unsupported: snapshot git cat-file must use batch mode.'
+    }
+    return `snapshot-git-command-unsupported: git ${arg} is not allowed for read-only OpenCode snapshot evidence.`
+  }
+  return 'snapshot-git-command-unsupported: git command was missing.'
+}
+
 async function runGit(args: string[], input: {
   cwd: string
   stdin?: string
   timeoutMs: number
   maxBytes: number
 }): Promise<GitRunResult> {
+  const allowlistError = validateOpenCodeSnapshotGitStoreArgs(args)
+  if (allowlistError) {
+    return {
+      code: 1,
+      stdout: Buffer.alloc(0),
+      stderr: '',
+      diagnostics: [allowlistError],
+    }
+  }
   return new Promise(resolve => {
     const child = spawn(gitExe(), args, {
       cwd: input.cwd,
