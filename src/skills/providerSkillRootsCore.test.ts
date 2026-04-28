@@ -31,7 +31,7 @@ describe('providerSkillRootsCore', () => {
         additionalDirs: ['/tmp/add-dir'],
       }),
     ).toEqual({
-      userSkillsDirs: ['/Users/me/.codex/skills'],
+      userSkillsDirs: [join('/Users/me/.codex', 'skills')],
       projectSkillsDirs: ['/tmp/repo/.codex/skills'],
       additionalSkillsDirs: [join('/tmp/add-dir', '.codex', 'skills')],
     })

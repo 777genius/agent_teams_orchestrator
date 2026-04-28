@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { describe, expect, test } from 'bun:test'
 
 const REGISTRY_STATUS_TEST_TIMEOUT_MS = 30_000
@@ -30,6 +33,7 @@ async function loadCodexStatus(options: {
   codexApiKey?: string | null
   codexCliPath?: string | null
   nativeBinaryDetected?: boolean
+  nativeBinaryPath?: string
   settingsInline?: Record<string, unknown> | null
 } = {}) {
   const originalCodexBackend = process.env.CLAUDE_CODE_CODEX_BACKEND
@@ -49,7 +53,9 @@ async function loadCodexStatus(options: {
   const originalWhich = Bun.which
   Bun.which = ((binaryName: string) => {
     if (binaryName === 'codex') {
-      return options.nativeBinaryDetected === false ? null : '/usr/local/bin/codex'
+      return options.nativeBinaryDetected === false
+        ? null
+        : options.nativeBinaryPath ?? '/usr/local/bin/codex'
     }
     return originalWhich(binaryName)
   }) as typeof Bun.which
@@ -79,6 +85,29 @@ async function loadCodexStatus(options: {
     setOptionalEnv('OPENAI_API_KEY', undefined, originalOpenAiApiKey)
     setOptionalEnv('CODEX_API_KEY', undefined, originalCodexApiKey)
     setOptionalEnv('CODEX_CLI_PATH', undefined, originalCodexCliPath)
+  }
+}
+
+function createLoggedInCodexShim(): { binaryPath: string; cleanup: () => void } {
+  const dir = mkdtempSync(path.join(tmpdir(), 'codex-login-shim-'))
+  const binaryPath = path.join(dir, process.platform === 'win32' ? 'codex.cmd' : 'codex')
+
+  if (process.platform === 'win32') {
+    writeFileSync(
+      binaryPath,
+      '@echo off\r\nif "%1"=="login" if "%2"=="status" exit /b 0\r\nexit /b 1\r\n',
+    )
+  } else {
+    writeFileSync(
+      binaryPath,
+      '#!/bin/sh\nif [ "$1" = "login" ] && [ "$2" = "status" ]; then exit 0; fi\nexit 1\n',
+    )
+    chmodSync(binaryPath, 0o755)
+  }
+
+  return {
+    binaryPath,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
   }
 }
 
@@ -165,30 +194,36 @@ describe('codex-native registry rollout states', () => {
   }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 
   test('reports ready for host-managed ChatGPT auth without requiring API keys', async () => {
-    const codex = await loadCodexStatus({
-      codexApiKey: null,
-      openAiApiKey: null,
-      settingsInline: {
-        codex: {
-          forced_login_method: 'chatgpt',
+    const shim = createLoggedInCodexShim()
+    try {
+      const codex = await loadCodexStatus({
+        codexApiKey: null,
+        openAiApiKey: null,
+        nativeBinaryPath: shim.binaryPath,
+        settingsInline: {
+          codex: {
+            forced_login_method: 'chatgpt',
+          },
         },
-      },
-    })
+      })
 
-    expect(codex?.selectedBackendId).toBe('codex-native')
-    expect(codex?.resolvedBackendId).toBe('codex-native')
-    expect(codex?.authMethod).toBe('oauth_token')
-    expect(codex?.availableBackends[0]).toMatchObject({
-      id: 'codex-native',
-      selectable: true,
-      available: true,
-      state: 'ready',
-      audience: 'general',
-      statusMessage: 'Ready',
-    })
-    expect(codex?.backend).toMatchObject({
-      kind: 'codex-native',
-      authMethodDetail: 'oauth_token',
-    })
+      expect(codex?.selectedBackendId).toBe('codex-native')
+      expect(codex?.resolvedBackendId).toBe('codex-native')
+      expect(codex?.authMethod).toBe('oauth_token')
+      expect(codex?.availableBackends[0]).toMatchObject({
+        id: 'codex-native',
+        selectable: true,
+        available: true,
+        state: 'ready',
+        audience: 'general',
+        statusMessage: 'Ready',
+      })
+      expect(codex?.backend).toMatchObject({
+        kind: 'codex-native',
+        authMethodDetail: 'oauth_token',
+      })
+    } finally {
+      shim.cleanup()
+    }
   }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 })

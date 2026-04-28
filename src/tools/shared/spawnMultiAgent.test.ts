@@ -5,8 +5,11 @@ import { join } from 'node:path'
 
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import { getSeparateProcessRequirement } from './spawnMultiAgent.js'
+import { isProcessBackendCommandForTeammate } from './spawnMultiAgent.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
+import { parseProcessBackendPid } from './spawnMultiAgent.js'
 import { resolveTeammateModel } from './spawnMultiAgent.js'
+import { shouldUseNativeProcessBackendForSpawn } from './spawnMultiAgent.js'
 import { spawnTeammate } from './spawnMultiAgent.js'
 
 afterEach(() => {
@@ -367,5 +370,78 @@ describe('spawnTeammate worktree isolation validation', () => {
         } as never,
       ),
     ).rejects.toThrow('cwd is mutually exclusive with isolation: "worktree"')
+  })
+})
+
+describe('native process teammate backend selection', () => {
+  it('uses native process backend only for forced auto teammate mode', () => {
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'auto',
+        forceProcessTeammates: '1',
+      }),
+    ).toBe(true)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'in-process',
+        forceProcessTeammates: 'true',
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'tmux',
+        forceProcessTeammates: '1',
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'auto',
+        forceProcessTeammates: undefined,
+      }),
+    ).toBe(false)
+  })
+
+  it('parses persisted process backend pid markers', () => {
+    expect(parseProcessBackendPid('process:1234')).toBe(1234)
+    expect(parseProcessBackendPid('5678')).toBe(5678)
+    expect(parseProcessBackendPid('%1')).toBeNull()
+    expect(parseProcessBackendPid('in-process')).toBeNull()
+  })
+
+  it('matches process backend command lines by teammate identity', () => {
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name alpha --agent-id bob@alpha --agent-name bob',
+        'bob@alpha',
+        'alpha',
+      ),
+    ).toBe(true)
+
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name alpha --agent-id alice@alpha --agent-name alice',
+        'bob@alpha',
+        'alpha',
+      ),
+    ).toBe(false)
+
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name alpha --agent-id alice@alpha --note bob@alpha',
+        'bob@alpha',
+        'alpha',
+      ),
+    ).toBe(false)
+
+    expect(
+      isProcessBackendCommandForTeammate(
+        'bun cli.js --team-name "alpha team" --agent-id "bob@alpha team"',
+        'bob@alpha team',
+        'alpha team',
+      ),
+    ).toBe(true)
   })
 })

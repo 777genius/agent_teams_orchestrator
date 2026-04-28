@@ -9,6 +9,7 @@ import {
   MAX_TASK_OUTPUT_BYTES_DISPLAY,
 } from './task/diskOutput.js'
 import { TaskOutput } from './task/TaskOutput.js'
+import { killProcessTree } from './processKill.js'
 
 export type ExecResult = {
   stdout: string
@@ -337,7 +338,11 @@ class ShellCommandImpl implements ShellCommand {
   #doKill(code?: number): void {
     this.#status = 'killed'
     if (this.#childProcess.pid) {
-      treeKill(this.#childProcess.pid, 'SIGKILL')
+      if (process.platform === 'win32') {
+        killProcessTree(this.#childProcess.pid, 'SIGKILL')
+      } else {
+        treeKill(this.#childProcess.pid, 'SIGKILL')
+      }
     }
     this.#resolveExitCode(code ?? SIGKILL)
   }

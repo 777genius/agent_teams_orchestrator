@@ -14,6 +14,10 @@ import { getAgentName, getTeamName, isTeammate } from '../teammate.js'
 import { hasWorktreeChanges, removeAgentWorktree } from '../worktree.js'
 import { type BackendType, isPaneBackend } from './backends/types.js'
 import { TEAM_LEAD_NAME } from './constants.js'
+import {
+  buildProcessBackendPaneId,
+  killProcessBackendRuntime,
+} from './processBackend.js'
 import { safeWindowsPathSegment } from '../windowsReservedNames.js'
 
 export const inputSchema = lazySchema(() =>
@@ -91,6 +95,7 @@ export type TeamFile = {
     worktreeBaseWorkspaceRoot?: string
     worktreeDirtyWarning?: string
     sessionId?: string
+    runtimePid?: number
     subscriptions: string[]
     backendType?: BackendType
     isActive?: boolean // false when idle, undefined/true when active
@@ -956,21 +961,30 @@ export async function cleanupSessionTeams(): Promise<void> {
   // deleting directories alone would orphan them in open tmux/iTerm2 panes.
   // (TeamDeleteTool's path doesn't need this — by then teammates have
   // gracefully exited and useInboxPoller has already closed their panes.)
-  await Promise.allSettled(teams.map(name => killOrphanedTeammatePanes(name)))
+  await Promise.allSettled(teams.map(name => killOrphanedTeammateRuntimes(name)))
   await Promise.allSettled(teams.map(name => cleanupTeamDirectories(name)))
   sessionCreatedTeams.clear()
 }
 
 /**
- * Best-effort kill of all pane-backed teammate panes for a team.
+ * Best-effort kill of all out-of-process teammate runtimes for a team.
  * Called from cleanupSessionTeams on ungraceful leader exit (SIGINT/SIGTERM).
  * Dynamic imports avoid adding registry/detection to this module's static
  * dep graph — this only runs at shutdown, so the import cost is irrelevant.
  */
-async function killOrphanedTeammatePanes(teamName: string): Promise<void> {
+async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
   const teamFile = readTeamFile(teamName)
   if (!teamFile) return
 
+  const processMembers = teamFile.members.filter(
+    m =>
+      m.name !== TEAM_LEAD_NAME &&
+      (m.backendType === 'process' ||
+        (!m.backendType && m.tmuxPaneId?.trim().startsWith('process:')) ||
+        (!m.backendType &&
+          typeof m.runtimePid === 'number' &&
+          m.runtimePid > 0)),
+  )
   const paneMembers = teamFile.members.filter(
     m =>
       m.name !== TEAM_LEAD_NAME &&
@@ -978,6 +992,24 @@ async function killOrphanedTeammatePanes(teamName: string): Promise<void> {
       m.backendType &&
       isPaneBackend(m.backendType),
   )
+
+  await Promise.allSettled(
+    processMembers.map(async m => {
+      const paneId =
+        m.tmuxPaneId?.trim() ||
+        (typeof m.runtimePid === 'number' && m.runtimePid > 0
+          ? buildProcessBackendPaneId(m.runtimePid)
+          : undefined)
+      const ok = await killProcessBackendRuntime(paneId, {
+        expectedAgentId: m.agentId,
+        teamName,
+      })
+      logForDebugging(
+        `cleanupSessionTeams: killProcess ${m.name} (${m.tmuxPaneId}) => ${ok}`,
+      )
+    }),
+  )
+
   if (paneMembers.length === 0) return
 
   const [{ ensureBackendsRegistered, getBackendByType }, { isInsideTmux }] =

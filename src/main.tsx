@@ -814,7 +814,10 @@ export async function main() {
   const hasPrintFlag = cliArgs.includes('-p') || cliArgs.includes('--print');
   const hasInitOnlyFlag = cliArgs.includes('--init-only');
   const hasSdkUrl = cliArgs.some(arg => arg.startsWith('--sdk-url'));
-  const isNonInteractive = hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || !process.stdout.isTTY;
+  const hasTeammateIdentityFlag = cliArgs.some(
+    arg => arg === '--agent-id' || arg.startsWith('--agent-id='),
+  );
+  const isNonInteractive = hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || (!process.stdout.isTTY && !hasTeammateIdentityFlag);
 
   // Stop capturing early input for non-interactive modes
   if (isNonInteractive) {

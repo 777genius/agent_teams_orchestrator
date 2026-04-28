@@ -74,9 +74,8 @@ describe('createTeammateWorktree', () => {
     expect(worktree.gitRoot).toBe(repoDir)
     expect(worktree.baseWorkspaceRoot).toBe(repoDir)
     expect(worktree.dirtyLeaderWarning).toContain('uncommitted changes')
-    expect(await readFile(join(worktree.worktreePath, 'tracked.txt'), 'utf8')).toBe(
-      'committed\n',
-    )
+    const trackedContent = await readFile(join(worktree.worktreePath, 'tracked.txt'), 'utf8')
+    expect(trackedContent.replace(/\r\n/g, '\n')).toBe('committed\n')
 
     await removeAgentWorktree(
       worktree.worktreePath,

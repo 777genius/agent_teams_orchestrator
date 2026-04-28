@@ -6,8 +6,9 @@ import type { EffortLevel } from '../../effort.js'
  * - 'tmux': Uses tmux for pane management (works in tmux or standalone)
  * - 'iterm2': Uses iTerm2 native split panes via the it2 CLI
  * - 'in-process': Runs teammate in the same Node.js process with isolated context
+ * - 'process': Runs teammate as a separate CLI process without terminal panes
  */
-export type BackendType = 'tmux' | 'iterm2' | 'in-process'
+export type BackendType = 'tmux' | 'iterm2' | 'in-process' | 'process'
 
 /**
  * Subset of BackendType for pane-based backends only.
@@ -40,7 +41,7 @@ export type CreatePaneResult = {
  */
 export type PaneBackend = {
   /** The type identifier for this backend */
-  readonly type: BackendType
+  readonly type: PaneBackendType
 
   /** Human-readable display name for this backend */
   readonly displayName: string
@@ -312,6 +313,6 @@ export type TeammateExecutor = {
 /**
  * Type guard to check if a backend type uses terminal panes.
  */
-export function isPaneBackend(type: BackendType): type is 'tmux' | 'iterm2' {
+export function isPaneBackend(type: BackendType): type is PaneBackendType {
   return type === 'tmux' || type === 'iterm2'
 }

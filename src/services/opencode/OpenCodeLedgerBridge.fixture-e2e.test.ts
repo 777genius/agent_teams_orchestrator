@@ -14,6 +14,7 @@ import type { OpenCodeSessionRecord } from './types.js'
 let tempDir = ''
 let homeDir = ''
 let previousHome: string | undefined
+const LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS = 15_000
 
 class FixtureOpenCodeOfflineSessionReader extends OpenCodeOfflineSessionReader {
   constructor(private readonly dbPath: string) {
@@ -378,6 +379,19 @@ function childEnvForHome(home: string): NodeJS.ProcessEnv {
   }
 }
 
+function cliDevCommand(): { command: string; prefixArgs: string[] } {
+  if (process.platform === 'win32') {
+    return {
+      command: process.execPath,
+      prefixArgs: [path.join(process.cwd(), 'dist', 'local-cli-dev', 'cli.js')],
+    }
+  }
+  return {
+    command: path.join(process.cwd(), 'cli-dev'),
+    prefixArgs: [],
+  }
+}
+
 async function readJsonlEvents(projectDir: string, taskId: string): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(
     path.join(projectDir, '.board-task-changes', 'events', `${encodeURIComponent(taskId)}.jsonl`),
@@ -506,7 +520,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
   })
 
   test('CLI command recovers the same SQLite fixture through the public runtime entrypoint', async () => {
-    const cliPath = path.join(process.cwd(), 'cli-dev')
+    const cliDev = cliDevCommand()
     const workspaceRoot = path.join(tempDir, 'workspace-cli')
     const projectDir = path.join(tempDir, 'claude-project-cli')
     const dataDir = envPathsDataDirForHome(homeDir)
@@ -517,8 +531,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     const deliveryContextPath = await createFixtureDeliveryContext(path.join(tempDir, 'delivery-context-cli.json'))
 
     const dryRun = spawnSync(
-      cliPath,
+      cliDev.command,
       [
+        ...cliDev.prefixArgs,
         'runtime',
         'opencode-ledger-backfill',
         '--json',
@@ -557,8 +572,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
 
     const cli = spawnSync(
-      cliPath,
+      cliDev.command,
       [
+        ...cliDev.prefixArgs,
         'runtime',
         'opencode-ledger-backfill',
         '--json',
@@ -601,5 +617,5 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       eventCount: 4,
       totalFiles: 2,
     })
-  })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 })

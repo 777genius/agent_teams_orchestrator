@@ -8,7 +8,7 @@ import type {
   OpenCodeSqlitePartRow,
 } from './OpenCodeOfflineSessionReader.js'
 
-const workspaceRoot = '/repo'
+const workspaceRoot = path.resolve('/repo')
 const defaultTaskRefs = [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }]
 
 function structuredDeliveryPrompt(input: {

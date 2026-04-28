@@ -165,6 +165,9 @@ const TEAMMATE_ENV_VARS = [
   'GCLOUD_PROJECT',
   // Config directory override
   'CLAUDE_CONFIG_DIR',
+  // Desktop-managed teammate backend preference. Forward this so process-backed
+  // teammates keep spawning their own teammates without requiring tmux.
+  'CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES',
   // CCR marker — teammates need this for CCR-aware code paths. Auth finds
   // its own way via /home/claude/.claude/remote/.oauth_token regardless;
   // the FD env var wouldn't help (pipe FDs don't cross tmux).
@@ -264,7 +267,19 @@ export function buildInheritedEnvVars(options?: {
   provider?: TeammateProvider
   extraEnv?: Record<string, string | undefined>
 }): string {
-  const envVars = ['CLAUDECODE=1', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1']
+  return Object.entries(buildInheritedEnvObject(options))
+    .map(([key, value]) => `${key}=${quote([value])}`)
+    .join(' ')
+}
+
+export function buildInheritedEnvObject(options?: {
+  provider?: TeammateProvider
+  extraEnv?: Record<string, string | undefined>
+}): Record<string, string> {
+  const envVars: Record<string, string> = {
+    CLAUDECODE: '1',
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+  }
   const provider = options?.provider
   const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(provider)
 
@@ -282,7 +297,7 @@ export function buildInheritedEnvVars(options?: {
     // Explicitly blank the inherited shell env for pane-based teammates. Not
     // forwarding the key is insufficient because tmux/login shells can still
     // inherit ANTHROPIC_API_KEY from the parent environment.
-    envVars.push("ANTHROPIC_API_KEY=''")
+    envVars.ANTHROPIC_API_KEY = ''
   }
 
   for (const key of TEAMMATE_ENV_VARS) {
@@ -294,19 +309,19 @@ export function buildInheritedEnvVars(options?: {
     }
     const value = process.env[key]
     if (value !== undefined && value !== '') {
-      envVars.push(`${key}=${quote([value])}`)
+      envVars[key] = value
     }
   }
 
   if (clearCodexApiKeys) {
-    envVars.push("CODEX_API_KEY=''")
-    envVars.push("OPENAI_API_KEY=''")
+    envVars.CODEX_API_KEY = ''
+    envVars.OPENAI_API_KEY = ''
   }
 
   if (options?.extraEnv) {
     for (const [key, value] of Object.entries(options.extraEnv)) {
       if (value !== undefined) {
-        envVars.push(`${key}=${quote([value])}`)
+        envVars[key] = value
       }
     }
   }
@@ -317,14 +332,12 @@ export function buildInheritedEnvVars(options?: {
     shouldForwardAnthropicAuthToken(provider) &&
     process.env.ANTHROPIC_AUTH_TOKEN
   ) {
-    envVars.push(
-      `ANTHROPIC_AUTH_TOKEN=${quote([process.env.ANTHROPIC_AUTH_TOKEN])}`,
-    )
+    envVars.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
   }
 
   if (provider) {
     for (const key of PROVIDER_SELECTION_ENV_VARS) {
-      envVars.push(`${key}=''`)
+      envVars[key] = ''
     }
     // Teammate provider overrides must be positive pins, not "unset and hope
     // firstParty wins". The desktop/dev host can already be running with a
@@ -332,13 +345,11 @@ export function buildInheritedEnvVars(options?: {
     // applied again after trust inside the child. Mark the child as
     // host-managed and set an explicit entry provider for all override cases,
     // including anthropic, so model alias resolution cannot drift.
-    envVars.push('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1')
-    envVars.push(
-      `CLAUDE_CODE_ENTRY_PROVIDER=${getExplicitEntryProvider(provider)}`,
-    )
+    envVars.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    envVars.CLAUDE_CODE_ENTRY_PROVIDER = getExplicitEntryProvider(provider)
   }
 
-  return envVars.join(' ')
+  return envVars
 }
 
 const TMUX_SPAWN_SMOKE_DELAY_MS = 800

@@ -73,6 +73,7 @@ describe('OpenCodeBridgePreconditions', () => {
 function preconditions(overrides: Record<string, unknown> = {}) {
   return {
     handshakeIdentityHash: 'handshake-1',
+    laneId: null,
     expectedRunId: null,
     expectedCapabilitySnapshotId: null,
     expectedBehaviorFingerprint: null,

@@ -108,6 +108,7 @@ export type BootstrapMemberState = {
   failureReason?: string
   agentId?: string
   backendType?: string
+  runtimePid?: number
 }
 
 export type TeamBootstrapSummary = {

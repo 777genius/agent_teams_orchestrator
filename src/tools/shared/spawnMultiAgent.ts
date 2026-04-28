@@ -5,6 +5,7 @@
 
 import React from 'react'
 import { randomUUID } from 'crypto'
+import { spawn, type ChildProcess } from 'node:child_process'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -31,12 +32,15 @@ import { isInBundledMode } from '../../utils/bundledMode.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
 import type { EffortLevel } from '../../utils/effort.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
+import { parseArguments } from '../../utils/argumentSubstitution.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
+import { killProcessTree } from '../../utils/processKill.js'
 import {
   IT2_COMMAND,
   isTmuxAvailable,
@@ -70,10 +74,18 @@ import {
 } from '../../utils/swarm/spawnInProcess.js'
 import {
   buildPaneLauncherCommand,
+  buildInheritedEnvObject,
   buildInheritedEnvVars,
   probeTmuxTeammateSpawn,
   wrapTeammateSpawnCommand,
 } from '../../utils/swarm/spawnUtils.js'
+import {
+  buildProcessBackendPaneId,
+  isProcessBackendCommandForTeammate as isProcessBackendCommandForTeammateValue,
+  isProcessBackendRuntimeAlive,
+  killProcessBackendRuntime,
+  parseProcessBackendPid as parseProcessBackendPidValue,
+} from '../../utils/swarm/processBackend.js'
 import {
   cleanupSpawnReadySentinelDir,
   createSpawnReadySentinel,
@@ -399,6 +411,8 @@ export type SpawnOutput = {
   tmux_pane_id: string
   team_name?: string
   is_splitpane?: boolean
+  backend_type?: BackendType
+  runtime_pid?: number
   plan_mode_required?: boolean
   worktreePath?: string
   worktreeBranch?: string
@@ -590,7 +604,14 @@ async function resolveExistingTeammateState(
     const [teammateId, teammate] = inMemoryTeammate
     let runtimeAlive = false
     const paneId = teammate.tmuxPaneId?.trim()
-    if (paneId && paneId !== 'in-process') {
+    const processPid = parseProcessBackendPid(paneId)
+    if (processPid) {
+      runtimeAlive = await isProcessBackendRuntimeAlive(
+        processPid,
+        teammateId,
+        teamName,
+      )
+    } else if (paneId && paneId !== 'in-process') {
       runtimeAlive =
         (await isTmuxPaneAlive(paneId, false)) ||
         (await isTmuxPaneAlive(paneId, true)) ||
@@ -627,6 +648,8 @@ async function resolveExistingTeammateState(
 
   let runtimeAlive = false
   const paneId = existingMember.tmuxPaneId?.trim()
+  const persistedProcessPid =
+    parseProcessBackendPid(paneId) ?? existingMember.runtimePid
   if (existingMember.backendType === 'in-process') {
     runtimeAlive = Boolean(
       Object.values(appState.tasks).find(task => {
@@ -642,11 +665,30 @@ async function resolveExistingTeammateState(
       (await isTmuxPaneAlive(paneId, true))
   } else if (paneId && existingMember.backendType === 'iterm2') {
     runtimeAlive = await isItermPaneAlive(paneId)
+  } else if (existingMember.backendType === 'process') {
+    runtimeAlive = persistedProcessPid
+      ? await isProcessBackendRuntimeAlive(
+          persistedProcessPid,
+          existingMember.agentId || canonicalAgentId,
+          teamName,
+        )
+      : false
   } else if (paneId) {
-    runtimeAlive =
-      (await isTmuxPaneAlive(paneId, false)) ||
-      (await isTmuxPaneAlive(paneId, true)) ||
-      (await isItermPaneAlive(paneId))
+    runtimeAlive = persistedProcessPid
+      ? await isProcessBackendRuntimeAlive(
+          persistedProcessPid,
+          existingMember.agentId || canonicalAgentId,
+          teamName,
+        )
+      : (await isTmuxPaneAlive(paneId, false)) ||
+        (await isTmuxPaneAlive(paneId, true)) ||
+        (await isItermPaneAlive(paneId))
+  } else if (persistedProcessPid) {
+    runtimeAlive = await isProcessBackendRuntimeAlive(
+      persistedProcessPid,
+      existingMember.agentId || canonicalAgentId,
+      teamName,
+    )
   }
 
   if (!runtimeAlive) {
@@ -754,6 +796,93 @@ function getTeammateCommand(): string {
     return quote([process.execPath])
   }
   return `${quote([process.execPath])} ${quote([process.argv[1]!])}`
+}
+
+function getTeammateCommandArgv(): { command: string; args: string[] } {
+  const override = process.env[TEAMMATE_COMMAND_ENV_VAR]?.trim()
+  if (override) {
+    const parts = parseArguments(override)
+    if (parts.length === 0) {
+      throw new Error(`${TEAMMATE_COMMAND_ENV_VAR} is set but empty`)
+    }
+    return { command: parts[0]!, args: parts.slice(1) }
+  }
+  if (isInBundledMode()) {
+    return { command: process.execPath, args: [] }
+  }
+  return { command: process.execPath, args: [process.argv[1]!] }
+}
+
+export function parseProcessBackendPid(value: string | undefined): number | null {
+  return parseProcessBackendPidValue(value)
+}
+
+export function isProcessBackendCommandForTeammate(
+  command: string,
+  teammateId: string,
+  teamName: string,
+): boolean {
+  return isProcessBackendCommandForTeammateValue(command, teammateId, teamName)
+}
+
+function toTeamFileEffort(
+  effort: EffortLevel | undefined,
+): 'low' | 'medium' | 'high' | 'max' | undefined {
+  return effort === 'low' ||
+    effort === 'medium' ||
+    effort === 'high' ||
+    effort === 'max'
+    ? effort
+    : undefined
+}
+
+export function shouldUseNativeProcessBackendForSpawn(options?: {
+  teammateMode?: 'auto' | 'tmux' | 'in-process'
+  forceProcessTeammates?: string | boolean
+}): boolean {
+  const teammateMode = options?.teammateMode ?? getTeammateModeFromSnapshot()
+  const forceProcessTeammates =
+    options?.forceProcessTeammates ?? process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
+  return teammateMode === 'auto' && isEnvTruthy(forceProcessTeammates)
+}
+
+const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
+
+async function probeNativeProcessTeammateSpawn(
+  child: ChildProcess,
+  teammateId: string,
+): Promise<string | null> {
+  return new Promise(resolve => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const finish = (failure: string | null): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      child.off('error', onError)
+      child.off('exit', onExit)
+      resolve(failure)
+    }
+
+    const onError = (error: Error): void => {
+      finish(`Teammate process ${teammateId} failed to start: ${error.message}`)
+    }
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      const suffix =
+        code !== null ? ` with code ${code}` : signal ? ` from signal ${signal}` : ''
+      finish(`Teammate process ${teammateId} exited immediately${suffix}.`)
+    }
+
+    child.once('error', onError)
+    child.once('exit', onExit)
+    timer = setTimeout(() => finish(null), PROCESS_SPAWN_SMOKE_DELAY_MS)
+  })
 }
 
 /**
@@ -1190,6 +1319,7 @@ async function handleSpawnSplitPane(
       tmux_pane_id: paneId,
       team_name: teamName,
       is_splitpane: true,
+      backend_type: detectionResult.backend.type,
       plan_mode_required,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
       ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
@@ -1476,6 +1606,7 @@ async function handleSpawnSeparateWindow(
       tmux_pane_id: paneId,
       team_name: teamName,
       is_splitpane: false,
+      backend_type: 'tmux',
       plan_mode_required,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
       ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
@@ -1571,10 +1702,259 @@ function registerOutOfProcessTeammateTask(
     () => {
       if (isPaneBackend(backendType)) {
         void getBackendByType(backendType).killPane(paneId, !insideTmux)
+      } else if (backendType === 'process') {
+        void killProcessBackendRuntime(paneId, {
+          signal: 'SIGTERM',
+          expectedAgentId: teammateId,
+          teamName,
+        })
       }
     },
     { once: true },
   )
+}
+
+/**
+ * Handle spawn operation for separate CLI processes without terminal panes.
+ * This is the Windows-friendly fallback when the desktop host requires real
+ * teammate processes but tmux/iTerm2 panes are unavailable.
+ */
+async function handleSpawnNativeProcess(
+  input: SpawnInput,
+  context: ToolUseContext,
+): Promise<{ data: SpawnOutput }> {
+  const { setAppState, getAppState } = context
+  const { name, prompt, agent_type, plan_mode_required } = input
+  const { provider } = getSeparateProcessRequirement(input.provider)
+  const model = resolveSpawnModel(
+    input.model,
+    getAppState().mainLoopModel,
+    input.provider,
+  )
+  const effort = input.effort
+  const worktreeInfo = input.worktreeInfo
+
+  if (!name || !prompt) {
+    throw new Error('name and prompt are required for spawn operation')
+  }
+
+  const appState = getAppState()
+  const teamName = input.team_name || appState.teamContext?.teamName
+  if (!teamName) {
+    throw new Error(
+      'team_name is required for spawn operation. Either provide team_name in input or call spawnTeam first to establish team context.',
+    )
+  }
+  assertNotWindowsReservedBasename(teamName, 'team_name')
+  assertNotWindowsReservedBasename(name, 'name')
+
+  const sanitizedName = sanitizeAgentName(name)
+  const teammateId = formatAgentId(sanitizedName, teamName)
+  const teammateColor = assignTeammateColor(teammateId)
+  const workingDir = worktreeInfo?.worktreePath ?? input.cwd ?? getCwd()
+
+  const teammateArgs = [
+    '--agent-id',
+    teammateId,
+    '--agent-name',
+    sanitizedName,
+    '--team-name',
+    teamName,
+    '--agent-color',
+    teammateColor,
+    '--parent-session-id',
+    getSessionId(),
+    ...(plan_mode_required ? ['--plan-mode-required'] : []),
+    ...(agent_type ? ['--agent-type', agent_type] : []),
+  ]
+
+  let inheritedFlags = buildInheritedCliFlags({
+    planModeRequired: plan_mode_required,
+    permissionMode: appState.toolPermissionContext.mode,
+    effortValue:
+      typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
+    strictMcpConfig: Boolean(teamName),
+  })
+
+  if (crossesProviderBoundary(input.provider)) {
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+  }
+  if (model) {
+    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+    inheritedFlags = inheritedFlags
+      ? `${inheritedFlags} --model ${quote([model])}`
+      : `--model ${quote([model])}`
+  }
+  if (effort) {
+    inheritedFlags = stripInheritedEffortFlag(inheritedFlags)
+    inheritedFlags = inheritedFlags
+      ? `${inheritedFlags} --effort ${quote([effort])}`
+      : `--effort ${quote([effort])}`
+  }
+
+  logTeammateSpawnSnapshot({
+    teamName,
+    teammateName: sanitizedName,
+    provider,
+    model,
+    effort,
+    prompt,
+    strictMcpConfig: Boolean(teamName),
+  })
+
+  const { command, args: commandArgs } = getTeammateCommandArgv()
+  const argv = [...commandArgs, ...teammateArgs, ...parseArguments(inheritedFlags)]
+  const launchBoundaryIso = new Date().toISOString()
+  const persistedEffort = toTeamFileEffort(effort)
+  let child: ChildProcess | null = null
+
+  try {
+    child = spawn(command, argv, {
+      cwd: workingDir,
+      detached: true,
+      env: {
+        ...process.env,
+        ...buildInheritedEnvObject({
+          provider,
+          extraEnv: worktreeEnv(worktreeInfo),
+        }),
+      },
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+
+    if (!child.pid) {
+      throw new Error(`Failed to spawn teammate process for ${teammateId}: missing pid`)
+    }
+
+    const runtimePid = child.pid
+    const processPaneId = buildProcessBackendPaneId(runtimePid)
+    const spawnFailure = await probeNativeProcessTeammateSpawn(child, teammateId)
+    if (spawnFailure) {
+      killProcessTree(runtimePid, 'SIGTERM')
+      throw new Error(spawnFailure)
+    }
+
+    const updateResult = await updateTeamFileAsync(teamName, teamFile =>
+      upsertTeamMember(teamFile, {
+        agentId: teammateId,
+        name: sanitizedName,
+        agentType: agent_type,
+        model,
+        provider,
+        effort: persistedEffort,
+        prompt,
+        color: teammateColor,
+        planModeRequired: plan_mode_required,
+        joinedAt: Date.now(),
+        bootstrapExpectedAfter: launchBoundaryIso,
+        tmuxPaneId: processPaneId,
+        runtimePid,
+        cwd: workingDir,
+        ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+        ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+        ...(worktreeInfo?.headCommit ? { worktreeHeadCommit: worktreeInfo.headCommit } : {}),
+        ...(worktreeInfo?.gitRoot ? { worktreeGitRoot: worktreeInfo.gitRoot } : {}),
+        ...(worktreeInfo?.hookBased ? { worktreeHookBased: true } : {}),
+        ...(worktreeInfo?.baseWorkspaceRoot
+          ? { worktreeBaseWorkspaceRoot: worktreeInfo.baseWorkspaceRoot }
+          : {}),
+        ...(worktreeInfo?.dirtyLeaderWarning
+          ? { worktreeDirtyWarning: worktreeInfo.dirtyLeaderWarning }
+          : {}),
+        subscriptions: [],
+        backendType: 'process',
+      }),
+    )
+    if (updateResult.status === 'missing') {
+      throw new Error(
+        `Team "${teamName}" does not exist. Call spawnTeam first to create the team.`,
+      )
+    }
+
+    await writeToMailbox(
+      sanitizedName,
+      {
+        from: TEAM_LEAD_NAME,
+        text: prompt,
+        timestamp: new Date().toISOString(),
+      },
+      teamName,
+    )
+
+    setAppState(prev => ({
+      ...prev,
+      teamContext: {
+        ...prev.teamContext,
+        teamName: teamName ?? prev.teamContext?.teamName ?? 'default',
+        teamFilePath: prev.teamContext?.teamFilePath ?? '',
+        leadAgentId: prev.teamContext?.leadAgentId ?? '',
+        teammates: {
+          ...(prev.teamContext?.teammates || {}),
+          [teammateId]: {
+            name: sanitizedName,
+            agentType: agent_type,
+            color: teammateColor,
+            tmuxSessionName: 'process',
+            tmuxPaneId: processPaneId,
+            cwd: workingDir,
+            ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+            spawnedAt: Date.now(),
+          },
+        },
+      },
+    }))
+
+    registerOutOfProcessTeammateTask(setAppState, {
+      teammateId,
+      sanitizedName,
+      teamName,
+      teammateColor,
+      prompt,
+      plan_mode_required,
+      paneId: processPaneId,
+      insideTmux: false,
+      backendType: 'process',
+      toolUseId: context.toolUseId,
+      worktreeInfo,
+    })
+
+    child.unref()
+    logForDebugging(
+      `[handleSpawnNativeProcess] Spawned teammate ${teammateId} as pid ${runtimePid}`,
+    )
+
+    return {
+      data: {
+        teammate_id: teammateId,
+        agent_id: teammateId,
+        agent_type,
+        model,
+        provider,
+        effort,
+        name: sanitizedName,
+        color: teammateColor,
+        tmux_session_name: 'process',
+        tmux_window_name: 'process',
+        tmux_pane_id: processPaneId,
+        team_name: teamName,
+        is_splitpane: false,
+        backend_type: 'process',
+        runtime_pid: runtimePid,
+        plan_mode_required,
+        ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
+        ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
+        ...(worktreeInfo?.dirtyLeaderWarning
+          ? { dirtyLeaderWarning: worktreeInfo.dirtyLeaderWarning }
+          : {}),
+      },
+    }
+  } catch (error) {
+    if (child?.pid) {
+      killProcessTree(child.pid, 'SIGTERM')
+    }
+    throw error
+  }
 }
 
 /**
@@ -1847,6 +2227,7 @@ async function handleSpawnInProcess(
       tmux_pane_id: 'in-process',
       team_name: teamName,
       is_splitpane: false,
+      backend_type: 'in-process',
       plan_mode_required,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
       ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
@@ -1905,6 +2286,12 @@ async function handleSpawn(
     try {
       await detectAndGetBackend()
     } catch (error) {
+      if (shouldUseNativeProcessBackendForSpawn()) {
+        logForDebugging(
+          `[handleSpawn] No pane backend available, using native process backend: ${errorMessage(error)}`,
+        )
+        return await handleSpawnNativeProcess(spawnInput, context)
+      }
       if (forceSeparateProcess) {
         if (separateProcessRequirement.reason === 'codex-native-runtime') {
           throw new Error(

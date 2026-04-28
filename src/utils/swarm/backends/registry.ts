@@ -364,17 +364,17 @@ export function isInProcessEnabled(): boolean {
       )
       return true
     }
-    if (inProcessFallbackActive) {
-      logForDebugging(
-        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, fallback after pane backend unavailable)',
-      )
-      return true
-    }
     if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
       logForDebugging(
         '[BackendRegistry] isInProcessEnabled: false (forced process teammates for non-interactive session)',
       )
       return false
+    }
+    if (inProcessFallbackActive) {
+      logForDebugging(
+        '[BackendRegistry] isInProcessEnabled: true (non-interactive session, fallback after pane backend unavailable)',
+      )
+      return true
     }
     logForDebugging(
       '[BackendRegistry] isInProcessEnabled: true (non-interactive session)',
@@ -387,6 +387,11 @@ export function isInProcessEnabled(): boolean {
     enabled = true
   } else if (mode === 'tmux') {
     enabled = false
+  } else if (isEnvTruthy(process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES)) {
+    logForDebugging(
+      '[BackendRegistry] isInProcessEnabled: false (forced process teammates in auto mode)',
+    )
+    return false
   } else {
     // 'auto' mode - if a prior spawn fell back to in-process because no pane
     // backend was available, stay in-process (scoped to auto mode only so a

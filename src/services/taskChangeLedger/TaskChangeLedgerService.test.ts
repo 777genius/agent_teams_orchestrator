@@ -5,7 +5,15 @@ import { access, mkdtemp, readFile, rm, writeFile, mkdir, unlink } from 'fs/prom
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 
-import { setCwdState, setOriginalCwd, switchSession } from '../../bootstrap/state.js'
+import {
+  getCwdState,
+  getOriginalCwd,
+  getSessionId,
+  getSessionProjectDir,
+  setCwdState,
+  setOriginalCwd,
+  switchSession,
+} from '../../bootstrap/state.js'
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
 import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
 import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
@@ -37,6 +45,10 @@ let previousWorktreePath: string | undefined
 let previousWorktreeBranch: string | undefined
 let previousBaseWorkspaceRoot: string | undefined
 let previousWorktreeDirtyWarning: string | undefined
+let previousOriginalCwd = ''
+let previousCwd = ''
+let previousSessionId = ''
+let previousSessionProjectDir: string | null = null
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 setDefaultTimeout(20_000)
 
@@ -235,6 +247,10 @@ function sha256(content: string | Buffer): string {
 beforeEach(async () => {
   getRuntimeBoardTaskExecutionStore().clearForTests()
   clearDeferredTaskChangeShellSnapshotsForTests()
+  previousOriginalCwd = getOriginalCwd()
+  previousCwd = getCwdState()
+  previousSessionId = getSessionId()
+  previousSessionProjectDir = getSessionProjectDir()
   previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
   previousLedgerProjectDir = process.env[TASK_CHANGE_LEDGER_PROJECT_DIR_ENV]
   previousWorktreePath = process.env[TASK_CHANGE_WORKTREE_PATH_ENV]
@@ -287,6 +303,9 @@ afterEach(async () => {
   } else {
     process.env[TASK_CHANGE_WORKTREE_DIRTY_WARNING_ENV] = previousWorktreeDirtyWarning
   }
+  setOriginalCwd(previousOriginalCwd)
+  setCwdState(previousCwd)
+  switchSession(previousSessionId as never, previousSessionProjectDir)
 })
 
 describe('TaskChangeLedgerService integration', () => {

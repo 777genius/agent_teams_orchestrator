@@ -5,7 +5,10 @@
  * Used by the Teams UI in the footer to show team status.
  */
 
-import { isPaneBackend, type PaneBackendType } from './swarm/backends/types.js'
+import {
+  isPaneBackend,
+  type BackendType,
+} from './swarm/backends/types.js'
 import { readTeamFile } from './swarm/teamHelpers.js'
 
 export type TeamSummary = {
@@ -28,7 +31,7 @@ export type TeammateStatus = {
   cwd: string
   worktreePath?: string
   isHidden?: boolean // Whether the pane is currently hidden from the swarm view
-  backendType?: PaneBackendType // The backend type used for this teammate
+  backendType?: BackendType // The backend type used for this teammate
   mode?: string // Current permission mode for this teammate
 }
 
@@ -54,6 +57,17 @@ export function getTeammateStatuses(teamName: string): TeammateStatus[] {
     // Read isActive from config, defaulting to true (active) if undefined
     const isActive = member.isActive !== false
     const status: 'running' | 'idle' = isActive ? 'running' : 'idle'
+    const paneId = member.tmuxPaneId?.trim() ?? ''
+    const backendType: BackendType | undefined = paneId.startsWith('process:')
+      ? 'process'
+      : member.backendType &&
+          (isPaneBackend(member.backendType) ||
+            member.backendType === 'process' ||
+            member.backendType === 'in-process')
+        ? member.backendType
+        : typeof member.runtimePid === 'number' && member.runtimePid > 0
+          ? 'process'
+        : undefined
 
     statuses.push({
       name: member.name,
@@ -67,10 +81,7 @@ export function getTeammateStatuses(teamName: string): TeammateStatus[] {
       cwd: member.cwd,
       worktreePath: member.worktreePath,
       isHidden: hiddenPaneIds.has(member.tmuxPaneId),
-      backendType:
-        member.backendType && isPaneBackend(member.backendType)
-          ? member.backendType
-          : undefined,
+      backendType,
       mode: member.mode,
     })
   }
