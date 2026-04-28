@@ -1829,6 +1829,50 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(result.diagnostics).toContain(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: missing part.data`)
   })
 
+  test('returns skipped-capability when every OpenCode file toolpart has unsupported shape', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => ({
+          ...offlineFixture(),
+          rawParts: [
+            partRow('tool-part-bad-write', 'assistant-1', {
+              type: 'tool',
+              tool: 'write',
+              state: {
+                status: 'completed',
+                input: {
+                  content: 'missing path',
+                },
+              },
+            }),
+          ],
+          diagnostics: [
+            'OpenCode SQLite write toolpart tool-part-bad-write has unsupported state/input/filePath shape; it will be skipped.',
+          ],
+        }),
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+    })
+
+    expect(result.outcome).toBe('skipped-capability')
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode SQLite write toolpart tool-part-bad-write has unsupported state/input/filePath shape; it will be skipped.',
+    )
+    expect(result.diagnostics).toContain(
+      'OpenCode write toolpart tool-part-bad-write missing state/input/filePath.',
+    )
+  })
+
   test('treats partial SQLite history caps as retryable without importing unproven files', async () => {
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },

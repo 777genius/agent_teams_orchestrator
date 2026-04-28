@@ -670,8 +670,7 @@ export class OpenCodeOfflineSessionReader {
       }
       const state = asRecord(parsed.state)
       if (!state) {
-        diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state.`)
-        supported = false
+        diagnostics.push(`OpenCode SQLite ${tool} toolpart ${row.id} has unsupported state shape; it will be skipped.`)
         continue
       }
       const status = asString(state.status)?.toLowerCase()
@@ -687,13 +686,11 @@ export class OpenCodeOfflineSessionReader {
       }
       const input = asRecord(state?.input)
       if (!input) {
-        diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state/input.`)
-        supported = false
+        diagnostics.push(`OpenCode SQLite ${tool} toolpart ${row.id} has unsupported state/input shape; it will be skipped.`)
         continue
       }
       if (!asString(input.filePath)) {
-        diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state/input/filePath.`)
-        supported = false
+        diagnostics.push(`OpenCode SQLite ${tool} toolpart ${row.id} has unsupported state/input/filePath shape; it will be skipped.`)
       }
     }
     return supported

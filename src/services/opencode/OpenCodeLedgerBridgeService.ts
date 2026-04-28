@@ -796,6 +796,9 @@ export class OpenCodeLedgerBridgeService {
     if (result.candidateEvents === 0 && this.hasRetryableOpenCodeReadDiagnostic(result.diagnostics)) {
       return 'transient-error'
     }
+    if (result.candidateEvents === 0 && this.hasUnsupportedOpenCodeToolpartShapeDiagnostic(result.diagnostics)) {
+      return 'skipped-capability'
+    }
     if (result.candidateEvents > 0 && result.skippedEvents > 0) {
       return 'duplicates-only'
     }
@@ -815,6 +818,13 @@ export class OpenCodeLedgerBridgeService {
       diagnostic.includes('OpenCode SQLite part cap exceeded') ||
       diagnostic.includes('sqlite-busy:') ||
       /database is (?:locked|busy)/i.test(diagnostic)
+    )
+  }
+
+  private hasUnsupportedOpenCodeToolpartShapeDiagnostic(diagnostics: string[]): boolean {
+    return diagnostics.some(diagnostic =>
+      /OpenCode SQLite (?:write|edit|apply_patch) toolpart .+ has unsupported .*shape; it will be skipped\./.test(diagnostic) ||
+      /OpenCode (?:write|edit|apply_patch) toolpart .+ missing state(?:\/input(?:\/filePath|\/patch)?)?\./.test(diagnostic)
     )
   }
 

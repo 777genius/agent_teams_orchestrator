@@ -240,6 +240,56 @@ describe('OpenCodeOfflineSessionReader schema drift sentinel', () => {
     expect(result?.diagnostics.join('\n')).not.toContain('missing state/input/filePath')
   })
 
+  test('does not reject a session because one completed write toolpart has unsupported input shape', async () => {
+    const db = new Database(dbPath)
+    try {
+      createSchema(db)
+      insertMessage(db, 'message-1', JSON.stringify({ id: 'message-1' }))
+      insertPart(
+        db,
+        'part-valid-write',
+        'message-1',
+        JSON.stringify({
+          type: 'tool',
+          tool: 'write',
+          state: {
+            status: 'completed',
+            input: {
+              filePath: '/repo/src/index.ts',
+              content: 'export const ok = true\n',
+            },
+          },
+        }),
+      )
+      insertPart(
+        db,
+        'part-malformed-write',
+        'message-1',
+        JSON.stringify({
+          type: 'tool',
+          tool: 'write',
+          state: {
+            status: 'completed',
+            input: {
+              content: 'missing path',
+            },
+          },
+        }),
+      )
+    } finally {
+      db.close()
+    }
+
+    const result = await readFixture()
+
+    expect(result?.historyShape).toBe('supported')
+    expect(result?.rawParts.map(part => part.id).sort()).toEqual(['part-malformed-write', 'part-valid-write'])
+    expect(result?.diagnostics.join('\n')).toContain(
+      'OpenCode SQLite write toolpart part-malformed-write has unsupported state/input/filePath shape; it will be skipped.',
+    )
+    expect(result?.diagnostics.join('\n')).not.toContain(OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE)
+  })
+
   test('does not reject a session because a completed apply_patch toolpart has an unknown input shape', async () => {
     const db = new Database(dbPath)
     try {
