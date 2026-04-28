@@ -14,18 +14,73 @@ export function eagerParseCliFlag(
   flagName: string,
   argv: string[] = process.argv,
 ): string | undefined {
+  return eagerParseCliFlags(flagName, argv)[0]
+}
+
+export function eagerParseCliFlags(
+  flagName: string,
+  argv: string[] = process.argv,
+): string[] {
+  const values: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     // Handle --flag=value syntax
     if (arg?.startsWith(`${flagName}=`)) {
-      return arg.slice(flagName.length + 1)
+      values.push(arg.slice(flagName.length + 1))
+      continue
     }
     // Handle --flag value syntax
     if (arg === flagName && i + 1 < argv.length) {
-      return argv[i + 1]
+      values.push(argv[i + 1]!)
+      i += 1
     }
   }
-  return undefined
+  return values
+}
+
+type JsonObject = Record<string, unknown>
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseJsonObject(value: string): JsonObject | null {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return isJsonObject(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function deepMergeJsonObjects(target: JsonObject, source: JsonObject): JsonObject {
+  const merged: JsonObject = { ...target }
+  for (const [key, value] of Object.entries(source)) {
+    const current = merged[key]
+    if (isJsonObject(current) && isJsonObject(value)) {
+      merged[key] = deepMergeJsonObjects(current, value)
+      continue
+    }
+    merged[key] = value
+  }
+  return merged
+}
+
+export function mergeJsonObjectCliFlagValues(values: string[]): string | undefined {
+  if (values.length === 0) {
+    return undefined
+  }
+
+  let merged: JsonObject = {}
+  for (const value of values) {
+    const parsed = parseJsonObject(value)
+    if (!parsed) {
+      return values[0]
+    }
+    merged = deepMergeJsonObjects(merged, parsed)
+  }
+
+  return JSON.stringify(merged)
 }
 
 /**

@@ -151,7 +151,11 @@ import { getRelevantTips } from 'src/services/tips/tipRegistry.js';
 import { logContextMetrics } from 'src/utils/api.js';
 import { CLAUDE_IN_CHROME_MCP_SERVER_NAME, isClaudeInChromeMCPServer } from 'src/utils/claudeInChrome/common.js';
 import { registerCleanup } from 'src/utils/cleanupRegistry.js';
-import { eagerParseCliFlag } from 'src/utils/cliArgs.js';
+import {
+  eagerParseCliFlag,
+  eagerParseCliFlags,
+  mergeJsonObjectCliFlagValues,
+} from 'src/utils/cliArgs.js';
 import { createEmptyAttributionState } from 'src/utils/commitAttribution.js';
 import { countConcurrentSessions, registerSession, updateSessionName } from 'src/utils/concurrentSessions.js';
 import { getCwd } from 'src/utils/cwd.js';
@@ -512,7 +516,7 @@ function loadSettingSourcesFromFlag(settingSourcesArg: string): void {
 function eagerLoadSettings(): void {
   profileCheckpoint('eagerLoadSettings_start');
   // Parse --settings flag early to ensure settings are loaded before init()
-  const settingsFile = eagerParseCliFlag('--settings');
+  const settingsFile = mergeJsonObjectCliFlagValues(eagerParseCliFlags('--settings'));
   if (settingsFile) {
     loadSettingsFromFlag(settingsFile);
   }
