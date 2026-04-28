@@ -1242,6 +1242,58 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
+  test('strict delivery backfill ignores assistant comment text without toolparts', async () => {
+    const commentOnlyFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'assistant-text-1',
+          'assistant-1',
+          {
+            type: 'text',
+            text: 'Done, I changed src/opencode.ts and updated the implementation.',
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => commentOnlyFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.scannedSessions).toBe(1)
+    expect(result.scannedToolparts).toBe(2)
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const eventFileExists = await readFile(eventFile, 'utf8').then(
+      () => true,
+      () => false,
+    )
+    expect(eventFileExists).toBe(false)
+  })
+
   test('strict delivery backfill rejects delivery records that only match display id', async () => {
     let readCount = 0
     const service = new OpenCodeLedgerBridgeService(
@@ -1263,6 +1315,42 @@ describe('OpenCodeLedgerBridgeService', () => {
       workspaceRoot,
       deliveryContextPath: await writeDeliveryContext({
         taskRefs: [{ taskId: 'old-task', displayId: 'abc12345', teamName: 'team-a' }],
+      }),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no usable delivery records for this task.',
+    )
+  })
+
+  test('strict delivery backfill rejects records that include related task refs', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext({
+        taskRefs: [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+          { taskId: 'related-task', displayId: 'def67890', teamName: 'team-a' },
+        ],
       }),
       attributionMode: 'strict-delivery',
     })
