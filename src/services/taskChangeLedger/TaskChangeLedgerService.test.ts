@@ -402,6 +402,53 @@ describe('TaskChangeLedgerService integration', () => {
     expect(bundle.totalLinesRemoved).toBe(1)
   })
 
+  test('upgrades partial OpenCode snapshot evidence when full before and after text arrives', async () => {
+    const taskId = 'task-opencode-partial-snapshot-upgrade'
+    const partial = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: null,
+        afterContent: 'export const value = 2;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 2;\n'), sizeBytes: 24 },
+        confidence: 'medium',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-partial',
+        snapshotSource: 'opencode',
+      }),
+    ])
+    expect(partial.importedEventCount).toBe(1)
+
+    const full = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 2;\n'), sizeBytes: 24 },
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-full',
+        snapshotSource: 'opencode',
+      }),
+    ])
+
+    expect(full.importedEventCount).toBe(1)
+    expect(full.skippedDuplicateCount).toBe(0)
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(2)
+    expect(events[1]?.supersedesEventId).toBe(events[0]?.eventId)
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(bundle.projectedEventCount).toBe(1)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({
+      relativePath: 'src/opencode.ts',
+      reviewability: 'full-text',
+      journalEventCount: 2,
+      eventCount: 1,
+    })
+  })
+
   test('does not append weaker or operation-mismatched OpenCode evidence after an upgrade', async () => {
     const taskId = 'task-opencode-upgrade-guard'
     const strong = openCodeChange({

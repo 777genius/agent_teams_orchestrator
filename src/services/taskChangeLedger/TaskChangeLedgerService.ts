@@ -1492,12 +1492,18 @@ function buildSummaryGroupKey(event: TaskChangeEventV1): string {
     : `path:${normalizeLedgerPathForKey(event.filePath)}`
 }
 
+function hasFullTextEvidence(event: Pick<TaskChangeEventV1, 'before' | 'after' | 'operation'>): boolean {
+  if (event.operation === 'create') {
+    return !!event.after
+  }
+  if (event.operation === 'delete') {
+    return !!event.before
+  }
+  return !!event.before && !!event.after
+}
+
 function evidenceRankForEvent(event: Pick<TaskChangeEventV1, 'evidenceProof' | 'before' | 'after' | 'operation' | 'beforeState' | 'afterState'>): number {
-  const hasFullText =
-    !!event.before ||
-    !!event.after ||
-    (event.operation === 'create' && event.afterState?.exists === true && !event.afterState.unavailableReason) ||
-    (event.operation === 'delete' && event.beforeState?.exists === true && !event.beforeState.unavailableReason)
+  const hasFullText = hasFullTextEvidence(event)
   switch (event.evidenceProof) {
     case 'opencode-snapshot':
       return hasFullText ? 50 : 35
