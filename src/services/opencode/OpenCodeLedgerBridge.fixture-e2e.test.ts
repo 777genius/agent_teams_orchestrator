@@ -692,6 +692,17 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(result.diagnostics.join('\n')).toContain(
       'snapshot-path-not-touched: 227/formatter-only.js was present in snapshot diff but not in toolpart touched paths.',
     )
+    const diagnosticsText = result.diagnostics.join('\n')
+    for (const sensitiveText of [
+      '<main>v1</main>',
+      '<main>tom</main>',
+      'export const snapshot = 1',
+      'export const snapshot = 2',
+      'snapshot = 1',
+      'snapshot = 2',
+    ]) {
+      expect(diagnosticsText).not.toContain(sensitiveText)
+    }
 
     const events = await readJsonlEvents(projectDir, 'task-1')
     expect(events.some(event => event.relativePath === '227/formatter-only.js')).toBe(false)
