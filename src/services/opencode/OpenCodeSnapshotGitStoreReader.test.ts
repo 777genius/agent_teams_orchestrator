@@ -148,6 +148,32 @@ describe('OpenCodeSnapshotGitStoreReader', () => {
     expect(result.diagnostics.join('\n')).toContain('snapshot-path-not-touched: other.txt')
   })
 
+  test('scopes snapshot diff to session directory and keeps outside touched paths metadata-only', async () => {
+    await mkdir(path.join(worktree, 'src'), { recursive: true })
+    await writeFile(path.join(worktree, 'src/file.txt'), 'src-before\n')
+    await writeFile(path.join(worktree, 'root.txt'), 'root-before\n')
+    const before = writeTree()
+    await writeFile(path.join(worktree, 'src/file.txt'), 'src-after\n')
+    await writeFile(path.join(worktree, 'root.txt'), 'root-after\n')
+    const after = writeTree()
+
+    const result = await reader().read(baseInput({
+      directory: path.join(worktree, 'src'),
+      fromSnapshot: before,
+      toSnapshot: after,
+      touchedRelativePaths: ['src/file.txt', 'root.txt'],
+    }))
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    expect(result.files.map(file => file.relativePath)).toEqual(['src/file.txt'])
+    expect(result.diagnostics.join('\n')).toContain(
+      'snapshot-touched-path-not-in-diff: root.txt was requested but absent from the scoped snapshot diff.',
+    )
+  })
+
   test('keeps binary and large file evidence metadata-only', async () => {
     await writeFile(path.join(worktree, 'binary.bin'), Buffer.from([0, 1, 2, 3]))
     await writeFile(path.join(worktree, 'large.txt'), 'small\n')

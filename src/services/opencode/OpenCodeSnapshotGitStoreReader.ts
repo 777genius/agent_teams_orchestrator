@@ -675,6 +675,9 @@ export class OpenCodeSnapshotGitStoreReader {
     }
 
     const rawEntries = parseOpenCodeSnapshotRawDiffZ(rawResult.stdout, diagnostics)
+    const rawMatchedPaths = new Set(
+      rawEntries.filter(entry => touchedPaths.has(entry.relativePath)).map(entry => entry.relativePath),
+    )
     const matchingEntries = rawEntries.filter(entry => touchedPaths.has(entry.relativePath))
     if (matchingEntries.length > input.limits.maxFiles) {
       diagnostics.push(`snapshot-file-cap: captured first ${input.limits.maxFiles} snapshot files; remaining files skipped.`)
@@ -683,6 +686,11 @@ export class OpenCodeSnapshotGitStoreReader {
     for (const entry of rawEntries) {
       if (!touchedPaths.has(entry.relativePath)) {
         diagnostics.push(`snapshot-path-not-touched: ${entry.relativePath} was present in snapshot diff but not in toolpart touched paths.`)
+      }
+    }
+    for (const touchedPath of touchedPaths) {
+      if (!rawMatchedPaths.has(touchedPath)) {
+        diagnostics.push(`snapshot-touched-path-not-in-diff: ${touchedPath} was requested but absent from the scoped snapshot diff.`)
       }
     }
 
