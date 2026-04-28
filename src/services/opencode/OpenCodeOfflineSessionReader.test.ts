@@ -363,6 +363,7 @@ describe('OpenCodeOfflineSessionReader schema drift sentinel', () => {
         timeCreated: 1000,
         hash: '1111111111111111111111111111111111111111',
         files: ['src/index.ts'],
+        relativeFiles: ['src/index.ts'],
       },
     ])
     expect(result?.snapshotWindows).toEqual([
@@ -378,6 +379,49 @@ describe('OpenCodeOfflineSessionReader schema drift sentinel', () => {
         finishPartOrder: 2,
       },
     ])
+  })
+
+  test('normalizes OpenCode patch files to safe project-relative paths', async () => {
+    const db = new Database(dbPath)
+    const outsidePath = path.join(path.dirname(tempDir), 'outside.ts')
+    try {
+      createSchema(db)
+      createIdentitySchema(db)
+      insertSessionIdentity(db)
+      insertMessage(db, 'assistant-1', JSON.stringify({ id: 'assistant-1', role: 'assistant' }))
+      insertPart(db, 'part-patch', 'assistant-1', JSON.stringify({
+        type: 'patch',
+        hash: '1111111111111111111111111111111111111111',
+        files: [
+          path.join(tempDir, 'src/index.ts').replace(/\\/g, '/'),
+          'src/relative.ts',
+          outsidePath.replace(/\\/g, '/'),
+        ],
+      }), 1000)
+    } finally {
+      db.close()
+    }
+
+    const result = await readFixture()
+
+    expect(result?.historyShape).toBe('supported')
+    expect(result?.patchParts).toEqual([
+      {
+        partId: 'part-patch',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        partOrder: 0,
+        timeCreated: 1000,
+        hash: '1111111111111111111111111111111111111111',
+        files: [
+          path.join(tempDir, 'src/index.ts').replace(/\\/g, '/'),
+          'src/relative.ts',
+          outsidePath.replace(/\\/g, '/'),
+        ],
+        relativeFiles: ['src/index.ts', 'src/relative.ts'],
+      },
+    ])
+    expect(result?.diagnostics.join('\n')).toContain('snapshot-patch-part-unsafe-path')
   })
 
   test('keeps malformed snapshot parts diagnostic-only without rejecting toolpart history', async () => {

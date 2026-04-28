@@ -6,6 +6,7 @@ import path from 'node:path'
 import {
   areSameOpenCodeWorkspace,
   isOpenCodeWorkspaceSameOrDescendant,
+  normalizeOpenCodeFilePath,
 } from './OpenCodeBridgePath.js'
 
 import type { OpenCodeMessage, OpenCodeSessionRecord } from './types.js'
@@ -62,6 +63,7 @@ export type OpenCodePatchPart = {
   timeCreated: number
   hash: string
   files: string[]
+  relativeFiles: string[]
 }
 
 export type OpenCodeSnapshotWindow = {
@@ -279,7 +281,11 @@ export class OpenCodeOfflineSessionReader {
         }
       }
 
-      const snapshotParts = this.extractSnapshotParts(parts, diagnostics)
+      const snapshotParts = this.extractSnapshotParts(
+        parts,
+        diagnostics,
+        sessionIdentity?.project?.worktree ?? null,
+      )
 
       const finalFingerprint = await readSqliteFingerprint(dbPath)
       if (
@@ -466,6 +472,7 @@ export class OpenCodeOfflineSessionReader {
   private extractSnapshotParts(
     parts: OpenCodeSqlitePartRow[],
     diagnostics: string[],
+    projectWorktree: string | null,
   ): { snapshotStepParts: OpenCodeSnapshotStepPart[]; patchParts: OpenCodePatchPart[] } {
     const snapshotStepParts: OpenCodeSnapshotStepPart[] = []
     const patchParts: OpenCodePatchPart[] = []
@@ -523,6 +530,12 @@ export class OpenCodeOfflineSessionReader {
           timeCreated: row.time_created,
           hash,
           files,
+          relativeFiles: this.normalizePatchFiles({
+            partId: row.id,
+            files,
+            projectWorktree,
+            diagnostics,
+          }),
         })
       }
     }
@@ -539,6 +552,35 @@ export class OpenCodeOfflineSessionReader {
     )
 
     return { snapshotStepParts, patchParts }
+  }
+
+  private normalizePatchFiles(input: {
+    partId: string
+    files: string[]
+    projectWorktree: string | null
+    diagnostics: string[]
+  }): string[] {
+    if (!input.projectWorktree) {
+      input.diagnostics.push(`snapshot-patch-part-paths-unavailable: OpenCode patch part ${input.partId} cannot normalize files without project worktree.`)
+      return []
+    }
+    const relativeFiles: string[] = []
+    const seen = new Set<string>()
+    for (const filePath of input.files) {
+      const normalized = normalizeOpenCodeFilePath({
+        projectPath: input.projectWorktree,
+        filePath,
+      })
+      if ('skipped' in normalized) {
+        input.diagnostics.push(`snapshot-patch-part-unsafe-path: OpenCode patch part ${input.partId} skipped ${filePath} - ${normalized.diagnostic}`)
+        continue
+      }
+      if (!seen.has(normalized.relativePath)) {
+        seen.add(normalized.relativePath)
+        relativeFiles.push(normalized.relativePath)
+      }
+    }
+    return relativeFiles
   }
 
   private buildSnapshotWindows(
