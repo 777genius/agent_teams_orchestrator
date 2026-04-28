@@ -160,6 +160,7 @@ async function writeDeliveryContext(overrides: Partial<{
   inboxMessageId: string | null
   deliveredUserMessageId: string | null
   snapshotBoundary: OpenCodeSnapshotBoundary | Record<string, unknown> | null
+  taskRefs: Array<{ taskId: string; displayId: string; teamName: string }>
 }> = {}): Promise<string> {
   const filePath = path.join(tempDir, 'delivery-context.json')
   const hasRuntimeSessionIdOverride = Object.prototype.hasOwnProperty.call(overrides, 'runtimeSessionId')
@@ -182,7 +183,7 @@ async function writeDeliveryContext(overrides: Partial<{
           ...(overrides.snapshotBoundary !== undefined
             ? { snapshotBoundary: overrides.snapshotBoundary }
             : {}),
-          taskRefs: [
+          taskRefs: overrides.taskRefs ?? [
             { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
           ],
         },
@@ -1239,6 +1240,39 @@ describe('OpenCodeLedgerBridgeService', () => {
       attributionMethod: 'delivery-ledger-taskrefs',
       sourcePartId: 'tool-part-1',
     })
+  })
+
+  test('strict delivery backfill rejects delivery records that only match display id', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext({
+        taskRefs: [{ taskId: 'old-task', displayId: 'abc12345', teamName: 'team-a' }],
+      }),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no usable delivery records for this task.',
+    )
   })
 
   test('strict delivery backfill imports with missing runtime session id when parent message id matches', async () => {
