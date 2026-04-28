@@ -10,10 +10,6 @@ export type OpenCodeEvidenceProof =
   | 'metadata-only-fallback'
 
 export type OpenCodeEvidencePipelineMode =
-  | 'off'
-  | 'metadata-only'
-  | 'chain-only'
-  | 'snapshot-probe'
   | 'snapshot-auto'
 
 export type OpenCodeSnapshotCaptureStatus =
@@ -109,13 +105,3 @@ export const DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE: OpenCodeEvidencePipelineMo
 
 export const OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC =
   'snapshot-provider-unavailable: OpenCode snapshot evidence provider is unavailable; using chain/metadata fallback.'
-
-export function normalizeOpenCodeEvidencePipelineMode(value: unknown): OpenCodeEvidencePipelineMode {
-  return value === 'off' ||
-    value === 'metadata-only' ||
-    value === 'chain-only' ||
-    value === 'snapshot-probe' ||
-    value === 'snapshot-auto'
-    ? value
-    : DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE
-}

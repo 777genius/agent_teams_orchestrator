@@ -77,7 +77,7 @@ type BackfillParams = {
   deliveryContextPath?: string
   deliveryContextHash?: string
   attributionMode?: OpenCodeLedgerAttributionMode
-  evidenceMode?: OpenCodeEvidencePipelineMode
+  evidenceMode?: unknown
   dryRun?: boolean
 }
 
@@ -713,7 +713,6 @@ export class OpenCodeLedgerBridgeService {
         changes: reconstructed.changes,
         workspaceRoot,
         sessionRecord: record,
-        evidenceMode: canTrySessionSnapshotEvidence ? evidenceMode : 'chain-only',
         offline,
         snapshotProvider: canTrySessionSnapshotEvidence ? this.snapshotEvidenceProvider : undefined,
         evidenceMetadata,

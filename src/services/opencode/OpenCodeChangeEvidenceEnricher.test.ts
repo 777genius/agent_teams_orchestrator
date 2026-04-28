@@ -132,17 +132,16 @@ function offlineFixture(overrides: Partial<OpenCodeOfflineSessionReadResult> = {
 }
 
 describe('OpenCodeChangeEvidenceEnricher', () => {
-  test('passes metadata-only changes through in chain-only mode', async () => {
+  test('keeps metadata-only fallback when snapshot evidence is unavailable', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
-      evidenceMode: 'chain-only',
       diagnostics,
     })
 
-    expect(diagnostics).toEqual([])
+    expect(diagnostics).toContain(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
     expect(result[0]).toMatchObject({
       beforeContent: null,
       afterContent: null,
@@ -172,7 +171,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
           operation: 'modify',
         }),
       ],
-      evidenceMode: 'chain-only',
       diagnostics,
     })
 
@@ -206,7 +204,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
           ],
         }),
       ],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider({
         relativePath: 'src/file.ts',
@@ -236,7 +233,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture({ snapshotWindows: [] }),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
@@ -254,7 +250,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       diagnostics,
     })
@@ -273,7 +268,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
@@ -306,7 +300,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [first, second],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 3;\n'),
       diagnostics,
@@ -348,7 +341,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [first, second],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 3;\n'),
       diagnostics,
@@ -370,7 +362,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('value = 2; value = 2;\n'),
       diagnostics,
@@ -401,7 +392,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
           ],
         }),
       ],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
@@ -428,7 +418,6 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
           newString: undefined,
         }),
       ],
-      evidenceMode: 'snapshot-auto',
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider({
         relativePath: 'src/file.ts',

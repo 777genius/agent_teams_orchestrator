@@ -4,7 +4,6 @@ import { normalizeOpenCodeFilePath } from './OpenCodeBridgePath.js'
 import {
   OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC,
   type OpenCodeEvidenceProof,
-  type OpenCodeEvidencePipelineMode,
   type OpenCodeSnapshotEvidenceProvider,
   type OpenCodeSnapshotEvidenceResult,
 } from './OpenCodeChangeEvidence.js'
@@ -17,7 +16,6 @@ type EnrichmentParams = {
   workspaceRoot: string
   sessionRecord: OpenCodeSessionRecord
   changes: ReconstructedOpenCodeToolChange[]
-  evidenceMode: OpenCodeEvidencePipelineMode
   offline?: OpenCodeOfflineSessionReadResult | null
   snapshotProvider?: OpenCodeSnapshotEvidenceProvider
   evidenceMetadata?: {
@@ -183,43 +181,38 @@ function snapshotFilesByRelativePath(result: OpenCodeSnapshotEvidenceResult | nu
 
 export class OpenCodeChangeEvidenceEnricher {
   async enrich(params: EnrichmentParams): Promise<ReconstructedOpenCodeToolChange[]> {
-    if (params.evidenceMode === 'off') {
-      return params.changes
+    const result = params.changes.map(change => applyProof(change, exactOrMetadataProof(change)))
+    if (result.length === 0) {
+      return result
     }
-
     let snapshotResult: OpenCodeSnapshotEvidenceResult | null = null
-    if (params.evidenceMode === 'snapshot-auto') {
-      if (!params.snapshotProvider) {
-        params.diagnostics.push(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
-      } else if (!params.offline || params.offline.snapshotWindows.length === 0) {
-        params.diagnostics.push('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
-      } else {
-        snapshotResult = await params.snapshotProvider.readSessionEvidence({
-          workspaceRoot: params.workspaceRoot,
-          sessionRecord: params.sessionRecord,
-          offline: params.offline,
-          changes: params.changes,
-          touchedRelativePaths: params.changes.map(change => change.relativePath),
-        }).catch(error => {
-          params.diagnostics.push(`OpenCode snapshot evidence read failed - ${error instanceof Error ? error.message : String(error)}`)
-          return null
-        })
-        if (snapshotResult && !snapshotResult.supported) {
-          params.diagnostics.push(...snapshotResult.diagnostics)
-        } else if (snapshotResult?.diagnostics?.length) {
-          params.diagnostics.push(...snapshotResult.diagnostics)
-        }
-        if (snapshotResult?.supported) {
-          params.evidenceMetadata ??= {}
-          params.evidenceMetadata.snapshotShapeFingerprint = snapshotResult.shapeFingerprint
-        }
+    if (!params.snapshotProvider) {
+      params.diagnostics.push(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
+    } else if (!params.offline || params.offline.snapshotWindows.length === 0) {
+      params.diagnostics.push('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
+    } else {
+      snapshotResult = await params.snapshotProvider.readSessionEvidence({
+        workspaceRoot: params.workspaceRoot,
+        sessionRecord: params.sessionRecord,
+        offline: params.offline,
+        changes: params.changes,
+        touchedRelativePaths: params.changes.map(change => change.relativePath),
+      }).catch(error => {
+        params.diagnostics.push(`OpenCode snapshot evidence read failed - ${error instanceof Error ? error.message : String(error)}`)
+        return null
+      })
+      if (snapshotResult && !snapshotResult.supported) {
+        params.diagnostics.push(...snapshotResult.diagnostics)
+      } else if (snapshotResult?.diagnostics?.length) {
+        params.diagnostics.push(...snapshotResult.diagnostics)
       }
-    } else if (params.evidenceMode === 'snapshot-probe') {
-      params.diagnostics.push('OpenCode snapshot evidence is probe-only; normal backfill uses chain/metadata fallback.')
+      if (snapshotResult?.supported) {
+        params.evidenceMetadata ??= {}
+        params.evidenceMetadata.snapshotShapeFingerprint = snapshotResult.shapeFingerprint
+      }
     }
 
     const snapshotAfterByPath = snapshotFilesByRelativePath(snapshotResult)
-    const result = params.changes.map(change => applyProof(change, exactOrMetadataProof(change)))
 
     if (snapshotAfterByPath.size === 0) {
       return result
