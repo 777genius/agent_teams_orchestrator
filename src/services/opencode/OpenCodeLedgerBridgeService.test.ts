@@ -1829,7 +1829,7 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(result.diagnostics).toContain(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: missing part.data`)
   })
 
-  test('treats partial SQLite history caps as diagnostic-only without importing unproven files', async () => {
+  test('treats partial SQLite history caps as retryable without importing unproven files', async () => {
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       {
@@ -1851,12 +1851,50 @@ describe('OpenCodeLedgerBridgeService', () => {
       ...(await writeDeliveryContext()),
     })
 
-    expect(result.outcome).toBe('no-attribution')
+    expect(result.outcome).toBe('transient-error')
+    expect(result.retryAfterReason).toBe('sqlite-history-cap-exceeded')
     expect(result.scannedSessions).toBe(1)
     expect(result.scannedToolparts).toBe(0)
     expect(result.candidateEvents).toBe(0)
     expect(result.importedEvents).toBe(0)
     expect(result.diagnostics).toContain('OpenCode SQLite part cap exceeded for session-1.')
+  })
+
+  test('treats SQLite WAL races and busy reads as retryable when no candidates were proven', async () => {
+    const runWithDiagnostic = async (diagnostic: string) => {
+      const service = new OpenCodeLedgerBridgeService(
+        { list: async () => [sessionRecord()] },
+        {
+          readSession: async () => ({
+            ...offlineFixture(),
+            rawMessages: [],
+            rawParts: [],
+            messages: [],
+            diagnostics: [diagnostic],
+          }),
+        },
+      )
+
+      return await service.backfill({
+        teamName: 'team-a',
+        taskId: 'task-1',
+        projectDir,
+        workspaceRoot,
+        ...(await writeDeliveryContext()),
+      })
+    }
+
+    const changed = await runWithDiagnostic(
+      'OpenCode SQLite file changed while snapshot was read; using transaction snapshot.',
+    )
+    expect(changed.outcome).toBe('transient-error')
+    expect(changed.retryAfterReason).toBe('sqlite-changed-during-read')
+    expect(changed.importedEvents).toBe(0)
+
+    const busy = await runWithDiagnostic('sqlite-busy: OpenCode SQLite read was busy; retry later.')
+    expect(busy.outcome).toBe('transient-error')
+    expect(busy.retryAfterReason).toBe('sqlite-busy')
+    expect(busy.importedEvents).toBe(0)
   })
 
   test('reports imported when at least one session imports even if another session is unsupported', async () => {

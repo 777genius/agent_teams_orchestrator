@@ -316,6 +316,9 @@ export class OpenCodeOfflineSessionReader {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      if (/sqlite_busy|database is (?:locked|busy)/i.test(message)) {
+        diagnostics.push('sqlite-busy: OpenCode SQLite read was busy; retry later.')
+      }
       diagnostics.push(
         error instanceof UnsupportedOpenCodeHistoryShapeError
           ? `${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: ${message}`

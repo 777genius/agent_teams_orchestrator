@@ -777,6 +777,9 @@ export class OpenCodeLedgerBridgeService {
     }
 
     result.outcome = this.resolveOutcome(result)
+    if (result.outcome === 'transient-error' && !result.retryAfterReason) {
+      result.retryAfterReason = this.resolveRetryAfterReason(result.diagnostics)
+    }
     return result
   }
 
@@ -790,6 +793,9 @@ export class OpenCodeLedgerBridgeService {
     if (result.outcome === 'unsafe-input' || result.outcome === 'skipped-capability' || result.outcome === 'transient-error') {
       return result.outcome
     }
+    if (result.candidateEvents === 0 && this.hasRetryableOpenCodeReadDiagnostic(result.diagnostics)) {
+      return 'transient-error'
+    }
     if (result.candidateEvents > 0 && result.skippedEvents > 0) {
       return 'duplicates-only'
     }
@@ -800,6 +806,29 @@ export class OpenCodeLedgerBridgeService {
       return 'no-attribution'
     }
     return result.outcome === 'unsafe-input' ? 'unsafe-input' : 'no-attribution'
+  }
+
+  private hasRetryableOpenCodeReadDiagnostic(diagnostics: string[]): boolean {
+    return diagnostics.some(diagnostic =>
+      diagnostic.includes('OpenCode SQLite file changed while snapshot was read') ||
+      diagnostic.includes('OpenCode SQLite message cap exceeded') ||
+      diagnostic.includes('OpenCode SQLite part cap exceeded') ||
+      diagnostic.includes('sqlite-busy:') ||
+      /database is (?:locked|busy)/i.test(diagnostic)
+    )
+  }
+
+  private resolveRetryAfterReason(diagnostics: string[]): string {
+    if (diagnostics.some(diagnostic => diagnostic.includes('sqlite-busy:') || /database is (?:locked|busy)/i.test(diagnostic))) {
+      return 'sqlite-busy'
+    }
+    if (diagnostics.some(diagnostic => diagnostic.includes('OpenCode SQLite file changed while snapshot was read'))) {
+      return 'sqlite-changed-during-read'
+    }
+    if (diagnostics.some(diagnostic => diagnostic.includes('OpenCode SQLite message cap exceeded') || diagnostic.includes('OpenCode SQLite part cap exceeded'))) {
+      return 'sqlite-history-cap-exceeded'
+    }
+    return 'opencode-read-transient'
   }
 
   private async resolveWorkspaceRoot(
