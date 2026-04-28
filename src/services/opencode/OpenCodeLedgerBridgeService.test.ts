@@ -128,6 +128,10 @@ function offlineFixture(): OpenCodeOfflineSessionReadResult {
     source: 'opencode-sqlite',
     dbPath: path.join(tempDir, 'state.db'),
     dbFingerprint: { dbMtimeMs: 1, dbSizeBytes: 1 },
+    sessionIdentity: null,
+    snapshotStepParts: [],
+    patchParts: [],
+    snapshotWindows: [],
     rawMessages: [
       messageRow('user-1', { id: 'user-1' }, 900),
       messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-1' }, 1000),

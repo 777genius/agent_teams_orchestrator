@@ -24,11 +24,62 @@ export type OpenCodeSqlitePartRow = {
   data: string
 }
 
+export type OpenCodeSqliteProjectIdentity = {
+  id: string
+  worktree: string | null
+  vcs: string | null
+}
+
+export type OpenCodeSqliteSessionIdentity = {
+  sessionId: string
+  projectId: string | null
+  directory: string | null
+  project: OpenCodeSqliteProjectIdentity | null
+  snapshotEvidenceSupported: boolean
+  unsupportedReasons: string[]
+}
+
+export type OpenCodeSnapshotStepPart = {
+  partId: string
+  messageId: string
+  sessionId: string
+  partOrder: number
+  timeCreated: number
+  kind: 'step-start' | 'step-finish'
+  snapshot: string
+}
+
+export type OpenCodePatchPart = {
+  partId: string
+  messageId: string
+  sessionId: string
+  partOrder: number
+  timeCreated: number
+  hash: string
+  files: string[]
+}
+
+export type OpenCodeSnapshotWindow = {
+  windowId: string
+  messageId: string
+  sessionId: string
+  fromSnapshot: string
+  toSnapshot: string
+  startPartId: string
+  finishPartId: string
+  startPartOrder: number
+  finishPartOrder: number
+}
+
 export type OpenCodeOfflineSessionReadResult = {
   source: 'opencode-sqlite'
   dbPath: string
   dbFingerprint: OpenCodeSqliteFingerprint
   historyShape?: 'supported' | 'unsupported'
+  sessionIdentity: OpenCodeSqliteSessionIdentity | null
+  snapshotStepParts: OpenCodeSnapshotStepPart[]
+  patchParts: OpenCodePatchPart[]
+  snapshotWindows: OpenCodeSnapshotWindow[]
   rawMessages: OpenCodeSqliteMessageRow[]
   rawParts: OpenCodeSqlitePartRow[]
   messages: OpenCodeMessage[]
@@ -57,6 +108,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function asStringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
@@ -101,6 +156,15 @@ async function readSqliteFingerprint(dbPath: string): Promise<OpenCodeSqliteFing
   }
 }
 
+function isSameOrDescendantPath(childPath: string, parentPath: string): boolean {
+  const rel = path.relative(parentPath, childPath)
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+function sameResolvedPath(left: string, right: string): boolean {
+  return path.resolve(left) === path.resolve(right)
+}
+
 export class OpenCodeOfflineSessionReader {
   resolveDbPath(profileRootKey: string): string | null {
     if (!isSafeProfileRootKey(profileRootKey)) {
@@ -141,6 +205,7 @@ export class OpenCodeOfflineSessionReader {
       this.assertSchema(db)
       db.exec('BEGIN')
       transactionOpen = true
+      const sessionIdentity = this.readSessionIdentity(db, record, diagnostics)
       const rawMessages = db.query(
         'select id, session_id, time_created, time_updated, length(cast(data as blob)) as dataLengthBytes, data from message where session_id = ? order by time_created asc, id asc limit ?',
       ).all(record.opencodeSessionId, MAX_OPENCODE_MESSAGES_PER_SESSION + 1) as OpenCodeSqliteMessageRow[]
@@ -157,6 +222,10 @@ export class OpenCodeOfflineSessionReader {
           dbPath,
           dbFingerprint: initialFingerprint,
           historyShape: 'supported',
+          sessionIdentity,
+          snapshotStepParts: [],
+          patchParts: [],
+          snapshotWindows: [],
           rawMessages: [],
           rawParts: [],
           messages: [],
@@ -170,6 +239,10 @@ export class OpenCodeOfflineSessionReader {
           dbPath,
           dbFingerprint: initialFingerprint,
           historyShape: 'supported',
+          sessionIdentity,
+          snapshotStepParts: [],
+          patchParts: [],
+          snapshotWindows: [],
           rawMessages: [],
           rawParts: [],
           messages: [],
@@ -199,12 +272,18 @@ export class OpenCodeOfflineSessionReader {
           dbPath,
           dbFingerprint: initialFingerprint,
           historyShape: 'unsupported',
+          sessionIdentity,
+          snapshotStepParts: [],
+          patchParts: [],
+          snapshotWindows: [],
           rawMessages: [],
           rawParts: [],
           messages: [],
           diagnostics,
         }
       }
+
+      const snapshotParts = this.extractSnapshotParts(parts, diagnostics)
 
       const finalFingerprint = await readSqliteFingerprint(dbPath)
       if (
@@ -224,6 +303,10 @@ export class OpenCodeOfflineSessionReader {
         dbPath,
         dbFingerprint: finalFingerprint ?? initialFingerprint,
         historyShape: 'supported',
+        sessionIdentity,
+        snapshotStepParts: snapshotParts.snapshotStepParts,
+        patchParts: snapshotParts.patchParts,
+        snapshotWindows: this.buildSnapshotWindows(snapshotParts.snapshotStepParts, diagnostics),
         rawMessages: messages,
         rawParts: parts,
         messages: this.normalizeMessages(messages, parts, diagnostics),
@@ -241,6 +324,10 @@ export class OpenCodeOfflineSessionReader {
         dbPath,
         dbFingerprint: initialFingerprint,
         historyShape: error instanceof UnsupportedOpenCodeHistoryShapeError ? 'unsupported' : 'supported',
+        sessionIdentity: null,
+        snapshotStepParts: [],
+        patchParts: [],
+        snapshotWindows: [],
         rawMessages: [],
         rawParts: [],
         messages: [],
@@ -275,6 +362,235 @@ export class OpenCodeOfflineSessionReader {
         throw new UnsupportedOpenCodeHistoryShapeError(`OpenCode SQLite part.${column} missing`)
       }
     }
+  }
+
+  private tableColumns(db: Database, tableName: 'message' | 'part' | 'session' | 'project'): Set<string> | null {
+    try {
+      const rows = db.query(`pragma table_info(${tableName})`).all() as Array<{ name: string }>
+      if (rows.length === 0) {
+        return null
+      }
+      return new Set(rows.map(row => row.name))
+    } catch {
+      return null
+    }
+  }
+
+  private hasColumns(columns: Set<string> | null, required: string[]): boolean {
+    return !!columns && required.every(column => columns.has(column))
+  }
+
+  private readSessionIdentity(
+    db: Database,
+    record: OpenCodeSessionRecord,
+    diagnostics: string[],
+  ): OpenCodeSqliteSessionIdentity | null {
+    const sessionColumns = this.tableColumns(db, 'session')
+    if (!this.hasColumns(sessionColumns, ['id', 'project_id', 'directory'])) {
+      diagnostics.push('snapshot-project-identity-missing: OpenCode SQLite session identity columns are unavailable.')
+      return null
+    }
+
+    try {
+      const session = db.query(
+        'select id, project_id, directory from session where id = ?',
+      ).get(record.opencodeSessionId) as { id: string; project_id: string | null; directory: string | null } | null
+      if (!session) {
+        diagnostics.push('snapshot-project-identity-missing: OpenCode SQLite session row is unavailable.')
+        return null
+      }
+
+      const unsupportedReasons: string[] = []
+      let project: OpenCodeSqliteProjectIdentity | null = null
+      if (!session.project_id) {
+        unsupportedReasons.push('snapshot-project-identity-missing')
+      } else {
+        const projectColumns = this.tableColumns(db, 'project')
+        if (!this.hasColumns(projectColumns, ['id', 'worktree', 'vcs'])) {
+          unsupportedReasons.push('snapshot-project-identity-missing')
+          diagnostics.push('snapshot-project-identity-missing: OpenCode SQLite project identity columns are unavailable.')
+        } else {
+          const projectRow = db.query(
+            'select id, worktree, vcs from project where id = ?',
+          ).get(session.project_id) as { id: string; worktree: string | null; vcs: string | null } | null
+          if (!projectRow) {
+            unsupportedReasons.push('snapshot-project-identity-missing')
+            diagnostics.push('snapshot-project-identity-missing: OpenCode SQLite project row is unavailable.')
+          } else {
+            project = {
+              id: projectRow.id,
+              worktree: projectRow.worktree,
+              vcs: projectRow.vcs,
+            }
+          }
+        }
+      }
+
+      if (project?.vcs !== 'git') {
+        unsupportedReasons.push('snapshot-project-not-git')
+      }
+      if (!project?.worktree) {
+        unsupportedReasons.push('snapshot-project-identity-missing')
+      }
+      if (!session.directory) {
+        unsupportedReasons.push('snapshot-project-identity-missing')
+      }
+      if (project?.worktree && session.directory && !isSameOrDescendantPath(
+        path.resolve(session.directory),
+        path.resolve(project.worktree),
+      )) {
+        unsupportedReasons.push('snapshot-session-directory-outside-worktree')
+      }
+      if (project?.worktree && !sameResolvedPath(record.projectPath, project.worktree)) {
+        unsupportedReasons.push('snapshot-project-worktree-mismatch')
+      }
+
+      const uniqueUnsupportedReasons = [...new Set(unsupportedReasons)]
+      for (const reason of uniqueUnsupportedReasons) {
+        diagnostics.push(`${reason}: OpenCode snapshot session identity is not usable for full-text evidence.`)
+      }
+
+      return {
+        sessionId: session.id,
+        projectId: session.project_id,
+        directory: session.directory,
+        project,
+        snapshotEvidenceSupported: uniqueUnsupportedReasons.length === 0,
+        unsupportedReasons: uniqueUnsupportedReasons,
+      }
+    } catch (error) {
+      diagnostics.push(`snapshot-project-identity-missing: OpenCode SQLite session identity read failed - ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
+  }
+
+  private extractSnapshotParts(
+    parts: OpenCodeSqlitePartRow[],
+    diagnostics: string[],
+  ): { snapshotStepParts: OpenCodeSnapshotStepPart[]; patchParts: OpenCodePatchPart[] } {
+    const snapshotStepParts: OpenCodeSnapshotStepPart[] = []
+    const patchParts: OpenCodePatchPart[] = []
+    const orderedByMessage = new Map<string, OpenCodeSqlitePartRow[]>()
+    for (const row of parts) {
+      const bucket = orderedByMessage.get(row.message_id) ?? []
+      bucket.push(row)
+      orderedByMessage.set(row.message_id, bucket)
+    }
+
+    const partOrderById = new Map<string, number>()
+    for (const rows of orderedByMessage.values()) {
+      rows.sort((left, right) => left.id.localeCompare(right.id))
+      rows.forEach((row, index) => partOrderById.set(row.id, index))
+    }
+
+    for (const row of parts) {
+      const parsed = safeParseJsonRecord(row.data)
+      if (!parsed) {
+        continue
+      }
+      const partOrder = partOrderById.get(row.id) ?? 0
+      if (parsed.type === 'step-start' || parsed.type === 'step-finish') {
+        const snapshot = asStringOrNull(parsed.snapshot)
+        if (!snapshot) {
+          diagnostics.push(`snapshot-window-missing: OpenCode ${parsed.type} part ${row.id} missing snapshot hash.`)
+          continue
+        }
+        snapshotStepParts.push({
+          partId: row.id,
+          messageId: row.message_id,
+          sessionId: row.session_id,
+          partOrder,
+          timeCreated: row.time_created,
+          kind: parsed.type,
+          snapshot,
+        })
+        continue
+      }
+
+      if (parsed.type === 'patch') {
+        const hash = asStringOrNull(parsed.hash)
+        const files = Array.isArray(parsed.files)
+          ? parsed.files.filter((file): file is string => typeof file === 'string' && file.length > 0)
+          : []
+        if (!hash || !Array.isArray(parsed.files)) {
+          diagnostics.push(`snapshot-patch-part-malformed: OpenCode patch part ${row.id} has unsupported shape.`)
+          continue
+        }
+        patchParts.push({
+          partId: row.id,
+          messageId: row.message_id,
+          sessionId: row.session_id,
+          partOrder,
+          timeCreated: row.time_created,
+          hash,
+          files,
+        })
+      }
+    }
+
+    snapshotStepParts.sort((left, right) =>
+      left.messageId.localeCompare(right.messageId) ||
+      left.partOrder - right.partOrder ||
+      left.partId.localeCompare(right.partId)
+    )
+    patchParts.sort((left, right) =>
+      left.messageId.localeCompare(right.messageId) ||
+      left.partOrder - right.partOrder ||
+      left.partId.localeCompare(right.partId)
+    )
+
+    return { snapshotStepParts, patchParts }
+  }
+
+  private buildSnapshotWindows(
+    snapshotStepParts: OpenCodeSnapshotStepPart[],
+    diagnostics: string[],
+  ): OpenCodeSnapshotWindow[] {
+    const windows: OpenCodeSnapshotWindow[] = []
+    const byMessage = new Map<string, OpenCodeSnapshotStepPart[]>()
+    for (const part of snapshotStepParts) {
+      const bucket = byMessage.get(part.messageId) ?? []
+      bucket.push(part)
+      byMessage.set(part.messageId, bucket)
+    }
+
+    for (const [messageId, parts] of byMessage.entries()) {
+      parts.sort((left, right) =>
+        left.partOrder - right.partOrder ||
+        left.partId.localeCompare(right.partId)
+      )
+      let openStart: OpenCodeSnapshotStepPart | null = null
+      for (const part of parts) {
+        if (part.kind === 'step-start') {
+          if (openStart) {
+            diagnostics.push(`snapshot-window-ambiguous: OpenCode step-start part ${openStart.partId} was not closed before ${part.partId}.`)
+          }
+          openStart = part
+          continue
+        }
+        if (!openStart) {
+          diagnostics.push(`snapshot-window-missing: OpenCode step-finish part ${part.partId} has no preceding step-start in message ${messageId}.`)
+          continue
+        }
+        windows.push({
+          windowId: `${messageId}:${openStart.partId}->${part.partId}`,
+          messageId,
+          sessionId: part.sessionId,
+          fromSnapshot: openStart.snapshot,
+          toSnapshot: part.snapshot,
+          startPartId: openStart.partId,
+          finishPartId: part.partId,
+          startPartOrder: openStart.partOrder,
+          finishPartOrder: part.partOrder,
+        })
+        openStart = null
+      }
+      if (openStart) {
+        diagnostics.push(`snapshot-window-missing: OpenCode step-start part ${openStart.partId} has no following step-finish in message ${messageId}.`)
+      }
+    }
+
+    return windows
   }
 
   private validateHistoryShape(

@@ -1196,6 +1196,10 @@ describe('OpenCodeSessionBridge', () => {
           source: 'opencode-sqlite',
           dbPath: '/tmp/state.db',
           dbFingerprint: { dbMtimeMs: 1, dbSizeBytes: 1 },
+          sessionIdentity: null,
+          snapshotStepParts: [],
+          patchParts: [],
+          snapshotWindows: [],
           rawMessages: [],
           rawParts: [],
           messages: [
