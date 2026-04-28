@@ -19,7 +19,7 @@ branch: feat/opencode-hybrid-evidence-ui-continuation
 Verified completion snapshot:
 
 ```text
-orchestrator targeted suite: 161 pass, 0 fail
+orchestrator targeted suite: 162 pass, 0 fail
 orchestrator build: bun run build:dev passed
 OpenCode live snapshot evidence E2E: 1 pass, 0 fail
 OpenCode live ledger bridge E2E: 1 pass, 0 fail
@@ -36,6 +36,7 @@ This prevents UI auto-backfill from caching a temporarily incomplete OpenCode hi
 Malformed completed OpenCode write/edit toolparts are now row-level diagnostic skips, so one bad toolpart no longer drops otherwise valid session history.
 If every file toolpart candidate has unsupported shape, backfill resolves to skipped-capability instead of a clean no-attribution result.
 OpenCode same-message toolpart chains now use message-local part id order before timestamps, matching the snapshot window ordering contract and preventing timestamp skew from breaking write -> edit reconstruction.
+OpenCode evidence upgrades now fail closed when the existing source import identity and incoming event disagree on relative path, session id, part id, or message id.
 ```
 
 ## Executive Summary
