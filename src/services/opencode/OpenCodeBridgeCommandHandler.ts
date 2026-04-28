@@ -1976,7 +1976,6 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runTranscript(envelope)
     case 'opencode.backfillTaskLedger': {
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
-      const evidenceMode = asString(envelope.body.evidenceMode)
       const result = await openCodeLedgerBridgeService.backfill({
         teamId: asString(envelope.body.teamId) ?? undefined,
         teamName: asString(envelope.body.teamName) ?? asString(envelope.body.teamId) ?? '',
@@ -1988,13 +1987,6 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
         workspaceRoot: asString(envelope.body.workspaceRoot) ?? undefined,
         deliveryContextPath: asString(envelope.body.deliveryContextPath) ?? undefined,
         attributionMode: asString(envelope.body.attributionMode) === 'strict-delivery' ? 'strict-delivery' : 'compatible',
-        evidenceMode: evidenceMode === 'off' ||
-          evidenceMode === 'metadata-only' ||
-          evidenceMode === 'chain-only' ||
-          evidenceMode === 'snapshot-probe' ||
-          evidenceMode === 'snapshot-auto'
-          ? evidenceMode
-          : undefined,
         dryRun: envelope.body.dryRun === true,
       })
       return { snapshot, data: result }
