@@ -462,7 +462,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(events.find(event => event.sourcePartId === 'amb-write')).toBeUndefined()
     expect(events.find(event => event.sourcePartId === 'tom-write-index-existing')).toMatchObject({
       operation: 'modify',
-      confidence: 'high',
+      confidence: 'medium',
       beforeState: {
         exists: true,
         unavailableReason: 'opencode-before-content-unavailable',

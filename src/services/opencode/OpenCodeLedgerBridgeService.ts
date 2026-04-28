@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -65,6 +65,7 @@ type BackfillParams = {
 type SessionStorePort = Pick<typeof openCodeSessionStore, 'list'>
 
 const MAX_SCANNED_RECORDS = 50
+const MAX_METADATA_TEXT_BLOB_BYTES = 1024 * 1024
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -137,7 +138,11 @@ function toLedgerChange(change: ReconstructedOpenCodeToolChange): ImportedOpenCo
     filePath: change.filePath,
     beforeContent: change.beforeContent,
     afterContent: change.afterContent,
-    source: change.sourceTool === 'write' ? 'opencode_toolpart_write' : 'opencode_toolpart_edit',
+    source: change.sourceTool === 'write'
+      ? 'opencode_toolpart_write'
+      : change.sourceTool === 'edit'
+        ? 'opencode_toolpart_edit'
+        : 'opencode_toolpart_apply_patch',
     confidence: change.confidence,
     operation: change.operation,
     beforeState: change.beforeState,
@@ -155,6 +160,131 @@ function toLedgerChange(change: ReconstructedOpenCodeToolChange): ImportedOpenCo
     parentUserMessageId: change.parentUserMessageId,
     attributionMethod: change.attributionMethod,
   }
+}
+
+function sha256Buffer(content: Buffer): string {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+function looksBinary(content: Buffer): boolean {
+  return content.includes(0)
+}
+
+function isValidUtf8RoundTrip(content: Buffer, text: string): boolean {
+  return Buffer.compare(Buffer.from(text, 'utf8'), content) === 0
+}
+
+async function readMetadataOnlyDiskState(filePath: string): Promise<{
+  afterState: NonNullable<ImportedOpenCodeFileChange['afterState']>
+  warning?: string
+}> {
+  try {
+    const fileStat = await stat(filePath)
+    if (!fileStat.isFile()) {
+      return {
+        afterState: {
+          exists: true,
+          unavailableReason: 'opencode-after-path-not-regular-file',
+        },
+        warning: 'OpenCode metadata-only capture found a non-file path on disk; review is manual-only.',
+      }
+    }
+    if (fileStat.size > MAX_METADATA_TEXT_BLOB_BYTES) {
+      return {
+        afterState: {
+          exists: true,
+          sizeBytes: fileStat.size,
+          unavailableReason: 'opencode-after-content-too-large',
+        },
+        warning: 'OpenCode metadata-only capture skipped large final content; review is manual-only.',
+      }
+    }
+    const content = await readFile(filePath)
+    const sha256 = sha256Buffer(content)
+    if (looksBinary(content)) {
+      return {
+        afterState: {
+          exists: true,
+          sha256,
+          sizeBytes: content.byteLength,
+          unavailableReason: 'opencode-after-content-binary',
+        },
+        warning: 'OpenCode metadata-only capture found binary final content; review is manual-only.',
+      }
+    }
+    const text = content.toString('utf8')
+    if (!isValidUtf8RoundTrip(content, text)) {
+      return {
+        afterState: {
+          exists: true,
+          sha256,
+          sizeBytes: content.byteLength,
+          unavailableReason: 'opencode-after-content-non-utf8',
+        },
+        warning: 'OpenCode metadata-only capture found non-UTF-8 final content; review is manual-only.',
+      }
+    }
+    return {
+      afterState: {
+        exists: true,
+        sha256,
+        sizeBytes: content.byteLength,
+      },
+    }
+  } catch (error) {
+    const code = asRecord(error)?.code
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return {
+        afterState: { exists: false },
+      }
+    }
+    return {
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-after-content-read-error',
+      },
+      warning: `OpenCode metadata-only capture could not read final disk content - ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+}
+
+async function materializeMetadataOnlyChanges(
+  changes: ReconstructedOpenCodeToolChange[],
+  diagnostics: string[],
+): Promise<ReconstructedOpenCodeToolChange[]> {
+  const materialized: ReconstructedOpenCodeToolChange[] = []
+  for (const change of changes) {
+    const beforeUnavailable = change.beforeContent === null && !!change.beforeState?.unavailableReason
+    const afterUnavailable = change.afterContent === null && !!change.afterState?.unavailableReason
+    if (!beforeUnavailable || !afterUnavailable) {
+      materialized.push(change)
+      continue
+    }
+    const diskState = await readMetadataOnlyDiskState(change.filePath)
+    diagnostics.push(
+      `OpenCode metadata-only final disk state materialized for ${change.relativePath}.`,
+    )
+    const operation =
+      change.sourceTool === 'apply_patch' &&
+      change.operation === 'delete' &&
+      diskState.afterState.exists !== false
+        ? 'modify'
+        : change.operation
+    materialized.push({
+      ...change,
+      operation,
+      afterContent: null,
+      afterState: diskState.afterState,
+      warnings: [
+        ...(change.warnings ?? []),
+        ...(operation !== change.operation
+          ? ['OpenCode apply_patch requested a delete, but the final disk state still exists; ledger records this as manual-only modify evidence.']
+          : []),
+        ...(diskState.warning ? [diskState.warning] : []),
+      ],
+    })
+  }
+  return materialized
 }
 
 function dedupeRecords(records: OpenCodeSessionRecord[]): OpenCodeSessionRecord[] {
@@ -389,11 +519,15 @@ export class OpenCodeLedgerBridgeService {
       })
       result.diagnostics.push(...reconstructed.diagnostics)
       result.notices.push(...reconstructed.notices)
-      if (reconstructed.changes.length === 0) {
+      const materializedChanges = await materializeMetadataOnlyChanges(
+        reconstructed.changes,
+        result.diagnostics,
+      )
+      if (materializedChanges.length === 0) {
         continue
       }
 
-      for (const [taskId, changes] of groupByTask(reconstructed.changes)) {
+      for (const [taskId, changes] of groupByTask(materializedChanges)) {
         if (params.taskId && taskId !== params.taskId) {
           continue
         }

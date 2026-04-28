@@ -217,6 +217,11 @@ describe('OpenCodeLedgerBridgeService', () => {
   })
 
   test('imports edit-only OpenCode toolparts as manual-review metadata instead of dropping them', async () => {
+    await writeFile(
+      path.join(workspaceRoot, 'src/existing.ts'),
+      'export const value = 2;\n',
+      'utf8',
+    )
     const editFixture = {
       ...offlineFixture(),
       rawParts: [
@@ -272,8 +277,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       source: 'opencode_toolpart_edit',
       operation: 'modify',
-      confidence: 'high',
-      sourcePartId: 'tool-part-edit-only',
+      confidence: 'medium',
       oldString: 'value = 1',
       newString: 'value = 2',
       before: null,
@@ -284,7 +288,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       },
       afterState: {
         exists: true,
-        unavailableReason: 'opencode-edit-final-content-unavailable',
+        sizeBytes: 24,
       },
       relativePath: 'src/existing.ts',
     })
@@ -296,9 +300,252 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(bundle.totalFiles).toBe(1)
     expect(bundle.files[0]).toMatchObject({
       relativePath: 'src/existing.ts',
-      contentAvailability: 'metadata-only',
+      contentAvailability: 'hash-only',
       reviewability: 'metadata-only',
     })
+  })
+
+  test('imports OpenCode apply_patch toolparts as gitless metadata-only events', async () => {
+    await writeFile(
+      path.join(workspaceRoot, 'src/new.ts'),
+      'export const created = true;\n',
+      'utf8',
+    )
+    await writeFile(
+      path.join(workspaceRoot, 'src/existing.ts'),
+      'export const value = 2;\n',
+      'utf8',
+    )
+    const patchFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-apply-patch',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: 'call-apply-patch',
+            state: {
+              status: 'completed',
+              input: {
+                patch: [
+                  '*** Begin Patch',
+                  '*** Add File: src/new.ts',
+                  '+export const created = true;',
+                  '*** Update File: src/existing.ts',
+                  '@@',
+                  '-export const value = 1;',
+                  '+export const value = 2;',
+                  '*** Delete File: src/old.ts',
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => patchFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(3)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const events = (await readFile(eventFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, any>)
+    expect(events.map(event => [event.source, event.operation, event.relativePath])).toEqual([
+      ['opencode_toolpart_apply_patch', 'create', 'src/new.ts'],
+      ['opencode_toolpart_apply_patch', 'modify', 'src/existing.ts'],
+      ['opencode_toolpart_apply_patch', 'delete', 'src/old.ts'],
+    ])
+    expect(events[0]?.beforeState).toMatchObject({
+      exists: false,
+      unavailableReason: 'gitless-before-content-unavailable',
+    })
+    expect(events[0]?.afterState).toMatchObject({
+      exists: true,
+      sizeBytes: 29,
+    })
+    expect(events[2]?.afterState).toMatchObject({ exists: false })
+    expect(events[0]?.warnings).toContain(
+      'OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.',
+    )
+  })
+
+  test('materializes apply_patch binary and large final states as manual-only metadata', async () => {
+    await writeFile(path.join(workspaceRoot, 'src/blob.bin'), Buffer.from([0, 1, 2, 3]))
+    await writeFile(path.join(workspaceRoot, 'src/large.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8')
+    const patchFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-apply-patch-binary-large',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: 'call-apply-patch-binary-large',
+            state: {
+              status: 'completed',
+              input: {
+                patch: [
+                  '*** Begin Patch',
+                  '*** Update File: src/blob.bin',
+                  '*** Update File: src/large.txt',
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => patchFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const events = (await readFile(eventFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, any>)
+    const binaryEvent = events.find(event => event.relativePath === 'src/blob.bin')
+    const largeEvent = events.find(event => event.relativePath === 'src/large.txt')
+    expect(binaryEvent?.afterState).toMatchObject({
+      exists: true,
+      sizeBytes: 4,
+      unavailableReason: 'opencode-after-content-binary',
+    })
+    expect(typeof binaryEvent?.afterState?.sha256).toBe('string')
+    expect(binaryEvent?.warnings).toContain(
+      'OpenCode metadata-only capture found binary final content; review is manual-only.',
+    )
+    expect(largeEvent?.afterState).toMatchObject({
+      exists: true,
+      sizeBytes: 1024 * 1024 + 1,
+      unavailableReason: 'opencode-after-content-too-large',
+    })
+    expect(largeEvent?.warnings).toContain(
+      'OpenCode metadata-only capture skipped large final content; review is manual-only.',
+    )
+  })
+
+  test('downgrades apply_patch delete evidence when final disk state still exists', async () => {
+    await writeFile(
+      path.join(workspaceRoot, 'src/still-here.ts'),
+      'export const stillHere = true;\n',
+      'utf8',
+    )
+    const patchFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-delete',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: 'call-delete',
+            state: {
+              status: 'completed',
+              input: {
+                patch: [
+                  '*** Begin Patch',
+                  '*** Delete File: src/still-here.ts',
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => patchFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: await writeDeliveryContext(),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      operation: 'modify',
+      relativePath: 'src/still-here.ts',
+      afterState: {
+        exists: true,
+      },
+    })
+    expect(event.warnings).toContain(
+      'OpenCode apply_patch requested a delete, but the final disk state still exists; ledger records this as manual-only modify evidence.',
+    )
   })
 
   test('fails closed when a stored OpenCode session belongs to a different workspace root', async () => {

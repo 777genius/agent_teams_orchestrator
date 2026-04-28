@@ -832,6 +832,31 @@ describe('TaskChangeLedgerService integration', () => {
     expect(new Set(events.map(event => event.source))).toEqual(new Set(['shell_snapshot']))
   })
 
+  test('does not scan non-git bash workspaces without exact touched paths', async () => {
+    const initialGitRepo = repoDir
+    const nonGitDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-non-git-'))
+    await rm(initialGitRepo, { recursive: true, force: true })
+    setRepoContext(nonGitDir)
+
+    const agentId = 'alice@test'
+    openScope('task-non-git-bash', 'work', agentId)
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'mkdir -p src && cat > src/non-git.ts' },
+      toolUseId: 'tool-non-git-bash',
+      sessionId,
+      agentId,
+    })
+    expect(snapshot).toBeNull()
+
+    await writeRepoFile('src/non-git.ts', 'export const nonGit = true;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(await pathExists(bundlePath('task-non-git-bash'))).toBe(false)
+    expect(await pathExists(eventsPath('task-non-git-bash'))).toBe(false)
+  })
+
   test('does not persist shell snapshot when created file is removed before completion', async () => {
     const agentId = 'alice@test'
     openScope('task-shell-create-delete-net-zero', 'work', agentId)

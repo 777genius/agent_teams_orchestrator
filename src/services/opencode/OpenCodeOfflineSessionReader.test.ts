@@ -203,6 +203,59 @@ describe('OpenCodeOfflineSessionReader schema drift sentinel', () => {
     expect(result?.diagnostics.join('\n')).not.toContain('missing state/input/filePath')
   })
 
+  test('does not reject a session because a completed apply_patch toolpart has an unknown input shape', async () => {
+    const db = new Database(dbPath)
+    try {
+      createSchema(db)
+      insertMessage(db, 'message-1', JSON.stringify({ id: 'message-1' }))
+      insertPart(
+        db,
+        'part-valid-write',
+        'message-1',
+        JSON.stringify({
+          type: 'tool',
+          tool: 'write',
+          state: {
+            status: 'completed',
+            input: {
+              filePath: '/repo/src/index.ts',
+              content: 'export const ok = true\n',
+            },
+          },
+        }),
+      )
+      insertPart(
+        db,
+        'part-unknown-apply-patch',
+        'message-1',
+        JSON.stringify({
+          type: 'tool',
+          tool: 'apply_patch',
+          state: {
+            status: 'completed',
+            input: {
+              command: 'diff --git a/src/index.ts b/src/index.ts',
+            },
+          },
+        }),
+      )
+    } finally {
+      db.close()
+    }
+
+    const result = await readFixture()
+
+    expect(result?.historyShape).toBe('supported')
+    expect(result?.rawParts.map(part => part.id).sort()).toEqual([
+      'part-unknown-apply-patch',
+      'part-valid-write',
+    ])
+    expect(result?.diagnostics.join('\n')).toContain(
+      'OpenCode SQLite apply_patch toolpart part-unknown-apply-patch has unsupported state/input/patch shape; it will be skipped.',
+    )
+    expect(result?.diagnostics.join('\n')).not.toContain(OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE)
+  })
+
   test('caps oversized rows without treating the whole schema as unsupported', async () => {
     const db = new Database(dbPath)
     try {

@@ -97,7 +97,7 @@ function partRow(
 function toolPart(input: {
   id: string
   messageId?: string
-  tool: 'write' | 'edit'
+  tool: 'write' | 'edit' | 'apply_patch'
   status?: string
   filePath: string
   content?: string
@@ -125,6 +125,32 @@ function toolPart(input: {
         metadata: {
           exists: input.exists,
           truncated: input.truncated ?? false,
+        },
+        time: { end: input.time ?? 1000 },
+      },
+    },
+    input.time ?? 1000,
+  )
+}
+
+function applyPatchToolPart(input: {
+  id: string
+  messageId?: string
+  patch?: string
+  status?: string
+  time?: number
+}): OpenCodeSqlitePartRow {
+  return partRow(
+    input.id,
+    input.messageId ?? 'assistant-1',
+    {
+      type: 'tool',
+      tool: 'apply_patch',
+      callID: `call-${input.id}`,
+      state: {
+        status: input.status ?? 'completed',
+        input: {
+          ...(input.patch !== undefined ? { patch: input.patch } : {}),
         },
         time: { end: input.time ?? 1000 },
       },
@@ -262,7 +288,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes[0]).toMatchObject({
       sourceTool: 'edit',
       operation: 'modify',
-      confidence: 'high',
+      confidence: 'medium',
       beforeContent: null,
       afterContent: null,
       oldString: 'value = 1',
@@ -298,6 +324,155 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.diagnostics).toContain(
       'OpenCode edit toolpart part-edit-noop skipped because it contained no text delta.',
     )
+  })
+
+  test('captures apply_patch toolparts as metadata-only manual-review evidence', () => {
+    const result = reconstruct([
+      applyPatchToolPart({
+        id: 'part-apply-patch',
+        patch: [
+          '*** Begin Patch',
+          '*** Add File: src/new.ts',
+          '+export const created = true;',
+          '*** Add File: src/with space.ts',
+          '+export const spaced = true;',
+          '*** Update File: src/existing.ts',
+          '@@',
+          '-export const value = 1;',
+          '+export const value = 2;',
+          '*** Delete File: src/old.ts',
+          '*** End Patch',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes).toHaveLength(4)
+    expect(result.changes.map(change => ({
+      sourceTool: change.sourceTool,
+      operation: change.operation,
+      relativePath: change.relativePath,
+      confidence: change.confidence,
+    }))).toEqual([
+      {
+        sourceTool: 'apply_patch',
+        operation: 'create',
+        relativePath: 'src/new.ts',
+        confidence: 'medium',
+      },
+      {
+        sourceTool: 'apply_patch',
+        operation: 'create',
+        relativePath: 'src/with space.ts',
+        confidence: 'medium',
+      },
+      {
+        sourceTool: 'apply_patch',
+        operation: 'modify',
+        relativePath: 'src/existing.ts',
+        confidence: 'medium',
+      },
+      {
+        sourceTool: 'apply_patch',
+        operation: 'delete',
+        relativePath: 'src/old.ts',
+        confidence: 'medium',
+      },
+    ])
+    expect(result.changes[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      beforeState: {
+        exists: false,
+        unavailableReason: 'gitless-before-content-unavailable',
+      },
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-apply-patch-final-content-unavailable',
+      },
+    })
+  })
+
+  test('skips apply_patch toolparts when patch markers are unsupported', () => {
+    const result = reconstruct([
+      applyPatchToolPart({
+        id: 'part-apply-patch-unknown',
+        patch: 'diff --git a/src/file.ts b/src/file.ts\n',
+      }),
+    ])
+
+    expect(result.changes).toHaveLength(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode apply_patch toolpart part-apply-patch-unknown skipped because no supported Add/Update/Delete File markers were found.',
+    )
+  })
+
+  test('skips apply_patch toolparts with missing patch text without blocking valid file tools', () => {
+    const result = reconstruct([
+      applyPatchToolPart({
+        id: 'part-apply-patch-missing',
+        time: 1000,
+      }),
+      toolPart({
+        id: 'part-write-after-missing-patch',
+        tool: 'write',
+        filePath: path.join(workspaceRoot, 'src/after.ts'),
+        content: 'export const after = true;\n',
+        exists: false,
+        time: 1100,
+      }),
+    ])
+
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      sourcePartId: 'part-write-after-missing-patch',
+      sourceTool: 'write',
+      operation: 'create',
+      confidence: 'exact',
+    })
+    expect(result.diagnostics).toContain(
+      'OpenCode apply_patch toolpart part-apply-patch-missing missing state/input/patch.',
+    )
+  })
+
+  test('skips ambiguous apply_patch lifecycle markers for the same path', () => {
+    const result = reconstruct([
+      applyPatchToolPart({
+        id: 'part-apply-patch-ambiguous',
+        patch: [
+          '*** Begin Patch',
+          '*** Add File: src/same.ts',
+          '+export const value = 1;',
+          '*** Delete File: src/same.ts',
+          '*** End Patch',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.changes).toHaveLength(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode apply_patch toolpart part-apply-patch-ambiguous skipped ambiguous lifecycle markers for src/same.ts.',
+    )
+  })
+
+  test('skips apply_patch paths that escape the workspace', () => {
+    const result = reconstruct([
+      applyPatchToolPart({
+        id: 'part-apply-patch-outside',
+        patch: [
+          '*** Begin Patch',
+          '*** Add File: ../outside.ts',
+          '+export const outside = true;',
+          '*** Add File: src/inside.ts',
+          '+export const inside = true;',
+          '*** End Patch',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.changes.map(change => change.relativePath)).toEqual(['src/inside.ts'])
+    expect(result.diagnostics).toContain('OpenCode filePath is outside projectPath.')
   })
 
   test('ignores errored edit toolparts even when replacement fields are present', () => {
@@ -371,7 +546,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes).toHaveLength(1)
     expect(result.changes[0]).toMatchObject({
       operation: 'modify',
-      confidence: 'high',
+      confidence: 'medium',
       beforeContent: null,
       beforeState: { exists: true, unavailableReason: 'opencode-before-content-unavailable' },
     })

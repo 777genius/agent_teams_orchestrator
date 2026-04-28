@@ -113,7 +113,7 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
         continue
       }
       const tool = getString(data, 'tool')
-      if (tool !== 'write' && tool !== 'edit') {
+      if (tool !== 'write' && tool !== 'edit' && tool !== 'apply_patch') {
         continue
       }
       const state = data.state && typeof data.state === 'object'
@@ -123,7 +123,12 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
         ? state.input as Record<string, unknown>
         : null
       const filePath = getString(input, 'filePath')
-      if (!filePath || path.resolve(filePath) !== path.join(workspaceRoot, SMOKE_FILE)) {
+      const patch = getString(input, 'patch')
+      const targetsSmokeFile =
+        filePath
+          ? path.resolve(filePath) === path.join(workspaceRoot, SMOKE_FILE)
+          : typeof patch === 'string' && patch.includes(SMOKE_FILE)
+      if (!targetsSmokeFile) {
         continue
       }
       const message = db.query(
@@ -145,7 +150,7 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
   } finally {
     db.close()
   }
-  throw new Error(`No live OpenCode write/edit toolpart found for ${SMOKE_FILE}.`)
+  throw new Error(`No live OpenCode write/edit/apply_patch toolpart found for ${SMOKE_FILE}.`)
 }
 
 function sessionRecord(input: {
@@ -215,7 +220,7 @@ async function readBundle(projectDir: string): Promise<Record<string, unknown>> 
 }
 
 describe('OpenCode Ledger Bridge live e2e', () => {
-  liveTest('imports real OpenCode write/edit toolparts into task changes', async () => {
+  liveTest('imports real OpenCode file-changing toolparts into task changes', async () => {
     const version = runOpenCode(['--version'], childEnv(), 15_000)
     expect(version.status).toBe(0)
 

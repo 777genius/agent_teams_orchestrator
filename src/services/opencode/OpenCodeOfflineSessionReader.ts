@@ -305,7 +305,7 @@ export class OpenCodeOfflineSessionReader {
         supported = false
         continue
       }
-      if (tool !== 'write' && tool !== 'edit') {
+      if (tool !== 'write' && tool !== 'edit' && tool !== 'apply_patch') {
         continue
       }
       const state = asRecord(parsed.state)
@@ -318,8 +318,20 @@ export class OpenCodeOfflineSessionReader {
       if (status && status !== 'completed') {
         continue
       }
+      if (tool === 'apply_patch') {
+        const input = asRecord(state?.input)
+        if (typeof input?.patch !== 'string' || input.patch.length === 0) {
+          diagnostics.push(`OpenCode SQLite apply_patch toolpart ${row.id} has unsupported state/input/patch shape; it will be skipped.`)
+        }
+        continue
+      }
       const input = asRecord(state?.input)
-      if (!input || !asString(input.filePath)) {
+      if (!input) {
+        diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state/input.`)
+        supported = false
+        continue
+      }
+      if (!asString(input.filePath)) {
         diagnostics.push(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: OpenCode SQLite ${tool} toolpart ${row.id} missing state/input/filePath.`)
         supported = false
       }

@@ -47,7 +47,7 @@ export type ReconstructedOpenCodeToolChange = {
   toolUseId: string
   sourcePartId: string
   sourceMessageId: string
-  sourceTool: 'write' | 'edit'
+  sourceTool: 'write' | 'edit' | 'apply_patch'
   sourceImportKey: string
   filePath: string
   relativePath: string
@@ -65,8 +65,8 @@ export type ReconstructedOpenCodeToolChange = {
     sizeBytes?: number
     unavailableReason?: string
   }
-  operation: 'create' | 'modify'
-  confidence: 'exact' | 'high'
+  operation: 'create' | 'modify' | 'delete'
+  confidence: 'exact' | 'high' | 'medium'
   attributionMethod: 'delivery-ledger-taskrefs'
   oldString?: string
   newString?: string
@@ -78,10 +78,11 @@ type Toolpart = {
   partId: string
   messageId: string
   parentUserMessageId?: string
-  tool: 'write' | 'edit'
+  tool: 'write' | 'edit' | 'apply_patch'
   callId?: string
   status: string
-  filePath: string
+  filePath?: string
+  patch?: string
   content?: string
   oldString?: string
   newString?: string
@@ -107,6 +108,11 @@ type ReconstructedFileState = {
   text: string | null
   textAvailability: 'full-text' | 'metadata-only' | 'unavailable'
   exists: boolean
+}
+
+type ParsedApplyPatchPath = {
+  filePath: string
+  operation: 'create' | 'modify' | 'delete'
 }
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
@@ -293,6 +299,45 @@ function buildSourceImportKey(params: {
   return ['opencode', params.sessionId, params.partId, params.normalizedPath.comparisonKey].join('\0')
 }
 
+function parseApplyPatchTouchedPaths(patch: string, partId: string, diagnostics: string[]): ParsedApplyPatchPath[] {
+  const byPath = new Map<string, ParsedApplyPatchPath & { ambiguous?: true }>()
+  for (const rawLine of patch.split(/\r?\n/)) {
+    const line = rawLine.trimEnd()
+    const marker =
+      line.startsWith('*** Add File: ')
+        ? { operation: 'create' as const, filePath: line.slice('*** Add File: '.length).trim() }
+        : line.startsWith('*** Delete File: ')
+          ? { operation: 'delete' as const, filePath: line.slice('*** Delete File: '.length).trim() }
+          : line.startsWith('*** Update File: ')
+            ? { operation: 'modify' as const, filePath: line.slice('*** Update File: '.length).trim() }
+            : null
+    if (!marker) {
+      continue
+    }
+    if (!marker.filePath || marker.filePath.includes('\0')) {
+      diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped an empty or unsafe patch path.`)
+      continue
+    }
+    const existing = byPath.get(marker.filePath)
+    if (existing?.ambiguous) {
+      continue
+    }
+    if (existing) {
+      if (existing.operation !== marker.operation) {
+        byPath.set(marker.filePath, { ...existing, ambiguous: true })
+        diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped ambiguous lifecycle markers for ${marker.filePath}.`)
+      }
+      continue
+    }
+    byPath.set(marker.filePath, marker)
+  }
+  const changes = [...byPath.values()].filter((change): change is ParsedApplyPatchPath => change.ambiguous !== true)
+  if (changes.length === 0) {
+    diagnostics.push(`OpenCode apply_patch toolpart ${partId} skipped because no supported Add/Update/Delete File markers were found.`)
+  }
+  return changes
+}
+
 export class OpenCodeToolpartChangeReconstructor {
   reconstruct(params: {
     teamName: string
@@ -356,14 +401,6 @@ export class OpenCodeToolpartChangeReconstructor {
       if (toolpart.status !== 'completed') {
         continue
       }
-      const normalizedPath = normalizeOpenCodeFilePath({
-        projectPath: params.projectPath,
-        filePath: toolpart.filePath,
-      })
-      if ('skipped' in normalizedPath) {
-        diagnostics.push(normalizedPath.diagnostic)
-        continue
-      }
       const taskContextResolution = this.resolveTaskContext({
         toolpart,
         partsByMessageId,
@@ -377,6 +414,86 @@ export class OpenCodeToolpartChangeReconstructor {
         continue
       }
       const taskContext = taskContextResolution.context
+
+      if (toolpart.tool === 'apply_patch') {
+        if (!toolpart.patch) {
+          diagnostics.push(`OpenCode apply_patch toolpart ${toolpart.partId} skipped because patch text was unavailable.`)
+          continue
+        }
+        const touchedPaths = parseApplyPatchTouchedPaths(toolpart.patch, toolpart.partId, diagnostics)
+        for (const touchedPath of touchedPaths) {
+          const normalizedPath = normalizeOpenCodeFilePath({
+            projectPath: params.projectPath,
+            filePath: touchedPath.filePath,
+          })
+          if ('skipped' in normalizedPath) {
+            diagnostics.push(normalizedPath.diagnostic)
+            continue
+          }
+          fileStates.set(normalizedPath.comparisonKey, {
+            text: null,
+            textAvailability: 'metadata-only',
+            exists: touchedPath.operation !== 'delete',
+          })
+          changes.push({
+            taskId: taskContext.taskRef.taskId,
+            taskRef: taskContext.taskRef.taskId,
+            taskRefKind: 'canonical',
+            teamName: taskContext.taskRef.teamName,
+            memberName: params.memberName,
+            sessionId: params.sessionId,
+            ...(toolpart.parentUserMessageId ? { parentUserMessageId: toolpart.parentUserMessageId } : {}),
+            assistantMessageId: toolpart.messageId,
+            toolUseId: toolpart.callId ?? toolpart.partId,
+            sourcePartId: toolpart.partId,
+            sourceMessageId: toolpart.messageId,
+            sourceTool: 'apply_patch',
+            sourceImportKey: buildSourceImportKey({
+              sessionId: params.sessionId,
+              partId: toolpart.partId,
+              normalizedPath,
+            }),
+            filePath: normalizedPath.absolutePath,
+            relativePath: normalizedPath.relativePath,
+            beforeContent: null,
+            afterContent: null,
+            operation: touchedPath.operation,
+            confidence: 'medium',
+            attributionMethod: taskContext.method,
+            beforeState: {
+              exists: touchedPath.operation === 'create' ? false : true,
+              unavailableReason: touchedPath.operation === 'create'
+                ? 'gitless-before-content-unavailable'
+                : 'opencode-apply-patch-before-content-unavailable',
+            },
+            afterState: {
+              exists: touchedPath.operation !== 'delete',
+              unavailableReason: touchedPath.operation === 'delete'
+                ? 'opencode-apply-patch-delete-after-state-unverified'
+                : 'opencode-apply-patch-final-content-unavailable',
+            },
+            timestamp: toolpart.timestamp,
+            warnings: [
+              'OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.',
+              ...(taskContext.warning ? [taskContext.warning] : []),
+            ],
+          })
+        }
+        continue
+      }
+
+      if (!toolpart.filePath) {
+        diagnostics.push(`OpenCode ${toolpart.tool} toolpart ${toolpart.partId} missing state/input/filePath.`)
+        continue
+      }
+      const normalizedPath = normalizeOpenCodeFilePath({
+        projectPath: params.projectPath,
+        filePath: toolpart.filePath,
+      })
+      if ('skipped' in normalizedPath) {
+        diagnostics.push(normalizedPath.diagnostic)
+        continue
+      }
 
       if (toolpart.tool === 'write') {
         const previousState = fileStates.get(normalizedPath.comparisonKey)
@@ -432,7 +549,7 @@ export class OpenCodeToolpartChangeReconstructor {
           beforeContent,
           afterContent,
           operation: beforeKind === 'known-absent' ? 'create' : 'modify',
-          confidence: beforeKind === 'known-text' || beforeKind === 'known-absent' ? 'exact' : 'high',
+          confidence: beforeKind === 'known-text' || beforeKind === 'known-absent' ? 'exact' : 'medium',
           attributionMethod: taskContext.method,
           timestamp: toolpart.timestamp,
           beforeState:
@@ -509,7 +626,7 @@ export class OpenCodeToolpartChangeReconstructor {
           beforeContent: null,
           afterContent: null,
           operation: 'modify',
-          confidence: 'high',
+          confidence: 'medium',
           attributionMethod: taskContext.method,
           oldString: toolpart.oldString,
           newString: toolpart.newString,
@@ -586,7 +703,7 @@ export class OpenCodeToolpartChangeReconstructor {
         continue
       }
       const tool = asString(data.tool)
-      if (tool !== 'write' && tool !== 'edit') {
+      if (tool !== 'write' && tool !== 'edit' && tool !== 'apply_patch') {
         continue
       }
       const state = asRecord(data.state)
@@ -600,8 +717,18 @@ export class OpenCodeToolpartChangeReconstructor {
       }
       const input = asRecord(state?.input)
       const metadata = asRecord(state?.metadata)
-      const filePath = asString(input?.filePath)
-      if (!input || !filePath) {
+      const filePath = asString(input?.filePath) ?? undefined
+      const patch = asStringValue(input?.patch) ?? undefined
+      if (!input) {
+        diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input.`)
+        continue
+      }
+      if (tool === 'apply_patch') {
+        if (!patch) {
+          diagnostics.push(`OpenCode apply_patch toolpart ${row.id} missing state/input/patch.`)
+          continue
+        }
+      } else if (!filePath) {
         diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input/filePath.`)
         continue
       }
@@ -613,7 +740,8 @@ export class OpenCodeToolpartChangeReconstructor {
         tool,
         callId: asString(data.callID) ?? undefined,
         status,
-        filePath,
+        ...(filePath ? { filePath } : {}),
+        ...(patch ? { patch } : {}),
         content: asStringValue(input.content) ?? undefined,
         oldString: asStringValue(input.oldString) ?? undefined,
         newString: asStringValue(input.newString) ?? undefined,

@@ -84,6 +84,7 @@ export type TaskChangeSource =
   | 'post_tool_hook_snapshot'
   | 'opencode_toolpart_write'
   | 'opencode_toolpart_edit'
+  | 'opencode_toolpart_apply_patch'
 export type TaskChangeToolStatus = 'succeeded' | 'failed' | 'killed' | 'backgrounded'
 
 export type ResolvedTaskScope = {
@@ -325,7 +326,7 @@ export type ExactFileChange = {
 }
 
 export type ImportedOpenCodeFileChange = ExactFileChange & {
-  source: Extract<TaskChangeSource, 'opencode_toolpart_write' | 'opencode_toolpart_edit'>
+  source: Extract<TaskChangeSource, 'opencode_toolpart_write' | 'opencode_toolpart_edit' | 'opencode_toolpart_apply_patch'>
   toolUseId: string
   timestamp: string
   sourceImportKey: string
