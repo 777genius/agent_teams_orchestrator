@@ -19,13 +19,20 @@ branch: feat/opencode-hybrid-evidence-ui-continuation
 Verified completion snapshot:
 
 ```text
-orchestrator targeted suite: 155 pass, 0 fail
+orchestrator targeted suite: 158 pass, 0 fail
 orchestrator build: bun run build:dev passed
 OpenCode live snapshot evidence E2E: 1 pass, 0 fail
 OpenCode live ledger bridge E2E: 1 pass, 0 fail
 UI targeted suite: 119 pass, 0 fail
 UI typecheck: pnpm typecheck passed
 git diff --check: passed in both worktrees
+```
+
+Latest safety hardening added after the original completion snapshot:
+
+```text
+SQLite/WAL/busy/cap read races now resolve to transient-error with retryAfterReason, not stable no-attribution.
+This prevents UI auto-backfill from caching a temporarily incomplete OpenCode history as clean/no changes.
 ```
 
 ## Executive Summary
