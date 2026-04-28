@@ -159,8 +159,15 @@ export function resolveCodexRuntimeSelection(params?: {
   const chatgptLoginState =
     params?.chatgptLoginState
     ?? (hostManagedChatGptAuthSelected ? detectCodexCliLoginState() : 'unknown')
+  // When the host explicitly forces ChatGPT auth (chatgptModePinned) and the codex
+  // binary is present, treat 'unknown' login state as ready — the exec will surface
+  // real auth failures more accurately than a pre-flight `codex login status` check,
+  // which may disagree with the app-server's own session state.
+  // Only block on an explicit 'not_logged_in' result.
   const hostManagedChatGptAuthReady =
-    hostManagedChatGptAuthSelected && chatgptLoginState === 'logged_in'
+    hostManagedChatGptAuthSelected &&
+    (chatgptLoginState === 'logged_in' ||
+      (chatgptModePinned && nativeBinaryDetected && chatgptLoginState !== 'not_logged_in'))
   const apiKeyFallbackAllowed = forcedLoginMethod !== 'chatgpt'
 
   const nativeBackendAvailable =
