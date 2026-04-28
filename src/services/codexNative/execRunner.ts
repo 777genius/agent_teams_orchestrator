@@ -2,7 +2,11 @@ import { type ChildProcess } from 'node:child_process'
 import { PassThrough, type Readable } from 'node:stream'
 import readline from 'node:readline'
 
-import type { CodexForcedLoginMethod } from '../runtimeBackends/codexBackendResolver.js'
+import {
+  resolveCodexCliBinary,
+  type CodexCliBinarySource,
+  type CodexForcedLoginMethod,
+} from '../runtimeBackends/codexBackendResolver.js'
 import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli, spawnSyncPortableCli } from '../../utils/portableCli.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
@@ -27,7 +31,7 @@ export type CodexNativeExecRunnerOptions = {
 
 export type CodexNativeBinaryIdentity = {
   executablePath: string
-  executableSource: 'system-path'
+  executableSource: CodexCliBinarySource
   version: string | null
 }
 
@@ -325,14 +329,15 @@ export async function* runCodexNativeExec(
   options: CodexNativeExecRunnerOptions,
   deps: CodexNativeExecRunnerDeps = {},
 ): AsyncGenerator<CodexNativeExecObservation, CodexNativeExecSummary, unknown> {
-  const executablePath = deps.which?.('codex') ?? Bun.which('codex')
-  if (!executablePath) {
+  const binaryResolution = resolveCodexCliBinary({ which: deps.which })
+  if (!binaryResolution) {
     throw new Error('Codex native runtime requires the codex CLI binary.')
   }
+  const executablePath = binaryResolution.executablePath
 
   const identity: CodexNativeBinaryIdentity = {
     executablePath,
-    executableSource: 'system-path',
+    executableSource: binaryResolution.executableSource,
     version: (deps.resolveVersion ?? defaultResolveVersion)(executablePath),
   }
 

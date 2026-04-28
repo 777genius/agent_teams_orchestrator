@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+const REGISTRY_STATUS_TEST_TIMEOUT_MS = 30_000
+
 function setOptionalEnv(
   key: string,
   value: string | null | undefined,
@@ -26,12 +28,14 @@ async function loadCodexStatus(options: {
   backendEnv?: string | null
   openAiApiKey?: string | null
   codexApiKey?: string | null
+  codexCliPath?: string | null
   nativeBinaryDetected?: boolean
   settingsInline?: Record<string, unknown> | null
 } = {}) {
   const originalCodexBackend = process.env.CLAUDE_CODE_CODEX_BACKEND
   const originalOpenAiApiKey = process.env.OPENAI_API_KEY
   const originalCodexApiKey = process.env.CODEX_API_KEY
+  const originalCodexCliPath = process.env.CODEX_CLI_PATH
 
   setOptionalEnv(
     'CLAUDE_CODE_CODEX_BACKEND',
@@ -40,6 +44,7 @@ async function loadCodexStatus(options: {
   )
   setOptionalEnv('OPENAI_API_KEY', options.openAiApiKey ?? null, originalOpenAiApiKey)
   setOptionalEnv('CODEX_API_KEY', options.codexApiKey ?? null, originalCodexApiKey)
+  setOptionalEnv('CODEX_CLI_PATH', options.codexCliPath ?? null, originalCodexCliPath)
 
   const originalWhich = Bun.which
   Bun.which = ((binaryName: string) => {
@@ -73,6 +78,7 @@ async function loadCodexStatus(options: {
     setOptionalEnv('CLAUDE_CODE_CODEX_BACKEND', undefined, originalCodexBackend)
     setOptionalEnv('OPENAI_API_KEY', undefined, originalOpenAiApiKey)
     setOptionalEnv('CODEX_API_KEY', undefined, originalCodexApiKey)
+    setOptionalEnv('CODEX_CLI_PATH', undefined, originalCodexCliPath)
   }
 }
 
@@ -93,7 +99,7 @@ describe('codex-native registry rollout states', () => {
       audience: 'general',
       statusMessage: 'Ready',
     })
-  })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 
   test('reports authentication-required when both supported API key env vars are missing', async () => {
     const codex = await loadCodexStatus({
@@ -111,7 +117,7 @@ describe('codex-native registry rollout states', () => {
       audience: 'general',
       statusMessage: 'Authentication required',
     })
-  })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 
   test('reports runtime-missing when the codex binary is not detected', async () => {
     const codex = await loadCodexStatus({
@@ -129,7 +135,7 @@ describe('codex-native registry rollout states', () => {
       audience: 'general',
       statusMessage: 'Codex CLI not found',
     })
-  })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 
   test('normalizes legacy backend env values to the native option', async () => {
     const codex = await loadCodexStatus({
@@ -141,7 +147,22 @@ describe('codex-native registry rollout states', () => {
     expect(codex?.selectedBackendId).toBe('codex-native')
     expect(codex?.resolvedBackendId).toBe('codex-native')
     expect(codex?.availableBackends.map(option => option.id)).toEqual(['codex-native'])
-  })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
+
+  test('reports configured Codex CLI path in external diagnostics', async () => {
+    const codex = await loadCodexStatus({
+      codexApiKey: 'sk-native-test',
+      codexCliPath: '/opt/codex/bin/codex.cmd',
+      nativeBinaryDetected: false,
+    })
+
+    expect(codex?.resolvedBackendId).toBe('codex-native')
+    expect(codex?.externalRuntimeDiagnostics[0]).toMatchObject({
+      id: 'cli-bin',
+      detected: true,
+      detailMessage: '/opt/codex/bin/codex.cmd',
+    })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 
   test('reports ready for host-managed ChatGPT auth without requiring API keys', async () => {
     const codex = await loadCodexStatus({
@@ -169,5 +190,5 @@ describe('codex-native registry rollout states', () => {
       kind: 'codex-native',
       authMethodDetail: 'oauth_token',
     })
-  })
+  }, REGISTRY_STATUS_TEST_TIMEOUT_MS)
 })

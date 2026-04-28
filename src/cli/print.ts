@@ -988,7 +988,7 @@ export async function runHeadless(
     // Should not be getting control messages or stream events in non-stream mode.
     // Also filter out streamlined types since they're only produced by the transformer.
     // SDK-only system events are excluded so lastMessage stays at the result
-    // (session_state_changed(idle) and any late task_notification drain after
+    // (session_state_changed/status idle and any late task_notification drain after
     // result in the finally block).
     if (
       message.type !== 'control_response' &&
@@ -997,6 +997,7 @@ export async function runHeadless(
       !(
         message.type === 'system' &&
         (message.subtype === 'session_state_changed' ||
+          message.subtype === 'status' ||
           message.subtype === 'task_notification' ||
           message.subtype === 'task_started' ||
           message.subtype === 'task_progress' ||

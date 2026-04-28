@@ -883,4 +883,56 @@ describe('runCodexNativeExec', () => {
       }
     }
   })
+
+  test('uses CODEX_CLI_PATH before PATH lookup when spawning codex exec', async () => {
+    const originalCodexCliPath = process.env.CODEX_CLI_PATH
+    process.env.CODEX_CLI_PATH = '/opt/codex/bin/codex.cmd'
+
+    try {
+      const process = new FakeCodexProcess()
+      const spawnProcess = mock(() => process)
+      const iterator = runCodexNativeExec(
+        {
+          prompt: 'Reply only with OK',
+          cwd: '/tmp/demo',
+        },
+        {
+          which: () => '/usr/local/bin/codex',
+          resolveVersion: () => 'codex-cli 0.117.0',
+          spawnProcess: (binaryPath, args, options) =>
+            spawnProcess(binaryPath, args, options) as never,
+        },
+      )
+
+      const first = await iterator.next()
+      expect(first).toMatchObject({
+        done: false,
+        value: {
+          type: 'binary_identity',
+          identity: {
+            executablePath: '/opt/codex/bin/codex.cmd',
+            executableSource: 'configured-env',
+            version: 'codex-cli 0.117.0',
+          },
+        },
+      })
+      expect(spawnProcess).toHaveBeenCalledWith(
+        '/opt/codex/bin/codex.cmd',
+        expect.any(Array),
+        expect.objectContaining({
+          env: expect.objectContaining({
+            CODEX_CLI_PATH: '/opt/codex/bin/codex.cmd',
+          }),
+        }),
+      )
+
+      await iterator.return(undefined as never)
+    } finally {
+      if (originalCodexCliPath === undefined) {
+        delete process.env.CODEX_CLI_PATH
+      } else {
+        process.env.CODEX_CLI_PATH = originalCodexCliPath
+      }
+    }
+  })
 })

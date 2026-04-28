@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  detectCodexCliLoginState,
   getCodexApiKey,
   getCodexForcedLoginMethod,
   getCodexRuntimeBackendPreference,
   normalizeCodexBackendPreference,
+  resolveCodexCliBinary,
   resolveCodexRuntimeSelection,
 } from './codexBackendResolver.js'
 
@@ -30,6 +32,64 @@ describe('codexBackendResolver', () => {
     expect(getCodexRuntimeBackendPreference({ CLAUDE_CODE_CODEX_BACKEND: 'api' })).toBe(
       'codex-native',
     )
+  })
+
+  test('prefers CODEX_CLI_PATH over PATH lookup for the Codex binary', () => {
+    let whichCalled = false
+    expect(
+      resolveCodexCliBinary({
+        env: {
+          CODEX_CLI_PATH: ' C:\\Program Files\\OpenAI\\codex.cmd ',
+        },
+        which: () => {
+          whichCalled = true
+          return '/usr/local/bin/codex'
+        },
+      }),
+    ).toEqual({
+      executablePath: 'C:\\Program Files\\OpenAI\\codex.cmd',
+      executableSource: 'configured-env',
+    })
+    expect(whichCalled).toBe(false)
+  })
+
+  test('checks Codex login status through the configured binary and env', () => {
+    const calls: {
+      executablePath: string
+      args: string[]
+      env: NodeJS.ProcessEnv | undefined
+    }[] = []
+    const state = detectCodexCliLoginState(10_000, {
+      env: {
+        CODEX_CLI_PATH: '/opt/codex/bin/codex',
+        CODEX_HOME: '/tmp/codex-home-a',
+      },
+      which: () => '/usr/local/bin/codex',
+      spawnSync: (executablePath, args, options) => {
+        calls.push({
+          executablePath,
+          args,
+          env: options.env,
+        })
+        return {
+          status: 0,
+          stdout: 'Logged in using ChatGPT',
+          stderr: '',
+        } as never
+      },
+    })
+
+    expect(state).toBe('logged_in')
+    expect(calls).toEqual([
+      {
+        executablePath: '/opt/codex/bin/codex',
+        args: ['login', 'status'],
+        env: {
+          CODEX_CLI_PATH: '/opt/codex/bin/codex',
+          CODEX_HOME: '/tmp/codex-home-a',
+        },
+      },
+    ])
   })
 
   test('reads the host-managed forced login method from inline settings', () => {
@@ -181,6 +241,33 @@ describe('codexBackendResolver', () => {
       canLoginFromUi: false,
       statusMessage: 'Codex native runtime unavailable',
       detailMessage: 'Codex native runtime requires an active `codex login` ChatGPT session.',
+    })
+  })
+
+  test('includes configured runtime context when pinned ChatGPT login is not visible', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {
+        CODEX_CLI_PATH: '/opt/codex/bin/codex',
+        CODEX_HOME: '/tmp/empty-codex-home',
+      },
+      apiKeyConfigured: false,
+      nativeApiKeyConfigured: false,
+      chatgptLoginState: 'not_logged_in',
+      settingsInline: {
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: null,
+      authenticated: false,
+      authMethod: null,
+      statusMessage: 'Codex native runtime unavailable',
+      detailMessage:
+        'Codex native runtime requires an active `codex login` ChatGPT session. Runtime context: binary=configured-env:/opt/codex/bin/codex; CODEX_HOME=/tmp/empty-codex-home; login=not_logged_in.',
     })
   })
 

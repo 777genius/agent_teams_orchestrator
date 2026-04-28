@@ -20,7 +20,10 @@ import {
   getAnthropicVisibleRuntimeModels,
 } from './anthropicCatalog.js'
 import { buildAnthropicRuntimeStatus } from './anthropicStatus.js'
-import { resolveCodexRuntimeSelection } from './codexBackendResolver.js'
+import {
+  resolveCodexCliBinary,
+  resolveCodexRuntimeSelection,
+} from './codexBackendResolver.js'
 import type {
   RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
@@ -65,6 +68,17 @@ function detectExternalBinary(
     detected: Boolean(binaryPath),
     statusMessage: binaryPath ? `${label} detected` : `${label} not found`,
     detailMessage: binaryPath ?? null,
+  }
+}
+
+function detectCodexExternalBinary(): ExternalRuntimeDiagnostic {
+  const binaryResolution = resolveCodexCliBinary()
+  return {
+    id: 'cli-bin',
+    label: 'Codex CLI',
+    detected: Boolean(binaryResolution),
+    statusMessage: binaryResolution ? 'Codex CLI detected' : 'Codex CLI not found',
+    detailMessage: binaryResolution?.executablePath ?? null,
   }
 }
 
@@ -501,7 +515,7 @@ export async function getUnifiedRuntimeStatusPayload(
       selectedBackendId: codex.selectedBackendId,
       resolvedBackendId: codex.resolvedBackendId,
       availableBackends: codex.availableBackends,
-      externalRuntimeDiagnostics: [detectExternalBinary('codex', 'Codex CLI')],
+      externalRuntimeDiagnostics: [detectCodexExternalBinary()],
       models: getCodexModels(),
       runtimeCapabilities: {
         modelCatalog: {

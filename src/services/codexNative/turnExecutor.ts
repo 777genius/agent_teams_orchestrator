@@ -23,6 +23,7 @@ import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { getModelUsage, getTotalAPIDuration, getTotalCost } from '../../cost-tracker.js'
 import type { NonNullableUsage } from '../../entrypoints/sdk/coreTypes.js'
 import {
+  type CodexCliBinarySource,
   getCodexForcedLoginMethod,
   getCodexNativeApiKey,
 } from '../runtimeBackends/codexBackendResolver.js'
@@ -38,7 +39,7 @@ type CodexNativeExecutionSummary = {
   totalUsage: NonNullableUsage
   binaryIdentity: {
     executablePath: string
-    executableSource: 'system-path'
+    executableSource: CodexCliBinarySource
     version: string | null
   } | null
   threadId: string | null

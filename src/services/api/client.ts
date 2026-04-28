@@ -328,9 +328,12 @@ export async function getAnthropicClient({
     }
 
     const codexApiKey = getCodexApiKey()
+    const codexRuntimeDetail = resolution.detailMessage?.trim()
     throw new Error(
       codexApiKey
         ? 'Codex provider is pinned to the native runtime, but this code path still expects the removed legacy transport. Route through the dedicated codex-native execution lane instead.'
+        : codexRuntimeDetail?.includes('`codex login`')
+          ? codexRuntimeDetail
         : 'Codex provider is pinned to the native runtime, but no CODEX_API_KEY or OPENAI_API_KEY is configured.',
     )
   }

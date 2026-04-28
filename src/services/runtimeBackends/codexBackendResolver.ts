@@ -4,9 +4,16 @@ import type { CodexRuntimeBackendId } from './types.js'
 
 export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
 export const OPENAI_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
+export const CODEX_CLI_PATH_ENV_VAR = 'CODEX_CLI_PATH'
 export const CODEX_RUNTIME_BACKEND_ENV_VAR = 'CLAUDE_CODE_CODEX_BACKEND'
 export type CodexForcedLoginMethod = 'chatgpt' | 'api'
 export type CodexCliLoginState = 'logged_in' | 'not_logged_in' | 'unknown'
+export type CodexCliBinarySource = 'configured-env' | 'system-path'
+
+export type CodexCliBinaryResolution = {
+  executablePath: string
+  executableSource: CodexCliBinarySource
+}
 
 export type CodexResolvedRuntimeBackendId = CodexRuntimeBackendId
 
@@ -32,6 +39,7 @@ const CODEX_LOGIN_STATUS_CACHE_MS = 5_000
 let cachedCodexCliLoginState:
   | {
       checkedAtMs: number
+      cacheKey: string
       value: CodexCliLoginState
     }
   | null = null
@@ -87,29 +95,83 @@ export function getCodexRuntimeBackendPreference(
   return 'codex-native'
 }
 
+export function resolveCodexCliBinary(params?: {
+  env?: NodeJS.ProcessEnv
+  which?: (command: string) => string | null | undefined
+}): CodexCliBinaryResolution | null {
+  const env = params?.env ?? process.env
+  const configuredPath = env[CODEX_CLI_PATH_ENV_VAR]?.trim()
+  if (configuredPath) {
+    return {
+      executablePath: configuredPath,
+      executableSource: 'configured-env',
+    }
+  }
+
+  const which = params?.which ?? ((command: string) => Bun.which(command))
+  const systemPath = which('codex')?.trim()
+  if (!systemPath) {
+    return null
+  }
+
+  return {
+    executablePath: systemPath,
+    executableSource: 'system-path',
+  }
+}
+
+function getCodexLoginStateCacheKey(
+  env: NodeJS.ProcessEnv,
+  binaryResolution: CodexCliBinaryResolution | null,
+): string {
+  return [
+    binaryResolution?.executableSource ?? 'missing',
+    binaryResolution?.executablePath ?? '',
+    env.CODEX_HOME?.trim() ?? '',
+    env.HOME?.trim() ?? '',
+    env.USERPROFILE?.trim() ?? '',
+  ].join('\0')
+}
+
 export function detectCodexCliLoginState(
   nowMs: number = Date.now(),
+  params?: {
+    env?: NodeJS.ProcessEnv
+    which?: (command: string) => string | null | undefined
+    spawnSync?: typeof spawnSyncPortableCli
+  },
 ): CodexCliLoginState {
+  const env = params?.env ?? process.env
+  const codexBinary = resolveCodexCliBinary({
+    env,
+    which: params?.which,
+  })
+  const cacheKey = getCodexLoginStateCacheKey(env, codexBinary)
   if (
     cachedCodexCliLoginState
+    && cachedCodexCliLoginState.cacheKey === cacheKey
     && nowMs - cachedCodexCliLoginState.checkedAtMs < CODEX_LOGIN_STATUS_CACHE_MS
   ) {
     return cachedCodexCliLoginState.value
   }
 
-  const codexExecutable = Bun.which('codex')
-  if (!codexExecutable) {
-    cachedCodexCliLoginState = { checkedAtMs: nowMs, value: 'unknown' }
+  if (!codexBinary) {
+    cachedCodexCliLoginState = { checkedAtMs: nowMs, cacheKey, value: 'unknown' }
     return 'unknown'
   }
 
   let nextValue: CodexCliLoginState = 'unknown'
 
   try {
-    const result = spawnSyncPortableCli(codexExecutable, ['login', 'status'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    const result = (params?.spawnSync ?? spawnSyncPortableCli)(
+      codexBinary.executablePath,
+      ['login', 'status'],
+      {
+        encoding: 'utf8',
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
     const combinedOutput = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim()
 
     if (result.status === 0) {
@@ -121,8 +183,28 @@ export function detectCodexCliLoginState(
     nextValue = 'unknown'
   }
 
-  cachedCodexCliLoginState = { checkedAtMs: nowMs, value: nextValue }
+  cachedCodexCliLoginState = { checkedAtMs: nowMs, cacheKey, value: nextValue }
   return nextValue
+}
+
+function getConfiguredCodexRuntimeContextDetail(
+  env: NodeJS.ProcessEnv,
+  binaryResolution: CodexCliBinaryResolution | null,
+  loginState: CodexCliLoginState,
+): string {
+  if (!env[CODEX_CLI_PATH_ENV_VAR]?.trim() && !env.CODEX_HOME?.trim()) {
+    return ''
+  }
+
+  const parts = [
+    binaryResolution
+      ? `binary=${binaryResolution.executableSource}:${binaryResolution.executablePath}`
+      : 'binary=missing',
+    env.CODEX_HOME?.trim() ? `CODEX_HOME=${env.CODEX_HOME.trim()}` : null,
+    `login=${loginState}`,
+  ].filter((part): part is string => Boolean(part))
+
+  return ` Runtime context: ${parts.join('; ')}.`
 }
 
 export function resolveCodexRuntimeSelection(params?: {
@@ -151,16 +233,19 @@ export function resolveCodexRuntimeSelection(params?: {
     ?? getCodexForcedLoginMethod(params?.settingsInline ?? getFlagSettingsInline())
   const apiKeyConfigured = params?.apiKeyConfigured ?? Boolean(getCodexApiKey(env))
   const nativeApiKeyConfigured = params?.nativeApiKeyConfigured ?? apiKeyConfigured
+  const nativeBinaryResolution = resolveCodexCliBinary({ env })
   const nativeBinaryDetected =
-    params?.nativeBinaryDetected ?? Boolean(Bun.which('codex'))
+    params?.nativeBinaryDetected ?? nativeBinaryResolution !== null
   const chatgptModePinned = forcedLoginMethod === 'chatgpt'
   const hostManagedChatGptAuthSelected =
     chatgptModePinned || (forcedLoginMethod == null && oauthAuthenticated)
   const chatgptLoginState =
     params?.chatgptLoginState
-    ?? (hostManagedChatGptAuthSelected ? detectCodexCliLoginState() : 'unknown')
+    ?? (hostManagedChatGptAuthSelected
+      ? detectCodexCliLoginState(Date.now(), { env })
+      : 'unknown')
   // When the host explicitly forces ChatGPT auth (chatgptModePinned) and the codex
-  // binary is present, treat 'unknown' login state as ready — the exec will surface
+  // binary is present, treat 'unknown' login state as ready - the exec will surface
   // real auth failures more accurately than a pre-flight `codex login status` check,
   // which may disagree with the app-server's own session state.
   // Only block on an explicit 'not_logged_in' result.
@@ -199,7 +284,11 @@ export function resolveCodexRuntimeSelection(params?: {
     statusMessage = 'Codex native runtime unavailable'
     detailMessage =
       chatgptModePinned && chatgptLoginState !== 'logged_in'
-        ? 'Codex native runtime requires an active `codex login` ChatGPT session.'
+        ? `Codex native runtime requires an active \`codex login\` ChatGPT session.${getConfiguredCodexRuntimeContextDetail(
+            env,
+            nativeBinaryResolution,
+            chatgptLoginState,
+          )}`
         : hostManagedChatGptAuthSelected && chatgptLoginState !== 'logged_in'
           ? `Codex native runtime requires an active \`codex login\` ChatGPT session or ${CODEX_NATIVE_API_KEY_ENV_VAR}/${OPENAI_API_KEY_ENV_VAR}.`
           : `Codex native runtime requires ${CODEX_NATIVE_API_KEY_ENV_VAR} or ${OPENAI_API_KEY_ENV_VAR}.`
