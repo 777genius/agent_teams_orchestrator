@@ -10,6 +10,11 @@ export const CODEX_MODELS = [
     description: 'Current flagship GPT model',
   },
   {
+    id: 'gpt-5.5',
+    label: 'GPT-5.5',
+    description: 'Latest GPT model discovered by the Codex runtime catalog',
+  },
+  {
     id: 'gpt-5.4-mini',
     label: 'GPT-5.4 Mini',
     description: 'Fast and efficient for lightweight tasks',

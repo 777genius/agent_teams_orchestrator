@@ -2,7 +2,6 @@ import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/au
 import { getGlobalConfig } from '../../utils/config.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
-import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
@@ -24,6 +23,10 @@ import {
   resolveCodexCliBinary,
   resolveCodexRuntimeSelection,
 } from './codexBackendResolver.js'
+import {
+  getCodexRuntimeModelCatalog,
+  getVisibleCodexRuntimeModels,
+} from './codexModelCatalog.js'
 import type {
   RuntimeBackendOptionAudience,
   CodexRuntimeBackendId,
@@ -32,6 +35,7 @@ import type {
   RuntimeBackendOptionState,
   RuntimeExtensionCapabilities,
   RuntimeBackendOptionStatus,
+  RuntimeProviderModelCatalog,
   RuntimeProviderId,
   RuntimeProviderStatus,
   RuntimeStatusPayload,
@@ -201,6 +205,10 @@ function getAnthropicAuthenticated(): {
   return { authenticated, authMethod }
 }
 
+type RuntimeStatusRegistryDeps = {
+  getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
+}
+
 async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
   const anthropicAuth = getAnthropicAuthenticated()
   const modelCatalog = await getAnthropicRuntimeModelCatalog()
@@ -216,16 +224,50 @@ async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
   })
 }
 
-function getCodexModels(): string[] {
-  return filterDisplayModels(CODEX_MODELS.map(model => model.id))
-}
-
 function getGeminiModels(): string[] {
   return filterDisplayModels(GEMINI_MODELS.map(model => model.id))
 }
 
 function filterDisplayModels(models: string[]): string[] {
   return models.filter(model => isModelAllowed(model))
+}
+
+function filterCodexModelCatalog(
+  catalog: RuntimeProviderModelCatalog,
+): RuntimeProviderModelCatalog {
+  const models = catalog.models.filter(
+    model => isModelAllowed(model.launchModel) || isModelAllowed(model.id),
+  )
+  const defaultModel =
+    models.find(
+      model =>
+        model.id === catalog.defaultModelId ||
+        model.launchModel === catalog.defaultLaunchModel,
+    ) ??
+    models.find(model => model.isDefault) ??
+    models.find(model => !model.hidden) ??
+    models[0] ??
+    null
+
+  if (
+    models.length === catalog.models.length &&
+    defaultModel?.id === catalog.defaultModelId &&
+    defaultModel?.launchModel === catalog.defaultLaunchModel
+  ) {
+    return catalog
+  }
+
+  return {
+    ...catalog,
+    defaultModelId: defaultModel?.id ?? null,
+    defaultLaunchModel: defaultModel?.launchModel ?? null,
+    models: models.map(model => ({
+      ...model,
+      isDefault:
+        defaultModel !== null &&
+        (model.id === defaultModel.id || model.launchModel === defaultModel.launchModel),
+    })),
+  }
 }
 
 async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
@@ -481,6 +523,7 @@ function buildCodexStatuses(): {
 
 export async function getUnifiedRuntimeStatusPayload(
   providerFilter?: RuntimeProviderId | null,
+  deps: RuntimeStatusRegistryDeps = {},
 ): Promise<RuntimeStatusPayload> {
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
 
@@ -490,6 +533,13 @@ export async function getUnifiedRuntimeStatusPayload(
 
   if (!providerFilter || providerFilter === 'codex') {
     const codex = buildCodexStatuses()
+    const modelCatalog = filterCodexModelCatalog(
+      await (deps.getCodexModelCatalog ?? getCodexRuntimeModelCatalog)(),
+    )
+    const codexModels = getVisibleCodexRuntimeModels(modelCatalog)
+    const modelCatalogDynamic =
+      modelCatalog.source === 'app-server' &&
+      (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
     providers.codex = {
       providerId: 'codex',
       displayName: 'Codex',
@@ -516,11 +566,12 @@ export async function getUnifiedRuntimeStatusPayload(
       resolvedBackendId: codex.resolvedBackendId,
       availableBackends: codex.availableBackends,
       externalRuntimeDiagnostics: [detectCodexExternalBinary()],
-      models: getCodexModels(),
+      models: codexModels,
+      modelCatalog,
       runtimeCapabilities: {
         modelCatalog: {
-          dynamic: true,
-          source: 'runtime',
+          dynamic: modelCatalogDynamic,
+          source: modelCatalog.source,
         },
         reasoningEffort: {
           supported: true,

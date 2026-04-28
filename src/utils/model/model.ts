@@ -389,6 +389,9 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   if (name.includes('gpt-5.4-mini')) {
     return 'gpt-5.4-mini'
   }
+  if (name.includes('gpt-5.5')) {
+    return 'gpt-5.5'
+  }
   if (name.includes('gpt-5.4')) {
     return 'gpt-5.4'
   }
@@ -566,6 +569,8 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'Haiku 3.5'
     case getModelStrings().gpt54:
       return 'GPT-5.4'
+    case getModelStrings().gpt55:
+      return 'GPT-5.5'
     case getModelStrings().gpt53codex:
       return 'GPT-5.3 Codex'
     case getModelStrings().gpt54mini:
@@ -847,6 +852,9 @@ export function getMarketingNameForModel(
   // OpenAI Codex models
   if (canonical.includes('gpt-5.4-mini')) {
     return 'GPT-5.4 Mini'
+  }
+  if (canonical.includes('gpt-5.5')) {
+    return 'GPT-5.5'
   }
   if (canonical.includes('gpt-5.4')) {
     return 'GPT-5.4'

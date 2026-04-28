@@ -20,11 +20,74 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
       )
 
-      const payload = await getUnifiedRuntimeStatusPayload('codex')
+      const payload = await getUnifiedRuntimeStatusPayload('codex', {
+        getCodexModelCatalog: async () => ({
+          schemaVersion: 1,
+          providerId: 'codex',
+          source: 'app-server',
+          status: 'ready',
+          fetchedAt: '2026-04-28T00:00:00.000Z',
+          staleAt: '2026-04-28T00:10:00.000Z',
+          defaultModelId: 'gpt-5.4',
+          defaultLaunchModel: 'gpt-5.4',
+          models: [
+            {
+              id: 'gpt-5.4',
+              launchModel: 'gpt-5.4',
+              displayName: 'GPT-5.4',
+              hidden: false,
+              supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+              defaultReasoningEffort: 'medium',
+              inputModalities: ['text', 'image'],
+              supportsPersonality: false,
+              supportsFastMode: true,
+              isDefault: true,
+              upgrade: false,
+              source: 'app-server',
+            },
+            {
+              id: 'gpt-5.5',
+              launchModel: 'gpt-5.5',
+              displayName: 'GPT-5.5',
+              hidden: false,
+              supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+              defaultReasoningEffort: 'high',
+              inputModalities: ['text', 'image'],
+              supportsPersonality: false,
+              supportsFastMode: false,
+              isDefault: false,
+              upgrade: false,
+              source: 'app-server',
+            },
+            {
+              id: 'gpt-5.3-codex',
+              launchModel: 'gpt-5.3-codex',
+              displayName: 'GPT-5.3 Codex',
+              hidden: false,
+              supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+              defaultReasoningEffort: 'medium',
+              inputModalities: ['text', 'image'],
+              supportsPersonality: false,
+              supportsFastMode: false,
+              isDefault: false,
+              upgrade: false,
+              source: 'app-server',
+            },
+          ],
+          diagnostics: {
+            configReadState: 'skipped',
+            appServerState: 'healthy',
+            message: null,
+            code: null,
+          },
+        }),
+      })
       const codex = payload.providers.codex
 
       expect(payload.schemaVersion).toBe(2)
       expect(codex?.models).toContain('gpt-5.3-codex')
+      expect(codex?.models).toContain('gpt-5.5')
+      expect(codex?.modelCatalog?.source).toBe('app-server')
       expect(codex?.selectedBackendId).toBe('codex-native')
       expect(codex?.resolvedBackendId).toBe('codex-native')
       expect(codex?.capabilities.extensions.mcp.status).toBe('supported')
@@ -34,7 +97,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(codex?.runtimeCapabilities).toEqual({
         modelCatalog: {
           dynamic: true,
-          source: 'runtime',
+          source: 'app-server',
         },
         reasoningEffort: {
           supported: true,

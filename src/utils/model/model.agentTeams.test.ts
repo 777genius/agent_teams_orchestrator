@@ -14,6 +14,7 @@ import {
   parseUserSpecifiedModel,
 } from './model.js';
 import { getFastModeModel, isFastModeSupportedByModel } from '../fastMode.js';
+import { CODEX_MODELS, DEFAULT_CODEX_MODEL, isCodexModel } from './codex.js';
 
 function createCodexCapabilities(
   tier: string,
@@ -75,6 +76,7 @@ describe('model access fallback with agent_teams capabilities', () => {
     setAgentTeamsCapabilitiesForTesting(
       createCodexCapabilities('guest', {
         'gpt-5.4': false,
+        'gpt-5.5': false,
         'gpt-5.4-mini': false,
         'gpt-5.3-codex': false,
         'gpt-5.3-codex-spark': false,
@@ -94,6 +96,7 @@ describe('model access fallback with agent_teams capabilities', () => {
     setAgentTeamsCapabilitiesForTesting(
       createCodexCapabilities('guest', {
         'gpt-5.4': false,
+        'gpt-5.5': false,
         'gpt-5.4-mini': false,
         'gpt-5.3-codex': true,
         'gpt-5.3-codex-spark': false,
@@ -124,6 +127,14 @@ describe('model access fallback with agent_teams capabilities', () => {
 });
 
 describe('Opus 4.7 defaults', () => {
+  it('recognizes GPT-5.5 without making it the static Codex default', () => {
+    expect(isCodexModel('gpt-5.5')).toBe(true);
+    expect(CODEX_MODELS.map((model) => model.id)).toContain('gpt-5.5');
+    expect(DEFAULT_CODEX_MODEL).toBe('gpt-5.4');
+    expect(getPublicModelDisplayName('gpt-5.5')).toBe('GPT-5.5');
+    expect(getMarketingNameForModel('gpt-5.5')).toBe('GPT-5.5');
+  });
+
   it('resolves the first-party Opus alias to Opus 4.7', () => {
     expect(getDefaultOpusModel()).toBe('claude-opus-4-7');
     expect(parseUserSpecifiedModel('opus')).toBe('claude-opus-4-7');

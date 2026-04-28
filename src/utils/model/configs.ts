@@ -111,6 +111,14 @@ export const GPT_5_4_CONFIG = {
   openai: 'gpt-5.4',
 } as const satisfies ModelConfig
 
+export const GPT_5_5_CONFIG = {
+  firstParty: 'gpt-5.5',
+  bedrock: 'gpt-5.5',
+  vertex: 'gpt-5.5',
+  foundry: 'gpt-5.5',
+  openai: 'gpt-5.5',
+} as const satisfies ModelConfig
+
 export const GPT_5_3_CODEX_CONFIG = {
   firstParty: 'gpt-5.3-codex',
   bedrock: 'gpt-5.3-codex',
@@ -143,6 +151,7 @@ export const ALL_MODEL_CONFIGS = {
   opus46: CLAUDE_OPUS_4_6_CONFIG,
   // OpenAI Codex models
   gpt54: GPT_5_4_CONFIG,
+  gpt55: GPT_5_5_CONFIG,
   gpt53codex: GPT_5_3_CODEX_CONFIG,
   gpt54mini: GPT_5_4_MINI_CONFIG,
 } as const satisfies Record<string, ModelConfig>

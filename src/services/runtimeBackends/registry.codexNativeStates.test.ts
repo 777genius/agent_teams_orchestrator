@@ -72,7 +72,40 @@ async function loadCodexStatus(options: {
       `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
     )
 
-    const payload = await getUnifiedRuntimeStatusPayload('codex')
+    const payload = await getUnifiedRuntimeStatusPayload('codex', {
+      getCodexModelCatalog: async () => ({
+        schemaVersion: 1,
+        providerId: 'codex',
+        source: 'static-fallback',
+        status: 'degraded',
+        fetchedAt: '2026-04-28T00:00:00.000Z',
+        staleAt: '2026-04-28T00:10:00.000Z',
+        defaultModelId: 'gpt-5.4',
+        defaultLaunchModel: 'gpt-5.4',
+        models: [
+          {
+            id: 'gpt-5.4',
+            launchModel: 'gpt-5.4',
+            displayName: 'GPT-5.4',
+            hidden: false,
+            supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+            defaultReasoningEffort: 'medium',
+            inputModalities: ['text', 'image'],
+            supportsPersonality: false,
+            supportsFastMode: true,
+            isDefault: true,
+            upgrade: false,
+            source: 'static-fallback',
+          },
+        ],
+        diagnostics: {
+          configReadState: 'skipped',
+          appServerState: 'degraded',
+          message: null,
+          code: null,
+        },
+      }),
+    })
     return payload.providers.codex
   } finally {
     const bootstrapStateModulePath = new URL('../../bootstrap/state.js', import.meta.url).href

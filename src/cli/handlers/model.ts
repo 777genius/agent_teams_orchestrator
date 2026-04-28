@@ -1,9 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
-import {
-  CODEX_MODELS,
-  DEFAULT_CODEX_MODEL,
-} from '../../utils/model/codex.js'
+import { DEFAULT_CODEX_MODEL } from '../../utils/model/codex.js'
 import {
   DEFAULT_GEMINI_MODEL,
   GEMINI_MODELS,
@@ -11,6 +8,7 @@ import {
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { openCodeInventoryService } from '../../services/opencode/OpenCodeInventoryService.js'
 import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/anthropicCatalog.js'
+import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 type ModelProviderTarget = 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all'
@@ -20,6 +18,10 @@ type ModelSummary = {
   id: string
   label: string
   description: string
+}
+
+type ModelListDeps = {
+  getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
 }
 
 function getDefaultProvider(): InternalModelProvider {
@@ -33,22 +35,34 @@ function getDefaultProvider(): InternalModelProvider {
   return 'anthropic'
 }
 
-export async function getProviderModels(provider: InternalModelProvider): Promise<{
+export async function getProviderModels(
+  provider: InternalModelProvider,
+  deps: ModelListDeps = {},
+): Promise<{
   defaultModel: string
   displayName: string
   models: ModelSummary[]
 }> {
   switch (provider) {
-    case 'codex':
+    case 'codex': {
+      const catalog = await (deps.getCodexModelCatalog ?? getCodexRuntimeModelCatalog)()
+      const models = catalog.models
+        .filter(model => !model.hidden)
+        .map(model => ({
+          id: model.launchModel,
+          label: model.displayName,
+          description:
+            model.statusMessage ??
+            (catalog.source === 'app-server'
+              ? 'Discovered from the Codex app-server model catalog.'
+              : 'Static fallback Codex launch value.'),
+        }))
       return {
-        defaultModel: DEFAULT_CODEX_MODEL,
+        defaultModel: catalog.defaultLaunchModel ?? DEFAULT_CODEX_MODEL,
         displayName: 'Codex',
-        models: CODEX_MODELS.map(model => ({
-          id: model.id,
-          label: model.label,
-          description: model.description,
-        })),
+        models,
       }
+    }
     case 'gemini':
       return {
         defaultModel: DEFAULT_GEMINI_MODEL,
@@ -121,8 +135,7 @@ export async function modelList(opts: {
   }
 
   if (opts.text) {
-    for (const provider of providers) {
-      const details = await getProviderModels(provider)
+    for (const [, details] of providerEntries) {
       process.stdout.write(`${details.displayName}:\n`)
       process.stdout.write(`  default: ${details.defaultModel}\n`)
       for (const model of details.models) {
