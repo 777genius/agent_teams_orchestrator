@@ -488,6 +488,50 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
   })
 
+  test('does not treat sourceImportKey identity collisions as duplicates or upgrades', async () => {
+    const taskId = 'task-opencode-source-identity-guard'
+    expect((await importOpenCodeChanges(taskId, [openCodeChange()])).importedEventCount).toBe(1)
+
+    const changedPath = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        filePath: join(repoDir, 'src/other-opencode.ts'),
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-path-collision',
+        snapshotSource: 'opencode',
+      }),
+    ])
+    expect(changedPath.importedEventCount).toBe(0)
+    expect(changedPath.skippedDuplicateCount).toBe(0)
+    expect(changedPath.skippedUnsafeCount).toBe(1)
+    expect(changedPath.diagnostics).toContain(
+      `OpenCode ledger import skipped incompatible source identity for ${openCodeChange().sourceImportKey}.`,
+    )
+
+    const missingMessageIdentity = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-missing-message',
+        snapshotSource: 'opencode',
+        sourceMessageId: undefined,
+      }),
+    ])
+    expect(missingMessageIdentity.importedEventCount).toBe(0)
+    expect(missingMessageIdentity.skippedDuplicateCount).toBe(0)
+    expect(missingMessageIdentity.skippedUnsafeCount).toBe(1)
+    expect(missingMessageIdentity.diagnostics).toContain(
+      `OpenCode ledger import skipped incompatible source identity for ${openCodeChange().sourceImportKey}.`,
+    )
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(1)
+  })
+
   test('keeps concurrent OpenCode duplicate decisions inside the task writer lock', async () => {
     const taskId = 'task-opencode-concurrent-duplicates'
     const change = openCodeChange({

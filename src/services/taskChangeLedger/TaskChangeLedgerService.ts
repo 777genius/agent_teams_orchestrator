@@ -2323,9 +2323,16 @@ async function readExistingSourceImportProjection(
 
 function compatibleSourceIdentity(existing: ExistingSourceImportProjection, incoming: TaskChangeEventV1): boolean {
   return (
-    (!existing.sourceSessionId || !incoming.sourceSessionId || existing.sourceSessionId === incoming.sourceSessionId) &&
-    (!existing.sourcePartId || !incoming.sourcePartId || existing.sourcePartId === incoming.sourcePartId) &&
-    (!existing.sourceMessageId || !incoming.sourceMessageId || existing.sourceMessageId === incoming.sourceMessageId)
+    existing.relativePath === incoming.relativePath &&
+    !!existing.sourceSessionId &&
+    !!incoming.sourceSessionId &&
+    existing.sourceSessionId === incoming.sourceSessionId &&
+    !!existing.sourcePartId &&
+    !!incoming.sourcePartId &&
+    existing.sourcePartId === incoming.sourcePartId &&
+    !!existing.sourceMessageId &&
+    !!incoming.sourceMessageId &&
+    existing.sourceMessageId === incoming.sourceMessageId
   )
 }
 
@@ -2338,6 +2345,25 @@ function shouldAppendEvidenceUpgrade(
     existing.taskId === incoming.taskId &&
     existing.operation === incoming.operation &&
     compatibleSourceIdentity(existing, incoming)
+  )
+}
+
+function compatibleImportedChangeSourceIdentity(
+  existing: ExistingSourceImportProjection,
+  incoming: ImportedOpenCodeFileChange,
+  incomingRelativePath: string,
+): boolean {
+  return (
+    existing.relativePath === incomingRelativePath &&
+    !!existing.sourceSessionId &&
+    !!incoming.sourceSessionId &&
+    existing.sourceSessionId === incoming.sourceSessionId &&
+    !!existing.sourcePartId &&
+    !!incoming.sourcePartId &&
+    existing.sourcePartId === incoming.sourcePartId &&
+    !!existing.sourceMessageId &&
+    !!incoming.sourceMessageId &&
+    existing.sourceMessageId === incoming.sourceMessageId
   )
 }
 
@@ -2411,9 +2437,15 @@ export async function importTaskChangeLedgerEvents(params: {
               continue
             }
           }
+          const relativePath = displayRelativePath(filePath, params.workspaceRoot)
           const operation = change.operation ??
             operationForContents(change.beforeContent, change.afterContent)
           const existing = existingProjection.get(change.sourceImportKey)
+          if (existing && !compatibleImportedChangeSourceIdentity(existing, change, relativePath)) {
+            skippedUnsafeCount += 1
+            diagnostics.push(`OpenCode ledger import skipped incompatible source identity for ${change.sourceImportKey}.`)
+            continue
+          }
           const incomingRank = evidenceRankForImportedChange(change, operation)
           if (existing && existing.operation !== operation) {
             skippedUnsafeCount += 1
@@ -2466,7 +2498,7 @@ export async function importTaskChangeLedgerEvents(params: {
             workspaceRoot: params.workspaceRoot,
             ...worktreeMetadata,
             filePath,
-            relativePath: displayRelativePath(filePath, params.workspaceRoot),
+            relativePath,
             timestamp: change.timestamp,
             toolStatus: params.toolStatus,
             before,
