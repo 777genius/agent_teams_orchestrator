@@ -149,6 +149,84 @@ describe('OpenCodeSnapshotGitStoreReader', () => {
     expect(result.diagnostics.join('\n')).toContain('snapshot-path-not-touched: other.txt')
   })
 
+  test('does not spend blob budget on snapshot paths outside strict toolpart candidates', async () => {
+    await mkdir(path.join(worktree, 'aaa-extra'), { recursive: true })
+    await mkdir(path.join(worktree, 'zzz-candidates'), { recursive: true })
+    for (let index = 0; index < 40; index += 1) {
+      await writeFile(path.join(worktree, 'aaa-extra', `${index}.txt`), 'x'.repeat(4096))
+    }
+    await writeFile(path.join(worktree, 'zzz-candidates', 'one.txt'), 'one-before\n')
+    await writeFile(path.join(worktree, 'zzz-candidates', 'two.txt'), 'two-before\n')
+    const before = writeTree()
+
+    for (let index = 0; index < 40; index += 1) {
+      await writeFile(path.join(worktree, 'aaa-extra', `${index}.txt`), 'y'.repeat(4096))
+    }
+    await writeFile(path.join(worktree, 'zzz-candidates', 'one.txt'), 'one-after\n')
+    await writeFile(path.join(worktree, 'zzz-candidates', 'two.txt'), 'two-after\n')
+    const after = writeTree()
+
+    const result = await reader().read(baseInput({
+      fromSnapshot: before,
+      toSnapshot: after,
+      touchedRelativePaths: ['zzz-candidates/one.txt', 'zzz-candidates/two.txt'],
+      limits: {
+        maxFiles: 20,
+        maxBytesPerTextFile: 1024 * 1024,
+        maxTotalBytes: 16 * 1024,
+        timeoutMs: 3000,
+      },
+    }))
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    const byPath = new Map(result.files.map(file => [file.relativePath, file]))
+    expect(result.files.map(file => file.relativePath).sort()).toEqual([
+      'zzz-candidates/one.txt',
+      'zzz-candidates/two.txt',
+    ])
+    expect(byPath.get('zzz-candidates/one.txt')?.beforeContent).toBe('one-before\n')
+    expect(byPath.get('zzz-candidates/one.txt')?.afterContent).toBe('one-after\n')
+    expect(byPath.get('zzz-candidates/two.txt')?.beforeContent).toBe('two-before\n')
+    expect(byPath.get('zzz-candidates/two.txt')?.afterContent).toBe('two-after\n')
+    expect(result.diagnostics.filter(item => item.startsWith('snapshot-path-not-touched: aaa-extra/'))).toHaveLength(40)
+    expect(result.diagnostics.join('\n')).not.toContain('snapshot-total-byte-cap-exceeded')
+  })
+
+  test('caps matching candidate files before fetching snapshot blobs', async () => {
+    await mkdir(path.join(worktree, 'src'), { recursive: true })
+    for (let index = 0; index < 5; index += 1) {
+      await writeFile(path.join(worktree, 'src', `${index}.txt`), `before-${index}\n`)
+    }
+    const before = writeTree()
+    for (let index = 0; index < 5; index += 1) {
+      await writeFile(path.join(worktree, 'src', `${index}.txt`), `after-${index}\n`)
+    }
+    const after = writeTree()
+
+    const result = await reader().read(baseInput({
+      fromSnapshot: before,
+      toSnapshot: after,
+      touchedRelativePaths: ['src/0.txt', 'src/1.txt', 'src/2.txt', 'src/3.txt', 'src/4.txt'],
+      limits: {
+        maxFiles: 2,
+        maxBytesPerTextFile: 1024 * 1024,
+        maxTotalBytes: 1024 * 1024,
+        timeoutMs: 3000,
+      },
+    }))
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    expect(result.files).toHaveLength(2)
+    expect(result.files.map(file => file.relativePath)).toEqual(['src/0.txt', 'src/1.txt'])
+    expect(result.diagnostics.join('\n')).toContain('snapshot-file-cap: captured first 2 snapshot files; remaining files skipped.')
+  })
+
   test('scopes snapshot diff to session directory and keeps outside touched paths metadata-only', async () => {
     await mkdir(path.join(worktree, 'src'), { recursive: true })
     await writeFile(path.join(worktree, 'src/file.txt'), 'src-before\n')
