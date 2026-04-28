@@ -279,6 +279,47 @@ describe('OpenCodeSnapshotEvidenceProviderService', () => {
     expect(result.diagnostics.join('\n')).toContain('toolpart 000-step-start is outside OpenCode snapshot windows')
   })
 
+  test('diagnoses touched paths outside a subdirectory OpenCode session scope', async () => {
+    await mkdir(path.join(worktree, 'packages/a'), { recursive: true })
+    await mkdir(path.join(worktree, 'packages/b'), { recursive: true })
+    await writeFile(path.join(worktree, 'packages/a/inside.ts'), 'inside before\n')
+    await writeFile(path.join(worktree, 'packages/b/outside.ts'), 'outside before\n')
+    const before = writeTree()
+    await writeFile(path.join(worktree, 'packages/a/inside.ts'), 'inside after\n')
+    await writeFile(path.join(worktree, 'packages/b/outside.ts'), 'outside after\n')
+    const after = writeTree()
+    const offline = {
+      ...offlineFixture(before, after),
+      sessionIdentity: {
+        ...offlineFixture(before, after).sessionIdentity!,
+        directory: path.join(worktree, 'packages/a'),
+      },
+    }
+
+    const result = await provider().readSessionEvidence({
+      workspaceRoot: worktree,
+      sessionRecord: sessionRecord(),
+      offline,
+      changes: [
+        change({
+          filePath: path.join(worktree, 'packages/b/outside.ts'),
+          relativePath: 'packages/b/outside.ts',
+          sourceImportKey: `opencode\0session-1\0part-edit\0${path.join(worktree, 'packages/b/outside.ts')}`,
+        }),
+      ],
+      touchedRelativePaths: ['packages/b/outside.ts'],
+    })
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    expect(result.files).toEqual([])
+    expect(result.diagnostics.join('\n')).toContain(
+      'snapshot-touched-path-outside-session-directory: packages/b/outside.ts is outside OpenCode session directory scope packages/a.',
+    )
+  })
+
   test('fails closed when session identity is unsupported or workspace mismatches', async () => {
     await mkdir(path.join(worktree, 'src'), { recursive: true })
     await writeFile(path.join(worktree, 'src/file.ts'), 'before\n')

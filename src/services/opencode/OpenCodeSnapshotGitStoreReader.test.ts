@@ -316,6 +316,16 @@ describe('OpenCode snapshot raw parsers', () => {
     expect(diagnostics.join('\n')).toContain('snapshot-raw-diff-malformed')
   })
 
+  test('rejects unsupported non-SHA-1 raw object ids with an explicit diagnostic', () => {
+    const diagnostics: string[] = []
+    const objectA = 'a'.repeat(64)
+    const objectB = 'b'.repeat(64)
+    const raw = Buffer.from(`:100644 100644 ${objectA} ${objectB} M\0file.txt\0`)
+
+    expect(parseOpenCodeSnapshotRawDiffZ(raw, diagnostics)).toEqual([])
+    expect(diagnostics.join('\n')).toContain('snapshot-object-id-algorithm-unsupported')
+  })
+
   test('skips invalid UTF-8 path bytes with diagnostic', () => {
     const objectA = 'a'.repeat(40)
     const objectB = 'b'.repeat(40)

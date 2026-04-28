@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import path from 'node:path'
 
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import {
@@ -106,6 +107,27 @@ function appendPatchHintDiagnostics(
   }
 }
 
+function appendSessionDirectoryScopeDiagnostics(input: SnapshotSessionEvidenceInput, touchedRelativePaths: string[], diagnostics: string[]): void {
+  const identity = input.offline.sessionIdentity
+  const worktree = identity?.project?.worktree
+  const directory = identity?.directory
+  if (!worktree || !directory) {
+    return
+  }
+  const scopeRelativePath = normalizeOpenCodeSnapshotRelativePath(path.relative(worktree, directory).replace(/\\/g, '/'))
+  if (!scopeRelativePath) {
+    return
+  }
+  const scopePrefix = `${scopeRelativePath}/`
+  for (const relativePath of touchedRelativePaths) {
+    if (relativePath !== scopeRelativePath && !relativePath.startsWith(scopePrefix)) {
+      diagnostics.push(
+        `snapshot-touched-path-outside-session-directory: ${relativePath} is outside OpenCode session directory scope ${scopeRelativePath}.`,
+      )
+    }
+  }
+}
+
 export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshotEvidenceProvider {
   readonly adapterVersion = ADAPTER_VERSION
 
@@ -168,6 +190,7 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
       const touchedRelativePaths = [...new Set(changes
         .map(change => normalizeOpenCodeSnapshotRelativePath(change.relativePath))
         .filter((relativePath): relativePath is string => !!relativePath))]
+      appendSessionDirectoryScopeDiagnostics(input, touchedRelativePaths, diagnostics)
       appendPatchHintDiagnostics(input, window, touchedRelativePaths, diagnostics)
       const read = await this.gitStoreReader.read({
         profileRootKey: input.sessionRecord.profileRootKey,

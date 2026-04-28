@@ -107,6 +107,7 @@ type BlobContent =
 
 const ABSENT_OBJECT_ID = '0000000000000000000000000000000000000000'
 const RAW_HEADER_RE = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z][0-9]*)$/
+const RAW_HEADER_HEX_OBJECT_RE = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z][0-9]*)$/
 const FULL_OBJECT_ID_RE = /^[0-9a-f]{40}$/
 const REGULAR_FILE_MODES = new Set(['100644', '100755'])
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
@@ -287,6 +288,14 @@ export function parseOpenCodeSnapshotRawDiffZ(buffer: Buffer, diagnostics: strin
     }
     const match = RAW_HEADER_RE.exec(header)
     if (!match) {
+      const hexObjectMatch = RAW_HEADER_HEX_OBJECT_RE.exec(header)
+      if (
+        hexObjectMatch &&
+        ((hexObjectMatch[3]?.length ?? 0) > 40 || (hexObjectMatch[4]?.length ?? 0) > 40)
+      ) {
+        diagnostics.push('snapshot-object-id-algorithm-unsupported: raw diff object ids are not 40-character SHA-1 ids.')
+        continue
+      }
       diagnostics.push(`snapshot-raw-diff-malformed: unsupported raw diff header ${header}.`)
       continue
     }
