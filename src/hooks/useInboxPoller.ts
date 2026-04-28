@@ -38,11 +38,16 @@ import {
   ensureBackendsRegistered,
   getBackendByType,
 } from '../utils/swarm/backends/registry.js'
-import type { PaneBackendType } from '../utils/swarm/backends/types.js'
+import {
+  isPaneBackend,
+  type BackendType,
+} from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
+import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
 import {
+  readTeamFile,
   removeTeammateFromTeamFile,
   setMemberMode,
 } from '../utils/swarm/teamHelpers.js'
@@ -1685,24 +1690,57 @@ export function useInboxPoller({
           const parsed = isShutdownApproved(m.text)
           if (!parsed) continue
 
-          if (parsed.paneId && parsed.backendType) {
+          if (
+            parsed.paneId &&
+            (parsed.backendType || parsed.paneId.trim().startsWith('process:'))
+          ) {
             void (async () => {
               try {
-                await ensureBackendsRegistered()
-                const insideTmux = await isInsideTmux()
-                const backend = getBackendByType(
-                  parsed.backendType as PaneBackendType,
-                )
-                const success = await backend?.killPane(
-                  parsed.paneId!,
-                  !insideTmux,
-                )
-                logForDebugging(
-                  `[InboxPoller] Killed pane ${parsed.paneId} for ${parsed.from}: ${success}`,
-                )
+                const backendType = parsed.backendType as BackendType | undefined
+                if (
+                  backendType === 'process' ||
+                  parsed.paneId!.trim().startsWith('process:')
+                ) {
+                  const expectedAgentId = Object.entries(
+                    currentAppState.teamContext?.teammates ?? {},
+                  ).find(([, teammate]) => teammate.name === parsed.from)?.[0] ??
+                    (teamName
+                      ? readTeamFile(teamName)?.members.find(
+                          member => member.name === parsed.from,
+                        )?.agentId
+                      : undefined)
+                  if (!expectedAgentId || !teamName) {
+                    logForDebugging(
+                      `[InboxPoller] Skipping process kill for ${parsed.from}: expected agent id or team name unavailable`,
+                    )
+                    return
+                  }
+                  const success = await killProcessBackendRuntime(parsed.paneId, {
+                    expectedAgentId,
+                    teamName,
+                  })
+                  logForDebugging(
+                    `[InboxPoller] Killed process runtime ${parsed.paneId} for ${parsed.from}: ${success}`,
+                  )
+                } else if (backendType && isPaneBackend(backendType)) {
+                  await ensureBackendsRegistered()
+                  const insideTmux = await isInsideTmux()
+                  const backend = getBackendByType(backendType)
+                  const success = await backend?.killPane(
+                    parsed.paneId!,
+                    !insideTmux,
+                  )
+                  logForDebugging(
+                    `[InboxPoller] Killed pane ${parsed.paneId} for ${parsed.from}: ${success}`,
+                  )
+                } else {
+                  logForDebugging(
+                    `[InboxPoller] Skipping runtime kill for ${parsed.from}: backendType=${parsed.backendType}`,
+                  )
+                }
               } catch (error) {
                 logForDebugging(
-                  `[InboxPoller] Failed to kill pane for ${parsed.from}: ${error}`,
+                  `[InboxPoller] Failed to kill runtime for ${parsed.from}: ${error}`,
                 )
               }
             })()

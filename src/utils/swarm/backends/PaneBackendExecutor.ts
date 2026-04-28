@@ -24,8 +24,8 @@ import {
 import { assignTeammateColor } from '../teammateLayoutManager.js'
 import { isInsideTmux } from './detection.js'
 import type {
-  BackendType,
   PaneBackend,
+  PaneBackendType,
   TeammateExecutor,
   TeammateMessage,
   TeammateSpawnConfig,
@@ -54,7 +54,7 @@ function getCurrentProvider(): 'anthropic' | 'codex' | 'gemini' {
  * - isActive(): Checks if the pane is still running
  */
 export class PaneBackendExecutor implements TeammateExecutor {
-  readonly type: BackendType
+  readonly type: PaneBackendType
 
   private backend: PaneBackend
   private context: ToolUseContext | null = null

@@ -26,6 +26,7 @@ type DuplicateReason = 'already_running' | 'bootstrap_pending'
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
 const originalProbe = openCodeProvisioningProbe.probe
 const originalEnsureSession = openCodeSessionBridge.ensureSession
+const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalAnswerPermission = openCodeSessionBridge.answerPermission
@@ -158,6 +159,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     mock.clearAllMocks()
     __resetAppMcpToolProofCacheForTests()
     mockRequiredMcpTools()
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
+      ok: true,
+      runtimePid: record.runtimePid,
+      status: 'present',
+      connected: true,
+      diagnostics: [],
+    })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
     tempConfigDir = await mkdtemp(join(tmpdir(), 'mixed-opencode-handoff-'))
     process.env.CLAUDE_CONFIG_DIR = tempConfigDir
     registeredMemberNames = new Set()
@@ -244,6 +252,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     __resetAppMcpToolProofCacheForTests()
     openCodeProvisioningProbe.probe = originalProbe
     openCodeSessionBridge.ensureSession = originalEnsureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
     openCodeSessionBridge.promptAsync = originalPromptAsync
     openCodeSessionBridge.reconcileSession = originalReconcileSession
     openCodeSessionBridge.answerPermission = originalAnswerPermission

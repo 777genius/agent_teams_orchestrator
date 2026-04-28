@@ -155,6 +155,7 @@ export class TeamBootstrapStateStore {
       status: BootstrapMemberState['status']
       agentId?: string
       backendType?: string
+      runtimePid?: number
       failureReason?: string
     },
     now: () => number,
@@ -171,6 +172,9 @@ export class TeamBootstrapStateStore {
               lastObservedAt: timestamp,
               ...(result.agentId ? { agentId: result.agentId } : {}),
               ...(result.backendType ? { backendType: result.backendType } : {}),
+              ...(typeof result.runtimePid === 'number' && result.runtimePid > 0
+                ? { runtimePid: result.runtimePid }
+                : {}),
               ...(result.failureReason
                 ? { failureReason: result.failureReason }
                 : {}),

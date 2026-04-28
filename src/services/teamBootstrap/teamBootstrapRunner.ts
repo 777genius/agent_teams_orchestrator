@@ -500,6 +500,12 @@ export async function runTeamBootstrap(params: {
               continue
             }
 
+            const runtimePid =
+              'runtime_pid' in result.data &&
+              typeof result.data.runtime_pid === 'number' &&
+              result.data.runtime_pid > 0
+                ? result.data.runtime_pid
+                : undefined
             await stateStore.markMemberResult(
               member.displayName,
               {
@@ -510,6 +516,7 @@ export async function runTeamBootstrap(params: {
                   typeof result.data.backend_type === 'string'
                     ? result.data.backend_type
                     : undefined,
+                runtimePid,
               },
               now,
             )

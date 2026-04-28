@@ -21,8 +21,9 @@ import { getModeColor, type PermissionMode, permissionModeFromString, permission
 import { jsonStringify } from '../../utils/slowOperations.js';
 import { IT2_COMMAND, isInsideTmuxSync } from '../../utils/swarm/backends/detection.js';
 import { ensureBackendsRegistered, getBackendByType, getCachedBackend } from '../../utils/swarm/backends/registry.js';
-import type { PaneBackendType } from '../../utils/swarm/backends/types.js';
+import { isPaneBackend, type BackendType } from '../../utils/swarm/backends/types.js';
 import { getSwarmSocketName, TMUX_COMMAND } from '../../utils/swarm/constants.js';
+import { killProcessBackendRuntime } from '../../utils/swarm/processBackend.js';
 import { addHiddenPaneId, removeHiddenPaneId, removeMemberFromTeam, setMemberMode, setMultipleMemberModes } from '../../utils/swarm/teamHelpers.js';
 import { listTasks, type Task, unassignTeammateTasks } from '../../utils/tasks.js';
 import { getTeammateStatuses, type TeammateStatus, type TeamSummary } from '../../utils/teamDiscovery.js';
@@ -544,11 +545,21 @@ function _temp2(task_0) {
 function _temp(prev) {
   return !prev;
 }
-async function killTeammate(paneId: string, backendType: PaneBackendType | undefined, teamName: string, teammateId: string, teammateName: string, setAppState: (f: (prev: AppState) => AppState) => void): Promise<void> {
+async function killTeammate(paneId: string, backendType: BackendType | undefined, teamName: string, teammateId: string, teammateName: string, setAppState: (f: (prev: AppState) => AppState) => void): Promise<void> {
   // Kill the pane using the backend that created it (handles -s / -L flags correctly).
   // Wrapped in try/catch so cleanup (removeMemberFromTeam, unassignTeammateTasks,
-  // setAppState) always runs — matches useInboxPoller.ts error isolation.
-  if (backendType) {
+  // setAppState) always runs - matches useInboxPoller.ts error isolation.
+  if (backendType === 'process' || paneId.trim().startsWith('process:')) {
+    try {
+      const killed = await killProcessBackendRuntime(paneId, {
+        expectedAgentId: teammateId,
+        teamName,
+      });
+      logForDebugging(`[TeamsDialog] Killed process runtime ${paneId}: ${killed}`);
+    } catch (error) {
+      logForDebugging(`[TeamsDialog] Failed to kill process runtime ${paneId}: ${error}`);
+    }
+  } else if (backendType && isPaneBackend(backendType)) {
     try {
       // Use ensureBackendsRegistered (not detectAndGetBackend) — this process may
       // be a teammate that never ran detection, but we only need class imports
@@ -608,7 +619,12 @@ async function killTeammate(paneId: string, backendType: PaneBackendType | undef
   });
   logForDebugging(`[TeamsDialog] Removed ${teammateId} from teamContext`);
 }
-async function viewTeammateOutput(paneId: string, backendType: PaneBackendType | undefined): Promise<void> {
+async function viewTeammateOutput(paneId: string, backendType: BackendType | undefined): Promise<void> {
+  const trimmedPaneId = paneId.trim();
+  if (backendType === 'process' || backendType === 'in-process' || trimmedPaneId === 'in-process' || trimmedPaneId.startsWith('process:')) {
+    logForDebugging(`[TeamsDialog] No pane output to focus for ${backendType} teammate ${paneId}`);
+    return;
+  }
   if (backendType === 'iterm2') {
     // -s is required to target a specific session (ITermBackend.ts:216-217)
     await execFileNoThrow(IT2_COMMAND, ['session', 'focus', '-s', paneId]);
