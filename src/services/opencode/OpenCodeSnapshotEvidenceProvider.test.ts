@@ -252,6 +252,33 @@ describe('OpenCodeSnapshotEvidenceProviderService', () => {
     expect(result.diagnostics.join('\n')).toContain('toolpart part-edit is outside OpenCode snapshot windows')
   })
 
+  test('requires toolparts to be strictly inside a snapshot step window', async () => {
+    await mkdir(path.join(worktree, 'src'), { recursive: true })
+    await writeFile(path.join(worktree, 'src/file.ts'), 'before\n')
+    const before = writeTree()
+    await writeFile(path.join(worktree, 'src/file.ts'), 'after\n')
+    const after = writeTree()
+
+    const result = await provider().readSessionEvidence({
+      workspaceRoot: worktree,
+      sessionRecord: sessionRecord(),
+      offline: offlineFixture(before, after),
+      changes: [
+        change({
+          sourcePartId: '000-step-start',
+        }),
+      ],
+      touchedRelativePaths: ['src/file.ts'],
+    })
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    expect(result.files).toEqual([])
+    expect(result.diagnostics.join('\n')).toContain('toolpart 000-step-start is outside OpenCode snapshot windows')
+  })
+
   test('fails closed when session identity is unsupported or workspace mismatches', async () => {
     await mkdir(path.join(worktree, 'src'), { recursive: true })
     await writeFile(path.join(worktree, 'src/file.ts'), 'before\n')

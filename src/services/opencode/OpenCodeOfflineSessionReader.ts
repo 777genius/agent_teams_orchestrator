@@ -3,6 +3,11 @@ import envPaths from 'env-paths'
 import { stat } from 'node:fs/promises'
 import path from 'node:path'
 
+import {
+  areSameOpenCodeWorkspace,
+  isOpenCodeWorkspaceSameOrDescendant,
+} from './OpenCodeBridgePath.js'
+
 import type { OpenCodeMessage, OpenCodeSessionRecord } from './types.js'
 
 export type OpenCodeSqliteMessageRow = {
@@ -154,15 +159,6 @@ async function readSqliteFingerprint(dbPath: string): Promise<OpenCodeSqliteFing
   } catch {
     return null
   }
-}
-
-function isSameOrDescendantPath(childPath: string, parentPath: string): boolean {
-  const rel = path.relative(parentPath, childPath)
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
-}
-
-function sameResolvedPath(left: string, right: string): boolean {
-  return path.resolve(left) === path.resolve(right)
 }
 
 export class OpenCodeOfflineSessionReader {
@@ -435,13 +431,16 @@ export class OpenCodeOfflineSessionReader {
       if (!session.directory) {
         unsupportedReasons.push('snapshot-project-identity-missing')
       }
-      if (project?.worktree && session.directory && !isSameOrDescendantPath(
-        path.resolve(session.directory),
-        path.resolve(project.worktree),
-      )) {
+      if (project?.worktree && session.directory && !isOpenCodeWorkspaceSameOrDescendant({
+        parentWorkspaceRoot: project.worktree,
+        childPath: session.directory,
+      })) {
         unsupportedReasons.push('snapshot-session-directory-outside-worktree')
       }
-      if (project?.worktree && !sameResolvedPath(record.projectPath, project.worktree)) {
+      if (project?.worktree && !areSameOpenCodeWorkspace({
+        expectedWorkspaceRoot: record.projectPath,
+        recordProjectPath: project.worktree,
+      })) {
         unsupportedReasons.push('snapshot-project-worktree-mismatch')
       }
 

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import path from 'node:path'
 
+import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import {
   type OpenCodeSnapshotEvidenceFile,
   type OpenCodeSnapshotEvidenceProvider,
@@ -15,10 +15,6 @@ import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeRe
 
 const ADAPTER_VERSION = 2
 const SNAPSHOT_SHAPE_FINGERPRINT = `opencode-snapshot-git-store-v${ADAPTER_VERSION}`
-
-function sameResolvedPath(left: string, right: string): boolean {
-  return path.resolve(left) === path.resolve(right)
-}
 
 function fingerprintWindow(windowId: string, fromSnapshot: string, toSnapshot: string): string {
   return createHash('sha256')
@@ -70,8 +66,8 @@ function groupChangesByWindow(input: SnapshotSessionEvidenceInput, diagnostics: 
       continue
     }
     const matching = windows.filter(window =>
-      order >= window.startPartOrder &&
-      order <= window.finishPartOrder
+      order > window.startPartOrder &&
+      order < window.finishPartOrder
     )
     if (matching.length === 0) {
       diagnostics.push(`snapshot-window-missing: toolpart ${change.sourcePartId} is outside OpenCode snapshot windows for message ${change.sourceMessageId}.`)
@@ -117,7 +113,10 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
         ],
       }
     }
-    if (!sameResolvedPath(input.workspaceRoot, identity.project.worktree)) {
+    if (!areSameOpenCodeWorkspace({
+      expectedWorkspaceRoot: input.workspaceRoot,
+      recordProjectPath: identity.project.worktree,
+    })) {
       return {
         supported: false,
         code: 'snapshot-boundary-unavailable',
