@@ -267,7 +267,7 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
     insertPart(db, { id: 'bob-user-part-1', messageId: 'bob-user-1', sessionId: 'session-bob', time: 900, data: userTextPart(bobTaskPrompt) })
     insertMessage(db, { id: 'bob-assistant-1', sessionId: 'session-bob', time: 1_000, data: messageData('bob-assistant-1', 'bob-user-1') })
     insertPart(db, {
-      id: 'bob-write-index',
+      id: 'bob-0001-write-index',
       messageId: 'bob-assistant-1',
       sessionId: 'session-bob',
       time: 1_000,
@@ -279,7 +279,7 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
       }),
     })
     insertPart(db, {
-      id: 'bob-write-state',
+      id: 'bob-0002-write-state',
       messageId: 'bob-assistant-1',
       sessionId: 'session-bob',
       time: 1_010,
@@ -291,7 +291,7 @@ async function createOpenCodeSqliteFixture(dataDir: string, workspaceRoot: strin
       }),
     })
     insertPart(db, {
-      id: 'bob-edit-state',
+      id: 'bob-0003-edit-state',
       messageId: 'bob-assistant-1',
       sessionId: 'session-bob',
       time: 1_020,
