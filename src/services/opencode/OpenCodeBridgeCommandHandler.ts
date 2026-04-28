@@ -23,7 +23,10 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
-import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
+import {
+  OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
+  openCodeLedgerBridgeService,
+} from './OpenCodeLedgerBridgeService.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -924,9 +927,6 @@ async function runReadiness(envelope: BridgeEnvelope) {
         executionOutcome,
         skippedAppMcpToolProof(),
         requireSelectedModel,
-      )
-      const responseObservation = reconcileFailedObservation(
-        diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
       )
       return {
         snapshot,
@@ -1929,6 +1929,7 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
           minVersion: 1,
           currentVersion: 1,
           supportedCommands: SUPPORTED_COMMANDS,
+          opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
         },
         runtime: {
           ...createRuntimePreconditionSnapshot(snapshot),

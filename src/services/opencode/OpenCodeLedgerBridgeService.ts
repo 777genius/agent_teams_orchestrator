@@ -42,6 +42,7 @@ export type OpenCodeLedgerBackfillOutcome =
 export type OpenCodeLedgerBridgeBackfillResult = {
   schemaVersion: 1
   providerId: 'opencode'
+  opencodeTaskLedgerEvidenceContractVersion: number
   teamName: string
   taskId?: string
   projectDir?: string
@@ -86,6 +87,7 @@ const MAX_SCANNED_RECORDS = 50
 const MAX_METADATA_TEXT_BLOB_BYTES = 1024 * 1024
 const DELIVERY_CONTEXT_FILE_NAME = 'delivery-context.json'
 const DELIVERY_CONTEXT_TEMP_PREFIX = 'claude-team-opencode-ledger-context-'
+export const OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION = 1
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -540,6 +542,7 @@ export class OpenCodeLedgerBridgeService {
     const result: OpenCodeLedgerBridgeBackfillResult = {
       schemaVersion: 1,
       providerId: 'opencode',
+      opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
       teamName: params.teamName,
       ...(params.taskId ? { taskId: params.taskId } : {}),
       ...(params.projectDir ? { projectDir: params.projectDir } : {}),

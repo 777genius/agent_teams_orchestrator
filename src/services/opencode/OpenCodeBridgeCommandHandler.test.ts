@@ -382,6 +382,17 @@ function createDeferred<T>() {
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {}),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
+  })
+
   test('ignores legacy evidenceMode on task ledger backfill bridge commands', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     let captured: Parameters<typeof openCodeLedgerBridgeService.backfill>[0] | null = null
@@ -390,6 +401,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return {
         schemaVersion: 1,
         providerId: 'opencode',
+        opencodeTaskLedgerEvidenceContractVersion: 1,
         teamName: input.teamName,
         ...(input.taskId ? { taskId: input.taskId } : {}),
         dryRun: input.dryRun === true,
