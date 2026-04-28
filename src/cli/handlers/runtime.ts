@@ -612,6 +612,7 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
   projectDir?: string
   workspaceRoot?: string
   deliveryContext?: string
+  deliveryContextHash?: string
   attributionMode?: string
   dryRun?: boolean
   output?: string
@@ -625,6 +626,7 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
     projectDir: opts.projectDir,
     workspaceRoot: opts.workspaceRoot,
     deliveryContextPath: opts.deliveryContext,
+    deliveryContextHash: opts.deliveryContextHash,
     attributionMode: opts.attributionMode === 'strict-delivery' ? 'strict-delivery' : 'compatible',
     dryRun: opts.dryRun === true,
   })

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat, readFile, stat } from 'node:fs/promises'
+import { lstat, readFile, realpath, stat } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 
 import {
@@ -73,6 +74,7 @@ type BackfillParams = {
   projectDir?: string
   workspaceRoot?: string
   deliveryContextPath?: string
+  deliveryContextHash?: string
   attributionMode?: OpenCodeLedgerAttributionMode
   evidenceMode?: OpenCodeEvidencePipelineMode
   dryRun?: boolean
@@ -82,6 +84,8 @@ type SessionStorePort = Pick<typeof openCodeSessionStore, 'list'>
 
 const MAX_SCANNED_RECORDS = 50
 const MAX_METADATA_TEXT_BLOB_BYTES = 1024 * 1024
+const DELIVERY_CONTEXT_FILE_NAME = 'delivery-context.json'
+const DELIVERY_CONTEXT_TEMP_PREFIX = 'claude-team-opencode-ledger-context-'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -241,6 +245,15 @@ function sha256Buffer(content: Buffer): string {
 
 function sha256String(content: string): string {
   return createHash('sha256').update(content).digest('hex')
+}
+
+function isSha256Hex(value: string | undefined): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)
+}
+
+function isSameOrDescendantPath(childPath: string, parentPath: string): boolean {
+  const relative = path.relative(parentPath, childPath)
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
 function sqliteFingerprintToString(fingerprint: {
@@ -566,7 +579,11 @@ export class OpenCodeLedgerBridgeService {
       }
     }
 
-    const deliveryContextRead = await this.readOptionalDeliveryContext(params.deliveryContextPath, result.diagnostics)
+    const deliveryContextRead = await this.readOptionalDeliveryContext(
+      params.deliveryContextPath,
+      params.deliveryContextHash,
+      result.diagnostics,
+    )
     const deliveryContext = deliveryContextRead.context
     result.deliveryLedgerFingerprint = deliveryContextRead.fingerprint
     let strictDeliveryRecords: StrictDeliveryRecord[] = []
@@ -813,24 +830,61 @@ export class OpenCodeLedgerBridgeService {
 
   private async readOptionalDeliveryContext(
     deliveryContextPath: string | undefined,
+    expectedHash: string | undefined,
     diagnostics: string[],
   ): Promise<{ context: OpenCodeDeliveryContextV1 | null; fingerprint?: string }> {
     if (!deliveryContextPath) {
       return { context: null }
     }
     try {
-      const raw = await readFile(deliveryContextPath, 'utf8')
+      if (!path.isAbsolute(deliveryContextPath)) {
+        diagnostics.push('OpenCode delivery context path rejected because it is not absolute.')
+        return { context: null }
+      }
+      if (path.basename(deliveryContextPath) !== DELIVERY_CONTEXT_FILE_NAME) {
+        diagnostics.push('OpenCode delivery context path rejected because the file name is not delivery-context.json.')
+        return { context: null }
+      }
+      if (!isSha256Hex(expectedHash)) {
+        diagnostics.push('OpenCode delivery context expected hash is missing or invalid.')
+        return { context: null }
+      }
+      const tempRoot = await realpath(os.tmpdir())
+      const parentRealPath = await realpath(path.dirname(deliveryContextPath))
+      if (
+        !path.basename(parentRealPath).startsWith(DELIVERY_CONTEXT_TEMP_PREFIX) ||
+        !isSameOrDescendantPath(parentRealPath, tempRoot)
+      ) {
+        diagnostics.push('OpenCode delivery context path rejected because it is outside the trusted app temp directory.')
+        return { context: null }
+      }
+      const fileRealPath = await realpath(deliveryContextPath)
+      if (path.dirname(fileRealPath) !== parentRealPath) {
+        diagnostics.push('OpenCode delivery context path rejected because the file resolves outside its trusted temp directory.')
+        return { context: null }
+      }
+      const parentStat = await stat(parentRealPath)
+      if (process.platform !== 'win32' && (parentStat.mode & 0o077) !== 0) {
+        diagnostics.push('OpenCode delivery context path rejected because the parent temp directory is not private.')
+        return { context: null }
+      }
+      const raw = await readFile(fileRealPath, 'utf8')
       if (Buffer.byteLength(raw, 'utf8') > 512 * 1024) {
         diagnostics.push('OpenCode delivery context exceeded size cap.')
         return { context: null }
       }
+      const fingerprint = sha256String(raw)
+      if (fingerprint !== expectedHash.toLowerCase()) {
+        diagnostics.push('OpenCode delivery context hash mismatch.')
+        return { context: null, fingerprint }
+      }
       const parsed = normalizeDeliveryContext(JSON.parse(raw) as unknown)
       if (!parsed) {
-        diagnostics.push('OpenCode delivery context failed schema validation.')
+        diagnostics.push('unsupported-delivery-context-schema: OpenCode delivery context failed schema validation.')
       }
       return {
         context: parsed,
-        fingerprint: sha256String(raw),
+        fingerprint,
       }
     } catch (error) {
       diagnostics.push(`OpenCode delivery context read failed - ${error instanceof Error ? error.message : String(error)}`)

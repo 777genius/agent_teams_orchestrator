@@ -410,6 +410,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       buildEnvelope('opencode.backfillTaskLedger', {
         teamName: 'team-a',
         taskId: 'task-1',
+        deliveryContextPath: '/tmp/claude-team-opencode-ledger-context-test/delivery-context.json',
+        deliveryContextHash: 'a'.repeat(64),
         attributionMode: 'strict-delivery',
         evidenceMode: 'chain-only',
         dryRun: true,
@@ -420,6 +422,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(captured).toMatchObject({
       teamName: 'team-a',
       taskId: 'task-1',
+      deliveryContextPath: '/tmp/claude-team-opencode-ledger-context-test/delivery-context.json',
+      deliveryContextHash: 'a'.repeat(64),
       attributionMode: 'strict-delivery',
       dryRun: true,
     })

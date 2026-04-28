@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -161,37 +162,49 @@ async function writeDeliveryContext(overrides: Partial<{
   deliveredUserMessageId: string | null
   snapshotBoundary: OpenCodeSnapshotBoundary | Record<string, unknown> | null
   taskRefs: Array<{ taskId: string; displayId: string; teamName: string }>
-}> = {}): Promise<string> {
-  const filePath = path.join(tempDir, 'delivery-context.json')
+}> = {}): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
   const hasRuntimeSessionIdOverride = Object.prototype.hasOwnProperty.call(overrides, 'runtimeSessionId')
+  const rawContext = `${JSON.stringify({
+    schemaVersion: 1,
+    teamName: 'team-a',
+    taskId: 'task-1',
+    records: [
+      {
+        memberName: overrides.memberName ?? 'bob',
+        laneId: overrides.laneId ?? 'primary',
+        runtimeSessionId: hasRuntimeSessionIdOverride ? overrides.runtimeSessionId : 'session-1',
+        inboxMessageId: overrides.inboxMessageId ?? 'user-1',
+        deliveredUserMessageId: overrides.deliveredUserMessageId ?? null,
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        ...(overrides.snapshotBoundary !== undefined
+          ? { snapshotBoundary: overrides.snapshotBoundary }
+          : {}),
+        taskRefs: overrides.taskRefs ?? [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        ],
+      },
+    ],
+  })}\n`
+  return writeTrustedDeliveryContextRaw(rawContext)
+}
+
+async function writeTrustedDeliveryContextRaw(
+  rawContext: string,
+): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+  await chmod(contextDir, 0o700).catch(() => undefined)
+  const filePath = path.join(contextDir, 'delivery-context.json')
   await writeFile(
     filePath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      teamName: 'team-a',
-      taskId: 'task-1',
-      records: [
-        {
-          memberName: overrides.memberName ?? 'bob',
-          laneId: overrides.laneId ?? 'primary',
-          runtimeSessionId: hasRuntimeSessionIdOverride ? overrides.runtimeSessionId : 'session-1',
-          inboxMessageId: overrides.inboxMessageId ?? 'user-1',
-          deliveredUserMessageId: overrides.deliveredUserMessageId ?? null,
-          observedAssistantMessageId: null,
-          prePromptCursor: null,
-          postPromptCursor: null,
-          ...(overrides.snapshotBoundary !== undefined
-            ? { snapshotBoundary: overrides.snapshotBoundary }
-            : {}),
-          taskRefs: overrides.taskRefs ?? [
-            { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
-          ],
-        },
-      ],
-    })}\n`,
-    'utf8',
+    rawContext,
+    { encoding: 'utf8', mode: 0o600 },
   )
-  return filePath
+  return {
+    deliveryContextPath: filePath,
+    deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+  }
 }
 
 function snapshotProvider(
@@ -315,7 +328,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')
@@ -350,7 +363,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     }
 
     const first = await service.backfill(request)
@@ -414,7 +427,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')
@@ -520,14 +533,14 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
+      ...(await writeDeliveryContext({
         snapshotBoundary: {
           schemaVersion: 1,
           captureStatus: 'captured',
           preDeliverySnapshotHash: 'pre',
           postDeliverySnapshotHash: 'post',
         },
-      }),
+      })),
       attributionMode: 'strict-delivery',
     })
 
@@ -597,7 +610,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -683,7 +696,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -766,7 +779,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -846,7 +859,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -929,7 +942,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1009,7 +1022,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1072,7 +1085,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1111,7 +1124,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1173,7 +1186,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1204,7 +1217,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('unsafe-input')
@@ -1227,7 +1240,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1240,6 +1253,213 @@ describe('OpenCodeLedgerBridgeService', () => {
       attributionMethod: 'delivery-ledger-taskrefs',
       sourcePartId: 'tool-part-1',
     })
+  })
+
+  test('strict delivery backfill rejects tampered delivery context hashes', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeDeliveryContext()
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: context.deliveryContextPath,
+      deliveryContextHash: '0'.repeat(64),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain('OpenCode delivery context hash mismatch.')
+  })
+
+  test('strict delivery backfill rejects untrusted delivery context paths', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const rawContext = `${JSON.stringify({
+      schemaVersion: 1,
+      teamName: 'team-a',
+      taskId: 'task-1',
+      records: [
+        {
+          memberName: 'bob',
+          laneId: 'primary',
+          runtimeSessionId: 'session-1',
+          inboxMessageId: 'user-1',
+          deliveredUserMessageId: null,
+          taskRefs: [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }],
+        },
+      ],
+    })}\n`
+    const deliveryContextPath = path.join(tempDir, 'delivery-context.json')
+    await writeFile(deliveryContextPath, rawContext, 'utf8')
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because it is outside the trusted app temp directory.',
+    )
+  })
+
+  test('strict delivery backfill rejects relative delivery context paths', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeDeliveryContext()
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: path.relative(process.cwd(), context.deliveryContextPath),
+      deliveryContextHash: context.deliveryContextHash,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because it is not absolute.',
+    )
+  })
+
+  const deliveryContextSymlinkTest = process.platform === 'win32' ? test.skip : test
+
+  deliveryContextSymlinkTest('strict delivery backfill rejects delivery context symlink escapes', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const rawContext = `${JSON.stringify({
+      schemaVersion: 1,
+      teamName: 'team-a',
+      taskId: 'task-1',
+      records: [
+        {
+          memberName: 'bob',
+          laneId: 'primary',
+          runtimeSessionId: 'session-1',
+          inboxMessageId: 'user-1',
+          deliveredUserMessageId: null,
+          taskRefs: [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }],
+        },
+      ],
+    })}\n`
+    const targetPath = path.join(tempDir, 'outside-delivery-context.json')
+    await writeFile(targetPath, rawContext, 'utf8')
+    const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+    await chmod(contextDir, 0o700).catch(() => undefined)
+    const deliveryContextPath = path.join(contextDir, 'delivery-context.json')
+    await symlink(targetPath, deliveryContextPath)
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because the file resolves outside its trusted temp directory.',
+    )
+  })
+
+  test('strict delivery backfill reports unsupported delivery context schema', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeTrustedDeliveryContextRaw(
+      `${JSON.stringify({
+        schemaVersion: 2,
+        teamName: 'team-a',
+        taskId: 'task-1',
+        records: [],
+      })}\n`,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...context,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'unsupported-delivery-context-schema: OpenCode delivery context failed schema validation.',
+    )
   })
 
   test('strict delivery backfill ignores assistant comment text without toolparts', async () => {
@@ -1277,7 +1497,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -1313,9 +1533,9 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
+      ...(await writeDeliveryContext({
         taskRefs: [{ taskId: 'old-task', displayId: 'abc12345', teamName: 'team-a' }],
-      }),
+      })),
       attributionMode: 'strict-delivery',
     })
 
@@ -1346,12 +1566,12 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
+      ...(await writeDeliveryContext({
         taskRefs: [
           { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
           { taskId: 'related-task', displayId: 'def67890', teamName: 'team-a' },
         ],
-      }),
+      })),
       attributionMode: 'strict-delivery',
     })
 
@@ -1376,7 +1596,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: null }),
+      ...(await writeDeliveryContext({ runtimeSessionId: null })),
       attributionMode: 'strict-delivery',
     })
 
@@ -1416,7 +1636,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: null }),
+      ...(await writeDeliveryContext({ runtimeSessionId: null })),
       attributionMode: 'strict-delivery',
     })
 
@@ -1477,7 +1697,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: 'other-session' }),
+      ...(await writeDeliveryContext({ runtimeSessionId: 'other-session' })),
       attributionMode: 'strict-delivery',
     })
 
@@ -1509,7 +1729,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('skipped-capability')
@@ -1536,7 +1756,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('no-attribution')
@@ -1577,7 +1797,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')

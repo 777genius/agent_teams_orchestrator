@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -485,45 +485,52 @@ async function createFixtureSessionStore(dataDir: string, workspaceRoot: string)
   return store
 }
 
-async function createFixtureDeliveryContext(filePath: string): Promise<string> {
+async function createFixtureDeliveryContext(): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+  await chmod(contextDir, 0o700).catch(() => undefined)
+  const filePath = path.join(contextDir, 'delivery-context.json')
+  const rawContext = `${JSON.stringify({
+    schemaVersion: 1,
+    teamName: 'fixture-team',
+    taskId: 'task-1',
+    records: [
+      {
+        memberName: 'bob',
+        laneId: 'secondary:opencode:bob',
+        runtimeSessionId: 'session-bob',
+        inboxMessageId: 'bob-user-1',
+        deliveredUserMessageId: null,
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        taskRefs: [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
+        ],
+      },
+      {
+        memberName: 'tom',
+        laneId: 'secondary:opencode:tom',
+        runtimeSessionId: 'session-tom',
+        inboxMessageId: 'tom-user-1',
+        deliveredUserMessageId: null,
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        taskRefs: [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
+        ],
+      },
+    ],
+  })}\n`
   await writeFile(
     filePath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      teamName: 'fixture-team',
-      taskId: 'task-1',
-      records: [
-        {
-          memberName: 'bob',
-          laneId: 'secondary:opencode:bob',
-          runtimeSessionId: 'session-bob',
-          inboxMessageId: 'bob-user-1',
-          deliveredUserMessageId: null,
-          observedAssistantMessageId: null,
-          prePromptCursor: null,
-          postPromptCursor: null,
-          taskRefs: [
-            { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
-          ],
-        },
-        {
-          memberName: 'tom',
-          laneId: 'secondary:opencode:tom',
-          runtimeSessionId: 'session-tom',
-          inboxMessageId: 'tom-user-1',
-          deliveredUserMessageId: null,
-          observedAssistantMessageId: null,
-          prePromptCursor: null,
-          postPromptCursor: null,
-          taskRefs: [
-            { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
-          ],
-        },
-      ],
-    })}\n`,
-    'utf8',
+    rawContext,
+    { encoding: 'utf8', mode: 0o600 },
   )
-  return filePath
+  return {
+    deliveryContextPath: filePath,
+    deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+  }
 }
 
 function envPathsDataDirForHome(home: string): string {
@@ -595,7 +602,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     const workspaceRoot = path.join(tempDir, 'workspace')
     const projectDir = path.join(tempDir, 'claude-project')
     const dataDir = path.join(tempDir, 'fixture-data')
-    const deliveryContextPath = await createFixtureDeliveryContext(path.join(tempDir, 'delivery-context.json'))
+    const deliveryContext = await createFixtureDeliveryContext()
     await mkdir(workspaceRoot, { recursive: true })
     await mkdir(projectDir, { recursive: true })
     const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
@@ -612,7 +619,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath,
+      ...deliveryContext,
       attributionMode: 'strict-delivery',
     })
 
@@ -683,7 +690,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath,
+      ...deliveryContext,
       attributionMode: 'strict-delivery',
     })
     expect(duplicateResult.outcome).toBe('duplicates-only')
@@ -695,7 +702,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     const workspaceRoot = path.join(tempDir, 'workspace-snapshot')
     const projectDir = path.join(tempDir, 'claude-project-snapshot')
     const dataDir = path.join(tempDir, 'fixture-data-snapshot')
-    const deliveryContextPath = await createFixtureDeliveryContext(path.join(tempDir, 'delivery-context-snapshot.json'))
+    const deliveryContext = await createFixtureDeliveryContext()
     await mkdir(workspaceRoot, { recursive: true })
     await mkdir(projectDir, { recursive: true })
     const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
@@ -727,7 +734,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath,
+      ...deliveryContext,
       attributionMode: 'strict-delivery',
     })
 
@@ -805,7 +812,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath,
+      ...deliveryContext,
       attributionMode: 'strict-delivery',
     })
     expect(duplicateResult.outcome).toBe('duplicates-only')
@@ -821,7 +828,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     await mkdir(projectDir, { recursive: true })
     await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
     await createFixtureSessionStore(dataDir, workspaceRoot)
-    const deliveryContextPath = await createFixtureDeliveryContext(path.join(tempDir, 'delivery-context-cli.json'))
+    const deliveryContext = await createFixtureDeliveryContext()
 
     const dryRun = spawnSync(
       cliDev.command,
@@ -841,7 +848,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
         '--workspace-root',
         workspaceRoot,
         '--delivery-context',
-        deliveryContextPath,
+        deliveryContext.deliveryContextPath,
+        '--delivery-context-hash',
+        deliveryContext.deliveryContextHash,
         '--attribution-mode',
         'strict-delivery',
         '--dry-run',
@@ -882,7 +891,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
         '--workspace-root',
         workspaceRoot,
         '--delivery-context',
-        deliveryContextPath,
+        deliveryContext.deliveryContextPath,
+        '--delivery-context-hash',
+        deliveryContext.deliveryContextHash,
         '--attribution-mode',
         'strict-delivery',
       ],

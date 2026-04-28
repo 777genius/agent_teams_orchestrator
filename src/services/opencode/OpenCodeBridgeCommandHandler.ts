@@ -1986,6 +1986,7 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
         projectDir: asString(envelope.body.projectDir) ?? undefined,
         workspaceRoot: asString(envelope.body.workspaceRoot) ?? undefined,
         deliveryContextPath: asString(envelope.body.deliveryContextPath) ?? undefined,
+        deliveryContextHash: asString(envelope.body.deliveryContextHash) ?? undefined,
         attributionMode: asString(envelope.body.attributionMode) === 'strict-delivery' ? 'strict-delivery' : 'compatible',
         dryRun: envelope.body.dryRun === true,
       })

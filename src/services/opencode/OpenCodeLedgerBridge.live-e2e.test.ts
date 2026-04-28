@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -180,34 +181,42 @@ function sessionRecord(input: {
   }
 }
 
-async function writeDeliveryContext(filePath: string, input: {
+async function writeDeliveryContext(input: {
   sessionId: string
   parentUserMessageId: string
-}): Promise<void> {
+}): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+  await chmod(contextDir, 0o700).catch(() => undefined)
+  const filePath = path.join(contextDir, 'delivery-context.json')
+  const rawContext = `${JSON.stringify({
+    schemaVersion: 1,
+    teamName: TEAM_NAME,
+    taskId: TASK_ID,
+    records: [
+      {
+        memberName: MEMBER_NAME,
+        laneId: LANE_ID,
+        runtimeSessionId: input.sessionId,
+        inboxMessageId: input.parentUserMessageId,
+        deliveredUserMessageId: input.parentUserMessageId,
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        taskRefs: [
+          { taskId: TASK_ID, displayId: TASK_DISPLAY_ID, teamName: TEAM_NAME },
+        ],
+      },
+    ],
+  }, null, 2)}\n`
   await writeFile(
     filePath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      teamName: TEAM_NAME,
-      taskId: TASK_ID,
-      records: [
-        {
-          memberName: MEMBER_NAME,
-          laneId: LANE_ID,
-          runtimeSessionId: input.sessionId,
-          inboxMessageId: input.parentUserMessageId,
-          deliveredUserMessageId: input.parentUserMessageId,
-          observedAssistantMessageId: null,
-          prePromptCursor: null,
-          postPromptCursor: null,
-          taskRefs: [
-            { taskId: TASK_ID, displayId: TASK_DISPLAY_ID, teamName: TEAM_NAME },
-          ],
-        },
-      ],
-    }, null, 2)}\n`,
-    'utf8',
+    rawContext,
+    { encoding: 'utf8', mode: 0o600 },
   )
+  return {
+    deliveryContextPath: filePath,
+    deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+  }
 }
 
 async function readBundle(projectDir: string): Promise<Record<string, unknown>> {
@@ -259,8 +268,7 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
 
     const toolpart = findLiveToolpart(dbPath, workspaceRoot)
-    const deliveryContextPath = path.join(tempDir, 'delivery-context.json')
-    await writeDeliveryContext(deliveryContextPath, {
+    const deliveryContext = await writeDeliveryContext({
       sessionId: toolpart.sessionId,
       parentUserMessageId: toolpart.parentUserMessageId,
     })
@@ -277,7 +285,7 @@ describe('OpenCode Ledger Bridge live e2e', () => {
       laneId: LANE_ID,
       projectDir,
       workspaceRoot,
-      deliveryContextPath,
+      ...deliveryContext,
       attributionMode: 'strict-delivery',
     })
 
