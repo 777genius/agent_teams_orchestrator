@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -60,6 +60,16 @@ function runOpenCode(args: string[], env: NodeJS.ProcessEnv, cwd: string, timeou
     timeout: timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
   })
+}
+
+function runGit(args: string[], cwd: string): void {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  })
+  expect(result.status, `git ${args.join(' ')}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0)
 }
 
 function parseSnapshotHash(stdout: string): string | null {
@@ -160,9 +170,15 @@ function failOrWarn(message: string): void {
 describe('OpenCode snapshot evidence live probe', () => {
   liveSnapshotTest('captures source-driven SQLite snapshot evidence after a real file-changing OpenCode run', async () => {
     const env = childEnv()
-    const workspaceRoot = path.join(tempDir, 'workspace')
-    await mkdir(workspaceRoot, { recursive: true })
+    const workspaceRootRaw = path.join(tempDir, 'workspace')
+    await mkdir(workspaceRootRaw, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootRaw)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-snapshot-probe@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Snapshot Probe'], workspaceRoot)
     await writeFile(path.join(workspaceRoot, 'README.md'), 'snapshot probe\n', 'utf8')
+    runGit(['add', 'README.md'], workspaceRoot)
+    runGit(['commit', '-m', 'seed snapshot probe workspace'], workspaceRoot)
 
     const version = runOpenCode(['--version'], env, workspaceRoot, 15_000)
     if (version.status !== 0) {
@@ -176,6 +192,8 @@ describe('OpenCode snapshot evidence live probe', () => {
 
     const preTrack = runOpenCode(['debug', 'snapshot', 'track'], env, workspaceRoot, 30_000)
     expect(preTrack.status, `stdout:\n${preTrack.stdout}\nstderr:\n${preTrack.stderr}`).toBe(0)
+    const preHash = parseSnapshotHash(preTrack.stdout)
+    expect(preHash, `stdout:\n${preTrack.stdout}\nstderr:\n${preTrack.stderr}`).toBeTruthy()
 
     const prompt = [
       'You are running a live OpenCode snapshot probe.',
@@ -209,11 +227,11 @@ describe('OpenCode snapshot evidence live probe', () => {
     const postHash = parseSnapshotHash(postTrack.stdout)
     expect(postHash, `stdout:\n${postTrack.stdout}\nstderr:\n${postTrack.stderr}`).toBeTruthy()
 
-    const patch = runOpenCode(['debug', 'snapshot', 'patch', postHash!], env, workspaceRoot, 30_000)
+    const patch = runOpenCode(['debug', 'snapshot', 'patch', preHash!], env, workspaceRoot, 30_000)
     expect(patch.status, `stdout:\n${patch.stdout}\nstderr:\n${patch.stderr}`).toBe(0)
     expect(`${patch.stdout}\n${patch.stderr}`).toContain(SNAPSHOT_FILE)
 
-    const diff = runOpenCode(['debug', 'snapshot', 'diff', postHash!], env, workspaceRoot, 30_000)
+    const diff = runOpenCode(['debug', 'snapshot', 'diff', preHash!], env, workspaceRoot, 30_000)
     expect(diff.status, `stdout:\n${diff.stdout}\nstderr:\n${diff.stderr}`).toBe(0)
     expect(`${diff.stdout}\n${diff.stderr}`).toContain(SNAPSHOT_FILE)
 
