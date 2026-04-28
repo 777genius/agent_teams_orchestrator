@@ -204,7 +204,7 @@ function snapshotProvider(
         adapterVersion: 1,
       }
     },
-    async readBoundaryEvidence() {
+    async readSessionEvidence() {
       return {
         supported: true,
         shapeFingerprint: 'shape-v1',
@@ -216,6 +216,55 @@ function snapshotProvider(
         ],
       }
     },
+  }
+}
+
+function withSnapshotWindow(
+  fixture: OpenCodeOfflineSessionReadResult,
+): OpenCodeOfflineSessionReadResult {
+  return {
+    ...fixture,
+    snapshotStepParts: [
+      {
+        partId: '000-step-start',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        partOrder: 0,
+        timeCreated: 999,
+        kind: 'step-start',
+        snapshot: '1'.repeat(40),
+      },
+      {
+        partId: 'zzz-step-finish',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        partOrder: 2,
+        timeCreated: 1001,
+        kind: 'step-finish',
+        snapshot: '2'.repeat(40),
+      },
+    ],
+    snapshotWindows: [
+      {
+        windowId: 'assistant-1:000-step-start->zzz-step-finish',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        fromSnapshot: '1'.repeat(40),
+        toSnapshot: '2'.repeat(40),
+        startPartId: '000-step-start',
+        finishPartId: 'zzz-step-finish',
+        startPartOrder: 0,
+        finishPartOrder: 2,
+      },
+    ],
+    rawParts: [
+      partRow('000-step-start', 'assistant-1', { type: 'step-start', snapshot: '1'.repeat(40) }, 999),
+      ...fixture.rawParts,
+      partRow('zzz-step-finish', 'assistant-1', { type: 'step-finish', snapshot: '2'.repeat(40) }, 1001),
+    ].sort((left, right) =>
+      left.message_id.localeCompare(right.message_id) ||
+      left.id.localeCompare(right.id)
+    ),
   }
 }
 
@@ -262,7 +311,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       'export const value = 2;\n',
       'utf8',
     )
-    const editFixture = {
+    const editFixture = withSnapshotWindow({
       ...offlineFixture(),
       rawParts: [
         partRow(
@@ -294,7 +343,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           1000,
         ),
       ],
-    }
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => editFixture },
@@ -349,7 +398,7 @@ describe('OpenCodeLedgerBridgeService', () => {
   test('uses captured snapshot boundary to upgrade strict edit evidence through provider abstraction', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
-    const editFixture = {
+    const editFixture = withSnapshotWindow({
       ...offlineFixture(),
       rawParts: [
         partRow(
@@ -381,7 +430,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           1000,
         ),
       ],
-    }
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => editFixture },
@@ -428,7 +477,7 @@ describe('OpenCodeLedgerBridgeService', () => {
   test('uses captured snapshot boundary to upgrade apply_patch update evidence through verified hunks', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
-    const patchFixture = {
+    const patchFixture = withSnapshotWindow({
       ...offlineFixture(),
       rawParts: [
         partRow(
@@ -464,7 +513,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           1000,
         ),
       ],
-    }
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => patchFixture },

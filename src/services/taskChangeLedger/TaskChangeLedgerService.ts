@@ -159,6 +159,7 @@ type TaskChangeEventV1 = {
   evidenceWarnings?: string[]
   snapshotId?: string
   snapshotSource?: 'opencode'
+  supersedesEventId?: string
   importedAt?: string
   importBatchId?: string
   importSchemaVersion?: 1
@@ -249,6 +250,7 @@ type TaskChangeSummaryFileV2 = {
   linesRemoved: number
   diffStatKnown: boolean
   eventCount: number
+  journalEventCount?: number
   firstTimestamp: string
   lastTimestamp: string
   latestOperation: TaskChangeOperation
@@ -283,6 +285,7 @@ type TaskChangeSummaryBundleV2 = {
   journalStamp: TaskChangeJournalStamp
   integrity: 'ok' | 'recovered' | 'partial'
   eventCount: number
+  projectedEventCount?: number
   noticeCount: number
   scope: TaskChangeSummaryScopeV2
   files: TaskChangeSummaryFileV2[]
@@ -1483,6 +1486,66 @@ function deriveCaptureConfidence(
   return 'high'
 }
 
+function buildSummaryGroupKey(event: TaskChangeEventV1): string {
+  return event.relation
+    ? buildRelationChangeKey(event.relation, event.worktreePath)
+    : `path:${normalizeLedgerPathForKey(event.filePath)}`
+}
+
+function evidenceRankForEvent(event: Pick<TaskChangeEventV1, 'evidenceProof' | 'before' | 'after' | 'operation' | 'beforeState' | 'afterState'>): number {
+  const hasFullText =
+    !!event.before ||
+    !!event.after ||
+    (event.operation === 'create' && event.afterState?.exists === true && !event.afterState.unavailableReason) ||
+    (event.operation === 'delete' && event.beforeState?.exists === true && !event.beforeState.unavailableReason)
+  switch (event.evidenceProof) {
+    case 'opencode-snapshot':
+      return hasFullText ? 50 : 35
+    case 'inverse-apply-patch-chain':
+    case 'inverse-edit-chain':
+    case 'toolpart-chain':
+      return hasFullText ? 40 : 25
+    case 'metadata-only-fallback':
+      return 10
+    default:
+      return hasFullText ? 30 : 5
+  }
+}
+
+function projectTaskChangeEventsForSummary(events: TaskChangeEventV1[]): {
+  events: TaskChangeEventV1[]
+  rawCountByGroupKey: Map<string, number>
+} {
+  const rawCountByGroupKey = new Map<string, number>()
+  const selectedBySourceKey = new Map<string, { event: TaskChangeEventV1; index: number; rank: number }>()
+  const passthrough: Array<{ event: TaskChangeEventV1; index: number }> = []
+
+  events.forEach((event, index) => {
+    const groupKey = buildSummaryGroupKey(event)
+    rawCountByGroupKey.set(groupKey, (rawCountByGroupKey.get(groupKey) ?? 0) + 1)
+
+    if (!event.sourceImportKey) {
+      passthrough.push({ event, index })
+      return
+    }
+    const rank = evidenceRankForEvent(event)
+    const existing = selectedBySourceKey.get(event.sourceImportKey)
+    if (!existing || rank >= existing.rank) {
+      selectedBySourceKey.set(event.sourceImportKey, { event, index, rank })
+    }
+  })
+
+  return {
+    events: [
+      ...passthrough,
+      ...[...selectedBySourceKey.values()].map(item => ({ event: item.event, index: item.index })),
+    ]
+      .sort((left, right) => left.index - right.index)
+      .map(item => item.event),
+    rawCountByGroupKey,
+  }
+}
+
 async function rebuildBundle(taskId: string, projectDir: string): Promise<{
   bundle: TaskChangeSummaryBundleV2
   freshness: TaskChangeFreshnessSignalV2
@@ -1493,6 +1556,8 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     computeTaskJournalStamp(taskId, projectDir),
   ])
   const events = eventRead.entries
+  const projection = projectTaskChangeEventsForSummary(events)
+  const summaryEvents = projection.events
   const notices = noticeRead.entries
   const recovered = eventRead.recovered || noticeRead.recovered
   const warnings = new Set<string>()
@@ -1517,7 +1582,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
   }
 
   const accumulators = new Map<string, Accumulator>()
-  for (const event of events) {
+  for (const event of summaryEvents) {
     for (const warning of event.warnings ?? []) {
       warnings.add(warning)
     }
@@ -1527,9 +1592,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     if (event.toolStatus === 'killed') {
       warnings.add(`Background tool ${event.toolUseId} was killed after changing files.`)
     }
-    const groupKey = event.relation
-      ? buildRelationChangeKey(event.relation, event.worktreePath)
-      : `path:${normalizeLedgerPathForKey(event.filePath)}`
+    const groupKey = buildSummaryGroupKey(event)
     const existing = accumulators.get(groupKey) ?? {
       groupKey,
       filePath: event.relation?.newPath
@@ -1692,6 +1755,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       contributorVisible.set(actorKey, visibleSet)
     }
 
+    const journalEventCount = projection.rawCountByGroupKey.get(accumulator.groupKey) ?? accumulator.events.length
     files.push({
       changeKey: buildChangeKey({
         filePath: accumulator.filePath,
@@ -1706,6 +1770,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       linesRemoved: lineStats.removed,
       diffStatKnown,
       eventCount: accumulator.events.length,
+      ...(journalEventCount !== accumulator.events.length ? { journalEventCount } : {}),
       firstTimestamp: firstEvent.timestamp,
       lastTimestamp: lastEvent.timestamp,
       latestOperation: lastEvent.operation,
@@ -1788,15 +1853,15 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     })
 
   const uniqueToolUseIds = [...new Set([
-    ...events.map(event => event.toolUseId),
+    ...summaryEvents.map(event => event.toolUseId),
     ...notices.map(notice => notice.toolUseId),
   ])]
-  const captureConfidence = deriveCaptureConfidence(events)
-  const bundleConfidence = confidenceLabelForEvents(events)
-  const worktreePaths = [...new Set(events.flatMap(event => (event.worktreePath ? [event.worktreePath] : [])))].sort()
-  const worktreeBranches = [...new Set(events.flatMap(event => (event.worktreeBranch ? [event.worktreeBranch] : [])))].sort()
-  const baseWorkspaceRoots = [...new Set(events.flatMap(event => (event.baseWorkspaceRoot ? [event.baseWorkspaceRoot] : [])))].sort()
-  const dirtyLeaderWarnings = [...new Set(events.flatMap(event => (event.dirtyLeaderWarning ? [event.dirtyLeaderWarning] : [])))].sort()
+  const captureConfidence = deriveCaptureConfidence(summaryEvents)
+  const bundleConfidence = confidenceLabelForEvents(summaryEvents)
+  const worktreePaths = [...new Set(summaryEvents.flatMap(event => (event.worktreePath ? [event.worktreePath] : [])))].sort()
+  const worktreeBranches = [...new Set(summaryEvents.flatMap(event => (event.worktreeBranch ? [event.worktreeBranch] : [])))].sort()
+  const baseWorkspaceRoots = [...new Set(summaryEvents.flatMap(event => (event.baseWorkspaceRoot ? [event.baseWorkspaceRoot] : [])))].sort()
+  const dirtyLeaderWarnings = [...new Set(summaryEvents.flatMap(event => (event.dirtyLeaderWarning ? [event.dirtyLeaderWarning] : [])))].sort()
   const scope: TaskChangeSummaryScopeV2 = {
     confidence: {
       tier:
@@ -1814,34 +1879,34 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
       contributors[0]?.agentId ??
       contributors[0]?.actorKey ??
       '',
-    agentIds: [...new Set(events.flatMap(event => (event.agentId ? [event.agentId] : [])))].sort(),
-    ...(events.some(event => !!event.memberName)
+    agentIds: [...new Set(summaryEvents.flatMap(event => (event.agentId ? [event.agentId] : [])))].sort(),
+    ...(summaryEvents.some(event => !!event.memberName)
       ? {
           memberNames: [
-            ...new Set(events.flatMap(event => (event.memberName ? [event.memberName] : []))),
+            ...new Set(summaryEvents.flatMap(event => (event.memberName ? [event.memberName] : []))),
           ].sort(),
         }
       : {}),
-    startTimestamp: events[0]?.timestamp ?? notices[0]?.timestamp ?? new Date().toISOString(),
+    startTimestamp: summaryEvents[0]?.timestamp ?? notices[0]?.timestamp ?? new Date().toISOString(),
     endTimestamp:
-      events[events.length - 1]?.timestamp ??
+      summaryEvents[summaryEvents.length - 1]?.timestamp ??
       notices[notices.length - 1]?.timestamp ??
       new Date().toISOString(),
     toolUseIds: uniqueToolUseIds.slice(0, 256),
     toolUseCount: uniqueToolUseIds.length,
     ...(uniqueToolUseIds.length > 256 ? { toolUseIdsTruncated: true } : {}),
-    phaseSet: [...new Set(events.map(event => event.phase))].sort(),
-    ...(events.length > 0
+    phaseSet: [...new Set(summaryEvents.map(event => event.phase))].sort(),
+    ...(summaryEvents.length > 0
       ? {
           executionSeqRange: {
-            start: Math.min(...events.map(event => event.executionSeq)),
-            end: Math.max(...events.map(event => event.executionSeq)),
+            start: Math.min(...summaryEvents.map(event => event.executionSeq)),
+            end: Math.max(...summaryEvents.map(event => event.executionSeq)),
           },
         }
       : {}),
     confidenceBreakdown: {
       capture: captureConfidence,
-      attribution: events.every(event => event.agentId) ? 'high' : 'medium',
+      attribution: summaryEvents.every(event => event.agentId) ? 'high' : 'medium',
       reviewability: files.every(file => file.reviewability === 'full-text')
         ? 'full-text'
         : files.some(file => file.reviewability === 'full-text' || file.reviewability === 'partial-text')
@@ -1865,6 +1930,7 @@ async function rebuildBundle(taskId: string, projectDir: string): Promise<{
     journalStamp,
     integrity: recovered ? 'recovered' : 'ok',
     eventCount: events.length,
+    ...(summaryEvents.length !== events.length ? { projectedEventCount: summaryEvents.length } : {}),
     noticeCount: notices.length,
     scope,
     files,
@@ -2141,24 +2207,121 @@ function buildImportedEventId(sourceImportKey: string): string {
   return `opencode-import-${sha256(sourceImportKey).slice(0, 32)}`
 }
 
-async function readExistingSourceImportKeys(taskId: string, projectDir: string): Promise<Set<string>> {
+function buildImportedUpgradeEventId(input: {
+  sourceImportKey: string
+  evidenceProof?: string
+  snapshotId?: string
+  beforeSha?: string
+  afterSha?: string
+  revision: number
+}): string {
+  return `opencode-import-upgrade-${sha256(JSON.stringify(input)).slice(0, 32)}`
+}
+
+type ExistingSourceImportProjection = {
+  sourceImportKey: string
+  eventId: string
+  evidenceProof?: string
+  evidenceRank: number
+  eventCount: number
+  taskId: string
+  relativePath: string
+  sourceSessionId?: string
+  sourcePartId?: string
+  sourceMessageId?: string
+  operation: TaskChangeOperation
+}
+
+function sourceImportKeyForEvent(event: TaskChangeEventV1): string | null {
+  if (event.sourceImportKey) {
+    return event.sourceImportKey
+  }
+  if (event.sourceRuntime && event.sourceSessionId && event.sourcePartId) {
+    return [
+      event.sourceRuntime,
+      event.sourceSessionId,
+      event.sourcePartId,
+      normalizeLedgerPathForKey(event.filePath),
+    ].join('\0')
+  }
+  return null
+}
+
+function projectionFromEvent(
+  event: TaskChangeEventV1,
+  sourceImportKey: string,
+  eventCount: number,
+): ExistingSourceImportProjection {
+  return {
+    sourceImportKey,
+    eventId: event.eventId,
+    ...(event.evidenceProof ? { evidenceProof: event.evidenceProof } : {}),
+    evidenceRank: evidenceRankForEvent(event),
+    eventCount,
+    taskId: event.taskId,
+    relativePath: event.relativePath,
+    ...(event.sourceSessionId ? { sourceSessionId: event.sourceSessionId } : {}),
+    ...(event.sourcePartId ? { sourcePartId: event.sourcePartId } : {}),
+    ...(event.sourceMessageId ? { sourceMessageId: event.sourceMessageId } : {}),
+    operation: event.operation,
+  }
+}
+
+function evidenceRankForImportedChange(
+  change: ImportedOpenCodeFileChange,
+  operation: TaskChangeOperation,
+): number {
+  return evidenceRankForEvent({
+    evidenceProof: change.evidenceProof,
+    before: change.beforeContent === null ? null : { sha256: '', sizeBytes: Buffer.byteLength(change.beforeContent, 'utf8') },
+    after: change.afterContent === null ? null : { sha256: '', sizeBytes: Buffer.byteLength(change.afterContent, 'utf8') },
+    operation,
+    beforeState: change.beforeState,
+    afterState: change.afterState,
+  })
+}
+
+async function readExistingSourceImportProjection(
+  taskId: string,
+  projectDir: string,
+): Promise<Map<string, ExistingSourceImportProjection>> {
   const existing = await readTaskEvents(taskId, projectDir)
-  const keys = new Set<string>()
+  const byKey = new Map<string, ExistingSourceImportProjection>()
+  const counts = new Map<string, number>()
   for (const event of existing.entries) {
-    if (event.sourceImportKey) {
-      keys.add(event.sourceImportKey)
+    const sourceImportKey = sourceImportKeyForEvent(event)
+    if (!sourceImportKey) {
       continue
     }
-    if (event.sourceRuntime && event.sourceSessionId && event.sourcePartId) {
-      keys.add([
-        event.sourceRuntime,
-        event.sourceSessionId,
-        event.sourcePartId,
-        normalizeLedgerPathForKey(event.filePath),
-      ].join('\0'))
+    const nextCount = (counts.get(sourceImportKey) ?? 0) + 1
+    counts.set(sourceImportKey, nextCount)
+    const projection = projectionFromEvent(event, sourceImportKey, nextCount)
+    const current = byKey.get(sourceImportKey)
+    if (!current || projection.evidenceRank >= current.evidenceRank) {
+      byKey.set(sourceImportKey, projection)
     }
   }
-  return keys
+  return byKey
+}
+
+function compatibleSourceIdentity(existing: ExistingSourceImportProjection, incoming: TaskChangeEventV1): boolean {
+  return (
+    (!existing.sourceSessionId || !incoming.sourceSessionId || existing.sourceSessionId === incoming.sourceSessionId) &&
+    (!existing.sourcePartId || !incoming.sourcePartId || existing.sourcePartId === incoming.sourcePartId) &&
+    (!existing.sourceMessageId || !incoming.sourceMessageId || existing.sourceMessageId === incoming.sourceMessageId)
+  )
+}
+
+function shouldAppendEvidenceUpgrade(
+  existing: ExistingSourceImportProjection,
+  incoming: TaskChangeEventV1,
+): boolean {
+  return (
+    evidenceRankForEvent(incoming) > existing.evidenceRank &&
+    existing.taskId === incoming.taskId &&
+    existing.operation === incoming.operation &&
+    compatibleSourceIdentity(existing, incoming)
+  )
 }
 
 export async function importTaskChangeLedgerEvents(params: {
@@ -2190,144 +2353,183 @@ export async function importTaskChangeLedgerEvents(params: {
       diagnostics: ['OpenCode ledger import skipped because workspaceRoot is not absolute.'],
     }
   }
+  if (params.changes.length === 0) {
+    return {
+      importedFilePaths: [],
+      importedEventCount: 0,
+      skippedDuplicateCount: 0,
+      skippedUnsafeCount: 0,
+      diagnostics,
+    }
+  }
 
-  const existingSourceKeys = await readExistingSourceImportKeys(params.scope.taskId, projectDir)
   const importedFilePaths: string[] = []
   let skippedDuplicateCount = 0
   let skippedUnsafeCount = 0
-  const events: TaskChangeEventV1[] = []
-  const worktreeMetadata = getLedgerWorktreeMetadata(params.workspaceRoot)
-  const importedAt = new Date().toISOString()
+  let importedEventCount = 0
 
-  for (const change of params.changes) {
-    if (existingSourceKeys.has(change.sourceImportKey)) {
-      skippedDuplicateCount += 1
-      continue
-    }
-    const filePath = normalizeFilePath(change.filePath, params.workspaceRoot)
-    if (!isSameOrDescendantPath(filePath, params.workspaceRoot)) {
-      skippedUnsafeCount += 1
-      diagnostics.push(`OpenCode ledger import skipped outside-workspace path ${filePath}.`)
-      continue
-    }
-    if (change.beforeContent !== null && change.afterContent !== null) {
-      if (sha256(change.beforeContent) === sha256(change.afterContent)) {
-        skippedUnsafeCount += 1
-        continue
-      }
-    }
-    const before = await buildContentRef(change.beforeContent, projectDir)
-    const after = await buildContentRef(change.afterContent, projectDir)
-    const operation = change.operation ??
-      operationForContents(change.beforeContent, change.afterContent)
-    const beforeState = defaultStateForSide(
-      change.beforeState,
-      before,
-      change.beforeContent,
-      operation,
-      'before',
-    )
-    const afterState = defaultStateForSide(
-      change.afterState,
-      after,
-      change.afterContent,
-      operation,
-      'after',
-    )
-    const lineStats = canUseSnippetLineStats(change)
-      ? countLineChanges(
-          change.oldString ?? change.beforeContent,
-          change.newString ?? change.afterContent,
-        )
-      : { added: 0, removed: 0 }
-    const eventBase: Omit<TaskChangeEventV1, 'eventId'> = {
-      schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
-      taskId: params.scope.taskId,
-      taskRef: params.scope.task.ref,
-      taskRefKind: params.scope.task.refKind,
-      phase: params.scope.phase,
-      executionSeq: params.scope.executionSeq,
+  await enqueueTaskWrite(params.scope.taskId, async () => {
+    await runTaskLedgerWrite({
+      scope: params.scope,
       sessionId: params.sessionId,
-      ...(params.agentId ? { agentId: params.agentId } : {}),
-      ...(params.memberName ? { memberName: params.memberName } : {}),
-      toolUseId: change.toolUseId,
-      source: change.source,
-      operation,
-      confidence: change.confidence,
-      workspaceRoot: params.workspaceRoot,
-      ...worktreeMetadata,
-      filePath,
-      relativePath: displayRelativePath(filePath, params.workspaceRoot),
-      timestamp: change.timestamp,
-      toolStatus: params.toolStatus,
-      before,
-      after,
-      ...(beforeState ? { beforeState } : {}),
-      ...(afterState ? { afterState } : {}),
-      ...(change.relation ? { relation: change.relation } : {}),
-      linesAdded: lineStats.added,
-      linesRemoved: lineStats.removed,
-      ...(change.oldString !== undefined ? { oldString: change.oldString } : {}),
-      ...(change.newString !== undefined ? { newString: change.newString } : {}),
-      ...(change.replaceAll !== undefined ? { replaceAll: change.replaceAll } : {}),
-      ...(change.structuredPatch !== undefined
-        ? { structuredPatch: change.structuredPatch }
-        : {}),
-      ...(change.warnings?.length || worktreeMetadata.dirtyLeaderWarning
-        ? {
-            warnings: [
-              ...(change.warnings ?? []),
-              ...(worktreeMetadata.dirtyLeaderWarning
-                ? [worktreeMetadata.dirtyLeaderWarning]
-                : []),
-            ],
-          }
-        : {}),
-      sourceRuntime: 'opencode',
-      sourceProvider: 'opencode',
-      ...(change.sourceSessionId ? { sourceSessionId: change.sourceSessionId } : {}),
-      ...(change.sourcePartId ? { sourcePartId: change.sourcePartId } : {}),
-      ...(change.sourceMessageId ? { sourceMessageId: change.sourceMessageId } : {}),
-      ...(change.parentUserMessageId ? { parentUserMessageId: change.parentUserMessageId } : {}),
-      ...(change.attributionMethod ? { attributionMethod: change.attributionMethod } : {}),
-      sourceImportKey: change.sourceImportKey,
-      ...(change.evidenceProof ? { evidenceProof: change.evidenceProof } : {}),
-      ...(change.evidenceDiagnostics?.length ? { evidenceDiagnostics: change.evidenceDiagnostics } : {}),
-      ...(change.evidenceWarnings?.length ? { evidenceWarnings: change.evidenceWarnings } : {}),
-      ...(change.snapshotId ? { snapshotId: change.snapshotId } : {}),
-      ...(change.snapshotSource ? { snapshotSource: change.snapshotSource } : {}),
-      importedAt,
-      ...(change.importBatchId ? { importBatchId: change.importBatchId } : {}),
-      importSchemaVersion: 1,
-    }
-    events.push({
-      ...eventBase,
-      eventId: buildImportedEventId(change.sourceImportKey),
-    })
-    existingSourceKeys.add(change.sourceImportKey)
-    importedFilePaths.push(filePath)
-  }
+      agentId: params.agentId,
+      toolUseId: params.changes[0]?.toolUseId ?? 'opencode-import',
+      projectDir,
+      write: async () => {
+        const existingProjection = await readExistingSourceImportProjection(params.scope.taskId, projectDir)
+        const worktreeMetadata = getLedgerWorktreeMetadata(params.workspaceRoot)
+        const importedAt = new Date().toISOString()
+        const events: TaskChangeEventV1[] = []
 
-  if (events.length > 0) {
-    await enqueueTaskWrite(params.scope.taskId, async () => {
-      await runTaskLedgerWrite({
-        scope: params.scope,
-        sessionId: params.sessionId,
-        agentId: params.agentId,
-        toolUseId: events[0]?.toolUseId ?? 'opencode-import',
-        projectDir,
-        write: async () => {
-          for (const event of events) {
-            await appendEvent(event, projectDir)
+        for (const change of params.changes) {
+          const filePath = normalizeFilePath(change.filePath, params.workspaceRoot)
+          if (!isSameOrDescendantPath(filePath, params.workspaceRoot)) {
+            skippedUnsafeCount += 1
+            diagnostics.push(`OpenCode ledger import skipped outside-workspace path ${filePath}.`)
+            continue
           }
-        },
-      })
+          if (change.beforeContent !== null && change.afterContent !== null) {
+            if (sha256(change.beforeContent) === sha256(change.afterContent)) {
+              skippedUnsafeCount += 1
+              continue
+            }
+          }
+          const operation = change.operation ??
+            operationForContents(change.beforeContent, change.afterContent)
+          const existing = existingProjection.get(change.sourceImportKey)
+          const incomingRank = evidenceRankForImportedChange(change, operation)
+          if (existing && existing.operation !== operation) {
+            skippedUnsafeCount += 1
+            diagnostics.push(
+              `OpenCode ledger import skipped evidence upgrade for ${change.sourceImportKey} because operation changed from ${existing.operation} to ${operation}.`,
+            )
+            continue
+          }
+          if (existing && incomingRank <= existing.evidenceRank) {
+            skippedDuplicateCount += 1
+            continue
+          }
+
+          const before = await buildContentRef(change.beforeContent, projectDir)
+          const after = await buildContentRef(change.afterContent, projectDir)
+          const beforeState = defaultStateForSide(
+            change.beforeState,
+            before,
+            change.beforeContent,
+            operation,
+            'before',
+          )
+          const afterState = defaultStateForSide(
+            change.afterState,
+            after,
+            change.afterContent,
+            operation,
+            'after',
+          )
+          const lineStats = canUseSnippetLineStats(change)
+            ? countLineChanges(
+                change.oldString ?? change.beforeContent,
+                change.newString ?? change.afterContent,
+              )
+            : { added: 0, removed: 0 }
+          const eventBase: Omit<TaskChangeEventV1, 'eventId'> = {
+            schemaVersion: TASK_CHANGE_JOURNAL_SCHEMA_VERSION,
+            taskId: params.scope.taskId,
+            taskRef: params.scope.task.ref,
+            taskRefKind: params.scope.task.refKind,
+            phase: params.scope.phase,
+            executionSeq: params.scope.executionSeq,
+            sessionId: params.sessionId,
+            ...(params.agentId ? { agentId: params.agentId } : {}),
+            ...(params.memberName ? { memberName: params.memberName } : {}),
+            toolUseId: change.toolUseId,
+            source: change.source,
+            operation,
+            confidence: change.confidence,
+            workspaceRoot: params.workspaceRoot,
+            ...worktreeMetadata,
+            filePath,
+            relativePath: displayRelativePath(filePath, params.workspaceRoot),
+            timestamp: change.timestamp,
+            toolStatus: params.toolStatus,
+            before,
+            after,
+            ...(beforeState ? { beforeState } : {}),
+            ...(afterState ? { afterState } : {}),
+            ...(change.relation ? { relation: change.relation } : {}),
+            linesAdded: lineStats.added,
+            linesRemoved: lineStats.removed,
+            ...(change.oldString !== undefined ? { oldString: change.oldString } : {}),
+            ...(change.newString !== undefined ? { newString: change.newString } : {}),
+            ...(change.replaceAll !== undefined ? { replaceAll: change.replaceAll } : {}),
+            ...(change.structuredPatch !== undefined
+              ? { structuredPatch: change.structuredPatch }
+              : {}),
+            ...(change.warnings?.length || worktreeMetadata.dirtyLeaderWarning
+              ? {
+                  warnings: [
+                    ...(change.warnings ?? []),
+                    ...(worktreeMetadata.dirtyLeaderWarning
+                      ? [worktreeMetadata.dirtyLeaderWarning]
+                      : []),
+                  ],
+                }
+              : {}),
+            sourceRuntime: 'opencode',
+            sourceProvider: 'opencode',
+            ...(change.sourceSessionId ? { sourceSessionId: change.sourceSessionId } : {}),
+            ...(change.sourcePartId ? { sourcePartId: change.sourcePartId } : {}),
+            ...(change.sourceMessageId ? { sourceMessageId: change.sourceMessageId } : {}),
+            ...(change.parentUserMessageId ? { parentUserMessageId: change.parentUserMessageId } : {}),
+            ...(change.attributionMethod ? { attributionMethod: change.attributionMethod } : {}),
+            sourceImportKey: change.sourceImportKey,
+            ...(change.evidenceProof ? { evidenceProof: change.evidenceProof } : {}),
+            ...(change.evidenceDiagnostics?.length ? { evidenceDiagnostics: change.evidenceDiagnostics } : {}),
+            ...(change.evidenceWarnings?.length ? { evidenceWarnings: change.evidenceWarnings } : {}),
+            ...(change.snapshotId ? { snapshotId: change.snapshotId } : {}),
+            ...(change.snapshotSource ? { snapshotSource: change.snapshotSource } : {}),
+            importedAt,
+            ...(change.importBatchId ? { importBatchId: change.importBatchId } : {}),
+            importSchemaVersion: 1,
+          }
+          const incomingEvent: TaskChangeEventV1 = {
+            ...eventBase,
+            eventId: existing
+              ? buildImportedUpgradeEventId({
+                  sourceImportKey: change.sourceImportKey,
+                  evidenceProof: change.evidenceProof,
+                  snapshotId: change.snapshotId,
+                  beforeSha: before?.sha256 ?? beforeState?.sha256,
+                  afterSha: after?.sha256 ?? afterState?.sha256,
+                  revision: existing.eventCount + 1,
+                })
+              : buildImportedEventId(change.sourceImportKey),
+            ...(existing ? { supersedesEventId: existing.eventId } : {}),
+          }
+          if (existing && !shouldAppendEvidenceUpgrade(existing, incomingEvent)) {
+            skippedUnsafeCount += 1
+            diagnostics.push(`OpenCode ledger import skipped incompatible evidence upgrade for ${change.sourceImportKey}.`)
+            continue
+          }
+          events.push(incomingEvent)
+          existingProjection.set(
+            change.sourceImportKey,
+            projectionFromEvent(incomingEvent, change.sourceImportKey, (existing?.eventCount ?? 0) + 1),
+          )
+          importedFilePaths.push(filePath)
+        }
+
+        for (const event of events) {
+          await appendEvent(event, projectDir)
+        }
+        importedEventCount = events.length
+      },
     })
-  }
+  })
 
   return {
     importedFilePaths,
-    importedEventCount: events.length,
+    importedEventCount,
     skippedDuplicateCount,
     skippedUnsafeCount,
     diagnostics,

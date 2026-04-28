@@ -17,6 +17,7 @@ import {
 import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
 import {
   OpenCodeToolpartChangeReconstructor,
   type OpenCodeDeliveryContextV1,
@@ -452,22 +453,6 @@ function matchesStrictDeliveryRecord(
   )
 }
 
-function getSnapshotBoundaryForRecord(
-  deliveryContext: OpenCodeDeliveryContextV1 | null,
-  record: OpenCodeSessionRecord,
-): OpenCodeSnapshotBoundary | null {
-  for (const deliveryRecord of deliveryContext?.records ?? []) {
-    if (
-      deliveryRecord.memberName === record.memberName &&
-      deliveryRecord.laneId === record.laneId &&
-      deliveryRecord.runtimeSessionId === record.opencodeSessionId
-    ) {
-      return deliveryRecord.snapshotBoundary ?? null
-    }
-  }
-  return null
-}
-
 function validateCandidateBatch(
   changes: ReconstructedOpenCodeToolChange[],
   diagnostics: string[],
@@ -693,13 +678,16 @@ export class OpenCodeLedgerBridgeService {
       result.diagnostics.push(...reconstructed.diagnostics)
       result.notices.push(...reconstructed.notices)
       const evidenceMetadata: { snapshotShapeFingerprint?: string } = {}
+      const canTrySessionSnapshotEvidence =
+        attributionMode === 'strict-delivery' &&
+        reconstructed.changes.length > 0
       const enrichedChanges = await this.evidenceEnricher.enrich({
         changes: reconstructed.changes,
         workspaceRoot,
         sessionRecord: record,
-        evidenceMode,
-        snapshotBoundary: getSnapshotBoundaryForRecord(deliveryContext, record),
-        snapshotProvider: this.snapshotEvidenceProvider,
+        evidenceMode: canTrySessionSnapshotEvidence ? evidenceMode : 'chain-only',
+        offline,
+        snapshotProvider: canTrySessionSnapshotEvidence ? this.snapshotEvidenceProvider : undefined,
         evidenceMetadata,
         diagnostics: result.diagnostics,
       }).catch(error => {
@@ -836,4 +824,10 @@ export class OpenCodeLedgerBridgeService {
   }
 }
 
-export const openCodeLedgerBridgeService = new OpenCodeLedgerBridgeService()
+export const openCodeLedgerBridgeService = new OpenCodeLedgerBridgeService(
+  openCodeSessionStore,
+  openCodeOfflineSessionReader,
+  new OpenCodeToolpartChangeReconstructor(),
+  new OpenCodeChangeEvidenceEnricher(),
+  new OpenCodeSnapshotEvidenceProviderService(),
+)

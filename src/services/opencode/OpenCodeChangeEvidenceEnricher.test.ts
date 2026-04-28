@@ -5,6 +5,7 @@ import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher
 import { OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC } from './OpenCodeChangeEvidence.js'
 
 import type { OpenCodeSnapshotEvidenceFile, OpenCodeSnapshotEvidenceProvider } from './OpenCodeChangeEvidence.js'
+import type { OpenCodeOfflineSessionReadResult } from './OpenCodeOfflineSessionReader.js'
 import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -82,7 +83,7 @@ function snapshotProvider(file: string | OpenCodeSnapshotEvidenceFile): OpenCode
         adapterVersion: 1,
       }
     },
-    async readBoundaryEvidence() {
+    async readSessionEvidence() {
       return {
         supported: true,
         shapeFingerprint: 'shape-v1',
@@ -97,6 +98,36 @@ function snapshotProvider(file: string | OpenCodeSnapshotEvidenceFile): OpenCode
         ],
       }
     },
+  }
+}
+
+function offlineFixture(overrides: Partial<OpenCodeOfflineSessionReadResult> = {}): OpenCodeOfflineSessionReadResult {
+  return {
+    source: 'opencode-sqlite',
+    dbPath: '/tmp/opencode.db',
+    dbFingerprint: { dbMtimeMs: 1, dbSizeBytes: 1 },
+    historyShape: 'supported',
+    sessionIdentity: null,
+    snapshotStepParts: [],
+    patchParts: [],
+    snapshotWindows: [
+      {
+        windowId: 'assistant-1:start->finish',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        fromSnapshot: '1'.repeat(40),
+        toSnapshot: '2'.repeat(40),
+        startPartId: 'start',
+        finishPartId: 'finish',
+        startPartOrder: 0,
+        finishPartOrder: 2,
+      },
+    ],
+    rawMessages: [],
+    rawParts: [],
+    messages: [],
+    diagnostics: [],
+    ...overrides,
   }
 }
 
@@ -150,21 +181,21 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
-  test('does not use snapshot evidence without a captured boundary', async () => {
+  test('does not use snapshot evidence without SQLite snapshot windows', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
       workspaceRoot,
       sessionRecord: sessionRecord(),
       changes: [change()],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: { schemaVersion: 1, captureStatus: 'not-terminal' },
+      offline: offlineFixture({ snapshotWindows: [] }),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
     })
 
     expect(result[0]?.beforeContent).toBeNull()
     expect(diagnostics).toContain(
-      'OpenCode snapshot evidence skipped because delivery snapshot boundary is unavailable or not terminal.',
+      'OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.',
     )
   })
 
@@ -175,12 +206,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [change()],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       diagnostics,
     })
 
@@ -199,12 +225,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [change()],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
     })
@@ -237,12 +258,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [first, second],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 3;\n'),
       diagnostics,
     })
@@ -272,12 +288,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [change()],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       snapshotProvider: snapshotProvider('value = 2; value = 2;\n'),
       diagnostics,
     })
@@ -308,12 +319,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
         }),
       ],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 2;\n'),
       diagnostics,
     })
@@ -340,12 +346,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
         }),
       ],
       evidenceMode: 'snapshot-auto',
-      snapshotBoundary: {
-        schemaVersion: 1,
-        captureStatus: 'captured',
-        preDeliverySnapshotHash: 'pre',
-        postDeliverySnapshotHash: 'post',
-      },
+      offline: offlineFixture(),
       snapshotProvider: snapshotProvider({
         relativePath: 'src/file.ts',
         beforeContent: 'export const value = 1;\n',

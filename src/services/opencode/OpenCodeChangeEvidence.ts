@@ -1,3 +1,7 @@
+import type { OpenCodeOfflineSessionReadResult } from './OpenCodeOfflineSessionReader.js'
+import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
+import type { OpenCodeSessionRecord } from './types.js'
+
 export type OpenCodeEvidenceProof =
   | 'toolpart-chain'
   | 'opencode-snapshot'
@@ -36,6 +40,18 @@ export type OpenCodeSnapshotEvidenceFile = {
   afterContent?: string
   beforeContent?: string
   operation?: 'create' | 'modify' | 'delete'
+  beforeState?: {
+    exists: boolean
+    sha256?: string
+    sizeBytes?: number
+    unavailableReason?: string
+  }
+  afterState?: {
+    exists: boolean
+    sha256?: string
+    sizeBytes?: number
+    unavailableReason?: string
+  }
   snapshotId?: string
   warnings?: string[]
 }
@@ -82,13 +98,21 @@ export type SnapshotBoundaryReadInput = {
   touchedRelativePaths: string[]
 }
 
+export type SnapshotSessionEvidenceInput = {
+  workspaceRoot: string
+  sessionRecord: OpenCodeSessionRecord
+  offline: OpenCodeOfflineSessionReadResult
+  changes: ReconstructedOpenCodeToolChange[]
+  touchedRelativePaths: string[]
+}
+
 export interface OpenCodeSnapshotEvidenceProvider {
   readonly adapterVersion: number
   probe(input: SnapshotProbeInput): Promise<OpenCodeSnapshotProbeResult>
-  readBoundaryEvidence(input: SnapshotBoundaryReadInput): Promise<OpenCodeSnapshotEvidenceResult>
+  readSessionEvidence(input: SnapshotSessionEvidenceInput): Promise<OpenCodeSnapshotEvidenceResult>
 }
 
-export const DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE: OpenCodeEvidencePipelineMode = 'chain-only'
+export const DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE: OpenCodeEvidencePipelineMode = 'snapshot-auto'
 
 export const OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC =
   'snapshot-provider-unavailable: OpenCode snapshot evidence provider is unavailable; using chain/metadata fallback.'

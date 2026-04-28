@@ -2,15 +2,14 @@ import { createHash } from 'node:crypto'
 
 import { normalizeOpenCodeFilePath } from './OpenCodeBridgePath.js'
 import {
-  isCapturedSnapshotBoundary,
   OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC,
   type OpenCodeEvidenceProof,
   type OpenCodeEvidencePipelineMode,
-  type OpenCodeSnapshotBoundary,
   type OpenCodeSnapshotEvidenceProvider,
   type OpenCodeSnapshotEvidenceResult,
 } from './OpenCodeChangeEvidence.js'
 
+import type { OpenCodeOfflineSessionReadResult } from './OpenCodeOfflineSessionReader.js'
 import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -19,7 +18,7 @@ type EnrichmentParams = {
   sessionRecord: OpenCodeSessionRecord
   changes: ReconstructedOpenCodeToolChange[]
   evidenceMode: OpenCodeEvidencePipelineMode
-  snapshotBoundary?: OpenCodeSnapshotBoundary | null
+  offline?: OpenCodeOfflineSessionReadResult | null
   snapshotProvider?: OpenCodeSnapshotEvidenceProvider
   evidenceMetadata?: {
     snapshotShapeFingerprint?: string
@@ -192,13 +191,14 @@ export class OpenCodeChangeEvidenceEnricher {
     if (params.evidenceMode === 'snapshot-auto') {
       if (!params.snapshotProvider) {
         params.diagnostics.push(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
-      } else if (!isCapturedSnapshotBoundary(params.snapshotBoundary)) {
-        params.diagnostics.push('OpenCode snapshot evidence skipped because delivery snapshot boundary is unavailable or not terminal.')
+      } else if (!params.offline || params.offline.snapshotWindows.length === 0) {
+        params.diagnostics.push('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
       } else {
-        snapshotResult = await params.snapshotProvider.readBoundaryEvidence({
+        snapshotResult = await params.snapshotProvider.readSessionEvidence({
           workspaceRoot: params.workspaceRoot,
-          sessionId: params.sessionRecord.opencodeSessionId,
-          boundary: params.snapshotBoundary,
+          sessionRecord: params.sessionRecord,
+          offline: params.offline,
+          changes: params.changes,
           touchedRelativePaths: params.changes.map(change => change.relativePath),
         }).catch(error => {
           params.diagnostics.push(`OpenCode snapshot evidence read failed - ${error instanceof Error ? error.message : String(error)}`)
