@@ -1,19 +1,31 @@
 # OpenCode Hybrid Evidence Pipeline - Source-Driven Continuation Plan
 
-Status: IOF revision after reading our current bridge code, installed OpenCode 1.14.19 behavior, official docs, current OpenCode `dev` source from `anomalyco/opencode`, and a local `git diff --raw -z` prototype for unusual paths.
+Status: implemented and verified in the continuation worktrees. This document was originally an IOF revision after reading our current bridge code, installed OpenCode 1.14.19 behavior, official docs, current OpenCode `dev` source from `anomalyco/opencode`, and a local `git diff --raw -z` prototype for unusual paths.
 
 Current worktree:
 
 ```text
 /Users/belief/dev/projects/claude/_worktrees/agent_teams_orchestrator_opencode_snapshot_bridge
-branch: research/opencode-snapshot-ledger-bridge
+branch: research/opencode-hybrid-evidence-continuation
 ```
 
 Related UI worktree:
 
 ```text
 /Users/belief/dev/projects/claude/_worktrees/claude_team_opencode_ledger_bridge
-branch: feat/opencode-ledger-bridge-ui
+branch: feat/opencode-hybrid-evidence-ui-continuation
+```
+
+Verified completion snapshot:
+
+```text
+orchestrator targeted suite: 155 pass, 0 fail
+orchestrator build: bun run build:dev passed
+OpenCode live snapshot evidence E2E: 1 pass, 0 fail
+OpenCode live ledger bridge E2E: 1 pass, 0 fail
+UI targeted suite: 119 pass, 0 fail
+UI typecheck: pnpm typecheck passed
+git diff --check: passed in both worktrees
 ```
 
 ## Executive Summary
