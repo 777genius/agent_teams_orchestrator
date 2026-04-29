@@ -37,6 +37,8 @@ const MULTI_GAMMA_FILE = 'live-multi-gamma.ts'
 const FALLBACK_FILE = 'live-metadata-fallback.ts'
 const LIVE_CLI_FILE = 'live-cli-runtime.ts'
 const LIVE_CLI_CREATE_FILE = 'live-cli-created.ts'
+const LIVE_CLI_MIXED_MODIFY_FILE = 'live-cli-mixed-modify.ts'
+const LIVE_CLI_MIXED_CREATE_FILE = 'live-cli-mixed-create.ts'
 
 let tempDir = ''
 
@@ -951,6 +953,160 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     })
     expect(['toolpart-chain', 'opencode-snapshot']).toContain(createEvent?.evidenceProof)
   }, 300_000)
+
+  liveSnapshotBridgeTest('public CLI imports real prompt-driven create and modify OpenCode changes as full-text task changes', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-live-cli-mixed-lifecycle')
+    const projectDir = path.join(tempDir, 'claude-project-live-cli-mixed-lifecycle')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+    const modifyPath = path.join(workspaceRoot, LIVE_CLI_MIXED_MODIFY_FILE)
+    const createPath = path.join(workspaceRoot, LIVE_CLI_MIXED_CREATE_FILE)
+    await writeFile(modifyPath, 'export const mixedModify = 1;\n', 'utf8')
+    runGit(['add', LIVE_CLI_MIXED_MODIFY_FILE], workspaceRoot)
+    runGit(['commit', '-m', 'seed live cli mixed lifecycle workspace'], workspaceRoot)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams mixed lifecycle ledger smoke test.`,
+      `Use file write/edit/apply_patch tools only. Do not use shell, bash, grep, glob, or read.`,
+      `Make exactly these file changes in the current workspace:`,
+      `1. Change ${LIVE_CLI_MIXED_MODIFY_FILE} so the entire final content is exactly: export const mixedModify = 2;`,
+      `2. Create ${LIVE_CLI_MIXED_CREATE_FILE} with exactly: export const mixedCreate = 3;`,
+      `Do not create, delete, inspect, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env, 300_000)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    expect((await readFile(modifyPath, 'utf8')).trim()).toBe('export const mixedModify = 2;')
+    expect((await readFile(createPath, 'utf8')).trim()).toBe('export const mixedCreate = 3;')
+
+    const toolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [
+      LIVE_CLI_MIXED_MODIFY_FILE,
+      LIVE_CLI_MIXED_CREATE_FILE,
+    ])
+    const profileRootKey = 'live-cli-mixed-lifecycle-profile'
+    await materializeLiveManagedProfile({ dbPath, profileRootKey })
+    await writeLiveSessionStoreRecord({
+      profileRootKey,
+      sessionId: toolpart.sessionId,
+      workspaceRoot,
+    })
+
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+    const cli = runCliBackfill({
+      env,
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+    })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        scannedSessions: number
+        snapshotShapeFingerprint?: string
+        diagnostics: string[]
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      scannedSessions: 1,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(2)
+    expect(stdout.result.diagnostics.join('\n')).not.toContain('snapshot-gitdir-missing')
+    expect(stdout.result.diagnostics.join('\n')).not.toContain('snapshot-diff-read-failed')
+
+    const bundle = await readBundle(projectDir)
+    expect(bundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: TASK_ID,
+      totalFiles: 2,
+    })
+    const files = bundle.files as Array<Record<string, unknown>>
+    const byPath = new Map(files.map(file => [file.relativePath, file]))
+    expect(byPath.get(LIVE_CLI_MIXED_MODIFY_FILE)).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: false,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+    expect(byPath.get(LIVE_CLI_MIXED_CREATE_FILE)).toMatchObject({
+      latestOperation: 'create',
+      createdInTask: true,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+
+    const events = await readEvents(projectDir)
+    const eventByPath = new Map(events.map(event => [event.relativePath, event]))
+    for (const relativePath of [
+      LIVE_CLI_MIXED_MODIFY_FILE,
+      LIVE_CLI_MIXED_CREATE_FILE,
+    ]) {
+      const event = eventByPath.get(relativePath)
+      expect(event).toBeTruthy()
+      expect(['opencode-snapshot', 'inverse-edit-chain', 'inverse-apply-patch-chain', 'toolpart-chain']).toContain(event?.evidenceProof)
+      if (event?.snapshotId) {
+        expect(event.snapshotSource).toBe('opencode')
+      }
+    }
+    expect(eventByPath.get(LIVE_CLI_MIXED_MODIFY_FILE)).toMatchObject({
+      operation: 'modify',
+      beforeState: { exists: true },
+      afterState: { exists: true },
+    })
+    expect(eventByPath.get(LIVE_CLI_MIXED_CREATE_FILE)).toMatchObject({
+      operation: 'create',
+      beforeState: { exists: false },
+      afterState: { exists: true },
+    })
+
+    const eventCountAfterFirstImport = events.length
+    const duplicateCli = runCliBackfill({
+      env,
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+    })
+    expect(duplicateCli.status, `stdout:\n${duplicateCli.stdout}\nstderr:\n${duplicateCli.stderr}`).toBe(0)
+    const duplicateStdout = JSON.parse(duplicateCli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(duplicateStdout.result).toMatchObject({
+      outcome: 'duplicates-only',
+      importedEvents: 0,
+    })
+    expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
+  }, 360_000)
 
   liveTest('imports real non-snapshot OpenCode existing-file edits as visible manual-review changes', async () => {
     const env = childEnv()
