@@ -837,6 +837,64 @@ describe('executeCodexNativeTurn', () => {
     })
   })
 
+  test('emits codex turn-settled before yielding the terminal result', async () => {
+    setDynamicTeamContext({
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const events: CodexNativeTurnSettledEvent[] = []
+    const iterator = executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+      runExec: async function* () {
+        yield {
+          type: 'normalized_event',
+          event: {
+            type: 'assistant_text',
+            itemId: 'item_0',
+            text: 'OK',
+          },
+        }
+        yield {
+          type: 'normalized_event',
+          event: {
+            type: 'turn_completed',
+          },
+        }
+        return {
+          identity: null,
+          threadId: 'thread-123',
+          credentialSource: 'ambient-process-env',
+          completionPolicy: 'ephemeral',
+          finalHistoryCompleteness: 'live-only',
+          finalUsageAuthority: 'live-turn-completed',
+        }
+      },
+      runtimeTurnSettledEmitter: {
+        async emit(event) {
+          events.push(event)
+        },
+      },
+    })
+
+    try {
+      while (true) {
+        const next = await iterator.next()
+        expect(next.done).toBe(false)
+        if (!next.done && next.value.type === 'result') {
+          expect(events).toHaveLength(1)
+          expect(events[0]).toMatchObject({
+            outcome: 'success',
+            threadId: 'thread-123',
+          })
+          break
+        }
+      }
+    } finally {
+      await iterator.return(undefined as never)
+    }
+  })
+
   test('emits codex turn-settled event for terminal error paths', async () => {
     setDynamicTeamContext({
       agentId: 'bob@alpha',

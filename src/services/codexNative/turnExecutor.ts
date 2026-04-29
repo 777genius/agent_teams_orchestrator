@@ -415,6 +415,11 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'unsupported',
+      detail: unsupportedReason,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message: unsupportedReason,
@@ -423,11 +428,6 @@ export async function* executeCodexNativeTurn(
       initialAppState: params.initialAppState,
       totalUsage: params.totalUsage,
       model: params.model,
-    })
-    params.setSDKStatus?.('idle')
-    await emitRuntimeTurnSettled({
-      outcome: 'unsupported',
-      detail: unsupportedReason,
     })
     return {
       totalUsage: params.totalUsage,
@@ -548,6 +548,12 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'error',
+      threadId,
+      detail: message,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message,
@@ -556,12 +562,6 @@ export async function* executeCodexNativeTurn(
       initialAppState: params.initialAppState,
       totalUsage: projector.getTotalUsage(),
       model: params.model,
-    })
-    params.setSDKStatus?.('idle')
-    await emitRuntimeTurnSettled({
-      outcome: 'error',
-      threadId,
-      detail: message,
     })
     return {
       totalUsage: projector.getTotalUsage(),
@@ -606,6 +606,12 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'no_assistant',
+      threadId,
+      detail: message,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message,
@@ -614,12 +620,6 @@ export async function* executeCodexNativeTurn(
       initialAppState: params.initialAppState,
       totalUsage: projector.getTotalUsage(),
       model: params.model,
-    })
-    params.setSDKStatus?.('idle')
-    await emitRuntimeTurnSettled({
-      outcome: 'no_assistant',
-      threadId,
-      detail: message,
     })
     return {
       totalUsage: projector.getTotalUsage(),
@@ -666,6 +666,11 @@ export async function* executeCodexNativeTurn(
     finalAssistant.message.content.find(block => block.type === 'text')?.text ??
     ''
 
+  params.setSDKStatus?.('idle')
+  await emitRuntimeTurnSettled({
+    outcome: 'success',
+    threadId,
+  })
   yield buildResultSuccessMessage({
     result: finalText,
     startTime: params.startTime,
@@ -673,11 +678,6 @@ export async function* executeCodexNativeTurn(
     initialAppState: params.initialAppState,
     totalUsage: projector.getTotalUsage(),
     model: params.model,
-  })
-  params.setSDKStatus?.('idle')
-  await emitRuntimeTurnSettled({
-    outcome: 'success',
-    threadId,
   })
 
   return {
