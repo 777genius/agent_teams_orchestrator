@@ -11,6 +11,11 @@ import {
 import { openCodeProvisioningProbe } from '../opencode/OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from '../opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
+import {
+  createIdleNotification,
+  writeToMailbox,
+} from '../../utils/teammateMailbox.js'
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { PROVIDER_DEFAULT_MODEL_SELECTION } from './teamBootstrapModelSelection.js'
 
 import type { TeamBootstrapRequest } from './teamBootstrapTypes.js'
@@ -144,6 +149,23 @@ function mockRequiredMcpTools(): void {
   ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
 }
 
+async function writeBootstrapConfirmation(memberName: string): Promise<void> {
+  const now = new Date().toISOString()
+  await writeToMailbox(
+    TEAM_LEAD_NAME,
+    {
+      from: `${memberName}@atlas-hq`,
+      text: JSON.stringify(
+        createIdleNotification(`${memberName}@atlas-hq`, {
+          idleReason: 'available',
+        }),
+      ),
+      timestamp: now,
+    },
+    'atlas-hq',
+  )
+}
+
 describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
   let tempConfigDir: string
   let registeredMemberNames: Set<string>
@@ -212,6 +234,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         }
         const duplicateReason = duplicateSpawns.get(name)
         if (duplicateReason) {
+          await writeBootstrapConfirmation(name)
           return {
             data: {
               status: 'duplicate_skipped',
@@ -226,6 +249,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
             },
           }
         }
+        registeredMemberNames.add(name)
+        await writeBootstrapConfirmation(name)
         return {
           data: {
             agent_id: `${name}@atlas-hq`,
@@ -373,17 +398,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -526,17 +546,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -672,16 +687,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -817,12 +828,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -988,12 +999,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('tom')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack', 'tom'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -1206,12 +1217,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('tom')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack', 'tom'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -1373,17 +1384,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -1582,18 +1588,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-      'tom',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -1755,17 +1755,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -1964,18 +1959,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-      'tom',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -2141,17 +2130,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual([
-      'alice',
-      'reviewer',
-      'bob',
-      'jack',
-    ])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -2366,7 +2350,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(promotedBobResult.data.members.jack).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
-  test('promotes a launching OpenCode sibling lane to ready when Anthropic-only primary bootstrap is partial success without disturbing a permission-blocked sibling', async () => {
+  test('promotes a launching OpenCode sibling lane to ready when Anthropic-only primary bootstrap fails in partial mode without disturbing a permission-blocked sibling', async () => {
     registeredMemberNames = new Set(['bob', 'jack'])
     spawnFailures.set('alice', 'Anthropic pane exited before bootstrap')
     const { runTeamBootstrap } = await import('./teamBootstrapRunner.js')
@@ -2485,17 +2469,18 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       }),
     )
 
-    expect(primaryResult.ok).toBe(true)
+    expect(primaryResult.ok).toBe(false)
     expect(initialBobResult.ok).toBe(true)
     expect(jackResult.ok).toBe(true)
     expect(promotedBobResult.ok).toBe(true)
-    if (!primaryResult.ok || !initialBobResult.ok || !jackResult.ok || !promotedBobResult.ok) {
+    if (primaryResult.ok || !initialBobResult.ok || !jackResult.ok || !promotedBobResult.ok) {
       return
     }
     expect(spawnInputs.map(input => input.name)).toEqual(['alice'])
-    expect(primaryResult.summary.terminalStatus).toBe('partial_success')
-    expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.failedMembers).toEqual([
+    expect(primaryResult.summary?.terminalStatus).toBe('failed')
+    expect(primaryResult.summary?.expectedMembers).toEqual(['alice'])
+    expect(primaryResult.summary?.registeredMembers).toEqual([])
+    expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
     expect(events.items).toContainEqual({
@@ -2503,6 +2488,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       memberName: 'alice',
       outcome: 'failed',
       reason: 'Anthropic pane exited before bootstrap',
+    })
+    expect(events.items).toContainEqual({
+      type: 'failed',
+      reason: primaryResult.error,
     })
     expect(ensureInputs).toEqual([
       {
@@ -3040,7 +3029,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -3259,7 +3248,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -3349,7 +3338,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -3442,7 +3431,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(ensureInputs).toEqual([
       {
         laneId: 'secondary:opencode:bob',
@@ -3595,7 +3584,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['reviewer'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'alice', reason: 'Codex native process exited before bootstrap' },
     ])
@@ -3724,7 +3713,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -3861,7 +3850,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -4028,7 +4017,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -4203,12 +4192,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -4350,12 +4339,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -4495,12 +4484,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -4668,7 +4657,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([])
     expect(ensureInputs).toEqual([
       {
@@ -4705,7 +4694,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(promotedBobResult.data.members.jack).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
-  test('creates a new Anthropic-only team and promotes a launching OpenCode sibling lane to ready when the Anthropic lead bootstrap is partial success without disturbing a permission-blocked sibling', async () => {
+  test('creates a new Anthropic-only team and promotes a launching OpenCode sibling lane to ready when the Anthropic lead bootstrap fails in partial mode without disturbing a permission-blocked sibling', async () => {
     teamConfigExists = false
     registeredMemberNames = new Set(['bob', 'jack'])
     spawnFailures.set('alice', 'Anthropic pane exited before bootstrap')
@@ -4827,11 +4816,11 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       }),
     )
 
-    expect(primaryResult.ok).toBe(true)
+    expect(primaryResult.ok).toBe(false)
     expect(initialBobResult.ok).toBe(true)
     expect(jackResult.ok).toBe(true)
     expect(promotedBobResult.ok).toBe(true)
-    if (!primaryResult.ok || !initialBobResult.ok || !jackResult.ok || !promotedBobResult.ok) {
+    if (primaryResult.ok || !initialBobResult.ok || !jackResult.ok || !promotedBobResult.ok) {
       return
     }
     expect(createTeamCalls).toEqual([
@@ -4843,12 +4832,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).toEqual(['alice'])
     expect(spawnInputs.map(input => input.name)).not.toContain('bob')
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
-    expect(primaryResult.summary.createdTeam).toBe(true)
-    expect(primaryResult.summary.reusedExistingTeam).toBe(false)
-    expect(primaryResult.summary.terminalStatus).toBe('partial_success')
-    expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['bob', 'jack'])
-    expect(primaryResult.summary.failedMembers).toEqual([
+    expect(primaryResult.summary?.createdTeam).toBe(true)
+    expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
+    expect(primaryResult.summary?.terminalStatus).toBe('failed')
+    expect(primaryResult.summary?.expectedMembers).toEqual(['alice'])
+    expect(primaryResult.summary?.registeredMembers).toEqual([])
+    expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
     expect(events.items).toContainEqual({
@@ -4856,6 +4845,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       memberName: 'alice',
       outcome: 'failed',
       reason: 'Anthropic pane exited before bootstrap',
+    })
+    expect(events.items).toContainEqual({
+      type: 'failed',
+      reason: primaryResult.error,
     })
     expect(ensureInputs).toEqual([
       {
@@ -5034,7 +5027,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual([])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
@@ -5225,12 +5218,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack', 'tom'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -5449,12 +5442,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob', 'jack', 'tom'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack', 'tom'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -5505,7 +5498,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(promotedBobResult.data.members.tom).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
-  test('creates a new Anthropic-only team and promotes a launching OpenCode sibling lane to ready while ready and permission-blocked siblings stay isolated when the Anthropic lead bootstrap is partial success', async () => {
+  test('creates a new Anthropic-only team and promotes a launching OpenCode sibling lane to ready while ready and permission-blocked siblings stay isolated when the Anthropic lead bootstrap fails in partial mode', async () => {
     teamConfigExists = false
     registeredMemberNames = new Set(['bob', 'jack', 'tom'])
     spawnFailures.set('alice', 'Anthropic pane exited before bootstrap')
@@ -5643,13 +5636,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       }),
     )
 
-    expect(primaryResult.ok).toBe(true)
+    expect(primaryResult.ok).toBe(false)
     expect(initialBobResult.ok).toBe(true)
     expect(jackResult.ok).toBe(true)
     expect(tomResult.ok).toBe(true)
     expect(promotedBobResult.ok).toBe(true)
     if (
-      !primaryResult.ok
+      primaryResult.ok
       || !initialBobResult.ok
       || !jackResult.ok
       || !tomResult.ok
@@ -5667,12 +5660,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).not.toContain('bob')
     expect(spawnInputs.map(input => input.name)).not.toContain('jack')
     expect(spawnInputs.map(input => input.name)).not.toContain('tom')
-    expect(primaryResult.summary.createdTeam).toBe(true)
-    expect(primaryResult.summary.reusedExistingTeam).toBe(false)
-    expect(primaryResult.summary.terminalStatus).toBe('partial_success')
-    expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['bob', 'jack', 'tom'])
-    expect(primaryResult.summary.failedMembers).toEqual([
+    expect(primaryResult.summary?.createdTeam).toBe(true)
+    expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
+    expect(primaryResult.summary?.terminalStatus).toBe('failed')
+    expect(primaryResult.summary?.expectedMembers).toEqual(['alice'])
+    expect(primaryResult.summary?.registeredMembers).toEqual([])
+    expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
     expect(events.items).toContainEqual({
@@ -5680,6 +5673,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       memberName: 'alice',
       outcome: 'failed',
       reason: 'Anthropic pane exited before bootstrap',
+    })
+    expect(events.items).toContainEqual({
+      type: 'failed',
+      reason: primaryResult.error,
     })
     expect(ensureInputs).toEqual([
       {
@@ -5892,7 +5889,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['bob', 'jack', 'tom'])
+    expect(primaryResult.summary?.registeredMembers).toEqual([])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
@@ -6073,12 +6070,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -6230,12 +6227,12 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'reviewer'])
     expect(events.completedEvents).toEqual([
       {
         status: 'completed',
         expectedMembers: ['alice', 'reviewer'],
-        registeredMembers: ['alice', 'reviewer', 'bob', 'jack'],
+        registeredMembers: ['alice', 'reviewer'],
         failedMembers: [],
       },
     ])
@@ -6409,7 +6406,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -6612,7 +6609,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['reviewer'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
@@ -6811,7 +6808,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Anthropic pane exited before bootstrap' },
     ])
@@ -6975,7 +6972,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Codex native process exited before bootstrap' },
     ])
@@ -7156,7 +7153,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['reviewer'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'alice', reason: 'Codex native process exited before bootstrap' },
     ])
@@ -7320,7 +7317,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -7501,7 +7498,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary?.reusedExistingTeam).toBe(false)
     expect(primaryResult.summary?.terminalStatus).toBe('failed')
     expect(primaryResult.summary?.expectedMembers).toEqual(['alice', 'reviewer'])
-    expect(primaryResult.summary?.registeredMembers).toEqual(['alice', 'bob', 'jack'])
+    expect(primaryResult.summary?.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary?.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
@@ -7630,7 +7627,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.reusedExistingTeam).toBe(true)
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(ensureInputs).toEqual([
       {
         laneId: 'secondary:opencode:bob',
@@ -7905,7 +7902,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       {
         status: 'completed',
         expectedMembers: ['alice'],
-        registeredMembers: ['alice', 'bob', 'jack'],
+        registeredMembers: ['alice'],
         failedMembers: [],
       },
     ])
@@ -8450,7 +8447,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     }
     expect(spawnInputs.map(input => input.name)).toEqual(['alice', 'reviewer'])
     expect(primaryResult.summary.terminalStatus).toBe('partial_success')
-    expect(primaryResult.summary.registeredMembers).toEqual(['alice', 'bob'])
+    expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([
       { name: 'reviewer', reason: 'Gemini pane exited before bootstrap' },
     ])
