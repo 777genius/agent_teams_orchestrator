@@ -29,11 +29,11 @@ describe('OpenCodePreviewObserver', () => {
         expect(String(input)).toBe('http://127.0.0.1:4096/event')
         return buildSseResponse([
           'data: {"type":"server.connected","properties":{}}\n\n',
-          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":"active"}}\n\n',
+          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":{"type":"busy"}}}\n\n',
           'data: {"type":"message.updated","properties":{"info":{"id":"msg-assistant-1","role":"assistant","sessionID":"session-1"}}}\n\n',
           'data: {"type":"message.part.updated","properties":{"part":{"id":"part-1","type":"text","sessionID":"session-1","messageID":"msg-assistant-1"},"delta":"Hello"}}\n\n',
           'data: {"type":"message.part.updated","properties":{"part":{"id":"part-1","type":"text","sessionID":"session-1","messageID":"msg-assistant-1"},"delta":" world"}}\n\n',
-          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n',
+          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":{"type":"idle"}}}\n\n',
         ])
       },
     })

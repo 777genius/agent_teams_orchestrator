@@ -33,7 +33,7 @@ describe('OpenCodeTurnSettledObserver', () => {
           'data: {"type":"message.updated","properties":{"info":{"id":"msg_prompt_1","role":"user","sessionID":"session-1"}}}\n\n',
           'data: {"type":"message.updated","properties":{"info":{"id":"msg-assistant-1","role":"assistant","sessionID":"session-1"}}}\n\n',
           'data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-1"}}}\n\n',
-          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n',
+          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":{"session-1":{"type":"idle"}}}}\n\n',
         ])
       },
     })

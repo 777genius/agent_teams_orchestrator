@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto'
 
 import {
+  getOpenCodeSseMessageId,
+  getOpenCodeSseMessageRole,
+  getOpenCodeSsePartType,
+  getOpenCodeSseSessionId,
+  getOpenCodeSseSessionStatusType,
   readOpenCodeSseEndpoint,
   type OpenCodeSseEndpoint,
   type OpenCodeSseFetch,
@@ -61,57 +66,8 @@ type ObservationState = {
   terminal: OpenCodeTurnSettledSummary | null
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>
-  }
-  return null
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 ? value : null
-}
-
 function buildPromptMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, '')}`
-}
-
-function getSessionId(properties: Record<string, unknown>): string | null {
-  return (
-    asString(properties.sessionID)
-    ?? asString(properties.sessionId)
-    ?? asString(asRecord(properties.info)?.sessionID)
-    ?? asString(asRecord(properties.info)?.sessionId)
-    ?? asString(asRecord(properties.part)?.sessionID)
-    ?? asString(asRecord(properties.part)?.sessionId)
-  )
-}
-
-function getMessageId(properties: Record<string, unknown>): string | null {
-  return (
-    asString(asRecord(properties.info)?.id)
-    ?? asString(asRecord(properties.part)?.messageID)
-    ?? asString(asRecord(properties.part)?.messageId)
-    ?? asString(properties.messageID)
-    ?? asString(properties.messageId)
-  )
-}
-
-function getStatus(properties: Record<string, unknown>, sessionId: string): string | null {
-  const direct = asString(properties.status)
-  if (direct) {
-    return direct
-  }
-
-  const statusRecord = asRecord(properties.status)
-  if (!statusRecord) {
-    return null
-  }
-  return asString(statusRecord[sessionId])
-}
-
-function roleFromProperties(properties: Record<string, unknown>): string | null {
-  return asString(asRecord(properties.info)?.role)
 }
 
 function isAssistantActivityPartType(partType: string | null): boolean {
@@ -237,7 +193,7 @@ export class OpenCodeTurnSettledObserver {
         return
       }
 
-      const sessionId = getSessionId(event.properties)
+      const sessionId = getOpenCodeSseSessionId(event.properties)
       if (sessionId !== params.sessionId) {
         return
       }
@@ -264,7 +220,7 @@ export class OpenCodeTurnSettledObserver {
       }
 
       if (event.type === 'session.status') {
-        const status = getStatus(event.properties, params.sessionId)
+        const status = getOpenCodeSseSessionStatusType(event.properties.status, params.sessionId)
         if (status === 'idle' && state.promptState === 'accepted') {
           settle(
             state.assistantActivityCount > 0 ? 'success' : 'idle_without_assistant_activity',
@@ -281,8 +237,8 @@ export class OpenCodeTurnSettledObserver {
       }
 
       if (event.type === 'message.updated') {
-        const messageId = getMessageId(event.properties)
-        const role = roleFromProperties(event.properties)
+        const messageId = getOpenCodeSseMessageId(event.properties)
+        const role = getOpenCodeSseMessageRole(event.properties)
         if (messageId === runtimePromptMessageId && role === 'user') {
           state.promptPersisted = true
           return
@@ -295,11 +251,11 @@ export class OpenCodeTurnSettledObserver {
       }
 
       if (event.type === 'message.part.updated') {
-        const messageId = getMessageId(event.properties)
+        const messageId = getOpenCodeSseMessageId(event.properties)
         if (messageId === runtimePromptMessageId) {
           return
         }
-        const partType = asString(asRecord(event.properties.part)?.type)
+        const partType = getOpenCodeSsePartType(event.properties)
         if (isAssistantActivityPartType(partType)) {
           state.assistantActivityCount += 1
           state.latestAssistantMessageId = messageId
