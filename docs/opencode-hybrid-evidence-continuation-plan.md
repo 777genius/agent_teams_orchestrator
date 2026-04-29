@@ -19,11 +19,11 @@ branch: feat/opencode-hybrid-evidence-ui-continuation
 Verified completion snapshot:
 
 ```text
-orchestrator targeted suite: 171 pass, 0 fail
+orchestrator targeted suite: 172 pass, 0 fail
 orchestrator build: bun run build:dev passed
-OpenCode fixture/public-runtime E2E: 13 pass, 0 fail
+OpenCode fixture/public-runtime E2E: 14 pass, 0 fail
 OpenCode live snapshot evidence E2E: 1 pass, 0 fail
-OpenCode live ledger bridge E2E: 4 pass, 0 fail, 65 expect calls
+OpenCode live ledger bridge E2E: 5 pass, 0 fail, 84 expect calls
 Combined live snapshot bridge E2E: real OpenCode snapshot:true run -> strict delivery bridge -> full-text ledger bundle passed
 UI targeted suite: 119 pass, 0 fail
 UI typecheck: pnpm typecheck passed
@@ -43,6 +43,7 @@ Added a gated combined live E2E proving a real snapshot:true OpenCode file edit 
 Added fixture/public-runtime E2E for same-session other-task rejection, missing snapshot gitdir metadata-only visibility, and metadata-only to full-text snapshot evidence upgrade.
 Added public-runtime E2E for snapshot dry-run no-write behavior, idempotent duplicate handling, CLI metadata-only to full-text upgrade, and snapshot-backed apply_patch delete lifecycle projection.
 Expanded gated real OpenCode bridge E2E to cover strict-delivery fail-closed on wrong delivery ids, multi-file snapshot full-text import, duplicate-safe repeated backfill on live data, and non-snapshot existing-file fallback as visible manual-only changes.
+Expanded public runtime E2E to cover mismatched delivery context fail-closed with zero ledger artifacts, plus a gated live CLI test proving real OpenCode snapshot artifacts import through `cli-dev runtime opencode-ledger-backfill` from managed-profile storage.
 ```
 
 ## Executive Summary

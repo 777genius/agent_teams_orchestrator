@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { buildManagedConfig } from './OpenCodeProfileManager.js'
+import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
 import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
 
@@ -34,6 +35,7 @@ const MULTI_ALPHA_FILE = 'live-multi-alpha.ts'
 const MULTI_BETA_FILE = 'live-multi-beta.ts'
 const MULTI_GAMMA_FILE = 'live-multi-gamma.ts'
 const FALLBACK_FILE = 'live-metadata-fallback.ts'
+const LIVE_CLI_FILE = 'live-cli-runtime.ts'
 
 let tempDir = ''
 
@@ -58,7 +60,7 @@ afterEach(async () => {
 })
 
 function childEnv(options: { snapshot?: boolean } = {}): NodeJS.ProcessEnv {
-  const home = path.join(tempDir, 'home')
+  const home = liveHome()
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: home,
@@ -77,6 +79,34 @@ function childEnv(options: { snapshot?: boolean } = {}): NodeJS.ProcessEnv {
     env.OPENCODE_DISABLE_CLAUDE_CODE = '1'
   }
   return env
+}
+
+function liveHome(): string {
+  return path.join(tempDir, 'home')
+}
+
+function appDataDirForHome(home: string): string {
+  const appName = 'claude-multimodel-nodejs'
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', appName)
+  }
+  if (process.platform === 'win32') {
+    return path.join(home, 'AppData', 'Local', appName, 'Data')
+  }
+  return path.join(home, '.local', 'share', appName)
+}
+
+function cliDevCommand(): { command: string; prefixArgs: string[] } {
+  if (process.platform === 'win32') {
+    return {
+      command: process.execPath,
+      prefixArgs: [path.join(process.cwd(), 'dist', 'local-cli-dev', 'cli.js')],
+    }
+  }
+  return {
+    command: path.join(process.cwd(), 'cli-dev'),
+    prefixArgs: [],
+  }
 }
 
 function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000) {
@@ -259,6 +289,82 @@ async function writeDeliveryContext(input: {
     deliveryContextPath: filePath,
     deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
   }
+}
+
+async function materializeLiveManagedProfile(input: {
+  dbPath: string
+  profileRootKey: string
+}): Promise<string> {
+  const profileDataDir = path.join(
+    appDataDirForHome(liveHome()),
+    'opencode',
+    'profiles',
+    input.profileRootKey,
+    'data',
+    'opencode',
+  )
+  await mkdir(path.dirname(profileDataDir), { recursive: true })
+  await rm(profileDataDir, { recursive: true, force: true })
+  await cp(path.dirname(input.dbPath), profileDataDir, { recursive: true, force: true })
+  return profileDataDir
+}
+
+async function writeLiveSessionStoreRecord(input: {
+  profileRootKey: string
+  sessionId: string
+  workspaceRoot: string
+}): Promise<void> {
+  const store = new OpenCodeSessionStore(
+    path.join(appDataDirForHome(liveHome()), 'opencode', 'session-store.json'),
+  )
+  await store.upsert({
+    ...sessionRecord({
+      sessionId: input.sessionId,
+      workspaceRoot: input.workspaceRoot,
+    }),
+    profileRootKey: input.profileRootKey,
+  })
+}
+
+function runCliBackfill(input: {
+  env: NodeJS.ProcessEnv
+  projectDir: string
+  workspaceRoot: string
+  deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
+}) {
+  const cliDev = cliDevCommand()
+  return spawnSync(
+    cliDev.command,
+    [
+      ...cliDev.prefixArgs,
+      'runtime',
+      'opencode-ledger-backfill',
+      '--json',
+      '--team',
+      TEAM_NAME,
+      '--task',
+      TASK_ID,
+      '--task-display-id',
+      TASK_DISPLAY_ID,
+      '--project-dir',
+      input.projectDir,
+      '--workspace-root',
+      input.workspaceRoot,
+      '--delivery-context',
+      input.deliveryContext.deliveryContextPath,
+      '--delivery-context-hash',
+      input.deliveryContext.deliveryContextHash,
+      '--attribution-mode',
+      'strict-delivery',
+    ],
+    {
+      cwd: process.cwd(),
+      env: input.env,
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
+    },
+  )
 }
 
 async function readBundle(projectDir: string): Promise<Record<string, unknown>> {
@@ -614,6 +720,139 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     expect(duplicateResult.importedEvents).toBe(0)
     expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
   }, 240_000)
+
+  liveSnapshotBridgeTest('public CLI imports real OpenCode snapshot changes from managed profile artifacts', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-live-cli')
+    const projectDir = path.join(tempDir, 'claude-project-live-cli')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+    const liveCliPath = path.join(workspaceRoot, LIVE_CLI_FILE)
+    await writeFile(liveCliPath, 'export const cliRuntime = 1;\n', 'utf8')
+    runGit(['add', LIVE_CLI_FILE], workspaceRoot)
+    runGit(['commit', '-m', 'seed live cli runtime workspace'], workspaceRoot)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams CLI ledger smoke test.`,
+      `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+      `Overwrite this exact absolute file path: ${liveCliPath}`,
+      `The write tool content must be exactly: export const cliRuntime = 2;`,
+      `Do not create, delete, inspect, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    const toolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [LIVE_CLI_FILE])
+    const profileRootKey = 'live-cli-profile'
+    await materializeLiveManagedProfile({ dbPath, profileRootKey })
+    await writeLiveSessionStoreRecord({
+      profileRootKey,
+      sessionId: toolpart.sessionId,
+      workspaceRoot,
+    })
+
+    const wrongProjectDir = path.join(tempDir, 'claude-project-live-cli-wrong-delivery')
+    await mkdir(wrongProjectDir, { recursive: true })
+    const wrongDeliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: `${toolpart.parentUserMessageId}-wrong`,
+    })
+    const wrongCli = runCliBackfill({
+      env,
+      projectDir: wrongProjectDir,
+      workspaceRoot,
+      deliveryContext: wrongDeliveryContext,
+    })
+    expect(wrongCli.status, `stdout:\n${wrongCli.stdout}\nstderr:\n${wrongCli.stderr}`).toBe(0)
+    const wrongStdout = JSON.parse(wrongCli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(wrongStdout.result).toMatchObject({
+      outcome: 'no-attribution',
+      importedEvents: 0,
+    })
+    expect(await readBundle(wrongProjectDir).catch(() => null)).toBeNull()
+
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+    const cli = runCliBackfill({
+      env,
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+    })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        scannedSessions: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      scannedSessions: 1,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const bundle = await readBundle(projectDir)
+    expect(bundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: TASK_ID,
+      totalFiles: 1,
+    })
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === LIVE_CLI_FILE)).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+
+    const eventCountAfterFirstImport = (await readEvents(projectDir)).length
+    const duplicateCli = runCliBackfill({
+      env,
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+    })
+    expect(duplicateCli.status, `stdout:\n${duplicateCli.stdout}\nstderr:\n${duplicateCli.stderr}`).toBe(0)
+    const duplicateStdout = JSON.parse(duplicateCli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(duplicateStdout.result).toMatchObject({
+      outcome: 'duplicates-only',
+      importedEvents: 0,
+    })
+    expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
+  }, 300_000)
 
   liveTest('imports real non-snapshot OpenCode existing-file edits as visible manual-review changes', async () => {
     const env = childEnv()

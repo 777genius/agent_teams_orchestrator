@@ -687,6 +687,41 @@ async function createFixtureDeliveryContext(): Promise<{ deliveryContextPath: st
   }
 }
 
+async function createMismatchedFixtureDeliveryContext(): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+  await chmod(contextDir, 0o700).catch(() => undefined)
+  const filePath = path.join(contextDir, 'delivery-context.json')
+  const rawContext = `${JSON.stringify({
+    schemaVersion: 1,
+    teamName: 'fixture-team',
+    taskId: 'task-1',
+    records: [
+      {
+        memberName: 'bob',
+        laneId: 'secondary:opencode:bob',
+        runtimeSessionId: 'session-bob',
+        inboxMessageId: 'bob-user-missing',
+        deliveredUserMessageId: 'bob-user-missing',
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        taskRefs: [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'fixture-team' },
+        ],
+      },
+    ],
+  })}\n`
+  await writeFile(
+    filePath,
+    rawContext,
+    { encoding: 'utf8', mode: 0o600 },
+  )
+  return {
+    deliveryContextPath: filePath,
+    deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+  }
+}
+
 function envPathsDataDirForHome(home: string): string {
   const appName = 'claude-multimodel-nodejs'
   if (process.platform === 'darwin') {
@@ -1385,6 +1420,34 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       eventCount: 4,
       totalFiles: 2,
     })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command fails closed with mismatched delivery context and writes no ledger artifacts', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-mismatched-delivery')
+    const projectDir = path.join(tempDir, 'claude-project-cli-mismatched-delivery')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createMismatchedFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; candidateEvents: number; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'no-attribution',
+      candidateEvents: 0,
+      importedEvents: 0,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'OpenCode toolpart bob-0001-write-index skipped because no delivery record matched its parent message.',
+    )
+    expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
+    expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
