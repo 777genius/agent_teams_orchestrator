@@ -139,6 +139,29 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
+  it('forwards runtime turn-settled spool env vars to tmux teammates', () => {
+    const originalSpoolRoot =
+      process.env.AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT
+
+    process.env.AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT =
+      '/tmp/agent-teams-runtime-hooks'
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'codex' })
+
+      expect(env).toContain(
+        'AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT=/tmp/agent-teams-runtime-hooks',
+      )
+    } finally {
+      if (originalSpoolRoot === undefined) {
+        delete process.env.AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT
+      } else {
+        process.env.AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT =
+          originalSpoolRoot
+      }
+    }
+  })
+
   it('clears Codex API key env vars for ChatGPT-auth codex teammates', () => {
     const originalApiKey = process.env.OPENAI_API_KEY
     const originalCodexApiKey = process.env.CODEX_API_KEY
