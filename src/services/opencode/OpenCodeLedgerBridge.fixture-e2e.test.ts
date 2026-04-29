@@ -387,6 +387,7 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   includeUnattributedSnapshotFile?: boolean
   includeNewlinePathEdit?: boolean
   includeWriteOverwrite?: boolean
+  includeApplyPatchUpdate?: boolean
   includeApplyPatchDelete?: boolean
 }): Promise<{ fromSnapshot: string; toSnapshot: string; gitDir: string }> {
   const profileDataDir = path.dirname(input.dbPath)
@@ -415,6 +416,10 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
     await writeFile(path.join(input.workspaceRoot, '227', 'delete-me.js'), 'export const remove = 1;\n', 'utf8')
   }
+  if (input.includeApplyPatchUpdate) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'patch-update.ts'), 'export const patched = 1;\n', 'utf8')
+  }
   const fromSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
   await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
   await writeFile(path.join(input.workspaceRoot, '227', 'index.html'), '<main>v1</main>\n', 'utf8')
@@ -433,6 +438,9 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   }
   if (input.includeApplyPatchDelete) {
     await rm(path.join(input.workspaceRoot, '227', 'delete-me.js'))
+  }
+  if (input.includeApplyPatchUpdate) {
+    await writeFile(path.join(input.workspaceRoot, '227', 'patch-update.ts'), 'export const patched = 2;\n', 'utf8')
   }
   const toSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
 
@@ -558,6 +566,31 @@ async function insertSnapshotApplyPatchDeleteToolpart(dbPath: string): Promise<v
   }
 }
 
+async function insertSnapshotApplyPatchUpdateToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-apply-patch-update',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_029,
+      data: applyPatchToolPart({
+        patch: [
+          '*** Begin Patch',
+          '*** Update File: 227/patch-update.ts',
+          '@@',
+          '-export const patched = 1;',
+          '+export const patched = 2;',
+          '*** End Patch',
+        ].join('\n'),
+        callID: 'call-bob-apply-patch-update',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
 async function insertBinaryLargeMetadataToolparts(dbPath: string, workspaceRoot: string): Promise<void> {
   const db = new Database(dbPath)
   try {
@@ -637,6 +670,96 @@ async function insertSymlinkEditToolpart(dbPath: string, workspaceRoot: string):
         newString: 'target = true',
         callID: 'call-bob-edit-symlink',
       }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertApplyPatchMixedLifecycleToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-apply-patch-mixed-lifecycle',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_032,
+      data: applyPatchToolPart({
+        patch: [
+          '*** Begin Patch',
+          '*** Add File: 227/new.ts',
+          '+export const created = true;',
+          '*** Update File: 227/existing.ts',
+          '@@',
+          '-export const value = 1;',
+          '+export const value = 2;',
+          '*** Delete File: 227/old.ts',
+          '*** End Patch',
+        ].join('\n'),
+        callID: 'call-bob-apply-patch-mixed-lifecycle',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function replaceFixtureWithUnsupportedWriteToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    db.query("delete from part where id <> 'bob-user-part-1'").run()
+    db.query("delete from message where id <> 'bob-user-1'").run()
+    insertMessage(db, {
+      id: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_000,
+      data: messageData('bob-assistant-1', 'bob-user-1'),
+    })
+    insertPart(db, {
+      id: 'bob-bad-write-shape',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_001,
+      data: {
+        type: 'tool',
+        tool: 'write',
+        callID: 'call-bob-bad-write-shape',
+        state: {
+          status: 'completed',
+          input: {
+            filePath: 42,
+            content: 'export const bad = true;\n',
+          },
+          time: { end: 1_000 },
+        },
+      },
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertUnsupportedWriteToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-extra-bad-write-shape',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_033,
+      data: {
+        type: 'tool',
+        tool: 'write',
+        callID: 'call-bob-extra-bad-write-shape',
+        state: {
+          status: 'completed',
+          input: {
+            filePath: { path: '227/bad.ts' },
+            content: 'export const bad = true;\n',
+          },
+          time: { end: 1_000 },
+        },
+      },
     })
   } finally {
     db.close()
@@ -1507,6 +1630,66 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
+  test('CLI command projects OpenCode write and edit chains into visible full-text Changes rows', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-visible-chain')
+    const projectDir = path.join(tempDir, 'claude-project-cli-visible-chain')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 4,
+    })
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events.find(event => event.sourcePartId === 'bob-0001-write-index')).toMatchObject({
+      source: 'opencode_toolpart_write',
+      relativePath: '227/index.html',
+      operation: 'create',
+      confidence: 'exact',
+      beforeState: { exists: false },
+      afterState: { exists: true },
+    })
+    expect(events.find(event => event.sourcePartId === 'bob-0003-edit-state')).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/state.js',
+      operation: 'modify',
+      confidence: 'exact',
+      beforeState: { exists: true },
+      afterState: { exists: true },
+    })
+    expect(events.find(event => event.sourcePartId === 'bob-error-edit-state')).toBeUndefined()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/state.js')).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: true,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      eventCount: 2,
+      memberNames: ['bob'],
+    })
+    expect(files.find(file => file.relativePath === '227/index.html')).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: true,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      eventCount: 2,
+      memberNames: ['bob', 'tom'],
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
   test('CLI command fails closed with mismatched delivery context and writes no ledger artifacts', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-cli-mismatched-delivery')
     const projectDir = path.join(tempDir, 'claude-project-cli-mismatched-delivery')
@@ -1566,6 +1749,69 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     )
     expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
     expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command reports unsupported OpenCode file toolpart shapes without writing ledger artifacts', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-unsupported-only')
+    const projectDir = path.join(tempDir, 'claude-project-cli-unsupported-only')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await replaceFixtureWithUnsupportedWriteToolpart(dbPath)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; candidateEvents: number; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'skipped-capability',
+      candidateEvents: 0,
+      importedEvents: 0,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'OpenCode SQLite write toolpart bob-bad-write-shape has unsupported state/input/filePath shape; it will be skipped.',
+    )
+    expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
+    expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports valid changes when a sibling OpenCode toolpart has unsupported shape', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-valid-plus-unsupported')
+    const projectDir = path.join(tempDir, 'claude-project-cli-valid-plus-unsupported')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertUnsupportedWriteToolpart(dbPath)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 4,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'OpenCode SQLite write toolpart bob-extra-bad-write-shape has unsupported state/input/filePath shape; it will be skipped.',
+    )
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events).toHaveLength(4)
+    expect(events.some(event => event.sourcePartId === 'bob-extra-bad-write-shape')).toBe(false)
+    expect(await readTaskChangeBundle(projectDir, 'task-1')).toMatchObject({
+      eventCount: 4,
+      totalFiles: 2,
+      integrity: 'ok',
+    })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI command fails closed on case-colliding OpenCode paths and writes no ledger artifacts', async () => {
@@ -1654,6 +1900,72 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
+  test('CLI command imports mixed apply_patch create update delete lifecycle as visible Changes rows', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-apply-patch-mixed')
+    const projectDir = path.join(tempDir, 'claude-project-cli-apply-patch-mixed')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertApplyPatchMixedLifecycleToolpart(dbPath)
+    await writeFile(path.join(workspaceRoot, '227', 'new.ts'), 'export const created = true;\n', 'utf8')
+    await writeFile(path.join(workspaceRoot, '227', 'existing.ts'), 'export const value = 2;\n', 'utf8')
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(stdout.result.outcome).toBe('imported')
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(3)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const patchEvents = events.filter(event => event.sourcePartId === 'bob-apply-patch-mixed-lifecycle')
+    expect(patchEvents.map(event => [event.operation, event.relativePath])).toEqual([
+      ['create', '227/new.ts'],
+      ['modify', '227/existing.ts'],
+      ['delete', '227/old.ts'],
+    ])
+    expect(patchEvents[0]).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      confidence: 'exact',
+      beforeState: { exists: false },
+      afterState: { exists: true },
+    })
+    expect(patchEvents[1]).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-apply-patch-before-content-unavailable',
+      },
+      afterState: { exists: true },
+    })
+    expect(patchEvents[2]).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      evidenceProof: 'metadata-only-fallback',
+      afterState: { exists: false },
+    })
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/new.ts')).toMatchObject({
+      latestOperation: 'create',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+    expect(files.find(file => file.relativePath === '227/existing.ts')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+    })
+    expect(files.find(file => file.relativePath === '227/old.ts')).toMatchObject({
+      latestOperation: 'delete',
+      reviewability: 'metadata-only',
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
   test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot')
     const projectDir = path.join(tempDir, 'claude-project-cli-snapshot')
@@ -1720,6 +2032,180 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       scannedSessions: 2,
     })
     expect(await readJsonlEvents(projectDir, 'task-1')).toHaveLength(events.length)
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports snapshot-backed write overwrite as full-text modify Changes row', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-write-overwrite')
+    const projectDir = path.join(tempDir, 'claude-project-cli-write-overwrite')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotWriteOverwriteToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeWriteOverwrite: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; snapshotShapeFingerprint?: string }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const rewriteEvent = events.find(event => event.sourcePartId === 'bob-write-rewrite')
+    expect(rewriteEvent).toMatchObject({
+      source: 'opencode_toolpart_write',
+      relativePath: '227/rewrite.js',
+      operation: 'modify',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotSource: 'opencode',
+      beforeState: { exists: true },
+      afterState: { exists: true },
+    })
+    expect(rewriteEvent?.snapshotId).toBeTruthy()
+    expect((rewriteEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((rewriteEvent?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/rewrite.js')).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: false,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (rewriteEvent?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (rewriteEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports snapshot-backed apply_patch update as full-text modify Changes row', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-apply-patch-update')
+    const projectDir = path.join(tempDir, 'claude-project-cli-apply-patch-update')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotApplyPatchUpdateToolpart(dbPath)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeApplyPatchUpdate: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; snapshotShapeFingerprint?: string }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const updateEvent = events.find(event => event.sourcePartId === 'bob-apply-patch-update')
+    expect(updateEvent).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      relativePath: '227/patch-update.ts',
+      operation: 'modify',
+      confidence: 'high',
+      evidenceProof: 'inverse-apply-patch-chain',
+      snapshotSource: 'opencode',
+      beforeState: { exists: true },
+      afterState: { exists: true },
+    })
+    expect(updateEvent?.snapshotId).toBeTruthy()
+    expect((updateEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((updateEvent?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/patch-update.ts')).toMatchObject({
+      latestOperation: 'modify',
+      createdInTask: false,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (updateEvent?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (updateEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports newline path snapshot evidence as one full-text Changes row', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-newline-path')
+    const projectDir = path.join(tempDir, 'claude-project-cli-newline-path')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertNewlinePathSnapshotEditToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeNewlinePathEdit: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        diagnostics: string[]
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path 227/new\nline.js; using raw snapshot diff as path proof.',
+    )
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const newlineEvent = events.find(event => event.sourcePartId === 'bob-edit-newline-path')
+    expect(newlineEvent).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/new\nline.js',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+      snapshotSource: 'opencode',
+    })
+    expect(newlineEvent?.snapshotId).toBeTruthy()
+    expect(events.some(event => event.relativePath === '227/new')).toBe(false)
+    expect(events.some(event => event.relativePath === 'line.js')).toBe(false)
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/new\nline.js')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (newlineEvent?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (newlineEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
+    expect(files.some(file => file.relativePath === '227/new')).toBe(false)
+    expect(files.some(file => file.relativePath === 'line.js')).toBe(false)
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI command does not import snapshot-only formatter noise without a matching toolpart path', async () => {
