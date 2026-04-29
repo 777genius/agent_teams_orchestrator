@@ -30,6 +30,12 @@ import {
 import { runCodexNativeExec } from './execRunner.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import {
+  buildCodexNativeTurnSettledEvent,
+  emitCodexNativeTurnSettledBestEffort,
+  type CodexNativeTurnSettledEmitterPort,
+  type CodexNativeTurnSettledOutcome,
+} from './runtimeTurnSettledEmitter.js'
+import {
   createCodexNativeExecutionSummaryMessage,
   createCodexNativeThreadStatusMessage,
 } from './statusAuthority.js'
@@ -73,6 +79,7 @@ type ExecuteCodexNativeTurnDeps = {
   runExec?: typeof runCodexNativeExec
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
+  runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
 }
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 300_000
@@ -362,6 +369,25 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
+  const emitRuntimeTurnSettled = async (input: {
+    outcome: CodexNativeTurnSettledOutcome
+    threadId?: string | null
+    detail?: string
+  }): Promise<void> => {
+    const event = buildCodexNativeTurnSettledEvent({
+      cwd: params.cwd,
+      outcome: input.outcome,
+      threadId: input.threadId,
+      detail: input.detail,
+    })
+    if (!event) {
+      return
+    }
+    await emitCodexNativeTurnSettledBestEffort(
+      event,
+      deps.runtimeTurnSettledEmitter,
+    )
+  }
 
   params.setSDKStatus?.('running')
 
@@ -399,6 +425,10 @@ export async function* executeCodexNativeTurn(
       model: params.model,
     })
     params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'unsupported',
+      detail: unsupportedReason,
+    })
     return {
       totalUsage: params.totalUsage,
       binaryIdentity: null,
@@ -528,6 +558,11 @@ export async function* executeCodexNativeTurn(
       model: params.model,
     })
     params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'error',
+      threadId,
+      detail: message,
+    })
     return {
       totalUsage: projector.getTotalUsage(),
       binaryIdentity,
@@ -581,6 +616,11 @@ export async function* executeCodexNativeTurn(
       model: params.model,
     })
     params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'no_assistant',
+      threadId,
+      detail: message,
+    })
     return {
       totalUsage: projector.getTotalUsage(),
       binaryIdentity,
@@ -635,6 +675,10 @@ export async function* executeCodexNativeTurn(
     model: params.model,
   })
   params.setSDKStatus?.('idle')
+  await emitRuntimeTurnSettled({
+    outcome: 'success',
+    threadId,
+  })
 
   return {
     totalUsage: projector.getTotalUsage(),

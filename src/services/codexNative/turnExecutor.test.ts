@@ -1,11 +1,13 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
   getFlagSettingsInline,
   setFlagSettingsInline,
 } from '../../bootstrap/state.js'
 import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSdkTypes.js'
+import { clearDynamicTeamContext, setDynamicTeamContext } from '../../utils/teammate.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
+import type { CodexNativeTurnSettledEvent } from './runtimeTurnSettledEmitter.js'
 import {
   executeCodexNativeTurn,
   resolveCodexNativeExecTimeoutPolicy,
@@ -63,6 +65,10 @@ async function collectMessagesAndSummary(
     messages.push(next.value)
   }
 }
+
+afterEach(() => {
+  clearDynamicTeamContext()
+})
 
 describe('executeCodexNativeTurn', () => {
   test('applies mailbox timeout policy to ordinary queued mailbox prompts', () => {
@@ -756,5 +762,154 @@ describe('executeCodexNativeTurn', () => {
         codexNativeThreadId: 'thread-persistent',
       },
     ])
+  })
+
+  test('emits codex turn-settled event after native exec completes for teammates', async () => {
+    setDynamicTeamContext({
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const order: string[] = []
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+        runExec: async function* () {
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'thread_started',
+              threadId: 'thread-123',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          order.push('exec-completed')
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: 'thread-123',
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            order.push('emitted')
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(order).toEqual(['exec-completed', 'emitted'])
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      provider: 'codex',
+      eventName: 'runtime_turn_settled',
+      hookEventName: 'Stop',
+      source: 'agent-teams-orchestrator-codex-native',
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      cwd: '/tmp/alpha',
+      outcome: 'success',
+      threadId: 'thread-123',
+    })
+  })
+
+  test('emits codex turn-settled event for terminal error paths', async () => {
+    setDynamicTeamContext({
+      agentId: 'bob@alpha',
+      agentName: 'bob',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        runExec: async function* () {
+          throw new Error('codex crashed')
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      provider: 'codex',
+      agentName: 'bob',
+      teamName: 'alpha',
+      outcome: 'error',
+      detail: 'codex crashed',
+    })
+  })
+
+  test('does not emit codex turn-settled event outside teammate context', async () => {
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        runExec: async function* () {
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: null,
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(events).toEqual([])
   })
 })
