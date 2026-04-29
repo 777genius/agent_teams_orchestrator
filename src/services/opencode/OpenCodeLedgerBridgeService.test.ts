@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -9,6 +10,7 @@ import { OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE } from './OpenCodeOfflineSessio
 import { OpenCodeToolpartChangeReconstructor } from './OpenCodeToolpartChangeReconstructor.js'
 
 import type { OpenCodeSnapshotBoundary, OpenCodeSnapshotEvidenceFile, OpenCodeSnapshotEvidenceProvider } from './OpenCodeChangeEvidence.js'
+import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
 import type {
   OpenCodeOfflineSessionReadResult,
   OpenCodeSqliteMessageRow,
@@ -128,6 +130,10 @@ function offlineFixture(): OpenCodeOfflineSessionReadResult {
     source: 'opencode-sqlite',
     dbPath: path.join(tempDir, 'state.db'),
     dbFingerprint: { dbMtimeMs: 1, dbSizeBytes: 1 },
+    sessionIdentity: null,
+    snapshotStepParts: [],
+    patchParts: [],
+    snapshotWindows: [],
     rawMessages: [
       messageRow('user-1', { id: 'user-1' }, 900),
       messageRow('assistant-1', { id: 'assistant-1', parentID: 'user-1' }, 1000),
@@ -155,36 +161,50 @@ async function writeDeliveryContext(overrides: Partial<{
   inboxMessageId: string | null
   deliveredUserMessageId: string | null
   snapshotBoundary: OpenCodeSnapshotBoundary | Record<string, unknown> | null
-}> = {}): Promise<string> {
-  const filePath = path.join(tempDir, 'delivery-context.json')
+  taskRefs: Array<{ taskId: string; displayId: string; teamName: string }>
+}> = {}): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const hasRuntimeSessionIdOverride = Object.prototype.hasOwnProperty.call(overrides, 'runtimeSessionId')
+  const rawContext = `${JSON.stringify({
+    schemaVersion: 1,
+    teamName: 'team-a',
+    taskId: 'task-1',
+    records: [
+      {
+        memberName: overrides.memberName ?? 'bob',
+        laneId: overrides.laneId ?? 'primary',
+        runtimeSessionId: hasRuntimeSessionIdOverride ? overrides.runtimeSessionId : 'session-1',
+        inboxMessageId: overrides.inboxMessageId ?? 'user-1',
+        deliveredUserMessageId: overrides.deliveredUserMessageId ?? null,
+        observedAssistantMessageId: null,
+        prePromptCursor: null,
+        postPromptCursor: null,
+        ...(overrides.snapshotBoundary !== undefined
+          ? { snapshotBoundary: overrides.snapshotBoundary }
+          : {}),
+        taskRefs: overrides.taskRefs ?? [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+        ],
+      },
+    ],
+  })}\n`
+  return writeTrustedDeliveryContextRaw(rawContext)
+}
+
+async function writeTrustedDeliveryContextRaw(
+  rawContext: string,
+): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
+  const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+  await chmod(contextDir, 0o700).catch(() => undefined)
+  const filePath = path.join(contextDir, 'delivery-context.json')
   await writeFile(
     filePath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      teamName: 'team-a',
-      taskId: 'task-1',
-      records: [
-        {
-          memberName: overrides.memberName ?? 'bob',
-          laneId: overrides.laneId ?? 'primary',
-          runtimeSessionId: overrides.runtimeSessionId ?? 'session-1',
-          inboxMessageId: overrides.inboxMessageId ?? 'user-1',
-          deliveredUserMessageId: overrides.deliveredUserMessageId ?? null,
-          observedAssistantMessageId: null,
-          prePromptCursor: null,
-          postPromptCursor: null,
-          ...(overrides.snapshotBoundary !== undefined
-            ? { snapshotBoundary: overrides.snapshotBoundary }
-            : {}),
-          taskRefs: [
-            { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
-          ],
-        },
-      ],
-    })}\n`,
-    'utf8',
+    rawContext,
+    { encoding: 'utf8', mode: 0o600 },
   )
-  return filePath
+  return {
+    deliveryContextPath: filePath,
+    deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+  }
 }
 
 function snapshotProvider(
@@ -200,7 +220,7 @@ function snapshotProvider(
         adapterVersion: 1,
       }
     },
-    async readBoundaryEvidence() {
+    async readSessionEvidence() {
       return {
         supported: true,
         shapeFingerprint: 'shape-v1',
@@ -212,6 +232,86 @@ function snapshotProvider(
         ],
       }
     },
+  }
+}
+
+function withSnapshotWindow(
+  fixture: OpenCodeOfflineSessionReadResult,
+): OpenCodeOfflineSessionReadResult {
+  return {
+    ...fixture,
+    snapshotStepParts: [
+      {
+        partId: '000-step-start',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        partOrder: 0,
+        timeCreated: 999,
+        kind: 'step-start',
+        snapshot: '1'.repeat(40),
+      },
+      {
+        partId: 'zzz-step-finish',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        partOrder: 2,
+        timeCreated: 1001,
+        kind: 'step-finish',
+        snapshot: '2'.repeat(40),
+      },
+    ],
+    snapshotWindows: [
+      {
+        windowId: 'assistant-1:000-step-start->zzz-step-finish',
+        messageId: 'assistant-1',
+        sessionId: 'session-1',
+        fromSnapshot: '1'.repeat(40),
+        toSnapshot: '2'.repeat(40),
+        startPartId: '000-step-start',
+        finishPartId: 'zzz-step-finish',
+        startPartOrder: 0,
+        finishPartOrder: 2,
+      },
+    ],
+    rawParts: [
+      partRow('000-step-start', 'assistant-1', { type: 'step-start', snapshot: '1'.repeat(40) }, 999),
+      ...fixture.rawParts,
+      partRow('zzz-step-finish', 'assistant-1', { type: 'step-finish', snapshot: '2'.repeat(40) }, 1001),
+    ].sort((left, right) =>
+      left.message_id.localeCompare(right.message_id) ||
+      left.id.localeCompare(right.id)
+    ),
+  }
+}
+
+function reconstructedChange(overrides: Partial<ReconstructedOpenCodeToolChange> = {}): ReconstructedOpenCodeToolChange {
+  const relativePath = overrides.relativePath ?? 'src/opencode.ts'
+  const filePath = overrides.filePath ?? path.join(workspaceRoot, relativePath)
+  return {
+    taskId: 'task-1',
+    taskRef: 'task-1',
+    taskRefKind: 'canonical',
+    teamName: 'team-a',
+    memberName: 'bob',
+    sessionId: 'session-1',
+    parentUserMessageId: 'user-1',
+    assistantMessageId: 'assistant-1',
+    toolUseId: 'tool-part-1',
+    sourcePartId: 'tool-part-1',
+    sourceMessageId: 'assistant-1',
+    sourceTool: 'write',
+    sourceImportKey: `opencode\0session-1\0tool-part-1\0${relativePath}`,
+    filePath,
+    relativePath,
+    beforeContent: null,
+    afterContent: 'export const value = 1;\n',
+    beforeState: { exists: false, sizeBytes: 0 },
+    afterState: { exists: true, sizeBytes: 24 },
+    operation: 'create',
+    confidence: 'exact',
+    attributionMethod: 'delivery-ledger-taskrefs',
+    timestamp: '2026-03-01T10:00:00.000Z',
+    ...overrides,
   }
 }
 
@@ -228,7 +328,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')
@@ -252,13 +352,69 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
+  test('ignores direct legacy evidenceMode input and keeps the default snapshot path', async () => {
+    const seenParams: Array<Parameters<OpenCodeChangeEvidenceEnricher['enrich']>[0]> = []
+    const evidenceEnricher = {
+      async enrich(params: Parameters<OpenCodeChangeEvidenceEnricher['enrich']>[0]) {
+        seenParams.push(params)
+        return params.changes
+      },
+    } as OpenCodeChangeEvidenceEnricher
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      new OpenCodeToolpartChangeReconstructor(),
+      evidenceEnricher,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      attributionMode: 'strict-delivery',
+      evidenceMode: 'chain-only',
+      ...(await writeDeliveryContext()),
+    })
+
+    expect(result.evidenceMode).toBe('snapshot-auto')
+    expect(seenParams).toHaveLength(1)
+    expect(seenParams[0]).not.toHaveProperty('evidenceMode')
+  })
+
+  test('counts duplicate OpenCode imports once without appending a second event', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+    )
+    const request = {
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+    }
+
+    const first = await service.backfill(request)
+    const second = await service.backfill(request)
+
+    expect(first.importedEvents).toBe(1)
+    expect(second.outcome).toBe('duplicates-only')
+    expect(second.importedEvents).toBe(0)
+    expect(second.skippedEvents).toBe(1)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    expect((await readFile(eventFile, 'utf8')).trim().split('\n')).toHaveLength(1)
+  })
+
   test('imports edit-only OpenCode toolparts as manual-review metadata instead of dropping them', async () => {
     await writeFile(
       path.join(workspaceRoot, 'src/existing.ts'),
       'export const value = 2;\n',
       'utf8',
     )
-    const editFixture = {
+    const editFixture = withSnapshotWindow({
       ...offlineFixture(),
       rawParts: [
         partRow(
@@ -290,7 +446,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           1000,
         ),
       ],
-    }
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => editFixture },
@@ -302,7 +458,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')
@@ -342,7 +498,7 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
-  test('uses captured snapshot boundary to upgrade strict edit evidence through provider abstraction', async () => {
+  test('ignores status-only snapshot boundary when SQLite snapshot windows are missing', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
     const editFixture = {
@@ -378,6 +534,99 @@ describe('OpenCodeLedgerBridgeService', () => {
         ),
       ],
     }
+    let snapshotProviderCalled = false
+    const provider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        return { supported: true, shapeFingerprint: 'shape-v1', adapterVersion: 1 }
+      },
+      async readSessionEvidence() {
+        snapshotProviderCalled = true
+        return {
+          supported: true,
+          shapeFingerprint: 'shape-v1',
+          adapterVersion: 1,
+          files: [{ relativePath: 'src/existing.ts', afterContent: 'export const value = 2;\n' }],
+        }
+      },
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => editFixture },
+      new OpenCodeToolpartChangeReconstructor(),
+      new OpenCodeChangeEvidenceEnricher(),
+      provider,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext({
+        snapshotBoundary: {
+          schemaVersion: 1,
+          captureStatus: 'captured',
+          preDeliverySnapshotHash: 'pre',
+          postDeliverySnapshotHash: 'post',
+        },
+      })),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(snapshotProviderCalled).toBe(false)
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    expect(result.snapshotShapeFingerprint).toBeUndefined()
+    expect(result.diagnostics).toContain('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
+      before: null,
+      after: null,
+    })
+  })
+
+  test('uses SQLite snapshot windows to upgrade strict edit evidence through provider abstraction', async () => {
+    const afterPath = path.join(workspaceRoot, 'src/existing.ts')
+    await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
+    const editFixture = withSnapshotWindow({
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-edit-existing',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'edit',
+            callID: 'call-edit-existing',
+            state: {
+              status: 'completed',
+              input: {
+                filePath: afterPath,
+                oldString: 'value = 1',
+                newString: 'value = 2',
+              },
+              metadata: { exists: true, truncated: false },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => editFixture },
@@ -392,16 +641,8 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
-        snapshotBoundary: {
-          schemaVersion: 1,
-          captureStatus: 'captured',
-          preDeliverySnapshotHash: 'pre',
-          postDeliverySnapshotHash: 'post',
-        },
-      }),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
-      evidenceMode: 'snapshot-auto',
     })
 
     expect(result.outcome).toBe('imported')
@@ -421,10 +662,104 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(event.after).toMatchObject({ sizeBytes: 24 })
   })
 
-  test('uses captured snapshot boundary to upgrade apply_patch update evidence through verified hunks', async () => {
+  test('falls back to metadata-only when session snapshot evidence is unavailable', async () => {
     const afterPath = path.join(workspaceRoot, 'src/existing.ts')
     await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
-    const patchFixture = {
+    const editFixture = withSnapshotWindow({
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-edit-existing',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'edit',
+            callID: 'call-edit-existing',
+            state: {
+              status: 'completed',
+              input: {
+                filePath: afterPath,
+                oldString: 'value = 1',
+                newString: 'value = 2',
+              },
+              metadata: { exists: true, truncated: false },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    })
+    let providerCalled = false
+    const missingSnapshotProvider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        return { supported: true, shapeFingerprint: 'shape-v1', adapterVersion: 1 }
+      },
+      async readSessionEvidence() {
+        providerCalled = true
+        return {
+          supported: false,
+          code: 'snapshot-session-unavailable',
+          diagnostics: ['snapshot-gitdir-missing: fixture snapshot gitdir does not exist.'],
+        }
+      },
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => editFixture },
+      new OpenCodeToolpartChangeReconstructor(),
+      new OpenCodeChangeEvidenceEnricher(),
+      missingSnapshotProvider,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(providerCalled).toBe(true)
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    expect(result.snapshotShapeFingerprint).toBeUndefined()
+    expect(result.diagnostics).toContain('snapshot-gitdir-missing: fixture snapshot gitdir does not exist.')
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      operation: 'modify',
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
+      before: null,
+      after: null,
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+        sizeBytes: 24,
+      },
+    })
+  })
+
+  test('uses SQLite snapshot windows to upgrade apply_patch update evidence through verified hunks', async () => {
+    const afterPath = path.join(workspaceRoot, 'src/existing.ts')
+    await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
+    const patchFixture = withSnapshotWindow({
       ...offlineFixture(),
       rawParts: [
         partRow(
@@ -460,7 +795,7 @@ describe('OpenCodeLedgerBridgeService', () => {
           1000,
         ),
       ],
-    }
+    })
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },
       { readSession: async () => patchFixture },
@@ -475,16 +810,8 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({
-        snapshotBoundary: {
-          schemaVersion: 1,
-          captureStatus: 'captured',
-          preDeliverySnapshotHash: 'pre',
-          postDeliverySnapshotHash: 'post',
-        },
-      }),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
-      evidenceMode: 'snapshot-auto',
     })
 
     expect(result.outcome).toBe('imported')
@@ -563,7 +890,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -595,6 +922,67 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(events[1]?.warnings).toContain(
       'OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.',
     )
+  })
+
+  test('keeps OpenCode backfill diagnostics free of prompt and raw patch content', async () => {
+    const promptSecret = 'PROMPT_SECRET_SHOULD_NOT_LEAK'
+    const patchSecret = 'PATCH_SECRET_SHOULD_NOT_LEAK'
+    const patchFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: promptSecret,
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-apply-patch-secret',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'apply_patch',
+            callID: 'call-apply-patch-secret',
+            state: {
+              status: 'completed',
+              input: {
+                patch: [
+                  '*** Begin Patch',
+                  '*** Update File: src/secret.ts',
+                  '@@',
+                  patchSecret,
+                  '*** End Patch',
+                ].join('\n'),
+              },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => patchFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.diagnostics.some(item => item.includes('unsupported hunk lines'))).toBe(true)
+    const serializedDiagnostics = JSON.stringify(result.diagnostics)
+    expect(serializedDiagnostics).not.toContain(promptSecret)
+    expect(serializedDiagnostics).not.toContain(patchSecret)
   })
 
   test('materializes apply_patch binary and large final states as manual-only metadata', async () => {
@@ -646,7 +1034,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -726,7 +1114,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -789,13 +1177,54 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
     expect(result.importedEvents).toBe(0)
     expect(result.skippedEvents).toBe(2)
     expect(result.diagnostics).toContain('OpenCode evidence skipped 1 case-colliding path group(s).')
+  })
+
+  test('fails closed on sourceImportKey collisions with different file identity', async () => {
+    const sourceImportKey = 'opencode\0session-1\0tool-part-1\0src/opencode.ts'
+    const changes = [
+      reconstructedChange({ sourceImportKey }),
+      reconstructedChange({
+        sourceImportKey,
+        filePath: path.join(workspaceRoot, 'src/other.ts'),
+        relativePath: 'src/other.ts',
+        afterContent: 'export const other = 1;\n',
+        afterState: { exists: true, sizeBytes: 24 },
+      }),
+    ]
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      {
+        reconstruct: () => ({
+          changes,
+          notices: [],
+          diagnostics: [],
+        }),
+      } as unknown as OpenCodeToolpartChangeReconstructor,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('unsafe-input')
+    expect(result.candidateEvents).toBe(2)
+    expect(result.importedEvents).toBe(0)
+    expect(result.skippedEvents).toBe(2)
+    expect(result.diagnostics).toContain('OpenCode evidence skipped 1 sourceImportKey collision(s).')
   })
 
   test('downgrades apply_patch delete evidence when final disk state still exists', async () => {
@@ -849,7 +1278,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskDisplayId: 'abc12345',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -880,7 +1309,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('unsafe-input')
@@ -903,7 +1332,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
       attributionMode: 'strict-delivery',
     })
 
@@ -916,6 +1345,399 @@ describe('OpenCodeLedgerBridgeService', () => {
       attributionMethod: 'delivery-ledger-taskrefs',
       sourcePartId: 'tool-part-1',
     })
+  })
+
+  test('strict delivery backfill rejects tampered delivery context hashes', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeDeliveryContext()
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: context.deliveryContextPath,
+      deliveryContextHash: '0'.repeat(64),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain('OpenCode delivery context hash mismatch.')
+  })
+
+  test('strict delivery backfill rejects untrusted delivery context paths', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const rawContext = `${JSON.stringify({
+      schemaVersion: 1,
+      teamName: 'team-a',
+      taskId: 'task-1',
+      records: [
+        {
+          memberName: 'bob',
+          laneId: 'primary',
+          runtimeSessionId: 'session-1',
+          inboxMessageId: 'user-1',
+          deliveredUserMessageId: null,
+          taskRefs: [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }],
+        },
+      ],
+    })}\n`
+    const deliveryContextPath = path.join(tempDir, 'delivery-context.json')
+    await writeFile(deliveryContextPath, rawContext, 'utf8')
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because it is outside the trusted app temp directory.',
+    )
+  })
+
+  test('strict delivery backfill rejects relative delivery context paths', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeDeliveryContext()
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath: path.relative(process.cwd(), context.deliveryContextPath),
+      deliveryContextHash: context.deliveryContextHash,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because it is not absolute.',
+    )
+  })
+
+  const deliveryContextSymlinkTest = process.platform === 'win32' ? test.skip : test
+
+  deliveryContextSymlinkTest('strict delivery backfill rejects delivery context symlink escapes', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const rawContext = `${JSON.stringify({
+      schemaVersion: 1,
+      teamName: 'team-a',
+      taskId: 'task-1',
+      records: [
+        {
+          memberName: 'bob',
+          laneId: 'primary',
+          runtimeSessionId: 'session-1',
+          inboxMessageId: 'user-1',
+          deliveredUserMessageId: null,
+          taskRefs: [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }],
+        },
+      ],
+    })}\n`
+    const targetPath = path.join(tempDir, 'outside-delivery-context.json')
+    await writeFile(targetPath, rawContext, 'utf8')
+    const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
+    await chmod(contextDir, 0o700).catch(() => undefined)
+    const deliveryContextPath = path.join(contextDir, 'delivery-context.json')
+    await symlink(targetPath, deliveryContextPath)
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      deliveryContextPath,
+      deliveryContextHash: createHash('sha256').update(rawContext).digest('hex'),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode delivery context path rejected because the file resolves outside its trusted temp directory.',
+    )
+  })
+
+  test('strict delivery backfill reports unsupported delivery context schema', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+    const context = await writeTrustedDeliveryContextRaw(
+      `${JSON.stringify({
+        schemaVersion: 2,
+        teamName: 'team-a',
+        taskId: 'task-1',
+        records: [],
+      })}\n`,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...context,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'unsupported-delivery-context-schema: OpenCode delivery context failed schema validation.',
+    )
+  })
+
+  test('strict delivery backfill ignores assistant comment text without toolparts', async () => {
+    const commentOnlyFixture = {
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'assistant-text-1',
+          'assistant-1',
+          {
+            type: 'text',
+            text: 'Done, I changed src/opencode.ts and updated the implementation.',
+          },
+          1000,
+        ),
+      ],
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => commentOnlyFixture },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.scannedSessions).toBe(1)
+    expect(result.scannedToolparts).toBe(2)
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const eventFileExists = await readFile(eventFile, 'utf8').then(
+      () => true,
+      () => false,
+    )
+    expect(eventFileExists).toBe(false)
+  })
+
+  test('strict delivery backfill rejects delivery records that only match display id', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext({
+        taskRefs: [{ taskId: 'old-task', displayId: 'abc12345', teamName: 'team-a' }],
+      })),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no usable delivery records for this task.',
+    )
+  })
+
+  test('strict delivery backfill rejects records that include related task refs', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext({
+        taskRefs: [
+          { taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' },
+          { taskId: 'related-task', displayId: 'def67890', teamName: 'team-a' },
+        ],
+      })),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no usable delivery records for this task.',
+    )
+  })
+
+  test('strict delivery backfill imports with missing runtime session id when parent message id matches', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext({ runtimeSessionId: null })),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      sourceSessionId: 'session-1',
+      parentUserMessageId: 'user-1',
+      attributionMethod: 'delivery-ledger-taskrefs',
+      sourcePartId: 'tool-part-1',
+    })
+  })
+
+  test('strict delivery backfill skips missing runtime session id when member lane has multiple sessions', async () => {
+    let readCount = 0
+    const service = new OpenCodeLedgerBridgeService(
+      {
+        list: async () => [
+          sessionRecord(),
+          sessionRecord({ opencodeSessionId: 'session-2' }),
+        ],
+      },
+      {
+        readSession: async () => {
+          readCount += 1
+          return offlineFixture()
+        },
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      memberName: 'bob',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext({ runtimeSessionId: null })),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.importedEvents).toBe(0)
+    expect(readCount).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode strict delivery attribution found no stored OpenCode session matching the delivery context.',
+    )
   })
 
   test('strict delivery backfill does not fall back to parent taskRefs without delivery context', async () => {
@@ -967,7 +1789,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       memberName: 'bob',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext({ runtimeSessionId: 'other-session' }),
+      ...(await writeDeliveryContext({ runtimeSessionId: 'other-session' })),
       attributionMode: 'strict-delivery',
     })
 
@@ -999,12 +1821,124 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('skipped-capability')
     expect(result.importedEvents).toBe(0)
     expect(result.diagnostics).toContain(`${OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE}: missing part.data`)
+  })
+
+  test('returns skipped-capability when every OpenCode file toolpart has unsupported shape', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => ({
+          ...offlineFixture(),
+          rawParts: [
+            partRow('tool-part-bad-write', 'assistant-1', {
+              type: 'tool',
+              tool: 'write',
+              state: {
+                status: 'completed',
+                input: {
+                  content: 'missing path',
+                },
+              },
+            }),
+          ],
+          diagnostics: [
+            'OpenCode SQLite write toolpart tool-part-bad-write has unsupported state/input/filePath shape; it will be skipped.',
+          ],
+        }),
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+    })
+
+    expect(result.outcome).toBe('skipped-capability')
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.diagnostics).toContain(
+      'OpenCode SQLite write toolpart tool-part-bad-write has unsupported state/input/filePath shape; it will be skipped.',
+    )
+    expect(result.diagnostics).toContain(
+      'OpenCode write toolpart tool-part-bad-write missing state/input/filePath.',
+    )
+  })
+
+  test('treats partial SQLite history caps as retryable without importing unproven files', async () => {
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      {
+        readSession: async () => ({
+          ...offlineFixture(),
+          rawMessages: [],
+          rawParts: [],
+          messages: [],
+          diagnostics: ['OpenCode SQLite part cap exceeded for session-1.'],
+        }),
+      },
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+    })
+
+    expect(result.outcome).toBe('transient-error')
+    expect(result.retryAfterReason).toBe('sqlite-history-cap-exceeded')
+    expect(result.scannedSessions).toBe(1)
+    expect(result.scannedToolparts).toBe(0)
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.diagnostics).toContain('OpenCode SQLite part cap exceeded for session-1.')
+  })
+
+  test('treats SQLite WAL races and busy reads as retryable when no candidates were proven', async () => {
+    const runWithDiagnostic = async (diagnostic: string) => {
+      const service = new OpenCodeLedgerBridgeService(
+        { list: async () => [sessionRecord()] },
+        {
+          readSession: async () => ({
+            ...offlineFixture(),
+            rawMessages: [],
+            rawParts: [],
+            messages: [],
+            diagnostics: [diagnostic],
+          }),
+        },
+      )
+
+      return await service.backfill({
+        teamName: 'team-a',
+        taskId: 'task-1',
+        projectDir,
+        workspaceRoot,
+        ...(await writeDeliveryContext()),
+      })
+    }
+
+    const changed = await runWithDiagnostic(
+      'OpenCode SQLite file changed while snapshot was read; using transaction snapshot.',
+    )
+    expect(changed.outcome).toBe('transient-error')
+    expect(changed.retryAfterReason).toBe('sqlite-changed-during-read')
+    expect(changed.importedEvents).toBe(0)
+
+    const busy = await runWithDiagnostic('sqlite-busy: OpenCode SQLite read was busy; retry later.')
+    expect(busy.outcome).toBe('transient-error')
+    expect(busy.retryAfterReason).toBe('sqlite-busy')
+    expect(busy.importedEvents).toBe(0)
   })
 
   test('reports imported when at least one session imports even if another session is unsupported', async () => {
@@ -1037,7 +1971,7 @@ describe('OpenCodeLedgerBridgeService', () => {
       taskId: 'task-1',
       projectDir,
       workspaceRoot,
-      deliveryContextPath: await writeDeliveryContext(),
+      ...(await writeDeliveryContext()),
     })
 
     expect(result.outcome).toBe('imported')

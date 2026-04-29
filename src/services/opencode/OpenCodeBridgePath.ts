@@ -179,3 +179,15 @@ export function areSameOpenCodeWorkspace(params: {
   }
   return expected.comparisonKey === actual.comparisonKey
 }
+
+export function isOpenCodeWorkspaceSameOrDescendant(params: {
+  parentWorkspaceRoot: string
+  childPath: string
+}): boolean {
+  const parent = normalizeOpenCodeWorkspaceRoot(params.parentWorkspaceRoot)
+  const child = normalizeOpenCodeWorkspaceRoot(params.childPath)
+  if ('skipped' in parent || 'skipped' in child || parent.style !== child.style) {
+    return false
+  }
+  return isInsidePath(parent.absolutePath, child.absolutePath, parent.style)
+}

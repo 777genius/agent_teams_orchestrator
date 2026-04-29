@@ -23,7 +23,7 @@ const baseProfile: OpenCodePreparedProfile = {
   managedConfig: {
     default_agent: 'teammate',
     share: 'disabled',
-    snapshot: false,
+    snapshot: true,
   },
   managedConfigFingerprint: 'managed-config-v1',
   homePath: '/tmp/profile-root/home',

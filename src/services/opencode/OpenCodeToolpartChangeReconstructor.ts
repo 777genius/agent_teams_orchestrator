@@ -106,6 +106,7 @@ type Toolpart = {
   partTimeCreated: number
   messageTimeCreated: number
   messageIdSort: string
+  messagePartOrder: number
   timestamp: string
 }
 
@@ -363,9 +364,10 @@ export class OpenCodeToolpartChangeReconstructor {
 
     for (const toolpart of toolparts.sort((left, right) => {
       return (
-        left.partTimeCreated - right.partTimeCreated ||
         left.messageTimeCreated - right.messageTimeCreated ||
         left.messageIdSort.localeCompare(right.messageIdSort) ||
+        left.messagePartOrder - right.messagePartOrder ||
+        left.partTimeCreated - right.partTimeCreated ||
         left.partId.localeCompare(right.partId)
       )
     })) {
@@ -685,6 +687,7 @@ export class OpenCodeToolpartChangeReconstructor {
     diagnostics: string[],
   ): Toolpart[] {
     const toolparts: Toolpart[] = []
+    const partOrderById = this.buildMessagePartOrderById(rows.map(item => item.row))
     for (const { row, data } of rows) {
       if (data.type !== 'tool') {
         continue
@@ -737,10 +740,26 @@ export class OpenCodeToolpartChangeReconstructor {
         partTimeCreated: row.time_created,
         messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
         messageIdSort: row.message_id,
+        messagePartOrder: partOrderById.get(row.id) ?? 0,
         timestamp: toIsoTimestamp(asNumber(asRecord(state.time)?.end) ?? asNumber(asRecord(state.time)?.start), row.time_created),
       })
     }
     return toolparts
+  }
+
+  private buildMessagePartOrderById(rows: OpenCodeSqlitePartRow[]): Map<string, number> {
+    const byMessage = new Map<string, OpenCodeSqlitePartRow[]>()
+    for (const row of rows) {
+      const bucket = byMessage.get(row.message_id) ?? []
+      bucket.push(row)
+      byMessage.set(row.message_id, bucket)
+    }
+    const result = new Map<string, number>()
+    for (const messageRows of byMessage.values()) {
+      messageRows.sort((left, right) => left.id.localeCompare(right.id))
+      messageRows.forEach((row, index) => result.set(row.id, index))
+    }
+    return result
   }
 
   private resolveTaskContext(input: {
@@ -807,7 +826,7 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!record.laneId || !input.laneId || record.laneId !== input.laneId) {
         continue
       }
-      if (!record.runtimeSessionId || record.runtimeSessionId !== input.sessionId) {
+      if (record.runtimeSessionId && record.runtimeSessionId !== input.sessionId) {
         continue
       }
       const recordTaskRef = getSingleRequestedTeamRef(

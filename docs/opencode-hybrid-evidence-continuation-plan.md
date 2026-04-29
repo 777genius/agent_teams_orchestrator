@@ -1,19 +1,55 @@
 # OpenCode Hybrid Evidence Pipeline - Source-Driven Continuation Plan
 
-Status: IOF revision after reading our current bridge code, installed OpenCode 1.14.19 behavior, official docs, current OpenCode `dev` source from `anomalyco/opencode`, and a local `git diff --raw -z` prototype for unusual paths.
+Status: implemented and verified in the continuation worktrees. This document was originally an IOF revision after reading our current bridge code, installed OpenCode 1.14.19 behavior, official docs, current OpenCode `dev` source from `anomalyco/opencode`, and a local `git diff --raw -z` prototype for unusual paths.
 
 Current worktree:
 
 ```text
 /Users/belief/dev/projects/claude/_worktrees/agent_teams_orchestrator_opencode_snapshot_bridge
-branch: research/opencode-snapshot-ledger-bridge
+branch: research/opencode-hybrid-evidence-continuation
 ```
 
 Related UI worktree:
 
 ```text
 /Users/belief/dev/projects/claude/_worktrees/claude_team_opencode_ledger_bridge
-branch: feat/opencode-ledger-bridge-ui
+branch: feat/opencode-hybrid-evidence-ui-continuation
+```
+
+Verified completion snapshot:
+
+```text
+orchestrator targeted suite: 184 pass, 7 gated live skip, 0 fail
+orchestrator build: bun run build:dev passed
+OpenCode fixture/public-runtime E2E: 26 pass, 0 fail
+OpenCode live snapshot evidence E2E: 1 pass, 0 fail
+OpenCode live ledger bridge E2E: 6 pass, 0 fail, 98 expect calls
+OpenCode prompt-driven create/modify live E2E: 1 pass, 0 fail, 28 expect calls
+Combined live snapshot bridge E2E: real OpenCode snapshot:true run -> strict delivery bridge -> full-text ledger bundle passed
+UI targeted suite: 119 pass, 0 fail
+UI typecheck: pnpm typecheck passed
+git diff --check: passed in both worktrees
+```
+
+Latest safety hardening added after the original completion snapshot:
+
+```text
+SQLite/WAL/busy/cap read races now resolve to transient-error with retryAfterReason, not stable no-attribution.
+This prevents UI auto-backfill from caching a temporarily incomplete OpenCode history as clean/no changes.
+Malformed completed OpenCode write/edit toolparts are now row-level diagnostic skips, so one bad toolpart no longer drops otherwise valid session history.
+If every file toolpart candidate has unsupported shape, backfill resolves to skipped-capability instead of a clean no-attribution result.
+OpenCode same-message toolpart chains now use message-local part id order before timestamps, matching the snapshot window ordering contract and preventing timestamp skew from breaking write -> edit reconstruction.
+OpenCode evidence upgrades now fail closed when the existing source import identity and incoming event disagree on relative path, session id, part id, or message id.
+Added a gated combined live E2E proving a real snapshot:true OpenCode file edit can be imported through the default bridge path as full-text reviewable task changes.
+Added fixture/public-runtime E2E for same-session other-task rejection, missing snapshot gitdir metadata-only visibility, and metadata-only to full-text snapshot evidence upgrade.
+Added public-runtime E2E for snapshot dry-run no-write behavior, idempotent duplicate handling, CLI metadata-only to full-text upgrade, and snapshot-backed apply_patch delete lifecycle projection.
+Expanded gated real OpenCode bridge E2E to cover strict-delivery fail-closed on wrong delivery ids, multi-file snapshot full-text import, duplicate-safe repeated backfill on live data, and non-snapshot existing-file fallback as visible manual-only changes.
+Expanded public runtime E2E to cover mismatched delivery context fail-closed with zero ledger artifacts, plus a gated live CLI test proving real OpenCode snapshot artifacts import through `cli-dev runtime opencode-ledger-backfill` from managed-profile storage.
+Expanded E2E again to cover real public-CLI create lifecycle from OpenCode write toolparts and public-runtime binary/large-file manual-only metadata behavior.
+Expanded public-runtime Changes E2E to cover workspace-root mismatch fail-closed behavior and snapshot-only formatter noise being excluded unless a strict delivery-matched toolpart proves the path.
+Expanded public-runtime Changes E2E to cover case-colliding OpenCode paths failing closed with zero ledger artifacts and symlink final-state paths staying visible only as manual-review metadata.
+Expanded public-runtime Changes E2E to cover visible write/edit chain projection, unsupported toolpart shape fail-closed behavior, mixed valid+unsupported history, mixed apply_patch create/update/delete lifecycle, snapshot-backed write overwrite, snapshot-backed apply_patch update, and newline path snapshot evidence.
+Added a gated real prompt-driven OpenCode E2E proving `opencode run` can modify and create real files, then public CLI strict-delivery backfill imports those changes as full-text task Changes with duplicate-safe replay.
 ```
 
 ## Executive Summary

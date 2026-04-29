@@ -23,7 +23,10 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
-import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
+import {
+  OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
+  openCodeLedgerBridgeService,
+} from './OpenCodeLedgerBridgeService.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -924,9 +927,6 @@ async function runReadiness(envelope: BridgeEnvelope) {
         executionOutcome,
         skippedAppMcpToolProof(),
         requireSelectedModel,
-      )
-      const responseObservation = reconcileFailedObservation(
-        diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
       )
       return {
         snapshot,
@@ -1929,6 +1929,7 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
           minVersion: 1,
           currentVersion: 1,
           supportedCommands: SUPPORTED_COMMANDS,
+          opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
         },
         runtime: {
           ...createRuntimePreconditionSnapshot(snapshot),
@@ -1976,7 +1977,6 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return runTranscript(envelope)
     case 'opencode.backfillTaskLedger': {
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
-      const evidenceMode = asString(envelope.body.evidenceMode)
       const result = await openCodeLedgerBridgeService.backfill({
         teamId: asString(envelope.body.teamId) ?? undefined,
         teamName: asString(envelope.body.teamName) ?? asString(envelope.body.teamId) ?? '',
@@ -1987,14 +1987,8 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
         projectDir: asString(envelope.body.projectDir) ?? undefined,
         workspaceRoot: asString(envelope.body.workspaceRoot) ?? undefined,
         deliveryContextPath: asString(envelope.body.deliveryContextPath) ?? undefined,
+        deliveryContextHash: asString(envelope.body.deliveryContextHash) ?? undefined,
         attributionMode: asString(envelope.body.attributionMode) === 'strict-delivery' ? 'strict-delivery' : 'compatible',
-        evidenceMode: evidenceMode === 'off' ||
-          evidenceMode === 'metadata-only' ||
-          evidenceMode === 'chain-only' ||
-          evidenceMode === 'snapshot-probe' ||
-          evidenceMode === 'snapshot-auto'
-          ? evidenceMode
-          : undefined,
         dryRun: envelope.body.dryRun === true,
       })
       return { snapshot, data: result }

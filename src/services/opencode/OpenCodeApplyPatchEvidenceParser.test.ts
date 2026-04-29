@@ -84,6 +84,22 @@ describe('OpenCodeApplyPatchEvidenceParser', () => {
     )
   })
 
+  test('keeps diagnostics free of raw patch content', () => {
+    const diagnostics: string[] = []
+    const secretLine = 'const apiKey = "sk-live-secret";'
+    const result = parseOpenCodeApplyPatchEvidence([
+      '*** Begin Patch',
+      '*** Add File: src/secret.ts',
+      secretLine,
+      '*** End Patch',
+    ].join('\n'), 'part-secret', diagnostics)
+
+    expect(result).toEqual([])
+    expect(diagnostics.join('\n')).toContain('OpenCode apply_patch toolpart part-secret skipped Add File src/secret.ts')
+    expect(diagnostics.join('\n')).not.toContain(secretLine)
+    expect(diagnostics.join('\n')).not.toContain('sk-live-secret')
+  })
+
   test('parses Delete File body as full before content when present', () => {
     const diagnostics: string[] = []
     const result = parseOpenCodeApplyPatchEvidence([

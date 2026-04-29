@@ -243,7 +243,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
   test('reconstructs exact edit only after a proven text baseline', () => {
     const result = reconstruct([
       toolPart({
-        id: 'part-write-1',
+        id: 'part-0001-write',
         tool: 'write',
         filePath: path.join(workspaceRoot, 'src/file.ts'),
         content: 'export const value = 1;\n',
@@ -251,7 +251,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
         time: 1000,
       }),
       toolPart({
-        id: 'part-edit-1',
+        id: 'part-0002-edit',
         tool: 'edit',
         filePath: path.join(workspaceRoot, 'src/file.ts'),
         oldString: 'value = 1',
@@ -264,6 +264,38 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes[1]).toMatchObject({
       sourceTool: 'edit',
       operation: 'modify',
+      confidence: 'exact',
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+    })
+  })
+
+  test('orders same-message toolparts by OpenCode part id instead of timestamp', () => {
+    const result = reconstruct([
+      toolPart({
+        id: 'part-0002-edit',
+        tool: 'edit',
+        filePath: path.join(workspaceRoot, 'src/file.ts'),
+        oldString: 'value = 1',
+        newString: 'value = 2',
+        time: 900,
+      }),
+      toolPart({
+        id: 'part-0001-write',
+        tool: 'write',
+        filePath: path.join(workspaceRoot, 'src/file.ts'),
+        content: 'export const value = 1;\n',
+        exists: false,
+        time: 1100,
+      }),
+    ])
+
+    expect(result.changes.map(change => change.sourcePartId)).toEqual([
+      'part-0001-write',
+      'part-0002-edit',
+    ])
+    expect(result.changes[1]).toMatchObject({
+      sourceTool: 'edit',
       confidence: 'exact',
       beforeContent: 'export const value = 1;\n',
       afterContent: 'export const value = 2;\n',
