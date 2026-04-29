@@ -145,7 +145,8 @@ export function getClaudeTmuxEnv(): string | null {
  *
  * When tmux is not available:
  * - TungstenTool (Tmux) will not work
- * - TeammateTool will not work (it uses tmux for pane management)
+ * - Pane-based teammate transport will not work
+ * - Native process and in-process teammates can still run without tmux
  * - Bash commands will run without tmux isolation
  */
 export async function checkTmuxAvailable(): Promise<boolean> {
@@ -162,7 +163,7 @@ export async function checkTmuxAvailable(): Promise<boolean> {
     tmuxAvailable = result.code === 0
     if (!tmuxAvailable) {
       logForDebugging(
-        `[Socket] tmux is not installed. The Tmux tool and Teammate tool will not be available.`,
+        `[Socket] tmux is not installed. Tmux tool and pane-based teammate transport are unavailable; native process and in-process teammates can still run without tmux.`,
       )
     }
     tmuxAvailabilityChecked = true
