@@ -98,6 +98,8 @@ const CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS'
 const CODEX_NATIVE_DIRECT_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_DIRECT_TURN_TIMEOUT_MS'
+const CODEX_NATIVE_IGNORE_USER_CONFIG_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG'
 
 export type CodexNativeExecTimeoutPolicy = {
   idleTimeoutMs: number | null
@@ -248,6 +250,13 @@ function shouldUseEphemeralCodexNativeThread(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return env.CLAUDE_CODE_CODEX_NATIVE_PERSIST_THREADS !== '1'
+}
+
+function shouldIgnoreCodexNativeUserConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const value = env[CODEX_NATIVE_IGNORE_USER_CONFIG_ENV]?.trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
 }
 
 function resolveCodexNativeDisabledFeatures(params: {
@@ -474,6 +483,7 @@ export async function* executeCodexNativeTurn(
         apiKey,
         forcedLoginMethod,
       }),
+      ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
       abortSignal: params.abortSignal,
       idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
       absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,

@@ -380,6 +380,58 @@ describe('executeCodexNativeTurn', () => {
     }
   })
 
+  test('passes explicit user config isolation to native exec', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedIgnoreUserConfig: boolean | undefined
+
+    try {
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'true'
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedIgnoreUserConfig = options.ignoreUserConfig
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedIgnoreUserConfig).toBe(true)
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+    }
+  })
+
   test('records an assistant API error when native execution completes without assistant output', async () => {
     const params = baseParams({
       persistSession: true,

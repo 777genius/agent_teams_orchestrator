@@ -24,6 +24,7 @@ export type CodexNativeExecRunnerOptions = {
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
   disabledFeatures?: string[]
+  ignoreUserConfig?: boolean
   abortSignal?: AbortSignal
   timeoutMs?: number | null
   idleTimeoutMs?: number | null
@@ -122,6 +123,10 @@ export function buildCodexNativeExecArgs(
   options: CodexNativeExecRunnerOptions,
 ): string[] {
   const args = ['exec', '--json', '--skip-git-repo-check', '-C', options.cwd]
+
+  if (options.ignoreUserConfig) {
+    args.push('--ignore-user-config')
+  }
 
   if (options.ephemeral !== false) {
     args.push('--ephemeral')

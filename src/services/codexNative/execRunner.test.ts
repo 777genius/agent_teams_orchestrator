@@ -132,6 +132,30 @@ describe('buildCodexNativeExecArgs', () => {
     ])
   })
 
+  test('can ignore user config without dropping dynamic MCP overrides', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        ignoreUserConfig: true,
+        configOverrides: [
+          'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+        ],
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ignore-user-config',
+      '--ephemeral',
+      '-c',
+      'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+      '-',
+    ])
+  })
+
   test('passes disabled Codex feature flags without dropping user config overrides', () => {
     expect(
       buildCodexNativeExecArgs({
