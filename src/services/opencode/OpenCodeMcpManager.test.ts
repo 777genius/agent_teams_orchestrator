@@ -323,7 +323,7 @@ describe('OpenCodeMcpManager', () => {
       type: 'local',
       command: ['/usr/local/bin/node', path.resolve('/tmp/agent-teams-mcp.js')],
       enabled: true,
-      timeout: 8000,
+      timeout: 30000,
       environment: {
         PATH: '/usr/local/bin:/usr/bin',
         CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
