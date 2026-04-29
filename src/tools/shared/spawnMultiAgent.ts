@@ -883,11 +883,16 @@ function toTeamFileEffort(
 export function shouldUseNativeProcessBackendForSpawn(options?: {
   teammateMode?: 'auto' | 'tmux' | 'in-process'
   forceProcessTeammates?: string | boolean
+  separateProcessRequired?: boolean
 }): boolean {
   const teammateMode = options?.teammateMode ?? getTeammateModeFromSnapshot()
+  if (teammateMode !== 'auto') {
+    return false
+  }
+
   const forceProcessTeammates =
     options?.forceProcessTeammates ?? process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
-  return teammateMode === 'auto' && isEnvTruthy(forceProcessTeammates)
+  return isEnvTruthy(forceProcessTeammates) || options?.separateProcessRequired === true
 }
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
@@ -2578,7 +2583,11 @@ async function handleSpawn(
     try {
       await detectAndGetBackend()
     } catch (error) {
-      if (shouldUseNativeProcessBackendForSpawn()) {
+      if (
+        shouldUseNativeProcessBackendForSpawn({
+          separateProcessRequired: forceSeparateProcess,
+        })
+      ) {
         logForDebugging(
           `[handleSpawn] No pane backend available, using native process backend: ${errorMessage(error)}`,
         )
@@ -2587,11 +2596,11 @@ async function handleSpawn(
       if (forceSeparateProcess) {
         if (separateProcessRequirement.reason === 'codex-native-runtime') {
           throw new Error(
-            `Teammate "${input.name}" uses Codex native runtime, which must run in a separate process through the dedicated codex-native lane. No pane-based transport is available. Enable an explicit pane transport such as tmux/iTerm2, or use a process-backend build.`,
+            `Teammate "${input.name}" uses Codex native runtime, which must run in a separate process through the dedicated codex-native lane. No pane-based transport is available. Use teammate mode auto to allow the native process backend, or enable an explicit pane transport such as tmux/iTerm2.`,
           )
         }
         throw new Error(
-          `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". This teammate must run outside the in-process lane, but no pane-based transport is available. Enable an explicit pane transport such as tmux/iTerm2, or use a process-backend build.`,
+          `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". This teammate must run outside the in-process lane, but no pane-based transport is available. Use teammate mode auto to allow the native process backend, or enable an explicit pane transport such as tmux/iTerm2.`,
         )
       }
       // Only fall back silently in auto mode. If the user explicitly configured

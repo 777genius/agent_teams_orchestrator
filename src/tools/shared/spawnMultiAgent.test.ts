@@ -393,7 +393,7 @@ describe('spawnTeammate worktree isolation validation', () => {
 })
 
 describe('native process teammate backend selection', () => {
-  it('uses native process backend only for forced auto teammate mode', () => {
+  it('uses native process backend for forced or separate-process auto teammate mode', () => {
     expect(
       shouldUseNativeProcessBackendForSpawn({
         teammateMode: 'auto',
@@ -419,6 +419,28 @@ describe('native process teammate backend selection', () => {
       shouldUseNativeProcessBackendForSpawn({
         teammateMode: 'auto',
         forceProcessTeammates: undefined,
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'auto',
+        forceProcessTeammates: undefined,
+        separateProcessRequired: true,
+      }),
+    ).toBe(true)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'in-process',
+        separateProcessRequired: true,
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'tmux',
+        separateProcessRequired: true,
       }),
     ).toBe(false)
   })
