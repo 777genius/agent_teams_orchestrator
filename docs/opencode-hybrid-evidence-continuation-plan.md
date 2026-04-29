@@ -19,8 +19,9 @@ branch: feat/opencode-hybrid-evidence-ui-continuation
 Verified completion snapshot:
 
 ```text
-orchestrator targeted suite: 162 pass, 0 fail
+orchestrator targeted suite: 167 pass, 0 fail
 orchestrator build: bun run build:dev passed
+OpenCode fixture/public-runtime E2E: 9 pass, 0 fail
 OpenCode live snapshot evidence E2E: 1 pass, 0 fail
 OpenCode live ledger bridge E2E: 2 pass, 0 fail
 Combined live snapshot bridge E2E: real OpenCode snapshot:true run -> strict delivery bridge -> full-text ledger bundle passed
@@ -39,6 +40,7 @@ If every file toolpart candidate has unsupported shape, backfill resolves to ski
 OpenCode same-message toolpart chains now use message-local part id order before timestamps, matching the snapshot window ordering contract and preventing timestamp skew from breaking write -> edit reconstruction.
 OpenCode evidence upgrades now fail closed when the existing source import identity and incoming event disagree on relative path, session id, part id, or message id.
 Added a gated combined live E2E proving a real snapshot:true OpenCode file edit can be imported through the default bridge path as full-text reviewable task changes.
+Added fixture/public-runtime E2E for same-session other-task rejection, missing snapshot gitdir metadata-only visibility, and metadata-only to full-text snapshot evidence upgrade.
 ```
 
 ## Executive Summary

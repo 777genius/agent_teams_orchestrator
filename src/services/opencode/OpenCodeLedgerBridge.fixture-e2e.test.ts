@@ -505,6 +505,79 @@ async function insertSnapshotWriteOverwriteToolpart(dbPath: string, workspaceRoo
   }
 }
 
+async function insertSnapshotWindowPartsOnly(dbPath: string, input: {
+  fromSnapshot?: string
+  toSnapshot?: string
+} = {}): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: '000-step-start',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 995,
+      data: snapshotStepPart(
+        'step-start',
+        input.fromSnapshot ?? '1111111111111111111111111111111111111111',
+      ),
+    })
+    insertPart(db, {
+      id: 'zzz-step-finish',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_095,
+      data: snapshotStepPart(
+        'step-finish',
+        input.toSnapshot ?? '2222222222222222222222222222222222222222',
+      ),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertSameSessionOtherTaskToolpart(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    const taskTwoPrompt = [
+      '<opencode_app_message_delivery>',
+      `<opencode_delivery_context>${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'opencode-delivery-context',
+        teamName: 'fixture-team',
+        memberName: 'bob',
+        laneId: 'secondary:opencode:bob',
+        inboundMessageId: 'bob-user-2',
+        taskRefs: [
+          { taskId: 'task-2', displayId: 'def67890', teamName: 'fixture-team' },
+        ],
+      })}</opencode_delivery_context>`,
+      '</opencode_app_message_delivery>',
+      '',
+      '<opencode_inbound_app_message>',
+      'Implement the second task.',
+      '</opencode_inbound_app_message>',
+    ].join('\n')
+    insertMessage(db, { id: 'bob-user-2', sessionId: 'session-bob', time: 4_000, data: messageData('bob-user-2') })
+    insertPart(db, { id: 'bob-user-part-2', messageId: 'bob-user-2', sessionId: 'session-bob', time: 4_000, data: userTextPart(taskTwoPrompt) })
+    insertMessage(db, { id: 'bob-assistant-2', sessionId: 'session-bob', time: 4_100, data: messageData('bob-assistant-2', 'bob-user-2') })
+    insertPart(db, {
+      id: 'bob-task2-write',
+      messageId: 'bob-assistant-2',
+      sessionId: 'session-bob',
+      time: 4_100,
+      data: writeToolPart({
+        filePath: path.join(workspaceRoot, '227', 'other-task.js'),
+        content: 'export const otherTask = true;\n',
+        exists: false,
+        callID: 'call-bob-task2',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
 async function createFixtureSessionStore(dataDir: string, workspaceRoot: string): Promise<OpenCodeSessionStore> {
   const store = new OpenCodeSessionStore(path.join(dataDir, 'opencode', 'session-store.json'))
   await store.upsert(sessionRecord({ sessionId: 'session-bob', memberName: 'bob', workspaceRoot }))
@@ -726,6 +799,44 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(4)
   })
 
+  test('does not import same-session toolparts from a different delivered task', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-same-session')
+    const projectDir = path.join(tempDir, 'claude-project-same-session')
+    const dataDir = path.join(tempDir, 'fixture-data-same-session')
+    const deliveryContext = await createFixtureDeliveryContext()
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSameSessionOtherTaskToolpart(dbPath, workspaceRoot)
+    const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
+    const bridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      new FixtureOpenCodeOfflineSessionReader(dbPath),
+    )
+
+    const result = await bridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(4)
+    expect(result.diagnostics.join('\n')).toContain(
+      'OpenCode toolpart bob-task2-write skipped because no delivery record matched its parent message.',
+    )
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events.some(event => event.sourcePartId === 'bob-task2-write')).toBe(false)
+    expect(events.some(event => event.relativePath === '227/other-task.js')).toBe(false)
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.some(file => file.relativePath === '227/other-task.js')).toBe(false)
+  })
+
   test('imports source-driven OpenCode snapshot evidence from SQLite step windows and snapshot git store', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-snapshot')
     const projectDir = path.join(tempDir, 'claude-project-snapshot')
@@ -867,6 +978,153 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
     expect(duplicateResult.outcome).toBe('duplicates-only')
     expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(7)
+  })
+
+  test('degrades to visible metadata-only changes when snapshot gitdir is missing', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-missing-snapshot')
+    const projectDir = path.join(tempDir, 'claude-project-missing-snapshot')
+    const dataDir = path.join(tempDir, 'fixture-data-missing-snapshot')
+    const deliveryContext = await createFixtureDeliveryContext()
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await insertSnapshotWindowPartsOnly(dbPath)
+    await writeFile(path.join(workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 2;\n', 'utf8')
+    const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
+    const offlineReader = new FixtureOpenCodeOfflineSessionReader(dbPath)
+    const bridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      offlineReader,
+      undefined,
+      undefined,
+      new OpenCodeSnapshotEvidenceProviderService(
+        new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+      ),
+    )
+
+    const result = await bridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(5)
+    expect(result.diagnostics.join('\n')).toContain('snapshot-gitdir-missing:')
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const degradedEvent = events.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(degradedEvent).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/snapshot-only.js',
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+      },
+    })
+    expect((degradedEvent?.afterState as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect(degradedEvent?.snapshotId).toBeUndefined()
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
+    })
+  })
+
+  test('upgrades an existing metadata-only import to full-text when snapshot evidence appears', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-upgrade')
+    const projectDir = path.join(tempDir, 'claude-project-upgrade')
+    const dataDir = path.join(tempDir, 'fixture-data-upgrade')
+    const deliveryContext = await createFixtureDeliveryContext()
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+    })
+    const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
+    const offlineReader = new FixtureOpenCodeOfflineSessionReader(dbPath)
+
+    const metadataOnlyBridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      offlineReader,
+    )
+    const first = await metadataOnlyBridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+    expect(first.outcome).toBe('imported')
+    const firstEvents = await readJsonlEvents(projectDir, 'task-1')
+    const initialSnapshotOnlyEvent = firstEvents.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(initialSnapshotOnlyEvent).toMatchObject({
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+    })
+
+    const snapshotBridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      offlineReader,
+      undefined,
+      undefined,
+      new OpenCodeSnapshotEvidenceProviderService(
+        new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+      ),
+    )
+    const second = await snapshotBridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+    expect(second.outcome).toBe('imported')
+    expect(second.importedEvents).toBeGreaterThanOrEqual(1)
+    expect(second.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
+
+    const upgradedEvents = await readJsonlEvents(projectDir, 'task-1')
+    const snapshotOnlyEvents = upgradedEvents.filter(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(snapshotOnlyEvents).toHaveLength(2)
+    const upgradedSnapshotOnlyEvent = snapshotOnlyEvents.find(event => event.supersedesEventId)
+    expect(upgradedSnapshotOnlyEvent).toMatchObject({
+      evidenceProof: 'inverse-edit-chain',
+      snapshotSource: 'opencode',
+    })
+    expect(upgradedSnapshotOnlyEvent?.snapshotId).toBeTruthy()
+    expect((upgradedSnapshotOnlyEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((upgradedSnapshotOnlyEvent?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (upgradedSnapshotOnlyEvent?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (upgradedSnapshotOnlyEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
   })
 
   test('CLI command recovers the same SQLite fixture through the public runtime entrypoint', async () => {
@@ -1056,6 +1314,140 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       contentAvailability: 'full-text',
       latestBeforeHash: (snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256,
       latestAfterHash: (snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command does not import same-session toolparts from another delivered task', async () => {
+    const cliDev = cliDevCommand()
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-same-session')
+    const projectDir = path.join(tempDir, 'claude-project-cli-same-session')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSameSessionOtherTaskToolpart(dbPath, workspaceRoot)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = spawnSync(
+      cliDev.command,
+      [
+        ...cliDev.prefixArgs,
+        'runtime',
+        'opencode-ledger-backfill',
+        '--json',
+        '--team',
+        'fixture-team',
+        '--task',
+        'task-1',
+        '--task-display-id',
+        'abc12345',
+        '--project-dir',
+        projectDir,
+        '--workspace-root',
+        workspaceRoot,
+        '--delivery-context',
+        deliveryContext.deliveryContextPath,
+        '--delivery-context-hash',
+        deliveryContext.deliveryContextHash,
+        '--attribution-mode',
+        'strict-delivery',
+      ],
+      {
+        cwd: process.cwd(),
+        env: childEnvForHome(homeDir),
+        encoding: 'utf8',
+      },
+    )
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 4,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'OpenCode toolpart bob-task2-write skipped because no delivery record matched its parent message.',
+    )
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events).toHaveLength(4)
+    expect(events.some(event => event.sourcePartId === 'bob-task2-write')).toBe(false)
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.some(file => file.relativePath === '227/other-task.js')).toBe(false)
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command keeps missing snapshot gitdir changes visible as metadata-only', async () => {
+    const cliDev = cliDevCommand()
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-missing-snapshot')
+    const projectDir = path.join(tempDir, 'claude-project-cli-missing-snapshot')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await insertSnapshotWindowPartsOnly(dbPath)
+    await writeFile(path.join(workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 2;\n', 'utf8')
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = spawnSync(
+      cliDev.command,
+      [
+        ...cliDev.prefixArgs,
+        'runtime',
+        'opencode-ledger-backfill',
+        '--json',
+        '--team',
+        'fixture-team',
+        '--task',
+        'task-1',
+        '--task-display-id',
+        'abc12345',
+        '--project-dir',
+        projectDir,
+        '--workspace-root',
+        workspaceRoot,
+        '--delivery-context',
+        deliveryContext.deliveryContextPath,
+        '--delivery-context-hash',
+        deliveryContext.deliveryContextHash,
+        '--attribution-mode',
+        'strict-delivery',
+      ],
+      {
+        cwd: process.cwd(),
+        env: childEnvForHome(homeDir),
+        encoding: 'utf8',
+      },
+    )
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 5,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain('snapshot-gitdir-missing:')
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const degradedEvent = events.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(degradedEvent).toMatchObject({
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+    })
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 })
