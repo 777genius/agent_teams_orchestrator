@@ -23,6 +23,8 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
+import { openCodeTurnSettledEmissionCoordinator } from './OpenCodeTurnSettledEmissionCoordinator.js'
+import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import {
   OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
   openCodeLedgerBridgeService,
@@ -43,6 +45,8 @@ const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 1_500
 const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 6_000
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
+const OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS = 12_000
+const OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -1139,7 +1143,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
 
   const settledMembers = await mapWithConcurrency(promptedMembers, 3, async ({ name, record }) => {
     const settleDiagnostics: TeamDiagnostic[] = []
-    await openCodeSessionBridge.observePreview(record, {
+    const preview = await openCodeSessionBridge.observePreview(record, {
       timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
       idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
     }).catch(error => {
@@ -1148,6 +1152,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
         `${name}: ${error instanceof Error ? error.message : String(error)}`,
         'info',
       ))
+      return null
     })
 
     try {
@@ -1155,13 +1160,24 @@ async function runLaunch(envelope: BridgeEnvelope) {
         openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
         OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
       )
-      return { name, record, reconciled, diagnostics: settleDiagnostics }
+      const reconciledRecord = reconciled.record ?? record
+      await openCodeTurnSettledEmissionCoordinator.emitLaunch({
+        record: reconciledRecord,
+        previewSummary: preview?.summary ?? null,
+        reconcileSummary: reconciled.summary,
+      })
+      return { name, record: reconciledRecord, reconciled, diagnostics: settleDiagnostics }
     } catch (error) {
       settleDiagnostics.push(teamDiagnostic(
         'member_launch_reconcile_pending',
         `${name}: ${error instanceof Error ? error.message : String(error)}`,
         'warning',
       ))
+      await openCodeTurnSettledEmissionCoordinator.emitLaunch({
+        record,
+        previewSummary: preview?.summary ?? null,
+        reconcileSummary: null,
+      })
       return { name, record, reconciled: null, diagnostics: settleDiagnostics }
     }
   })
@@ -1587,11 +1603,28 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     })
     : null
 
-  await openCodeSessionBridge.promptAsync(deliveryRecord, {
-    text: identityReminder ? `${identityReminder}\n\n${text}` : text,
-    agent: asString(body.agent) ?? 'teammate',
-    noReply: body.noReply === true,
-  })
+  const deliveryText = identityReminder ? `${identityReminder}\n\n${text}` : text
+  const deliveryAgent = asString(body.agent) ?? 'teammate'
+  const noReply = body.noReply === true
+  let runtimePromptMessageId: string | null = null
+  let turnSettled: OpenCodeTurnSettledSummary | null = null
+  if (noReply) {
+    await openCodeSessionBridge.promptAsync(deliveryRecord, {
+      text: deliveryText,
+      agent: deliveryAgent,
+      noReply: true,
+    })
+  } else {
+    const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
+      text: deliveryText,
+      agent: deliveryAgent,
+      noReply: false,
+      timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
+      idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
+    })
+    runtimePromptMessageId = prompted.runtimePromptMessageId
+    turnSettled = prompted.turnSettled
+  }
 
   let runtimePid =
     typeof deliveryRecord.runtimePid === 'number' && deliveryRecord.runtimePid > 0
@@ -1599,11 +1632,15 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       : mcpRuntimePid
   let reconcileDiagnostics: TeamDiagnostic[] = mcpDiagnostics
   let responseObservation: OpenCodeDeliveryResponseObservation | undefined
+  let reconcileSummary: OpenCodeSessionReconcileSummary | null = null
+  let emitRecord = deliveryRecord
   try {
     const reconciled = await withTimeout(
       openCodeSessionBridge.reconcileSession(deliveryRecord, { limit: 50 }),
       OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
     )
+    emitRecord = reconciled.record
+    reconcileSummary = reconciled.summary
     runtimePid =
       typeof reconciled.record.runtimePid === 'number' && reconciled.record.runtimePid > 0
         ? reconciled.record.runtimePid
@@ -1630,6 +1667,15 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       ),
     ]
     responseObservation = reconcileFailedObservation(message)
+  }
+  if (!noReply) {
+    await openCodeTurnSettledEmissionCoordinator.emitDelivery({
+      record: emitRecord,
+      runtimePromptMessageId,
+      turnSettled,
+      reconcileSummary,
+      responseObservation,
+    })
   }
 
   return {
