@@ -41,8 +41,14 @@ export function modelSupportsEffort(model: string): boolean {
   if (supported3P !== undefined) {
     return supported3P
   }
-  // Supported by a subset of Claude 4 models
-  if (m.includes('opus-4-7') || m.includes('opus-4-6') || m.includes('sonnet-4-6')) {
+  // Supported by a subset of Claude 4 models.
+  if (
+    m.includes('opus-4-7')
+    || m.includes('opus-4-6')
+    || m.includes('opus-4-5')
+    || m.includes('sonnet-4-6')
+    || m.includes('haiku-4-5')
+  ) {
     return true
   }
   // Exclude any other known legacy models (haiku, older opus/sonnet variants)
@@ -61,7 +67,7 @@ export function modelSupportsEffort(model: string): boolean {
 }
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
-// Public docs currently describe `max` on Opus 4.7 and Opus 4.6.
+// Public docs currently describe `max` on Opus 4.7, Opus 4.6, and Sonnet 4.6.
 export function modelSupportsMaxEffort(model: string): boolean {
   if (isGeminiModel(model) || isCodexModel(model)) {
     return false
@@ -72,7 +78,8 @@ export function modelSupportsMaxEffort(model: string): boolean {
   }
   if (
     model.toLowerCase().includes('opus-4-7') ||
-    model.toLowerCase().includes('opus-4-6')
+    model.toLowerCase().includes('opus-4-6') ||
+    model.toLowerCase().includes('sonnet-4-6')
   ) {
     return true
   }

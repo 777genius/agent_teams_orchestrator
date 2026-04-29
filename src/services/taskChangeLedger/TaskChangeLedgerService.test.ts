@@ -25,7 +25,9 @@ import {
   completeDeferredTaskChangeShellSnapshot,
   deferTaskChangeShellSnapshot,
   finishTaskChangeShellSnapshot,
+  importTaskChangeLedgerEvents,
   maybeBeginTaskChangeShellSnapshot,
+  type ImportedOpenCodeFileChange,
 } from './TaskChangeLedgerService.js'
 import {
   TASK_CHANGE_BASE_WORKSPACE_ROOT_ENV,
@@ -309,6 +311,377 @@ afterEach(async () => {
 })
 
 describe('TaskChangeLedgerService integration', () => {
+  function openCodeChange(overrides: Partial<ImportedOpenCodeFileChange> = {}): ImportedOpenCodeFileChange {
+    return {
+      filePath: join(repoDir, 'src/opencode.ts'),
+      beforeContent: null,
+      afterContent: null,
+      source: 'opencode_toolpart_edit',
+      confidence: 'medium',
+      operation: 'modify',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-final-content-unavailable',
+      },
+      toolUseId: 'tool-opencode-edit',
+      timestamp: '2026-04-26T10:00:00.000Z',
+      sourceImportKey: 'opencode\0session-opencode\0part-edit\0src/opencode.ts',
+      sourceRuntime: 'opencode',
+      sourceSessionId: 'session-opencode',
+      sourcePartId: 'part-edit',
+      sourceMessageId: 'assistant-1',
+      parentUserMessageId: 'user-1',
+      attributionMethod: 'delivery-ledger-taskrefs',
+      evidenceProof: 'metadata-only-fallback',
+      ...overrides,
+    }
+  }
+
+  async function importOpenCodeChanges(
+    taskId: string,
+    changes: ImportedOpenCodeFileChange[],
+  ): Promise<Awaited<ReturnType<typeof importTaskChangeLedgerEvents>>> {
+    return importTaskChangeLedgerEvents({
+      scope: {
+        taskId,
+        task: { ref: taskId, refKind: 'canonical' },
+        phase: 'work',
+        executionSeq: 0,
+      },
+      sessionId: 'session-opencode',
+      memberName: 'bob',
+      workspaceRoot: repoDir,
+      toolStatus: 'succeeded',
+      changes,
+    })
+  }
+
+  test('upgrades OpenCode metadata-only import without duplicating the visible bundle row', async () => {
+    const taskId = 'task-opencode-upgrade'
+    const first = await importOpenCodeChanges(taskId, [openCodeChange()])
+    expect(first.importedEventCount).toBe(1)
+
+    const upgraded = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 2;\n'), sizeBytes: 24 },
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-1',
+        snapshotSource: 'opencode',
+      }),
+    ])
+
+    expect(upgraded.importedEventCount).toBe(1)
+    expect(upgraded.skippedDuplicateCount).toBe(0)
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(2)
+    expect(events[1]?.eventId).not.toBe(events[0]?.eventId)
+    expect(events[1]?.supersedesEventId).toBe(events[0]?.eventId)
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(bundle.eventCount).toBe(2)
+    expect(bundle.projectedEventCount).toBe(1)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({
+      relativePath: 'src/opencode.ts',
+      eventCount: 1,
+      journalEventCount: 2,
+      reviewability: 'full-text',
+      linesAdded: 1,
+      linesRemoved: 1,
+    })
+    expect(bundle.totalLinesAdded).toBe(1)
+    expect(bundle.totalLinesRemoved).toBe(1)
+  })
+
+  test('upgrades partial OpenCode snapshot evidence when full before and after text arrives', async () => {
+    const taskId = 'task-opencode-partial-snapshot-upgrade'
+    const partial = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: null,
+        afterContent: 'export const value = 2;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 2;\n'), sizeBytes: 24 },
+        confidence: 'medium',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-partial',
+        snapshotSource: 'opencode',
+      }),
+    ])
+    expect(partial.importedEventCount).toBe(1)
+
+    const full = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 2;\n'), sizeBytes: 24 },
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-full',
+        snapshotSource: 'opencode',
+      }),
+    ])
+
+    expect(full.importedEventCount).toBe(1)
+    expect(full.skippedDuplicateCount).toBe(0)
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(2)
+    expect(events[1]?.supersedesEventId).toBe(events[0]?.eventId)
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(bundle.projectedEventCount).toBe(1)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({
+      relativePath: 'src/opencode.ts',
+      reviewability: 'full-text',
+      journalEventCount: 2,
+      eventCount: 1,
+    })
+  })
+
+  test('does not append weaker or operation-mismatched OpenCode evidence after an upgrade', async () => {
+    const taskId = 'task-opencode-upgrade-guard'
+    const strong = openCodeChange({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotId: 'snapshot-window-1',
+      snapshotSource: 'opencode',
+    })
+    expect((await importOpenCodeChanges(taskId, [strong])).importedEventCount).toBe(1)
+    const weaker = await importOpenCodeChanges(taskId, [openCodeChange()])
+    expect(weaker.importedEventCount).toBe(0)
+    expect(weaker.skippedDuplicateCount).toBe(1)
+
+    const mismatched = await importOpenCodeChanges(taskId, [
+      {
+        ...strong,
+        sourceImportKey: 'opencode\0session-opencode\0part-create\0src/opencode.ts',
+        sourcePartId: 'part-create',
+        operation: 'create',
+      },
+      {
+        ...openCodeChange(),
+        sourceImportKey: strong.sourceImportKey,
+        operation: 'delete',
+        beforeContent: 'export const value = 2;\n',
+        afterContent: null,
+        evidenceProof: 'opencode-snapshot',
+      },
+    ])
+    expect(mismatched.importedEventCount).toBe(1)
+    expect(mismatched.skippedUnsafeCount).toBe(1)
+    expect(mismatched.diagnostics.join('\n')).toContain('operation changed from modify to delete')
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(2)
+  })
+
+  test('does not treat sourceImportKey identity collisions as duplicates or upgrades', async () => {
+    const taskId = 'task-opencode-source-identity-guard'
+    expect((await importOpenCodeChanges(taskId, [openCodeChange()])).importedEventCount).toBe(1)
+
+    const changedPath = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        filePath: join(repoDir, 'src/other-opencode.ts'),
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-path-collision',
+        snapshotSource: 'opencode',
+      }),
+    ])
+    expect(changedPath.importedEventCount).toBe(0)
+    expect(changedPath.skippedDuplicateCount).toBe(0)
+    expect(changedPath.skippedUnsafeCount).toBe(1)
+    expect(changedPath.diagnostics).toContain(
+      `OpenCode ledger import skipped incompatible source identity for ${openCodeChange().sourceImportKey}.`,
+    )
+
+    const missingMessageIdentity = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+        snapshotId: 'snapshot-window-missing-message',
+        snapshotSource: 'opencode',
+        sourceMessageId: undefined,
+      }),
+    ])
+    expect(missingMessageIdentity.importedEventCount).toBe(0)
+    expect(missingMessageIdentity.skippedDuplicateCount).toBe(0)
+    expect(missingMessageIdentity.skippedUnsafeCount).toBe(1)
+    expect(missingMessageIdentity.diagnostics).toContain(
+      `OpenCode ledger import skipped incompatible source identity for ${openCodeChange().sourceImportKey}.`,
+    )
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(1)
+  })
+
+  test('keeps concurrent OpenCode duplicate decisions inside the task writer lock', async () => {
+    const taskId = 'task-opencode-concurrent-duplicates'
+    const change = openCodeChange({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+    })
+
+    const [left, right] = await Promise.all([
+      importOpenCodeChanges(taskId, [change]),
+      importOpenCodeChanges(taskId, [change]),
+    ])
+
+    expect(left.importedEventCount + right.importedEventCount).toBe(1)
+    expect(left.skippedDuplicateCount + right.skippedDuplicateCount).toBe(1)
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(1)
+  })
+
+  test('does not project non-OpenCode rows that accidentally carry sourceImportKey', async () => {
+    const taskId = 'task-non-opencode-source-import-key'
+    openScope(taskId)
+    await mkdir(dirname(eventsPath(taskId)), { recursive: true })
+    const timestamp = '2026-04-26T10:00:00.000Z'
+    const manualBase = {
+      schemaVersion: 1,
+      taskId,
+      taskRef: taskId,
+      taskRefKind: 'canonical',
+      phase: 'work',
+      executionSeq: 0,
+      sessionId,
+      toolUseId: 'manual-tool',
+      source: 'Edit',
+      operation: 'modify',
+      confidence: 'medium',
+      workspaceRoot: repoDir,
+      timestamp,
+      toolStatus: 'succeeded',
+      before: null,
+      after: null,
+      beforeState: { exists: true, unavailableReason: 'test-before-unavailable' },
+      afterState: { exists: true, unavailableReason: 'test-after-unavailable' },
+      sourceImportKey: 'shared-non-opencode-key',
+    }
+    await writeFile(
+      eventsPath(taskId),
+      [
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-a',
+          filePath: join(repoDir, 'src', 'manual-a.ts'),
+          relativePath: 'src/manual-a.ts',
+        }),
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-b',
+          filePath: join(repoDir, 'src', 'manual-b.ts'),
+          relativePath: 'src/manual-b.ts',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    )
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/trigger.ts',
+        content: 'export const trigger = 1;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-non-opencode-source-import-key-trigger',
+      sessionId,
+      agentId: 'alice@test',
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(new Set(files.map(file => file.relativePath))).toEqual(
+      new Set(['src/manual-a.ts', 'src/manual-b.ts', 'src/trigger.ts']),
+    )
+    expect(bundle.projectedEventCount).toBeUndefined()
+  })
+
+  test('does not project non-OpenCode rows that accidentally carry opencode-prefixed sourceImportKey', async () => {
+    const taskId = 'task-non-opencode-prefixed-source-import-key'
+    openScope(taskId)
+    await mkdir(dirname(eventsPath(taskId)), { recursive: true })
+    const timestamp = '2026-04-26T10:00:00.000Z'
+    const manualBase = {
+      schemaVersion: 1,
+      taskId,
+      taskRef: taskId,
+      taskRefKind: 'canonical',
+      phase: 'work',
+      executionSeq: 0,
+      sessionId,
+      toolUseId: 'manual-tool',
+      source: 'Edit',
+      operation: 'modify',
+      confidence: 'medium',
+      workspaceRoot: repoDir,
+      timestamp,
+      toolStatus: 'succeeded',
+      before: null,
+      after: null,
+      beforeState: { exists: true, unavailableReason: 'test-before-unavailable' },
+      afterState: { exists: true, unavailableReason: 'test-after-unavailable' },
+      sourceImportKey: 'opencode\0session-1\0part-1\0src/manual.ts',
+    }
+    await writeFile(
+      eventsPath(taskId),
+      [
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-prefixed-a',
+          filePath: join(repoDir, 'src', 'manual-a.ts'),
+          relativePath: 'src/manual-a.ts',
+        }),
+        JSON.stringify({
+          ...manualBase,
+          eventId: 'manual-non-opencode-prefixed-b',
+          filePath: join(repoDir, 'src', 'manual-b.ts'),
+          relativePath: 'src/manual-b.ts',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    )
+
+    await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/trigger.ts',
+        content: 'export const trigger = 1;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-non-opencode-prefixed-source-import-key-trigger',
+      sessionId,
+      agentId: 'alice@test',
+    })
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(new Set(files.map(file => file.relativePath))).toEqual(
+      new Set(['src/manual-a.ts', 'src/manual-b.ts', 'src/trigger.ts']),
+    )
+    expect(bundle.projectedEventCount).toBeUndefined()
+  })
+
   test('captures exact write create and rewrite into bundle v2 without storing events[]', async () => {
     const agentId = 'alice@test'
     openScope('task-write', 'work', agentId)
@@ -830,6 +1203,31 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events).toHaveLength(2)
     expect(new Set(events.map(event => event.toolStatus))).toEqual(new Set(['succeeded']))
     expect(new Set(events.map(event => event.source))).toEqual(new Set(['shell_snapshot']))
+  })
+
+  test('does not scan non-git bash workspaces without exact touched paths', async () => {
+    const initialGitRepo = repoDir
+    const nonGitDir = await mkdtemp(join(tmpdir(), 'task-change-ledger-non-git-'))
+    await rm(initialGitRepo, { recursive: true, force: true })
+    setRepoContext(nonGitDir)
+
+    const agentId = 'alice@test'
+    openScope('task-non-git-bash', 'work', agentId)
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'mkdir -p src && cat > src/non-git.ts' },
+      toolUseId: 'tool-non-git-bash',
+      sessionId,
+      agentId,
+    })
+    expect(snapshot).toBeNull()
+
+    await writeRepoFile('src/non-git.ts', 'export const nonGit = true;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    expect(await pathExists(bundlePath('task-non-git-bash'))).toBe(false)
+    expect(await pathExists(eventsPath('task-non-git-bash'))).toBe(false)
   })
 
   test('does not persist shell snapshot when created file is removed before completion', async () => {

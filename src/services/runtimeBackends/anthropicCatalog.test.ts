@@ -39,6 +39,7 @@ describe('anthropic runtime catalog', () => {
             low: { supported: true },
             medium: { supported: true },
             high: { supported: true },
+            max: { supported: true },
           },
           image_input: { supported: true },
         },
@@ -103,11 +104,19 @@ describe('anthropic runtime catalog', () => {
       supportsFastMode: true,
       source: 'anthropic-models-api',
     })
+    expect(catalog.models.find((model) => model.launchModel === 'sonnet')).toMatchObject({
+      displayName: 'Sonnet 4.6',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      supportsFastMode: false,
+      source: 'anthropic-models-api',
+    })
     expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
       displayName: 'Haiku 4.5',
       hidden: false,
-      supportedReasoningEfforts: [],
-      defaultReasoningEffort: null,
+      supportedReasoningEfforts: ['low', 'medium', 'high'],
+      defaultReasoningEffort: 'high',
       supportsFastMode: false,
       source: 'anthropic-models-api',
     })
@@ -128,10 +137,27 @@ describe('anthropic runtime catalog', () => {
       'sonnet',
       'haiku',
     ])
+    expect(getAnthropicRuntimeReasoningEfforts(catalog)).toEqual([
+      'low',
+      'medium',
+      'high',
+      'max',
+    ])
+    expect(catalog.models.find((model) => model.launchModel === 'opus')).toMatchObject({
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      source: 'static-fallback',
+    })
     expect(catalog.models.find((model) => model.launchModel === 'claude-sonnet-4-6[1m]')).toMatchObject({
       hidden: true,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
       supportsFastMode: false,
+      source: 'static-fallback',
+    })
+    expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
+      supportedReasoningEfforts: ['low', 'medium', 'high'],
+      defaultReasoningEffort: 'high',
       source: 'static-fallback',
     })
   })

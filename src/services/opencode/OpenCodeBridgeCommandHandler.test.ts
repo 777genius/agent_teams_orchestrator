@@ -7,6 +7,7 @@ import {
 } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -296,6 +297,7 @@ const originalProjectLogMessages = openCodeSessionBridge.projectLogMessages
 const originalList = openCodeSessionStore.list
 const originalGet = openCodeSessionStore.get
 const originalMarkStale = openCodeSessionStore.markStale
+const originalBackfillTaskLedger = openCodeLedgerBridgeService.backfill
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
@@ -353,6 +355,7 @@ afterEach(() => {
   openCodeSessionStore.list = originalList
   openCodeSessionStore.get = originalGet
   openCodeSessionStore.markStale = originalMarkStale
+  openCodeLedgerBridgeService.backfill = originalBackfillTaskLedger
   Client.prototype.connect = originalClientConnect
   Client.prototype.listTools = originalClientListTools
   Client.prototype.close = originalClientClose
@@ -379,6 +382,17 @@ function createDeferred<T>() {
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {}),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
+  })
+
   test('executes host cleanup without provisioning a readiness host', async () => {
     let probeCalled = false
     let cleanupInput: unknown = null

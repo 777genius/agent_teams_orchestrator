@@ -81,6 +81,7 @@ type OpenCodeClientFactoryDeps = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
 
@@ -164,19 +165,27 @@ export class OpenCodeClientFactory {
           method: 'DELETE',
         }),
       listAgents: () => request<OpenCodeAgentResponse[]>('/agent'),
-      getMcp: () => request<OpenCodeMcpResponse>('/mcp'),
+      getMcp: () => request<OpenCodeMcpResponse>('/mcp', undefined, MCP_REQUEST_TIMEOUT_MS),
       addMcp: (name, config) =>
-        request<OpenCodeMcpResponse>('/mcp', {
-          method: 'POST',
-          body: JSON.stringify({
-            name,
-            config,
-          }),
-        }),
+        request<OpenCodeMcpResponse>(
+          '/mcp',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              name,
+              config,
+            }),
+          },
+          MCP_REQUEST_TIMEOUT_MS,
+        ),
       connectMcp: name =>
-        request<OpenCodeMcpResponse>(`/mcp/${encodeURIComponent(name)}/connect`, {
-          method: 'POST',
-        }),
+        request<OpenCodeMcpResponse>(
+          `/mcp/${encodeURIComponent(name)}/connect`,
+          {
+            method: 'POST',
+          },
+          MCP_REQUEST_TIMEOUT_MS,
+        ),
       createSession: body =>
         request<OpenCodeSessionSummary>('/session', {
           method: 'POST',

@@ -4,7 +4,15 @@ import {
   normalizeOpenCodeFilePath,
   type NormalizedOpenCodeFilePath,
 } from './OpenCodeBridgePath.js'
+import {
+  parseOpenCodeApplyPatchEvidence,
+  type OpenCodeApplyPatchHunk,
+} from './OpenCodeApplyPatchEvidenceParser.js'
 
+import type {
+  OpenCodeEvidenceProof,
+  OpenCodeSnapshotBoundary,
+} from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodeSqliteMessageRow,
   OpenCodeSqlitePartRow,
@@ -31,6 +39,7 @@ export type OpenCodeDeliveryContextV1 = {
     observedAssistantMessageId?: string | null
     prePromptCursor?: string | null
     postPromptCursor?: string | null
+    snapshotBoundary?: OpenCodeSnapshotBoundary | null
     taskRefs: OpenCodeTaskRef[]
   }>
 }
@@ -47,7 +56,7 @@ export type ReconstructedOpenCodeToolChange = {
   toolUseId: string
   sourcePartId: string
   sourceMessageId: string
-  sourceTool: 'write' | 'edit'
+  sourceTool: 'write' | 'edit' | 'apply_patch'
   sourceImportKey: string
   filePath: string
   relativePath: string
@@ -66,11 +75,17 @@ export type ReconstructedOpenCodeToolChange = {
     unavailableReason?: string
   }
   operation: 'create' | 'modify' | 'delete'
-  confidence: 'exact' | 'high'
+  confidence: 'exact' | 'high' | 'medium'
   attributionMethod: 'delivery-ledger-taskrefs'
   oldString?: string
   newString?: string
+  patchBeforeContent?: string
+  patchUpdateHunks?: OpenCodeApplyPatchHunk[]
   warnings?: string[]
+  evidenceProof?: OpenCodeEvidenceProof
+  evidenceDiagnostics?: string[]
+  snapshotId?: string
+  snapshotSource?: 'opencode'
   timestamp: string
 }
 
@@ -78,10 +93,11 @@ type Toolpart = {
   partId: string
   messageId: string
   parentUserMessageId?: string
-  tool: 'write' | 'edit'
+  tool: 'write' | 'edit' | 'apply_patch'
   callId?: string
   status: string
-  filePath: string
+  filePath?: string
+  patch?: string
   content?: string
   oldString?: string
   newString?: string
@@ -93,6 +109,7 @@ type Toolpart = {
   partTimeCreated: number
   messageTimeCreated: number
   messageIdSort: string
+  messagePartOrder: number
   timestamp: string
 }
 
@@ -388,21 +405,14 @@ export class OpenCodeToolpartChangeReconstructor {
 
     for (const toolpart of toolparts.sort((left, right) => {
       return (
-        left.partTimeCreated - right.partTimeCreated ||
         left.messageTimeCreated - right.messageTimeCreated ||
         left.messageIdSort.localeCompare(right.messageIdSort) ||
+        left.messagePartOrder - right.messagePartOrder ||
+        left.partTimeCreated - right.partTimeCreated ||
         left.partId.localeCompare(right.partId)
       )
     })) {
       if (toolpart.status !== 'completed') {
-        continue
-      }
-      const normalizedPath = normalizeOpenCodeFilePath({
-        projectPath: params.projectPath,
-        filePath: toolpart.filePath,
-      })
-      if ('skipped' in normalizedPath) {
-        diagnostics.push(normalizedPath.diagnostic)
         continue
       }
       const taskContextResolution = this.resolveTaskContext({
@@ -418,6 +428,102 @@ export class OpenCodeToolpartChangeReconstructor {
         continue
       }
       const taskContext = taskContextResolution.context
+
+      if (toolpart.tool === 'apply_patch') {
+        if (!toolpart.patch) {
+          diagnostics.push(`OpenCode apply_patch toolpart ${toolpart.partId} skipped because patch text was unavailable.`)
+          continue
+        }
+        const touchedPaths = parseOpenCodeApplyPatchEvidence(toolpart.patch, toolpart.partId, diagnostics)
+        for (const touchedPath of touchedPaths) {
+          const normalizedPath = normalizeOpenCodeFilePath({
+            projectPath: params.projectPath,
+            filePath: touchedPath.filePath,
+          })
+          if ('skipped' in normalizedPath) {
+            diagnostics.push(normalizedPath.diagnostic)
+            continue
+          }
+          const afterContent = touchedPath.operation === 'create' && typeof touchedPath.afterContent === 'string'
+            ? touchedPath.afterContent
+            : null
+          const patchBeforeContent = touchedPath.operation === 'delete' && typeof touchedPath.beforeContent === 'string'
+            ? touchedPath.beforeContent
+            : undefined
+          const patchUpdateHunks = touchedPath.operation === 'modify' && touchedPath.updateHunks?.length
+            ? touchedPath.updateHunks
+            : undefined
+          fileStates.set(normalizedPath.comparisonKey, {
+            text: afterContent,
+            textAvailability: afterContent === null ? 'metadata-only' : 'full-text',
+            exists: touchedPath.operation !== 'delete',
+          })
+          changes.push({
+            taskId: taskContext.taskRef.taskId,
+            taskRef: taskContext.taskRef.taskId,
+            taskRefKind: 'canonical',
+            teamName: taskContext.taskRef.teamName,
+            memberName: params.memberName,
+            sessionId: params.sessionId,
+            ...(toolpart.parentUserMessageId ? { parentUserMessageId: toolpart.parentUserMessageId } : {}),
+            assistantMessageId: toolpart.messageId,
+            toolUseId: toolpart.callId ?? toolpart.partId,
+            sourcePartId: toolpart.partId,
+            sourceMessageId: toolpart.messageId,
+            sourceTool: 'apply_patch',
+            sourceImportKey: buildSourceImportKey({
+              sessionId: params.sessionId,
+              partId: toolpart.partId,
+              normalizedPath,
+            }),
+            filePath: normalizedPath.absolutePath,
+            relativePath: normalizedPath.relativePath,
+            beforeContent: null,
+            afterContent,
+            operation: touchedPath.operation,
+            confidence: afterContent !== null ? 'exact' : 'medium',
+            attributionMethod: taskContext.method,
+            ...(patchBeforeContent !== undefined ? { patchBeforeContent } : {}),
+            ...(patchUpdateHunks ? { patchUpdateHunks } : {}),
+            beforeState: {
+              exists: touchedPath.operation === 'create' ? false : true,
+              ...(touchedPath.operation === 'create'
+                ? { sizeBytes: 0 }
+                : { unavailableReason: 'opencode-apply-patch-before-content-unavailable' }),
+            },
+            afterState: afterContent !== null
+              ? contentStateForText(afterContent)
+              : {
+                  exists: touchedPath.operation !== 'delete',
+                  unavailableReason: touchedPath.operation === 'delete'
+                    ? 'opencode-apply-patch-delete-after-state-unverified'
+                    : 'opencode-apply-patch-final-content-unavailable',
+                },
+            evidenceProof: afterContent !== null ? 'inverse-apply-patch-chain' : 'metadata-only-fallback',
+            timestamp: toolpart.timestamp,
+            warnings: [
+              ...(afterContent === null
+                ? ['OpenCode apply_patch was captured without a git/snapshot baseline; apply/reject is manual-only.']
+                : []),
+              ...(taskContext.warning ? [taskContext.warning] : []),
+            ],
+          })
+        }
+        continue
+      }
+
+      if (!toolpart.filePath) {
+        diagnostics.push(`OpenCode ${toolpart.tool} toolpart ${toolpart.partId} missing state/input/filePath.`)
+        continue
+      }
+      const normalizedPath = normalizeOpenCodeFilePath({
+        projectPath: params.projectPath,
+        filePath: toolpart.filePath,
+      })
+      if ('skipped' in normalizedPath) {
+        diagnostics.push(normalizedPath.diagnostic)
+        continue
+      }
 
       if (toolpart.metadataOnly) {
         const operation = toolpart.operationOverride ?? (toolpart.tool === 'write' ? 'create' : 'modify')
@@ -449,7 +555,7 @@ export class OpenCodeToolpartChangeReconstructor {
           beforeContent: null,
           afterContent: null,
           operation,
-          confidence: 'high',
+          confidence: 'medium',
           attributionMethod: taskContext.method,
           ...(toolpart.oldString !== undefined ? { oldString: toolpart.oldString } : {}),
           ...(toolpart.newString !== undefined ? { newString: toolpart.newString } : {}),
@@ -461,6 +567,7 @@ export class OpenCodeToolpartChangeReconstructor {
             operation === 'delete'
               ? { exists: false, sizeBytes: 0 }
               : { exists: true, unavailableReason: 'opencode-apply-patch-after-content-unavailable' },
+          evidenceProof: 'metadata-only-fallback',
           timestamp: toolpart.timestamp,
           warnings: [
             'OpenCode apply_patch was captured without full before/after text; review is manual-only.',
@@ -525,7 +632,7 @@ export class OpenCodeToolpartChangeReconstructor {
           beforeContent,
           afterContent,
           operation: toolpart.operationOverride ?? (beforeKind === 'known-absent' ? 'create' : 'modify'),
-          confidence: beforeKind === 'known-text' || beforeKind === 'known-absent' ? 'exact' : 'high',
+          confidence: beforeKind === 'known-text' || beforeKind === 'known-absent' ? 'exact' : 'medium',
           attributionMethod: taskContext.method,
           timestamp: toolpart.timestamp,
           beforeState:
@@ -603,7 +710,7 @@ export class OpenCodeToolpartChangeReconstructor {
           beforeContent: null,
           afterContent: null,
           operation: 'modify',
-          confidence: 'high',
+          confidence: 'medium',
           attributionMethod: taskContext.method,
           oldString: toolpart.oldString,
           newString: toolpart.newString,
@@ -679,6 +786,7 @@ export class OpenCodeToolpartChangeReconstructor {
     diagnostics: string[],
   ): Toolpart[] {
     const toolparts: Toolpart[] = []
+    const partOrderById = this.buildMessagePartOrderById(rows.map(item => item.row))
     for (const { row, data } of rows) {
       if (data.type !== 'tool') {
         continue
@@ -698,65 +806,72 @@ export class OpenCodeToolpartChangeReconstructor {
       }
       const input = asRecord(state?.input)
       const metadata = asRecord(state?.metadata)
+      const filePath = asString(input?.filePath) ?? undefined
+      const patch = asStringValue(input?.patch) ?? undefined
       const assistantMessage = messagesById.get(row.message_id)
-      if (tool === 'apply_patch') {
-        const files = Array.isArray(metadata?.files)
-          ? metadata.files.map(asRecord).filter((file): file is Record<string, unknown> => file !== null)
-          : []
-        if (files.length === 0) {
-          diagnostics.push(`OpenCode apply_patch toolpart ${row.id} missing metadata.files.`)
-          continue
-        }
-        for (const file of files) {
-          const filePath = asString(file.filePath)
-          const operation = getApplyPatchOperation(asString(file.type))
-          if (!filePath || !operation) {
-            diagnostics.push(`OpenCode apply_patch toolpart ${row.id} contained an unsupported file entry.`)
-            continue
-          }
-          const patch = asStringValue(file.patch)
-          const content = operation === 'create'
-            ? extractUnifiedDiffLines(patch, '+') ?? undefined
-            : undefined
-          const oldString = operation === 'modify' || operation === 'delete'
-            ? extractUnifiedDiffLines(patch, '-') ?? undefined
-            : undefined
-          const newString = operation === 'modify'
-            ? extractUnifiedDiffLines(patch, '+') ?? undefined
-            : undefined
-          const hasReplacement = typeof oldString === 'string' && typeof newString === 'string'
-          toolparts.push({
-            partId: row.id,
-            messageId: row.message_id,
-            parentUserMessageId: asString(assistantMessage?.parentID),
-            tool: operation === 'create' ? 'write' : 'edit',
-            callId: asString(data.callID) ?? undefined,
-            status,
-            filePath,
-            content,
-            oldString,
-            newString,
-            metadataExists: operation !== 'create',
-            metadataOnly:
-              (operation === 'create' && !content) ||
-              (operation === 'modify' && !hasReplacement) ||
-              operation === 'delete',
-            operationOverride: operation,
-            warnings: ['OpenCode apply_patch toolpart imported from patch metadata.'],
-            truncated: false,
-            partTimeCreated: row.time_created,
-            messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
-            messageIdSort: row.message_id,
-            timestamp: toIsoTimestamp(
-              asNumber(asRecord(state.time)?.end) ?? asNumber(asRecord(state.time)?.start),
-              row.time_created,
-            ),
-          })
-        }
+      if (!input) {
+        diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input.`)
         continue
       }
-      const filePath = asString(input?.filePath)
-      if (!input || !filePath) {
+      if (tool === 'apply_patch') {
+        if (!patch) {
+          const files = Array.isArray(metadata?.files)
+            ? metadata.files.map(asRecord).filter((file): file is Record<string, unknown> => file !== null)
+            : []
+          if (files.length > 0) {
+            for (const file of files) {
+              const metadataFilePath = asString(file.filePath)
+              const operation = getApplyPatchOperation(asString(file.type))
+              if (!metadataFilePath || !operation) {
+                diagnostics.push(`OpenCode apply_patch toolpart ${row.id} contained an unsupported file entry.`)
+                continue
+              }
+              const filePatch = asStringValue(file.patch)
+              const content = operation === 'create'
+                ? extractUnifiedDiffLines(filePatch, '+') ?? undefined
+                : undefined
+              const oldString = operation === 'modify' || operation === 'delete'
+                ? extractUnifiedDiffLines(filePatch, '-') ?? undefined
+                : undefined
+              const newString = operation === 'modify'
+                ? extractUnifiedDiffLines(filePatch, '+') ?? undefined
+                : undefined
+              const hasReplacement = typeof oldString === 'string' && typeof newString === 'string'
+              toolparts.push({
+                partId: row.id,
+                messageId: row.message_id,
+                parentUserMessageId: asString(assistantMessage?.parentID),
+                tool: operation === 'create' ? 'write' : 'edit',
+                callId: asString(data.callID) ?? undefined,
+                status,
+                filePath: metadataFilePath,
+                content,
+                oldString,
+                newString,
+                metadataExists: operation !== 'create',
+                metadataOnly:
+                  (operation === 'create' && !content) ||
+                  (operation === 'modify' && !hasReplacement) ||
+                  operation === 'delete',
+                operationOverride: operation,
+                warnings: ['OpenCode apply_patch toolpart imported from patch metadata.'],
+                truncated: false,
+                partTimeCreated: row.time_created,
+                messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
+                messageIdSort: row.message_id,
+                messagePartOrder: partOrderById.get(row.id) ?? 0,
+                timestamp: toIsoTimestamp(
+                  asNumber(asRecord(state.time)?.end) ?? asNumber(asRecord(state.time)?.start),
+                  row.time_created,
+                ),
+              })
+            }
+            continue
+          }
+          diagnostics.push(`OpenCode apply_patch toolpart ${row.id} missing state/input/patch.`)
+          continue
+        }
+      } else if (!filePath) {
         diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input/filePath.`)
         continue
       }
@@ -767,7 +882,8 @@ export class OpenCodeToolpartChangeReconstructor {
         tool,
         callId: asString(data.callID) ?? undefined,
         status,
-        filePath,
+        ...(filePath ? { filePath } : {}),
+        ...(patch ? { patch } : {}),
         content: asStringValue(input.content) ?? undefined,
         oldString: asStringValue(input.oldString) ?? undefined,
         newString: asStringValue(input.newString) ?? undefined,
@@ -776,10 +892,26 @@ export class OpenCodeToolpartChangeReconstructor {
         partTimeCreated: row.time_created,
         messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
         messageIdSort: row.message_id,
+        messagePartOrder: partOrderById.get(row.id) ?? 0,
         timestamp: toIsoTimestamp(asNumber(asRecord(state.time)?.end) ?? asNumber(asRecord(state.time)?.start), row.time_created),
       })
     }
     return toolparts
+  }
+
+  private buildMessagePartOrderById(rows: OpenCodeSqlitePartRow[]): Map<string, number> {
+    const byMessage = new Map<string, OpenCodeSqlitePartRow[]>()
+    for (const row of rows) {
+      const bucket = byMessage.get(row.message_id) ?? []
+      bucket.push(row)
+      byMessage.set(row.message_id, bucket)
+    }
+    const result = new Map<string, number>()
+    for (const messageRows of byMessage.values()) {
+      messageRows.sort((left, right) => left.id.localeCompare(right.id))
+      messageRows.forEach((row, index) => result.set(row.id, index))
+    }
+    return result
   }
 
   private resolveTaskContext(input: {
@@ -846,7 +978,7 @@ export class OpenCodeToolpartChangeReconstructor {
       if (!record.laneId || !input.laneId || record.laneId !== input.laneId) {
         continue
       }
-      if (!record.runtimeSessionId || record.runtimeSessionId !== input.sessionId) {
+      if (record.runtimeSessionId && record.runtimeSessionId !== input.sessionId) {
         continue
       }
       const recordTaskRef = getSingleRequestedTeamRef(

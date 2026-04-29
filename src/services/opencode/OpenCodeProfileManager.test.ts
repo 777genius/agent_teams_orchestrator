@@ -66,7 +66,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       default_agent: 'teammate',
       share: 'disabled',
       autoupdate: false,
-      snapshot: false,
+      snapshot: true,
       agent: {
         teammate: {
           permission: {

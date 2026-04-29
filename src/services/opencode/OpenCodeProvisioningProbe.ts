@@ -200,9 +200,9 @@ export class OpenCodeProvisioningProbe {
         )
       }
 
-      if (config.snapshot !== false) {
+      if (config.snapshot !== true) {
         diagnostics.push(
-          `Managed snapshot mismatch (${String(config.snapshot ?? 'unset')} instead of false)`,
+          `Managed snapshot mismatch (${String(config.snapshot ?? 'unset')} instead of true)`,
         )
       }
       if (appMcp.summary.status === 'missing' || appMcp.summary.status === 'attach_failed') {

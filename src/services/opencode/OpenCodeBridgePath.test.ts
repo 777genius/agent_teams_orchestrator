@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { areSameOpenCodeWorkspace, normalizeOpenCodeFilePath } from './OpenCodeBridgePath.js'
+import {
+  areSameOpenCodeWorkspace,
+  isOpenCodeWorkspaceSameOrDescendant,
+  normalizeOpenCodeFilePath,
+} from './OpenCodeBridgePath.js'
 
 describe('OpenCodeBridgePath', () => {
   test('normalizes POSIX project-relative paths without escaping workspace root', () => {
@@ -46,6 +50,20 @@ describe('OpenCodeBridgePath', () => {
         recordProjectPath: 'c:/repo/',
       }),
     ).toBe(true)
+
+    expect(
+      isOpenCodeWorkspaceSameOrDescendant({
+        parentWorkspaceRoot: 'C:\\Repo',
+        childPath: 'c:/repo/src',
+      }),
+    ).toBe(true)
+
+    expect(
+      isOpenCodeWorkspaceSameOrDescendant({
+        parentWorkspaceRoot: 'C:\\Repo',
+        childPath: 'D:/repo/src',
+      }),
+    ).toBe(false)
   })
 
   test('rejects device paths and mixed absolute path styles', () => {

@@ -524,6 +524,8 @@ export type OpenCodeSessionRecord = {
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
   projectBehaviorFingerprint: string
+  managedConfigFingerprint?: string
+  opencodeVersion?: string
   staleReason: string | null
   createdAt: string
   updatedAt: string
