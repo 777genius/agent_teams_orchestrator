@@ -12,6 +12,7 @@ import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
+import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
   OpenCodeProvisioningSnapshot,
   OpenCodeSessionRecord,
@@ -288,6 +289,7 @@ const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistent
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalPromptAsync = openCodeSessionBridge.promptAsync
+const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalObservePreview = openCodeSessionBridge.observePreview
 const originalAbort = openCodeSessionBridge.abort
@@ -304,6 +306,26 @@ const originalClientClose = Client.prototype.close
 
 beforeEach(() => {
   mockRequiredMcpTools()
+  openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
+    await openCodeSessionBridge.promptAsync(record, input)
+    const runtimePromptMessageId = 'msg_test_turn_settled'
+    const turnSettled: OpenCodeTurnSettledSummary = {
+      outcome: 'success',
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+      turnId: runtimePromptMessageId,
+      endpoint: '/event',
+      streamConnected: true,
+      observedEventCount: 2,
+      matchedEventCount: 2,
+      assistantActivityCount: 1,
+      promptPersisted: true,
+      latestEventType: 'session.status',
+      latestAssistantMessageId: 'msg-assistant-1',
+      diagnostics: [],
+    }
+    return { runtimePromptMessageId, turnSettled }
+  }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
   openCodeHostManager.reconcilePersistentHosts = (async () => ({
     cleaned: 0,
     remaining: 0,
@@ -346,6 +368,7 @@ afterEach(() => {
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.promptAsync = originalPromptAsync
+  openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
   openCodeSessionBridge.reconcileSession = originalReconcileSession
   openCodeSessionBridge.observePreview = originalObservePreview
   openCodeSessionBridge.abort = originalAbort
@@ -3735,6 +3758,42 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.accepted).toBe(true)
     expect(result.data.sessionId).toBe('session-bob')
     expect(result.data.runtimePid).toBe(789)
+  })
+
+  test('keeps noReply OpenCode delivery out of turn-settled observer path', async () => {
+    const promptCalls: Array<{ noReply?: boolean }> = []
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+    })
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async (_sessionRecord, input) => {
+      promptCalls.push({ noReply: input.noReply })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.promptAsyncWithTurnSettled = (async () => {
+      throw new Error('noReply must not wait for turn-settled observation')
+    }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'silent bootstrap',
+        noReply: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(promptCalls).toEqual([{ noReply: true }])
   })
 
   test('reattaches app MCP before sending a message to an OpenCode lane session', async () => {
