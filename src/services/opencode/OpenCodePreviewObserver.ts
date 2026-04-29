@@ -1,3 +1,12 @@
+import {
+  extractOpenCodeSseData,
+  getOpenCodeSseMessageId,
+  getOpenCodeSseMessageRole,
+  getOpenCodeSseSessionId,
+  getOpenCodeSseSessionStatusType,
+  normalizeOpenCodeSseEvent,
+  parseOpenCodeSseDataBlocks,
+} from './OpenCodeSseEventStream.js'
 import type {
   OpenCodePreviewRuntimeState,
   OpenCodeSessionPreviewSummary,
@@ -55,65 +64,6 @@ function buildPreviewText(value: string): string | null {
     return null
   }
   return compacted.length <= 160 ? compacted : `${compacted.slice(0, 157)}...`
-}
-
-function normalizeEvent(raw: unknown): OpenCodeSseEvent | null {
-  const record = asRecord(raw)
-  if (!record) {
-    return null
-  }
-
-  const directType = asString(record.type)
-  const payload = asRecord(record.payload)
-  const eventRecord =
-    directType
-      ? record
-      : payload
-        ? payload
-        : null
-
-  if (!eventRecord) {
-    return null
-  }
-
-  const type = asString(eventRecord.type)
-  if (!type) {
-    return null
-  }
-
-  return {
-    type,
-    properties: asRecord(eventRecord.properties) ?? {},
-    directory: asString(record.directory),
-    raw,
-  }
-}
-
-function parseSseDataBlocks(input: string): string[] {
-  return input
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .split('\n\n')
-}
-
-function extractDataLines(block: string): string | null {
-  const dataLines: string[] = []
-  for (const line of block.split('\n')) {
-    if (!line || line.startsWith(':')) {
-      continue
-    }
-    if (!line.startsWith('data:')) {
-      continue
-    }
-
-    let data = line.slice(5)
-    if (data.startsWith(' ')) {
-      data = data.slice(1)
-    }
-    dataLines.push(data)
-  }
-
-  return dataLines.length > 0 ? dataLines.join('\n') : null
 }
 
 function buildEmptySummary(sessionId: string): OpenCodeSessionPreviewSummary {
@@ -238,10 +188,7 @@ export class OpenCodePreviewObserver {
       }
 
       const properties = event.properties
-      const sessionId =
-        asString(properties.sessionID)
-        ?? asString(asRecord(properties.info)?.sessionID)
-        ?? asString(asRecord(properties.part)?.sessionID)
+      const sessionId = getOpenCodeSseSessionId(properties)
 
       if (sessionId !== params.sessionId) {
         return
@@ -253,7 +200,7 @@ export class OpenCodePreviewObserver {
 
       switch (event.type) {
         case 'session.status': {
-          const status = asString(properties.status)
+          const status = getOpenCodeSseSessionStatusType(properties.status, params.sessionId)
           if (status === 'active' || status === 'busy') {
             state.runtimeState = 'running'
           } else if (status === 'idle') {
@@ -275,9 +222,8 @@ export class OpenCodePreviewObserver {
         }
 
         case 'message.updated': {
-          const info = asRecord(properties.info)
-          const messageId = asString(info?.id)
-          const role = asString(info?.role)
+          const messageId = getOpenCodeSseMessageId(properties)
+          const role = getOpenCodeSseMessageRole(properties)
           if (!messageId) {
             state.diagnostics.push('OpenCode preview observed message.updated without info.id')
             return
@@ -298,7 +244,7 @@ export class OpenCodePreviewObserver {
 
         case 'message.part.updated': {
           const part = asRecord(properties.part)
-          const messageId = asString(part?.messageID) ?? asString(properties.messageID)
+          const messageId = getOpenCodeSseMessageId(properties)
           const partId = asString(part?.id) ?? '__default__'
           const partType = asString(part?.type)
           if (!messageId || !partType) {
@@ -433,15 +379,15 @@ export class OpenCodePreviewObserver {
               break
             }
             buffer += decoder.decode(value, { stream: true })
-            const blocks = parseSseDataBlocks(buffer)
+            const blocks = parseOpenCodeSseDataBlocks(buffer)
             buffer = blocks.pop() ?? ''
             for (const block of blocks) {
-              const data = extractDataLines(block)
+              const data = extractOpenCodeSseData(block)
               if (!data) {
                 continue
               }
               try {
-                const event = normalizeEvent(JSON.parse(data))
+                const event = normalizeOpenCodeSseEvent(JSON.parse(data))
                 if (!event) {
                   state.diagnostics.push('OpenCode preview ignored an unrecognized SSE payload shape')
                   continue
@@ -455,10 +401,10 @@ export class OpenCodePreviewObserver {
             }
           }
 
-          const finalData = extractDataLines(buffer)
+          const finalData = extractOpenCodeSseData(buffer)
           if (finalData) {
             try {
-              const event = normalizeEvent(JSON.parse(finalData))
+              const event = normalizeOpenCodeSseEvent(JSON.parse(finalData))
               if (event) {
                 handleEvent(event)
               }

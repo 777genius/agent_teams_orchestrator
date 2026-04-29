@@ -22,6 +22,62 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
+export function getOpenCodeSseSessionId(properties: Record<string, unknown>): string | null {
+  return (
+    asString(properties.sessionID)
+    ?? asString(properties.sessionId)
+    ?? asString(asRecord(properties.info)?.sessionID)
+    ?? asString(asRecord(properties.info)?.sessionId)
+    ?? asString(asRecord(properties.part)?.sessionID)
+    ?? asString(asRecord(properties.part)?.sessionId)
+  )
+}
+
+export function getOpenCodeSseMessageId(properties: Record<string, unknown>): string | null {
+  return (
+    asString(asRecord(properties.info)?.id)
+    ?? asString(asRecord(properties.part)?.messageID)
+    ?? asString(asRecord(properties.part)?.messageId)
+    ?? asString(properties.messageID)
+    ?? asString(properties.messageId)
+  )
+}
+
+export function getOpenCodeSseMessageRole(properties: Record<string, unknown>): string | null {
+  return asString(asRecord(properties.info)?.role)
+}
+
+export function getOpenCodeSsePartType(properties: Record<string, unknown>): string | null {
+  return asString(asRecord(properties.part)?.type)
+}
+
+export function getOpenCodeSseSessionStatusType(
+  status: unknown,
+  sessionId?: string | null,
+): string | null {
+  const direct = asString(status)
+  if (direct) {
+    return direct
+  }
+
+  const record = asRecord(status)
+  if (!record) {
+    return null
+  }
+
+  const typed = asString(record.type)
+  if (typed) {
+    return typed
+  }
+
+  if (!sessionId) {
+    return null
+  }
+
+  const scoped = record[sessionId]
+  return asString(scoped) ?? asString(asRecord(scoped)?.type)
+}
+
 export function normalizeOpenCodeSseEvent(raw: unknown): OpenCodeSseEvent | null {
   const record = asRecord(raw)
   if (!record) {
