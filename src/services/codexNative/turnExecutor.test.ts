@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
+import {
+  getFlagSettingsInline,
+  setFlagSettingsInline,
+} from '../../bootstrap/state.js'
 import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSdkTypes.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import {
@@ -238,6 +242,136 @@ describe('executeCodexNativeTurn', () => {
 
     expect(observedIdleTimeoutMs).toBe(900_000)
     expect(observedAbsoluteTimeoutMs).toBe(3_600_000)
+  })
+
+  test('disables unsupported Codex plugins only for API-key native execution', async () => {
+    const previousCodeKey = process.env.CODEX_API_KEY
+    const previousOpenAiKey = process.env.OPENAI_API_KEY
+    const previousSettings = getFlagSettingsInline()
+    let observedDisabledFeatures: string[] | undefined
+
+    try {
+      process.env.CODEX_API_KEY = 'sk-test'
+      delete process.env.OPENAI_API_KEY
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'api',
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedDisabledFeatures = options.disabledFeatures
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedDisabledFeatures).toEqual(['plugins'])
+    } finally {
+      if (previousCodeKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = previousCodeKey
+      }
+      if (previousOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = previousOpenAiKey
+      }
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
+  test('keeps Codex plugins enabled for ChatGPT native execution', async () => {
+    const previousCodeKey = process.env.CODEX_API_KEY
+    const previousOpenAiKey = process.env.OPENAI_API_KEY
+    const previousSettings = getFlagSettingsInline()
+    let observedDisabledFeatures: string[] | undefined
+
+    try {
+      process.env.CODEX_API_KEY = 'sk-test'
+      delete process.env.OPENAI_API_KEY
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedDisabledFeatures = options.disabledFeatures
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedDisabledFeatures).toEqual([])
+    } finally {
+      if (previousCodeKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = previousCodeKey
+      }
+      if (previousOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = previousOpenAiKey
+      }
+      setFlagSettingsInline(previousSettings)
+    }
   })
 
   test('records an assistant API error when native execution completes without assistant output', async () => {

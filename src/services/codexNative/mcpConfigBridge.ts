@@ -37,11 +37,13 @@ function toCodexConfigLiteral(value: unknown): string {
 
 function buildCodexServerOverride(
   serverName: string,
-  fieldPath: string,
+  fieldPathSegments: string[],
   value: unknown,
 ): string {
-  const encodedServerName = encodeCodexConfigKeySegment(serverName)
-  return `mcp_servers.${encodedServerName}.${fieldPath}=${toCodexConfigLiteral(value)}`
+  const fieldPath = [serverName, ...fieldPathSegments]
+    .map(encodeCodexConfigKeySegment)
+    .join('.')
+  return `mcp_servers.${fieldPath}=${toCodexConfigLiteral(value)}`
 }
 
 function parseDynamicMcpConfigs(
@@ -98,17 +100,23 @@ function buildOverridesForServer(
     case undefined:
     case 'stdio': {
       const overrides = [
-        buildCodexServerOverride(serverName, 'command', config.command),
-        buildCodexServerOverride(serverName, 'args', config.args ?? []),
+        buildCodexServerOverride(serverName, ['command'], config.command),
+        buildCodexServerOverride(serverName, ['args'], config.args ?? []),
       ]
       if (config.env && Object.keys(config.env).length > 0) {
-        overrides.push(buildCodexServerOverride(serverName, 'env', config.env))
+        overrides.push(
+          ...Object.entries(config.env)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, value]) =>
+              buildCodexServerOverride(serverName, ['env', key], value),
+            ),
+        )
       }
       if (AUTO_APPROVE_DYNAMIC_MCP_SERVERS.has(serverName)) {
         overrides.push(
           buildCodexServerOverride(
             serverName,
-            'default_tools_approval_mode',
+            ['default_tools_approval_mode'],
             'approve',
           ),
         )

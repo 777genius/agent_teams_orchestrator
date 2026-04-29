@@ -243,6 +243,19 @@ function shouldUseEphemeralCodexNativeThread(
   return env.CLAUDE_CODE_CODEX_NATIVE_PERSIST_THREADS !== '1'
 }
 
+function resolveCodexNativeDisabledFeatures(params: {
+  apiKey: string | null | undefined
+  forcedLoginMethod: ReturnType<typeof getCodexForcedLoginMethod> | undefined
+}): string[] {
+  if (!params.apiKey || params.forcedLoginMethod === 'chatgpt') {
+    return []
+  }
+
+  // Codex API-key auth cannot sync ChatGPT remote plugins. Keep user config and
+  // MCP overrides intact, but disable the unsupported plugin subsystem.
+  return ['plugins']
+}
+
 async function persistMessages(
   messages: Message[],
   persistSession: boolean,
@@ -411,6 +424,8 @@ export async function* executeCodexNativeTurn(
     const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
       resolvedPrompt.text,
     )
+    const apiKey = getCodexNativeApiKey() ?? undefined
+    const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
     const iterator = runExec({
       prompt: resolvedPrompt.text,
       cwd: params.cwd,
@@ -422,9 +437,13 @@ export async function* executeCodexNativeTurn(
       sandboxMode: mapPermissionModeToSandboxMode(params.permissionMode),
       additionalWritableDirectories: params.additionalWritableDirectories,
       ephemeral: shouldUseEphemeralCodexNativeThread(),
-      apiKey: getCodexNativeApiKey() ?? undefined,
-      forcedLoginMethod: getCodexForcedLoginMethod() ?? undefined,
+      apiKey,
+      forcedLoginMethod,
       configOverrides: buildCodexNativeMcpConfigOverrides(),
+      disabledFeatures: resolveCodexNativeDisabledFeatures({
+        apiKey,
+        forcedLoginMethod,
+      }),
       abortSignal: params.abortSignal,
       idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
       absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,

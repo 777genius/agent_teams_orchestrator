@@ -42,7 +42,7 @@ export type CodexNativeNormalizedEvent =
     }
   | {
       type: 'warning'
-      source: 'stderr'
+      source: 'stderr' | 'codex'
       text: string
     }
   | {

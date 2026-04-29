@@ -26,9 +26,36 @@ describe('buildCodexNativeMcpConfigOverrides', () => {
     expect(overrides).toEqual([
       'mcp_servers.agent-teams.command="/usr/local/bin/node"',
       'mcp_servers.agent-teams.args=["/tmp/agent-teams/index.js"]',
-      'mcp_servers.agent-teams.env={"TEAMS_ENV":"1"}',
+      'mcp_servers.agent-teams.env.TEAMS_ENV="1"',
       'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
     ])
+  })
+
+  test('bridges MCP env vars as nested TOML keys instead of JSON strings', () => {
+    const overrides = buildCodexNativeMcpConfigOverrides({
+      mcpConfigEntries: [
+        JSON.stringify({
+          mcpServers: {
+            'agent-teams': {
+              command: '/usr/local/bin/node',
+              args: ['/tmp/agent-teams/index.js'],
+              env: {
+                AGENT_TEAMS_MCP_CLAUDE_DIR: '/tmp/app/.claude',
+                'AGENT-TEAMS-MODE': 'test',
+              },
+            },
+          },
+        }),
+      ],
+    })
+
+    expect(overrides).toContain(
+      'mcp_servers.agent-teams.env.AGENT_TEAMS_MCP_CLAUDE_DIR="/tmp/app/.claude"',
+    )
+    expect(overrides).toContain(
+      'mcp_servers.agent-teams.env.AGENT-TEAMS-MODE="test"',
+    )
+    expect(overrides.some(override => override.includes('env={'))).toBe(false)
   })
 
   test('parses file-based dynamic MCP config entries', async () => {

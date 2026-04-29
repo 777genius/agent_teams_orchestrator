@@ -46,12 +46,26 @@ type CodexTurnCompletedEvent = {
   }
 }
 
+type CodexErrorEvent = {
+  type?: 'error'
+  message?: string
+}
+
+type CodexTurnFailedEvent = {
+  type?: 'turn.failed'
+  error?: {
+    message?: string
+  }
+}
+
 type CodexExecJsonEvent =
   | CodexThreadStartedEvent
   | CodexTurnStartedEvent
   | CodexItemStartedEvent
   | CodexItemCompletedEvent
   | CodexTurnCompletedEvent
+  | CodexErrorEvent
+  | CodexTurnFailedEvent
   | {
       type?: string
       [key: string]: unknown
@@ -199,6 +213,35 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
         type: 'turn_completed',
       },
     ]
+  }
+
+  if (event.type === 'error' && typeof event.message === 'string') {
+    const message = event.message.trim()
+    if (message.length > 0) {
+      return [
+        {
+          type: 'warning',
+          source: 'codex',
+          text: `Codex native error: ${message}`,
+        },
+      ]
+    }
+  }
+
+  if (
+    event.type === 'turn.failed' &&
+    typeof event.error?.message === 'string'
+  ) {
+    const message = event.error.message.trim()
+    if (message.length > 0) {
+      return [
+        {
+          type: 'warning',
+          source: 'codex',
+          text: `Codex native turn failed: ${message}`,
+        },
+      ]
+    }
   }
 
   if (event.type === 'item.started' || event.type === 'item.completed') {
