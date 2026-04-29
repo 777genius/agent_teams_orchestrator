@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -583,6 +583,59 @@ async function insertBinaryLargeMetadataToolparts(dbPath: string, workspaceRoot:
         oldString: 'large-before',
         newString: 'large-after',
         callID: 'call-bob-edit-large',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function replaceFixtureWithCaseCollidingApplyPatchToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    db.query("delete from part where id <> 'bob-user-part-1'").run()
+    db.query("delete from message where id <> 'bob-user-1'").run()
+    insertMessage(db, {
+      id: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_000,
+      data: messageData('bob-assistant-1', 'bob-user-1'),
+    })
+    insertPart(db, {
+      id: 'bob-apply-patch-case-collision',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_001,
+      data: applyPatchToolPart({
+        patch: [
+          '*** Begin Patch',
+          '*** Add File: 227/Foo.ts',
+          '+export const upper = true;',
+          '*** Add File: 227/foo.ts',
+          '+export const lower = true;',
+          '*** End Patch',
+        ].join('\n'),
+        callID: 'call-bob-apply-patch-case-collision',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertSymlinkEditToolpart(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-edit-symlink',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_031,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'link.ts'),
+        oldString: 'target = false',
+        newString: 'target = true',
+        callID: 'call-bob-edit-symlink',
       }),
     })
   } finally {
@@ -1513,6 +1566,92 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     )
     expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
     expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command fails closed on case-colliding OpenCode paths and writes no ledger artifacts', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-case-collision')
+    const projectDir = path.join(tempDir, 'claude-project-cli-case-collision')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await replaceFixtureWithCaseCollidingApplyPatchToolpart(dbPath)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        candidateEvents: number
+        importedEvents: number
+        skippedEvents: number
+        diagnostics: string[]
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'unsafe-input',
+      candidateEvents: 2,
+      importedEvents: 0,
+      skippedEvents: 2,
+    })
+    expect(stdout.result.diagnostics).toContain('OpenCode evidence skipped 1 case-colliding path group(s).')
+    expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
+    expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  const symlinkFixtureTest = process.platform === 'win32' ? test.skip : test
+
+  symlinkFixtureTest('CLI command keeps symlink OpenCode changes visible as manual-only metadata', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-symlink')
+    const projectDir = path.join(tempDir, 'claude-project-cli-symlink')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSymlinkEditToolpart(dbPath, workspaceRoot)
+    await writeFile(path.join(workspaceRoot, '227', 'target.ts'), 'export const target = true;\n', 'utf8')
+    await symlink('target.ts', path.join(workspaceRoot, '227', 'link.ts'))
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number }
+    }
+    expect(stdout.result.outcome).toBe('imported')
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(5)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const symlinkEvent = events.find(event => event.sourcePartId === 'bob-edit-symlink')
+    expect(symlinkEvent).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/link.ts',
+      operation: 'modify',
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-path-symlink-unresolved',
+      },
+    })
+    expect(symlinkEvent?.warnings).toContain(
+      'OpenCode metadata-only capture found a symlink path; review is manual-only.',
+    )
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/link.ts')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+      contentAvailability: 'metadata-only',
+    })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
