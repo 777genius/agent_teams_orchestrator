@@ -8,12 +8,20 @@ import path from 'node:path'
 
 import { OpenCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
+import { buildManagedConfig } from './OpenCodeProfileManager.js'
+import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
+import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
 const liveTest = process.env.OPENCODE_LEDGER_LIVE_E2E === '1'
   ? test
   : test.skip
+const liveSnapshotBridgeTest =
+  process.env.OPENCODE_LEDGER_LIVE_E2E === '1' &&
+  process.env.OPENCODE_LEDGER_SNAPSHOT_PROBE === '1'
+    ? test
+    : test.skip
 
 const LIVE_MODEL = process.env.OPENCODE_LEDGER_LIVE_MODEL ?? 'opencode/big-pickle'
 const TEAM_NAME = 'live-opencode-ledger-smoke'
@@ -45,9 +53,9 @@ afterEach(async () => {
   }
 })
 
-function childEnv(): NodeJS.ProcessEnv {
+function childEnv(options: { snapshot?: boolean } = {}): NodeJS.ProcessEnv {
   const home = path.join(tempDir, 'home')
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: home,
     USERPROFILE: home,
@@ -58,6 +66,13 @@ function childEnv(): NodeJS.ProcessEnv {
     XDG_CACHE_HOME: path.join(tempDir, 'xdg-cache'),
     XDG_STATE_HOME: path.join(tempDir, 'xdg-state'),
   }
+  if (options.snapshot === true) {
+    const managedConfig = buildManagedConfig(null, { defaultModelId: LIVE_MODEL })
+    managedConfig.snapshot = true
+    env.OPENCODE_CONFIG_CONTENT = JSON.stringify(managedConfig)
+    env.OPENCODE_DISABLE_CLAUDE_CODE = '1'
+  }
+  return env
 }
 
 function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000) {
@@ -68,6 +83,16 @@ function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000
     timeout: timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
   })
+}
+
+function runGit(args: string[], cwd: string): void {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  })
+  expect(result.status, `git ${args.join(' ')}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0)
 }
 
 function parseDbPath(stdout: string): string {
@@ -228,6 +253,14 @@ async function readBundle(projectDir: string): Promise<Record<string, unknown>> 
   ) as Record<string, unknown>
 }
 
+async function readEvents(projectDir: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(
+    path.join(projectDir, '.board-task-changes', 'events', `${encodeURIComponent(TASK_ID)}.jsonl`),
+    'utf8',
+  )
+  return raw.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+}
+
 describe('OpenCode Ledger Bridge live e2e', () => {
   liveTest('imports real OpenCode file-changing toolparts into task changes', async () => {
     const version = runOpenCode(['--version'], childEnv(), 15_000)
@@ -304,5 +337,111 @@ describe('OpenCode Ledger Bridge live e2e', () => {
       relativePath: SMOKE_FILE,
     })
     expect((files[0]?.eventCount as number) ?? 0).toBeGreaterThanOrEqual(1)
+  }, 240_000)
+
+  liveSnapshotBridgeTest('imports real OpenCode snapshot evidence into full-text task changes', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-snapshot-bridge')
+    const projectDir = path.join(tempDir, 'claude-project-snapshot-bridge')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+    await writeFile(path.join(workspaceRoot, SMOKE_FILE), 'export const liveSmoke = 1;\n', 'utf8')
+    runGit(['add', SMOKE_FILE], workspaceRoot)
+    runGit(['commit', '-m', 'seed live snapshot bridge workspace'], workspaceRoot)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams snapshot ledger smoke test.`,
+      `Use the file edit or write tool, not shell.`,
+      `Change the existing ${SMOKE_FILE} file in the current workspace.`,
+      `The final content must be exactly: export const liveSmoke = 2;`,
+      `Do not create, delete, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    const toolpart = findLiveToolpart(dbPath, workspaceRoot)
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+
+    const offlineReader = new LiveOpenCodeOfflineSessionReader(dbPath)
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord({ sessionId: toolpart.sessionId, workspaceRoot })] },
+      offlineReader,
+      undefined,
+      undefined,
+      new OpenCodeSnapshotEvidenceProviderService(
+        new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+      ),
+    )
+    const result = await service.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBeGreaterThanOrEqual(1)
+    expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
+    expect(result.diagnostics.join('\n')).not.toContain('snapshot-gitdir-missing')
+    expect(result.diagnostics.join('\n')).not.toContain('snapshot-diff-read-failed')
+
+    const events = await readEvents(projectDir)
+    const snapshotEvent = events.find(event =>
+      event.relativePath === SMOKE_FILE &&
+      event.snapshotSource === 'opencode' &&
+      typeof event.snapshotId === 'string'
+    )
+    expect(snapshotEvent).toBeTruthy()
+    expect(snapshotEvent?.operation).toBe('modify')
+    expect(['opencode-snapshot', 'inverse-edit-chain', 'inverse-apply-patch-chain']).toContain(snapshotEvent?.evidenceProof)
+    expect((snapshotEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect((snapshotEvent?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readBundle(projectDir)
+    expect(bundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: TASK_ID,
+      totalFiles: 1,
+    })
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === SMOKE_FILE)).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (snapshotEvent?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (snapshotEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
   }, 240_000)
 })
