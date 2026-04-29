@@ -30,6 +30,10 @@ const TASK_DISPLAY_ID = 'live12345'
 const MEMBER_NAME = 'bob'
 const LANE_ID = `secondary:opencode:${MEMBER_NAME}`
 const SMOKE_FILE = 'live-opencode-ledger-smoke.ts'
+const MULTI_ALPHA_FILE = 'live-multi-alpha.ts'
+const MULTI_BETA_FILE = 'live-multi-beta.ts'
+const MULTI_GAMMA_FILE = 'live-multi-gamma.ts'
+const FALLBACK_FILE = 'live-metadata-fallback.ts'
 
 let tempDir = ''
 
@@ -128,6 +132,16 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
   parentUserMessageId: string
   partId: string
 } {
+  return findLiveToolpartForFiles(dbPath, workspaceRoot, [SMOKE_FILE])
+}
+
+function findLiveToolpartForFiles(dbPath: string, workspaceRoot: string, relativePaths: string[]): {
+  sessionId: string
+  assistantMessageId: string
+  parentUserMessageId: string
+  partId: string
+} {
+  const targetPaths = new Set(relativePaths.map(relativePath => path.join(workspaceRoot, relativePath)))
   const db = new Database(dbPath, { readonly: true })
   try {
     const rows = db.query(
@@ -150,10 +164,13 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
         : null
       const filePath = getString(input, 'filePath')
       const patch = getString(input, 'patch')
+      const resolvedFilePath = filePath
+        ? path.resolve(path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath))
+        : null
       const targetsSmokeFile =
-        filePath
-          ? path.resolve(filePath) === path.join(workspaceRoot, SMOKE_FILE)
-          : typeof patch === 'string' && patch.includes(SMOKE_FILE)
+        resolvedFilePath
+          ? targetPaths.has(resolvedFilePath) || relativePaths.includes(filePath ?? '')
+          : typeof patch === 'string' && relativePaths.some(relativePath => patch.includes(relativePath))
       if (!targetsSmokeFile) {
         continue
       }
@@ -176,7 +193,7 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
   } finally {
     db.close()
   }
-  throw new Error(`No live OpenCode write/edit/apply_patch toolpart found for ${SMOKE_FILE}.`)
+  throw new Error(`No live OpenCode write/edit/apply_patch toolpart found for ${relativePaths.join(', ')}.`)
 }
 
 function sessionRecord(input: {
@@ -261,6 +278,23 @@ async function readEvents(projectDir: string): Promise<Array<Record<string, unkn
   return raw.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
 }
 
+function liveSnapshotBridgeService(input: {
+  dbPath: string
+  sessionId: string
+  workspaceRoot: string
+}): OpenCodeLedgerBridgeService {
+  const offlineReader = new LiveOpenCodeOfflineSessionReader(input.dbPath)
+  return new OpenCodeLedgerBridgeService(
+    { list: async () => [sessionRecord({ sessionId: input.sessionId, workspaceRoot: input.workspaceRoot })] },
+    offlineReader,
+    undefined,
+    undefined,
+    new OpenCodeSnapshotEvidenceProviderService(
+      new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+    ),
+  )
+}
+
 describe('OpenCode Ledger Bridge live e2e', () => {
   liveTest('imports real OpenCode file-changing toolparts into task changes', async () => {
     const version = runOpenCode(['--version'], childEnv(), 15_000)
@@ -272,6 +306,7 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     await mkdir(workspaceRootPath, { recursive: true })
     await mkdir(projectDir, { recursive: true })
     const workspaceRoot = await realpath(workspaceRootPath)
+    const smokePath = path.join(workspaceRoot, SMOKE_FILE)
 
     const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
     expect(dbPathResult.status).toBe(0)
@@ -279,10 +314,10 @@ describe('OpenCode Ledger Bridge live e2e', () => {
 
     const prompt = [
       `You are running a live Agent Teams ledger smoke test.`,
-      `Use the file write/edit tool, not shell.`,
-      `Create ${SMOKE_FILE} in the current workspace with exactly: export const liveSmoke = 1;`,
-      `Then edit ${SMOKE_FILE} so the content is exactly: export const liveSmoke = 2;`,
-      `Do not create any other files.`,
+      `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+      `Write this exact absolute file path: ${smokePath}`,
+      `The write tool content must be exactly: export const liveSmoke = 2;`,
+      `Do not create, delete, inspect, or modify any other files.`,
       `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
     ].join('\n')
 
@@ -301,6 +336,30 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
 
     const toolpart = findLiveToolpart(dbPath, workspaceRoot)
+    const wrongProjectDir = path.join(tempDir, 'claude-project-wrong-delivery')
+    await mkdir(wrongProjectDir, { recursive: true })
+    const wrongDeliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: `${toolpart.parentUserMessageId}-wrong`,
+    })
+    const wrongDeliveryService = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord({ sessionId: toolpart.sessionId, workspaceRoot })] },
+      new LiveOpenCodeOfflineSessionReader(dbPath),
+    )
+    const wrongDeliveryResult = await wrongDeliveryService.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir: wrongProjectDir,
+      workspaceRoot,
+      ...wrongDeliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+    expect(wrongDeliveryResult.outcome).toBe('no-attribution')
+    expect(wrongDeliveryResult.importedEvents).toBe(0)
+
     const deliveryContext = await writeDeliveryContext({
       sessionId: toolpart.sessionId,
       parentUserMessageId: toolpart.parentUserMessageId,
@@ -443,5 +502,222 @@ describe('OpenCode Ledger Bridge live e2e', () => {
       latestBeforeHash: (snapshotEvent?.before as { sha256?: string } | undefined)?.sha256,
       latestAfterHash: (snapshotEvent?.after as { sha256?: string } | undefined)?.sha256,
     })
+  }, 240_000)
+
+  liveSnapshotBridgeTest('imports real multi-file OpenCode snapshot evidence into full-text task changes', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-snapshot-multi-file')
+    const projectDir = path.join(tempDir, 'claude-project-snapshot-multi-file')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+    await writeFile(path.join(workspaceRoot, MULTI_ALPHA_FILE), 'export const alpha = 1;\n', 'utf8')
+    await writeFile(path.join(workspaceRoot, MULTI_BETA_FILE), 'export const beta = 1;\n', 'utf8')
+    runGit(['add', MULTI_ALPHA_FILE, MULTI_BETA_FILE], workspaceRoot)
+    runGit(['commit', '-m', 'seed live multi-file snapshot workspace'], workspaceRoot)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams multi-file snapshot ledger smoke test.`,
+      `Use file write/edit tools, not shell.`,
+      `Change ${MULTI_ALPHA_FILE} so the final content is exactly: export const alpha = 2;`,
+      `Change ${MULTI_BETA_FILE} so the final content is exactly: export const beta = 2;`,
+      `Create ${MULTI_GAMMA_FILE} with exactly: export const gamma = 3;`,
+      `Do not create, delete, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    const toolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [
+      MULTI_ALPHA_FILE,
+      MULTI_BETA_FILE,
+      MULTI_GAMMA_FILE,
+    ])
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+
+    const service = liveSnapshotBridgeService({
+      dbPath,
+      sessionId: toolpart.sessionId,
+      workspaceRoot,
+    })
+    const result = await service.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
+    expect(result.importedEvents).toBeGreaterThanOrEqual(3)
+    const bundle = await readBundle(projectDir)
+    expect(bundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: TASK_ID,
+      totalFiles: 3,
+    })
+    const files = bundle.files as Array<Record<string, unknown>>
+    const byPath = new Map(files.map(file => [file.relativePath, file]))
+    for (const relativePath of [MULTI_ALPHA_FILE, MULTI_BETA_FILE, MULTI_GAMMA_FILE]) {
+      expect(byPath.get(relativePath)).toMatchObject({
+        reviewability: 'full-text',
+        contentAvailability: 'full-text',
+      })
+    }
+    expect(byPath.get(MULTI_ALPHA_FILE)).toMatchObject({ latestOperation: 'modify' })
+    expect(byPath.get(MULTI_BETA_FILE)).toMatchObject({ latestOperation: 'modify' })
+    expect(byPath.get(MULTI_GAMMA_FILE)).toMatchObject({ latestOperation: 'create' })
+
+    const eventCountAfterFirstImport = (await readEvents(projectDir)).length
+    const duplicateResult = await service.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+    expect(duplicateResult.outcome).toBe('duplicates-only')
+    expect(duplicateResult.importedEvents).toBe(0)
+    expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
+  }, 240_000)
+
+  liveTest('imports real non-snapshot OpenCode existing-file edits as visible manual-review changes', async () => {
+    const env = childEnv()
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-metadata-fallback')
+    const projectDir = path.join(tempDir, 'claude-project-metadata-fallback')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    const fallbackPath = path.join(workspaceRoot, FALLBACK_FILE)
+    await writeFile(fallbackPath, 'export const fallback = 1;\n', 'utf8')
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams metadata fallback smoke test.`,
+      `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+      `Overwrite this exact absolute file path: ${fallbackPath}`,
+      `The write tool content must be exactly: export const fallback = 2;`,
+      `Do not create, delete, inspect, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    const toolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [FALLBACK_FILE])
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord({ sessionId: toolpart.sessionId, workspaceRoot })] },
+      new LiveOpenCodeOfflineSessionReader(dbPath),
+    )
+    const result = await service.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBeGreaterThanOrEqual(1)
+    const bundle = await readBundle(projectDir)
+    expect(bundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: TASK_ID,
+      totalFiles: 1,
+    })
+    const files = bundle.files as Array<Record<string, unknown>>
+    const fallbackFile = files.find(file => file.relativePath === FALLBACK_FILE)
+    expect(fallbackFile).toMatchObject({
+      latestOperation: 'modify',
+      contentAvailability: 'hash-only',
+    })
+    expect(['metadata-only', 'partial-text']).toContain(fallbackFile?.reviewability)
+    expect((fallbackFile?.warnings as string[] | undefined)?.join('\n')).toContain('manual-only')
+    const events = await readEvents(projectDir)
+    const fallbackEvent = events.find(event => event.relativePath === FALLBACK_FILE)
+    expect(fallbackEvent).toMatchObject({
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+      },
+      afterState: {
+        exists: true,
+      },
+    })
+
+    const eventCountAfterFirstImport = events.length
+    const duplicateResult = await service.backfill({
+      teamName: TEAM_NAME,
+      taskId: TASK_ID,
+      taskDisplayId: TASK_DISPLAY_ID,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+    expect(duplicateResult.outcome).toBe('duplicates-only')
+    expect(duplicateResult.importedEvents).toBe(0)
+    expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
   }, 240_000)
 })
