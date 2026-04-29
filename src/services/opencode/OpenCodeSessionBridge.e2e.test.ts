@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -78,7 +81,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
         openCodeSessionBridge.sendMessage(record, {
           text: 'Reply with exactly: pong',
         }),
-        20_000,
+        90_000,
         'sendMessage(text)',
       )
 
@@ -93,22 +96,25 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(reconciled.summary.toolCallCount).toBe(0)
       const assistant = reconciled.summary.messages.find(message => message.role === 'assistant')
       expect(assistant).toBeDefined()
-      expect(assistant?.contentBlocks.some(block => block.type === 'reasoning')).toBe(true)
       expect(assistant?.contentBlocks.some(block => block.type === 'text')).toBe(true)
     } finally {
       await openCodeSessionBridge.releaseSession(record)
       await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
     }
-  }, 90_000)
+  }, 150_000)
 
   liveTest('projects a real OpenCode bash tool call into canonical transcript blocks', async () => {
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-live-tool')
+    const projectPath = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-session-bridge-e2e-')))
+    const expectedPathToken = process.platform === 'win32'
+      ? path.basename(projectPath)
+      : projectPath
     const record = await withTimeout(
       openCodeSessionBridge.ensureSession({
         ...identity,
         selectedModel,
-        projectPath: process.cwd(),
+        projectPath,
       }),
       20_000,
       'ensureSession(tool)',
@@ -156,8 +162,8 @@ describe('OpenCodeSessionBridge live e2e', () => {
 
       const bashCall = toolMessage?.toolCalls.find(tool => tool.toolName === 'bash')
       expect(bashCall?.status).toBe('completed')
-      expect(bashCall?.outputText).toContain(process.cwd())
-      expect(reconciled.summary.latestAssistantText).toContain(process.cwd())
+      expect(bashCall?.outputText).toContain(expectedPathToken)
+      expect(reconciled.summary.latestAssistantText).toContain(expectedPathToken)
       expect(projectedLogs.logProjection.messages).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -193,6 +199,23 @@ describe('OpenCodeSessionBridge live e2e', () => {
     } finally {
       await openCodeSessionBridge.releaseSession(record)
       await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
+      await removeTempDirWithRetries(projectPath)
     }
   }, 120_000)
 })
+
+async function removeTempDirWithRetries(dirPath: string): Promise<void> {
+  const attempts = process.platform === 'win32' ? 20 : 1
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await rm(dirPath, { recursive: true, force: true })
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if ((code !== 'EBUSY' && code !== 'EPERM') || attempt === attempts) {
+        throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+}

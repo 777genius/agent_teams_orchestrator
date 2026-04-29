@@ -118,6 +118,25 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
     ).toBe(false)
   })
 
+  it('accepts teammate display names when runtime ids include the team suffix', () => {
+    expect(
+      isBootstrapConfirmationMailboxMessage(
+        {
+          text: JSON.stringify({
+            type: 'idle_notification',
+            from: 'alice',
+            timestamp: '2026-04-08T12:00:00.000Z',
+            idleReason: 'available',
+          }),
+          timestamp: '2026-04-08T12:00:00.000Z',
+        },
+        'alice@live-team',
+        '2026-04-08T11:59:59.000Z',
+        'alice',
+      ),
+    ).toBe(true)
+  })
+
   it('respects bootstrapExpectedAfter boundary when provided', () => {
     const boundary = '2026-04-08T12:00:02.000Z'
 

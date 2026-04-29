@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
-import { spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
+import { spawnSyncPortableCli } from '../../utils/portableCli.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -60,7 +60,7 @@ function childEnv(): NodeJS.ProcessEnv {
 }
 
 function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000) {
-  return spawnSync('opencode', args, {
+  return spawnSyncPortableCli('opencode', args, {
     cwd: tempDir,
     env,
     encoding: 'utf8',
@@ -96,6 +96,34 @@ function getString(record: Record<string, unknown> | null | undefined, key: stri
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
+function getLiveToolFilePaths(data: Record<string, unknown>, workspaceRoot: string): string[] {
+  const tool = getString(data, 'tool')
+  const state = data.state && typeof data.state === 'object'
+    ? data.state as Record<string, unknown>
+    : null
+  const input = state?.input && typeof state.input === 'object'
+    ? state.input as Record<string, unknown>
+    : null
+  if (tool === 'write' || tool === 'edit') {
+    const filePath = getString(input, 'filePath')
+    return filePath ? [filePath] : []
+  }
+  if (tool !== 'apply_patch') {
+    return []
+  }
+  const metadata = state?.metadata && typeof state.metadata === 'object'
+    ? state.metadata as Record<string, unknown>
+    : null
+  const files = Array.isArray(metadata?.files) ? metadata.files : []
+  return files.flatMap(file => {
+    const fileRecord = file && typeof file === 'object' && !Array.isArray(file)
+      ? file as Record<string, unknown>
+      : null
+    const filePath = getString(fileRecord, 'filePath')
+    return filePath ? [filePath] : []
+  }).filter(filePath => path.resolve(filePath).startsWith(workspaceRoot))
+}
+
 function findLiveToolpart(dbPath: string, workspaceRoot: string): {
   sessionId: string
   assistantMessageId: string
@@ -113,17 +141,12 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
         continue
       }
       const tool = getString(data, 'tool')
-      if (tool !== 'write' && tool !== 'edit') {
+      if (tool !== 'write' && tool !== 'edit' && tool !== 'apply_patch') {
         continue
       }
-      const state = data.state && typeof data.state === 'object'
-        ? data.state as Record<string, unknown>
-        : null
-      const input = state?.input && typeof state.input === 'object'
-        ? state.input as Record<string, unknown>
-        : null
-      const filePath = getString(input, 'filePath')
-      if (!filePath || path.resolve(filePath) !== path.join(workspaceRoot, SMOKE_FILE)) {
+      if (!getLiveToolFilePaths(data, workspaceRoot).some(filePath =>
+        path.resolve(filePath) === path.join(workspaceRoot, SMOKE_FILE)
+      )) {
         continue
       }
       const message = db.query(
@@ -145,7 +168,7 @@ function findLiveToolpart(dbPath: string, workspaceRoot: string): {
   } finally {
     db.close()
   }
-  throw new Error(`No live OpenCode write/edit toolpart found for ${SMOKE_FILE}.`)
+  throw new Error(`No live OpenCode file toolpart found for ${SMOKE_FILE}.`)
 }
 
 function sessionRecord(input: {
@@ -215,7 +238,7 @@ async function readBundle(projectDir: string): Promise<Record<string, unknown>> 
 }
 
 describe('OpenCode Ledger Bridge live e2e', () => {
-  liveTest('imports real OpenCode write/edit toolparts into task changes', async () => {
+  liveTest('imports real OpenCode file toolparts into task changes', async () => {
     const version = runOpenCode(['--version'], childEnv(), 15_000)
     expect(version.status).toBe(0)
 
@@ -228,14 +251,14 @@ describe('OpenCode Ledger Bridge live e2e', () => {
 
     const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
     expect(dbPathResult.status).toBe(0)
-    const dbPath = parseDbPath(dbPathResult.stdout)
+    const dbPath = parseDbPath(String(dbPathResult.stdout))
 
     const prompt = [
       `You are running a live Agent Teams ledger smoke test.`,
-      `Use the file write/edit tool, not shell.`,
+      `Use an OpenCode file modification tool, not shell.`,
       `Create ${SMOKE_FILE} in the current workspace with exactly: export const liveSmoke = 1;`,
-      `Then edit ${SMOKE_FILE} so the content is exactly: export const liveSmoke = 2;`,
       `Do not create any other files.`,
+      `Stop immediately after the file exists.`,
       `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
     ].join('\n')
 

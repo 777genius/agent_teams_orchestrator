@@ -133,6 +133,41 @@ function toolPart(input: {
   )
 }
 
+function applyPatchPart(input: {
+  id: string
+  filePath: string
+  type: 'add' | 'update' | 'delete'
+  patch: string
+}): OpenCodeSqlitePartRow {
+  return partRow(
+    input.id,
+    'assistant-1',
+    {
+      type: 'tool',
+      tool: 'apply_patch',
+      callID: `call-${input.id}`,
+      state: {
+        status: 'completed',
+        input: {
+          patchText: input.patch,
+        },
+        metadata: {
+          files: [
+            {
+              filePath: input.filePath,
+              relativePath: path.relative(workspaceRoot, input.filePath),
+              type: input.type,
+              patch: input.patch,
+            },
+          ],
+        },
+        time: { end: 1000 },
+      },
+    },
+    1000,
+  )
+}
+
 function deliveryContext(overrides: Partial<{
   memberName: string
   laneId: string
@@ -212,6 +247,69 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       relativePath: 'src/new.ts',
     })
     expect(result.changes[0]?.afterContent).toBe('export const value = 1;\n')
+  })
+
+  test('reconstructs OpenCode apply_patch adds from patch metadata', () => {
+    const result = reconstruct([
+      applyPatchPart({
+        id: 'part-apply-patch-add',
+        filePath: path.join(workspaceRoot, 'src/from-patch.ts'),
+        type: 'add',
+        patch: [
+          'Index: /repo/src/from-patch.ts',
+          '===================================================================',
+          '--- /dev/null',
+          '+++ /repo/src/from-patch.ts',
+          '@@ -0,0 +1,1 @@',
+          '+export const fromPatch = true;',
+          '',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      sourceTool: 'write',
+      operation: 'create',
+      confidence: 'exact',
+      relativePath: 'src/from-patch.ts',
+      afterContent: 'export const fromPatch = true;\n',
+    })
+  })
+
+  test('imports OpenCode apply_patch updates as manual-review metadata without a baseline', () => {
+    const result = reconstruct([
+      applyPatchPart({
+        id: 'part-apply-patch-update',
+        filePath: path.join(workspaceRoot, 'src/existing.ts'),
+        type: 'update',
+        patch: [
+          'Index: /repo/src/existing.ts',
+          '===================================================================',
+          '--- /repo/src/existing.ts',
+          '+++ /repo/src/existing.ts',
+          '@@ -1,1 +1,1 @@',
+          '-export const value = 1;',
+          '+export const value = 2;',
+          '',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      sourceTool: 'edit',
+      operation: 'modify',
+      confidence: 'high',
+      relativePath: 'src/existing.ts',
+      oldString: 'export const value = 1;\n',
+      newString: 'export const value = 2;\n',
+      beforeContent: null,
+      afterContent: null,
+    })
+    expect(result.changes[0]?.warnings?.join('\n')).toContain('OpenCode apply_patch')
   })
 
   test('reconstructs exact edit only after a proven text baseline', () => {

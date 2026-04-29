@@ -289,6 +289,21 @@ function normalizeTeammateIdentity(name: string): string {
   return sanitizeAgentName(name).trim().toLowerCase()
 }
 
+function buildBootstrapConfirmationIdentitySet(
+  identities: Array<string | null | undefined>,
+): Set<string> {
+  const result = new Set<string>()
+  for (const identity of identities) {
+    const trimmed = identity?.trim()
+    if (!trimmed) {
+      continue
+    }
+    result.add(trimmed.toLowerCase())
+    result.add(normalizeTeammateIdentity(trimmed))
+  }
+  return result
+}
+
 function buildTeammateSpawnReservationKey(
   teamName: string,
   name: string,
@@ -324,6 +339,7 @@ export function isBootstrapConfirmationMailboxMessage(
   message: Pick<TeammateMessage, 'text' | 'timestamp'>,
   teammateId: string,
   bootstrapExpectedAfter?: string | null,
+  teammateName?: string | null,
 ): boolean {
   const classified = classifyIdleNotification(message.text)
   if (!classified) {
@@ -352,8 +368,19 @@ export function isBootstrapConfirmationMailboxMessage(
     }
   }
 
+  const confirmationFrom = classified.payload.from?.trim()
+  if (!confirmationFrom) {
+    return false
+  }
+  const allowedIdentities = buildBootstrapConfirmationIdentitySet([
+    teammateId,
+    teammateName,
+  ])
+  const normalizedConfirmationFrom = normalizeTeammateIdentity(confirmationFrom)
+
   return (
-    classified.payload.from === teammateId &&
+    (allowedIdentities.has(confirmationFrom.toLowerCase()) ||
+      allowedIdentities.has(normalizedConfirmationFrom)) &&
     classified.countsAsBootstrapConfirmation
   )
 }
@@ -391,6 +418,7 @@ export async function hasBootstrapConfirmation(
   teamName: string,
   teammateId: string,
   bootstrapExpectedAfter?: string | null,
+  teammateName?: string | null,
 ): Promise<boolean> {
   const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
   return leaderMessages.some(message =>
@@ -398,6 +426,7 @@ export async function hasBootstrapConfirmation(
       message,
       teammateId,
       bootstrapExpectedAfter,
+      teammateName,
     ),
   )
 }
@@ -599,6 +628,7 @@ async function resolveExistingTeammateState(
       teamName,
       inProcessTask.identity.agentId,
       bootstrapExpectedAfter,
+      canonicalName,
     )
     return {
       decision: bootstrapConfirmed
@@ -639,6 +669,7 @@ async function resolveExistingTeammateState(
         teamName,
         teammateId,
         bootstrapExpectedAfter,
+        teammate.name || canonicalName,
       )
       return {
         decision: bootstrapConfirmed
@@ -711,6 +742,7 @@ async function resolveExistingTeammateState(
     teamName,
     existingMember.agentId || canonicalAgentId,
     existingMember.bootstrapExpectedAfter ?? null,
+    existingMember.name || canonicalName,
   )
   return {
     decision: bootstrapConfirmed
@@ -1904,7 +1936,7 @@ async function handleSpawnNativeProcess(
           },
         }),
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
 
@@ -1914,8 +1946,15 @@ async function handleSpawnNativeProcess(
 
     const runtimePid = child.pid
     const processPaneId = buildProcessBackendPaneId(runtimePid)
+    child.stdin?.on('error', error => {
+      logForDebugging(
+        `[handleSpawnNativeProcess] stdin pipe failed for ${teammateId}: ${error.message}`,
+        { level: 'warn' },
+      )
+    })
     child.stdout?.pipe(stdoutLog)
     child.stderr?.pipe(stderrLog)
+    ;(child.stdin as { unref?: () => void } | null)?.unref?.()
     ;(child.stdout as { unref?: () => void } | null)?.unref?.()
     ;(child.stderr as { unref?: () => void } | null)?.unref?.()
     child.once('close', (code, signal) => {

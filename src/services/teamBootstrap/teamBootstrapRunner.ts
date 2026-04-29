@@ -354,6 +354,7 @@ async function waitForRequiredBootstrapConfirmations(params: {
           params.request.teamName,
           pendingMember.agentId,
           pendingMember.bootstrapExpectedAfter,
+          memberName,
         )
       ) {
         pending.delete(memberName)

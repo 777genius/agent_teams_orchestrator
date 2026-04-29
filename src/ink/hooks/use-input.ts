@@ -40,7 +40,12 @@ type Options = {
  * ```
  */
 const useInput = (inputHandler: Handler, options: Options = {}) => {
-  const { setRawMode, internal_exitOnCtrlC, internal_eventEmitter } = useStdin()
+  const {
+    setRawMode,
+    isRawModeSupported,
+    internal_exitOnCtrlC,
+    internal_eventEmitter,
+  } = useStdin()
 
   // useLayoutEffect (not useEffect) so that raw mode is enabled synchronously
   // during React's commit phase, before render() returns. With useEffect, raw
@@ -52,12 +57,19 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
       return
     }
 
+    const supportsHeadlessPipedInput =
+      !isRawModeSupported &&
+      process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless'
+    if (!isRawModeSupported && !supportsHeadlessPipedInput) {
+      return
+    }
+
     setRawMode(true)
 
     return () => {
       setRawMode(false)
     }
-  }, [options.isActive, setRawMode])
+  }, [isRawModeSupported, options.isActive, setRawMode])
 
   // Register the listener once on mount so its slot in the EventEmitter's
   // listener array is stable. If isActive were in the effect's deps, the

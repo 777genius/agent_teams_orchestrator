@@ -141,11 +141,13 @@ async function writeLeaderConfirmation() {
     messages = Array.isArray(parsed) ? parsed : []
   } catch {}
   const now = new Date().toISOString()
+  const confirmationFrom =
+    mode === 'member-name-confirmation' ? agentName : agentId
   messages.push({
-    from: agentId,
+    from: confirmationFrom,
     text: JSON.stringify({
       type: 'idle_notification',
-      from: agentId,
+      from: confirmationFrom,
       timestamp: now,
       idleReason: 'available',
     }),
@@ -186,6 +188,15 @@ try {
     console.error('pipe flood stderr end')
   }
 
+  if (mode === 'stdin-sensitive') {
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('end', async () => {
+      await writeEvent('failed', 'stdin ended')
+      process.exit(77)
+    })
+    process.stdin.resume()
+  }
+
   let child
   if (mode === 'hold-child') {
     child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
@@ -210,6 +221,11 @@ try {
   await writeEvent('bootstrap_confirmed', 'leader idle notification written')
   if (mode === 'hold-child') {
     await writeEvent('heartbeat', 'holding parent open')
+    await sleep(60_000)
+    process.exit(0)
+  }
+  if (mode === 'stdin-sensitive') {
+    await writeEvent('heartbeat', 'stdin pipe held open')
     await sleep(60_000)
     process.exit(0)
   }
@@ -269,8 +285,11 @@ afterEach(async () => {
 })
 
 describe('supervised process teammate backend e2e', () => {
-  it('launches a headless child process, waits readiness, captures logs, and completes only after bootstrap confirmation', async () => {
-    const fixture = await createFixture({ trusted: true })
+  it('launches a headless child process and accepts member-name bootstrap confirmation', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'member-name-confirmation',
+    })
     const spawnResults: Array<{ backendType?: string; agentId?: string }> = []
     const completed: Array<{
       status: string
@@ -507,6 +526,43 @@ describe('supervised process teammate backend e2e', () => {
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
+  it('keeps stdin open so headless non-TTY teammate runtimes stay alive after bootstrap', async () => {
+    const fixture = await createFixture({ trusted: true, mode: 'stdin-sensitive' })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    const runtimePid = result.data.runtime_pid!
+    runtimePids.push(runtimePid)
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      ['runtime_ready', 'bootstrap_submitted', 'bootstrap_confirmed', 'heartbeat'],
+      10_000,
+    )
+    expect(events.find(event => event.type === 'failed')?.detail).not.toBe(
+      'stdin ended',
+    )
+    expect(isProcessAlive(runtimePid)).toBe(true)
+
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+    expect(isProcessAlive(runtimePid)).toBe(true)
+
+    killProcessTree(runtimePid, 'SIGTERM')
+    await waitForCondition(() => !isProcessAlive(runtimePid), 7_500)
+    runtimePids = runtimePids.filter(pid => pid !== runtimePid)
+  })
+
   it('fails preflight before spawn when the target cwd disappeared', async () => {
     const fixture = await createFixture({ trusted: true })
     await rm(fixture.projectRealpath, { recursive: true, force: true })
@@ -595,7 +651,13 @@ function restoreEnv(snapshot: EnvSnapshot): void {
 
 async function createFixture(options: {
   trusted: boolean
-  mode?: 'success' | 'exit-before-ready' | 'pipe-flood' | 'hold-child'
+  mode?:
+    | 'success'
+    | 'exit-before-ready'
+    | 'pipe-flood'
+    | 'hold-child'
+    | 'stdin-sensitive'
+    | 'member-name-confirmation'
 }): Promise<{
   teamName: string
   projectRealpath: string

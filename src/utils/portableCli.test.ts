@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -42,6 +42,46 @@ describe('portableCli Windows launcher resolution', () => {
           '  SET "_prog=node"',
           ')',
           'endLocal & "%_prog%" "%dp0%codex.js" %*',
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+
+      expect(resolveDirectWindowsLauncher(shimPath)).toEqual({
+        command: 'node',
+        argsPrefix: [scriptPath],
+      })
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('resolves extensionless npm node cmd shims to the underlying node script', async () => {
+    setPlatform('win32')
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'portable-cli-test-'))
+    try {
+      const scriptDir = path.join(tempDir, 'node_modules', 'opencode-ai', 'bin')
+      const scriptPath = path.join(scriptDir, 'opencode')
+      const shimPath = path.join(tempDir, 'opencode.cmd')
+      await mkdir(scriptDir, { recursive: true })
+      await writeFile(scriptPath, 'console.log("ok")\n', 'utf8')
+      await writeFile(
+        shimPath,
+        [
+          '@ECHO off',
+          'GOTO start',
+          ':find_dp0',
+          'SET dp0=%~dp0',
+          'EXIT /b',
+          ':start',
+          'SETLOCAL',
+          'CALL :find_dp0',
+          'IF EXIST "%dp0%\\node.exe" (',
+          '  SET "_prog=%dp0%\\node.exe"',
+          ') ELSE (',
+          '  SET "_prog=node"',
+          ')',
+          'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\opencode-ai\\bin\\opencode" %*',
           '',
         ].join('\n'),
         'utf8',
