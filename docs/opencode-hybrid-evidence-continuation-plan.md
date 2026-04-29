@@ -19,9 +19,9 @@ branch: feat/opencode-hybrid-evidence-ui-continuation
 Verified completion snapshot:
 
 ```text
-orchestrator targeted suite: 173 pass, 0 fail
+orchestrator targeted suite: 175 pass, 0 fail
 orchestrator build: bun run build:dev passed
-OpenCode fixture/public-runtime E2E: 15 pass, 0 fail
+OpenCode fixture/public-runtime E2E: 17 pass, 0 fail
 OpenCode live snapshot evidence E2E: 1 pass, 0 fail
 OpenCode live ledger bridge E2E: 6 pass, 0 fail, 98 expect calls
 Combined live snapshot bridge E2E: real OpenCode snapshot:true run -> strict delivery bridge -> full-text ledger bundle passed
@@ -45,6 +45,7 @@ Added public-runtime E2E for snapshot dry-run no-write behavior, idempotent dupl
 Expanded gated real OpenCode bridge E2E to cover strict-delivery fail-closed on wrong delivery ids, multi-file snapshot full-text import, duplicate-safe repeated backfill on live data, and non-snapshot existing-file fallback as visible manual-only changes.
 Expanded public runtime E2E to cover mismatched delivery context fail-closed with zero ledger artifacts, plus a gated live CLI test proving real OpenCode snapshot artifacts import through `cli-dev runtime opencode-ledger-backfill` from managed-profile storage.
 Expanded E2E again to cover real public-CLI create lifecycle from OpenCode write toolparts and public-runtime binary/large-file manual-only metadata behavior.
+Expanded public-runtime Changes E2E to cover workspace-root mismatch fail-closed behavior and snapshot-only formatter noise being excluded unless a strict delivery-matched toolpart proves the path.
 ```
 
 ## Executive Summary

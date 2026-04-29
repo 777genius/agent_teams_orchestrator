@@ -1482,6 +1482,39 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
+  test('CLI command fails closed when requested workspace root does not match stored session workspace', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-wrong-root')
+    const wrongWorkspaceRoot = path.join(tempDir, 'workspace-cli-wrong-root-other')
+    const projectDir = path.join(tempDir, 'claude-project-cli-wrong-root')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(wrongWorkspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({
+      projectDir,
+      workspaceRoot: wrongWorkspaceRoot,
+      deliveryContext,
+    })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; diagnostics: string[] }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'unsafe-input',
+      importedEvents: 0,
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'OpenCode ledger backfill skipped bob/session-bob because workspace identity was not trusted.',
+    )
+    expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
+    expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
   test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot')
     const projectDir = path.join(tempDir, 'claude-project-cli-snapshot')
@@ -1548,6 +1581,53 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       scannedSessions: 2,
     })
     expect(await readJsonlEvents(projectDir, 'task-1')).toHaveLength(events.length)
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command does not import snapshot-only formatter noise without a matching toolpart path', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot-noise')
+    const projectDir = path.join(tempDir, 'claude-project-cli-snapshot-noise')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+      includeUnattributedSnapshotFile: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        diagnostics: string[]
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 5,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.diagnostics.join('\n')).toContain(
+      'snapshot-path-not-touched: 227/formatter-only.js was present in snapshot diff but not in toolpart touched paths.',
+    )
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    expect(events.some(event => event.relativePath === '227/formatter-only.js')).toBe(false)
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.some(file => file.relativePath === '227/formatter-only.js')).toBe(false)
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI dry-run with snapshot evidence does not write ledger artifacts', async () => {
