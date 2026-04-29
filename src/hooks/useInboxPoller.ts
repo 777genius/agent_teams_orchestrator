@@ -44,6 +44,7 @@ import {
 } from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
+import { writeTeammateRuntimeEvent } from '../utils/swarm/teammateRuntimeEvents.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
 import {
@@ -1058,6 +1059,7 @@ export function useInboxPoller({
   )
   const terminal = useTerminalNotification()
   const pollInFlightRef = useRef(false)
+  const didWriteInboxPollerReadyRef = useRef(false)
   const bootstrapAttemptsRef = useRef<Map<string, BootstrapAttemptState>>(
     new Map(),
   )
@@ -2360,6 +2362,15 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId)
+        if (isTeammate()) {
+          void writeTeammateRuntimeEvent({
+            type: 'bootstrap_confirmed',
+            teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: sessionId,
+          })
+        }
 
         void (async () => {
           try {
@@ -2599,6 +2610,15 @@ export function useInboxPoller({
       }
 
       if (bootstrapPendingMessage?.messageId && submitted.userMessageUuid) {
+        if (isTeammate()) {
+          void writeTeammateRuntimeEvent({
+            type: 'bootstrap_submitted',
+            teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: sessionId,
+          })
+        }
         bootstrapAttemptsRef.current.set(bootstrapPendingMessage.messageId, {
           submitUserMessageUuid: submitted.userMessageUuid,
           submittedAt: Date.now(),
@@ -2671,9 +2691,22 @@ export function useInboxPoller({
     if (!enabled) return
     if (hasDoneInitialPollRef.current) return
     // Use store.getState() to avoid dependency on appState object
-    if (getAgentNameToPoll(store.getState())) {
+    const currentAppState = store.getState()
+    const agentName = getAgentNameToPoll(currentAppState)
+    if (agentName) {
       hasDoneInitialPollRef.current = true
-      void poll()
+      void poll().finally(() => {
+        if (!didWriteInboxPollerReadyRef.current && isTeammate()) {
+          didWriteInboxPollerReadyRef.current = true
+          void writeTeammateRuntimeEvent({
+            type: 'inbox_poller_ready',
+            teamName: currentAppState.teamContext?.teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: getSessionId(),
+          })
+        }
+      })
     }
     // Note: poll uses store.getState() (not appState) so it won't re-run on appState changes
     // The ref guard is a safety measure to ensure initial poll only happens once

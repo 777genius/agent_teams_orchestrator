@@ -4,6 +4,7 @@ import * as os from 'os'
 import * as path from 'path'
 
 import {
+  __setTeamBootstrapRunnerDepsForTests,
   assertBootstrapTimeoutBudget,
   assertBootstrapRuntimeWorkspace,
   deriveBootstrapTerminalStatus,
@@ -25,6 +26,7 @@ afterEach(async () => {
   } else {
     process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
   }
+  __setTeamBootstrapRunnerDepsForTests(null)
 })
 
 describe('team bootstrap partial-failure policy', () => {
@@ -221,6 +223,111 @@ describe('team bootstrap early-failure durability', () => {
     expect(rawState.phase).toBe('failed')
     expect(rawState.terminal?.status).toBe('failed')
     expect(rawState.terminal?.reason).toContain('boom')
+  })
+})
+
+describe('team bootstrap readiness contract', () => {
+  test('registered teammate without bootstrap confirmation fails instead of completed', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-ready-'))
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    const teamName = `team-${Date.now()}`
+    const agentId = `alice@${teamName}`
+    let completedEmitted = false
+    let failedReason = ''
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            {
+              name: 'alice',
+              agentId,
+              bootstrapExpectedAfter: '2026-04-29T00:00:00.000Z',
+            },
+          ],
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async () =>
+        ({
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name: 'alice',
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: 'process:1234',
+            backend_type: 'process',
+            runtime_pid: 1234,
+          },
+        }) as never,
+      teamCreateCall: async () => {},
+    })
+
+    const result = await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId: 'run-ready-1',
+        requestHash: 'hash-ready-1',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+          },
+        ],
+        bootstrapTimeoutMs: 500,
+        continueOnPartialFailure: false,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {
+          completedEmitted = true
+        },
+        failed: async reason => {
+          failedReason = reason
+        },
+      },
+    })
+
+    expect(result.ok).toBe(false)
+    expect(completedEmitted).toBe(false)
+    expect(failedReason).toContain('did not bootstrap-confirm')
   })
 })
 
