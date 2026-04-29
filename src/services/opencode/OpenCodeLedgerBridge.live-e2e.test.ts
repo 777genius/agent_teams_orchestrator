@@ -36,6 +36,7 @@ const MULTI_BETA_FILE = 'live-multi-beta.ts'
 const MULTI_GAMMA_FILE = 'live-multi-gamma.ts'
 const FALLBACK_FILE = 'live-metadata-fallback.ts'
 const LIVE_CLI_FILE = 'live-cli-runtime.ts'
+const LIVE_CLI_CREATE_FILE = 'live-cli-created.ts'
 
 let tempDir = ''
 
@@ -852,6 +853,103 @@ describe('OpenCode Ledger Bridge live e2e', () => {
       importedEvents: 0,
     })
     expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
+  }, 300_000)
+
+  liveSnapshotBridgeTest('public CLI imports real OpenCode creates as full-text task changes', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const workspaceRootPath = path.join(tempDir, 'workspace-live-cli-create')
+    const projectDir = path.join(tempDir, 'claude-project-live-cli-create')
+    await mkdir(workspaceRootPath, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const workspaceRoot = await realpath(workspaceRootPath)
+    runGit(['init'], workspaceRoot)
+    runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+    runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+    await writeFile(path.join(workspaceRoot, '.gitkeep'), '\n', 'utf8')
+    runGit(['add', '.gitkeep'], workspaceRoot)
+    runGit(['commit', '-m', 'seed live cli create workspace'], workspaceRoot)
+    const liveCreatePath = path.join(workspaceRoot, LIVE_CLI_CREATE_FILE)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    const prompt = [
+      `You are running a live Agent Teams CLI create ledger smoke test.`,
+      `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+      `Create this exact absolute file path: ${liveCreatePath}`,
+      `The write tool content must be exactly: export const cliCreated = 1;`,
+      `Do not create, delete, inspect, or modify any other files.`,
+      `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+    ].join('\n')
+
+    const run = runOpenCode([
+      'run',
+      '--pure',
+      '--dir',
+      workspaceRoot,
+      '--model',
+      LIVE_MODEL,
+      '--dangerously-skip-permissions',
+      '--format',
+      'json',
+      prompt,
+    ], env)
+    expect(run.status, `stdout:\n${run.stdout}\nstderr:\n${run.stderr}`).toBe(0)
+
+    const toolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [LIVE_CLI_CREATE_FILE])
+    const profileRootKey = 'live-cli-create-profile'
+    await materializeLiveManagedProfile({ dbPath, profileRootKey })
+    await writeLiveSessionStoreRecord({
+      profileRootKey,
+      sessionId: toolpart.sessionId,
+      workspaceRoot,
+    })
+    const deliveryContext = await writeDeliveryContext({
+      sessionId: toolpart.sessionId,
+      parentUserMessageId: toolpart.parentUserMessageId,
+    })
+    const cli = runCliBackfill({
+      env,
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+    })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        scannedSessions: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      scannedSessions: 1,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const bundle = await readBundle(projectDir)
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === LIVE_CLI_CREATE_FILE)).toMatchObject({
+      latestOperation: 'create',
+      createdInTask: true,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+    const events = await readEvents(projectDir)
+    const createEvent = events.find(event => event.relativePath === LIVE_CLI_CREATE_FILE)
+    expect(createEvent).toMatchObject({
+      operation: 'create',
+      beforeState: { exists: false },
+      afterState: { exists: true },
+    })
+    expect(['toolpart-chain', 'opencode-snapshot']).toContain(createEvent?.evidenceProof)
   }, 300_000)
 
   liveTest('imports real non-snapshot OpenCode existing-file edits as visible manual-review changes', async () => {

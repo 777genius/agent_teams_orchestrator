@@ -558,6 +558,38 @@ async function insertSnapshotApplyPatchDeleteToolpart(dbPath: string): Promise<v
   }
 }
 
+async function insertBinaryLargeMetadataToolparts(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-edit-binary',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_029,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'asset.bin'),
+        oldString: 'binary-before',
+        newString: 'binary-after',
+        callID: 'call-bob-edit-binary',
+      }),
+    })
+    insertPart(db, {
+      id: 'bob-edit-large',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_030,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'large.txt'),
+        oldString: 'large-before',
+        newString: 'large-after',
+        callID: 'call-bob-edit-large',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
 async function insertSnapshotWindowPartsOnly(dbPath: string, input: {
   fromSnapshot?: string
   toSnapshot?: string
@@ -1673,6 +1705,77 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       reviewability: 'full-text',
       contentAvailability: 'full-text',
       latestBeforeHash: (deleteEvent?.before as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command keeps binary and large OpenCode changes visible as manual-only metadata', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-binary-large')
+    const projectDir = path.join(tempDir, 'claude-project-cli-binary-large')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertBinaryLargeMetadataToolparts(dbPath, workspaceRoot)
+    await writeFile(path.join(workspaceRoot, '227', 'asset.bin'), Buffer.from([0, 1, 2, 3, 255]))
+    await writeFile(path.join(workspaceRoot, '227', 'large.txt'), 'x'.repeat(1024 * 1024 + 1), 'utf8')
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(2)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const binaryEvent = events.find(event => event.sourcePartId === 'bob-edit-binary')
+    const largeEvent = events.find(event => event.sourcePartId === 'bob-edit-large')
+    expect(binaryEvent).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/asset.bin',
+      operation: 'modify',
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-after-content-binary',
+      },
+    })
+    expect(largeEvent).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      relativePath: '227/large.txt',
+      operation: 'modify',
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+      afterState: {
+        exists: true,
+        unavailableReason: 'opencode-after-content-too-large',
+      },
+    })
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/asset.bin')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
+    })
+    expect(files.find(file => file.relativePath === '227/large.txt')).toMatchObject({
+      latestOperation: 'modify',
+      reviewability: 'metadata-only',
+      contentAvailability: 'metadata-only',
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
