@@ -24,12 +24,13 @@ permissions:
 
 jobs:
   task-change-ledger:
+    if: github.event_name != 'pull_request'
     name: Task change ledger (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - name: Checkout
