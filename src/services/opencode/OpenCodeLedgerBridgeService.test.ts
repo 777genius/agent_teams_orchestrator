@@ -352,37 +352,6 @@ describe('OpenCodeLedgerBridgeService', () => {
     })
   })
 
-  test('ignores direct legacy evidenceMode input and keeps the default snapshot path', async () => {
-    const seenParams: Array<Parameters<OpenCodeChangeEvidenceEnricher['enrich']>[0]> = []
-    const evidenceEnricher = {
-      async enrich(params: Parameters<OpenCodeChangeEvidenceEnricher['enrich']>[0]) {
-        seenParams.push(params)
-        return params.changes
-      },
-    } as OpenCodeChangeEvidenceEnricher
-    const service = new OpenCodeLedgerBridgeService(
-      { list: async () => [sessionRecord()] },
-      { readSession: async () => offlineFixture() },
-      new OpenCodeToolpartChangeReconstructor(),
-      evidenceEnricher,
-    )
-
-    const result = await service.backfill({
-      teamName: 'team-a',
-      taskId: 'task-1',
-      taskDisplayId: 'abc12345',
-      projectDir,
-      workspaceRoot,
-      attributionMode: 'strict-delivery',
-      evidenceMode: 'chain-only',
-      ...(await writeDeliveryContext()),
-    })
-
-    expect(result.evidenceMode).toBe('snapshot-auto')
-    expect(seenParams).toHaveLength(1)
-    expect(seenParams[0]).not.toHaveProperty('evidenceMode')
-  })
-
   test('counts duplicate OpenCode imports once without appending a second event', async () => {
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },

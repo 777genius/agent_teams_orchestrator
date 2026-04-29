@@ -77,7 +77,6 @@ type BackfillParams = {
   deliveryContextPath?: string
   deliveryContextHash?: string
   attributionMode?: OpenCodeLedgerAttributionMode
-  evidenceMode?: unknown
   dryRun?: boolean
 }
 

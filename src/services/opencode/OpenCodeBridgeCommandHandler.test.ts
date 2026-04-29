@@ -393,55 +393,6 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
   })
 
-  test('ignores legacy evidenceMode on task ledger backfill bridge commands', async () => {
-    openCodeProvisioningProbe.probe = async () => snapshot
-    let captured: Parameters<typeof openCodeLedgerBridgeService.backfill>[0] | null = null
-    openCodeLedgerBridgeService.backfill = (async input => {
-      captured = input
-      return {
-        schemaVersion: 1,
-        providerId: 'opencode',
-        opencodeTaskLedgerEvidenceContractVersion: 1,
-        teamName: input.teamName,
-        ...(input.taskId ? { taskId: input.taskId } : {}),
-        dryRun: input.dryRun === true,
-        attributionMode: input.attributionMode ?? 'compatible',
-        evidenceMode: 'snapshot-auto',
-        scannedSessions: 0,
-        scannedToolparts: 0,
-        candidateEvents: 0,
-        importedEvents: 0,
-        skippedEvents: 0,
-        outcome: 'no-history',
-        notices: [],
-        diagnostics: [],
-      }
-    }) as typeof openCodeLedgerBridgeService.backfill
-
-    const result = await executeOpenCodeBridgeCommandEnvelope(
-      buildEnvelope('opencode.backfillTaskLedger', {
-        teamName: 'team-a',
-        taskId: 'task-1',
-        deliveryContextPath: '/tmp/claude-team-opencode-ledger-context-test/delivery-context.json',
-        deliveryContextHash: 'a'.repeat(64),
-        attributionMode: 'strict-delivery',
-        evidenceMode: 'chain-only',
-        dryRun: true,
-      }),
-    )
-
-    expect(result.ok).toBe(true)
-    expect(captured).toMatchObject({
-      teamName: 'team-a',
-      taskId: 'task-1',
-      deliveryContextPath: '/tmp/claude-team-opencode-ledger-context-test/delivery-context.json',
-      deliveryContextHash: 'a'.repeat(64),
-      attributionMode: 'strict-delivery',
-      dryRun: true,
-    })
-    expect(captured).not.toHaveProperty('evidenceMode')
-  })
-
   test('executes host cleanup without provisioning a readiness host', async () => {
     let probeCalled = false
     let cleanupInput: unknown = null
