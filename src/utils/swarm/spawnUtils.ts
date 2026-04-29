@@ -168,6 +168,10 @@ const TEAMMATE_ENV_VARS = [
   // Desktop-managed teammate backend preference. Forward this so process-backed
   // teammates keep spawning their own teammates without requiring tmux.
   'CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES',
+  // App-managed runtime turn-settled spool. Codex native teammates emit durable
+  // turn completion events here so the desktop member-work-sync reconciler can
+  // react after a managed Codex turn stops.
+  'AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT',
   // CCR marker — teammates need this for CCR-aware code paths. Auth finds
   // its own way via /home/claude/.claude/remote/.oauth_token regardless;
   // the FD env var wouldn't help (pipe FDs don't cross tmux).
