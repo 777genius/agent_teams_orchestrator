@@ -152,6 +152,28 @@ function editToolPart(input: {
   }
 }
 
+function applyPatchToolPart(input: {
+  patch: string
+  status?: 'completed' | 'error'
+  callID: string
+}): Record<string, unknown> {
+  return {
+    type: 'tool',
+    tool: 'apply_patch',
+    callID: input.callID,
+    state: {
+      status: input.status ?? 'completed',
+      input: {
+        patch: input.patch,
+      },
+      metadata: {
+        truncated: false,
+      },
+      time: { end: 1_200 },
+    },
+  }
+}
+
 function snapshotStepPart(kind: 'step-start' | 'step-finish', snapshot: string): Record<string, unknown> {
   return {
     type: kind,
@@ -365,6 +387,7 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   includeUnattributedSnapshotFile?: boolean
   includeNewlinePathEdit?: boolean
   includeWriteOverwrite?: boolean
+  includeApplyPatchDelete?: boolean
 }): Promise<{ fromSnapshot: string; toSnapshot: string; gitDir: string }> {
   const profileDataDir = path.dirname(input.dbPath)
   const gitDir = path.join(profileDataDir, 'snapshot', SNAPSHOT_PROJECT_ID, hashFast(input.workspaceRoot))
@@ -388,6 +411,10 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
     await writeFile(path.join(input.workspaceRoot, '227', 'rewrite.js'), 'export const rewrite = 1;\n', 'utf8')
   }
+  if (input.includeApplyPatchDelete) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'delete-me.js'), 'export const remove = 1;\n', 'utf8')
+  }
   const fromSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
   await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
   await writeFile(path.join(input.workspaceRoot, '227', 'index.html'), '<main>v1</main>\n', 'utf8')
@@ -403,6 +430,9 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   }
   if (input.includeWriteOverwrite) {
     await writeFile(path.join(input.workspaceRoot, '227', 'rewrite.js'), 'export const rewrite = 2;\n', 'utf8')
+  }
+  if (input.includeApplyPatchDelete) {
+    await rm(path.join(input.workspaceRoot, '227', 'delete-me.js'))
   }
   const toSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
 
@@ -498,6 +528,29 @@ async function insertSnapshotWriteOverwriteToolpart(dbPath: string, workspaceRoo
         content: 'export const rewrite = 2;\n',
         exists: true,
         callID: 'call-bob-write-rewrite',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertSnapshotApplyPatchDeleteToolpart(dbPath: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-apply-patch-delete',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_028,
+      data: applyPatchToolPart({
+        patch: [
+          '*** Begin Patch',
+          '*** Delete File: 227/delete-me.js',
+          '-export const remove = 1;',
+          '*** End Patch',
+        ].join('\n'),
+        callID: 'call-bob-apply-patch-delete',
       }),
     })
   } finally {
@@ -670,6 +723,46 @@ function cliDevCommand(): { command: string; prefixArgs: string[] } {
     command: path.join(process.cwd(), 'cli-dev'),
     prefixArgs: [],
   }
+}
+
+function runCliBackfill(input: {
+  projectDir: string
+  workspaceRoot: string
+  deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
+  dryRun?: boolean
+}) {
+  const cliDev = cliDevCommand()
+  return spawnSync(
+    cliDev.command,
+    [
+      ...cliDev.prefixArgs,
+      'runtime',
+      'opencode-ledger-backfill',
+      '--json',
+      '--team',
+      'fixture-team',
+      '--task',
+      'task-1',
+      '--task-display-id',
+      'abc12345',
+      '--project-dir',
+      input.projectDir,
+      '--workspace-root',
+      input.workspaceRoot,
+      '--delivery-context',
+      input.deliveryContext.deliveryContextPath,
+      '--delivery-context-hash',
+      input.deliveryContext.deliveryContextHash,
+      '--attribution-mode',
+      'strict-delivery',
+      ...(input.dryRun === true ? ['--dry-run'] : []),
+    ],
+    {
+      cwd: process.cwd(),
+      env: childEnvForHome(homeDir),
+      encoding: 'utf8',
+    },
+  )
 }
 
 async function readJsonlEvents(projectDir: string, taskId: string): Promise<Array<Record<string, unknown>>> {
@@ -1127,6 +1220,69 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
   })
 
+  test('imports apply_patch delete as full-text when snapshot evidence proves the deleted content', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-apply-patch-delete')
+    const projectDir = path.join(tempDir, 'claude-project-apply-patch-delete')
+    const dataDir = path.join(tempDir, 'fixture-data-apply-patch-delete')
+    const deliveryContext = await createFixtureDeliveryContext()
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotApplyPatchDeleteToolpart(dbPath)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeApplyPatchDelete: true,
+    })
+    const sessionStore = await createFixtureSessionStore(dataDir, workspaceRoot)
+    const offlineReader = new FixtureOpenCodeOfflineSessionReader(dbPath)
+    const bridge = new OpenCodeLedgerBridgeService(
+      sessionStore,
+      offlineReader,
+      undefined,
+      undefined,
+      new OpenCodeSnapshotEvidenceProviderService(
+        new OpenCodeSnapshotGitStoreReader({ offlineSessionReader: offlineReader }),
+      ),
+    )
+
+    const result = await bridge.backfill({
+      teamName: 'fixture-team',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...deliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const deleteEvent = events.find(event => event.sourcePartId === 'bob-apply-patch-delete')
+    expect(deleteEvent).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      relativePath: '227/delete-me.js',
+      operation: 'delete',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotSource: 'opencode',
+      afterState: { exists: false },
+    })
+    expect(deleteEvent?.snapshotId).toBeTruthy()
+    expect((deleteEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    expect(deleteEvent?.after).toBeNull()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/delete-me.js')).toMatchObject({
+      latestOperation: 'delete',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (deleteEvent?.before as { sha256?: string } | undefined)?.sha256,
+    })
+  })
+
   test('CLI command recovers the same SQLite fixture through the public runtime entrypoint', async () => {
     const cliDev = cliDevCommand()
     const workspaceRoot = path.join(tempDir, 'workspace-cli')
@@ -1232,7 +1388,6 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
   test('CLI command imports source-driven snapshot evidence through the public runtime entrypoint', async () => {
-    const cliDev = cliDevCommand()
     const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot')
     const projectDir = path.join(tempDir, 'claude-project-cli-snapshot')
     const dataDir = envPathsDataDirForHome(homeDir)
@@ -1248,36 +1403,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     await createFixtureSessionStore(dataDir, workspaceRoot)
     const deliveryContext = await createFixtureDeliveryContext()
 
-    const cli = spawnSync(
-      cliDev.command,
-      [
-        ...cliDev.prefixArgs,
-        'runtime',
-        'opencode-ledger-backfill',
-        '--json',
-        '--team',
-        'fixture-team',
-        '--task',
-        'task-1',
-        '--task-display-id',
-        'abc12345',
-        '--project-dir',
-        projectDir,
-        '--workspace-root',
-        workspaceRoot,
-        '--delivery-context',
-        deliveryContext.deliveryContextPath,
-        '--delivery-context-hash',
-        deliveryContext.deliveryContextHash,
-        '--attribution-mode',
-        'strict-delivery',
-      ],
-      {
-        cwd: process.cwd(),
-        env: childEnvForHome(homeDir),
-        encoding: 'utf8',
-      },
-    )
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
 
     expect(cli.status).toBe(0)
     const stdout = JSON.parse(cli.stdout) as {
@@ -1314,6 +1440,176 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       contentAvailability: 'full-text',
       latestBeforeHash: (snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256,
       latestAfterHash: (snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256,
+    })
+
+    const duplicateCli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+    expect(duplicateCli.status, `stdout:\n${duplicateCli.stdout}\nstderr:\n${duplicateCli.stderr}`).toBe(0)
+    const duplicateStdout = JSON.parse(duplicateCli.stdout) as {
+      result: { outcome: string; importedEvents: number; scannedSessions: number }
+    }
+    expect(duplicateStdout.result).toMatchObject({
+      outcome: 'duplicates-only',
+      importedEvents: 0,
+      scannedSessions: 2,
+    })
+    expect(await readJsonlEvents(projectDir, 'task-1')).toHaveLength(events.length)
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI dry-run with snapshot evidence does not write ledger artifacts', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-snapshot-dry-run')
+    const projectDir = path.join(tempDir, 'claude-project-cli-snapshot-dry-run')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const dryRun = runCliBackfill({
+      projectDir,
+      workspaceRoot,
+      deliveryContext,
+      dryRun: true,
+    })
+
+    expect(dryRun.status, `stdout:\n${dryRun.stdout}\nstderr:\n${dryRun.stderr}`).toBe(0)
+    const stdout = JSON.parse(dryRun.stdout) as {
+      result: {
+        outcome: string
+        candidateEvents: number
+        importedEvents: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'manual-only',
+      candidateEvents: 5,
+      importedEvents: 0,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(await readTaskChangeBundle(projectDir, 'task-1').catch(() => null)).toBeNull()
+    expect(await readJsonlEvents(projectDir, 'task-1').catch(() => null)).toBeNull()
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command upgrades a previous metadata-only import to full-text snapshot evidence', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-upgrade')
+    const projectDir = path.join(tempDir, 'claude-project-cli-upgrade')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(path.join(workspaceRoot, '227'), { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+    await writeFile(path.join(workspaceRoot, '227', 'snapshot-only.js'), 'export const snapshot = 2;\n', 'utf8')
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const first = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+    expect(first.status, `stdout:\n${first.stdout}\nstderr:\n${first.stderr}`).toBe(0)
+    const firstEvents = await readJsonlEvents(projectDir, 'task-1')
+    const firstSnapshotOnly = firstEvents.find(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(firstSnapshotOnly).toMatchObject({
+      evidenceProof: 'metadata-only-fallback',
+      beforeState: {
+        exists: true,
+        unavailableReason: 'opencode-edit-baseline-not-captured',
+      },
+    })
+
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeSnapshotOnlyEdit: true,
+    })
+    const second = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+    expect(second.status, `stdout:\n${second.stdout}\nstderr:\n${second.stderr}`).toBe(0)
+    const secondStdout = JSON.parse(second.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(secondStdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(secondStdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+    const upgradedEvents = await readJsonlEvents(projectDir, 'task-1')
+    const snapshotOnlyEvents = upgradedEvents.filter(event => event.sourcePartId === 'bob-edit-snapshot-only')
+    expect(snapshotOnlyEvents).toHaveLength(2)
+    const upgradedSnapshotOnly = snapshotOnlyEvents.find(event => event.supersedesEventId)
+    expect(upgradedSnapshotOnly).toMatchObject({
+      evidenceProof: 'inverse-edit-chain',
+      snapshotSource: 'opencode',
+    })
+    expect(upgradedSnapshotOnly?.snapshotId).toBeTruthy()
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (upgradedSnapshotOnly?.before as { sha256?: string } | undefined)?.sha256,
+      latestAfterHash: (upgradedSnapshotOnly?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command imports apply_patch delete as full-text from snapshot evidence', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-apply-patch-delete')
+    const projectDir = path.join(tempDir, 'claude-project-cli-apply-patch-delete')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotApplyPatchDeleteToolpart(dbPath)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeApplyPatchDelete: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const deleteEvent = events.find(event => event.sourcePartId === 'bob-apply-patch-delete')
+    expect(deleteEvent).toMatchObject({
+      source: 'opencode_toolpart_apply_patch',
+      relativePath: '227/delete-me.js',
+      operation: 'delete',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotSource: 'opencode',
+      afterState: { exists: false },
+    })
+    expect(deleteEvent?.snapshotId).toBeTruthy()
+    expect((deleteEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/delete-me.js')).toMatchObject({
+      latestOperation: 'delete',
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestBeforeHash: (deleteEvent?.before as { sha256?: string } | undefined)?.sha256,
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
