@@ -898,6 +898,7 @@ export function shouldUseNativeProcessBackendForSpawn(options?: {
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
 async function probeNativeProcessTeammateSpawn(
   child: ChildProcess,
@@ -1935,6 +1936,7 @@ async function handleSpawnNativeProcess(
           provider,
           extraEnv: {
             ...worktreeEnv(worktreeInfo),
+            [TEAMMATE_RUNTIME_ENV]: 'headless',
             [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
               startupReadySentinel.filePath,
             [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,

@@ -55,6 +55,7 @@ const teamName = getArg('--team-name')
 const agentName = getArg('--agent-name')
 const agentId = getArg('--agent-id')
 const teammateRuntime = getArg('--teammate-runtime')
+const teammateRuntimeEnv = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME
 const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_PROCESS_FALLBACK_EXPECTED_PROMPT || ''
@@ -137,10 +138,17 @@ async function writeLeaderConfirmation() {
 }
 
 try {
-  await writeEvent('cli_started', 'teammateRuntime=' + teammateRuntime)
+  await writeEvent(
+    'cli_started',
+    'teammateRuntime=' + teammateRuntime + ';env=' + teammateRuntimeEnv,
+  )
   if (teammateRuntime !== 'headless') {
     await writeEvent('failed', 'missing headless runtime flag')
     process.exit(2)
+  }
+  if (teammateRuntimeEnv !== 'headless') {
+    await writeEvent('failed', 'missing headless runtime env')
+    process.exit(3)
   }
   await writeEvent('runtime_ready', 'headless runtime accepted')
   await waitForBootstrapPrompt()
@@ -326,6 +334,9 @@ describe('spawnTeammate process backend fallback routing', () => {
       expect(eventTypes).toContain('process_spawned')
       expect(eventTypes).toContain('runtime_ready')
       expect(eventTypes).toContain('bootstrap_submitted')
+      expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
+        'env=headless',
+      )
     },
     20000,
   )

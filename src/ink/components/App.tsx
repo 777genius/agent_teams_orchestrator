@@ -26,6 +26,12 @@ import { TerminalSizeContext } from './TerminalSizeContext.js';
 
 // Platforms that support Unix-style process suspension (SIGSTOP/SIGCONT)
 const SUPPORTS_SUSPEND = process.platform !== 'win32';
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
+
+function isHeadlessTeammateRuntime(): boolean {
+  return process.env[TEAMMATE_RUNTIME_ENV] === 'headless' ||
+    process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless';
+}
 
 // After this many milliseconds of stdin silence, the next chunk triggers
 // a terminal mode re-assert (mouse tracking). Catches tmux detach→attach,
@@ -211,7 +217,7 @@ export default class App extends PureComponent<Props, State> {
       stdin
     } = this.props;
     if (!this.isRawModeSupported()) {
-      if (process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless') {
+      if (isHeadlessTeammateRuntime()) {
         stdin.setEncoding('utf8');
         if (isEnabled) {
           if (this.rawModeEnabledCount === 0) {

@@ -70,6 +70,7 @@ const teamName = getArg('--team-name')
 const agentName = getArg('--agent-name')
 const agentId = getArg('--agent-id')
 const teammateRuntime = getArg('--teammate-runtime')
+const teammateRuntimeEnv = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME
 const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
@@ -161,7 +162,10 @@ try {
   if (markerPath) {
     await writeFile(markerPath, 'spawned:' + process.pid)
   }
-  await writeEvent('cli_started', 'teammateRuntime=' + teammateRuntime)
+  await writeEvent(
+    'cli_started',
+    'teammateRuntime=' + teammateRuntime + ';env=' + teammateRuntimeEnv,
+  )
 
   if (mode === 'exit-before-ready') {
     console.error('fatal fake crash before runtime_ready')
@@ -171,6 +175,10 @@ try {
   if (teammateRuntime !== 'headless') {
     await writeEvent('failed', 'missing headless teammate runtime flag')
     process.exit(2)
+  }
+  if (teammateRuntimeEnv !== 'headless') {
+    await writeEvent('failed', 'missing headless teammate runtime env')
+    process.exit(3)
   }
 
   console.log('fake stdout: ' + agentId + ' cwd=' + process.cwd())
@@ -414,6 +422,9 @@ describe('supervised process teammate backend e2e', () => {
     expect(
       events.find(event => event.type === 'cli_started')?.detail,
     ).toContain('teammateRuntime=headless')
+    expect(
+      events.find(event => event.type === 'cli_started')?.detail,
+    ).toContain('env=headless')
     expect(
       events.find(event => event.type === 'runtime_ready')?.pid,
     ).toBe(alice?.runtimePid)

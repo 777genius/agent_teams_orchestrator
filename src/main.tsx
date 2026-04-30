@@ -173,6 +173,8 @@ import { plural } from 'src/utils/stringUtils.js';
 import { writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
+
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('./utils/permissions/autoModeState.js') as typeof import('./utils/permissions/autoModeState.js') : null;
 
@@ -833,7 +835,7 @@ export async function main() {
   // Initialize entrypoint based on mode - needs to be set before any event is logged
   initializeEntrypoint(isNonInteractive);
   if (hasHeadlessTeammateRuntimeFlag) {
-    process.env.CLAUDE_CODE_ENTRYPOINT = 'team-headless';
+    process.env[TEAMMATE_RUNTIME_ENV] = 'headless';
   }
 
   // Determine client type

@@ -15,6 +15,13 @@ type Options = {
   isActive?: boolean
 }
 
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
+
+function isHeadlessTeammateRuntime(): boolean {
+  return process.env[TEAMMATE_RUNTIME_ENV] === 'headless' ||
+    process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless'
+}
+
 /**
  * This hook is used for handling user input.
  * It's a more convenient alternative to using `StdinContext` and listening to `data` events.
@@ -59,7 +66,7 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
 
     const supportsHeadlessPipedInput =
       !isRawModeSupported &&
-      process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless'
+      isHeadlessTeammateRuntime()
     if (!isRawModeSupported && !supportsHeadlessPipedInput) {
       return
     }
