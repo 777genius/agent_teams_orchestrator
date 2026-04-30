@@ -115,8 +115,8 @@ describe('anthropic runtime catalog', () => {
     expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
       displayName: 'Haiku 4.5',
       hidden: false,
-      supportedReasoningEfforts: ['low', 'medium', 'high'],
-      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
       supportsFastMode: false,
       source: 'anthropic-models-api',
     })
@@ -156,8 +156,8 @@ describe('anthropic runtime catalog', () => {
       source: 'static-fallback',
     })
     expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
-      supportedReasoningEfforts: ['low', 'medium', 'high'],
-      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
       source: 'static-fallback',
     })
   })
