@@ -933,7 +933,7 @@ export class OpenCodeHostManager {
         updatedAt: this.nowIso(),
         leases: {},
       },
-      { force: false },
+      { force: true },
     )
     await this.removePersistentHost(hostKey).catch(() => undefined)
     return true

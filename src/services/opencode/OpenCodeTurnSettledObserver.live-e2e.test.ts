@@ -101,6 +101,31 @@ async function readSingleSpoolEvent(spoolRoot: string): Promise<Record<string, u
   return JSON.parse(await readFile(path.join(spoolRoot, 'incoming', files[0] ?? ''), 'utf8'))
 }
 
+async function cleanupLiveSession(input: {
+  record?: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>>
+  identity: ReturnType<typeof buildUniqueIdentity>
+  reason: string
+}): Promise<void> {
+  if (tempDir) {
+    await openCodeHostManager.reconcilePersistentHosts({
+      mode: 'force',
+      reason: input.reason,
+      projectPath: tempDir,
+      staleAgeMs: 0,
+      leaseStaleAgeMs: 0,
+      preflightLeaseStaleAgeMs: 0,
+    }).catch(() => undefined)
+  }
+  if (input.record) {
+    await openCodeSessionBridge.releaseSession(input.record).catch(() => undefined)
+  }
+  await openCodeSessionStore.delete(
+    input.identity.teamId,
+    input.identity.laneId,
+    input.identity.memberName,
+  ).catch(() => undefined)
+}
+
 afterEach(async () => {
   if (tempDir) {
     await rm(tempDir, { recursive: true, force: true })
@@ -114,17 +139,19 @@ describe('OpenCode turn-settled observer live e2e', () => {
     const spoolRoot = path.join(tempDir, 'runtime-turn-settled')
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-turn-settled-live')
-    const record = await withTimeout(
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
+
+    try {
+      record = await withTimeout(
         openCodeSessionBridge.ensureSession({
           ...identity,
           selectedModel,
           projectPath: tempDir,
         }),
-      30_000,
-      'ensureSession',
-    )
+        30_000,
+        'ensureSession',
+      )
 
-    try {
       const prompted = await withTimeout(
         openCodeSessionBridge.promptAsyncWithTurnSettled(record, {
           text: 'Reply with exactly OK.',
@@ -174,19 +201,10 @@ describe('OpenCode turn-settled observer live e2e', () => {
       })
       expect(['success', 'error']).toContain(event.outcome)
     } finally {
-      await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.delete(
-        identity.teamId,
-        identity.laneId,
-        identity.memberName,
-      )
-      await openCodeHostManager.reconcilePersistentHosts({
-        mode: 'stale',
+      await cleanupLiveSession({
+        record,
+        identity,
         reason: 'turn_settled_live_e2e_cleanup',
-        projectPath: tempDir,
-        staleAgeMs: 0,
-        leaseStaleAgeMs: 0,
-        preflightLeaseStaleAgeMs: 0,
       })
     }
   }, 120_000)
@@ -195,17 +213,19 @@ describe('OpenCode turn-settled observer live e2e', () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-turn-settled-sequential-live-'))
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-turn-settled-sequential-live')
-    const record = await withTimeout(
-      openCodeSessionBridge.ensureSession({
-        ...identity,
-        selectedModel,
-        projectPath: tempDir,
-      }),
-      30_000,
-      'ensureSession(sequential)',
-    )
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
 
     try {
+      record = await withTimeout(
+        openCodeSessionBridge.ensureSession({
+          ...identity,
+          selectedModel,
+          projectPath: tempDir,
+        }),
+        30_000,
+        'ensureSession(sequential)',
+      )
+
       for (const label of ['first', 'second']) {
         const prompted = await withTimeout(
           openCodeSessionBridge.promptAsyncWithTurnSettled(record, {
@@ -258,19 +278,10 @@ describe('OpenCode turn-settled observer live e2e', () => {
         }
       }
     } finally {
-      await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.delete(
-        identity.teamId,
-        identity.laneId,
-        identity.memberName,
-      )
-      await openCodeHostManager.reconcilePersistentHosts({
-        mode: 'stale',
+      await cleanupLiveSession({
+        record,
+        identity,
         reason: 'turn_settled_sequential_live_e2e_cleanup',
-        projectPath: tempDir,
-        staleAgeMs: 0,
-        leaseStaleAgeMs: 0,
-        preflightLeaseStaleAgeMs: 0,
       })
     }
   }, 180_000)
@@ -283,17 +294,19 @@ describe('OpenCode turn-settled observer live e2e', () => {
       return
     }
     const identity = buildUniqueIdentity('opencode-turn-settled-tool-live')
-    const record = await withTimeout(
-      openCodeSessionBridge.ensureSession({
-        ...identity,
-        selectedModel,
-        projectPath: tempDir,
-      }),
-      30_000,
-      'ensureSession(tool)',
-    )
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
 
     try {
+      record = await withTimeout(
+        openCodeSessionBridge.ensureSession({
+          ...identity,
+          selectedModel,
+          projectPath: tempDir,
+        }),
+        30_000,
+        'ensureSession(tool)',
+      )
+
       let prompted: Awaited<ReturnType<typeof openCodeSessionBridge.promptAsyncWithTurnSettled>> | null = null
       let reconciled: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>> | null = null
       let previousToolCallCount = 0
@@ -349,19 +362,10 @@ describe('OpenCode turn-settled observer live e2e', () => {
         runtimePromptMessageId: prompted.runtimePromptMessageId,
       })
     } finally {
-      await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.delete(
-        identity.teamId,
-        identity.laneId,
-        identity.memberName,
-      )
-      await openCodeHostManager.reconcilePersistentHosts({
-        mode: 'stale',
+      await cleanupLiveSession({
+        record,
+        identity,
         reason: 'turn_settled_tool_live_e2e_cleanup',
-        projectPath: tempDir,
-        staleAgeMs: 0,
-        leaseStaleAgeMs: 0,
-        preflightLeaseStaleAgeMs: 0,
       })
     }
   }, 180_000)

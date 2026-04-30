@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
+import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -54,6 +58,32 @@ async function getLiveModel(): Promise<string> {
   return preferred
 }
 
+async function createTempProject(prefix: string): Promise<string> {
+  return mkdtemp(path.join(os.tmpdir(), `${prefix}-`))
+}
+
+async function cleanupLiveSession(input: {
+  projectPath: string
+  record?: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>>
+  identity: ReturnType<typeof buildUniqueIdentity>
+  reason: string
+}): Promise<void> {
+  await openCodeHostManager.reconcilePersistentHosts({
+    mode: 'force',
+    reason: input.reason,
+    projectPath: input.projectPath,
+    staleAgeMs: 0,
+    leaseStaleAgeMs: 0,
+    preflightLeaseStaleAgeMs: 0,
+  }).catch(() => undefined)
+  if (input.record) {
+    await openCodeSessionBridge.releaseSession(input.record).catch(() => undefined)
+  }
+  await openCodeSessionStore.delete(input.identity.teamId, input.identity.memberName)
+    .catch(() => undefined)
+  await rm(input.projectPath, { recursive: true, force: true }).catch(() => undefined)
+}
+
 const liveTest =
   process.env.OPENCODE_E2E === '1'
     ? test
@@ -63,17 +93,20 @@ describe('OpenCodeSessionBridge live e2e', () => {
   liveTest('reconciles a simple assistant reply against a real OpenCode host', async () => {
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-live-text')
-    const record = await withTimeout(
-      openCodeSessionBridge.ensureSession({
-        ...identity,
-        selectedModel,
-        projectPath: process.cwd(),
-      }),
-      20_000,
-      'ensureSession(text)',
-    )
+    const projectPath = await createTempProject('opencode-session-bridge-live-text')
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
 
     try {
+      record = await withTimeout(
+        openCodeSessionBridge.ensureSession({
+          ...identity,
+          selectedModel,
+          projectPath,
+        }),
+        20_000,
+        'ensureSession(text)',
+      )
+
       await withTimeout(
         openCodeSessionBridge.sendMessage(record, {
           text: 'Reply with exactly: pong',
@@ -96,25 +129,32 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(assistant?.contentBlocks.some(block => block.type === 'reasoning')).toBe(true)
       expect(assistant?.contentBlocks.some(block => block.type === 'text')).toBe(true)
     } finally {
-      await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.delete(identity.teamId, identity.memberName)
+      await cleanupLiveSession({
+        projectPath,
+        record,
+        identity,
+        reason: 'opencode_session_bridge_live_text_e2e_cleanup',
+      })
     }
   }, 90_000)
 
   liveTest('projects a real OpenCode bash tool call into canonical transcript blocks', async () => {
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-live-tool')
-    const record = await withTimeout(
-      openCodeSessionBridge.ensureSession({
-        ...identity,
-        selectedModel,
-        projectPath: process.cwd(),
-      }),
-      20_000,
-      'ensureSession(tool)',
-    )
+    const projectPath = await createTempProject('opencode-session-bridge-live-tool')
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
 
     try {
+      record = await withTimeout(
+        openCodeSessionBridge.ensureSession({
+          ...identity,
+          selectedModel,
+          projectPath,
+        }),
+        20_000,
+        'ensureSession(tool)',
+      )
+
       await withTimeout(
         openCodeSessionBridge.sendMessage(record, {
           text: 'Run pwd and then answer with the working directory only.',
@@ -156,8 +196,8 @@ describe('OpenCodeSessionBridge live e2e', () => {
 
       const bashCall = toolMessage?.toolCalls.find(tool => tool.toolName === 'bash')
       expect(bashCall?.status).toBe('completed')
-      expect(bashCall?.outputText).toContain(process.cwd())
-      expect(reconciled.summary.latestAssistantText).toContain(process.cwd())
+      expect(bashCall?.outputText).toContain(projectPath)
+      expect(reconciled.summary.latestAssistantText).toContain(projectPath)
       expect(projectedLogs.logProjection.messages).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -191,8 +231,12 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(projectedBashTool?.id).toBeTruthy()
       expect(projectedToolResult).toBeDefined()
     } finally {
-      await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.delete(identity.teamId, identity.memberName)
+      await cleanupLiveSession({
+        projectPath,
+        record,
+        identity,
+        reason: 'opencode_session_bridge_live_tool_e2e_cleanup',
+      })
     }
   }, 120_000)
 })
