@@ -49,6 +49,40 @@ import {
 } from './teamBootstrapRunner.js'
 
 const BOOTSTRAP_PROMPT = 'process backend e2e bootstrap prompt'
+const WINDOWS_PROCESS_CLEANUP_TIMEOUT_MS = 3_000
+const WINDOWS_TEMP_RM_ATTEMPTS = 10
+const WINDOWS_TEMP_RM_DELAY_MS = 100
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function waitForRuntimePidsToExit(pids: number[]): Promise<void> {
+  const deadline = Date.now() + WINDOWS_PROCESS_CLEANUP_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (pids.every(pid => !isProcessAlive(pid))) {
+      return
+    }
+    await sleep(WINDOWS_TEMP_RM_DELAY_MS)
+  }
+}
+
+async function removeTempDirWithRetry(dir: string): Promise<void> {
+  for (let attempt = 1; attempt <= WINDOWS_TEMP_RM_ATTEMPTS; attempt += 1) {
+    try {
+      await rm(dir, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (
+        attempt === WINDOWS_TEMP_RM_ATTEMPTS ||
+        (error as NodeJS.ErrnoException).code !== 'EBUSY'
+      ) {
+        throw error
+      }
+      await sleep(WINDOWS_TEMP_RM_DELAY_MS)
+    }
+  }
+}
 
 const FAKE_TEAMMATE_RUNTIME_SCRIPT = String.raw`
 import { spawn } from 'node:child_process'
@@ -272,14 +306,16 @@ beforeEach(() => {
 
 afterEach(async () => {
   __setTeamBootstrapRunnerDepsForTests(null)
+  const pidsToCleanup = [...runtimePids]
   for (const pid of runtimePids) {
     if (isProcessAlive(pid)) {
       killProcessTree(pid, 'SIGTERM')
     }
   }
+  await waitForRuntimePidsToExit(pidsToCleanup)
   runtimePids = []
   await Promise.all(
-    tempDirs.map(dir => rm(dir, { recursive: true, force: true })),
+    tempDirs.map(dir => removeTempDirWithRetry(dir)),
   )
   tempDirs = []
   restoreEnv(envSnapshot)

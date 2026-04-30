@@ -807,6 +807,77 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'noop' })
   })
 
+  test('lifecycle - bootstrap API error fails instead of retrying', () => {
+    const submitted = createUserMessage({
+      content: 'bootstrap handoff',
+      isMeta: true,
+      uuid: 'bootstrap-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Please run /login',
+      errorDetails: 'API Error: 401 invalid authentication credentials',
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+        },
+      }),
+    ).toEqual({
+      type: 'fail',
+      detail: 'API Error: 401 invalid authentication credentials',
+    })
+  })
+
+  test('lifecycle - transient bootstrap API error keeps cooldown retry behavior', () => {
+    const submitted = createUserMessage({
+      content: 'bootstrap handoff',
+      isMeta: true,
+      uuid: 'bootstrap-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'API Error: 502 upstream unavailable',
+      errorDetails: 'API Error: 502 upstream unavailable',
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown' })
+  })
+
   test('lifecycle - in-flight row without post-submit activity stays in processing', () => {
     const submitted = createUserMessage({
       content: 'bootstrap handoff',

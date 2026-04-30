@@ -421,6 +421,7 @@ type OrdinaryAttemptExecutionError = {
   type: 'api_error' | 'codex_native_timeout'
   detail: string
 }
+type BootstrapAttemptExecutionError = OrdinaryAttemptExecutionError
 type BootstrapToolDescriptor = Pick<
   Tool,
   'alwaysLoad' | 'isMcp' | 'name' | 'shouldDefer'
@@ -747,6 +748,81 @@ export function findOrdinaryAttemptExecutionError({
   return null
 }
 
+export function findBootstrapAttemptExecutionError({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): BootstrapAttemptExecutionError | null {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return null
+  }
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant' || message.isApiErrorMessage !== true) {
+      continue
+    }
+
+    const text = extractAssistantText(message)
+    const errorDetails =
+      'errorDetails' in message && typeof message.errorDetails === 'string'
+        ? message.errorDetails
+        : undefined
+    const detail = errorDetails || text
+
+    if (detail && isCodexNativeExecTimeoutText(detail)) {
+      return {
+        type: 'codex_native_timeout',
+        detail,
+      }
+    }
+
+    if (detail) {
+      return {
+        type: 'api_error',
+        detail,
+      }
+    }
+  }
+
+  return null
+}
+
+function isFatalBootstrapAttemptExecutionError(
+  error: BootstrapAttemptExecutionError,
+): boolean {
+  if (error.type === 'codex_native_timeout') {
+    return true
+  }
+
+  const detail = error.detail.toLowerCase()
+  return (
+    detail.includes('401') ||
+    detail.includes('403') ||
+    detail.includes('authentication_error') ||
+    detail.includes('invalid authentication') ||
+    detail.includes('please run /login') ||
+    detail.includes('unauthorized') ||
+    detail.includes('forbidden')
+  )
+}
+
 export function findOrdinaryDirectReplyFallback({
   messages,
   submitUserMessageUuid,
@@ -846,6 +922,7 @@ type BootstrapProcessingAction =
   | { type: 'reset_to_pending' }
   | { type: 'finalize' }
   | { type: 'schedule_cooldown' }
+  | { type: 'fail'; detail: string }
 type OrdinaryProcessingAction =
   | { type: 'noop' }
   | { type: 'reset_to_pending' }
@@ -888,6 +965,16 @@ export function getBootstrapProcessingAction({
 
   if (outcome !== 'none') {
     return { type: 'finalize' }
+  }
+
+  const executionError = findBootstrapAttemptExecutionError({
+    messages,
+    submitUserMessageUuid: attempt.submitUserMessageUuid,
+  })
+  if (executionError) {
+    if (isFatalBootstrapAttemptExecutionError(executionError)) {
+      return { type: 'fail', detail: executionError.detail }
+    }
   }
 
   if (attempt.status === 'in_flight') {
@@ -2395,6 +2482,63 @@ export function useInboxPoller({
           } catch (error) {
             logForDebugging(
               `[InboxPoller] Failed to finalize bootstrap row ${processingBootstrapMessage.messageId}: ${String(error)}`,
+            )
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingBootstrapMessage.id &&
+                  message.status === 'processing'
+                    ? { ...message, status: 'pending' as const }
+                    : message,
+                ),
+              },
+            }))
+          }
+        })()
+        return
+      }
+
+      if (processingAction.type === 'fail' && attempt) {
+        if (attempt.timer) {
+          clearTimeout(attempt.timer)
+        }
+        bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId)
+        const detail = `Bootstrap failed after teammate startup: ${processingAction.detail}`
+        if (isTeammate()) {
+          void writeTeammateRuntimeEvent({
+            type: 'failed',
+            teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: sessionId,
+            detail,
+          })
+        }
+
+        void (async () => {
+          try {
+            await finalizeClaimedMessagesAsRead(
+              agentName,
+              [processingBootstrapMessage.messageId!],
+              sessionId,
+              teamName,
+            )
+
+            const processingRowId = processingBootstrapMessage.id
+            setAppState(prev => ({
+              ...prev,
+              inbox: {
+                messages: prev.inbox.messages.map(message =>
+                  message.id === processingRowId
+                    ? { ...message, status: 'processed' as const }
+                    : message,
+                ),
+              },
+            }))
+          } catch (error) {
+            logForDebugging(
+              `[InboxPoller] Failed to finalize failed bootstrap row ${processingBootstrapMessage.messageId}: ${String(error)}`,
             )
             setAppState(prev => ({
               ...prev,

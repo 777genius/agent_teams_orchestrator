@@ -10,6 +10,7 @@ import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
 import { parseProcessBackendPid } from './spawnMultiAgent.js'
 import { resolveTeammateModel } from './spawnMultiAgent.js'
 import { shouldUseNativeProcessBackendForSpawn } from './spawnMultiAgent.js'
+import { shouldDetachNativeProcessBackend } from './spawnMultiAgent.js'
 import { spawnTeammate } from './spawnMultiAgent.js'
 
 afterEach(() => {
@@ -17,6 +18,12 @@ afterEach(() => {
 })
 
 describe('spawnMultiAgent bootstrap confirmation', () => {
+  it('keeps native process teammates attached to the parent console on Windows', () => {
+    expect(shouldDetachNativeProcessBackend('win32')).toBe(false)
+    expect(shouldDetachNativeProcessBackend('linux')).toBe(true)
+    expect(shouldDetachNativeProcessBackend('darwin')).toBe(true)
+  })
+
   it('counts heartbeat, peer-summary heartbeat, interrupted, and task-terminal idle as bootstrap confirmation', () => {
     expect(
       isBootstrapConfirmationMailboxMessage(

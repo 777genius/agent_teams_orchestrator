@@ -895,6 +895,12 @@ export function shouldUseNativeProcessBackendForSpawn(options?: {
   return isEnvTruthy(forceProcessTeammates) || options?.separateProcessRequired === true
 }
 
+export function shouldDetachNativeProcessBackend(
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform !== 'win32'
+}
+
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
@@ -1929,7 +1935,7 @@ async function handleSpawnNativeProcess(
 
     child = spawn(command, argv, {
       cwd: workingDir,
-      detached: true,
+      detached: shouldDetachNativeProcessBackend(),
       env: {
         ...process.env,
         ...buildInheritedEnvObject({

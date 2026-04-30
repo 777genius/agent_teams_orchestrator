@@ -21,6 +21,10 @@ import {
   unregisterTeamForSessionCleanup,
   updateTeamFileAsync,
 } from 'src/utils/swarm/teamHelpers.js'
+import {
+  getTeammateRuntimePaths,
+  readTeammateRuntimeEvents,
+} from 'src/utils/swarm/teammateRuntimeEvents.js'
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
 import { getBootstrapSpawnDelayMs } from './teamBootstrapSpawnSchedule.js'
@@ -317,13 +321,54 @@ function buildSummary(params: {
   }
 }
 
+async function readBootstrapRuntimeFailure(params: {
+  teamName: string
+  memberName: string
+  backendType?: string
+  runtimePid?: number
+  bootstrapExpectedAfter?: string | null
+}): Promise<string | null> {
+  if (params.backendType !== 'process' && typeof params.runtimePid !== 'number') {
+    return null
+  }
+
+  const boundaryMs = params.bootstrapExpectedAfter
+    ? Date.parse(params.bootstrapExpectedAfter)
+    : Number.NaN
+  const eventsPath = getTeammateRuntimePaths({
+    teamName: params.teamName,
+    agentName: params.memberName,
+  }).eventsPath
+  const events = await readTeammateRuntimeEvents(eventsPath)
+  const failure = [...events].reverse().find(event => {
+    if (event.type !== 'failed') {
+      return false
+    }
+    if (typeof params.runtimePid === 'number' && event.pid !== params.runtimePid) {
+      return false
+    }
+    if (Number.isFinite(boundaryMs)) {
+      const eventMs = Date.parse(event.timestamp)
+      return Number.isFinite(eventMs) && eventMs >= boundaryMs
+    }
+    return true
+  })
+
+  return failure?.detail ?? null
+}
+
 async function waitForRequiredBootstrapConfirmations(params: {
   request: TeamBootstrapRequest
   stateStore: TeamBootstrapStateStore
   failedMembers: Array<{ name: string; reason: string }>
   membersByName: Map<
     string,
-    { agentId?: string; bootstrapExpectedAfter?: string | null }
+    {
+      agentId?: string
+      bootstrapExpectedAfter?: string | null
+      backendType?: string
+      runtimePid?: number
+    }
   >
   timeoutStartedAt: number
   monotonicNow: () => number
@@ -331,7 +376,12 @@ async function waitForRequiredBootstrapConfirmations(params: {
 }): Promise<string[]> {
   const pending = new Map<
     string,
-    { agentId: string; bootstrapExpectedAfter?: string | null }
+    {
+      agentId: string
+      bootstrapExpectedAfter?: string | null
+      backendType?: string
+      runtimePid?: number
+    }
   >()
   const confirmedMembers = new Set<string>()
 
@@ -344,6 +394,8 @@ async function waitForRequiredBootstrapConfirmations(params: {
     pending.set(member.displayName, {
       agentId,
       bootstrapExpectedAfter: registered.bootstrapExpectedAfter ?? null,
+      backendType: registered.backendType,
+      runtimePid: registered.runtimePid,
     })
   }
 
@@ -364,6 +416,31 @@ async function waitForRequiredBootstrapConfirmations(params: {
           {
             status: 'bootstrap_confirmed',
             agentId: pendingMember.agentId,
+          },
+          params.now,
+        )
+        continue
+      }
+
+      const runtimeFailure = await readBootstrapRuntimeFailure({
+        teamName: params.request.teamName,
+        memberName,
+        backendType: pendingMember.backendType,
+        runtimePid: pendingMember.runtimePid,
+        bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
+      })
+      if (runtimeFailure) {
+        pending.delete(memberName)
+        if (
+          !params.failedMembers.some(failed => failed.name === memberName)
+        ) {
+          params.failedMembers.push({ name: memberName, reason: runtimeFailure })
+        }
+        await params.stateStore.markMemberResult(
+          memberName,
+          {
+            status: 'failed',
+            failureReason: runtimeFailure,
           },
           params.now,
         )
@@ -667,6 +744,8 @@ export async function runTeamBootstrap(params: {
                 {
                   agentId: member.agentId,
                   bootstrapExpectedAfter: member.bootstrapExpectedAfter ?? null,
+                  backendType: member.backendType,
+                  runtimePid: member.runtimePid,
                 },
               ] as const,
             ]
