@@ -2537,6 +2537,35 @@ export async function __handleSpawnNativeProcessForTests(
   return handleSpawnNativeProcess(input, context)
 }
 
+type SpawnMultiAgentDepsForTests = {
+  detectAndGetBackend?: typeof detectAndGetBackend
+  getTeammateModeFromSnapshot?: typeof getTeammateModeFromSnapshot
+  isInProcessEnabled?: typeof isInProcessEnabled
+}
+
+let spawnMultiAgentDepsForTests: SpawnMultiAgentDepsForTests | null = null
+
+export function __setSpawnMultiAgentDepsForTests(
+  deps: SpawnMultiAgentDepsForTests | null,
+): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setSpawnMultiAgentDepsForTests is only available in tests')
+  }
+  spawnMultiAgentDepsForTests = deps
+}
+
+function getSpawnMultiAgentDeps(): Required<SpawnMultiAgentDepsForTests> {
+  return {
+    detectAndGetBackend:
+      spawnMultiAgentDepsForTests?.detectAndGetBackend ?? detectAndGetBackend,
+    getTeammateModeFromSnapshot:
+      spawnMultiAgentDepsForTests?.getTeammateModeFromSnapshot ??
+      getTeammateModeFromSnapshot,
+    isInProcessEnabled:
+      spawnMultiAgentDepsForTests?.isInProcessEnabled ?? isInProcessEnabled,
+  }
+}
+
 /**
  * Handle spawn operation - creates a new Claude Code instance.
  * Uses in-process mode when enabled, otherwise uses tmux/iTerm2 split-pane view.
@@ -2572,9 +2601,10 @@ async function handleSpawn(
   }
 
   try {
+    const spawnDeps = getSpawnMultiAgentDeps()
 
     // Check if in-process mode is enabled via feature flag
-    if (isInProcessEnabled() && !forceSeparateProcess) {
+    if (spawnDeps.isInProcessEnabled() && !forceSeparateProcess) {
       return await handleSpawnInProcess(spawnInput, context)
     }
 
@@ -2583,7 +2613,7 @@ async function handleSpawn(
     // isInProcessEnabled() returns false but detectAndGetBackend() has no viable backend.
     // Narrowly scoped so user cancellation and other spawn errors propagate normally.
     try {
-      await detectAndGetBackend()
+      await spawnDeps.detectAndGetBackend()
     } catch (error) {
       if (
         shouldUseNativeProcessBackendForSpawn({
@@ -2608,7 +2638,7 @@ async function handleSpawn(
       // Only fall back silently in auto mode. If the user explicitly configured
       // teammateMode: 'tmux', let the error propagate so they see the actionable
       // install instructions from getTmuxInstallInstructions().
-      if (getTeammateModeFromSnapshot() !== 'auto') {
+      if (spawnDeps.getTeammateModeFromSnapshot() !== 'auto') {
         throw error
       }
       logForDebugging(

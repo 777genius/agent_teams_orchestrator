@@ -270,49 +270,39 @@ describe('spawnTeammate process backend fallback routing', () => {
       )
       expect(await actualTeamHelpers.readTeamFileAsync(teamName)).not.toBeNull()
 
-      const registryModulePath = new URL(
-        '../../utils/swarm/backends/registry.js',
-        import.meta.url,
-      ).href
-      const registryModule = await import(registryModulePath)
-      mock.module(registryModulePath, () => ({
-        ...registryModule,
-        detectAndGetBackend: async () => {
-          throw new Error('pane backend unavailable in route test')
-        },
-        isInProcessEnabled: () => false,
-      }))
-
-      const teammateModeModulePath = new URL(
-        '../../utils/swarm/backends/teammateModeSnapshot.js',
-        import.meta.url,
-      ).href
-      const teammateModeModule = await import(teammateModeModulePath)
-      mock.module(teammateModeModulePath, () => ({
-        ...teammateModeModule,
-        getTeammateModeFromSnapshot: () => 'auto',
-      }))
-
       const spawnModulePath = new URL(
         `./spawnMultiAgent.ts?processFallbackRouteTest=${Date.now()}`,
         import.meta.url,
       ).href
-      const { spawnTeammate } = await import(spawnModulePath)
+      const { spawnTeammate, __setSpawnMultiAgentDepsForTests } =
+        await import(spawnModulePath)
+      __setSpawnMultiAgentDepsForTests({
+        detectAndGetBackend: async () => {
+          throw new Error('pane backend unavailable in route test')
+        },
+        getTeammateModeFromSnapshot: () => 'auto',
+        isInProcessEnabled: () => false,
+      })
       const { context } = createProcessFallbackToolContext(
         teamName,
         actualTeamHelpers.getTeamFilePath(teamName),
       )
 
-      const result = await spawnTeammate(
-        {
-          name: 'codexer',
-          prompt: PROCESS_FALLBACK_PROMPT,
-          team_name: teamName,
-          cwd: projectRealpath,
-          provider: 'codex',
-        },
-        context,
-      )
+      let result: Awaited<ReturnType<typeof spawnTeammate>>
+      try {
+        result = await spawnTeammate(
+          {
+            name: 'codexer',
+            prompt: PROCESS_FALLBACK_PROMPT,
+            team_name: teamName,
+            cwd: projectRealpath,
+            provider: 'codex',
+          },
+          context,
+        )
+      } finally {
+        __setSpawnMultiAgentDepsForTests(null)
+      }
       if (result.data.runtime_pid) {
         runtimePids.push(result.data.runtime_pid)
       }
