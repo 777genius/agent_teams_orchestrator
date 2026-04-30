@@ -526,6 +526,139 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('posts prompt_async with app-owned message id and waits for OpenCode turn-settled observation', async () => {
+    const promptBodies: unknown[] = []
+    const observationMarks: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      turnSettledObserver: {
+        observe: input => {
+          expect(input).toMatchObject({
+            baseUrl: 'http://127.0.0.1:4096',
+            sessionId: 'session-1',
+            projectPath: '/tmp/project',
+            timeoutMs: 500,
+            idleTimeoutMs: 100,
+          })
+          return {
+            runtimePromptMessageId: 'msg_prompt_1',
+            turnId: 'msg_prompt_1',
+            markPromptSubmitting: () => {
+              observationMarks.push('submitting')
+            },
+            markPromptAcceptedByEndpoint: () => {
+              observationMarks.push('accepted')
+            },
+            markPromptRejectedByEndpoint: error => {
+              observationMarks.push(`rejected:${String(error)}`)
+            },
+            waitForSettled: async () => ({
+              outcome: 'success',
+              sessionId: 'session-1',
+              runtimePromptMessageId: 'msg_prompt_1',
+              turnId: 'msg_prompt_1',
+              endpoint: '/event',
+              streamConnected: true,
+              observedEventCount: 2,
+              matchedEventCount: 2,
+              assistantActivityCount: 1,
+              promptPersisted: true,
+              latestEventType: 'session.status',
+              latestAssistantMessageId: 'msg-assistant-1',
+              diagnostics: [],
+            }),
+            dispose: () => {
+              observationMarks.push('disposed')
+            },
+          }
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async (_sessionId, body) => {
+            promptBodies.push(body)
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.promptAsyncWithTurnSettled(buildRecord(), {
+      text: 'Continue task',
+      agent: 'teammate',
+      timeoutMs: 500,
+      idleTimeoutMs: 100,
+    })
+
+    expect(result.runtimePromptMessageId).toBe('msg_prompt_1')
+    expect(result.turnSettled.outcome).toBe('success')
+    expect(promptBodies).toEqual([
+      {
+        messageID: 'msg_prompt_1',
+        agent: 'teammate',
+        noReply: undefined,
+        system: undefined,
+        model: {
+          providerID: 'openai',
+          modelID: 'gpt-5.4-mini',
+        },
+        parts: [{ type: 'text', text: 'Continue task' }],
+      },
+    ])
+    expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
+  })
+
+  test('rejects noReply prompt_async before attaching turn-settled observation', async () => {
+    let hostEnsured = false
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => {
+          hostEnsured = true
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      turnSettledObserver: {
+        observe: () => {
+          throw new Error('turn-settled observer must not be attached for noReply')
+        },
+      },
+    })
+
+    await expect(bridge.promptAsyncWithTurnSettled(buildRecord(), {
+      text: 'fire and forget',
+      noReply: true,
+    })).rejects.toThrow('does not support noReply')
+    expect(hostEnsured).toBe(false)
+  })
+
   test('reconciles durable session history from messages and status', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const bridge = new OpenCodeSessionBridge({

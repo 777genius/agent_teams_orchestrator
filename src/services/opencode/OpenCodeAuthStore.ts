@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -5,6 +6,31 @@ import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js
 
 type OpenCodeAuthEntry = Record<string, unknown>
 type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
+
+const authStoreWriteQueues = new Map<string, Promise<void>>()
+
+async function withAuthStoreWriteLock<T>(
+  filePath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const lockKey = path.resolve(filePath)
+  const previous = authStoreWriteQueues.get(lockKey) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>(resolve => {
+    release = resolve
+  })
+  authStoreWriteQueues.set(lockKey, previous.then(() => current, () => current))
+
+  await previous.catch(() => undefined)
+  try {
+    return await operation()
+  } finally {
+    release()
+    if (authStoreWriteQueues.get(lockKey) === current) {
+      authStoreWriteQueues.delete(lockKey)
+    }
+  }
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -59,7 +85,7 @@ async function writeOpenCodeAuthStore(filePath: string, authStore: OpenCodeAuthS
   await mkdir(path.dirname(filePath), { recursive: true })
   const tempPath = path.join(
     path.dirname(filePath),
-    `.auth.json.${process.pid}.${Date.now()}.tmp`,
+    `.auth.json.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
   )
   await writeFile(tempPath, `${JSON.stringify(authStore, null, 2)}\n`, 'utf8')
   await rename(tempPath, filePath)
@@ -92,13 +118,15 @@ export async function syncOpenCodeManagedAuthStore(input: {
   sourceAuthPath: string
   managedAuthPath: string
 }): Promise<void> {
-  const source = await readOpenCodeAuthStore(input.sourceAuthPath)
-  const managed = await readOpenCodeAuthStore(input.managedAuthPath)
-  const merged = mergeOpenCodeAuthStores({ source, managed })
+  await withAuthStoreWriteLock(input.managedAuthPath, async () => {
+    const source = await readOpenCodeAuthStore(input.sourceAuthPath)
+    const managed = await readOpenCodeAuthStore(input.managedAuthPath)
+    const merged = mergeOpenCodeAuthStores({ source, managed })
 
-  if (JSON.stringify(merged) !== JSON.stringify(managed)) {
-    await writeOpenCodeAuthStore(input.managedAuthPath, merged)
-  }
+    if (JSON.stringify(merged) !== JSON.stringify(managed)) {
+      await writeOpenCodeAuthStore(input.managedAuthPath, merged)
+    }
+  })
 }
 
 export async function upsertOpenCodeApiAuthCredential(input: {
@@ -138,13 +166,15 @@ export async function upsertOpenCodeApiAuth(
     }
   }
 
-  const authStore = await readOpenCodeAuthStore(authPath)
-  authStore[providerId] = {
-    type: 'api',
-    key: apiKey,
-    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-  }
-  await writeOpenCodeAuthStore(authPath, authStore)
+  await withAuthStoreWriteLock(authPath, async () => {
+    const authStore = await readOpenCodeAuthStore(authPath)
+    authStore[providerId] = {
+      type: 'api',
+      key: apiKey,
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+    }
+    await writeOpenCodeAuthStore(authPath, authStore)
+  })
 }
 
 export async function removeOpenCodeAuthCredential(input: {
@@ -156,12 +186,14 @@ export async function removeOpenCodeAuthCredential(input: {
     throw new Error('OpenCode provider id is invalid')
   }
 
-  const authStore = await readOpenCodeAuthStore(input.authPath)
-  if (!(providerId in authStore)) {
-    return
-  }
-  delete authStore[providerId]
-  await writeOpenCodeAuthStore(input.authPath, authStore)
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    const authStore = await readOpenCodeAuthStore(input.authPath)
+    if (!(providerId in authStore)) {
+      return
+    }
+    delete authStore[providerId]
+    await writeOpenCodeAuthStore(input.authPath, authStore)
+  })
 }
 
 export async function readOpenCodeAuthProviderSummaries(

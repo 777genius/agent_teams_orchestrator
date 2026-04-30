@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import {
@@ -9,9 +12,11 @@ import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
+import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
   OpenCodeProvisioningSnapshot,
   OpenCodeSessionRecord,
@@ -288,6 +293,7 @@ const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistent
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalPromptAsync = openCodeSessionBridge.promptAsync
+const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalObservePreview = openCodeSessionBridge.observePreview
 const originalAbort = openCodeSessionBridge.abort
@@ -301,9 +307,31 @@ const originalBackfillTaskLedger = openCodeLedgerBridgeService.backfill
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
+let previousRuntimeTurnSettledSpoolRoot: string | undefined
 
 beforeEach(() => {
+  previousRuntimeTurnSettledSpoolRoot = process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV]
   mockRequiredMcpTools()
+  openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
+    await openCodeSessionBridge.promptAsync(record, input)
+    const runtimePromptMessageId = 'msg_test_turn_settled'
+    const turnSettled: OpenCodeTurnSettledSummary = {
+      outcome: 'success',
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+      turnId: runtimePromptMessageId,
+      endpoint: '/event',
+      streamConnected: true,
+      observedEventCount: 2,
+      matchedEventCount: 2,
+      assistantActivityCount: 1,
+      promptPersisted: true,
+      latestEventType: 'session.status',
+      latestAssistantMessageId: 'msg-assistant-1',
+      diagnostics: [],
+    }
+    return { runtimePromptMessageId, turnSettled }
+  }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
   openCodeHostManager.reconcilePersistentHosts = (async () => ({
     cleaned: 0,
     remaining: 0,
@@ -339,6 +367,11 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  if (previousRuntimeTurnSettledSpoolRoot == null) {
+    delete process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV]
+  } else {
+    process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = previousRuntimeTurnSettledSpoolRoot
+  }
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
@@ -346,6 +379,7 @@ afterEach(() => {
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.promptAsync = originalPromptAsync
+  openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
   openCodeSessionBridge.reconcileSession = originalReconcileSession
   openCodeSessionBridge.observePreview = originalObservePreview
   openCodeSessionBridge.abort = originalAbort
@@ -3735,6 +3769,139 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.accepted).toBe(true)
     expect(result.data.sessionId).toBe('session-bob')
     expect(result.data.runtimePid).toBe(789)
+  })
+
+  test('emits runtime turn-settled spool from the production send-message command path', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-send-spool-test-'))
+    process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = path.join(tempDir, 'runtime-turn-settled')
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+    })
+    try {
+      openCodeProvisioningProbe.probe = async () => snapshot
+      openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.promptAsync = (async () => undefined) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+        record: sessionRecord,
+        summary: buildReconcileSummary({
+          sessionId: sessionRecord.opencodeSessionId,
+          latestUserMessageId: 'msg_test_turn_settled',
+          latestAssistantMessageId: 'msg-current-assistant',
+          messages: [
+            {
+              id: 'msg_test_turn_settled',
+              parentId: null,
+              role: 'user',
+              agent: null,
+              providerId: null,
+              modelId: null,
+              createdAt: null,
+              completedAt: null,
+              text: 'hello bob',
+              reasoningText: '',
+              previewText: null,
+              partTypes: [],
+              reasoningPartCount: 0,
+              toolCalls: [],
+              contentBlocks: [],
+              finishReason: null,
+              errorName: null,
+              errorMessage: null,
+              hasError: false,
+            },
+            {
+              id: 'msg-current-assistant',
+              parentId: 'msg_test_turn_settled',
+              role: 'assistant',
+              agent: null,
+              providerId: null,
+              modelId: null,
+              createdAt: null,
+              completedAt: null,
+              text: 'done',
+              reasoningText: '',
+              previewText: 'done',
+              partTypes: [],
+              reasoningPartCount: 0,
+              toolCalls: [],
+              contentBlocks: [],
+              finishReason: null,
+              errorName: null,
+              errorMessage: null,
+              hasError: false,
+            },
+          ],
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.sendMessage', {
+          teamId: 'team-a',
+          teamName: 'team-a',
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          projectPath: '/tmp/project',
+          text: 'hello bob',
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      const incomingDir = path.join(tempDir, 'runtime-turn-settled', 'incoming')
+      const files = await readdir(incomingDir)
+      expect(files).toHaveLength(1)
+      const event = JSON.parse(await readFile(path.join(incomingDir, files[0] ?? ''), 'utf8'))
+      expect(event).toMatchObject({
+        provider: 'opencode',
+        source: 'agent-teams-orchestrator-opencode',
+        eventName: 'runtime_turn_settled',
+        hookEventName: 'Stop',
+        teamName: 'team-a',
+        memberName: 'bob',
+        sessionId: 'session-bob',
+        runtimePromptMessageId: 'msg_test_turn_settled',
+        outcome: 'success',
+      })
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps noReply OpenCode delivery out of turn-settled observer path', async () => {
+    const promptCalls: Array<{ noReply?: boolean }> = []
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+    })
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async (_sessionRecord, input) => {
+      promptCalls.push({ noReply: input.noReply })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.promptAsyncWithTurnSettled = (async () => {
+      throw new Error('noReply must not wait for turn-settled observation')
+    }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'silent bootstrap',
+        noReply: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(promptCalls).toEqual([{ noReply: true }])
   })
 
   test('reattaches app MCP before sending a message to an OpenCode lane session', async () => {

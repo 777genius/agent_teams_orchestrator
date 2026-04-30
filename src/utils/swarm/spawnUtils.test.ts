@@ -8,6 +8,8 @@ import {
   buildInheritedEnvVars,
   shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
+  stripInheritedCliFlag,
+  stripProviderBoundaryInheritedRuntimeFlags,
 } from './spawnUtils.js'
 
 function unquoteLauncherPath(launcher: string): string {
@@ -39,6 +41,33 @@ describe('buildPaneLauncherCommand', () => {
     } finally {
       await rm(dirname(scriptPath), { recursive: true, force: true })
     }
+  })
+})
+
+describe('inherited runtime flags', () => {
+  it('strips model and effort when crossing provider boundaries', () => {
+    expect(
+      stripProviderBoundaryInheritedRuntimeFlags(
+        '--dangerously-skip-permissions --model gpt-5.4 --effort high --settings /tmp/settings.json',
+      ),
+    ).toBe('--dangerously-skip-permissions --settings /tmp/settings.json')
+  })
+
+  it('strips equals-style inherited flags too', () => {
+    expect(
+      stripProviderBoundaryInheritedRuntimeFlags(
+        '--model=gpt-5.4 --effort=high --strict-mcp-config',
+      ),
+    ).toBe('--strict-mcp-config')
+  })
+
+  it('keeps unrelated flags when stripping one inherited flag', () => {
+    expect(
+      stripInheritedCliFlag(
+        '--permission-mode auto --effort medium --strict-mcp-config',
+        '--effort',
+      ),
+    ).toBe('--permission-mode auto --strict-mcp-config')
   })
 })
 

@@ -8,6 +8,7 @@ import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
+import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
 import type {
   OpenCodeAuthState,
@@ -21,6 +22,7 @@ import type {
   OpenCodeSessionStatus,
   OpenCodeSessionSummary,
 } from './types.js'
+import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 
 type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
@@ -32,6 +34,7 @@ type OpenCodeSessionBridgeDeps = {
   logProjector?: Pick<typeof openCodeLogProjector, 'projectSummary'>
   offlineReader?: Pick<typeof openCodeOfflineSessionReader, 'readSession'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
+  turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
   prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
 }
 
@@ -111,6 +114,10 @@ export class OpenCodeSessionBridge {
 
   private get previewObserver() {
     return this.deps.previewObserver ?? openCodePreviewObserver
+  }
+
+  private get turnSettledObserver() {
+    return this.deps.turnSettledObserver ?? openCodeTurnSettledObserver
   }
 
   private get logProjector() {
@@ -542,6 +549,56 @@ export class OpenCodeSessionBridge {
         model: parseProviderScopedModel(record.selectedModel),
         parts: [{ type: 'text', text: params.text }],
       })
+    })
+  }
+
+  async promptAsyncWithTurnSettled(
+    record: OpenCodeSessionRecord,
+    params: {
+      text: string
+      agent?: string
+      noReply?: boolean
+      system?: string
+      timeoutMs?: number
+      idleTimeoutMs?: number
+    },
+  ): Promise<{
+    runtimePromptMessageId: string
+    turnSettled: OpenCodeTurnSettledSummary
+  }> {
+    if (params.noReply) {
+      throw new Error('OpenCode turn-settled observation does not support noReply prompts')
+    }
+    return this.withSessionHost(record, async ({ baseUrl }) => {
+      const observation = this.turnSettledObserver.observe({
+        baseUrl,
+        sessionId: record.opencodeSessionId,
+        projectPath: record.projectPath,
+        timeoutMs: params.timeoutMs,
+        idleTimeoutMs: params.idleTimeoutMs,
+      })
+      const client = this.clientFactory.create(baseUrl)
+      try {
+        observation.markPromptSubmitting()
+        await client.promptSessionAsync(record.opencodeSessionId, {
+          messageID: observation.runtimePromptMessageId,
+          agent: params.agent,
+          noReply: params.noReply,
+          system: params.system,
+          model: parseProviderScopedModel(record.selectedModel),
+          parts: [{ type: 'text', text: params.text }],
+        })
+        observation.markPromptAcceptedByEndpoint()
+        return {
+          runtimePromptMessageId: observation.runtimePromptMessageId,
+          turnSettled: await observation.waitForSettled(),
+        }
+      } catch (error) {
+        observation.markPromptRejectedByEndpoint(error)
+        throw error
+      } finally {
+        observation.dispose()
+      }
     })
   }
 

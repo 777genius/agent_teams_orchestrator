@@ -79,6 +79,8 @@ import {
   buildInheritedEnvObject,
   buildInheritedEnvVars,
   probeTmuxTeammateSpawn,
+  stripInheritedCliFlag,
+  stripProviderBoundaryInheritedRuntimeFlags,
   wrapTeammateSpawnCommand,
 } from '../../utils/swarm/spawnUtils.js'
 import {
@@ -252,17 +254,11 @@ function resolveSpawnModel(
 }
 
 function stripInheritedModelFlag(flags: string): string {
-  return flags
-    .split(' ')
-    .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
-    .join(' ')
+  return stripInheritedCliFlag(flags, '--model')
 }
 
 function stripInheritedEffortFlag(flags: string): string {
-  return flags
-    .split(' ')
-    .filter((flag, i, arr) => flag !== '--effort' && arr[i - 1] !== '--effort')
-    .join(' ')
+  return stripInheritedCliFlag(flags, '--effort')
 }
 
 function summarizePromptSize(prompt: string): string {
@@ -1214,7 +1210,7 @@ async function handleSpawnSplitPane(
   })
 
   if (crossesProviderBoundary(input.provider)) {
-    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+    inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
@@ -1504,7 +1500,7 @@ async function handleSpawnSeparateWindow(
   })
 
   if (crossesProviderBoundary(input.provider)) {
-    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+    inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
@@ -1877,7 +1873,7 @@ async function handleSpawnNativeProcess(
   })
 
   if (crossesProviderBoundary(input.provider)) {
-    inheritedFlags = stripInheritedModelFlag(inheritedFlags)
+    inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
   if (model) {
     inheritedFlags = stripInheritedModelFlag(inheritedFlags)

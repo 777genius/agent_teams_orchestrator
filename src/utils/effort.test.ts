@@ -15,9 +15,10 @@ describe('model effort support', () => {
     expect(modelSupportsMaxEffort('claude-opus-4-5')).toBe(false)
   })
 
-  test('allows standard effort levels for Haiku 4.5 without enabling max effort', () => {
-    expect(modelSupportsEffort('claude-haiku-4-5')).toBe(true)
-    expect(modelSupportsEffort('claude-haiku-4-5-20251001')).toBe(true)
+  test('does not send effort for Haiku models', () => {
+    expect(modelSupportsEffort('haiku')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku-4-5')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku-4-5-20251001')).toBe(false)
     expect(modelSupportsEffort('claude-3-5-haiku-20241022')).toBe(false)
     expect(modelSupportsMaxEffort('claude-haiku-4-5')).toBe(false)
   })

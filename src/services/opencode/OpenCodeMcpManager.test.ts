@@ -335,6 +335,27 @@ describe('OpenCodeMcpManager', () => {
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
 
+  test('resolves env override MCP launch config with full args JSON', async () => {
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/usr/local/bin/node',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/ignored-legacy-entry.js',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify([
+          '/tmp/tsx-cli.mjs',
+          '/tmp/agent-teams-mcp/src/index.ts',
+        ]),
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config.command).toEqual([
+      '/usr/local/bin/node',
+      '/tmp/tsx-cli.mjs',
+      '/tmp/agent-teams-mcp/src/index.ts',
+    ])
+  })
+
   test('resolves workspace source MCP launch through node and the tsx CLI entrypoint', async () => {
     const result = await resolveOpenCodeAppMcpLaunchConfig({
       env: {},

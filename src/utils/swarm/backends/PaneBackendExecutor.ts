@@ -13,6 +13,7 @@ import {
   buildInheritedEnvVars,
   getTeammateCommand,
   probeTmuxTeammateSpawn,
+  stripProviderBoundaryInheritedRuntimeFlags,
   wrapTeammateSpawnCommand,
 } from '../spawnUtils.js'
 import {
@@ -153,12 +154,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
       })
 
       if (config.provider && config.provider !== getCurrentProvider()) {
-        inheritedFlags = inheritedFlags
-          .split(' ')
-          .filter(
-            (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
-          )
-          .join(' ')
+        inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
       }
 
       // If teammate has a custom model, add --model flag (or replace inherited one)

@@ -20,6 +20,7 @@ const OPEN_CODE_APP_MCP_VERIFY_TIMEOUT_MS = 5_000
 const OPEN_CODE_APP_MCP_VERIFY_POLL_MS = 250
 const OPEN_CODE_MCP_ENTRY_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY'
 const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
+const OPEN_CODE_MCP_ARGS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON'
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
   'HOME',
@@ -76,6 +77,24 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function parseArgsJson(value: string | null): string[] | null {
+  if (!value) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) {
+      return null
+    }
+    const args = parsed
+      .map(item => asString(item))
+      .filter((item): item is string => Boolean(item))
+    return args.length > 0 ? args : null
+  } catch {
+    return null
+  }
 }
 
 function asStringRecord(value: unknown): Record<string, string> | null {
@@ -191,6 +210,23 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   const forwardedEnvironment = buildForwardedEnvironment(env)
   const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
   const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
+  const argsOverride = parseArgsJson(asString(env[OPEN_CODE_MCP_ARGS_JSON_ENV]))
+
+  if (argsOverride) {
+    return {
+      source: 'env-override',
+      config: {
+        type: 'local',
+        command: [
+          commandOverride ?? resolveNodeCommand(),
+          ...argsOverride.map(arg => arg.startsWith('-') || path.isAbsolute(arg) ? arg : path.resolve(arg)),
+        ],
+        environment: forwardedEnvironment,
+        enabled: true,
+        timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+      },
+    }
+  }
 
   if (entryOverride) {
     const absoluteEntry = path.resolve(entryOverride)

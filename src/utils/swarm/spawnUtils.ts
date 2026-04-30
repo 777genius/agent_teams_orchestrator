@@ -133,6 +133,32 @@ export function buildInheritedCliFlags(options?: {
   return flags.join(' ')
 }
 
+export function stripInheritedCliFlag(flags: string, flagName: string): string {
+  const parts = flags.split(' ').filter(Boolean)
+  const kept: string[] = []
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]!
+    if (part === flagName) {
+      i += 1
+      continue
+    }
+    if (part.startsWith(`${flagName}=`)) {
+      continue
+    }
+    kept.push(part)
+  }
+
+  return kept.join(' ')
+}
+
+export function stripProviderBoundaryInheritedRuntimeFlags(flags: string): string {
+  return stripInheritedCliFlag(
+    stripInheritedCliFlag(flags, '--model'),
+    '--effort',
+  )
+}
+
 /**
  * Environment variables that must be explicitly forwarded to tmux-spawned
  * teammates. Tmux may start a new login shell that doesn't inherit the

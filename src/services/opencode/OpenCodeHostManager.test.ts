@@ -139,6 +139,73 @@ describe('OpenCodeHostManager', () => {
     expect(spawned.killedSignals).toEqual(['SIGTERM'])
   })
 
+  test('force-kills an owned host that survives release SIGTERM', async () => {
+    const spawned = createMockChildProcess()
+    let spawnCount = 0
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43119,
+      spawnHostProcess: () => {
+        spawnCount += 1
+        return spawned.child
+      },
+      fetchJson: async (url, init) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43119 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        if (url.endsWith('/global/dispose') && init?.method === 'POST') {
+          return {
+            status: 200,
+            data: { ok: true },
+          }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      sleepMs: async () => {},
+      killProcess: (_pid, signal) => {
+        spawned.killedSignals.push(signal)
+      },
+      persistentRegistryPath: null,
+    })
+
+    await manager.ensureHost({ hostKey: 'host-key' })
+    expect(spawnCount).toBe(1)
+
+    await manager.releaseHost('host-key')
+
+    expect(manager.getHost('host-key')).toBeNull()
+    expect(spawned.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+
   test('drops a host from the registry when the child exits unexpectedly', async () => {
     const spawned = createMockChildProcess()
 
