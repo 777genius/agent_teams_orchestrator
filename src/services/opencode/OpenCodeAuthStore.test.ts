@@ -56,6 +56,53 @@ describe('OpenCodeAuthStore', () => {
     })
   })
 
+  test('serializes concurrent managed auth syncs without dropping providers', async () => {
+    const firstSourceAuthPath = path.join(tempDir, 'first-source-auth.json')
+    const secondSourceAuthPath = path.join(tempDir, 'second-source-auth.json')
+    const managedAuthPath = path.join(tempDir, 'managed', 'auth.json')
+
+    await mkdir(path.dirname(managedAuthPath), { recursive: true })
+    await writeFile(
+      firstSourceAuthPath,
+      JSON.stringify({
+        openai: { type: 'oauth' },
+      }),
+      'utf8',
+    )
+    await writeFile(
+      secondSourceAuthPath,
+      JSON.stringify({
+        anthropic: { type: 'api', key: 'sk-anthropic' },
+      }),
+      'utf8',
+    )
+    await writeFile(
+      managedAuthPath,
+      JSON.stringify({
+        openrouter: { type: 'api', key: 'sk-managed' },
+      }),
+      'utf8',
+    )
+
+    await Promise.all([
+      syncOpenCodeManagedAuthStore({
+        sourceAuthPath: firstSourceAuthPath,
+        managedAuthPath,
+      }),
+      syncOpenCodeManagedAuthStore({
+        sourceAuthPath: secondSourceAuthPath,
+        managedAuthPath,
+      }),
+    ])
+
+    const merged = JSON.parse(await readFile(managedAuthPath, 'utf8')) as Record<string, unknown>
+    expect(merged).toEqual({
+      openrouter: { type: 'api', key: 'sk-managed' },
+      openai: { type: 'oauth' },
+      anthropic: { type: 'api', key: 'sk-anthropic' },
+    })
+  })
+
   test('lets local source credentials win on provider conflicts', () => {
     expect(
       mergeOpenCodeAuthStores({

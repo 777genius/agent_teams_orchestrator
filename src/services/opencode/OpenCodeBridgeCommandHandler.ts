@@ -510,7 +510,10 @@ type AppMcpToolProof = {
   route: string | null
 }
 
-const APP_MCP_PREFLIGHT_TIMEOUT_MS = 10_000
+// Cold workspace/source MCP startup can take longer than a model turn on dev
+// machines. Keep this below the outer readiness timeout but avoid false launch
+// failures before OpenCode ever gets a chance to attach Agent Teams tools.
+const APP_MCP_PREFLIGHT_TIMEOUT_MS = 45_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
 
 type AppMcpToolProofCacheEntry = {
