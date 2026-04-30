@@ -4,7 +4,11 @@ import { OpenCodeTurnSettledEmissionCoordinator } from './OpenCodeTurnSettledEmi
 
 import type { OpenCodeRuntimeTurnSettledEvent } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
-import type { OpenCodeSessionRecord, OpenCodeSessionReconcileSummary } from './types.js'
+import type {
+  OpenCodeCanonicalMessage,
+  OpenCodeSessionRecord,
+  OpenCodeSessionReconcileSummary,
+} from './types.js'
 
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {
@@ -54,6 +58,33 @@ function buildReconcileSummary(
     replyPendingSinceMessageId: null,
     messages: [],
     diagnostics: [],
+    ...overrides,
+  }
+}
+
+function buildMessage(
+  overrides: Partial<OpenCodeCanonicalMessage>,
+): OpenCodeCanonicalMessage {
+  return {
+    id: null,
+    parentId: null,
+    role: 'unknown',
+    agent: null,
+    providerId: null,
+    modelId: null,
+    createdAt: null,
+    completedAt: null,
+    text: '',
+    reasoningText: '',
+    previewText: null,
+    partTypes: [],
+    reasoningPartCount: 0,
+    toolCalls: [],
+    contentBlocks: [],
+    finishReason: null,
+    errorName: null,
+    errorMessage: null,
+    hasError: false,
     ...overrides,
   }
 }
@@ -134,6 +165,215 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     expect(events[0]).toMatchObject({
       outcome: 'error',
       detail: expect.stringContaining('MCP Not connected'),
+    })
+  })
+
+  test('does not upgrade a stale previous assistant message to success for the current prompt', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitDelivery({
+      record: buildRecord(),
+      runtimePromptMessageId: 'msg-current-user',
+      turnSettled: {
+        outcome: 'idle_without_assistant_activity',
+        sessionId: 'session-1',
+        runtimePromptMessageId: 'msg-current-user',
+        turnId: 'msg-current-user',
+        endpoint: '/event',
+        streamConnected: true,
+        observedEventCount: 6,
+        matchedEventCount: 5,
+        assistantActivityCount: 0,
+        promptPersisted: true,
+        latestEventType: 'session.status',
+        latestAssistantMessageId: null,
+        diagnostics: ['OpenCode observed session.status idle without assistant activity'],
+      },
+      reconcileSummary: buildReconcileSummary({
+        latestUserMessageId: 'msg-current-user',
+        latestAssistantMessageId: 'msg-previous-assistant',
+        replyPendingSinceMessageId: 'msg-current-user',
+        messages: [
+          buildMessage({ id: 'msg-previous-user', role: 'user' }),
+          buildMessage({
+            id: 'msg-previous-assistant',
+            parentId: 'msg-previous-user',
+            role: 'assistant',
+            text: 'previous reply',
+          }),
+          buildMessage({ id: 'msg-current-user', role: 'user' }),
+        ],
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'idle_without_assistant_activity',
+      runtimePromptMessageId: 'msg-current-user',
+      detail: expect.stringContaining('without assistant activity'),
+    })
+  })
+
+  test('does not downgrade the current prompt because of a stale previous assistant error', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitDelivery({
+      record: buildRecord(),
+      runtimePromptMessageId: 'msg-current-user',
+      turnSettled: {
+        outcome: 'idle_without_assistant_activity',
+        sessionId: 'session-1',
+        runtimePromptMessageId: 'msg-current-user',
+        turnId: 'msg-current-user',
+        endpoint: '/event',
+        streamConnected: true,
+        observedEventCount: 6,
+        matchedEventCount: 5,
+        assistantActivityCount: 0,
+        promptPersisted: true,
+        latestEventType: 'session.status',
+        latestAssistantMessageId: null,
+        diagnostics: ['OpenCode observed session.status idle without assistant activity'],
+      },
+      reconcileSummary: buildReconcileSummary({
+        errorCount: 1,
+        latestUserMessageId: 'msg-current-user',
+        latestAssistantMessageId: 'msg-previous-assistant',
+        replyPendingSinceMessageId: 'msg-current-user',
+        messages: [
+          buildMessage({ id: 'msg-previous-user', role: 'user' }),
+          buildMessage({
+            id: 'msg-previous-assistant',
+            parentId: 'msg-previous-user',
+            role: 'assistant',
+            hasError: true,
+            errorName: 'ProviderError',
+            errorMessage: 'previous turn failed',
+          }),
+          buildMessage({ id: 'msg-current-user', role: 'user' }),
+        ],
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'idle_without_assistant_activity',
+      runtimePromptMessageId: 'msg-current-user',
+    })
+  })
+
+  test('uses reconcile proof only when an assistant response belongs to the current prompt', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitDelivery({
+      record: buildRecord(),
+      runtimePromptMessageId: 'msg-current-user',
+      turnSettled: {
+        outcome: 'timeout',
+        sessionId: 'session-1',
+        runtimePromptMessageId: 'msg-current-user',
+        turnId: 'msg-current-user',
+        endpoint: '/event',
+        streamConnected: true,
+        observedEventCount: 12,
+        matchedEventCount: 10,
+        assistantActivityCount: 0,
+        promptPersisted: true,
+        latestEventType: 'server.heartbeat',
+        latestAssistantMessageId: null,
+        diagnostics: ['observer timed out'],
+      },
+      reconcileSummary: buildReconcileSummary({
+        latestUserMessageId: 'msg-current-user',
+        latestAssistantMessageId: 'msg-current-assistant',
+        replyPendingSinceMessageId: null,
+        messages: [
+          buildMessage({ id: 'msg-current-user', role: 'user' }),
+          buildMessage({
+            id: 'msg-current-assistant',
+            parentId: 'msg-current-user',
+            role: 'assistant',
+            text: 'current reply',
+          }),
+        ],
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'success',
+      runtimePromptMessageId: 'msg-current-user',
+    })
+  })
+
+  test('uses reconcile error only when it belongs to the current prompt', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitDelivery({
+      record: buildRecord(),
+      runtimePromptMessageId: 'msg-current-user',
+      turnSettled: {
+        outcome: 'timeout',
+        sessionId: 'session-1',
+        runtimePromptMessageId: 'msg-current-user',
+        turnId: 'msg-current-user',
+        endpoint: '/event',
+        streamConnected: true,
+        observedEventCount: 12,
+        matchedEventCount: 10,
+        assistantActivityCount: 0,
+        promptPersisted: true,
+        latestEventType: 'server.heartbeat',
+        latestAssistantMessageId: null,
+        diagnostics: ['observer timed out'],
+      },
+      reconcileSummary: buildReconcileSummary({
+        errorCount: 1,
+        latestUserMessageId: 'msg-current-user',
+        latestAssistantMessageId: 'msg-current-assistant',
+        replyPendingSinceMessageId: null,
+        messages: [
+          buildMessage({ id: 'msg-current-user', role: 'user' }),
+          buildMessage({
+            id: 'msg-current-assistant',
+            parentId: 'msg-current-user',
+            role: 'assistant',
+            hasError: true,
+            errorName: 'ProviderError',
+            errorMessage: 'current turn failed',
+          }),
+        ],
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'error',
+      runtimePromptMessageId: 'msg-current-user',
     })
   })
 })

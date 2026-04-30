@@ -97,7 +97,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(assistant?.contentBlocks.some(block => block.type === 'text')).toBe(true)
     } finally {
       await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
+      await openCodeSessionStore.delete(identity.teamId, identity.memberName)
     }
   }, 90_000)
 
@@ -192,7 +192,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(projectedToolResult).toBeDefined()
     } finally {
       await openCodeSessionBridge.releaseSession(record)
-      await openCodeSessionStore.markStale(identity.teamId, identity.memberName, 'e2e_cleanup')
+      await openCodeSessionStore.delete(identity.teamId, identity.memberName)
     }
   }, 120_000)
 })

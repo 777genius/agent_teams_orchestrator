@@ -566,6 +566,9 @@ export class OpenCodeSessionBridge {
     runtimePromptMessageId: string
     turnSettled: OpenCodeTurnSettledSummary
   }> {
+    if (params.noReply) {
+      throw new Error('OpenCode turn-settled observation does not support noReply prompts')
+    }
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const observation = this.turnSettledObserver.observe({
         baseUrl,

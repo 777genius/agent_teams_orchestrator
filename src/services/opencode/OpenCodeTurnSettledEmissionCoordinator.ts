@@ -24,18 +24,78 @@ function isTerminalDeliveryProof(observation: OpenCodeDeliveryResponseObservatio
     observation?.state === 'tool_error'
 }
 
+function hasAssistantResponseForPrompt(
+  summary: OpenCodeSessionReconcileSummary | null | undefined,
+  runtimePromptMessageId: string | null | undefined,
+): boolean {
+  const promptId = runtimePromptMessageId?.trim()
+  if (!summary || !promptId) {
+    return false
+  }
+
+  if (summary.replyPendingSinceMessageId === promptId) {
+    return false
+  }
+
+  if (summary.messages.some(message => message.role === 'assistant' && message.parentId === promptId)) {
+    return true
+  }
+
+  const promptIndex = summary.messages.findIndex(
+    message => message.role === 'user' && message.id === promptId,
+  )
+  if (promptIndex < 0) {
+    return false
+  }
+
+  return summary.messages.slice(promptIndex + 1).some(message => message.role === 'assistant')
+}
+
+function hasErrorForPrompt(
+  summary: OpenCodeSessionReconcileSummary | null | undefined,
+  runtimePromptMessageId: string | null | undefined,
+): boolean {
+  const promptId = runtimePromptMessageId?.trim()
+  if (!summary || !promptId) {
+    return false
+  }
+
+  if (
+    summary.messages.some(
+      message => message.role === 'assistant' && message.parentId === promptId && message.hasError,
+    )
+  ) {
+    return true
+  }
+
+  const promptIndex = summary.messages.findIndex(
+    message => message.role === 'user' && message.id === promptId,
+  )
+  if (promptIndex < 0) {
+    return false
+  }
+
+  return summary.messages
+    .slice(promptIndex + 1)
+    .some(message => message.role === 'assistant' && message.hasError)
+}
+
 function outcomeFromDelivery(input: {
   turnSettled?: OpenCodeTurnSettledSummary | null
   reconcileSummary?: OpenCodeSessionReconcileSummary | null
   responseObservation?: OpenCodeDeliveryResponseObservation
+  runtimePromptMessageId?: string | null
 }): OpenCodeRuntimeTurnSettledOutcome {
   if (isTerminalDeliveryProof(input.responseObservation)) {
     return input.responseObservation?.state === 'tool_error' ? 'error' : 'success'
   }
-  if (input.reconcileSummary?.errorCount && input.reconcileSummary.errorCount > 0) {
+  const runtimePromptMessageId =
+    input.runtimePromptMessageId?.trim() ||
+    input.turnSettled?.runtimePromptMessageId?.trim()
+  if (hasErrorForPrompt(input.reconcileSummary, runtimePromptMessageId)) {
     return 'error'
   }
-  if (input.reconcileSummary?.latestAssistantMessageId) {
+  if (hasAssistantResponseForPrompt(input.reconcileSummary, runtimePromptMessageId)) {
     return 'success'
   }
   return input.turnSettled?.outcome ?? 'unknown'
@@ -104,7 +164,10 @@ export class OpenCodeTurnSettledEmissionCoordinator {
         memberName: input.record.memberName,
         laneId: input.record.laneId,
         cwd: input.record.projectPath,
-        outcome: outcomeFromDelivery(input),
+        outcome: outcomeFromDelivery({
+          ...input,
+          runtimePromptMessageId,
+        }),
         ...(runtimePromptMessageId ? { runtimePromptMessageId, turnId: runtimePromptMessageId } : {}),
         ...(input.record.selectedModel ? { selectedModel: input.record.selectedModel } : {}),
         ...(typeof input.record.runtimePid === 'number' && input.record.runtimePid > 0

@@ -635,6 +635,30 @@ describe('OpenCodeSessionBridge', () => {
     expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
   })
 
+  test('rejects noReply prompt_async before attaching turn-settled observation', async () => {
+    let hostEnsured = false
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => {
+          hostEnsured = true
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      turnSettledObserver: {
+        observe: () => {
+          throw new Error('turn-settled observer must not be attached for noReply')
+        },
+      },
+    })
+
+    await expect(bridge.promptAsyncWithTurnSettled(buildRecord(), {
+      text: 'fire and forget',
+      noReply: true,
+    })).rejects.toThrow('does not support noReply')
+    expect(hostEnsured).toBe(false)
+  })
+
   test('reconciles durable session history from messages and status', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const bridge = new OpenCodeSessionBridge({

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import {
   getOpenCodeSseMessageId,
+  getOpenCodeSseMessageParentId,
   getOpenCodeSseMessageRole,
   getOpenCodeSsePartType,
   getOpenCodeSseSessionId,
@@ -55,11 +56,13 @@ type ObservationState = {
   promptState: PromptState
   disposed: boolean
   streamConnected: boolean
+  streamClosedBeforeTerminalEvent: boolean
   endpoint: OpenCodeSseEndpoint | null
   observedEventCount: number
   matchedEventCount: number
   assistantActivityCount: number
   promptPersisted: boolean
+  pendingSessionErrorDiagnostic: string | null
   latestEventType: string | null
   latestAssistantMessageId: string | null
   diagnostics: string[]
@@ -101,11 +104,13 @@ export class OpenCodeTurnSettledObserver {
       promptState: 'created',
       disposed: false,
       streamConnected: false,
+      streamClosedBeforeTerminalEvent: false,
       endpoint: null,
       observedEventCount: 0,
       matchedEventCount: 0,
       assistantActivityCount: 0,
       promptPersisted: false,
+      pendingSessionErrorDiagnostic: null,
       latestEventType: null,
       latestAssistantMessageId: null,
       diagnostics: [],
@@ -177,6 +182,35 @@ export class OpenCodeTurnSettledObserver {
       idleTimer.unref?.()
     }
 
+    const hasCurrentPromptEvidence = () => state.promptPersisted || state.assistantActivityCount > 0
+
+    const recordUnattributedSessionError = (diagnostic: string, reason: string) => {
+      state.pendingSessionErrorDiagnostic = diagnostic
+      state.diagnostics.push(reason)
+      state.diagnostics.push(diagnostic)
+    }
+
+    const recordAssistantActivity = (
+      messageId: string | null,
+      options: {
+        parentId?: string | null
+        source: 'message' | 'part'
+      },
+    ) => {
+      if (
+        state.promptPersisted ||
+        options.parentId === runtimePromptMessageId ||
+        (options.source === 'part' && state.promptState === 'accepted')
+      ) {
+        state.assistantActivityCount += 1
+        state.latestAssistantMessageId = messageId
+        return
+      }
+      state.diagnostics.push(
+        'OpenCode ignored assistant activity without current prompt evidence',
+      )
+    }
+
     const handleEvent = (event: OpenCodeSseEvent) => {
       if (state.terminal || state.disposed) {
         return
@@ -202,7 +236,24 @@ export class OpenCodeTurnSettledObserver {
       resetIdleTimer()
 
       if (event.type === 'session.error') {
-        settle('error', `OpenCode observed session.error for ${params.sessionId}`)
+        const diagnostic = `OpenCode observed session.error for ${params.sessionId}`
+        if (state.promptState === 'accepted') {
+          if (hasCurrentPromptEvidence()) {
+            settle('error', diagnostic)
+            return
+          }
+          recordUnattributedSessionError(
+            diagnostic,
+            'OpenCode ignored session.error without current prompt evidence',
+          )
+          return
+        }
+        if (state.promptState === 'submitting') {
+          recordUnattributedSessionError(
+            diagnostic,
+            'OpenCode buffered session.error before prompt_async endpoint acceptance',
+          )
+        }
         return
       }
 
@@ -210,11 +261,18 @@ export class OpenCodeTurnSettledObserver {
         if (state.promptState !== 'accepted') {
           return
         }
-        settle(
-          state.assistantActivityCount > 0 ? 'success' : 'idle_without_assistant_activity',
-          state.assistantActivityCount > 0
-            ? 'OpenCode observed deprecated session.idle after assistant activity'
-            : 'OpenCode observed deprecated session.idle without assistant activity',
+        if (!hasCurrentPromptEvidence()) {
+          state.diagnostics.push(
+            'OpenCode ignored session.idle without current prompt evidence',
+          )
+          return
+        }
+        if (state.assistantActivityCount > 0) {
+          settle('success', 'OpenCode observed deprecated session.idle after assistant activity')
+          return
+        }
+        state.diagnostics.push(
+          'OpenCode observed deprecated session.idle without assistant activity; waiting for idle grace window',
         )
         return
       }
@@ -222,11 +280,18 @@ export class OpenCodeTurnSettledObserver {
       if (event.type === 'session.status') {
         const status = getOpenCodeSseSessionStatusType(event.properties.status, params.sessionId)
         if (status === 'idle' && state.promptState === 'accepted') {
-          settle(
-            state.assistantActivityCount > 0 ? 'success' : 'idle_without_assistant_activity',
-            state.assistantActivityCount > 0
-              ? 'OpenCode observed session.status idle after assistant activity'
-              : 'OpenCode observed session.status idle without assistant activity',
+          if (!hasCurrentPromptEvidence()) {
+            state.diagnostics.push(
+              'OpenCode ignored session.status idle without current prompt evidence',
+            )
+            return
+          }
+          if (state.assistantActivityCount > 0) {
+            settle('success', 'OpenCode observed session.status idle after assistant activity')
+            return
+          }
+          state.diagnostics.push(
+            'OpenCode observed session.status idle without assistant activity; waiting for idle grace window',
           )
         }
         return
@@ -244,8 +309,10 @@ export class OpenCodeTurnSettledObserver {
           return
         }
         if (role === 'assistant') {
-          state.assistantActivityCount += 1
-          state.latestAssistantMessageId = messageId
+          recordAssistantActivity(messageId, {
+            parentId: getOpenCodeSseMessageParentId(event.properties),
+            source: 'message',
+          })
         }
         return
       }
@@ -257,8 +324,7 @@ export class OpenCodeTurnSettledObserver {
         }
         const partType = getOpenCodeSsePartType(event.properties)
         if (isAssistantActivityPartType(partType)) {
-          state.assistantActivityCount += 1
-          state.latestAssistantMessageId = messageId
+          recordAssistantActivity(messageId, { source: 'part' })
         }
       }
     }
@@ -290,6 +356,8 @@ export class OpenCodeTurnSettledObserver {
             onEvent: handleEvent,
           })
           state.streamConnected = state.streamConnected || result.connected
+          state.streamClosedBeforeTerminalEvent =
+            state.streamClosedBeforeTerminalEvent || result.closedBeforeAbort
           state.diagnostics.push(...result.diagnostics)
 
           if (state.terminal || state.disposed) {
@@ -304,7 +372,14 @@ export class OpenCodeTurnSettledObserver {
           break
         }
         if (!state.terminal) {
-          settle(state.streamConnected ? 'timeout' : 'stream_unavailable')
+          settle(
+            state.streamConnected && !state.streamClosedBeforeTerminalEvent
+              ? 'timeout'
+              : 'stream_unavailable',
+            state.streamClosedBeforeTerminalEvent
+              ? 'OpenCode SSE stream closed before terminal event'
+              : undefined,
+          )
         }
       } finally {
         clearTimeout(timeoutTimer)

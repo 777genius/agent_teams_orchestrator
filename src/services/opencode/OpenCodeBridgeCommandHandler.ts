@@ -45,7 +45,9 @@ const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 1_500
 const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 6_000
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
-const OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS = 12_000
+// This is intentionally longer than the UI wait budget: the app can return
+// acceptanceUnknown early while this bridge keeps observing the real turn.
+const OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS = 25_000
 const OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',

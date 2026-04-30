@@ -81,6 +81,7 @@ describe('OpenCodeSseEventStream', () => {
     expect(result).toMatchObject({
       endpoint: '/event',
       connected: true,
+      closedBeforeAbort: true,
       observedEventCount: 2,
     })
     expect(result.diagnostics[0]).toContain('malformed payload')

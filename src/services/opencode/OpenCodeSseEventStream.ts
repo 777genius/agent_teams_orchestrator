@@ -7,6 +7,7 @@ export type OpenCodeSseEndpoint = '/event' | '/global/event'
 export type OpenCodeSseEndpointReadResult = {
   endpoint: OpenCodeSseEndpoint
   connected: boolean
+  closedBeforeAbort: boolean
   observedEventCount: number
   diagnostics: string[]
 }
@@ -45,6 +46,15 @@ export function getOpenCodeSseMessageId(properties: Record<string, unknown>): st
 
 export function getOpenCodeSseMessageRole(properties: Record<string, unknown>): string | null {
   return asString(asRecord(properties.info)?.role)
+}
+
+export function getOpenCodeSseMessageParentId(properties: Record<string, unknown>): string | null {
+  const info = asRecord(properties.info)
+  return (
+    asString(info?.parentID)
+    ?? asString(info?.parentId)
+    ?? asString(info?.parent)
+  )
 }
 
 export function getOpenCodeSsePartType(properties: Record<string, unknown>): string | null {
@@ -154,6 +164,7 @@ export async function readOpenCodeSseEndpoint(params: {
       return {
         endpoint: params.endpoint,
         connected: false,
+        closedBeforeAbort: false,
         observedEventCount: 0,
         diagnostics,
       }
@@ -164,6 +175,7 @@ export async function readOpenCodeSseEndpoint(params: {
     return {
       endpoint: params.endpoint,
       connected: false,
+      closedBeforeAbort: false,
       observedEventCount: 0,
       diagnostics,
     }
@@ -176,6 +188,7 @@ export async function readOpenCodeSseEndpoint(params: {
     return {
       endpoint: params.endpoint,
       connected: false,
+      closedBeforeAbort: false,
       observedEventCount: 0,
       diagnostics,
     }
@@ -186,6 +199,7 @@ export async function readOpenCodeSseEndpoint(params: {
     return {
       endpoint: params.endpoint,
       connected: false,
+      closedBeforeAbort: false,
       observedEventCount: 0,
       diagnostics,
     }
@@ -196,6 +210,7 @@ export async function readOpenCodeSseEndpoint(params: {
     return {
       endpoint: params.endpoint,
       connected: false,
+      closedBeforeAbort: false,
       observedEventCount: 0,
       diagnostics,
     }
@@ -203,6 +218,7 @@ export async function readOpenCodeSseEndpoint(params: {
 
   let observedEventCount = 0
   let buffer = ''
+  let reachedEof = false
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   try {
@@ -210,6 +226,7 @@ export async function readOpenCodeSseEndpoint(params: {
       const { done, value } = await reader.read()
       if (done) {
         buffer += decoder.decode()
+        reachedEof = true
         break
       }
       buffer += decoder.decode(value, { stream: true })
@@ -263,6 +280,7 @@ export async function readOpenCodeSseEndpoint(params: {
   return {
     endpoint: params.endpoint,
     connected: true,
+    closedBeforeAbort: reachedEof && !params.signal?.aborted,
     observedEventCount,
     diagnostics,
   }
