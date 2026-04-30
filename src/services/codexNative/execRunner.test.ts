@@ -131,6 +131,58 @@ describe('buildCodexNativeExecArgs', () => {
       '-',
     ])
   })
+
+  test('can ignore user config without dropping dynamic MCP overrides', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        ignoreUserConfig: true,
+        configOverrides: [
+          'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+        ],
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ignore-user-config',
+      '--ephemeral',
+      '-c',
+      'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+      '-',
+    ])
+  })
+
+  test('passes disabled Codex feature flags without dropping user config overrides', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        forcedLoginMethod: 'api',
+        configOverrides: [
+          'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+        ],
+        disabledFeatures: ['plugins'],
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-c',
+      'forced_login_method="api"',
+      '-c',
+      'mcp_servers.agent-teams.command="/usr/local/bin/node"',
+      '--disable',
+      'plugins',
+      '-',
+    ])
+  })
 })
 
 describe('runCodexNativeExec', () => {
@@ -741,6 +793,46 @@ describe('runCodexNativeExec', () => {
 
     await expect(remaining).rejects.toThrow(
       'Codex native exec exited with code 1: fatal native failure',
+    )
+  })
+
+  test('includes Codex JSON error diagnostics when codex exits non-zero without stderr', async () => {
+    const process = new FakeCodexProcess()
+
+    const iterator = runCodexNativeExec(
+      {
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+      },
+      {
+        which: () => '/usr/local/bin/codex',
+        resolveVersion: () => 'codex-cli 0.117.0',
+        spawnProcess: () => process as never,
+      },
+    )
+
+    await iterator.next()
+    const remaining = (async () => {
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) {
+          return
+        }
+      }
+    })()
+
+    process.stdout.write(
+      '{"type":"error","message":"Quota exceeded. Check your plan and billing details."}\n',
+    )
+    process.stdout.write(
+      '{"type":"turn.failed","error":{"message":"Quota exceeded. Check your plan and billing details."}}\n',
+    )
+    process.stdout.end()
+    process.stderr.end()
+    process.emit('close', 1, null)
+
+    await expect(remaining).rejects.toThrow(
+      'Codex native exec exited with code 1: Codex native error: Quota exceeded. Check your plan and billing details.',
     )
   })
 

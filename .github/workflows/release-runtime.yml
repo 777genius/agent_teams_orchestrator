@@ -195,16 +195,13 @@ jobs:
           mv "release/$ARCHIVE_NAME" "release/$versioned_archive_name"
           echo "archive_name=$versioned_archive_name" >> "$GITHUB_OUTPUT"
 
-      - name: Upload packaged runtime to target release
-        env:
-          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
-          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
-          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
-          VERSIONED_ARCHIVE_NAME: ${{ steps.versioned-archive.outputs.archive_name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release upload "$TARGET_RELEASE_TAG" "release/$VERSIONED_ARCHIVE_NAME" --repo "$TARGET_RELEASE_REPO" --clobber
+      - name: Upload packaged runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.platform }}
+          path: release/${{ steps.versioned-archive.outputs.archive_name }}
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish runtime assets
@@ -222,21 +219,12 @@ jobs:
         with:
           bun-version: 1.3.11
 
-      - name: Download packaged runtimes from target release
-        env:
-          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
-          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
-          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
-          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf release-flat
-          mkdir -p release-flat
-          gh release download "$TARGET_RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" --pattern "agent-teams-runtime-darwin-arm64-v${RUNTIME_VERSION}.tar.gz" --dir release-flat
-          gh release download "$TARGET_RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" --pattern "agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz" --dir release-flat
-          gh release download "$TARGET_RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" --pattern "agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz" --dir release-flat
-          gh release download "$TARGET_RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" --pattern "agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip" --dir release-flat
+      - name: Download packaged runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: release-flat
+          merge-multiple: true
 
       - name: Generate manifest and checksums
         env:
@@ -255,4 +243,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "$TARGET_RELEASE_TAG" release-flat/agent-teams-runtime-manifest-*.json release-flat/agent-teams-runtime-SHA256SUMS-* --repo "$TARGET_RELEASE_REPO" --clobber
+          gh release upload "$TARGET_RELEASE_TAG" release-flat/agent-teams-runtime-* --repo "$TARGET_RELEASE_REPO" --clobber

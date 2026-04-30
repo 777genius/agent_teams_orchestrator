@@ -1,7 +1,13 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 
+import {
+  getFlagSettingsInline,
+  setFlagSettingsInline,
+} from '../../bootstrap/state.js'
 import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSdkTypes.js'
+import { clearDynamicTeamContext, setDynamicTeamContext } from '../../utils/teammate.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
+import type { CodexNativeTurnSettledEvent } from './runtimeTurnSettledEmitter.js'
 import {
   executeCodexNativeTurn,
   resolveCodexNativeExecTimeoutPolicy,
@@ -59,6 +65,10 @@ async function collectMessagesAndSummary(
     messages.push(next.value)
   }
 }
+
+afterEach(() => {
+  clearDynamicTeamContext()
+})
 
 describe('executeCodexNativeTurn', () => {
   test('applies mailbox timeout policy to ordinary queued mailbox prompts', () => {
@@ -238,6 +248,188 @@ describe('executeCodexNativeTurn', () => {
 
     expect(observedIdleTimeoutMs).toBe(900_000)
     expect(observedAbsoluteTimeoutMs).toBe(3_600_000)
+  })
+
+  test('disables unsupported Codex plugins only for API-key native execution', async () => {
+    const previousCodeKey = process.env.CODEX_API_KEY
+    const previousOpenAiKey = process.env.OPENAI_API_KEY
+    const previousSettings = getFlagSettingsInline()
+    let observedDisabledFeatures: string[] | undefined
+
+    try {
+      process.env.CODEX_API_KEY = 'sk-test'
+      delete process.env.OPENAI_API_KEY
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'api',
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedDisabledFeatures = options.disabledFeatures
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedDisabledFeatures).toEqual(['plugins'])
+    } finally {
+      if (previousCodeKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = previousCodeKey
+      }
+      if (previousOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = previousOpenAiKey
+      }
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
+  test('keeps Codex plugins enabled for ChatGPT native execution', async () => {
+    const previousCodeKey = process.env.CODEX_API_KEY
+    const previousOpenAiKey = process.env.OPENAI_API_KEY
+    const previousSettings = getFlagSettingsInline()
+    let observedDisabledFeatures: string[] | undefined
+
+    try {
+      process.env.CODEX_API_KEY = 'sk-test'
+      delete process.env.OPENAI_API_KEY
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'chatgpt',
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedDisabledFeatures = options.disabledFeatures
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedDisabledFeatures).toEqual([])
+    } finally {
+      if (previousCodeKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = previousCodeKey
+      }
+      if (previousOpenAiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = previousOpenAiKey
+      }
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
+  test('passes explicit user config isolation to native exec', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedIgnoreUserConfig: boolean | undefined
+
+    try {
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'true'
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedIgnoreUserConfig = options.ignoreUserConfig
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedIgnoreUserConfig).toBe(true)
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+    }
   })
 
   test('records an assistant API error when native execution completes without assistant output', async () => {
@@ -622,5 +814,212 @@ describe('executeCodexNativeTurn', () => {
         codexNativeThreadId: 'thread-persistent',
       },
     ])
+  })
+
+  test('emits codex turn-settled event after native exec completes for teammates', async () => {
+    setDynamicTeamContext({
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const order: string[] = []
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+        runExec: async function* () {
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'thread_started',
+              threadId: 'thread-123',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          order.push('exec-completed')
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: 'thread-123',
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            order.push('emitted')
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(order).toEqual(['exec-completed', 'emitted'])
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      provider: 'codex',
+      eventName: 'runtime_turn_settled',
+      hookEventName: 'Stop',
+      source: 'agent-teams-orchestrator-codex-native',
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      cwd: '/tmp/alpha',
+      outcome: 'success',
+      threadId: 'thread-123',
+    })
+  })
+
+  test('emits codex turn-settled before yielding the terminal result', async () => {
+    setDynamicTeamContext({
+      agentId: 'jack@alpha',
+      agentName: 'jack',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const events: CodexNativeTurnSettledEvent[] = []
+    const iterator = executeCodexNativeTurn(baseParams({ cwd: '/tmp/alpha' }), {
+      runExec: async function* () {
+        yield {
+          type: 'normalized_event',
+          event: {
+            type: 'assistant_text',
+            itemId: 'item_0',
+            text: 'OK',
+          },
+        }
+        yield {
+          type: 'normalized_event',
+          event: {
+            type: 'turn_completed',
+          },
+        }
+        return {
+          identity: null,
+          threadId: 'thread-123',
+          credentialSource: 'ambient-process-env',
+          completionPolicy: 'ephemeral',
+          finalHistoryCompleteness: 'live-only',
+          finalUsageAuthority: 'live-turn-completed',
+        }
+      },
+      runtimeTurnSettledEmitter: {
+        async emit(event) {
+          events.push(event)
+        },
+      },
+    })
+
+    try {
+      while (true) {
+        const next = await iterator.next()
+        expect(next.done).toBe(false)
+        if (!next.done && next.value.type === 'result') {
+          expect(events).toHaveLength(1)
+          expect(events[0]).toMatchObject({
+            outcome: 'success',
+            threadId: 'thread-123',
+          })
+          break
+        }
+      }
+    } finally {
+      await iterator.return(undefined as never)
+    }
+  })
+
+  test('emits codex turn-settled event for terminal error paths', async () => {
+    setDynamicTeamContext({
+      agentId: 'bob@alpha',
+      agentName: 'bob',
+      teamName: 'alpha',
+      planModeRequired: false,
+    })
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        runExec: async function* () {
+          throw new Error('codex crashed')
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      provider: 'codex',
+      agentName: 'bob',
+      teamName: 'alpha',
+      outcome: 'error',
+      detail: 'codex crashed',
+    })
+  })
+
+  test('does not emit codex turn-settled event outside teammate context', async () => {
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams(), {
+        runExec: async function* () {
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: null,
+            credentialSource: 'ambient-process-env',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+        runtimeTurnSettledEmitter: {
+          async emit(event) {
+            events.push(event)
+          },
+        },
+      }),
+    )
+
+    expect(events).toEqual([])
   })
 })

@@ -30,6 +30,12 @@ import {
 import { runCodexNativeExec } from './execRunner.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import {
+  buildCodexNativeTurnSettledEvent,
+  emitCodexNativeTurnSettledBestEffort,
+  type CodexNativeTurnSettledEmitterPort,
+  type CodexNativeTurnSettledOutcome,
+} from './runtimeTurnSettledEmitter.js'
+import {
   createCodexNativeExecutionSummaryMessage,
   createCodexNativeThreadStatusMessage,
 } from './statusAuthority.js'
@@ -73,6 +79,7 @@ type ExecuteCodexNativeTurnDeps = {
   runExec?: typeof runCodexNativeExec
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
+  runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
 }
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 300_000
@@ -91,6 +98,8 @@ const CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_DIRECT_ABSOLUTE_TIMEOUT_MS'
 const CODEX_NATIVE_DIRECT_TIMEOUT_ENV =
   'CLAUDE_CODE_CODEX_NATIVE_DIRECT_TURN_TIMEOUT_MS'
+const CODEX_NATIVE_IGNORE_USER_CONFIG_ENV =
+  'CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG'
 
 export type CodexNativeExecTimeoutPolicy = {
   idleTimeoutMs: number | null
@@ -243,6 +252,26 @@ function shouldUseEphemeralCodexNativeThread(
   return env.CLAUDE_CODE_CODEX_NATIVE_PERSIST_THREADS !== '1'
 }
 
+function shouldIgnoreCodexNativeUserConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const value = env[CODEX_NATIVE_IGNORE_USER_CONFIG_ENV]?.trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+}
+
+function resolveCodexNativeDisabledFeatures(params: {
+  apiKey: string | null | undefined
+  forcedLoginMethod: ReturnType<typeof getCodexForcedLoginMethod> | undefined
+}): string[] {
+  if (!params.apiKey || params.forcedLoginMethod === 'chatgpt') {
+    return []
+  }
+
+  // Codex API-key auth cannot sync ChatGPT remote plugins. Keep user config and
+  // MCP overrides intact, but disable the unsupported plugin subsystem.
+  return ['plugins']
+}
+
 async function persistMessages(
   messages: Message[],
   persistSession: boolean,
@@ -349,6 +378,25 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
+  const emitRuntimeTurnSettled = async (input: {
+    outcome: CodexNativeTurnSettledOutcome
+    threadId?: string | null
+    detail?: string
+  }): Promise<void> => {
+    const event = buildCodexNativeTurnSettledEvent({
+      cwd: params.cwd,
+      outcome: input.outcome,
+      threadId: input.threadId,
+      detail: input.detail,
+    })
+    if (!event) {
+      return
+    }
+    await emitCodexNativeTurnSettledBestEffort(
+      event,
+      deps.runtimeTurnSettledEmitter,
+    )
+  }
 
   params.setSDKStatus?.('running')
 
@@ -376,6 +424,11 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'unsupported',
+      detail: unsupportedReason,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message: unsupportedReason,
@@ -385,7 +438,6 @@ export async function* executeCodexNativeTurn(
       totalUsage: params.totalUsage,
       model: params.model,
     })
-    params.setSDKStatus?.('idle')
     return {
       totalUsage: params.totalUsage,
       binaryIdentity: null,
@@ -411,6 +463,8 @@ export async function* executeCodexNativeTurn(
     const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
       resolvedPrompt.text,
     )
+    const apiKey = getCodexNativeApiKey() ?? undefined
+    const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
     const iterator = runExec({
       prompt: resolvedPrompt.text,
       cwd: params.cwd,
@@ -422,9 +476,14 @@ export async function* executeCodexNativeTurn(
       sandboxMode: mapPermissionModeToSandboxMode(params.permissionMode),
       additionalWritableDirectories: params.additionalWritableDirectories,
       ephemeral: shouldUseEphemeralCodexNativeThread(),
-      apiKey: getCodexNativeApiKey() ?? undefined,
-      forcedLoginMethod: getCodexForcedLoginMethod() ?? undefined,
+      apiKey,
+      forcedLoginMethod,
       configOverrides: buildCodexNativeMcpConfigOverrides(),
+      disabledFeatures: resolveCodexNativeDisabledFeatures({
+        apiKey,
+        forcedLoginMethod,
+      }),
+      ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
       abortSignal: params.abortSignal,
       idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
       absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,
@@ -499,6 +558,12 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'error',
+      threadId,
+      detail: message,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message,
@@ -508,7 +573,6 @@ export async function* executeCodexNativeTurn(
       totalUsage: projector.getTotalUsage(),
       model: params.model,
     })
-    params.setSDKStatus?.('idle')
     return {
       totalUsage: projector.getTotalUsage(),
       binaryIdentity,
@@ -552,6 +616,12 @@ export async function* executeCodexNativeTurn(
     )
     yield* normalizeMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
+    params.setSDKStatus?.('idle')
+    await emitRuntimeTurnSettled({
+      outcome: 'no_assistant',
+      threadId,
+      detail: message,
+    })
     yield buildResultErrorMessage({
       subtype: 'error_during_execution',
       message,
@@ -561,7 +631,6 @@ export async function* executeCodexNativeTurn(
       totalUsage: projector.getTotalUsage(),
       model: params.model,
     })
-    params.setSDKStatus?.('idle')
     return {
       totalUsage: projector.getTotalUsage(),
       binaryIdentity,
@@ -607,6 +676,11 @@ export async function* executeCodexNativeTurn(
     finalAssistant.message.content.find(block => block.type === 'text')?.text ??
     ''
 
+  params.setSDKStatus?.('idle')
+  await emitRuntimeTurnSettled({
+    outcome: 'success',
+    threadId,
+  })
   yield buildResultSuccessMessage({
     result: finalText,
     startTime: params.startTime,
@@ -615,7 +689,6 @@ export async function* executeCodexNativeTurn(
     totalUsage: projector.getTotalUsage(),
     model: params.model,
   })
-  params.setSDKStatus?.('idle')
 
   return {
     totalUsage: projector.getTotalUsage(),

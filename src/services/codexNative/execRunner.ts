@@ -23,6 +23,8 @@ export type CodexNativeExecRunnerOptions = {
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
+  disabledFeatures?: string[]
+  ignoreUserConfig?: boolean
   abortSignal?: AbortSignal
   timeoutMs?: number | null
   idleTimeoutMs?: number | null
@@ -122,6 +124,10 @@ export function buildCodexNativeExecArgs(
 ): string[] {
   const args = ['exec', '--json', '--skip-git-repo-check', '-C', options.cwd]
 
+  if (options.ignoreUserConfig) {
+    args.push('--ignore-user-config')
+  }
+
   if (options.ephemeral !== false) {
     args.push('--ephemeral')
   }
@@ -140,6 +146,10 @@ export function buildCodexNativeExecArgs(
 
   for (const override of options.configOverrides ?? []) {
     args.push('-c', override)
+  }
+
+  for (const feature of options.disabledFeatures ?? []) {
+    args.push('--disable', feature)
   }
 
   if (options.sandboxMode) {
@@ -483,6 +493,7 @@ export async function* runCodexNativeExec(
   }
 
   let threadId: string | null = null
+  const codexDiagnosticLines: string[] = []
   const stderrFilterState: CodexNativeStderrFilterState = {
     suppressAnalyticsHtmlContinuation: false,
   }
@@ -531,6 +542,9 @@ export async function* runCodexNativeExec(
         if (event.type === 'thread_started') {
           threadId = event.threadId
         }
+        if (event.type === 'warning' && event.source === 'codex') {
+          codexDiagnosticLines.push(event.text)
+        }
         yield {
           type: 'normalized_event',
           event,
@@ -562,8 +576,10 @@ export async function* runCodexNativeExec(
       const detail = exit.signal
         ? `signal ${exit.signal}`
         : `code ${exit.code ?? 1}`
+      const diagnosticLines =
+        stderrLines.length > 0 ? stderrLines : codexDiagnosticLines
       const stderrText =
-        stderrLines.length > 0 ? `: ${stderrLines.join('\n')}` : ''
+        diagnosticLines.length > 0 ? `: ${diagnosticLines.join('\n')}` : ''
       throw new Error(`Codex native exec exited with ${detail}${stderrText}`)
     }
 

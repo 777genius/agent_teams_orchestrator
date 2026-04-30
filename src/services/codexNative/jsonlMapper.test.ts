@@ -138,6 +138,32 @@ describe('mapCodexNativeExecLine', () => {
     ])
   })
 
+  test('surfaces Codex error and turn failure messages', () => {
+    expect(
+      mapCodexNativeExecLine(
+        '{"type":"error","message":"Quota exceeded. Check your plan and billing details."}',
+      ),
+    ).toEqual([
+      {
+        type: 'warning',
+        source: 'codex',
+        text: 'Codex native error: Quota exceeded. Check your plan and billing details.',
+      },
+    ])
+
+    expect(
+      mapCodexNativeExecLine(
+        '{"type":"turn.failed","error":{"message":"Missing bearer or basic authentication in header"}}',
+      ),
+    ).toEqual([
+      {
+        type: 'warning',
+        source: 'codex',
+        text: 'Codex native turn failed: Missing bearer or basic authentication in header',
+      },
+    ])
+  })
+
   test('drops unsupported item lifecycle events instead of surfacing noisy warnings', () => {
     expect(
       mapCodexNativeExecLine(
