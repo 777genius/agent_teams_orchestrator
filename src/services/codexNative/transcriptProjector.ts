@@ -62,6 +62,22 @@ function buildCodexNativeMcpToolName(params: {
   return `mcp__${params.serverName}__${params.toolName}`
 }
 
+function buildCodexNativeToolName(event: Extract<
+  CodexNativeNormalizedEvent,
+  { type: 'tool_call_started' | 'tool_call_completed' }
+>): string {
+  if (event.toolSource === 'mcp') {
+    if (!event.serverName) {
+      return event.toolName
+    }
+    return buildCodexNativeMcpToolName({
+      serverName: event.serverName,
+      toolName: event.toolName,
+    })
+  }
+  return event.toolName
+}
+
 function buildCodexNativeToolResultContent(event: Extract<
   CodexNativeNormalizedEvent,
   { type: 'tool_call_completed' }
@@ -70,7 +86,7 @@ function buildCodexNativeToolResultContent(event: Extract<
     return event.resultText
   }
   if (event.isError) {
-    const detail = event.errorMessage?.trim() || 'Codex MCP tool call failed.'
+    const detail = event.errorMessage?.trim() || 'Codex native tool call failed.'
     return `<tool_use_error>${detail}</tool_use_error>`
   }
   return 'Tool completed successfully.'
@@ -106,10 +122,7 @@ export class CodexNativeTranscriptProjector {
               {
                 type: 'tool_use',
                 id: event.itemId,
-                name: buildCodexNativeMcpToolName({
-                  serverName: event.serverName,
-                  toolName: event.toolName,
-                }),
+                name: buildCodexNativeToolName(event),
                 input: event.arguments,
               } as never,
             ],
@@ -205,13 +218,10 @@ export class CodexNativeTranscriptProjector {
     const agentId = getAgentId()
 
     const explicitlyAnnotated =
-      toolResultEvent && message.type === 'user'
+      toolResultEvent && message.type === 'user' && toolResultEvent.toolSource === 'mcp'
         ? annotateBoardTaskToolResultMessage({
             message: message as UserMessage,
-            toolName: buildCodexNativeMcpToolName({
-              serverName: toolResultEvent.serverName,
-              toolName: toolResultEvent.toolName,
-            }),
+            toolName: buildCodexNativeToolName(toolResultEvent),
             input: toolResultEvent.arguments,
             result: toolResultEvent.rawResult,
             toolUseId: toolResultEvent.itemId,

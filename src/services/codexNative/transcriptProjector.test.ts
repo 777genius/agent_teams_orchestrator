@@ -133,6 +133,7 @@ describe('CodexNativeTranscriptProjector', () => {
       projector.apply({
         type: 'tool_call_started',
         itemId: 'tool-1',
+        toolSource: 'mcp',
         serverName: 'agent-teams',
         toolName: 'member_briefing',
         arguments: {
@@ -140,6 +141,7 @@ describe('CodexNativeTranscriptProjector', () => {
           memberName: 'alice',
         },
         status: 'in_progress',
+        rawItemType: 'mcp_tool_call',
       }),
     ).toMatchObject({
       appendedMessages: [
@@ -167,6 +169,7 @@ describe('CodexNativeTranscriptProjector', () => {
       projector.apply({
         type: 'tool_call_completed',
         itemId: 'tool-1',
+        toolSource: 'mcp',
         serverName: 'agent-teams',
         toolName: 'member_briefing',
         arguments: {
@@ -185,6 +188,7 @@ describe('CodexNativeTranscriptProjector', () => {
         },
         errorMessage: null,
         isError: false,
+        rawItemType: 'mcp_tool_call',
       }),
     ).toMatchObject({
       appendedMessages: [
@@ -229,6 +233,79 @@ describe('CodexNativeTranscriptProjector', () => {
     })
   })
 
+  test('projects native command tools without fabricating MCP tool names', () => {
+    const projector = new CodexNativeTranscriptProjector()
+
+    const start = projector.apply({
+      type: 'tool_call_started',
+      itemId: 'item-command',
+      toolSource: 'native',
+      toolName: 'Bash',
+      arguments: {
+        command: 'pwd && ls',
+      },
+      status: 'in_progress',
+      rawItemType: 'command_execution',
+    })
+
+    expect(start.appendedMessages[0]).toMatchObject({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'item-command',
+            name: 'Bash',
+            input: {
+              command: 'pwd && ls',
+            },
+          },
+        ],
+      },
+    })
+    expect(JSON.stringify(start.appendedMessages[0])).not.toContain('mcp__undefined')
+
+    const result = projector.apply({
+      type: 'tool_call_completed',
+      itemId: 'item-command',
+      toolSource: 'native',
+      toolName: 'Bash',
+      arguments: {
+        command: 'pwd && ls',
+      },
+      status: 'completed',
+      resultText: '/tmp\nfile.txt\n',
+      rawResult: {
+        content: '/tmp\nfile.txt\n',
+        stdout: '/tmp\nfile.txt\n',
+        exitCode: 0,
+      },
+      errorMessage: null,
+      isError: false,
+      rawItemType: 'command_execution',
+    })
+
+    expect(result.appendedMessages[0]).toMatchObject({
+      type: 'user',
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'item-command',
+            content: '/tmp\nfile.txt\n',
+            is_error: false,
+          },
+        ],
+      },
+      toolUseResult: {
+        content: '/tmp\nfile.txt\n',
+        stdout: '/tmp\nfile.txt\n',
+        exitCode: 0,
+      },
+    })
+    expect(result.appendedMessages[0]).not.toHaveProperty('boardTaskToolActions')
+  })
+
   test('annotates Codex-native board lifecycle and ambient execution metadata for teammate sessions', () => {
     setDynamicTeamContext({
       agentId: 'alice@harbor-labs',
@@ -242,6 +319,7 @@ describe('CodexNativeTranscriptProjector', () => {
     projector.apply({
       type: 'tool_call_started',
       itemId: 'tool-start',
+      toolSource: 'mcp',
       serverName: 'agent-teams',
       toolName: 'task_start',
       arguments: {
@@ -249,11 +327,13 @@ describe('CodexNativeTranscriptProjector', () => {
         taskId: 'abcd1234',
       },
       status: 'in_progress',
+      rawItemType: 'mcp_tool_call',
     })
 
     const startResult = projector.apply({
       type: 'tool_call_completed',
       itemId: 'tool-start',
+      toolSource: 'mcp',
       serverName: 'agent-teams',
       toolName: 'task_start',
       arguments: {
@@ -268,6 +348,7 @@ describe('CodexNativeTranscriptProjector', () => {
       },
       errorMessage: null,
       isError: false,
+      rawItemType: 'mcp_tool_call',
     })
 
     expect(startResult.appendedMessages[0]).toMatchObject({
@@ -317,17 +398,20 @@ describe('CodexNativeTranscriptProjector', () => {
     projector.apply({
       type: 'tool_call_started',
       itemId: 'tool-read',
+      toolSource: 'mcp',
       serverName: 'filesystem',
       toolName: 'read_file',
       arguments: {
         path: '/tmp/spec.md',
       },
       status: 'in_progress',
+      rawItemType: 'mcp_tool_call',
     })
 
     const readResult = projector.apply({
       type: 'tool_call_completed',
       itemId: 'tool-read',
+      toolSource: 'mcp',
       serverName: 'filesystem',
       toolName: 'read_file',
       arguments: {
@@ -345,6 +429,7 @@ describe('CodexNativeTranscriptProjector', () => {
       },
       errorMessage: null,
       isError: false,
+      rawItemType: 'mcp_tool_call',
     })
 
     expect(readResult.appendedMessages[0]).toMatchObject({

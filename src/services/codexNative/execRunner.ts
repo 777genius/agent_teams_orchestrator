@@ -9,6 +9,7 @@ import {
 } from '../runtimeBackends/codexBackendResolver.js'
 import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli, spawnSyncPortableCli } from '../../utils/portableCli.js'
+import { CodexNativeTraceWriter } from './CodexNativeTraceWriter.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
 
@@ -497,6 +498,14 @@ export async function* runCodexNativeExec(
   const stderrFilterState: CodexNativeStderrFilterState = {
     suppressAnalyticsHtmlContinuation: false,
   }
+  const traceWriter = new CodexNativeTraceWriter({
+    cwd: options.cwd,
+    codexVersion: identity.version,
+  })
+  let traceOutcome: 'success' | 'error' | 'timeout' | 'aborted' | 'interrupted' =
+    'interrupted'
+  let traceExitCode: number | null | undefined
+  let traceSignal: NodeJS.Signals | null | undefined
 
   let spawnError: Error | null = null
   child.once('error', error => {
@@ -523,6 +532,7 @@ export async function* runCodexNativeExec(
           entry.line,
           stderrFilterState,
         )
+        await traceWriter.recordStderrLine(entry.line, rewrittenLine).catch(() => undefined)
         if (!rewrittenLine) {
           continue
         }
@@ -538,6 +548,7 @@ export async function* runCodexNativeExec(
         continue
       }
 
+      await traceWriter.recordStdoutLine(entry.line).catch(() => undefined)
       for (const event of mapCodexNativeExecLine(entry.line)) {
         if (event.type === 'thread_started') {
           threadId = event.threadId
@@ -553,15 +564,20 @@ export async function* runCodexNativeExec(
     }
 
     const exit = await exitPromise
+    traceExitCode = exit.code
+    traceSignal = exit.signal
 
     if (spawnError) {
+      traceOutcome = 'error'
       throw spawnError
     }
     if (stdinError) {
+      traceOutcome = 'error'
       throw stdinError
     }
 
     if (timeoutReason) {
+      traceOutcome = 'timeout'
       if (timeoutReason.type === 'idle') {
         throw new Error(
           `Codex native exec timed out after ${timeoutReason.timeoutMs}ms of inactivity.`,
@@ -573,6 +589,7 @@ export async function* runCodexNativeExec(
     }
 
     if (exit.code !== 0 || exit.signal) {
+      traceOutcome = options.abortSignal?.aborted ? 'aborted' : 'error'
       const detail = exit.signal
         ? `signal ${exit.signal}`
         : `code ${exit.code ?? 1}`
@@ -583,6 +600,7 @@ export async function* runCodexNativeExec(
       throw new Error(`Codex native exec exited with ${detail}${stderrText}`)
     }
 
+    traceOutcome = 'success'
     return {
       identity,
       threadId,
@@ -595,6 +613,13 @@ export async function* runCodexNativeExec(
       finalUsageAuthority: 'live-turn-completed',
     }
   } finally {
+    await traceWriter
+      .finish({
+        outcome: options.abortSignal?.aborted ? 'aborted' : traceOutcome,
+        exitCode: traceExitCode,
+        signal: traceSignal ?? null,
+      })
+      .catch(() => undefined)
     clearTimeouts()
     options.abortSignal?.removeEventListener('abort', onAbort)
     if (!childClosed) {

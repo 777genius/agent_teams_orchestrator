@@ -19,6 +19,16 @@ type CodexMcpToolCallItem = {
   result?: unknown
   error?: unknown
   status?: string
+  command?: string
+  aggregated_output?: string
+  output?: string
+  stderr?: string
+  exit_code?: number | null
+  exitCode?: number | null
+  changes?: Array<{
+    path?: string
+    kind?: string
+  }>
 }
 
 type CodexItemCompletedEvent = {
@@ -73,10 +83,31 @@ type CodexExecJsonEvent =
 
 function parseJsonLine(rawLine: string): CodexExecJsonEvent | null {
   try {
-    return JSON.parse(rawLine) as CodexExecJsonEvent
+    const parsed = JSON.parse(rawLine) as Record<string, unknown>
+    if (
+      typeof parsed.type !== 'string' &&
+      typeof parsed.method === 'string' &&
+      parsed.params &&
+      typeof parsed.params === 'object' &&
+      !Array.isArray(parsed.params)
+    ) {
+      return {
+        type: parsed.method,
+        ...(parsed.params as Record<string, unknown>),
+      } as CodexExecJsonEvent
+    }
+    return parsed as CodexExecJsonEvent
   } catch {
     return null
   }
+}
+
+function isCodexNativeToolMappingEnabled(): boolean {
+  const value = process.env.CLAUDE_CODE_CODEX_NATIVE_TOOL_MAPPING_ENABLED
+  if (value == null) {
+    return true
+  }
+  return /^(1|true|yes|on)$/i.test(value.trim())
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -120,6 +151,171 @@ function extractMcpToolErrorMessage(value: unknown): string | null {
   return typeof message === 'string' && message.trim().length > 0 ? message : null
 }
 
+function normalizeItemStatus(value: unknown, fallback: string): string {
+  return typeof value === 'string' && value.trim().length > 0 ? value : fallback
+}
+
+function summarizeFileChanges(changes: CodexMcpToolCallItem['changes']): string {
+  const normalizedChanges = Array.isArray(changes) ? changes : []
+  if (normalizedChanges.length === 0) {
+    return 'File changes completed.'
+  }
+  return [
+    'File changes:',
+    ...normalizedChanges.map(change => {
+      const path = typeof change.path === 'string' && change.path.trim().length > 0
+        ? change.path.trim()
+        : '(unknown path)'
+      const kind = typeof change.kind === 'string' && change.kind.trim().length > 0
+        ? change.kind.trim()
+        : 'update'
+      return `- ${path} (${kind})`
+    }),
+  ].join('\n')
+}
+
+function buildCommandResult(item: CodexMcpToolCallItem): Record<string, unknown> {
+  const output =
+    typeof item.aggregated_output === 'string'
+      ? item.aggregated_output
+      : typeof item.output === 'string'
+        ? item.output
+        : ''
+  const stderr = typeof item.stderr === 'string' ? item.stderr : ''
+  const exitCode =
+    typeof item.exit_code === 'number'
+      ? item.exit_code
+      : typeof item.exitCode === 'number'
+        ? item.exitCode
+        : null
+  const status = normalizeItemStatus(item.status, 'unknown')
+  return {
+    content: output || stderr || `Command ${status}.`,
+    stdout: output,
+    stderr,
+    exitCode,
+    status,
+    toolName: 'Bash',
+    toolUseId: item.id,
+  }
+}
+
+function getCommandExitCode(item: CodexMcpToolCallItem): number | null {
+  return typeof item.exit_code === 'number'
+    ? item.exit_code
+    : typeof item.exitCode === 'number'
+      ? item.exitCode
+      : null
+}
+
+function buildFileChangeResult(item: CodexMcpToolCallItem): Record<string, unknown> {
+  const content = summarizeFileChanges(item.changes)
+  return {
+    content,
+    changes: Array.isArray(item.changes) ? item.changes : [],
+    status: normalizeItemStatus(item.status, 'unknown'),
+    toolName: 'Edit',
+    toolUseId: item.id,
+  }
+}
+
+function mapNativeItemStarted(item: CodexMcpToolCallItem): CodexNativeNormalizedEvent[] {
+  if (typeof item.id !== 'string') {
+    return []
+  }
+
+  if (item.type === 'command_execution') {
+    return [
+      {
+        type: 'tool_call_started',
+        itemId: item.id,
+        toolSource: 'native',
+        toolName: 'Bash',
+        arguments: {
+          command: typeof item.command === 'string' ? item.command : '',
+        },
+        status: normalizeItemStatus(item.status, 'in_progress'),
+        rawItemType: 'command_execution',
+      },
+    ]
+  }
+
+  if (item.type === 'file_change') {
+    return [
+      {
+        type: 'tool_call_started',
+        itemId: item.id,
+        toolSource: 'native',
+        toolName: 'Edit',
+        arguments: {
+          file_path: item.changes?.find(change => typeof change.path === 'string')?.path ?? '',
+          changes: Array.isArray(item.changes) ? item.changes : [],
+        },
+        status: normalizeItemStatus(item.status, 'in_progress'),
+        rawItemType: 'file_change',
+      },
+    ]
+  }
+
+  return []
+}
+
+function mapNativeItemCompleted(item: CodexMcpToolCallItem): CodexNativeNormalizedEvent[] {
+  if (typeof item.id !== 'string') {
+    return []
+  }
+
+  if (item.type === 'command_execution') {
+    const status = normalizeItemStatus(item.status, 'unknown')
+    const rawResult = buildCommandResult(item)
+    const resultText = typeof rawResult.content === 'string' ? rawResult.content : null
+    const exitCode = getCommandExitCode(item)
+    return [
+      {
+        type: 'tool_call_completed',
+        itemId: item.id,
+        toolSource: 'native',
+        toolName: 'Bash',
+        arguments: {
+          command: typeof item.command === 'string' ? item.command : '',
+        },
+        status,
+        resultText,
+        rawResult,
+        errorMessage: status === 'failed' ? resultText : null,
+        isError: status === 'failed' || status === 'declined' || (exitCode !== null && exitCode !== 0),
+        rawItemType: 'command_execution',
+      },
+    ]
+  }
+
+  if (item.type === 'file_change') {
+    const status = normalizeItemStatus(item.status, 'unknown')
+    const rawResult = buildFileChangeResult(item)
+    const resultText = typeof rawResult.content === 'string' ? rawResult.content : null
+    return [
+      {
+        type: 'tool_call_completed',
+        itemId: item.id,
+        toolSource: 'native',
+        toolName: 'Edit',
+        arguments: {
+          file_path: item.changes?.find(change => typeof change.path === 'string')?.path ?? '',
+          changes: Array.isArray(item.changes) ? item.changes : [],
+        },
+        status,
+        resultText,
+        rawResult,
+        errorMessage: status === 'failed' ? resultText : null,
+        isError: status === 'failed',
+        rawItemType: 'file_change',
+      },
+    ]
+  }
+
+  return []
+}
+
 function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
   if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
     return [
@@ -145,6 +341,7 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
       {
         type: 'tool_call_started',
         itemId: event.item.id,
+        toolSource: 'mcp',
         serverName: event.item.server,
         toolName: event.item.tool,
         arguments: asRecord(event.item.arguments) ?? {},
@@ -152,8 +349,23 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
           typeof event.item.status === 'string' && event.item.status.trim().length > 0
             ? event.item.status
             : 'in_progress',
+        rawItemType: 'mcp_tool_call',
       },
     ]
+  }
+
+  if (event.type === 'item.started' && event.item && isCodexNativeToolMappingEnabled()) {
+    const nativeEvents = mapNativeItemStarted(event.item)
+    if (nativeEvents.length > 0) {
+      return nativeEvents
+    }
+    if (
+      event.item.type === 'todo_list' ||
+      event.item.type === 'reasoning' ||
+      event.item.type === 'agent_message'
+    ) {
+      return []
+    }
   }
 
   if (
@@ -188,17 +400,29 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
       {
         type: 'tool_call_completed',
         itemId: event.item.id,
+        toolSource: 'mcp',
         serverName: event.item.server,
         toolName: event.item.tool,
         arguments: asRecord(event.item.arguments) ?? {},
         status,
         resultText:
           extractMcpToolResultText(event.item.result) ?? errorMessage,
-        rawResult: event.item.result ?? null,
+        rawResult: event.item.result ?? event.item.error ?? null,
         errorMessage,
         isError,
+        rawItemType: 'mcp_tool_call',
       },
     ]
+  }
+
+  if (event.type === 'item.completed' && event.item && isCodexNativeToolMappingEnabled()) {
+    const nativeEvents = mapNativeItemCompleted(event.item)
+    if (nativeEvents.length > 0) {
+      return nativeEvents
+    }
+    if (event.item.type === 'todo_list' || event.item.type === 'reasoning') {
+      return []
+    }
   }
 
   if (event.type === 'turn.completed') {
@@ -244,8 +468,32 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
     }
   }
 
-  if (event.type === 'item.started' || event.type === 'item.completed') {
-    return []
+  if (
+    event.type === 'item.started' ||
+    event.type === 'item.completed' ||
+    event.type === 'item.updated'
+  ) {
+    const itemType = asRecord(event)?.item
+    const itemRecord = asRecord(itemType)
+    if (itemRecord?.type === 'todo_list' || itemRecord?.type === 'reasoning') {
+      return []
+    }
+    if (
+      !isCodexNativeToolMappingEnabled() &&
+      (itemRecord?.type === 'command_execution' || itemRecord?.type === 'file_change')
+    ) {
+      return []
+    }
+    return [
+      {
+        type: 'unsupported_raw_event',
+        rawType:
+          typeof itemRecord?.type === 'string'
+            ? `${event.type}:${itemRecord.type}`
+            : event.type,
+        payload: event,
+      },
+    ]
   }
 
   return [
