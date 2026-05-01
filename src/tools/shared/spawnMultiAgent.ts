@@ -6,8 +6,9 @@
 import React from 'react'
 import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createWriteStream, type WriteStream } from 'node:fs'
-import { access, readFile, writeFile } from 'node:fs/promises'
+import { createWriteStream, type Dirent, type WriteStream } from 'node:fs'
+import { access, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -300,11 +301,320 @@ function buildBootstrapConfirmationIdentitySet(
   return result
 }
 
+function matchesBootstrapTranscriptMemberName(
+  observedName: string,
+  expectedName: string,
+): boolean {
+  return normalizeTeammateIdentity(observedName) === normalizeTeammateIdentity(expectedName)
+}
+
 function buildTeammateSpawnReservationKey(
   teamName: string,
   name: string,
 ): string {
   return `${teamName.toLowerCase()}::${normalizeTeammateIdentity(name)}`
+}
+
+const BOOTSTRAP_TRANSCRIPT_LOOKBACK_MS = 30_000
+const BOOTSTRAP_TRANSCRIPT_CANDIDATE_CACHE_MS = 750
+const BOOTSTRAP_TRANSCRIPT_MAX_FILES = 80
+const BOOTSTRAP_TRANSCRIPT_TAIL_BYTES = 128 * 1024
+
+type BootstrapTranscriptCandidate = { filePath: string; mtimeMs: number }
+
+const bootstrapTranscriptCandidateCache = new Map<
+  string,
+  { expiresAt: number; candidates: BootstrapTranscriptCandidate[] }
+>()
+
+function extractTranscriptTextContent(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed ? [trimmed] : []
+  }
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const parts: string[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+    const record = item as { type?: unknown; text?: unknown; content?: unknown }
+    if (record.type === 'text' && typeof record.text === 'string') {
+      const trimmed = record.text.trim()
+      if (trimmed) {
+        parts.push(trimmed)
+      }
+      continue
+    }
+    parts.push(...extractTranscriptTextContent(record.content))
+  }
+  return parts
+}
+
+function extractTranscriptMessageText(record: unknown): string | null {
+  if (!record || typeof record !== 'object') {
+    return null
+  }
+  const normalizedRecord = record as {
+    text?: unknown
+    content?: unknown
+    message?: unknown
+    toolUseResult?: unknown
+  }
+  if (typeof normalizedRecord.text === 'string') {
+    const trimmed = normalizedRecord.text.trim()
+    if (trimmed) {
+      return trimmed
+    }
+  }
+  const fromContent = extractTranscriptTextContent(normalizedRecord.content)
+  if (fromContent.length > 0) {
+    return fromContent.join('\n')
+  }
+  const fromToolUseResult = extractTranscriptTextContent(
+    normalizedRecord.toolUseResult,
+  )
+  if (fromToolUseResult.length > 0) {
+    return fromToolUseResult.join('\n')
+  }
+  if (normalizedRecord.message) {
+    return extractTranscriptMessageText(normalizedRecord.message)
+  }
+  return null
+}
+
+function isBootstrapMemberBriefingSuccessText(params: {
+  text: string
+  teamName: string
+  teammateName: string
+}): boolean {
+  const normalizedText = params.text.replace(/\s+/g, ' ').trim().toLowerCase()
+  const normalizedTeamName = params.teamName.trim().toLowerCase()
+  const normalizedTeammateName = params.teammateName.trim().toLowerCase()
+  if (!normalizedText || !normalizedTeamName || !normalizedTeammateName) {
+    return false
+  }
+  return (
+    normalizedText.startsWith(
+      `member briefing for ${normalizedTeammateName} on team "${normalizedTeamName}" (${normalizedTeamName}).`,
+    )
+    || normalizedText.startsWith(
+      `member briefing for ${normalizedTeammateName} on team '${normalizedTeamName}' (${normalizedTeamName}).`,
+    )
+  )
+}
+
+function isBootstrapTranscriptContextText(params: {
+  text: string
+  teamName: string
+  teammateName: string
+}): boolean {
+  const normalizedText = params.text.replace(/\s+/g, ' ').trim().toLowerCase()
+  const normalizedTeamName = params.teamName.trim().toLowerCase()
+  const normalizedTeammateName = params.teammateName.trim().toLowerCase()
+  return (
+    normalizedText.includes(normalizedTeamName)
+    && normalizedText.includes(normalizedTeammateName)
+    && (normalizedText.includes('bootstrapping into team')
+      || normalizedText.includes('member briefing')
+      || normalizedText.includes('task briefing'))
+  )
+}
+
+async function readBootstrapConfirmationFromTranscriptFile(params: {
+  filePath: string
+  teamName: string
+  teammateName: string
+  boundaryMs: number
+}): Promise<boolean> {
+  let content: string
+  try {
+    const buffer = await readFile(params.filePath)
+    const tail =
+      buffer.length > BOOTSTRAP_TRANSCRIPT_TAIL_BYTES
+        ? buffer.subarray(buffer.length - BOOTSTRAP_TRANSCRIPT_TAIL_BYTES)
+        : buffer
+    content = tail.toString('utf8')
+  } catch {
+    return false
+  }
+
+  const lines = content.split('\n')
+  if (content.length >= BOOTSTRAP_TRANSCRIPT_TAIL_BYTES) {
+    lines.shift()
+  }
+  const contextBoundaryMs = params.boundaryMs - BOOTSTRAP_TRANSCRIPT_LOOKBACK_MS
+  let fileHasExpectedAgentContext = false
+  for (const rawLine of lines) {
+    const line = rawLine?.trim()
+    if (!line) {
+      continue
+    }
+    let parsed: { timestamp?: unknown; teamName?: unknown; agentName?: unknown } | null = null
+    try {
+      parsed = JSON.parse(line) as {
+        timestamp?: unknown
+        teamName?: unknown
+        agentName?: unknown
+      }
+    } catch {
+      continue
+    }
+    const timestampMs =
+      typeof parsed.timestamp === 'string'
+        ? Date.parse(parsed.timestamp)
+        : Number.NaN
+    if (!Number.isFinite(timestampMs) || timestampMs < contextBoundaryMs) {
+      continue
+    }
+    const parsedAgentName =
+      typeof parsed.agentName === 'string' ? parsed.agentName.trim() : ''
+    if (
+      !parsedAgentName
+      || !matchesBootstrapTranscriptMemberName(parsedAgentName, params.teammateName)
+    ) {
+      continue
+    }
+    const parsedTeamName =
+      typeof parsed.teamName === 'string' ? parsed.teamName.trim().toLowerCase() : ''
+    if (parsedTeamName === params.teamName.trim().toLowerCase()) {
+      fileHasExpectedAgentContext = true
+      break
+    }
+    const text = extractTranscriptMessageText(parsed)
+    if (
+      text
+      && isBootstrapTranscriptContextText({
+        text,
+        teamName: params.teamName,
+        teammateName: params.teammateName,
+      })
+    ) {
+      fileHasExpectedAgentContext = true
+      break
+    }
+  }
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]?.trim()
+    if (!line) {
+      continue
+    }
+    let parsed: { timestamp?: unknown } | null = null
+    try {
+      parsed = JSON.parse(line) as { timestamp?: unknown }
+    } catch {
+      continue
+    }
+    const timestampMs =
+      typeof parsed.timestamp === 'string'
+        ? Date.parse(parsed.timestamp)
+        : Number.NaN
+    if (!Number.isFinite(timestampMs) || timestampMs < params.boundaryMs) {
+      continue
+    }
+    const parsedAgentName =
+      typeof (parsed as { agentName?: unknown }).agentName === 'string'
+        ? (parsed as { agentName: string }).agentName.trim().toLowerCase()
+        : ''
+    if (
+      parsedAgentName
+      && !matchesBootstrapTranscriptMemberName(
+        parsedAgentName,
+        params.teammateName.trim().toLowerCase(),
+      )
+    ) {
+      continue
+    }
+    if (!parsedAgentName && !fileHasExpectedAgentContext) {
+      continue
+    }
+    const text = extractTranscriptMessageText(parsed)
+    if (
+      text
+      && isBootstrapMemberBriefingSuccessText({
+        text,
+        teamName: params.teamName,
+        teammateName: params.teammateName,
+      })
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+async function hasBootstrapTranscriptConfirmation(params: {
+  teamName: string
+  teammateName?: string | null
+  bootstrapExpectedAfter?: string | null
+}): Promise<boolean> {
+  const teammateName = params.teammateName?.trim()
+  if (!teammateName || !params.bootstrapExpectedAfter) {
+    return false
+  }
+  const boundaryMs = Date.parse(params.bootstrapExpectedAfter)
+  if (!Number.isFinite(boundaryMs)) {
+    return false
+  }
+
+  const projectDir = getLeaderTaskLedgerProjectDir()
+  const minMtimeMs = boundaryMs - BOOTSTRAP_TRANSCRIPT_LOOKBACK_MS
+  const candidates = await getBootstrapTranscriptCandidates(projectDir)
+  for (const candidate of candidates
+    .filter(candidate => candidate.mtimeMs >= minMtimeMs)
+    .slice(0, BOOTSTRAP_TRANSCRIPT_MAX_FILES)) {
+    if (
+      await readBootstrapConfirmationFromTranscriptFile({
+        filePath: candidate.filePath,
+        teamName: params.teamName,
+        teammateName,
+        boundaryMs,
+      })
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+async function getBootstrapTranscriptCandidates(
+  projectDir: string,
+): Promise<BootstrapTranscriptCandidate[]> {
+  const cached = bootstrapTranscriptCandidateCache.get(projectDir)
+  const nowMs = Date.now()
+  if (cached && cached.expiresAt > nowMs) {
+    return cached.candidates
+  }
+
+  let entries: Dirent[]
+  try {
+    entries = await readdir(projectDir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+
+  const candidates: BootstrapTranscriptCandidate[] = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) {
+      continue
+    }
+    const filePath = join(projectDir, entry.name)
+    try {
+      const fileStat = await stat(filePath)
+      candidates.push({ filePath, mtimeMs: fileStat.mtimeMs })
+    } catch {
+      // Ignore transient transcript races while the teammate process writes.
+    }
+  }
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)
+  bootstrapTranscriptCandidateCache.set(projectDir, {
+    expiresAt: nowMs + BOOTSTRAP_TRANSCRIPT_CANDIDATE_CACHE_MS,
+    candidates,
+  })
+  return candidates
 }
 
 async function isTmuxPaneAlive(
@@ -417,14 +727,24 @@ export async function hasBootstrapConfirmation(
   teammateName?: string | null,
 ): Promise<boolean> {
   const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
-  return leaderMessages.some(message =>
-    isBootstrapConfirmationMailboxMessage(
-      message,
-      teammateId,
-      bootstrapExpectedAfter,
-      teammateName,
-    ),
-  )
+  if (
+    leaderMessages.some(message =>
+      isBootstrapConfirmationMailboxMessage(
+        message,
+        teammateId,
+        bootstrapExpectedAfter,
+        teammateName,
+      ),
+    )
+  ) {
+    return true
+  }
+
+  return hasBootstrapTranscriptConfirmation({
+    teamName,
+    teammateName,
+    bootstrapExpectedAfter,
+  })
 }
 
 // ============================================================================

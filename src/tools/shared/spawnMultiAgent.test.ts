@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
+import { getProjectDir } from '../../utils/sessionStoragePortable.js'
 import { getSeparateProcessRequirement } from './spawnMultiAgent.js'
+import { hasBootstrapConfirmation } from './spawnMultiAgent.js'
 import { isProcessBackendCommandForTeammate } from './spawnMultiAgent.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
 import { parseProcessBackendPid } from './spawnMultiAgent.js'
@@ -298,6 +300,116 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
         '2026-04-08T12:00:02.000Z',
       ),
     ).toBe(false)
+  })
+
+  it('accepts member_briefing transcript success when teammate sends no idle heartbeat', async () => {
+    const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const tempConfigDir = await mkdtemp(join(tmpdir(), 'spawn-bootstrap-transcript-'))
+    try {
+      process.env.CLAUDE_CONFIG_DIR = tempConfigDir
+      const teamName = 'beacon-desk-test'
+      const memberName = 'atlas'
+      const boundary = new Date(Date.now() - 5_000).toISOString()
+      const successAt = new Date(Date.now() - 1_000).toISOString()
+      const projectDir = getProjectDir(process.cwd())
+      await mkdir(projectDir, { recursive: true })
+      await writeFile(
+        join(projectDir, 'atlas-session.jsonl'),
+        [
+          JSON.stringify({
+            timestamp: new Date(Date.now() - 6_000).toISOString(),
+            teamName,
+            agentName: memberName,
+            type: 'user',
+            message: {
+              role: 'user',
+              content: `You are bootstrapping into team "${teamName}" as member "${memberName}".`,
+            },
+          }),
+          JSON.stringify({
+            timestamp: successAt,
+            type: 'user',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'item_0',
+                  content: `Member briefing for ${memberName} on team "${teamName}" (${teamName}).\nTask briefing for ${memberName}:\nNo actionable tasks.`,
+                  is_error: false,
+                },
+              ],
+            },
+          }),
+        ].join('\n') + '\n',
+      )
+
+      await expect(
+        hasBootstrapConfirmation(
+          teamName,
+          `${memberName}@${teamName}`,
+          boundary,
+          memberName,
+        ),
+      ).resolves.toBe(true)
+    } finally {
+      if (originalClaudeConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
+      }
+      await rm(tempConfigDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not accept member_briefing transcript success from an unattributed file', async () => {
+    const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const tempConfigDir = await mkdtemp(join(tmpdir(), 'spawn-bootstrap-transcript-'))
+    try {
+      process.env.CLAUDE_CONFIG_DIR = tempConfigDir
+      const teamName = 'beacon-desk-test'
+      const memberName = 'atlas'
+      const boundary = new Date(Date.now() - 5_000).toISOString()
+      const successAt = new Date(Date.now() - 1_000).toISOString()
+      const projectDir = getProjectDir(process.cwd())
+      await mkdir(projectDir, { recursive: true })
+      await writeFile(
+        join(projectDir, 'lead-session.jsonl'),
+        JSON.stringify({
+          timestamp: successAt,
+          teamName,
+          agentName: 'team-lead',
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'item_0',
+                content: `Member briefing for ${memberName} on team "${teamName}" (${teamName}).\nTask briefing for ${memberName}:\nNo actionable tasks.`,
+                is_error: false,
+              },
+            ],
+          },
+        }) + '\n',
+      )
+
+      await expect(
+        hasBootstrapConfirmation(
+          teamName,
+          `${memberName}@${teamName}`,
+          boundary,
+          memberName,
+        ),
+      ).resolves.toBe(false)
+    } finally {
+      if (originalClaudeConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
+      }
+      await rm(tempConfigDir, { recursive: true, force: true })
+    }
   })
 })
 
