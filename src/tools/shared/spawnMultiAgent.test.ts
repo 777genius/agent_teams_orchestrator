@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, it } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import {
+  getSessionId,
+  getSessionProjectDir,
+  switchSession,
+} from '../../bootstrap/state.js'
+import type { SessionId } from '../../types/ids.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
+import { hasBootstrapConfirmation } from './spawnMultiAgent.js'
 import { getSeparateProcessRequirement } from './spawnMultiAgent.js'
 import { isProcessBackendCommandForTeammate } from './spawnMultiAgent.js'
 import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
@@ -298,6 +306,175 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
         '2026-04-08T12:00:02.000Z',
       ),
     ).toBe(false)
+  })
+
+  it('counts matching member_briefing transcript result as bootstrap confirmation', async () => {
+    const previousSessionId = getSessionId()
+    const previousProjectDir = getSessionProjectDir()
+    const projectDir = await mkdtemp(join(tmpdir(), 'spawn-transcript-ok-'))
+    const teamName = `transcript-team-${Date.now()}`
+    const boundary = '2026-05-01T19:56:38.000Z'
+
+    try {
+      switchSession(randomUUID() as SessionId, projectDir)
+      await writeFile(
+        join(projectDir, 'bob-session.jsonl'),
+        [
+          JSON.stringify({
+            teamName,
+            agentName: 'bob',
+            type: 'user',
+            timestamp: '2026-05-01T19:56:42.000Z',
+            message: {
+              role: 'user',
+              content: `You are bootstrapping into team "${teamName}" as member "bob".`,
+            },
+          }),
+          JSON.stringify({
+            type: 'assistant',
+            timestamp: '2026-05-01T19:56:56.000Z',
+            message: {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  name: 'mcp__agent-teams__member_briefing',
+                  input: { teamName, memberName: 'bob' },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: 'user',
+            timestamp: '2026-05-01T19:56:57.000Z',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  content: `Member briefing for bob on team "${teamName}" (${teamName}).\nRole: developer.`,
+                },
+              ],
+            },
+          }),
+        ].join('\n'),
+      )
+
+      expect(
+        await hasBootstrapConfirmation(
+          teamName,
+          `bob@${teamName}`,
+          boundary,
+          'bob',
+        ),
+      ).toBe(true)
+    } finally {
+      switchSession(previousSessionId, previousProjectDir)
+      await rm(projectDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not count stale or foreign member_briefing transcript results', async () => {
+    const previousSessionId = getSessionId()
+    const previousProjectDir = getSessionProjectDir()
+    const projectDir = await mkdtemp(join(tmpdir(), 'spawn-transcript-stale-'))
+    const teamName = `transcript-team-${Date.now()}`
+    const boundary = '2026-05-01T19:56:38.000Z'
+
+    try {
+      switchSession(randomUUID() as SessionId, projectDir)
+      await writeFile(
+        join(projectDir, 'foreign-session.jsonl'),
+        [
+          JSON.stringify({
+            teamName,
+            agentName: 'alice',
+            type: 'user',
+            timestamp: '2026-05-01T19:56:42.000Z',
+            message: { role: 'user', content: 'bootstrap' },
+          }),
+          JSON.stringify({
+            type: 'assistant',
+            timestamp: '2026-05-01T19:56:56.000Z',
+            message: {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  name: 'mcp__agent-teams__member_briefing',
+                  input: { teamName, memberName: 'bob' },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: 'user',
+            timestamp: '2026-05-01T19:56:57.000Z',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  content: `Member briefing for bob on team "${teamName}" (${teamName}).`,
+                },
+              ],
+            },
+          }),
+        ].join('\n'),
+      )
+
+      await writeFile(
+        join(projectDir, 'stale-session.jsonl'),
+        [
+          JSON.stringify({
+            teamName,
+            agentName: 'bob',
+            type: 'user',
+            timestamp: '2026-05-01T19:55:00.000Z',
+            message: { role: 'user', content: 'old bootstrap' },
+          }),
+          JSON.stringify({
+            type: 'assistant',
+            timestamp: '2026-05-01T19:55:01.000Z',
+            message: {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  name: 'mcp__agent-teams__member_briefing',
+                  input: { teamName, memberName: 'bob' },
+                },
+              ],
+            },
+          }),
+          JSON.stringify({
+            type: 'user',
+            timestamp: '2026-05-01T19:55:02.000Z',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  content: `Member briefing for bob on team "${teamName}" (${teamName}).`,
+                },
+              ],
+            },
+          }),
+        ].join('\n'),
+      )
+
+      expect(
+        await hasBootstrapConfirmation(
+          teamName,
+          `bob@${teamName}`,
+          boundary,
+          'bob',
+        ),
+      ).toBe(false)
+    } finally {
+      switchSession(previousSessionId, previousProjectDir)
+      await rm(projectDir, { recursive: true, force: true })
+    }
   })
 })
 

@@ -7,7 +7,8 @@ import React from 'react'
 import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, type WriteStream } from 'node:fs'
-import { access, readFile, writeFile } from 'node:fs/promises'
+import { access, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -300,6 +301,274 @@ function buildBootstrapConfirmationIdentitySet(
   return result
 }
 
+const BOOTSTRAP_TRANSCRIPT_MTIME_SLOP_MS = 30_000
+const BOOTSTRAP_TRANSCRIPT_MAX_CANDIDATE_FILES = 128
+
+function getRecordTimestampMs(record: unknown): number | null {
+  if (!record || typeof record !== 'object') {
+    return null
+  }
+  const timestamp = (record as { timestamp?: unknown }).timestamp
+  if (typeof timestamp !== 'string') {
+    return null
+  }
+  const parsed = Date.parse(timestamp)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function isMemberBriefingToolName(name: unknown): boolean {
+  return (
+    name === 'member_briefing' ||
+    name === 'mcp__agent-teams__member_briefing'
+  )
+}
+
+function contentParts(content: unknown): unknown[] {
+  if (Array.isArray(content)) {
+    return content
+  }
+  return [content]
+}
+
+function textFromToolResultContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content
+  }
+  if (!Array.isArray(content)) {
+    return ''
+  }
+  return content
+    .map(part => {
+      if (typeof part === 'string') {
+        return part
+      }
+      if (part && typeof part === 'object') {
+        const text = (part as { text?: unknown }).text
+        return typeof text === 'string' ? text : ''
+      }
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+function recordContent(record: unknown): unknown {
+  if (!record || typeof record !== 'object') {
+    return undefined
+  }
+  return (record as { message?: { content?: unknown } }).message?.content
+}
+
+function recordMatchesBootstrapTranscriptIdentity(
+  record: unknown,
+  teamName: string,
+  allowedIdentities: Set<string>,
+): boolean {
+  if (!record || typeof record !== 'object') {
+    return false
+  }
+  const candidate = record as { teamName?: unknown; agentName?: unknown }
+  if (candidate.teamName !== teamName || typeof candidate.agentName !== 'string') {
+    return false
+  }
+  const agentName = candidate.agentName.trim()
+  return (
+    allowedIdentities.has(agentName.toLowerCase()) ||
+    allowedIdentities.has(normalizeTeammateIdentity(agentName))
+  )
+}
+
+function contentHasMatchingMemberBriefingToolUse(
+  content: unknown,
+  teamName: string,
+  allowedIdentities: Set<string>,
+): boolean {
+  for (const part of contentParts(content)) {
+    if (!part || typeof part !== 'object') {
+      continue
+    }
+    const toolPart = part as { type?: unknown; name?: unknown; input?: unknown }
+    if (toolPart.type !== 'tool_use' || !isMemberBriefingToolName(toolPart.name)) {
+      continue
+    }
+    const input = toolPart.input
+    if (!input || typeof input !== 'object') {
+      continue
+    }
+    const payload = input as { teamName?: unknown; memberName?: unknown }
+    if (payload.teamName !== teamName || typeof payload.memberName !== 'string') {
+      continue
+    }
+    const memberName = payload.memberName.trim()
+    if (
+      allowedIdentities.has(memberName.toLowerCase()) ||
+      allowedIdentities.has(normalizeTeammateIdentity(memberName))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+function contentHasSuccessfulMemberBriefingToolResult(
+  content: unknown,
+  teamName: string,
+  allowedIdentities: Set<string>,
+): boolean {
+  for (const part of contentParts(content)) {
+    if (!part || typeof part !== 'object') {
+      continue
+    }
+    const toolPart = part as { type?: unknown; content?: unknown }
+    if (toolPart.type !== 'tool_result') {
+      continue
+    }
+    const text = textFromToolResultContent(toolPart.content)
+    if (!text.includes(` on team "${teamName}" (${teamName}).`)) {
+      continue
+    }
+    for (const identity of allowedIdentities) {
+      if (text.includes(`Member briefing for ${identity} on team "${teamName}"`)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function scanBootstrapTranscriptText(params: {
+  text: string
+  teamName: string
+  teammateId: string
+  teammateName?: string | null
+  boundaryMs: number
+}): boolean {
+  const allowedIdentities = buildBootstrapConfirmationIdentitySet([
+    params.teammateId,
+    params.teammateName,
+  ])
+  let matchedTranscriptIdentity = false
+  let matchedMemberBriefingToolUse = false
+
+  for (const line of params.text.split(/\r?\n/g)) {
+    if (!line.includes(params.teamName) && !line.includes('member_briefing')) {
+      continue
+    }
+    let record: unknown
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const timestampMs = getRecordTimestampMs(record)
+    if (timestampMs === null || timestampMs < params.boundaryMs) {
+      continue
+    }
+    if (
+      recordMatchesBootstrapTranscriptIdentity(
+        record,
+        params.teamName,
+        allowedIdentities,
+      )
+    ) {
+      matchedTranscriptIdentity = true
+    }
+    const content = recordContent(record)
+    if (
+      contentHasMatchingMemberBriefingToolUse(
+        content,
+        params.teamName,
+        allowedIdentities,
+      )
+    ) {
+      matchedMemberBriefingToolUse = true
+    }
+    if (
+      matchedTranscriptIdentity &&
+      matchedMemberBriefingToolUse &&
+      contentHasSuccessfulMemberBriefingToolResult(
+        content,
+        params.teamName,
+        allowedIdentities,
+      )
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function hasBootstrapTranscriptConfirmation(
+  teamName: string,
+  teammateId: string,
+  bootstrapExpectedAfter: string | null | undefined,
+  teammateName?: string | null,
+): Promise<boolean> {
+  if (!bootstrapExpectedAfter) {
+    return false
+  }
+  const boundaryMs = Date.parse(bootstrapExpectedAfter)
+  if (!Number.isFinite(boundaryMs)) {
+    return false
+  }
+
+  const projectDir = getLeaderTaskLedgerProjectDir()
+  const minMtimeMs = boundaryMs - BOOTSTRAP_TRANSCRIPT_MTIME_SLOP_MS
+  let entries: Awaited<ReturnType<typeof readdir>>
+  try {
+    entries = await readdir(projectDir, { withFileTypes: true })
+  } catch (error) {
+    logForDebugging(
+      `[teammate-spawn] bootstrap transcript scan unavailable for ${teammateId}: ${errorMessage(error)}`,
+    )
+    return false
+  }
+
+  const candidates: Array<{ path: string; mtimeMs: number }> = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) {
+      continue
+    }
+    const path = join(projectDir, entry.name)
+    try {
+      const fileStat = await stat(path)
+      if (fileStat.mtimeMs >= minMtimeMs) {
+        candidates.push({ path, mtimeMs: fileStat.mtimeMs })
+      }
+    } catch {
+      // The transcript writer may rotate/remove files while we are scanning.
+    }
+  }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const candidate of candidates.slice(
+    0,
+    BOOTSTRAP_TRANSCRIPT_MAX_CANDIDATE_FILES,
+  )) {
+    try {
+      if (
+        scanBootstrapTranscriptText({
+          text: await readFile(candidate.path, 'utf8'),
+          teamName,
+          teammateId,
+          teammateName,
+          boundaryMs,
+        })
+      ) {
+        logForDebugging(
+          `[teammate-spawn] bootstrap confirmed via transcript for ${teammateId}`,
+        )
+        return true
+      }
+    } catch {
+      // Treat unreadable partial transcript files as no evidence.
+    }
+  }
+
+  return false
+}
+
 function buildTeammateSpawnReservationKey(
   teamName: string,
   name: string,
@@ -416,15 +685,29 @@ export async function hasBootstrapConfirmation(
   bootstrapExpectedAfter?: string | null,
   teammateName?: string | null,
 ): Promise<boolean> {
+  if (
+    await hasBootstrapTranscriptConfirmation(
+      teamName,
+      teammateId,
+      bootstrapExpectedAfter,
+      teammateName,
+    )
+  ) {
+    return true
+  }
+
   const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
-  return leaderMessages.some(message =>
+  if (leaderMessages.some(message =>
     isBootstrapConfirmationMailboxMessage(
       message,
       teammateId,
       bootstrapExpectedAfter,
       teammateName,
     ),
-  )
+  )) {
+    return true
+  }
+  return false
 }
 
 // ============================================================================
