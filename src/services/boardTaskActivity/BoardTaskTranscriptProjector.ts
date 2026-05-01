@@ -199,7 +199,14 @@ function extractBoardTaskInputActor(input: unknown): string | undefined {
   if (!input || typeof input !== 'object') {
     return undefined
   }
-  return normalizeBoardTaskActor((input as Record<string, unknown>).actor)
+  const record = input as Record<string, unknown>
+  for (const key of ['actor', 'from', 'fromMember', 'memberName'] as const) {
+    const actor = normalizeBoardTaskActor(record[key])
+    if (actor) {
+      return actor
+    }
+  }
+  return undefined
 }
 
 function currentActorCandidates(effectiveAgentId?: string): Set<string> {
