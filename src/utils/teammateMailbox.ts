@@ -54,6 +54,12 @@ export type TeammateMessage = {
   messageKind?: 'agent_error'
 }
 
+export function isAgentErrorNotificationMessage(
+  message: Pick<TeammateMessage, 'messageKind'>,
+): message is TeammateMessage & { messageKind: 'agent_error' } {
+  return message.messageKind === 'agent_error'
+}
+
 type RawTeammateMessage = Omit<TeammateMessage, 'messageId'> & {
   messageId?: string
 }

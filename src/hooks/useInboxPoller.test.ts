@@ -154,6 +154,16 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       getOrdinaryPendingMessage({
         pendingMessages: [
           {
+            id: 'agent-error-row',
+            messageId: 'agent-error-1',
+            mailboxClaimedBySessionId: 's',
+            from: 'bob',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:00.500Z',
+            text: 'bob hit a mailbox turn execution error. API Error: balance exhausted',
+            messageKind: 'agent_error',
+          },
+          {
             id: '1',
             messageId: 'bootstrap',
             mailboxClaimedBySessionId: 's',

@@ -15,6 +15,7 @@ import {
   classifyIdleNotification,
   createCompatibilityInboxMessageId,
   finalizeClaimedMessagesAsRead,
+  isAgentErrorNotificationMessage,
   isSilentRegularMailboxMessageForLiveContext,
   isLiveInboxMirrorMessageOwnedBySession,
   readAndClaimInteractiveMailboxSnapshot,
@@ -146,6 +147,24 @@ describe('teammateMailbox', () => {
         timestamp: '2026-01-02T00:00:00.000Z',
       }),
     })
+  })
+
+  it('preserves agent error message kind in the team lead inbox', async () => {
+    await writeToMailbox(
+      'team-lead',
+      {
+        messageId: 'agent-error-1',
+        from: 'alice',
+        text: 'alice hit a mailbox turn execution error. API Error: balance exhausted',
+        timestamp: '2026-01-02T00:00:00.000Z',
+        messageKind: 'agent_error',
+      },
+      'my-team',
+    )
+
+    const [message] = await readMailbox('team-lead', 'my-team')
+    expect(message?.messageKind).toBe('agent_error')
+    expect(message && isAgentErrorNotificationMessage(message)).toBe(true)
   })
 
   it('classifies only availability-only idle notifications as silent regular live-context messages', () => {

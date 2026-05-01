@@ -359,6 +359,7 @@ export type AppState = DeepImmutable<{
       status: 'pending' | 'processing' | 'processed'
       color?: string
       summary?: string
+      messageKind?: 'agent_error'
     }>
   }
   // Worker sandbox permission requests (leader side) - for network access approval

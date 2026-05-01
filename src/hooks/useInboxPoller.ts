@@ -68,6 +68,7 @@ import {
   isPermissionResponse,
   isPlanApprovalRequest,
   isPlanApprovalResponse,
+  isAgentErrorNotificationMessage,
   isLiveInboxMirrorMessageOwnedBySession,
   isRegularInteractiveMailboxMessage,
   isSilentRegularMailboxMessageForLiveContext,
@@ -144,6 +145,11 @@ export type InboxPromptSubmitResult = {
   userMessageUuid?: string
 }
 
+export type AgentErrorUserNotification = Pick<
+  TeammateMessage,
+  'messageId' | 'from' | 'text' | 'timestamp' | 'color' | 'summary' | 'messageKind'
+> & { messageKind: 'agent_error' }
+
 type Props = {
   enabled: boolean
   isLoading: boolean
@@ -156,6 +162,7 @@ type Props = {
     formatted: string,
     options?: { isMeta?: boolean },
   ) => InboxPromptSubmitResult
+  onAgentErrorNotification: (message: AgentErrorUserNotification) => void
 }
 
 type PendingInboxMirrorMessage = Pick<
@@ -167,6 +174,7 @@ type PendingInboxMirrorMessage = Pick<
   | 'text'
   | 'timestamp'
   | 'status'
+  | 'messageKind'
 >
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
@@ -231,6 +239,7 @@ export function getOrdinaryPendingMessage({
   return pendingMessages.find(
     message =>
       !!message.messageId &&
+      message.messageKind !== 'agent_error' &&
       isRegularInteractiveMailboxMessage({ text: message.text }) &&
       !(
         message.from === TEAM_LEAD_NAME &&
@@ -445,7 +454,7 @@ export function buildMailboxExecutionFailureLeadNotificationText({
   })
 }
 
-async function writeAgentErrorUserNotification({
+async function writeAgentErrorLeadNotification({
   agentName,
   teamName,
   text,
@@ -459,7 +468,7 @@ async function writeAgentErrorUserNotification({
   const timestamp = new Date().toISOString()
   try {
     await writeToMailbox(
-      'user',
+      TEAM_LEAD_NAME,
       {
         messageId: `agent-error-${randomUUID()}`,
         from: agentName,
@@ -473,7 +482,7 @@ async function writeAgentErrorUserNotification({
     )
   } catch (error) {
     logForDebugging(
-      `[InboxPoller] Failed to notify user about agent error: ${String(error)}`,
+      `[InboxPoller] Failed to notify team-lead about agent error: ${String(error)}`,
     )
   }
 }
@@ -1196,6 +1205,7 @@ export function useInboxPoller({
   getMessages,
   transcriptActivitySignature,
   onSubmitMessage,
+  onAgentErrorNotification,
 }: Props): void {
   // Assign to original name for clarity within the function
   const onSubmitTeammateMessage = onSubmitMessage
@@ -1300,19 +1310,53 @@ export function useInboxPoller({
           teamName,
           { excludeMessageIds: [...mirroredMessageIds] },
         )
-      const silentlyFinalizedRegularMessages = claimedRegularMessages.filter(
-        message => isSilentRegularMailboxMessageForLiveContext(message),
+      const agentErrorNotificationMessages = claimedRegularMessages.filter(
+        isAgentErrorNotificationMessage,
       )
-      const terminalFailedRegularMessages = claimedRegularMessages.filter(
-        message =>
-          !isSilentRegularMailboxMessageForLiveContext(message) &&
-          ordinaryTerminalFailureRef.current.has(message.messageId),
+      const nonAgentErrorClaimedRegularMessages = claimedRegularMessages.filter(
+        message => !isAgentErrorNotificationMessage(message),
       )
-      const actionableClaimedRegularMessages = claimedRegularMessages.filter(
-        message =>
-          !isSilentRegularMailboxMessageForLiveContext(message) &&
-          !ordinaryTerminalFailureRef.current.has(message.messageId),
-      )
+      const silentlyFinalizedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(message =>
+          isSilentRegularMailboxMessageForLiveContext(message),
+        )
+      const terminalFailedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(
+          message =>
+            !isSilentRegularMailboxMessageForLiveContext(message) &&
+            ordinaryTerminalFailureRef.current.has(message.messageId),
+        )
+      const actionableClaimedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(
+          message =>
+            !isSilentRegularMailboxMessageForLiveContext(message) &&
+            !ordinaryTerminalFailureRef.current.has(message.messageId),
+        )
+
+      if (agentErrorNotificationMessages.length > 0) {
+        for (const message of agentErrorNotificationMessages) {
+          onAgentErrorNotification(message)
+          if (!isLoading && !focusedInputDialog) {
+            void sendNotification(
+              {
+                message: message.text,
+                title: 'Agent error',
+                notificationType: 'agent_error',
+              },
+              terminal,
+            )
+          }
+        }
+        await finalizeClaimedMessagesAsRead(
+          agentName,
+          agentErrorNotificationMessages.map(message => message.messageId),
+          sessionId,
+          teamName,
+        )
+        logForDebugging(
+          `[InboxPoller] Displayed ${agentErrorNotificationMessages.length} agent error notification(s)`,
+        )
+      }
 
       if (silentlyFinalizedRegularMessages.length > 0) {
         await finalizeClaimedMessagesAsRead(
@@ -2003,6 +2047,7 @@ export function useInboxPoller({
             .map(message => ({
               id: randomUUID(),
               messageId: message.messageId,
+              messageKind: message.messageKind,
               mailboxClaimedBySessionId: options.claimedBySessionId,
               from: message.from,
               text: message.text,
@@ -2039,6 +2084,9 @@ export function useInboxPoller({
     }
   }, [
     enabled,
+    focusedInputDialog,
+    isLoading,
+    onAgentErrorNotification,
     setAppState,
     terminal,
     store,
@@ -2102,6 +2150,7 @@ export function useInboxPoller({
     )
     const activeOrdinaryMessages = liveOwnedMessages.filter(
       message =>
+        message.messageKind !== 'agent_error' &&
         isRegularInteractiveMailboxMessage({ text: message.text }) &&
         !(
           message.from === TEAM_LEAD_NAME &&
@@ -2214,7 +2263,7 @@ export function useInboxPoller({
             ...recoveryState,
             notifiedLead: true,
           })
-          void writeAgentErrorUserNotification({
+          void writeAgentErrorLeadNotification({
             agentName,
             teamName,
             text: buildCodexNativeMailboxTimeoutLeadNotificationText({
@@ -2248,7 +2297,7 @@ export function useInboxPoller({
           try {
             if (teamName) {
               try {
-                await writeAgentErrorUserNotification({
+                await writeAgentErrorLeadNotification({
                   agentName,
                   teamName,
                   text:
@@ -2575,7 +2624,7 @@ export function useInboxPoller({
         void (async () => {
           try {
             if (teamName) {
-              await writeAgentErrorUserNotification({
+              await writeAgentErrorLeadNotification({
                 agentName,
                 teamName,
                 text: buildAgentErrorNotificationText({
@@ -2675,6 +2724,7 @@ export function useInboxPoller({
     const pendingMessages = currentAppState.inbox.messages.filter(
       m =>
         m.status === 'pending' &&
+        m.messageKind !== 'agent_error' &&
         isLiveInboxMirrorMessageOwnedBySession(m, sessionId),
     )
     const processedMessages = currentAppState.inbox.messages.filter(
