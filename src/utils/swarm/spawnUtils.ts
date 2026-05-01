@@ -20,7 +20,7 @@ import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
 import { getCustomApiKeyStatus } from '../config.js'
 import { logForDebugging } from '../debug.js'
-import { isRunningOnHomespace } from '../envUtils.js'
+import { isEnvTruthy, isRunningOnHomespace } from '../envUtils.js'
 import { execFileNoThrow } from '../execFileNoThrow.js'
 import { getAPIProvider } from '../model/providers.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
@@ -180,6 +180,7 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_CODEX_BACKEND',
   // Custom API endpoint
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_API_KEY',
   'GEMINI_BASE_URL',
   'GEMINI_API_VERSION',
   'GEMINI_API_KEY',
@@ -256,6 +257,15 @@ function shouldForwardAnthropicAuthToken(
   return (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'anthropic'
 }
 
+function isHostManagedAnthropicTeammateTarget(
+  provider: TeammateProvider | undefined,
+): boolean {
+  return (
+    (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'anthropic' &&
+    isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
+  )
+}
+
 export function shouldClearCodexApiKeysForTeammateSpawn(
   provider: TeammateProvider | undefined,
 ): boolean {
@@ -268,11 +278,21 @@ export function shouldClearCodexApiKeysForTeammateSpawn(
 export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
   anthropicApiKey: string | undefined
   customApiKeyStatus: 'approved' | 'rejected' | 'new'
+  isHostManagedAnthropicTarget?: boolean
   isHomespace: boolean
 }): boolean {
-  const { anthropicApiKey, customApiKeyStatus, isHomespace } = params
+  const {
+    anthropicApiKey,
+    customApiKeyStatus,
+    isHostManagedAnthropicTarget,
+    isHomespace,
+  } = params
 
   if (!anthropicApiKey || isHomespace) {
+    return false
+  }
+
+  if (isHostManagedAnthropicTarget) {
     return false
   }
 
@@ -312,23 +332,17 @@ export function buildInheritedEnvObject(options?: {
   }
   const provider = options?.provider
   const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(provider)
-
-  if (
-    shouldClearAnthropicApiKeyForTeammateSpawn({
-      anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-      customApiKeyStatus: process.env.ANTHROPIC_API_KEY
-        ? getCustomApiKeyStatus(
-            normalizeApiKeyForConfig(process.env.ANTHROPIC_API_KEY),
-          )
-        : 'rejected',
-      isHomespace: isRunningOnHomespace(),
-    })
-  ) {
-    // Explicitly blank the inherited shell env for pane-based teammates. Not
-    // forwarding the key is insufficient because tmux/login shells can still
-    // inherit ANTHROPIC_API_KEY from the parent environment.
-    envVars.ANTHROPIC_API_KEY = ''
-  }
+  const clearAnthropicApiKey = shouldClearAnthropicApiKeyForTeammateSpawn({
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    customApiKeyStatus: process.env.ANTHROPIC_API_KEY
+      ? getCustomApiKeyStatus(
+          normalizeApiKeyForConfig(process.env.ANTHROPIC_API_KEY),
+        )
+      : 'rejected',
+    isHostManagedAnthropicTarget:
+      isHostManagedAnthropicTeammateTarget(provider),
+    isHomespace: isRunningOnHomespace(),
+  })
 
   for (const key of TEAMMATE_ENV_VARS) {
     if (provider && PROVIDER_SELECTION_ENV_VAR_SET.has(key)) {
@@ -337,10 +351,23 @@ export function buildInheritedEnvObject(options?: {
     if (clearCodexApiKeys && (key === 'CODEX_API_KEY' || key === 'OPENAI_API_KEY')) {
       continue
     }
+    if (
+      key === 'ANTHROPIC_API_KEY' &&
+      !shouldForwardAnthropicAuthToken(provider)
+    ) {
+      continue
+    }
     const value = process.env[key]
     if (value !== undefined && value !== '') {
       envVars[key] = value
     }
+  }
+
+  if (clearAnthropicApiKey) {
+    // Explicitly blank the inherited shell env for pane/process teammates. Not
+    // forwarding the key is insufficient because tmux/login shells and native
+    // process spawns can still inherit ANTHROPIC_API_KEY from the parent env.
+    envVars.ANTHROPIC_API_KEY = ''
   }
 
   if (clearCodexApiKeys) {

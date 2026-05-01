@@ -6,6 +6,8 @@
 import React from 'react'
 import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createWriteStream, type WriteStream } from 'node:fs'
+import { access, readFile, writeFile } from 'node:fs/promises'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -29,7 +31,7 @@ import {
 import { formatAgentId } from '../../utils/agentId.js'
 import { quote } from '../../utils/bash/shellQuote.js'
 import { isInBundledMode } from '../../utils/bundledMode.js'
-import { getGlobalConfig } from '../../utils/config.js'
+import { getGlobalConfig, isPathTrusted } from '../../utils/config.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
@@ -40,7 +42,7 @@ import { getAPIProvider } from '../../utils/model/providers.js'
 import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import { parseArguments } from '../../utils/argumentSubstitution.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
-import { killProcessTree } from '../../utils/processKill.js'
+import { isProcessAlive, killProcessTree } from '../../utils/processKill.js'
 import {
   IT2_COMMAND,
   isTmuxAvailable,
@@ -93,6 +95,13 @@ import {
   createSpawnReadySentinel,
   TEAMMATE_STARTUP_READY_SENTINEL_ENV,
 } from '../../utils/swarm/startupReadySentinel.js'
+import {
+  ensureTeammateRuntimePaths,
+  getTeammateRuntimePaths,
+  TEAMMATE_RUNTIME_EVENTS_ENV,
+  waitForTeammateRuntimeEvent,
+  writeTeammateRuntimeEvent,
+} from '../../utils/swarm/teammateRuntimeEvents.js'
 import {
   readTeamFileAsync,
   sanitizeAgentName,
@@ -276,6 +285,21 @@ function normalizeTeammateIdentity(name: string): string {
   return sanitizeAgentName(name).trim().toLowerCase()
 }
 
+function buildBootstrapConfirmationIdentitySet(
+  identities: Array<string | null | undefined>,
+): Set<string> {
+  const result = new Set<string>()
+  for (const identity of identities) {
+    const trimmed = identity?.trim()
+    if (!trimmed) {
+      continue
+    }
+    result.add(trimmed.toLowerCase())
+    result.add(normalizeTeammateIdentity(trimmed))
+  }
+  return result
+}
+
 function buildTeammateSpawnReservationKey(
   teamName: string,
   name: string,
@@ -311,6 +335,7 @@ export function isBootstrapConfirmationMailboxMessage(
   message: Pick<TeammateMessage, 'text' | 'timestamp'>,
   teammateId: string,
   bootstrapExpectedAfter?: string | null,
+  teammateName?: string | null,
 ): boolean {
   const classified = classifyIdleNotification(message.text)
   if (!classified) {
@@ -339,8 +364,19 @@ export function isBootstrapConfirmationMailboxMessage(
     }
   }
 
+  const confirmationFrom = classified.payload.from?.trim()
+  if (!confirmationFrom) {
+    return false
+  }
+  const allowedIdentities = buildBootstrapConfirmationIdentitySet([
+    teammateId,
+    teammateName,
+  ])
+  const normalizedConfirmationFrom = normalizeTeammateIdentity(confirmationFrom)
+
   return (
-    classified.payload.from === teammateId &&
+    (allowedIdentities.has(confirmationFrom.toLowerCase()) ||
+      allowedIdentities.has(normalizedConfirmationFrom)) &&
     classified.countsAsBootstrapConfirmation
   )
 }
@@ -374,10 +410,11 @@ function getBootstrapExpectedAfterForTeammate(
   return byName?.bootstrapExpectedAfter ?? null
 }
 
-async function hasBootstrapConfirmation(
+export async function hasBootstrapConfirmation(
   teamName: string,
   teammateId: string,
   bootstrapExpectedAfter?: string | null,
+  teammateName?: string | null,
 ): Promise<boolean> {
   const leaderMessages = await readMailbox(TEAM_LEAD_NAME, teamName)
   return leaderMessages.some(message =>
@@ -385,6 +422,7 @@ async function hasBootstrapConfirmation(
       message,
       teammateId,
       bootstrapExpectedAfter,
+      teammateName,
     ),
   )
 }
@@ -409,6 +447,9 @@ export type SpawnOutput = {
   is_splitpane?: boolean
   backend_type?: BackendType
   runtime_pid?: number
+  runtime_events_log?: string
+  runtime_stdout_log?: string
+  runtime_stderr_log?: string
   plan_mode_required?: boolean
   worktreePath?: string
   worktreeBranch?: string
@@ -583,6 +624,7 @@ async function resolveExistingTeammateState(
       teamName,
       inProcessTask.identity.agentId,
       bootstrapExpectedAfter,
+      canonicalName,
     )
     return {
       decision: bootstrapConfirmed
@@ -623,6 +665,7 @@ async function resolveExistingTeammateState(
         teamName,
         teammateId,
         bootstrapExpectedAfter,
+        teammate.name || canonicalName,
       )
       return {
         decision: bootstrapConfirmed
@@ -695,6 +738,7 @@ async function resolveExistingTeammateState(
     teamName,
     existingMember.agentId || canonicalAgentId,
     existingMember.bootstrapExpectedAfter ?? null,
+    existingMember.name || canonicalName,
   )
   return {
     decision: bootstrapConfirmed
@@ -835,14 +879,28 @@ function toTeamFileEffort(
 export function shouldUseNativeProcessBackendForSpawn(options?: {
   teammateMode?: 'auto' | 'tmux' | 'in-process'
   forceProcessTeammates?: string | boolean
+  separateProcessRequired?: boolean
 }): boolean {
   const teammateMode = options?.teammateMode ?? getTeammateModeFromSnapshot()
+  if (teammateMode !== 'auto') {
+    return false
+  }
+
   const forceProcessTeammates =
     options?.forceProcessTeammates ?? process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
-  return teammateMode === 'auto' && isEnvTruthy(forceProcessTeammates)
+  return isEnvTruthy(forceProcessTeammates) || options?.separateProcessRequired === true
+}
+
+export function shouldDetachNativeProcessBackend(
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform !== 'win32'
 }
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
+const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
+const PROCESS_LOG_TAIL_BYTES = 8 * 1024
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
 async function probeNativeProcessTeammateSpawn(
   child: ChildProcess,
@@ -879,6 +937,24 @@ async function probeNativeProcessTeammateSpawn(
     child.once('exit', onExit)
     timer = setTimeout(() => finish(null), PROCESS_SPAWN_SMOKE_DELAY_MS)
   })
+}
+
+async function readProcessLogTail(filePath: string): Promise<string> {
+  try {
+    const raw = await readFile(filePath, 'utf8')
+    return raw.slice(-PROCESS_LOG_TAIL_BYTES).trim()
+  } catch {
+    return ''
+  }
+}
+
+function finishRuntimeLogStreams(streams: Array<WriteStream | undefined>): void {
+  for (const stream of streams) {
+    if (!stream || stream.destroyed) {
+      continue
+    }
+    stream.end()
+  }
 }
 
 /**
@@ -1748,8 +1824,32 @@ async function handleSpawnNativeProcess(
   const teammateId = formatAgentId(sanitizedName, teamName)
   const teammateColor = assignTeammateColor(teammateId)
   const workingDir = worktreeInfo?.worktreePath ?? input.cwd ?? getCwd()
+  const runtimePaths = getTeammateRuntimePaths({
+    teamName,
+    agentName: sanitizedName,
+  })
+
+  try {
+    await access(workingDir)
+  } catch (error) {
+    throw new Error(
+      `Teammate "${sanitizedName}" cannot start because cwd "${workingDir}" is unavailable: ${errorMessage(error)}`,
+    )
+  }
+  if (!isPathTrusted(workingDir)) {
+    throw new Error(
+      `Teammate "${sanitizedName}" cannot start in headless process runtime because workspace trust is not accepted for "${workingDir}". Open that workspace once interactively and accept trust, then launch the team again.`,
+    )
+  }
+  await ensureTeammateRuntimePaths(runtimePaths)
+  await writeFile(runtimePaths.eventsPath, '', {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
 
   const teammateArgs = [
+    '--teammate-runtime',
+    'headless',
     '--agent-id',
     teammateId,
     '--agent-name',
@@ -1803,19 +1903,49 @@ async function handleSpawnNativeProcess(
   const launchBoundaryIso = new Date().toISOString()
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
+  let stdoutLog: WriteStream | undefined
+  let stderrLog: WriteStream | undefined
+  const startupReadySentinel = await createSpawnReadySentinel()
 
   try {
+    stdoutLog = createWriteStream(runtimePaths.stdoutPath, {
+      flags: 'a',
+      mode: 0o600,
+    })
+    stderrLog = createWriteStream(runtimePaths.stderrPath, {
+      flags: 'a',
+      mode: 0o600,
+    })
+    stdoutLog.on('error', error => {
+      logForDebugging(
+        `[handleSpawnNativeProcess] stdout log write failed for ${teammateId}: ${error.message}`,
+        { level: 'warn' },
+      )
+    })
+    stderrLog.on('error', error => {
+      logForDebugging(
+        `[handleSpawnNativeProcess] stderr log write failed for ${teammateId}: ${error.message}`,
+        { level: 'warn' },
+      )
+    })
+
     child = spawn(command, argv, {
       cwd: workingDir,
-      detached: true,
+      detached: shouldDetachNativeProcessBackend(),
       env: {
         ...process.env,
         ...buildInheritedEnvObject({
           provider,
-          extraEnv: worktreeEnv(worktreeInfo),
+          extraEnv: {
+            ...worktreeEnv(worktreeInfo),
+            [TEAMMATE_RUNTIME_ENV]: 'headless',
+            [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
+              startupReadySentinel.filePath,
+            [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
+          },
         }),
       },
-      stdio: 'ignore',
+      stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
 
@@ -1825,10 +1955,117 @@ async function handleSpawnNativeProcess(
 
     const runtimePid = child.pid
     const processPaneId = buildProcessBackendPaneId(runtimePid)
+    child.stdin?.on('error', error => {
+      logForDebugging(
+        `[handleSpawnNativeProcess] stdin pipe failed for ${teammateId}: ${error.message}`,
+        { level: 'warn' },
+      )
+    })
+    child.stdout?.pipe(stdoutLog)
+    child.stderr?.pipe(stderrLog)
+    ;(child.stdin as { unref?: () => void } | null)?.unref?.()
+    ;(child.stdout as { unref?: () => void } | null)?.unref?.()
+    ;(child.stderr as { unref?: () => void } | null)?.unref?.()
+    child.once('close', (code, signal) => {
+      void writeTeammateRuntimeEvent({
+        type: 'exited',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail:
+          code !== null
+            ? `process exited with code ${code}`
+            : signal
+              ? `process exited from signal ${signal}`
+              : 'process exited',
+      })
+      finishRuntimeLogStreams([stdoutLog, stderrLog])
+    })
+    child.once('error', error => {
+      void writeTeammateRuntimeEvent({
+        type: 'failed',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail: `process error: ${error.message}`,
+      })
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'process_spawned',
+      eventsPath: runtimePaths.eventsPath,
+      pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      cwd: workingDir,
+      detail: `command=${command} args=${argv.length}`,
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'stdout_attached',
+      eventsPath: runtimePaths.eventsPath,
+      pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      cwd: workingDir,
+      detail: `stdout=${runtimePaths.stdoutPath} stderr=${runtimePaths.stderrPath}`,
+    })
     const spawnFailure = await probeNativeProcessTeammateSpawn(child, teammateId)
     if (spawnFailure) {
       killProcessTree(runtimePid, 'SIGTERM')
-      throw new Error(spawnFailure)
+      await writeTeammateRuntimeEvent({
+        type: 'failed',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail: spawnFailure,
+      })
+      const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
+      throw new Error(
+        stderrTail ? `${spawnFailure}\nLast stderr:\n${stderrTail}` : spawnFailure,
+      )
+    }
+
+    const runtimeReady = await waitForTeammateRuntimeEvent({
+      eventsPath: runtimePaths.eventsPath,
+      type: 'runtime_ready',
+      timeoutMs: PROCESS_RUNTIME_READY_TIMEOUT_MS,
+      pid: runtimePid,
+      isStillAlive: () => isProcessAlive(runtimePid),
+    })
+    if (!runtimeReady.ok) {
+      killProcessTree(runtimePid, 'SIGTERM')
+      const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
+      const stdoutTail = await readProcessLogTail(runtimePaths.stdoutPath)
+      const detail = [
+        runtimeReady.reason,
+        stderrTail ? `Last stderr:\n${stderrTail}` : '',
+        stdoutTail ? `Last stdout:\n${stdoutTail}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+      await writeTeammateRuntimeEvent({
+        type: 'failed',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail,
+      })
+      throw new Error(
+        `Teammate process ${teammateId} did not become runtime_ready: ${detail}`,
+      )
     }
 
     const updateResult = await updateTeamFileAsync(teamName, teamFile =>
@@ -1877,6 +2114,58 @@ async function handleSpawnNativeProcess(
       },
       teamName,
     )
+
+    const inboxPollerReady = await waitForTeammateRuntimeEvent({
+      eventsPath: runtimePaths.eventsPath,
+      type: 'inbox_poller_ready',
+      timeoutMs: 10_000,
+      pid: runtimePid,
+      isStillAlive: () => isProcessAlive(runtimePid),
+    })
+    if (!inboxPollerReady.ok) {
+      killProcessTree(runtimePid, 'SIGTERM')
+      await writeTeammateRuntimeEvent({
+        type: 'failed',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail: inboxPollerReady.reason,
+      })
+      throw new Error(
+        `Teammate process ${teammateId} did not become inbox_poller_ready: ${inboxPollerReady.reason}`,
+      )
+    }
+
+    const bootstrapSubmitted = await waitForTeammateRuntimeEvent({
+      eventsPath: runtimePaths.eventsPath,
+      type: 'bootstrap_submitted',
+      timeoutMs: 15_000,
+      pid: runtimePid,
+      isStillAlive: () => isProcessAlive(runtimePid),
+    })
+    if (!bootstrapSubmitted.ok) {
+      killProcessTree(runtimePid, 'SIGTERM')
+      const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
+      const detail = stderrTail
+        ? `${bootstrapSubmitted.reason}\nLast stderr:\n${stderrTail}`
+        : bootstrapSubmitted.reason
+      await writeTeammateRuntimeEvent({
+        type: 'failed',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        cwd: workingDir,
+        detail,
+      })
+      throw new Error(
+        `Teammate process ${teammateId} did not submit bootstrap prompt: ${detail}`,
+      )
+    }
 
     setAppState(prev => ({
       ...prev,
@@ -1937,6 +2226,9 @@ async function handleSpawnNativeProcess(
         is_splitpane: false,
         backend_type: 'process',
         runtime_pid: runtimePid,
+        runtime_events_log: runtimePaths.eventsPath,
+        runtime_stdout_log: runtimePaths.stdoutPath,
+        runtime_stderr_log: runtimePaths.stderrPath,
         plan_mode_required,
         ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
         ...(worktreeInfo?.worktreeBranch ? { worktreeBranch: worktreeInfo.worktreeBranch } : {}),
@@ -1949,7 +2241,10 @@ async function handleSpawnNativeProcess(
     if (child?.pid) {
       killProcessTree(child.pid, 'SIGTERM')
     }
+    finishRuntimeLogStreams([stdoutLog, stderrLog])
     throw error
+  } finally {
+    void cleanupSpawnReadySentinelDir(startupReadySentinel.dir)
   }
 }
 
@@ -2234,6 +2529,45 @@ async function handleSpawnInProcess(
   }
 }
 
+export async function __handleSpawnNativeProcessForTests(
+  input: SpawnTeammateConfig,
+  context: ToolUseContext,
+): Promise<{ data: SpawnOutput }> {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__handleSpawnNativeProcessForTests is only available in tests')
+  }
+  return handleSpawnNativeProcess(input, context)
+}
+
+type SpawnMultiAgentDepsForTests = {
+  detectAndGetBackend?: typeof detectAndGetBackend
+  getTeammateModeFromSnapshot?: typeof getTeammateModeFromSnapshot
+  isInProcessEnabled?: typeof isInProcessEnabled
+}
+
+let spawnMultiAgentDepsForTests: SpawnMultiAgentDepsForTests | null = null
+
+export function __setSpawnMultiAgentDepsForTests(
+  deps: SpawnMultiAgentDepsForTests | null,
+): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setSpawnMultiAgentDepsForTests is only available in tests')
+  }
+  spawnMultiAgentDepsForTests = deps
+}
+
+function getSpawnMultiAgentDeps(): Required<SpawnMultiAgentDepsForTests> {
+  return {
+    detectAndGetBackend:
+      spawnMultiAgentDepsForTests?.detectAndGetBackend ?? detectAndGetBackend,
+    getTeammateModeFromSnapshot:
+      spawnMultiAgentDepsForTests?.getTeammateModeFromSnapshot ??
+      getTeammateModeFromSnapshot,
+    isInProcessEnabled:
+      spawnMultiAgentDepsForTests?.isInProcessEnabled ?? isInProcessEnabled,
+  }
+}
+
 /**
  * Handle spawn operation - creates a new Claude Code instance.
  * Uses in-process mode when enabled, otherwise uses tmux/iTerm2 split-pane view.
@@ -2269,9 +2603,10 @@ async function handleSpawn(
   }
 
   try {
+    const spawnDeps = getSpawnMultiAgentDeps()
 
     // Check if in-process mode is enabled via feature flag
-    if (isInProcessEnabled() && !forceSeparateProcess) {
+    if (spawnDeps.isInProcessEnabled() && !forceSeparateProcess) {
       return await handleSpawnInProcess(spawnInput, context)
     }
 
@@ -2280,9 +2615,13 @@ async function handleSpawn(
     // isInProcessEnabled() returns false but detectAndGetBackend() has no viable backend.
     // Narrowly scoped so user cancellation and other spawn errors propagate normally.
     try {
-      await detectAndGetBackend()
+      await spawnDeps.detectAndGetBackend()
     } catch (error) {
-      if (shouldUseNativeProcessBackendForSpawn()) {
+      if (
+        shouldUseNativeProcessBackendForSpawn({
+          separateProcessRequired: forceSeparateProcess,
+        })
+      ) {
         logForDebugging(
           `[handleSpawn] No pane backend available, using native process backend: ${errorMessage(error)}`,
         )
@@ -2291,17 +2630,17 @@ async function handleSpawn(
       if (forceSeparateProcess) {
         if (separateProcessRequirement.reason === 'codex-native-runtime') {
           throw new Error(
-            `Teammate "${input.name}" uses Codex native runtime, which must run in a separate process through the dedicated codex-native lane. No pane-based backend is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
+            `Teammate "${input.name}" uses Codex native runtime, which must run in a separate process through the dedicated codex-native lane. No pane-based transport is available. Use teammate mode auto to allow the native process backend, or enable an explicit pane transport such as tmux/iTerm2.`,
           )
         }
         throw new Error(
-          `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". A pane-based backend is required for mixed-provider teammates, but none is available. Install/use tmux or switch teammate mode away from in-process/auto fallback.`,
+          `Teammate "${input.name}" requests provider "${requestedProvider}" which differs from the leader provider "${getCurrentTeammateProvider()}". This teammate must run outside the in-process lane, but no pane-based transport is available. Use teammate mode auto to allow the native process backend, or enable an explicit pane transport such as tmux/iTerm2.`,
         )
       }
       // Only fall back silently in auto mode. If the user explicitly configured
       // teammateMode: 'tmux', let the error propagate so they see the actionable
       // install instructions from getTmuxInstallInstructions().
-      if (getTeammateModeFromSnapshot() !== 'auto') {
+      if (spawnDeps.getTeammateModeFromSnapshot() !== 'auto') {
         throw error
       }
       logForDebugging(

@@ -10,6 +10,7 @@ import { isBootstrapConfirmationMailboxMessage } from './spawnMultiAgent.js'
 import { parseProcessBackendPid } from './spawnMultiAgent.js'
 import { resolveTeammateModel } from './spawnMultiAgent.js'
 import { shouldUseNativeProcessBackendForSpawn } from './spawnMultiAgent.js'
+import { shouldDetachNativeProcessBackend } from './spawnMultiAgent.js'
 import { spawnTeammate } from './spawnMultiAgent.js'
 
 afterEach(() => {
@@ -17,6 +18,12 @@ afterEach(() => {
 })
 
 describe('spawnMultiAgent bootstrap confirmation', () => {
+  it('keeps native process teammates attached to the parent console on Windows', () => {
+    expect(shouldDetachNativeProcessBackend('win32')).toBe(false)
+    expect(shouldDetachNativeProcessBackend('linux')).toBe(true)
+    expect(shouldDetachNativeProcessBackend('darwin')).toBe(true)
+  })
+
   it('counts heartbeat, peer-summary heartbeat, interrupted, and task-terminal idle as bootstrap confirmation', () => {
     expect(
       isBootstrapConfirmationMailboxMessage(
@@ -116,6 +123,25 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
         'alice',
       ),
     ).toBe(false)
+  })
+
+  it('accepts teammate display names when runtime ids include the team suffix', () => {
+    expect(
+      isBootstrapConfirmationMailboxMessage(
+        {
+          text: JSON.stringify({
+            type: 'idle_notification',
+            from: 'alice',
+            timestamp: '2026-04-08T12:00:00.000Z',
+            idleReason: 'available',
+          }),
+          timestamp: '2026-04-08T12:00:00.000Z',
+        },
+        'alice@live-team',
+        '2026-04-08T11:59:59.000Z',
+        'alice',
+      ),
+    ).toBe(true)
   })
 
   it('respects bootstrapExpectedAfter boundary when provided', () => {
@@ -374,7 +400,7 @@ describe('spawnTeammate worktree isolation validation', () => {
 })
 
 describe('native process teammate backend selection', () => {
-  it('uses native process backend only for forced auto teammate mode', () => {
+  it('uses native process backend for forced or separate-process auto teammate mode', () => {
     expect(
       shouldUseNativeProcessBackendForSpawn({
         teammateMode: 'auto',
@@ -400,6 +426,28 @@ describe('native process teammate backend selection', () => {
       shouldUseNativeProcessBackendForSpawn({
         teammateMode: 'auto',
         forceProcessTeammates: undefined,
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'auto',
+        forceProcessTeammates: undefined,
+        separateProcessRequired: true,
+      }),
+    ).toBe(true)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'in-process',
+        separateProcessRequired: true,
+      }),
+    ).toBe(false)
+
+    expect(
+      shouldUseNativeProcessBackendForSpawn({
+        teammateMode: 'tmux',
+        separateProcessRequired: true,
       }),
     ).toBe(false)
   })

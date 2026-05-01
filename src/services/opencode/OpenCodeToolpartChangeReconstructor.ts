@@ -102,6 +102,9 @@ type Toolpart = {
   oldString?: string
   newString?: string
   metadataExists?: boolean
+  metadataOnly?: boolean
+  operationOverride?: ReconstructedOpenCodeToolChange['operation']
+  warnings?: string[]
   truncated?: boolean
   partTimeCreated: number
   messageTimeCreated: number
@@ -297,6 +300,44 @@ function countOccurrences(haystack: string, needle: string): number {
   }
 }
 
+function extractUnifiedDiffLines(patch: string | null, marker: '+' | '-'): string | null {
+  if (!patch) {
+    return null
+  }
+  const lines: string[] = []
+  let inHunk = false
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith('@@')) {
+      inHunk = true
+      continue
+    }
+    if (!inHunk || !line.startsWith(marker)) {
+      continue
+    }
+    if (
+      (marker === '+' && line.startsWith('+++')) ||
+      (marker === '-' && line.startsWith('---'))
+    ) {
+      continue
+    }
+    lines.push(line.slice(1))
+  }
+  return lines.length > 0 ? `${lines.join('\n')}\n` : null
+}
+
+function getApplyPatchOperation(type: string | null): ReconstructedOpenCodeToolChange['operation'] | null {
+  if (type === 'add') {
+    return 'create'
+  }
+  if (type === 'delete') {
+    return 'delete'
+  }
+  if (type === 'update') {
+    return 'modify'
+  }
+  return null
+}
+
 function toIsoTimestamp(value: number | null, fallback: number): string {
   const millis = value && Number.isFinite(value) ? value : fallback
   return new Date(millis).toISOString()
@@ -484,6 +525,59 @@ export class OpenCodeToolpartChangeReconstructor {
         continue
       }
 
+      if (toolpart.metadataOnly) {
+        const operation = toolpart.operationOverride ?? (toolpart.tool === 'write' ? 'create' : 'modify')
+        fileStates.set(normalizedPath.comparisonKey, {
+          text: null,
+          textAvailability: 'metadata-only',
+          exists: operation !== 'delete',
+        })
+        changes.push({
+          taskId: taskContext.taskRef.taskId,
+          taskRef: taskContext.taskRef.taskId,
+          taskRefKind: 'canonical',
+          teamName: taskContext.taskRef.teamName,
+          memberName: params.memberName,
+          sessionId: params.sessionId,
+          ...(toolpart.parentUserMessageId ? { parentUserMessageId: toolpart.parentUserMessageId } : {}),
+          assistantMessageId: toolpart.messageId,
+          toolUseId: toolpart.callId ?? toolpart.partId,
+          sourcePartId: toolpart.partId,
+          sourceMessageId: toolpart.messageId,
+          sourceTool: toolpart.tool,
+          sourceImportKey: buildSourceImportKey({
+            sessionId: params.sessionId,
+            partId: toolpart.partId,
+            normalizedPath,
+          }),
+          filePath: normalizedPath.absolutePath,
+          relativePath: normalizedPath.relativePath,
+          beforeContent: null,
+          afterContent: null,
+          operation,
+          confidence: 'medium',
+          attributionMethod: taskContext.method,
+          ...(toolpart.oldString !== undefined ? { oldString: toolpart.oldString } : {}),
+          ...(toolpart.newString !== undefined ? { newString: toolpart.newString } : {}),
+          beforeState:
+            operation === 'create'
+              ? { exists: false, sizeBytes: 0 }
+              : { exists: true, unavailableReason: 'opencode-apply-patch-before-content-unavailable' },
+          afterState:
+            operation === 'delete'
+              ? { exists: false, sizeBytes: 0 }
+              : { exists: true, unavailableReason: 'opencode-apply-patch-after-content-unavailable' },
+          evidenceProof: 'metadata-only-fallback',
+          timestamp: toolpart.timestamp,
+          warnings: [
+            'OpenCode apply_patch was captured without full before/after text; review is manual-only.',
+            ...(toolpart.warnings ?? []),
+            ...(taskContext.warning ? [taskContext.warning] : []),
+          ],
+        })
+        continue
+      }
+
       if (toolpart.tool === 'write') {
         const previousState = fileStates.get(normalizedPath.comparisonKey)
         const fullTextAvailable = isFullTextAvailable(toolpart.content, toolpart.truncated)
@@ -537,7 +631,7 @@ export class OpenCodeToolpartChangeReconstructor {
           relativePath: normalizedPath.relativePath,
           beforeContent,
           afterContent,
-          operation: beforeKind === 'known-absent' ? 'create' : 'modify',
+          operation: toolpart.operationOverride ?? (beforeKind === 'known-absent' ? 'create' : 'modify'),
           confidence: beforeKind === 'known-text' || beforeKind === 'known-absent' ? 'exact' : 'medium',
           attributionMethod: taskContext.method,
           timestamp: toolpart.timestamp,
@@ -556,6 +650,7 @@ export class OpenCodeToolpartChangeReconstructor {
               ? ['OpenCode write overwrote an existing file before the bridge had a known baseline; reject is manual-only.']
               : []),
             ...(unavailableReason ? ['OpenCode toolpart content was unavailable or too large; review is manual-only.'] : []),
+            ...(toolpart.warnings ?? []),
             ...(taskContext.warning ? [taskContext.warning] : []),
           ].filter(Boolean),
         })
@@ -632,6 +727,7 @@ export class OpenCodeToolpartChangeReconstructor {
           timestamp: toolpart.timestamp,
           warnings: [
             'OpenCode edit was captured without a proven full-text baseline; apply/reject is manual-only.',
+            ...(toolpart.warnings ?? []),
             ...(taskContext.warning ? [taskContext.warning] : []),
           ],
         })
@@ -673,7 +769,10 @@ export class OpenCodeToolpartChangeReconstructor {
         beforeState: contentStateForText(previous),
         afterState: contentStateForText(afterContent),
         timestamp: toolpart.timestamp,
-        warnings: taskContext.warning ? [taskContext.warning] : undefined,
+        warnings: [
+          ...(toolpart.warnings ?? []),
+          ...(taskContext.warning ? [taskContext.warning] : []),
+        ].filter(Boolean),
       })
     }
 
@@ -709,12 +808,66 @@ export class OpenCodeToolpartChangeReconstructor {
       const metadata = asRecord(state?.metadata)
       const filePath = asString(input?.filePath) ?? undefined
       const patch = asStringValue(input?.patch) ?? undefined
+      const assistantMessage = messagesById.get(row.message_id)
       if (!input) {
         diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input.`)
         continue
       }
       if (tool === 'apply_patch') {
         if (!patch) {
+          const files = Array.isArray(metadata?.files)
+            ? metadata.files.map(asRecord).filter((file): file is Record<string, unknown> => file !== null)
+            : []
+          if (files.length > 0) {
+            for (const file of files) {
+              const metadataFilePath = asString(file.filePath)
+              const operation = getApplyPatchOperation(asString(file.type))
+              if (!metadataFilePath || !operation) {
+                diagnostics.push(`OpenCode apply_patch toolpart ${row.id} contained an unsupported file entry.`)
+                continue
+              }
+              const filePatch = asStringValue(file.patch)
+              const content = operation === 'create'
+                ? extractUnifiedDiffLines(filePatch, '+') ?? undefined
+                : undefined
+              const oldString = operation === 'modify' || operation === 'delete'
+                ? extractUnifiedDiffLines(filePatch, '-') ?? undefined
+                : undefined
+              const newString = operation === 'modify'
+                ? extractUnifiedDiffLines(filePatch, '+') ?? undefined
+                : undefined
+              const hasReplacement = typeof oldString === 'string' && typeof newString === 'string'
+              toolparts.push({
+                partId: row.id,
+                messageId: row.message_id,
+                parentUserMessageId: asString(assistantMessage?.parentID),
+                tool: operation === 'create' ? 'write' : 'edit',
+                callId: asString(data.callID) ?? undefined,
+                status,
+                filePath: metadataFilePath,
+                content,
+                oldString,
+                newString,
+                metadataExists: operation !== 'create',
+                metadataOnly:
+                  (operation === 'create' && !content) ||
+                  (operation === 'modify' && !hasReplacement) ||
+                  operation === 'delete',
+                operationOverride: operation,
+                warnings: ['OpenCode apply_patch toolpart imported from patch metadata.'],
+                truncated: false,
+                partTimeCreated: row.time_created,
+                messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
+                messageIdSort: row.message_id,
+                messagePartOrder: partOrderById.get(row.id) ?? 0,
+                timestamp: toIsoTimestamp(
+                  asNumber(asRecord(state.time)?.end) ?? asNumber(asRecord(state.time)?.start),
+                  row.time_created,
+                ),
+              })
+            }
+            continue
+          }
           diagnostics.push(`OpenCode apply_patch toolpart ${row.id} missing state/input/patch.`)
           continue
         }
@@ -722,7 +875,6 @@ export class OpenCodeToolpartChangeReconstructor {
         diagnostics.push(`OpenCode ${tool} toolpart ${row.id} missing state/input/filePath.`)
         continue
       }
-      const assistantMessage = messagesById.get(row.message_id)
       toolparts.push({
         partId: row.id,
         messageId: row.message_id,

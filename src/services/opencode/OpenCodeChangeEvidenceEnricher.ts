@@ -83,6 +83,25 @@ function buildRelativePathKey(workspaceRoot: string, filePath: string): string |
   return normalized.relativePath
 }
 
+function normalizeRelativePathKey(value: string): string | null {
+  if (!value || value.includes('\0')) {
+    return null
+  }
+  const normalized = value.replace(/\\/g, '/')
+  if (
+    normalized.startsWith('/') ||
+    /^[A-Za-z]:/.test(normalized) ||
+    normalized.includes('//') ||
+    normalized.endsWith('/')
+  ) {
+    return null
+  }
+  const segments = normalized.split('/')
+  return segments.some(segment => segment === '' || segment === '.' || segment === '..')
+    ? null
+    : normalized
+}
+
 function reverseEditFromAfter(input: {
   after: string
   oldString: string | undefined
@@ -220,7 +239,9 @@ export class OpenCodeChangeEvidenceEnricher {
 
     const byPath = new Map<string, ReconstructedOpenCodeToolChange[]>()
     for (const change of result) {
-      const relativePath = buildRelativePathKey(params.workspaceRoot, change.filePath)
+      const relativePath =
+        normalizeRelativePathKey(change.relativePath) ??
+        buildRelativePathKey(params.workspaceRoot, change.filePath)
       if (!relativePath) {
         continue
       }

@@ -26,6 +26,12 @@ import { TerminalSizeContext } from './TerminalSizeContext.js';
 
 // Platforms that support Unix-style process suspension (SIGSTOP/SIGCONT)
 const SUPPORTS_SUSPEND = process.platform !== 'win32';
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
+
+function isHeadlessTeammateRuntime(): boolean {
+  return process.env[TEAMMATE_RUNTIME_ENV] === 'headless' ||
+    process.env.CLAUDE_CODE_ENTRYPOINT === 'team-headless';
+}
 
 // After this many milliseconds of stdin silence, the next chunk triggers
 // a terminal mode re-assert (mouse tracking). Catches tmux detach→attach,
@@ -211,6 +217,23 @@ export default class App extends PureComponent<Props, State> {
       stdin
     } = this.props;
     if (!this.isRawModeSupported()) {
+      if (isHeadlessTeammateRuntime()) {
+        stdin.setEncoding('utf8');
+        if (isEnabled) {
+          if (this.rawModeEnabledCount === 0) {
+            stopCapturingEarlyInput();
+            stdin.ref();
+            stdin.addListener('readable', this.handleReadable);
+          }
+          this.rawModeEnabledCount++;
+          return;
+        }
+        if (this.rawModeEnabledCount > 0 && --this.rawModeEnabledCount === 0) {
+          stdin.removeListener('readable', this.handleReadable);
+          stdin.unref();
+        }
+        return;
+      }
       if (stdin === process.stdin) {
         throw new Error('Raw mode is not supported on the current process.stdin, which Ink uses as input stream by default.\nRead about how to prevent this error on https://github.com/vadimdemedes/ink/#israwmodesupported');
       } else {

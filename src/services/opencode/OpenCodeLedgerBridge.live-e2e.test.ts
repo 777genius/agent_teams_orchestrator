@@ -12,6 +12,7 @@ import { buildManagedConfig } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
 import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
+import { spawnSyncPortableCli } from '../../utils/portableCli.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -113,7 +114,7 @@ function cliDevCommand(): { command: string; prefixArgs: string[] } {
 }
 
 function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000) {
-  return spawnSync('opencode', args, {
+  return spawnSyncPortableCli('opencode', args, {
     cwd: tempDir,
     env,
     encoding: 'utf8',

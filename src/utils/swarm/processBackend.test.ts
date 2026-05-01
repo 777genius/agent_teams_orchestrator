@@ -44,6 +44,30 @@ describe('processBackend', () => {
     ).toBe(true)
   })
 
+  it('matches Windows command lines with quoted paths, spaces, and Cyrillic values', () => {
+    expect(
+      isProcessBackendCommandForTeammate(
+        '"C:\\Program Files\\Bun\\bun.exe" "C:\\Users\\User\\папка с пробелом\\fake teammate runtime.mjs" --teammate-runtime headless --team-name "vector room тест" --agent-id "alice@vector room тест" --agent-name alice',
+        'alice@vector room тест',
+        'vector room тест',
+      ),
+    ).toBe(true)
+    expect(
+      isProcessBackendCommandForTeammate(
+        '"C:\\Program Files\\Bun\\bun.exe" "C:\\tmp\\fake teammate runtime.mjs" --team-name "vector room тест-extra" --agent-id "alice@vector room тест"',
+        'alice@vector room тест',
+        'vector room тест',
+      ),
+    ).toBe(false)
+    expect(
+      isProcessBackendCommandForTeammate(
+        '"C:\\Program Files\\Bun\\bun.exe" "C:\\tmp\\fake teammate runtime.mjs" --team-name "vector room тест" --agent-id "alice@vector room тест-extra"',
+        'alice@vector room тест',
+        'vector room тест',
+      ),
+    ).toBe(false)
+  })
+
   it('fails closed when kill identity is incomplete', async () => {
     const currentPid = `process:${process.pid}`
 

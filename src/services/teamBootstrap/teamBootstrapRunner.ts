@@ -3,7 +3,10 @@ import { getSessionId } from 'src/bootstrap/state.js'
 import type { ToolUseContext } from 'src/Tool.js'
 import { TeamCreateTool } from 'src/tools/TeamCreateTool/TeamCreateTool.js'
 import type { DuplicateSkippedOutput } from 'src/tools/shared/spawnMultiAgent.js'
-import { spawnTeammate } from 'src/tools/shared/spawnMultiAgent.js'
+import {
+  hasBootstrapConfirmation,
+  spawnTeammate,
+} from 'src/tools/shared/spawnMultiAgent.js'
 import { getCwd } from 'src/utils/cwd.js'
 import { errorMessage } from 'src/utils/errors.js'
 import { addPermissionRulesToSettings } from 'src/utils/permissions/permissionsLoader.js'
@@ -18,6 +21,10 @@ import {
   unregisterTeamForSessionCleanup,
   updateTeamFileAsync,
 } from 'src/utils/swarm/teamHelpers.js'
+import {
+  getTeammateRuntimePaths,
+  readTeammateRuntimeEvents,
+} from 'src/utils/swarm/teammateRuntimeEvents.js'
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
 import { getBootstrapSpawnDelayMs } from './teamBootstrapSpawnSchedule.js'
@@ -166,7 +173,7 @@ function buildBootstrapFailureReason(params: {
       ? ` (+${params.failedMembers.length - 3} more)`
       : ''
   const policyReason = params.continueOnPartialFailure
-    ? 'no teammates were registered'
+    ? 'no teammates were bootstrap-confirmed'
     : 'continueOnPartialFailure=false'
   return preview.length > 0
     ? `Deterministic bootstrap for "${params.teamName}" failed because teammate startup failed and ${policyReason}. ${preview}${suffix}`
@@ -312,6 +319,166 @@ function buildSummary(params: {
       registeredMembersCount: params.registeredMembers.length,
     }),
   }
+}
+
+async function readBootstrapRuntimeFailure(params: {
+  teamName: string
+  memberName: string
+  backendType?: string
+  runtimePid?: number
+  bootstrapExpectedAfter?: string | null
+}): Promise<string | null> {
+  if (params.backendType !== 'process' && typeof params.runtimePid !== 'number') {
+    return null
+  }
+
+  const boundaryMs = params.bootstrapExpectedAfter
+    ? Date.parse(params.bootstrapExpectedAfter)
+    : Number.NaN
+  const eventsPath = getTeammateRuntimePaths({
+    teamName: params.teamName,
+    agentName: params.memberName,
+  }).eventsPath
+  const events = await readTeammateRuntimeEvents(eventsPath)
+  const failure = [...events].reverse().find(event => {
+    if (event.type !== 'failed') {
+      return false
+    }
+    if (typeof params.runtimePid === 'number' && event.pid !== params.runtimePid) {
+      return false
+    }
+    if (Number.isFinite(boundaryMs)) {
+      const eventMs = Date.parse(event.timestamp)
+      return Number.isFinite(eventMs) && eventMs >= boundaryMs
+    }
+    return true
+  })
+
+  return failure?.detail ?? null
+}
+
+async function waitForRequiredBootstrapConfirmations(params: {
+  request: TeamBootstrapRequest
+  stateStore: TeamBootstrapStateStore
+  failedMembers: Array<{ name: string; reason: string }>
+  membersByName: Map<
+    string,
+    {
+      agentId?: string
+      bootstrapExpectedAfter?: string | null
+      backendType?: string
+      runtimePid?: number
+    }
+  >
+  timeoutStartedAt: number
+  monotonicNow: () => number
+  now: () => number
+}): Promise<string[]> {
+  const pending = new Map<
+    string,
+    {
+      agentId: string
+      bootstrapExpectedAfter?: string | null
+      backendType?: string
+      runtimePid?: number
+    }
+  >()
+  const confirmedMembers = new Set<string>()
+
+  for (const member of params.request.members) {
+    const registered = params.membersByName.get(member.displayName)
+    const agentId = registered?.agentId
+    if (!agentId) {
+      continue
+    }
+    pending.set(member.displayName, {
+      agentId,
+      bootstrapExpectedAfter: registered.bootstrapExpectedAfter ?? null,
+      backendType: registered.backendType,
+      runtimePid: registered.runtimePid,
+    })
+  }
+
+  while (pending.size > 0) {
+    for (const [memberName, pendingMember] of [...pending]) {
+      if (
+        await hasBootstrapConfirmation(
+          params.request.teamName,
+          pendingMember.agentId,
+          pendingMember.bootstrapExpectedAfter,
+          memberName,
+        )
+      ) {
+        pending.delete(memberName)
+        confirmedMembers.add(memberName)
+        await params.stateStore.markMemberResult(
+          memberName,
+          {
+            status: 'bootstrap_confirmed',
+            agentId: pendingMember.agentId,
+          },
+          params.now,
+        )
+        continue
+      }
+
+      const runtimeFailure = await readBootstrapRuntimeFailure({
+        teamName: params.request.teamName,
+        memberName,
+        backendType: pendingMember.backendType,
+        runtimePid: pendingMember.runtimePid,
+        bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
+      })
+      if (runtimeFailure) {
+        pending.delete(memberName)
+        if (
+          !params.failedMembers.some(failed => failed.name === memberName)
+        ) {
+          params.failedMembers.push({ name: memberName, reason: runtimeFailure })
+        }
+        await params.stateStore.markMemberResult(
+          memberName,
+          {
+            status: 'failed',
+            failureReason: runtimeFailure,
+          },
+          params.now,
+        )
+      }
+    }
+
+    if (pending.size === 0) {
+      break
+    }
+
+    const elapsedMs = params.monotonicNow() - params.timeoutStartedAt
+    const remainingMs = params.request.bootstrapTimeoutMs - elapsedMs
+    if (remainingMs <= 0) {
+      for (const memberName of pending.keys()) {
+        if (
+          params.failedMembers.some(failed => failed.name === memberName)
+        ) {
+          continue
+        }
+        const reason =
+          'Teammate was registered but did not bootstrap-confirm before timeout.'
+        params.failedMembers.push({ name: memberName, reason })
+        await params.stateStore.markMemberResult(
+          memberName,
+          {
+            status: 'failed',
+            failureReason: reason,
+          },
+          params.now,
+        )
+      }
+      break
+    }
+
+    await sleep(Math.min(500, Math.max(50, remainingMs)))
+  }
+
+  return [...confirmedMembers]
 }
 
 export async function runTeamBootstrap(params: {
@@ -565,13 +732,27 @@ export async function runTeamBootstrap(params: {
         assertTimeoutBudget('before auditing bootstrap truth')
         await validateWorkspace('before auditing bootstrap truth')
         const teamFile = await deps.readTeamFileAsync(params.request.teamName)
-        const registeredMemberNames = new Set(
-          (teamFile?.members ?? [])
-            .map(member => member.name?.trim())
-            .filter((name): name is string => Boolean(name) && name !== 'team-lead'),
+        const membersByName = new Map(
+          (teamFile?.members ?? []).flatMap(member => {
+            const memberName = member.name?.trim()
+            if (!memberName || memberName === 'team-lead') {
+              return []
+            }
+            return [
+              [
+                memberName,
+                {
+                  agentId: member.agentId,
+                  bootstrapExpectedAfter: member.bootstrapExpectedAfter ?? null,
+                  backendType: member.backendType,
+                  runtimePid: member.runtimePid,
+                },
+              ] as const,
+            ]
+          }),
         )
         for (const member of params.request.members) {
-          if (registeredMemberNames.has(member.displayName)) {
+          if (membersByName.has(member.displayName)) {
             continue
           }
           const alreadyFailed = failedMembers.some(
@@ -592,12 +773,21 @@ export async function runTeamBootstrap(params: {
             now,
           )
         }
+        const confirmedMemberNames = await waitForRequiredBootstrapConfirmations({
+          request: params.request,
+          stateStore,
+          failedMembers,
+          membersByName,
+          timeoutStartedAt,
+          monotonicNow,
+          now,
+        })
 
         return buildSummary({
           request: params.request,
           reusedExistingTeam,
           failedMembers,
-          registeredMembers: [...registeredMemberNames],
+          registeredMembers: confirmedMemberNames,
         })
       },
     })

@@ -57,7 +57,7 @@ import { getInitialFastModeSetting, isFastModeEnabled, prefetchFastModeStatus, r
 import { applyConfigEnvironmentVariables } from './utils/managedEnv.js';
 import { createSystemMessage, createUserMessage } from './utils/messages.js';
 import { getPlatform } from './utils/platform.js';
-import { getBaseRenderOptions } from './utils/renderOptions.js';
+import { getBaseRenderOptions, getHeadlessTeammateRenderOptions } from './utils/renderOptions.js';
 import { getSessionIngressAuthToken } from './utils/sessionIngressAuth.js';
 import { settingsChangeDetector } from './utils/settings/changeDetector.js';
 import { skillChangeDetector } from './utils/skills/skillChangeDetector.js';
@@ -170,7 +170,10 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
+import { writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
+
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('./utils/permissions/autoModeState.js') as typeof import('./utils/permissions/autoModeState.js') : null;
@@ -814,6 +817,7 @@ export async function main() {
   const hasPrintFlag = cliArgs.includes('-p') || cliArgs.includes('--print');
   const hasInitOnlyFlag = cliArgs.includes('--init-only');
   const hasSdkUrl = cliArgs.some(arg => arg.startsWith('--sdk-url'));
+  const hasHeadlessTeammateRuntimeFlag = cliArgs.some((arg, index) => arg === '--teammate-runtime=headless' || arg === '--teammate-runtime' && cliArgs[index + 1] === 'headless');
   const hasTeammateIdentityFlag = cliArgs.some(
     arg => arg === '--agent-id' || arg.startsWith('--agent-id='),
   );
@@ -830,6 +834,9 @@ export async function main() {
 
   // Initialize entrypoint based on mode - needs to be set before any event is logged
   initializeEntrypoint(isNonInteractive);
+  if (hasHeadlessTeammateRuntimeFlag) {
+    process.env[TEAMMATE_RUNTIME_ENV] = 'headless';
+  }
 
   // Determine client type
   const clientType = (() => {
@@ -1146,6 +1153,9 @@ async function run(): Promise<CommanderCommand> {
     let inputFormat = options.inputFormat;
     let verbose = options.verbose ?? getGlobalConfig().verbose;
     let print = options.print;
+    const isHeadlessTeammateRuntime = (options as {
+      teammateRuntime?: string;
+    }).teammateRuntime === 'headless';
     const init = options.init ?? false;
     const initOnly = options.initOnly ?? false;
     const maintenance = options.maintenance ?? false;
@@ -1228,6 +1238,16 @@ async function run(): Promise<CommanderCommand> {
           planModeRequired: teammateOpts.planModeRequired ?? false,
           parentSessionId: teammateOpts.parentSessionId
         });
+        if (isHeadlessTeammateRuntime) {
+          void writeTeammateRuntimeEvent({
+            type: 'cli_started',
+            teamName: teammateOpts.teamName,
+            agentName: teammateOpts.agentName,
+            agentId: teammateOpts.agentId,
+            runId: getSessionId(),
+            cwd: getCwd()
+          });
+        }
       }
 
       // Set teammate mode CLI override if provided
@@ -2250,7 +2270,7 @@ async function run(): Promise<CommanderCommand> {
       const {
         createRoot
       } = await import('./ink.js');
-      root = await createRoot(ctx.renderOptions);
+      root = await createRoot(isHeadlessTeammateRuntime ? getHeadlessTeammateRenderOptions(ctx.renderOptions) : ctx.renderOptions);
 
       // Log startup time now, before any blocking dialog renders. Logging
       // from REPL's first render (the old location) included however long
@@ -2260,10 +2280,15 @@ async function run(): Promise<CommanderCommand> {
         event: 'startup' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         durationMs: Math.round(process.uptime() * 1000)
       });
-      logForDebugging('[STARTUP] Running showSetupScreens()...');
-      const setupScreensStart = Date.now();
-      const onboardingShown = await showSetupScreens(root, permissionMode, allowDangerouslySkipPermissions, commands, enableClaudeInChrome, devChannels);
-      logForDebugging(`[STARTUP] showSetupScreens() completed in ${Date.now() - setupScreensStart}ms`);
+      let onboardingShown = false;
+      if (!isHeadlessTeammateRuntime) {
+        logForDebugging('[STARTUP] Running showSetupScreens()...');
+        const setupScreensStart = Date.now();
+        onboardingShown = await showSetupScreens(root, permissionMode, allowDangerouslySkipPermissions, commands, enableClaudeInChrome, devChannels);
+        logForDebugging(`[STARTUP] showSetupScreens() completed in ${Date.now() - setupScreensStart}ms`);
+      } else {
+        logForDebugging('[STARTUP] Skipping setup screens for headless teammate runtime');
+      }
 
       // Now that trust is established and GrowthBook has auth headers,
       // resolve the --remote-control / --rc entitlement gate.
@@ -3868,6 +3893,7 @@ async function run(): Promise<CommanderCommand> {
   program.addOption(new Option('--agent-color <color>', 'Teammate UI color').hideHelp());
   program.addOption(new Option('--plan-mode-required', 'Require plan mode before implementation').hideHelp());
   program.addOption(new Option('--parent-session-id <id>', 'Parent session ID for analytics correlation').hideHelp());
+  program.addOption(new Option('--teammate-runtime <mode>', 'Teammate runtime mode').choices(['headless']).hideHelp());
   program.addOption(new Option('--teammate-mode <mode>', 'How to spawn teammates: "tmux", "in-process", or "auto"').choices(['auto', 'tmux', 'in-process']).hideHelp());
   program.addOption(new Option('--agent-type <type>', 'Custom agent type for this teammate').hideHelp());
 

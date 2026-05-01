@@ -263,6 +263,13 @@ export function getAnthropicApiKeyWithSource(
     ? undefined
     : process.env.ANTHROPIC_API_KEY
 
+  if (apiKeyEnv && isHostManagedAnthropicProviderSelection()) {
+    return {
+      key: apiKeyEnv,
+      source: 'ANTHROPIC_API_KEY',
+    }
+  }
+
   // Always check for direct environment variable when the user ran claude --print.
   // This is useful for CI, etc.
   if (preferThirdPartyAuthentication() && apiKeyEnv) {
@@ -1587,6 +1594,13 @@ export function hasExplicitHostManagedProviderSelection(): boolean {
   return (
     isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
     Boolean(process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim())
+  )
+}
+
+export function isHostManagedAnthropicProviderSelection(): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase() === 'anthropic'
   )
 }
 

@@ -62,7 +62,7 @@ function resolveNpmNodeShim(
   launcherDir: string,
 ): DirectWindowsLauncher | null {
   const scriptTemplate =
-    /"%_prog%"\s+"([^"]+\.(?:cjs|mjs|js))"\s+%\*/i.exec(content)?.[1]
+    /"%_prog%"\s+"([^"]+(?:\.(?:cjs|mjs|js))?)"\s+%\*/i.exec(content)?.[1]
   if (!scriptTemplate) {
     return null
   }

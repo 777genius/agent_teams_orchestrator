@@ -8,6 +8,7 @@ import type {
   TeamBootstrapRequest,
   TeamBootstrapResult,
 } from "./teamBootstrapTypes.js";
+import { writeToMailbox } from "../../utils/teammateMailbox.js";
 
 type SpawnInput = Record<string, unknown>;
 type DuplicateReason = "already_running" | "bootstrap_pending";
@@ -26,6 +27,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
   let createTeamCalls: Array<Record<string, unknown>>;
   let createTeamFailure: string | null;
   let registerSpawnedMembers: boolean;
+  let bootstrapConfirmedMemberNames: Set<string>;
 
   beforeEach(async () => {
     mock.restore();
@@ -42,6 +44,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
     createTeamCalls = [];
     createTeamFailure = null;
     registerSpawnedMembers = false;
+    bootstrapConfirmedMemberNames = new Set();
 
     const buildMockTeamFile = () => ({
       name: "atlas-hq",
@@ -59,10 +62,16 @@ describe("team bootstrap launch matrix safe e2e", () => {
       "./teamBootstrapRunner.js"
     );
     __setTeamBootstrapRunnerDepsForTests({
-      readTeamFileAsync: (async () =>
-        teamConfigExists
-          ? buildMockTeamFile()
-          : null) as never,
+      readTeamFileAsync: (async () => {
+        if (!teamConfigExists) {
+          return null;
+        }
+        await writeBootstrapConfirmations(
+          registeredMemberNames,
+          bootstrapConfirmedMemberNames,
+        );
+        return buildMockTeamFile();
+      }) as never,
       updateTeamFileAsync: (async (
         _teamName: string,
         updater: (teamFile: ReturnType<typeof buildMockTeamFile>) => unknown,
@@ -797,11 +806,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       }
       expect(result.summary.terminalStatus).toBe("completed");
       expect(result.summary.expectedMembers).toEqual(["alice"]);
-      expect(result.summary.registeredMembers).toEqual([
-        "alice",
-        "bob",
-        "jack",
-      ]);
+      expect(result.summary.registeredMembers).toEqual(["alice"]);
       expect(result.summary.failedMembers).toEqual([]);
       expect(events.items).toContainEqual({
         type: "member_spawn_started",
@@ -949,15 +954,16 @@ describe("team bootstrap launch matrix safe e2e", () => {
         emit: events.emit,
       });
 
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
       expect(spawnInputs.map((input) => input.name)).toEqual(["alice"]);
-      if (!result.ok) {
-        throw new Error("expected mixed primary lane partial success");
+      if (result.ok) {
+        throw new Error("expected mixed primary lane failure");
       }
-      expect(result.summary.terminalStatus).toBe("partial_success");
-      expect(result.summary.expectedMembers).toEqual(["alice"]);
-      expect(result.summary.registeredMembers).toEqual(["bob", "jack"]);
-      expect(result.summary.failedMembers).toEqual([
+      const failure = result as FailedTeamBootstrapResult;
+      expect(result.summary?.terminalStatus).toBe("failed");
+      expect(result.summary?.expectedMembers).toEqual(["alice"]);
+      expect(result.summary?.registeredMembers).toEqual([]);
+      expect(result.summary?.failedMembers).toEqual([
         {
           name: "alice",
           reason:
@@ -965,14 +971,14 @@ describe("team bootstrap launch matrix safe e2e", () => {
         },
       ]);
       expect(
-        result.summary.failedMembers.some((member) => member.name === "bob"),
+        result.summary?.failedMembers.some((member) => member.name === "bob"),
       ).toBe(false);
       expect(
-        result.summary.failedMembers.some((member) => member.name === "jack"),
+        result.summary?.failedMembers.some((member) => member.name === "jack"),
       ).toBe(false);
       expect(events.items).toContainEqual({
-        type: "completed",
-        status: "partial_success",
+        type: "failed",
+        reason: failure.error,
       });
     },
     SAFE_E2E_TIMEOUT_MS,
@@ -1017,7 +1023,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
       expect(failure.error).not.toContain("jack");
       expect(result.summary?.terminalStatus).toBe("failed");
       expect(result.summary?.expectedMembers).toEqual(["alice"]);
-      expect(result.summary?.registeredMembers).toEqual(["bob", "jack"]);
+      expect(result.summary?.registeredMembers).toEqual([]);
       expect(result.summary?.failedMembers).toEqual([
         {
           name: "alice",
@@ -1252,7 +1258,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
         { name: "bob", reason: "Codex native runtime unavailable" },
         { name: "zoe", reason: "Gemini pane failed to start" },
       ]);
-      expect(failure.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were bootstrap-confirmed");
       expect(events.completedEvents).toEqual([]);
       expect(events.items).toContainEqual({
         type: "failed",
@@ -1454,7 +1460,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
         type: "failed",
         reason: failure.error,
       });
-      expect(failure.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were bootstrap-confirmed");
     },
     SAFE_E2E_TIMEOUT_MS,
   );
@@ -1503,7 +1509,7 @@ describe("team bootstrap launch matrix safe e2e", () => {
         type: "failed",
         reason: failure.error,
       });
-      expect(failure.error).toContain("no teammates were registered");
+      expect(failure.error).toContain("no teammates were bootstrap-confirmed");
     },
     SAFE_E2E_TIMEOUT_MS,
   );
@@ -1953,6 +1959,36 @@ function member(
     provider,
     model,
   };
+}
+
+async function writeBootstrapConfirmations(
+  registeredMemberNames: Set<string>,
+  alreadyWritten: Set<string>,
+): Promise<void> {
+  await Promise.all(
+    [...registeredMemberNames].map(async (name) => {
+      if (alreadyWritten.has(name)) {
+        return;
+      }
+      alreadyWritten.add(name);
+      const agentId = `${name}@atlas-hq`;
+      const timestamp = new Date().toISOString();
+      await writeToMailbox(
+        "team-lead",
+        {
+          from: agentId,
+          text: JSON.stringify({
+            type: "idle_notification",
+            from: agentId,
+            timestamp,
+            idleReason: "available",
+          }),
+          timestamp,
+        },
+        "atlas-hq",
+      );
+    }),
+  );
 }
 
 function attachedContext(teamName: string) {

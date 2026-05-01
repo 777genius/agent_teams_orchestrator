@@ -19,6 +19,8 @@ let homeDir = ''
 let previousHome: string | undefined
 const LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS = 15_000
 const SNAPSHOT_PROJECT_ID = 'project-fixture'
+const supportsNewlineFilenames = process.platform !== 'win32'
+const newlinePathFixtureTest = supportsNewlineFilenames ? test : test.skip
 
 class FixtureOpenCodeOfflineSessionReader extends OpenCodeOfflineSessionReader {
   constructor(private readonly dbPath: string) {
@@ -31,7 +33,11 @@ class FixtureOpenCodeOfflineSessionReader extends OpenCodeOfflineSessionReader {
 }
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-ledger-fixture-e2e-'))
+  const tempRoot = process.platform === 'win32'
+    ? path.join(os.tmpdir(), 'oclf')
+    : os.tmpdir()
+  await mkdir(tempRoot, { recursive: true })
+  tempDir = await mkdtemp(path.join(tempRoot, 't-'))
   homeDir = path.join(tempDir, 'home')
   await mkdir(homeDir, { recursive: true })
   previousHome = process.env.HOME
@@ -85,13 +91,32 @@ function hashFast(value: string): string {
   return createHash('sha1').update(value).digest('hex')
 }
 
+function shortenGitPathArgs(args: string[], cwd: string): string[] {
+  const result = [...args]
+  for (let index = 0; index < result.length - 1; index += 1) {
+    if (result[index] !== '--git-dir' && result[index] !== '--work-tree') {
+      continue
+    }
+    const value = result[index + 1]
+    if (!value || !path.isAbsolute(value)) {
+      continue
+    }
+    const relative = path.relative(cwd, value)
+    if (relative && relative.length < value.length) {
+      result[index + 1] = relative
+    }
+  }
+  return result
+}
+
 function runGit(args: string[], cwd: string): string {
-  const result = spawnSync('git', args, {
+  const gitArgs = ['-c', 'core.longpaths=true', ...shortenGitPathArgs(args, cwd)]
+  const result = spawnSync('git', gitArgs, {
     cwd,
     encoding: 'utf8',
   })
   if (result.status !== 0) {
-    throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`)
+    throw new Error(`git ${gitArgs.join(' ')} failed: ${result.stderr}`)
   }
   return result.stdout.trim()
 }
@@ -1182,14 +1207,16 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     await mkdir(projectDir, { recursive: true })
     const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
     await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
-    await insertNewlinePathSnapshotEditToolpart(dbPath, workspaceRoot)
+    if (supportsNewlineFilenames) {
+      await insertNewlinePathSnapshotEditToolpart(dbPath, workspaceRoot)
+    }
     await insertSnapshotWriteOverwriteToolpart(dbPath, workspaceRoot)
     const snapshotStore = await createOpenCodeSnapshotGitStoreFixture({
       dbPath,
       workspaceRoot,
       includeSnapshotOnlyEdit: true,
       includeUnattributedSnapshotFile: true,
-      includeNewlinePathEdit: true,
+      includeNewlinePathEdit: supportsNewlineFilenames,
       includeWriteOverwrite: true,
     })
     await stat(snapshotStore.gitDir)
@@ -1217,14 +1244,16 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
 
     expect(result.outcome).toBe('imported')
     expect(result.snapshotShapeFingerprint).toBe('opencode-snapshot-git-store-v2')
-    expect(result.importedEvents).toBe(7)
+    expect(result.importedEvents).toBe(supportsNewlineFilenames ? 7 : 6)
     expect(result.diagnostics.join('\n')).toContain('OpenCode snapshot evidence skipped because SQLite snapshot windows are unavailable.')
     expect(result.diagnostics.join('\n')).toContain(
       'snapshot-path-not-touched: 227/formatter-only.js was present in snapshot diff but not in toolpart touched paths.',
     )
-    expect(result.diagnostics.join('\n')).toContain(
-      'snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path 227/new\nline.js; using raw snapshot diff as path proof.',
-    )
+    if (supportsNewlineFilenames) {
+      expect(result.diagnostics.join('\n')).toContain(
+        'snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path 227/new\nline.js; using raw snapshot diff as path proof.',
+      )
+    }
     const diagnosticsText = result.diagnostics.join('\n')
     for (const sensitiveText of [
       '<main>v1</main>',
@@ -1253,14 +1282,18 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect((snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
     expect((snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256).toBeTruthy()
     const newlinePathEdit = events.find(event => event.sourcePartId === 'bob-edit-newline-path')
-    expect(newlinePathEdit).toMatchObject({
-      source: 'opencode_toolpart_edit',
-      relativePath: '227/new\nline.js',
-      confidence: 'high',
-      evidenceProof: 'inverse-edit-chain',
-      operation: 'modify',
-    })
-    expect(newlinePathEdit?.snapshotId).toBeTruthy()
+    if (supportsNewlineFilenames) {
+      expect(newlinePathEdit).toMatchObject({
+        source: 'opencode_toolpart_edit',
+        relativePath: '227/new\nline.js',
+        confidence: 'high',
+        evidenceProof: 'inverse-edit-chain',
+        operation: 'modify',
+      })
+      expect(newlinePathEdit?.snapshotId).toBeTruthy()
+    } else {
+      expect(newlinePathEdit).toBeUndefined()
+    }
     const rewriteWrite = events.find(event => event.sourcePartId === 'bob-write-rewrite')
     expect(rewriteWrite).toMatchObject({
       source: 'opencode_toolpart_write',
@@ -1286,14 +1319,16 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       latestBeforeHash: (snapshotOnlyEdit?.before as { sha256?: string } | undefined)?.sha256,
       latestAfterHash: (snapshotOnlyEdit?.after as { sha256?: string } | undefined)?.sha256,
     })
-    expect(files.find(file => file.relativePath === '227/new\nline.js')).toMatchObject({
-      latestOperation: 'modify',
-      createdInTask: false,
-      reviewability: 'full-text',
-      contentAvailability: 'full-text',
-      latestBeforeHash: (newlinePathEdit?.before as { sha256?: string } | undefined)?.sha256,
-      latestAfterHash: (newlinePathEdit?.after as { sha256?: string } | undefined)?.sha256,
-    })
+    if (supportsNewlineFilenames) {
+      expect(files.find(file => file.relativePath === '227/new\nline.js')).toMatchObject({
+        latestOperation: 'modify',
+        createdInTask: false,
+        reviewability: 'full-text',
+        contentAvailability: 'full-text',
+        latestBeforeHash: (newlinePathEdit?.before as { sha256?: string } | undefined)?.sha256,
+        latestAfterHash: (newlinePathEdit?.after as { sha256?: string } | undefined)?.sha256,
+      })
+    }
     expect(files.find(file => file.relativePath === '227/rewrite.js')).toMatchObject({
       latestOperation: 'modify',
       createdInTask: false,
@@ -1313,7 +1348,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       attributionMode: 'strict-delivery',
     })
     expect(duplicateResult.outcome).toBe('duplicates-only')
-    expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(7)
+    expect((await readJsonlEvents(projectDir, 'task-1'))).toHaveLength(supportsNewlineFilenames ? 7 : 6)
   })
 
   test('degrades to visible metadata-only changes when snapshot gitdir is missing', async () => {
@@ -2146,7 +2181,7 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
-  test('CLI command imports newline path snapshot evidence as one full-text Changes row', async () => {
+  newlinePathFixtureTest('CLI command imports newline path snapshot evidence as one full-text Changes row', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-cli-newline-path')
     const projectDir = path.join(tempDir, 'claude-project-cli-newline-path')
     const dataDir = envPathsDataDirForHome(homeDir)

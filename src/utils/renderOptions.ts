@@ -1,4 +1,5 @@
 import { openSync } from 'fs'
+import { Writable } from 'node:stream'
 import { ReadStream } from 'tty'
 import type { RenderOptions } from '../ink.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -6,6 +7,7 @@ import { logError } from './log.js'
 
 // Cached stdin override - computed once per process
 let cachedStdinOverride: ReadStream | undefined | null = null
+let cachedHeadlessStdout: NodeJS.WriteStream | undefined
 
 /**
  * Gets a ReadStream for /dev/tty when stdin is piped.
@@ -74,4 +76,35 @@ export function getBaseRenderOptions(
     options.stdin = stdin
   }
   return options
+}
+
+function getHeadlessTeammateStdout(): NodeJS.WriteStream {
+  if (cachedHeadlessStdout) {
+    return cachedHeadlessStdout
+  }
+
+  const stream = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback()
+    },
+  }) as NodeJS.WriteStream & {
+    isTTY?: boolean
+    columns?: number
+    rows?: number
+  }
+  stream.isTTY = false
+  stream.columns = process.stdout.columns || 80
+  stream.rows = process.stdout.rows || 24
+  cachedHeadlessStdout = stream
+  return cachedHeadlessStdout
+}
+
+export function getHeadlessTeammateRenderOptions(
+  options: RenderOptions,
+): RenderOptions {
+  return {
+    ...options,
+    stdout: getHeadlessTeammateStdout(),
+    patchConsole: false,
+  }
 }

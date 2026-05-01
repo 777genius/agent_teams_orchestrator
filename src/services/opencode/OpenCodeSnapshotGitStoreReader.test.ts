@@ -342,6 +342,7 @@ describe('OpenCodeSnapshotGitStoreReader', () => {
     await rm(path.join(worktree, 'link.txt'))
     await writeFile(path.join(worktree, 'link.txt'), 'now regular\n')
     runGit(['--git-dir', gitDir, '--work-tree', worktree, 'add', '--all'], tempDir)
+    runGit(['--git-dir', gitDir, '--work-tree', worktree, 'update-index', '--chmod=+x', 'chmod.sh'], tempDir)
     runGit(['--git-dir', gitDir, '--work-tree', worktree, 'update-index', '--cacheinfo', '160000', '2222222222222222222222222222222222222222', 'submodule'], tempDir)
     const after = runGit(['--git-dir', gitDir, '--work-tree', worktree, 'write-tree'], tempDir)
 

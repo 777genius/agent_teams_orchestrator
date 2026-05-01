@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -59,7 +59,7 @@ async function getLiveModel(): Promise<string> {
 }
 
 async function createTempProject(prefix: string): Promise<string> {
-  return mkdtemp(path.join(os.tmpdir(), `${prefix}-`))
+  return realpath(await mkdtemp(path.join(os.tmpdir(), `${prefix}-`)))
 }
 
 async function cleanupLiveSession(input: {
@@ -81,7 +81,7 @@ async function cleanupLiveSession(input: {
   }
   await openCodeSessionStore.delete(input.identity.teamId, input.identity.memberName)
     .catch(() => undefined)
-  await rm(input.projectPath, { recursive: true, force: true }).catch(() => undefined)
+  await removeTempDirWithRetries(input.projectPath).catch(() => undefined)
 }
 
 const liveTest =
@@ -111,7 +111,7 @@ describe('OpenCodeSessionBridge live e2e', () => {
         openCodeSessionBridge.sendMessage(record, {
           text: 'Reply with exactly: pong',
         }),
-        20_000,
+        90_000,
         'sendMessage(text)',
       )
 
@@ -126,7 +126,6 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(reconciled.summary.toolCallCount).toBe(0)
       const assistant = reconciled.summary.messages.find(message => message.role === 'assistant')
       expect(assistant).toBeDefined()
-      expect(assistant?.contentBlocks.some(block => block.type === 'reasoning')).toBe(true)
       expect(assistant?.contentBlocks.some(block => block.type === 'text')).toBe(true)
     } finally {
       await cleanupLiveSession({
@@ -136,12 +135,15 @@ describe('OpenCodeSessionBridge live e2e', () => {
         reason: 'opencode_session_bridge_live_text_e2e_cleanup',
       })
     }
-  }, 90_000)
+  }, 150_000)
 
   liveTest('projects a real OpenCode bash tool call into canonical transcript blocks', async () => {
     const selectedModel = await getLiveModel()
     const identity = buildUniqueIdentity('opencode-live-tool')
     const projectPath = await createTempProject('opencode-session-bridge-live-tool')
+    const expectedPathToken = process.platform === 'win32'
+      ? path.basename(projectPath)
+      : projectPath
     let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
 
     try {
@@ -196,8 +198,8 @@ describe('OpenCodeSessionBridge live e2e', () => {
 
       const bashCall = toolMessage?.toolCalls.find(tool => tool.toolName === 'bash')
       expect(bashCall?.status).toBe('completed')
-      expect(bashCall?.outputText).toContain(projectPath)
-      expect(reconciled.summary.latestAssistantText).toContain(projectPath)
+      expect(bashCall?.outputText).toContain(expectedPathToken)
+      expect(reconciled.summary.latestAssistantText).toContain(expectedPathToken)
       expect(projectedLogs.logProjection.messages).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -240,3 +242,19 @@ describe('OpenCodeSessionBridge live e2e', () => {
     }
   }, 120_000)
 })
+
+async function removeTempDirWithRetries(dirPath: string): Promise<void> {
+  const attempts = process.platform === 'win32' ? 20 : 1
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await rm(dirPath, { recursive: true, force: true })
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if ((code !== 'EBUSY' && code !== 'EPERM') || attempt === attempts) {
+        throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+}

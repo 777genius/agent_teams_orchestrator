@@ -49,21 +49,6 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
         isInProcessEnabled: () => true,
       }))
 
-      const teamHelpersModulePath = new URL(
-        '../../utils/swarm/teamHelpers.js',
-        import.meta.url,
-      ).href
-      const teamHelpersModule = await import(teamHelpersModulePath)
-      const teamHelpersMock = {
-        ...teamHelpersModule,
-        updateTeamFileAsync: async () => ({
-          status: 'missing' as const,
-          teamFile: null,
-        }),
-      }
-      mock.module(teamHelpersModulePath, () => teamHelpersMock)
-      mock.module('src/utils/swarm/teamHelpers.js', () => teamHelpersMock)
-
       const spawnModulePath = new URL(
         './spawnMultiAgent.ts?spawnMultiAgentCleanupTest',
         import.meta.url,

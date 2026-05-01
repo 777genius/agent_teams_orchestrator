@@ -395,7 +395,8 @@ async function runGit(args: string[], input: {
   timeoutMs: number
   maxBytes: number
 }): Promise<GitRunResult> {
-  const allowlistError = validateOpenCodeSnapshotGitStoreArgs(args)
+  const gitArgs = shortenGitPathArgs(args, input.cwd)
+  const allowlistError = validateOpenCodeSnapshotGitStoreArgs(gitArgs)
   if (allowlistError) {
     return {
       code: 1,
@@ -405,7 +406,7 @@ async function runGit(args: string[], input: {
     }
   }
   return new Promise(resolve => {
-    const child = spawn(gitExe(), args, {
+    const child = spawn(gitExe(), gitArgs, {
       cwd: input.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -432,7 +433,7 @@ async function runGit(args: string[], input: {
     }
 
     timer = setTimeout(() => {
-      diagnostics.push(`snapshot-git-timeout: git ${args.join(' ')} timed out after ${input.timeoutMs}ms.`)
+      diagnostics.push(`snapshot-git-timeout: git ${gitArgs.join(' ')} timed out after ${input.timeoutMs}ms.`)
       child.kill('SIGTERM')
       settle(1)
     }, input.timeoutMs)
@@ -444,7 +445,7 @@ async function runGit(args: string[], input: {
       }
       const remaining = input.maxBytes - stdoutBytes
       if (remaining <= 0) {
-        diagnostics.push(`snapshot-git-output-cap: git ${args.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
+        diagnostics.push(`snapshot-git-output-cap: git ${gitArgs.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
         child.kill('SIGTERM')
         settle(1)
         return
@@ -452,7 +453,7 @@ async function runGit(args: string[], input: {
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining))
         stdoutBytes += remaining
-        diagnostics.push(`snapshot-git-output-cap: git ${args.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
+        diagnostics.push(`snapshot-git-output-cap: git ${gitArgs.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
         child.kill('SIGTERM')
         settle(1)
         return
@@ -500,6 +501,24 @@ function gitStoreArgs(gitDir: string, worktree: string, args: string[]): string[
     worktree,
     ...args,
   ]
+}
+
+function shortenGitPathArgs(args: string[], cwd: string): string[] {
+  const result = [...args]
+  for (let index = 0; index < result.length - 1; index += 1) {
+    if (result[index] !== '--git-dir' && result[index] !== '--work-tree') {
+      continue
+    }
+    const value = result[index + 1]
+    if (!value || !path.isAbsolute(value)) {
+      continue
+    }
+    const relative = path.relative(cwd, value)
+    if (relative && relative.length < value.length) {
+      result[index + 1] = relative
+    }
+  }
+  return result
 }
 
 function isRealObjectId(value: string): boolean {

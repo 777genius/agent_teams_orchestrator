@@ -250,7 +250,9 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
     return cachedDetectionResult
   }
 
-  // No backend available - tmux is not installed
+  // No pane backend available. Teammates may still run through the
+  // in-process or native-process transports; this error is for callers that
+  // explicitly requested pane transport.
   logForDebugging('[BackendRegistry] ERROR: No pane backend available')
   throw new Error(getTmuxInstallInstructions())
 }
@@ -263,26 +265,30 @@ function getTmuxInstallInstructions(): string {
 
   switch (platform) {
     case 'macos':
-      return `To use agent swarms, install tmux:
+      return `To use pane-based agent swarm transport, install tmux:
   brew install tmux
-Then start a tmux session with: tmux new-session -s claude`
+Then start a tmux session with: tmux new-session -s claude
+Native process and in-process teammates can still run without tmux.`
 
     case 'linux':
     case 'wsl':
-      return `To use agent swarms, install tmux:
+      return `To use pane-based agent swarm transport, install tmux:
   sudo apt install tmux    # Ubuntu/Debian
   sudo dnf install tmux    # Fedora/RHEL
-Then start a tmux session with: tmux new-session -s claude`
+Then start a tmux session with: tmux new-session -s claude
+Native process and in-process teammates can still run without tmux.`
 
     case 'windows':
-      return `To use agent swarms, you need tmux which requires WSL (Windows Subsystem for Linux).
+      return `To use pane-based agent swarm transport on Windows, tmux requires WSL (Windows Subsystem for Linux).
 Install WSL first, then inside WSL run:
   sudo apt install tmux
-Then start a tmux session with: tmux new-session -s claude`
+Then start a tmux session with: tmux new-session -s claude
+Native process and in-process teammates can still run without tmux.`
 
     default:
-      return `To use agent swarms, install tmux using your system's package manager.
-Then start a tmux session with: tmux new-session -s claude`
+      return `To use pane-based agent swarm transport, install tmux using your system's package manager.
+Then start a tmux session with: tmux new-session -s claude
+Native process and in-process teammates can still run without tmux.`
   }
 }
 

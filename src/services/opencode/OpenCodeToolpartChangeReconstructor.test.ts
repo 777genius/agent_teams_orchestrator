@@ -159,6 +159,43 @@ function applyPatchToolPart(input: {
   )
 }
 
+function applyPatchMetadataToolPart(input: {
+  id: string
+  messageId?: string
+  filePath: string
+  type: 'add' | 'update' | 'delete'
+  patch: string
+  time?: number
+}): OpenCodeSqlitePartRow {
+  return partRow(
+    input.id,
+    input.messageId ?? 'assistant-1',
+    {
+      type: 'tool',
+      tool: 'apply_patch',
+      callID: `call-${input.id}`,
+      state: {
+        status: 'completed',
+        input: {
+          patchText: input.patch,
+        },
+        metadata: {
+          files: [
+            {
+              filePath: input.filePath,
+              relativePath: path.relative(workspaceRoot, input.filePath),
+              type: input.type,
+              patch: input.patch,
+            },
+          ],
+        },
+        time: { end: input.time ?? 1000 },
+      },
+    },
+    input.time ?? 1000,
+  )
+}
+
 function deliveryContext(overrides: Partial<{
   memberName: string
   laneId: string
@@ -436,6 +473,76 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
         unavailableReason: 'opencode-apply-patch-final-content-unavailable',
       },
     })
+  })
+
+  test('reconstructs legacy OpenCode apply_patch adds from patch metadata', () => {
+    const result = reconstruct([
+      applyPatchMetadataToolPart({
+        id: 'part-apply-patch-add',
+        filePath: path.join(workspaceRoot, 'src/from-patch.ts'),
+        type: 'add',
+        patch: [
+          'Index: /repo/src/from-patch.ts',
+          '===================================================================',
+          '--- /dev/null',
+          '+++ /repo/src/from-patch.ts',
+          '@@ -0,0 +1,1 @@',
+          '+export const fromPatch = true;',
+          '',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      sourceTool: 'write',
+      operation: 'create',
+      confidence: 'exact',
+      relativePath: 'src/from-patch.ts',
+      afterContent: 'export const fromPatch = true;\n',
+    })
+    expect(result.changes[0]?.warnings).toContain(
+      'OpenCode apply_patch toolpart imported from patch metadata.',
+    )
+  })
+
+  test('imports legacy OpenCode apply_patch updates as manual-review metadata without a baseline', () => {
+    const result = reconstruct([
+      applyPatchMetadataToolPart({
+        id: 'part-apply-patch-update',
+        filePath: path.join(workspaceRoot, 'src/existing.ts'),
+        type: 'update',
+        patch: [
+          'Index: /repo/src/existing.ts',
+          '===================================================================',
+          '--- /repo/src/existing.ts',
+          '+++ /repo/src/existing.ts',
+          '@@ -1,1 +1,1 @@',
+          '-export const value = 1;',
+          '+export const value = 2;',
+          '',
+        ].join('\n'),
+      }),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes).toHaveLength(1)
+    expect(result.changes[0]).toMatchObject({
+      sourceTool: 'edit',
+      operation: 'modify',
+      confidence: 'medium',
+      relativePath: 'src/existing.ts',
+      beforeContent: null,
+      afterContent: null,
+      oldString: 'export const value = 1;\n',
+      newString: 'export const value = 2;\n',
+    })
+    expect(result.changes[0]?.warnings).toContain(
+      'OpenCode apply_patch toolpart imported from patch metadata.',
+    )
   })
 
   test('skips apply_patch toolparts when patch markers are unsupported', () => {

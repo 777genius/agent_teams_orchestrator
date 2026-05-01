@@ -102,6 +102,17 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     ).toBe(false)
   })
 
+  it('keeps an unapproved API key when the host manages an Anthropic teammate target', () => {
+    expect(
+      shouldClearAnthropicApiKeyForTeammateSpawn({
+        anthropicApiKey: 'sk-ant-test-host-managed',
+        customApiKeyStatus: 'new',
+        isHostManagedAnthropicTarget: true,
+        isHomespace: false,
+      }),
+    ).toBe(false)
+  })
+
   it('does not clear when there is no custom API key to leak into the child env', () => {
     expect(
       shouldClearAnthropicApiKeyForTeammateSpawn({
@@ -164,6 +175,80 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         delete process.env.CODEX_API_KEY
       } else {
         process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+    }
+  })
+
+  it('forwards Anthropic API keys to host-managed Anthropic teammates', () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-host-managed-teammate'
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'anthropic' })
+
+      expect(env).toContain('ANTHROPIC_API_KEY=sk-ant-host-managed-teammate')
+      expect(env).not.toContain("ANTHROPIC_API_KEY=''")
+    } finally {
+      if (originalApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalApiKey
+      }
+
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
+      }
+    }
+  })
+
+  it('blanks unapproved Anthropic API keys for non-host-managed teammates', () => {
+    const originalApiKey = process.env.ANTHROPIC_API_KEY
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-new-local-teammate'
+    delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'anthropic' })
+
+      expect(env).toContain("ANTHROPIC_API_KEY=''")
+      expect(env).not.toContain('ANTHROPIC_API_KEY=sk-ant-new-local-teammate')
+    } finally {
+      if (originalApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalApiKey
+      }
+
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+
+      if (originalEntryProvider === undefined) {
+        delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+      } else {
+        process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
       }
     }
   })
