@@ -68,6 +68,7 @@ import {
   isPermissionResponse,
   isPlanApprovalRequest,
   isPlanApprovalResponse,
+  isAgentErrorNotificationMessage,
   isLiveInboxMirrorMessageOwnedBySession,
   isRegularInteractiveMailboxMessage,
   isSilentRegularMailboxMessageForLiveContext,
@@ -144,6 +145,11 @@ export type InboxPromptSubmitResult = {
   userMessageUuid?: string
 }
 
+export type AgentErrorUserNotification = Pick<
+  TeammateMessage,
+  'messageId' | 'from' | 'text' | 'timestamp' | 'color' | 'summary' | 'messageKind'
+> & { messageKind: 'agent_error' }
+
 type Props = {
   enabled: boolean
   isLoading: boolean
@@ -156,6 +162,7 @@ type Props = {
     formatted: string,
     options?: { isMeta?: boolean },
   ) => InboxPromptSubmitResult
+  onAgentErrorNotification: (message: AgentErrorUserNotification) => void
 }
 
 type PendingInboxMirrorMessage = Pick<
@@ -167,6 +174,7 @@ type PendingInboxMirrorMessage = Pick<
   | 'text'
   | 'timestamp'
   | 'status'
+  | 'messageKind'
 >
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
@@ -231,6 +239,7 @@ export function getOrdinaryPendingMessage({
   return pendingMessages.find(
     message =>
       !!message.messageId &&
+      message.messageKind !== 'agent_error' &&
       isRegularInteractiveMailboxMessage({ text: message.text }) &&
       !(
         message.from === TEAM_LEAD_NAME &&
@@ -388,13 +397,43 @@ export function buildCodexNativeMailboxTimeoutLeadNotificationText({
   detail: string
   final: boolean
 }): string {
+  if (final) {
+    return buildAgentErrorNotificationText({
+      memberName,
+      taskRef,
+      detail,
+      action: 'could not recover a Codex native mailbox turn after timeout',
+      consequence: 'Marking the mailbox row processed to avoid an infinite loop',
+    })
+  }
+  return buildAgentErrorNotificationText({
+    memberName,
+    taskRef,
+    detail,
+    action: 'hit a Codex native mailbox timeout',
+    consequence:
+      'Scheduling one recovery turn that will inspect state before continuing',
+  })
+}
+
+export function buildAgentErrorNotificationText({
+  memberName,
+  taskRef,
+  detail,
+  action,
+  consequence,
+}: {
+  memberName: string
+  taskRef?: string
+  detail: string
+  action: string
+  consequence?: string
+}): string {
   const taskText = taskRef
     ? ` for ${formatTaskRefForHuman(taskRef)}`
     : ''
-  if (final) {
-    return `${memberName} could not recover a Codex native mailbox turn${taskText} after timeout. Marking the mailbox row processed to avoid an infinite loop. Last error: ${detail}`
-  }
-  return `${memberName} hit a Codex native mailbox timeout${taskText}. Scheduling one recovery turn that will inspect state before continuing. Error: ${detail}`
+  const consequenceText = consequence ? ` ${consequence}.` : ''
+  return `${memberName} ${action}${taskText}.${consequenceText} API Error: ${detail}`
 }
 
 export function buildMailboxExecutionFailureLeadNotificationText({
@@ -406,10 +445,46 @@ export function buildMailboxExecutionFailureLeadNotificationText({
   taskRef?: string
   detail: string
 }): string {
-  const taskText = taskRef
-    ? ` for ${formatTaskRefForHuman(taskRef)}`
-    : ''
-  return `${memberName} hit a mailbox turn execution error${taskText}. Marking the mailbox row processed to avoid an infinite loop. Error: ${detail}`
+  return buildAgentErrorNotificationText({
+    memberName,
+    taskRef,
+    detail,
+    action: 'hit a mailbox turn execution error',
+    consequence: 'Marking the mailbox row processed to avoid an infinite loop',
+  })
+}
+
+async function writeAgentErrorLeadNotification({
+  agentName,
+  teamName,
+  text,
+  summary,
+}: {
+  agentName: string
+  teamName?: string
+  text: string
+  summary: string
+}): Promise<void> {
+  const timestamp = new Date().toISOString()
+  try {
+    await writeToMailbox(
+      TEAM_LEAD_NAME,
+      {
+        messageId: `agent-error-${randomUUID()}`,
+        from: agentName,
+        text,
+        summary,
+        timestamp,
+        color: getTeammateColor(),
+        messageKind: 'agent_error' as const,
+      },
+      teamName,
+    )
+  } catch (error) {
+    logForDebugging(
+      `[InboxPoller] Failed to notify team-lead about agent error: ${String(error)}`,
+    )
+  }
 }
 
 type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
@@ -1130,6 +1205,7 @@ export function useInboxPoller({
   getMessages,
   transcriptActivitySignature,
   onSubmitMessage,
+  onAgentErrorNotification,
 }: Props): void {
   // Assign to original name for clarity within the function
   const onSubmitTeammateMessage = onSubmitMessage
@@ -1234,19 +1310,53 @@ export function useInboxPoller({
           teamName,
           { excludeMessageIds: [...mirroredMessageIds] },
         )
-      const silentlyFinalizedRegularMessages = claimedRegularMessages.filter(
-        message => isSilentRegularMailboxMessageForLiveContext(message),
+      const agentErrorNotificationMessages = claimedRegularMessages.filter(
+        isAgentErrorNotificationMessage,
       )
-      const terminalFailedRegularMessages = claimedRegularMessages.filter(
-        message =>
-          !isSilentRegularMailboxMessageForLiveContext(message) &&
-          ordinaryTerminalFailureRef.current.has(message.messageId),
+      const nonAgentErrorClaimedRegularMessages = claimedRegularMessages.filter(
+        message => !isAgentErrorNotificationMessage(message),
       )
-      const actionableClaimedRegularMessages = claimedRegularMessages.filter(
-        message =>
-          !isSilentRegularMailboxMessageForLiveContext(message) &&
-          !ordinaryTerminalFailureRef.current.has(message.messageId),
-      )
+      const silentlyFinalizedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(message =>
+          isSilentRegularMailboxMessageForLiveContext(message),
+        )
+      const terminalFailedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(
+          message =>
+            !isSilentRegularMailboxMessageForLiveContext(message) &&
+            ordinaryTerminalFailureRef.current.has(message.messageId),
+        )
+      const actionableClaimedRegularMessages =
+        nonAgentErrorClaimedRegularMessages.filter(
+          message =>
+            !isSilentRegularMailboxMessageForLiveContext(message) &&
+            !ordinaryTerminalFailureRef.current.has(message.messageId),
+        )
+
+      if (agentErrorNotificationMessages.length > 0) {
+        for (const message of agentErrorNotificationMessages) {
+          onAgentErrorNotification(message)
+          if (!isLoading && !focusedInputDialog) {
+            void sendNotification(
+              {
+                message: message.text,
+                title: 'Agent error',
+                notificationType: 'agent_error',
+              },
+              terminal,
+            )
+          }
+        }
+        await finalizeClaimedMessagesAsRead(
+          agentName,
+          agentErrorNotificationMessages.map(message => message.messageId),
+          sessionId,
+          teamName,
+        )
+        logForDebugging(
+          `[InboxPoller] Displayed ${agentErrorNotificationMessages.length} agent error notification(s)`,
+        )
+      }
 
       if (silentlyFinalizedRegularMessages.length > 0) {
         await finalizeClaimedMessagesAsRead(
@@ -1937,6 +2047,7 @@ export function useInboxPoller({
             .map(message => ({
               id: randomUUID(),
               messageId: message.messageId,
+              messageKind: message.messageKind,
               mailboxClaimedBySessionId: options.claimedBySessionId,
               from: message.from,
               text: message.text,
@@ -1973,6 +2084,9 @@ export function useInboxPoller({
     }
   }, [
     enabled,
+    focusedInputDialog,
+    isLoading,
+    onAgentErrorNotification,
     setAppState,
     terminal,
     store,
@@ -2036,6 +2150,7 @@ export function useInboxPoller({
     )
     const activeOrdinaryMessages = liveOwnedMessages.filter(
       message =>
+        message.messageKind !== 'agent_error' &&
         isRegularInteractiveMailboxMessage({ text: message.text }) &&
         !(
           message.from === TEAM_LEAD_NAME &&
@@ -2148,24 +2263,19 @@ export function useInboxPoller({
             ...recoveryState,
             notifiedLead: true,
           })
-          void writeToMailbox(
-            TEAM_LEAD_NAME,
-            {
-              from: agentName,
-              text: buildCodexNativeMailboxTimeoutLeadNotificationText({
-                memberName: agentName,
-                taskRef: recoveryState.taskRef,
-                detail: recoveryState.failureDetail,
-                final: false,
-              }),
-              summary: 'Codex native mailbox timeout',
-              timestamp: new Date().toISOString(),
-              color: getTeammateColor(),
-            },
+          void writeAgentErrorLeadNotification({
+            agentName,
             teamName,
-          ).catch(error => {
+            text: buildCodexNativeMailboxTimeoutLeadNotificationText({
+              memberName: agentName,
+              taskRef: recoveryState.taskRef,
+              detail: recoveryState.failureDetail,
+              final: false,
+            }),
+            summary: 'Codex native mailbox timeout',
+          }).catch(error => {
             logForDebugging(
-              `[InboxPoller] Failed to notify team-lead about Codex native timeout for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+              `[InboxPoller] Failed to notify about Codex native timeout for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
             )
           })
         }
@@ -2187,35 +2297,30 @@ export function useInboxPoller({
           try {
             if (teamName) {
               try {
-                await writeToMailbox(
-                  TEAM_LEAD_NAME,
-                  {
-                    from: agentName,
-                    text:
-                      processingAction.reason === 'execution_failed'
-                        ? buildMailboxExecutionFailureLeadNotificationText({
-                            memberName: agentName,
-                            taskRef: processingAction.taskRef,
-                            detail: processingAction.detail,
-                          })
-                        : buildCodexNativeMailboxTimeoutLeadNotificationText({
-                            memberName: agentName,
-                            taskRef: processingAction.taskRef,
-                            detail: processingAction.detail,
-                            final: true,
-                          }),
-                    summary:
-                      processingAction.reason === 'execution_failed'
-                        ? 'Mailbox turn execution failed'
-                        : 'Codex native mailbox recovery failed',
-                    timestamp: new Date().toISOString(),
-                    color: getTeammateColor(),
-                  },
+                await writeAgentErrorLeadNotification({
+                  agentName,
                   teamName,
-                )
+                  text:
+                    processingAction.reason === 'execution_failed'
+                      ? buildMailboxExecutionFailureLeadNotificationText({
+                          memberName: agentName,
+                          taskRef: processingAction.taskRef,
+                          detail: processingAction.detail,
+                        })
+                      : buildCodexNativeMailboxTimeoutLeadNotificationText({
+                          memberName: agentName,
+                          taskRef: processingAction.taskRef,
+                          detail: processingAction.detail,
+                          final: true,
+                        }),
+                  summary:
+                    processingAction.reason === 'execution_failed'
+                      ? 'Mailbox turn execution failed'
+                      : 'Codex native mailbox recovery failed',
+                })
               } catch (error) {
                 logForDebugging(
-                  `[InboxPoller] Failed to notify team-lead about Codex native recovery failure for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+                  `[InboxPoller] Failed to notify about mailbox failure for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
                 )
               }
             }
@@ -2518,6 +2623,19 @@ export function useInboxPoller({
 
         void (async () => {
           try {
+            if (teamName) {
+              await writeAgentErrorLeadNotification({
+                agentName,
+                teamName,
+                text: buildAgentErrorNotificationText({
+                  memberName: agentName,
+                  detail: processingAction.detail,
+                  action: 'failed bootstrap after teammate startup',
+                }),
+                summary: 'Agent bootstrap failed',
+              })
+            }
+
             await finalizeClaimedMessagesAsRead(
               agentName,
               [processingBootstrapMessage.messageId!],
@@ -2606,6 +2724,7 @@ export function useInboxPoller({
     const pendingMessages = currentAppState.inbox.messages.filter(
       m =>
         m.status === 'pending' &&
+        m.messageKind !== 'agent_error' &&
         isLiveInboxMirrorMessageOwnedBySession(m, sessionId),
     )
     const processedMessages = currentAppState.inbox.messages.filter(

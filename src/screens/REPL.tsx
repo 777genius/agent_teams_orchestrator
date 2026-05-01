@@ -194,7 +194,7 @@ import {
   getBootstrapTranscriptActivitySignature,
   useInboxPoller,
 } from '../hooks/useInboxPoller.js';
-import type { InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
+import type { AgentErrorUserNotification, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
@@ -4057,6 +4057,20 @@ export function REPL({
     };
   }, [onQuery, mainLoopModel, store]);
 
+  const handleAgentErrorNotification = useCallback((message: AgentErrorUserNotification) => {
+    setMessages(prev => [...prev, createAttachmentMessage({
+      type: 'teammate_mailbox',
+      messages: [message]
+    })]);
+    addNotification({
+      key: `agent-error-${message.messageId}`,
+      text: message.summary ? `${message.from}: ${message.summary}` : message.text,
+      color: 'error',
+      priority: 'high',
+      timeoutMs: 12000
+    });
+  }, [addNotification, setMessages]);
+
   // Voice input integration (VOICE_MODE builds only)
   const voice = feature('VOICE_MODE') ?
   // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
@@ -4076,6 +4090,7 @@ export function REPL({
     focusedInputDialog,
     getMessages: () => messagesRef.current,
     onSubmitMessage: handleIncomingPrompt,
+    onAgentErrorNotification: handleAgentErrorNotification,
     transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
   });
   useTeammateStartupReadySentinel({

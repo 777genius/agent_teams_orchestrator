@@ -51,6 +51,13 @@ export type TeammateMessage = {
   claimedAt?: string
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
+  messageKind?: 'agent_error'
+}
+
+export function isAgentErrorNotificationMessage(
+  message: Pick<TeammateMessage, 'messageKind'>,
+): message is TeammateMessage & { messageKind: 'agent_error' } {
+  return message.messageKind === 'agent_error'
 }
 
 type RawTeammateMessage = Omit<TeammateMessage, 'messageId'> & {

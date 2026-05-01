@@ -97,7 +97,7 @@ export function AttachmentMessage({
         // Plain text message - sender header with chevron, truncated content
         const inkColor = toInkColor(msg_0.color);
         const formattedContent = formatTeammateMessageContent(msg_0.text) ?? msg_0.text;
-        return <TeammateMessageContent key={idx} displayName={msg_0.from} inkColor={inkColor} content={formattedContent} summary={msg_0.summary} isTranscriptMode={isTranscriptMode} />;
+        return <TeammateMessageContent key={idx} displayName={msg_0.from} inkColor={msg_0.messageKind === 'agent_error' ? 'error' : inkColor} content={formattedContent} summary={msg_0.summary} isTranscriptMode={isTranscriptMode} />;
       })}
       </Box>;
   }

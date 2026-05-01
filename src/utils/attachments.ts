@@ -731,6 +731,7 @@ export type Attachment =
 export type TeammateMailboxAttachment = {
   type: 'teammate_mailbox'
   messages: Array<{
+    messageKind?: 'agent_error'
     from: string
     text: string
     timestamp: string
@@ -3673,6 +3674,7 @@ export async function getTeammateMailboxAttachments(
   const seen = new Set<string>()
   let allMessages: Array<{
     messageId?: string
+    messageKind?: 'agent_error'
     from: string
     text: string
     timestamp: string
@@ -3693,6 +3695,7 @@ export async function getTeammateMailboxAttachments(
       seen.add(key)
       allMessages.push({
         messageId: m.messageId,
+        messageKind: m.messageKind,
         from: m.from,
         text: m.text,
         timestamp: m.timestamp,

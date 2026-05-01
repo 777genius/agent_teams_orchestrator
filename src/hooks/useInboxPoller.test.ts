@@ -16,6 +16,8 @@ import {
   getOrdinaryPendingMessage,
   getBootstrapPendingMessage,
   getQueuedMailboxMetaPrompt,
+  buildAgentErrorNotificationText,
+  buildMailboxExecutionFailureLeadNotificationText,
   isBootstrapMemberBriefingCallableNow,
   isBootstrapMailboxInstructionText,
   isMemberBriefingToolName,
@@ -96,6 +98,29 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBe('Process the queued teammate mailbox attachment for this turn.')
   })
 
+  test('formats agent errors as red-renderable user-facing messages', () => {
+    const text = buildMailboxExecutionFailureLeadNotificationText({
+      memberName: 'bob',
+      taskRef: 'abc12345',
+      detail: 'Credit balance is too low',
+    })
+
+    expect(text).toContain('bob hit a mailbox turn execution error for #abc12345')
+    expect(text).toContain('API Error: Credit balance is too low')
+  })
+
+  test('formats generic agent errors without provider-specific assumptions', () => {
+    const text = buildAgentErrorNotificationText({
+      memberName: 'alice',
+      detail: 'provider rejected the request',
+      action: 'failed bootstrap after teammate startup',
+    })
+
+    expect(text).toBe(
+      'alice failed bootstrap after teammate startup. API Error: provider rejected the request',
+    )
+  })
+
   test('finds the first actionable bootstrap row for teammate sessions', () => {
     expect(
       getBootstrapPendingMessage({
@@ -128,6 +153,16 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     expect(
       getOrdinaryPendingMessage({
         pendingMessages: [
+          {
+            id: 'agent-error-row',
+            messageId: 'agent-error-1',
+            mailboxClaimedBySessionId: 's',
+            from: 'bob',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:00.500Z',
+            text: 'bob hit a mailbox turn execution error. API Error: balance exhausted',
+            messageKind: 'agent_error',
+          },
           {
             id: '1',
             messageId: 'bootstrap',
