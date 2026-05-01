@@ -1,3 +1,5 @@
+export type CodexNativeToolSource = 'mcp' | 'native'
+
 export type CodexNativeNormalizedEvent =
   | {
       type: 'thread_started'
@@ -14,15 +16,18 @@ export type CodexNativeNormalizedEvent =
   | {
       type: 'tool_call_started'
       itemId: string
-      serverName: string
+      toolSource: CodexNativeToolSource
+      serverName?: string
       toolName: string
       arguments: Record<string, unknown>
       status: string
+      rawItemType: string
     }
   | {
       type: 'tool_call_completed'
       itemId: string
-      serverName: string
+      toolSource: CodexNativeToolSource
+      serverName?: string
       toolName: string
       arguments: Record<string, unknown>
       status: string
@@ -30,6 +35,7 @@ export type CodexNativeNormalizedEvent =
       rawResult: unknown
       errorMessage: string | null
       isError: boolean
+      rawItemType: string
     }
   | {
       type: 'usage_updated'

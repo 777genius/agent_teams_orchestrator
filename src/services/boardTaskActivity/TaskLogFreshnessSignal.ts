@@ -153,3 +153,31 @@ export async function touchBoardTaskLogFreshnessSignals(params: {
     ),
   )
 }
+
+export async function touchBoardTaskLogFreshnessSignal(params: {
+  projectDir: string
+  taskId: string
+  teamName?: string
+  provider?: string
+  source?: string
+}): Promise<void> {
+  const taskId = params.taskId.trim()
+  if (!taskId) {
+    return
+  }
+
+  const freshnessDir = getBoardTaskLogFreshnessDir(params.projectDir)
+  await mkdir(freshnessDir, { recursive: true, mode: 0o700 })
+
+  await writeFile(
+    getBoardTaskLogFreshnessSignalFilePath(params.projectDir, taskId),
+    JSON.stringify({
+      taskId,
+      ...(params.teamName ? { teamName: params.teamName } : {}),
+      ...(params.provider ? { provider: params.provider } : {}),
+      ...(params.source ? { source: params.source } : {}),
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: 'utf8', mode: 0o600 },
+  )
+}
