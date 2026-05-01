@@ -31,7 +31,7 @@ import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { logError } from '../../utils/log.js'
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getProjectDir } from '../../utils/sessionStoragePortable.js'
-import { getAgentName } from '../../utils/teammate.js'
+import { getAgentId, getAgentName } from '../../utils/teammate.js'
 import { getTeammateContext } from '../../utils/teammateContext.js'
 import { getRuntimeBoardTaskExecutionStore } from '../boardTaskActivity/RuntimeBoardTaskExecutionStore.js'
 import type { BoardTaskLocator, BoardTaskPhase } from '../boardTaskActivity/contract.js'
@@ -588,6 +588,10 @@ function resolveLedgerMemberName(agentId?: AgentId): string | undefined {
   }
   const deterministicTeammateIdMatch = /^([^@\s]+)@[^@\s]+$/.exec(agentId)
   return deterministicTeammateIdMatch?.[1]?.trim() || undefined
+}
+
+function resolveEffectiveLedgerAgentId(agentId?: AgentId): AgentId | undefined {
+  return agentId ?? (getAgentId() as AgentId | undefined)
 }
 
 function isSameOrDescendantPath(childPath: string, parentPath: string): boolean {
@@ -2779,15 +2783,6 @@ export async function captureTaskChangeToolResult(params: {
 }): Promise<string[]> {
   try {
     const sessionId = params.sessionId ?? getSessionId()
-    const scope = await resolveTaskScopeForLedger({
-      sessionId,
-      agentId: params.agentId,
-      toolUseId: params.toolUseId,
-    })
-    if (!scope) {
-      return []
-    }
-
     const workspaceRoot = getCwd()
     const extractedChanges = extractExactFileChanges(params.toolName, params.resultData)
     const changes = params.materializePostHookDiskState
@@ -2796,11 +2791,20 @@ export async function captureTaskChangeToolResult(params: {
     if (changes.length === 0) {
       return []
     }
+    const effectiveAgentId = resolveEffectiveLedgerAgentId(params.agentId)
+    const scope = await resolveTaskScopeForLedger({
+      sessionId,
+      agentId: effectiveAgentId,
+      toolUseId: params.toolUseId,
+    })
+    if (!scope) {
+      return []
+    }
 
     await persistEvents(changes, {
       scope,
       sessionId,
-      agentId: params.agentId,
+      agentId: effectiveAgentId,
       toolUseId: params.toolUseId,
       workspaceRoot,
       toolStatus: params.toolStatus ?? 'succeeded',
@@ -3206,9 +3210,10 @@ export async function maybeBeginTaskChangeShellSnapshot(params: {
 
   try {
     const sessionId = params.sessionId ?? getSessionId()
+    const effectiveAgentId = resolveEffectiveLedgerAgentId(params.agentId)
     const scope = await resolveTaskScopeForLedger({
       sessionId,
-      agentId: params.agentId,
+      agentId: effectiveAgentId,
       toolUseId: params.toolUseId,
     })
     if (!scope) {
@@ -3226,10 +3231,10 @@ export async function maybeBeginTaskChangeShellSnapshot(params: {
     const beforeStatusPaths = beforeStatus.paths
     const beforeFiles = await snapshotFiles(gitRoot, beforeStatusPaths)
     return {
-      id: sha256(`${sessionId}:${params.agentId ?? 'main'}:${params.toolUseId}:${Date.now()}`),
+      id: sha256(`${sessionId}:${effectiveAgentId ?? 'main'}:${params.toolUseId}:${Date.now()}`),
       scope,
       sessionId,
-      agentId: params.agentId,
+      agentId: effectiveAgentId,
       toolUseId: params.toolUseId,
       workspaceRoot,
       gitRoot,

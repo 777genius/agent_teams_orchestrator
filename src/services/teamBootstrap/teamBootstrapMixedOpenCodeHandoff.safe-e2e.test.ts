@@ -24,6 +24,7 @@ import type {
   OpenCodeSessionRecord,
   OpenCodeSessionReconcileSummary,
 } from '../opencode/types.js'
+import type { OpenCodeTurnSettledSummary } from '../opencode/OpenCodeTurnSettledObserver.js'
 
 type SpawnInput = Record<string, unknown>
 type DuplicateReason = 'already_running' | 'bootstrap_pending'
@@ -33,6 +34,7 @@ const originalProbe = openCodeProvisioningProbe.probe
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalPromptAsync = openCodeSessionBridge.promptAsync
+const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalAnswerPermission = openCodeSessionBridge.answerPermission
 const originalAbort = openCodeSessionBridge.abort
@@ -42,6 +44,9 @@ const originalStoreList = openCodeSessionStore.list
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
+const originalAgentTeamsMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+const originalAgentTeamsMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+const originalAgentTeamsMcpArgsJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
 const SAFE_E2E_TIMEOUT_MS = 15_000
 
 const REQUIRED_MOCK_MCP_TOOL_NAMES = [
@@ -140,6 +145,14 @@ function expectStringMultiset(actual: string[], expected: string[]): void {
   expect([...actual].sort()).toEqual([...expected].sort())
 }
 
+function restoreEnvValue(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key]
+    return
+  }
+  process.env[key] = value
+}
+
 function mockRequiredMcpTools(): void {
   ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
   ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
@@ -188,8 +201,34 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       connected: true,
       diagnostics: [],
     })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
+      await openCodeSessionBridge.promptAsync(record, input)
+      const runtimePromptMessageId = `msg-${record.memberName}-turn-settled`
+      const turnSettled: OpenCodeTurnSettledSummary = {
+        outcome: 'success',
+        sessionId: record.opencodeSessionId,
+        runtimePromptMessageId,
+        turnId: runtimePromptMessageId,
+        endpoint: '/event',
+        streamConnected: true,
+        observedEventCount: 2,
+        matchedEventCount: 2,
+        assistantActivityCount: 1,
+        promptPersisted: true,
+        latestEventType: 'session.status',
+        latestAssistantMessageId: `msg-${record.memberName}-assistant`,
+        diagnostics: [],
+      }
+      return { runtimePromptMessageId, turnSettled }
+    }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
     tempConfigDir = await mkdtemp(join(tmpdir(), 'mixed-opencode-handoff-'))
     process.env.CLAUDE_CONFIG_DIR = tempConfigDir
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'node'
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = join(
+      tempConfigDir,
+      'agent-teams-mcp-test-entry.js',
+    )
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
     registeredMemberNames = new Set()
     spawnInputs = []
     spawnFailures = new Map()
@@ -279,6 +318,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     openCodeSessionBridge.ensureSession = originalEnsureSession
     openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
     openCodeSessionBridge.promptAsync = originalPromptAsync
+    openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
     openCodeSessionBridge.reconcileSession = originalReconcileSession
     openCodeSessionBridge.answerPermission = originalAnswerPermission
     openCodeSessionBridge.abort = originalAbort
@@ -293,6 +333,18 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     } else {
       process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
     }
+    restoreEnvValue(
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
+      originalAgentTeamsMcpCommand,
+    )
+    restoreEnvValue(
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY',
+      originalAgentTeamsMcpEntry,
+    )
+    restoreEnvValue(
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
+      originalAgentTeamsMcpArgsJson,
+    )
     await rm(tempConfigDir, { recursive: true, force: true })
   }, SAFE_E2E_TIMEOUT_MS)
 

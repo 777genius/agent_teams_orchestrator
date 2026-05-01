@@ -247,6 +247,258 @@ describe('BoardTaskTranscriptProjector', () => {
     ])
   })
 
+  test('does not open lead-local execution scopes for delegated harbor-labs task_start actors', () => {
+    setDynamicTeamContext({
+      agentId: 'team-lead@harbor-labs',
+      agentName: TEAM_LEAD_NAME,
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const jackStartMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-jack-start',
+          content: 'ok',
+        },
+      ],
+    })
+    const tomStartMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-tom-start',
+          content: 'ok',
+        },
+      ],
+    })
+
+    const annotatedJackStart = annotateBoardTaskToolResultMessage({
+      message: jackStartMessage,
+      toolName: 'mcp__agent-teams__task_start',
+      input: {
+        taskId: '5541d414-f86b-4abf-a3cd-c33d5254a339',
+        actor: 'jack',
+      },
+      result: {
+        id: '5541d414-f86b-4abf-a3cd-c33d5254a339',
+      },
+      toolUseId: 'tool-jack-start',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+    const annotatedTomStart = annotateBoardTaskToolResultMessage({
+      message: tomStartMessage,
+      toolName: 'mcp__agent-teams__task_start',
+      input: {
+        taskId: 'fe36048f-e592-427a-a481-96af7c50232f',
+        actor: 'tom',
+      },
+      result: {
+        id: 'fe36048f-e592-427a-a481-96af7c50232f',
+      },
+      toolUseId: 'tool-tom-start',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+
+    expect(annotatedJackStart.boardTaskLinks?.[0]?.linkKind).toBe('lifecycle')
+    expect(annotatedTomStart.boardTaskLinks?.[0]?.linkKind).toBe('lifecycle')
+    expect(
+      getRuntimeBoardTaskExecutionStore().getOpenScopeCount(
+        'session-harbor-labs',
+        'team-lead@harbor-labs',
+      ),
+    ).toBe(0)
+  })
+
+  test('opens execution scope when task_start actor matches the current teammate', () => {
+    setDynamicTeamContext({
+      agentId: 'tom@harbor-labs',
+      agentName: 'tom',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const startMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-tom-self-start',
+          content: 'ok',
+        },
+      ],
+    })
+
+    annotateBoardTaskToolResultMessage({
+      message: startMessage,
+      toolName: 'mcp__agent-teams__task_start',
+      input: {
+        taskId: 'fe36048f-e592-427a-a481-96af7c50232f',
+        actor: 'tom',
+      },
+      result: {
+        id: 'fe36048f-e592-427a-a481-96af7c50232f',
+      },
+      toolUseId: 'tool-tom-self-start',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+
+    expect(
+      getRuntimeBoardTaskExecutionStore().getSingleActiveScope(
+        'session-harbor-labs',
+        'tom@harbor-labs',
+      ),
+    ).toEqual({
+      locator: {
+        ref: 'fe36048f-e592-427a-a481-96af7c50232f',
+        refKind: 'canonical',
+        canonicalId: 'fe36048f-e592-427a-a481-96af7c50232f',
+      },
+      phase: 'work',
+      activeExecutionSeq: 1,
+    })
+  })
+
+  test('uses from as the lifecycle actor when actor is absent', () => {
+    setDynamicTeamContext({
+      agentId: 'team-lead@harbor-labs',
+      agentName: TEAM_LEAD_NAME,
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const leadReviewStartMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-review-start-lead',
+          content: 'ok',
+        },
+      ],
+    })
+
+    annotateBoardTaskToolResultMessage({
+      message: leadReviewStartMessage,
+      toolName: 'mcp__agent-teams__review_start',
+      input: {
+        taskId: '078c75fd-bf56-47b3-a230-a294642d20b1',
+        from: 'reviewer',
+      },
+      result: {
+        id: '078c75fd-bf56-47b3-a230-a294642d20b1',
+      },
+      toolUseId: 'tool-review-start-lead',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+
+    expect(
+      getRuntimeBoardTaskExecutionStore().getOpenScopeCount(
+        'session-harbor-labs',
+        'team-lead@harbor-labs',
+      ),
+    ).toBe(0)
+
+    setDynamicTeamContext({
+      agentId: 'reviewer@harbor-labs',
+      agentName: 'reviewer',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const reviewerReviewStartMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-review-start-reviewer',
+          content: 'ok',
+        },
+      ],
+    })
+
+    annotateBoardTaskToolResultMessage({
+      message: reviewerReviewStartMessage,
+      toolName: 'mcp__agent-teams__review_start',
+      input: {
+        taskId: '078c75fd-bf56-47b3-a230-a294642d20b1',
+        from: 'reviewer',
+      },
+      result: {
+        id: '078c75fd-bf56-47b3-a230-a294642d20b1',
+      },
+      toolUseId: 'tool-review-start-reviewer',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+
+    expect(
+      getRuntimeBoardTaskExecutionStore().getSingleActiveScope(
+        'session-harbor-labs',
+        'reviewer@harbor-labs',
+      ),
+    ).toEqual({
+      locator: {
+        ref: '078c75fd-bf56-47b3-a230-a294642d20b1',
+        refKind: 'canonical',
+        canonicalId: '078c75fd-bf56-47b3-a230-a294642d20b1',
+      },
+      phase: 'review',
+      activeExecutionSeq: 1,
+    })
+  })
+
+  test('uses memberName as the lifecycle actor when actor and from are absent', () => {
+    setDynamicTeamContext({
+      agentId: 'tom@harbor-labs',
+      agentName: 'tom',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+
+    const startMessage = createUserMessage({
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tool-member-name-start',
+          content: 'ok',
+        },
+      ],
+    })
+
+    annotateBoardTaskToolResultMessage({
+      message: startMessage,
+      toolName: 'mcp__agent-teams__task_start',
+      input: {
+        taskId: '80e41895-d621-4b65-b57a-1e4532595f66',
+        memberName: 'tom',
+      },
+      result: {
+        id: '80e41895-d621-4b65-b57a-1e4532595f66',
+      },
+      toolUseId: 'tool-member-name-start',
+      sessionId: 'session-harbor-labs',
+      agentId: undefined,
+    })
+
+    expect(
+      getRuntimeBoardTaskExecutionStore().getSingleActiveScope(
+        'session-harbor-labs',
+        'tom@harbor-labs',
+      ),
+    ).toEqual({
+      locator: {
+        ref: '80e41895-d621-4b65-b57a-1e4532595f66',
+        refKind: 'canonical',
+        canonicalId: '80e41895-d621-4b65-b57a-1e4532595f66',
+      },
+      phase: 'work',
+      activeExecutionSeq: 1,
+    })
+  })
+
   test('does not stamp ambient execution for lead sessions without a teammate actor id', () => {
     setDynamicTeamContext({
       agentId: 'team-lead@beacon-desk-2',
