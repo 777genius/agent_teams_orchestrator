@@ -187,6 +187,49 @@ function resolveEffectiveBoardTaskAgentId(
   return agentId ?? getAgentId()
 }
 
+function normalizeBoardTaskActor(value: unknown): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return undefined
+  }
+  const normalized = String(value).trim()
+  return normalized || undefined
+}
+
+function extractBoardTaskInputActor(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') {
+    return undefined
+  }
+  return normalizeBoardTaskActor((input as Record<string, unknown>).actor)
+}
+
+function currentActorCandidates(effectiveAgentId?: string): Set<string> {
+  const candidates = new Set<string>()
+  const push = (value: string | undefined) => {
+    const normalized = value?.trim().toLowerCase()
+    if (normalized) {
+      candidates.add(normalized)
+    }
+  }
+
+  push(effectiveAgentId)
+  if (effectiveAgentId?.includes('@')) {
+    push(effectiveAgentId.split('@')[0])
+  }
+  push(getAgentName())
+  return candidates
+}
+
+function shouldApplyBoardTaskTransitions(args: {
+  input: unknown
+  effectiveAgentId?: string
+}): boolean {
+  const actor = extractBoardTaskInputActor(args.input)
+  if (!actor) {
+    return true
+  }
+  return currentActorCandidates(args.effectiveAgentId).has(actor.toLowerCase())
+}
+
 function isEligibleAmbientBoardTaskActor(
   agentId?: string,
 ): boolean {
@@ -369,7 +412,13 @@ export function annotateBoardTaskToolResultMessage(args: {
     })
   }
 
-  store.applyTransitions(args.sessionId, effectiveAgentId, interpretation.transitions)
+  const transitions = shouldApplyBoardTaskTransitions({
+    input: args.input,
+    effectiveAgentId,
+  })
+    ? interpretation.transitions
+    : []
+  store.applyTransitions(args.sessionId, effectiveAgentId, transitions)
   store.markProcessedToolUseId(args.sessionId, effectiveAgentId, args.toolUseId)
   return message
 }

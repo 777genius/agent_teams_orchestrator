@@ -733,6 +733,77 @@ describe('TaskChangeLedgerService integration', () => {
     expect(events[1]?.memberName).toBe('alice')
   })
 
+  test('replays harbor-labs process teammate exact write when toolUseContext agentId is absent', async () => {
+    const taskId = 'fe36048f-e592-427a-a481-96af7c50232f'
+    const agentId = 'tom@harbor-labs'
+    setDynamicTeamContext({
+      agentId,
+      agentName: 'tom',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+    openScope(taskId, 'work', agentId)
+
+    const written = await captureTaskChangeToolResult({
+      toolName: FILE_WRITE_TOOL_NAME,
+      resultData: {
+        filePath: 'src/harbor-labs-tom.ts',
+        content: 'export const harborLabsTom = true;\n',
+        type: 'create',
+      },
+      toolUseId: 'tool-harbor-labs-tom-write',
+      sessionId,
+      agentId: undefined,
+    })
+
+    expect(written).toEqual([join(repoDir, 'src', 'harbor-labs-tom.ts')])
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath(taskId),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.agentId).toBe(agentId)
+    expect(events[0]?.memberName).toBe('tom')
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    expect((bundle.files as Array<Record<string, unknown>>)[0]?.relativePath).toBe(
+      'src/harbor-labs-tom.ts',
+    )
+  })
+
+  test('replays harbor-labs process teammate shell snapshot when toolUseContext agentId is absent', async () => {
+    const taskId = '5541d414-f86b-4abf-a3cd-c33d5254a339'
+    const agentId = 'jack@harbor-labs'
+    setDynamicTeamContext({
+      agentId,
+      agentName: 'jack',
+      teamName: 'harbor-labs',
+      planModeRequired: false,
+    })
+    openScope(taskId, 'work', agentId)
+    await writeRepoFile('README.md', '# harbor labs baseline\n')
+    await commitAll('initial commit')
+
+    const snapshot = await maybeBeginTaskChangeShellSnapshot({
+      toolName: BASH_TOOL_NAME,
+      input: { command: 'write src/harbor-labs-jack.ts' },
+      toolUseId: 'tool-harbor-labs-jack-shell',
+      sessionId,
+      agentId: undefined,
+    })
+
+    await writeRepoFile('src/harbor-labs-jack.ts', 'export const harborLabsJack = true;\n')
+    await finishTaskChangeShellSnapshot(snapshot, 'succeeded')
+
+    const events = await readJsonl<Array<Record<string, unknown>>[number]>(
+      eventsPath(taskId),
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]?.agentId).toBe(agentId)
+    expect(events[0]?.memberName).toBe('jack')
+    expect(events[0]?.relativePath).toBe('src/harbor-labs-jack.ts')
+  })
+
   test('does not materialize binary-looking exact file tool content as text blobs', async () => {
     const agentId = 'alice@test'
     const beforeContent = `header${String.fromCharCode(4)}before`
@@ -2178,6 +2249,45 @@ describe('TaskChangeLedgerService integration', () => {
     )
     expect(firstNotices[0]?.code).toBe('multi-scope-skipped')
     expect(secondNotices[0]?.code).toBe('multi-scope-skipped')
+  })
+
+  test('does not emit harbor-labs multi-scope notices for non-file MCP tools', async () => {
+    getRuntimeBoardTaskExecutionStore().applyTransitions(sessionId, undefined, [
+      {
+        type: 'open',
+        phase: 'work',
+        task: {
+          ref: '5541d414-f86b-4abf-a3cd-c33d5254a339',
+          refKind: 'canonical',
+          canonicalId: '5541d414-f86b-4abf-a3cd-c33d5254a339',
+        },
+      },
+      {
+        type: 'open',
+        phase: 'work',
+        task: {
+          ref: 'fe36048f-e592-427a-a481-96af7c50232f',
+          refKind: 'canonical',
+          canonicalId: 'fe36048f-e592-427a-a481-96af7c50232f',
+        },
+      },
+    ])
+
+    const written = await captureTaskChangeToolResult({
+      toolName: 'mcp__agent-teams__message_send',
+      resultData: {
+        delivered: true,
+      },
+      toolUseId: 'tool-harbor-labs-message-send',
+      sessionId,
+      agentId: undefined,
+    })
+
+    expect(written).toEqual([])
+    expect(await pathExists(bundlePath('5541d414-f86b-4abf-a3cd-c33d5254a339'))).toBe(false)
+    expect(await pathExists(bundlePath('fe36048f-e592-427a-a481-96af7c50232f'))).toBe(false)
+    expect(await pathExists(noticesPath('5541d414-f86b-4abf-a3cd-c33d5254a339'))).toBe(false)
+    expect(await pathExists(noticesPath('fe36048f-e592-427a-a481-96af7c50232f'))).toBe(false)
   })
 
   test('stores final disk bytes after post-hook mutation even when the tool failed', async () => {
