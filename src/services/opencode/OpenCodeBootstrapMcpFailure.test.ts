@@ -85,8 +85,22 @@ describe('OpenCodeBootstrapMcpFailure', () => {
 
     expect(summarizeOpenCodeBootstrapMcpFailure(summary)).toEqual({
       failedTools: ['runtime_bootstrap_checkin'],
+      missingTools: ['runtime_bootstrap_checkin', 'member_briefing'],
       message:
         'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin',
+    })
+  })
+
+  test('detects assistant completion without required bootstrap tool calls', () => {
+    const summary = buildSummary([
+      buildMessage([]),
+    ])
+
+    expect(summarizeOpenCodeBootstrapMcpFailure(summary)).toEqual({
+      failedTools: [],
+      missingTools: ['runtime_bootstrap_checkin', 'member_briefing'],
+      message:
+        'OpenCode bootstrap MCP did not complete required tools before assistant response: runtime_bootstrap_checkin, member_briefing',
     })
   })
 
@@ -100,6 +114,12 @@ describe('OpenCodeBootstrapMcpFailure', () => {
         }),
         buildToolCall({
           callId: 'tool-2',
+          status: 'completed',
+          output: { ok: true },
+        }),
+        buildToolCall({
+          callId: 'tool-3',
+          toolName: 'agent-teams_member_briefing',
           status: 'completed',
           output: { ok: true },
         }),

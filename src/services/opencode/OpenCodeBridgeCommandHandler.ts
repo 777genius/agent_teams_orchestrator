@@ -23,7 +23,10 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
-import { summarizeOpenCodeBootstrapMcpFailure } from './OpenCodeBootstrapMcpFailure.js'
+import {
+  summarizeOpenCodeBootstrapMcpFailure,
+  summarizeOpenCodeBootstrapMcpReadiness,
+} from './OpenCodeBootstrapMcpFailure.js'
 import { openCodeTurnSettledEmissionCoordinator } from './OpenCodeTurnSettledEmissionCoordinator.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import {
@@ -760,13 +763,14 @@ function readinessData(
 }
 
 function bridgeStateFromSummary(summary: OpenCodeSessionReconcileSummary): 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed' {
-  if (summary.staleReason || summary.errorCount > 0 || summarizeBootstrapMcpFailure(summary)) {
+  const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(summary)
+  if (summary.staleReason || summary.errorCount > 0 || bootstrapMcpReadiness.failure) {
     return 'failed'
   }
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     return 'permission_blocked'
   }
-  if (summary.latestAssistantMessageId) {
+  if (bootstrapMcpReadiness.ready) {
     return 'confirmed_alive'
   }
   return 'created'
@@ -777,12 +781,13 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
   const evidence = [
     { kind: 'member_session_recorded', observedAt },
   ]
+  const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(summary)
   const failed =
-    Boolean(summary.staleReason) || summary.errorCount > 0 || Boolean(summarizeBootstrapMcpFailure(summary))
+    Boolean(summary.staleReason) || summary.errorCount > 0 || Boolean(bootstrapMcpReadiness.failure)
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
-  if (!failed && summary.latestAssistantMessageId) {
+  if (!failed && bootstrapMcpReadiness.ready) {
     evidence.push({ kind: 'bootstrap_confirmed', observedAt })
     evidence.push({ kind: 'member_ready', observedAt })
   }

@@ -156,7 +156,7 @@ function buildReconcileSummary(
     profileAuthState: 'ok',
     pendingPermissionRequestIds: [],
     messageCount: 1,
-    toolCallCount: 0,
+    toolCallCount: 2,
     errorCount: 0,
     lastCanonicalCursor: 'cursor-1',
     latestUserMessageId: null,
@@ -164,7 +164,7 @@ function buildReconcileSummary(
     latestAssistantText: 'ready',
     latestAssistantPreview: 'ready',
     replyPendingSinceMessageId: null,
-    messages: [],
+    messages: buildBootstrapReadyMessages(),
     diagnostics: [],
     ...overrides,
   }
@@ -214,6 +214,30 @@ function buildToolCall(
     isError: false,
     ...overrides,
   }
+}
+
+function buildBootstrapReadyMessages(): OpenCodeCanonicalMessage[] {
+  return [
+    buildCanonicalMessage({
+      id: 'msg-assistant-1',
+      role: 'assistant',
+      text: 'ready',
+      toolCalls: [
+        buildToolCall({
+          callId: 'tool-bootstrap-checkin',
+          toolName: 'agent-teams_runtime_bootstrap_checkin',
+          status: 'completed',
+          output: { ok: true },
+        }),
+        buildToolCall({
+          callId: 'tool-member-briefing',
+          toolName: 'agent-teams_member_briefing',
+          status: 'completed',
+          output: { ok: true },
+        }),
+      ],
+    }),
+  ]
 }
 
 function buildReadinessSnapshot(
@@ -1264,6 +1288,61 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.launchState).toBe('failed')
     expect(result.data.members.alice?.diagnostics).toContain(
       'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin, member_briefing',
+    )
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+      'member_session_recorded',
+    ])
+  })
+
+  test('marks launch failed when assistant finishes without required bootstrap MCP tools', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: 'msg-no-tools',
+        latestAssistantText:
+          "I don't have the agent-teams MCP tools available in my current toolset.",
+        messages: [
+          buildCanonicalMessage({
+            id: 'msg-no-tools',
+            role: 'assistant',
+            text: "I don't have the agent-teams MCP tools available in my current toolset.",
+            toolCalls: [],
+          }),
+        ],
+        toolCallCount: 0,
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-missing-tools',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('failed')
+    expect(result.data.members.alice?.diagnostics).toContain(
+      'OpenCode bootstrap MCP did not complete required tools before assistant response: runtime_bootstrap_checkin, member_briefing',
     )
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
       'member_session_recorded',
@@ -3905,6 +3984,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           latestUserMessageId: 'msg_test_turn_settled',
           latestAssistantMessageId: 'msg-current-assistant',
           messages: [
+            ...buildBootstrapReadyMessages(),
             {
               id: 'msg_test_turn_settled',
               parentId: null,

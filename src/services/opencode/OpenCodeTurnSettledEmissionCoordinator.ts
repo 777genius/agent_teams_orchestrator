@@ -3,7 +3,10 @@ import {
   type OpenCodeRuntimeTurnSettledEmitterPort,
   type OpenCodeRuntimeTurnSettledOutcome,
 } from './OpenCodeRuntimeTurnSettledEmitter.js'
-import { summarizeOpenCodeBootstrapMcpFailure } from './OpenCodeBootstrapMcpFailure.js'
+import {
+  summarizeOpenCodeBootstrapMcpFailure,
+  summarizeOpenCodeBootstrapMcpReadiness,
+} from './OpenCodeBootstrapMcpFailure.js'
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
@@ -121,7 +124,7 @@ function outcomeFromLaunch(input: {
   if (bootstrapMcpFailureDetail(input.reconcileSummary)) {
     return 'error'
   }
-  if (input.reconcileSummary?.latestAssistantMessageId) {
+  if (input.reconcileSummary && summarizeOpenCodeBootstrapMcpReadiness(input.reconcileSummary).ready) {
     return 'success'
   }
   if (input.previewSummary?.runtimeState === 'error') {

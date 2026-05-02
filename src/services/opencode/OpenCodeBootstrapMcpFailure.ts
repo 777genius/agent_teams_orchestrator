@@ -7,10 +7,23 @@ const BOOTSTRAP_MCP_TOOL_NAMES = new Set([
   'runtime_bootstrap_checkin',
   'member_briefing',
 ])
+const REQUIRED_BOOTSTRAP_MCP_TOOL_NAMES = [
+  'runtime_bootstrap_checkin',
+  'member_briefing',
+]
 
 export type OpenCodeBootstrapMcpFailureSummary = {
   failedTools: string[]
+  missingTools: string[]
   message: string
+}
+
+export type OpenCodeBootstrapMcpReadinessSummary = {
+  ready: boolean
+  completedTools: string[]
+  missingTools: string[]
+  runningTools: string[]
+  failure: OpenCodeBootstrapMcpFailureSummary | null
 }
 
 export function normalizeAgentTeamsToolName(toolName: string | null | undefined): string {
@@ -67,11 +80,12 @@ function isFailedBootstrapToolCall(tool: OpenCodeCanonicalToolCall): boolean {
   return output.includes('not connected') || output.includes('mcp not connected')
 }
 
-export function summarizeOpenCodeBootstrapMcpFailure(
+export function summarizeOpenCodeBootstrapMcpReadiness(
   summary: OpenCodeSessionReconcileSummary,
-): OpenCodeBootstrapMcpFailureSummary | null {
+): OpenCodeBootstrapMcpReadinessSummary {
   const successfulTools = new Set<string>()
   const failedTools = new Set<string>()
+  const runningTools = new Set<string>()
 
   for (const message of summary.messages) {
     for (const tool of message.toolCalls) {
@@ -83,6 +97,10 @@ export function summarizeOpenCodeBootstrapMcpFailure(
         failedTools.add(toolName)
         continue
       }
+      if (tool.status === 'running') {
+        runningTools.add(toolName)
+        continue
+      }
       if (tool.status === 'completed') {
         successfulTools.add(toolName)
       }
@@ -90,12 +108,51 @@ export function summarizeOpenCodeBootstrapMcpFailure(
   }
 
   const failedWithoutLaterSuccess = [...failedTools].filter(toolName => !successfulTools.has(toolName))
-  if (failedWithoutLaterSuccess.length === 0) {
-    return null
+  const missingTools = REQUIRED_BOOTSTRAP_MCP_TOOL_NAMES.filter(toolName => !successfulTools.has(toolName))
+  const completedTools = REQUIRED_BOOTSTRAP_MCP_TOOL_NAMES.filter(toolName => successfulTools.has(toolName))
+  const assistantTurnFinished = Boolean(summary.latestAssistantMessageId) &&
+    summary.rawStatus !== 'busy' &&
+    [...runningTools].every(toolName => successfulTools.has(toolName))
+
+  if (failedWithoutLaterSuccess.length > 0) {
+    return {
+      ready: false,
+      completedTools,
+      missingTools,
+      runningTools: [...runningTools],
+      failure: {
+        failedTools: failedWithoutLaterSuccess,
+        missingTools,
+        message: `OpenCode bootstrap MCP tool failed before required attach completed: ${failedWithoutLaterSuccess.join(', ')}`,
+      },
+    }
+  }
+
+  if (missingTools.length > 0 && assistantTurnFinished) {
+    return {
+      ready: false,
+      completedTools,
+      missingTools,
+      runningTools: [...runningTools],
+      failure: {
+        failedTools: [],
+        missingTools,
+        message: `OpenCode bootstrap MCP did not complete required tools before assistant response: ${missingTools.join(', ')}`,
+      },
+    }
   }
 
   return {
-    failedTools: failedWithoutLaterSuccess,
-    message: `OpenCode bootstrap MCP tool failed before required attach completed: ${failedWithoutLaterSuccess.join(', ')}`,
+    ready: missingTools.length === 0,
+    completedTools,
+    missingTools,
+    runningTools: [...runningTools],
+    failure: null,
   }
+}
+
+export function summarizeOpenCodeBootstrapMcpFailure(
+  summary: OpenCodeSessionReconcileSummary,
+): OpenCodeBootstrapMcpFailureSummary | null {
+  return summarizeOpenCodeBootstrapMcpReadiness(summary).failure
 }

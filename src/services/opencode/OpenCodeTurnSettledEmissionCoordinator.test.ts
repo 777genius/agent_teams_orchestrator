@@ -49,7 +49,7 @@ function buildReconcileSummary(
     profileAuthState: 'ok',
     pendingPermissionRequestIds: [],
     messageCount: 2,
-    toolCallCount: 0,
+    toolCallCount: 2,
     errorCount: 0,
     lastCanonicalCursor: 'cursor-1',
     latestUserMessageId: 'msg-user-1',
@@ -57,7 +57,7 @@ function buildReconcileSummary(
     latestAssistantText: 'done',
     latestAssistantPreview: 'done',
     replyPendingSinceMessageId: null,
-    messages: [],
+    messages: buildBootstrapReadyMessages(),
     diagnostics: [],
     ...overrides,
   }
@@ -107,6 +107,30 @@ function buildToolCall(
     isError: false,
     ...overrides,
   }
+}
+
+function buildBootstrapReadyMessages(): OpenCodeCanonicalMessage[] {
+  return [
+    buildMessage({
+      id: 'msg-assistant-1',
+      role: 'assistant',
+      text: 'done',
+      toolCalls: [
+        buildToolCall({
+          callId: 'tool-bootstrap-checkin',
+          toolName: 'agent-teams_runtime_bootstrap_checkin',
+          status: 'completed',
+          output: { ok: true },
+        }),
+        buildToolCall({
+          callId: 'tool-member-briefing',
+          toolName: 'agent-teams_member_briefing',
+          status: 'completed',
+          output: { ok: true },
+        }),
+      ],
+    }),
+  ]
 }
 
 describe('OpenCodeTurnSettledEmissionCoordinator', () => {
@@ -439,6 +463,42 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     expect(events[0]).toMatchObject({
       outcome: 'error',
       detail: expect.stringContaining('runtime_bootstrap_checkin, member_briefing'),
+    })
+  })
+
+  test('emits launch error when bootstrap assistant response omits required MCP tools', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitLaunch({
+      record: buildRecord(),
+      reconcileSummary: buildReconcileSummary({
+        latestAssistantMessageId: 'msg-no-tools',
+        latestAssistantText:
+          "I don't have the agent-teams MCP tools available in my current toolset.",
+        messages: [
+          buildMessage({
+            id: 'msg-no-tools',
+            role: 'assistant',
+            text: "I don't have the agent-teams MCP tools available in my current toolset.",
+            toolCalls: [],
+          }),
+        ],
+        toolCallCount: 0,
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'error',
+      detail: expect.stringContaining(
+        'OpenCode bootstrap MCP did not complete required tools before assistant response',
+      ),
     })
   })
 })
