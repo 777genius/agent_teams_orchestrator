@@ -6,6 +6,7 @@ import type { OpenCodeRuntimeTurnSettledEvent } from './OpenCodeRuntimeTurnSettl
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
 import type {
   OpenCodeCanonicalMessage,
+  OpenCodeCanonicalToolCall,
   OpenCodeSessionRecord,
   OpenCodeSessionReconcileSummary,
 } from './types.js'
@@ -85,6 +86,25 @@ function buildMessage(
     errorName: null,
     errorMessage: null,
     hasError: false,
+    ...overrides,
+  }
+}
+
+function buildToolCall(
+  overrides: Partial<OpenCodeCanonicalToolCall>,
+): OpenCodeCanonicalToolCall {
+  return {
+    callId: 'tool-1',
+    toolName: 'agent-teams_runtime_bootstrap_checkin',
+    title: null,
+    status: 'completed',
+    input: null,
+    output: null,
+    outputText: null,
+    outputPreview: null,
+    startedAt: null,
+    completedAt: null,
+    isError: false,
     ...overrides,
   }
 }
@@ -374,6 +394,51 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     expect(events[0]).toMatchObject({
       outcome: 'error',
       runtimePromptMessageId: 'msg-current-user',
+    })
+  })
+
+  test('emits launch error when bootstrap MCP tools are not connected', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitLaunch({
+      record: buildRecord(),
+      reconcileSummary: buildReconcileSummary({
+        latestAssistantMessageId: 'msg-bootstrap-failed',
+        latestAssistantText: 'Both calls returned "Not connected".',
+        messages: [
+          buildMessage({
+            id: 'msg-bootstrap-failed',
+            role: 'assistant',
+            toolCalls: [
+              buildToolCall({
+                toolName: 'agent-teams_runtime_bootstrap_checkin',
+                status: 'errored',
+                outputText: 'Not connected',
+                isError: true,
+              }),
+              buildToolCall({
+                callId: 'tool-2',
+                toolName: 'agent-teams_member_briefing',
+                status: 'errored',
+                outputText: 'Not connected',
+                isError: true,
+              }),
+            ],
+          }),
+        ],
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'error',
+      detail: expect.stringContaining('runtime_bootstrap_checkin, member_briefing'),
     })
   })
 })

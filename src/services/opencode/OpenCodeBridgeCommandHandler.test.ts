@@ -18,6 +18,8 @@ import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
+  OpenCodeCanonicalMessage,
+  OpenCodeCanonicalToolCall,
   OpenCodeProvisioningSnapshot,
   OpenCodeSessionRecord,
   OpenCodeSessionReconcileSummary,
@@ -164,6 +166,52 @@ function buildReconcileSummary(
     replyPendingSinceMessageId: null,
     messages: [],
     diagnostics: [],
+    ...overrides,
+  }
+}
+
+function buildCanonicalMessage(
+  overrides: Partial<OpenCodeCanonicalMessage> = {},
+): OpenCodeCanonicalMessage {
+  return {
+    id: 'msg-1',
+    parentId: null,
+    role: 'assistant',
+    agent: null,
+    providerId: null,
+    modelId: null,
+    createdAt: null,
+    completedAt: null,
+    text: '',
+    reasoningText: '',
+    previewText: null,
+    partTypes: [],
+    reasoningPartCount: 0,
+    toolCalls: [],
+    contentBlocks: [],
+    finishReason: null,
+    errorName: null,
+    errorMessage: null,
+    hasError: false,
+    ...overrides,
+  }
+}
+
+function buildToolCall(
+  overrides: Partial<OpenCodeCanonicalToolCall> = {},
+): OpenCodeCanonicalToolCall {
+  return {
+    callId: 'tool-1',
+    toolName: 'agent-teams_runtime_bootstrap_checkin',
+    title: null,
+    status: 'completed',
+    input: null,
+    output: null,
+    outputText: null,
+    outputPreview: null,
+    startedAt: null,
+    completedAt: null,
+    isError: false,
     ...overrides,
   }
 }
@@ -1150,6 +1198,73 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+      'member_session_recorded',
+    ])
+  })
+
+  test('marks launch failed when required bootstrap MCP tools report Not connected', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: 'msg-bootstrap-failed',
+        latestAssistantText: 'Both calls returned "Not connected".',
+        messages: [
+          buildCanonicalMessage({
+            id: 'msg-bootstrap-failed',
+            role: 'assistant',
+            text: 'Both calls returned "Not connected".',
+            toolCalls: [
+              buildToolCall({
+                toolName: 'agent-teams_runtime_bootstrap_checkin',
+                status: 'errored',
+                outputText: 'Not connected',
+                isError: true,
+              }),
+              buildToolCall({
+                callId: 'tool-2',
+                toolName: 'agent-teams_member_briefing',
+                status: 'errored',
+                outputText: 'Not connected',
+                isError: true,
+              }),
+            ],
+          }),
+        ],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-not-connected',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('failed')
+    expect(result.data.members.alice?.launchState).toBe('failed')
+    expect(result.data.members.alice?.diagnostics).toContain(
+      'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin, member_briefing',
+    )
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
       'member_session_recorded',
     ])
@@ -3948,6 +4063,112 @@ describe('OpenCodeBridgeCommandHandler', () => {
       code: 'opencode_send_mcp_reattached',
       message: 'OpenCode app MCP was reattached before message delivery.',
       severity: 'info',
+    })
+  })
+
+  test('recreates OpenCode session before sending when bootstrap MCP failed in stored session', async () => {
+    const originalRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-broken',
+      lastCanonicalCursor: 'cursor-broken',
+    })
+    const freshRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-fresh',
+      lastCanonicalCursor: 'cursor-fresh',
+      runtimePid: 456,
+    })
+    const staleReasons: string[] = []
+    const promptSessionIds: string[] = []
+    const mcpCheckedSessionIds: string[] = []
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => originalRecord) as typeof openCodeSessionStore.get
+    openCodeSessionStore.markStale = (async (_teamId, _laneId, _memberName, staleReason) => {
+      staleReasons.push(staleReason)
+      return { ...originalRecord, staleReason }
+    }) as typeof openCodeSessionStore.markStale
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      expect(input).toMatchObject({
+        teamId: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: originalRecord.selectedModel,
+        projectPath: originalRecord.projectPath,
+        runId: 'run-bootstrap-repair',
+      })
+      return freshRecord
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: record.opencodeSessionId === 'session-bob-broken'
+        ? buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            latestAssistantMessageId: 'msg-bootstrap-failed',
+            messages: [
+              buildCanonicalMessage({
+                id: 'msg-bootstrap-failed',
+                role: 'assistant',
+                toolCalls: [
+                  buildToolCall({
+                    toolName: 'agent-teams_runtime_bootstrap_checkin',
+                    status: 'errored',
+                    outputText: 'MCP Not connected',
+                    isError: true,
+                  }),
+                ],
+              }),
+            ],
+          })
+        : buildReconcileSummary({
+            sessionId: record.opencodeSessionId,
+            lastCanonicalCursor: record.lastCanonicalCursor,
+          }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      mcpCheckedSessionIds.push(record.opencodeSessionId)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptSessionIds.push(record.opencodeSessionId)
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-bootstrap-repair',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello bob',
+        messageId: 'message-bootstrap-repair',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(staleReasons).toEqual(['bootstrap_app_mcp_unavailable'])
+    expect(ensureSessionCalls).toBe(1)
+    expect(mcpCheckedSessionIds).toEqual(['session-bob-fresh'])
+    expect(promptSessionIds).toEqual(['session-bob-fresh'])
+    expect(result.data.sessionId).toBe('session-bob-fresh')
+    expect(result.data.prePromptCursor).toBe('cursor-fresh')
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'opencode_send_session_recreated_after_bootstrap_mcp_failure',
+      message: 'Recreated OpenCode session before message delivery because bootstrap MCP failed in the stored session.',
+      severity: 'warning',
     })
   })
 

@@ -3,6 +3,7 @@ import {
   type OpenCodeRuntimeTurnSettledEmitterPort,
   type OpenCodeRuntimeTurnSettledOutcome,
 } from './OpenCodeRuntimeTurnSettledEmitter.js'
+import { summarizeOpenCodeBootstrapMcpFailure } from './OpenCodeBootstrapMcpFailure.js'
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
@@ -80,6 +81,15 @@ function hasErrorForPrompt(
     .some(message => message.role === 'assistant' && message.hasError)
 }
 
+function bootstrapMcpFailureDetail(
+  summary: OpenCodeSessionReconcileSummary | null | undefined,
+): string | null {
+  if (!summary) {
+    return null
+  }
+  return summarizeOpenCodeBootstrapMcpFailure(summary)?.message ?? null
+}
+
 function outcomeFromDelivery(input: {
   turnSettled?: OpenCodeTurnSettledSummary | null
   reconcileSummary?: OpenCodeSessionReconcileSummary | null
@@ -106,6 +116,9 @@ function outcomeFromLaunch(input: {
   reconcileSummary?: OpenCodeSessionReconcileSummary | null
 }): OpenCodeRuntimeTurnSettledOutcome {
   if (input.reconcileSummary?.errorCount && input.reconcileSummary.errorCount > 0) {
+    return 'error'
+  }
+  if (bootstrapMcpFailureDetail(input.reconcileSummary)) {
     return 'error'
   }
   if (input.reconcileSummary?.latestAssistantMessageId) {
@@ -186,6 +199,7 @@ export class OpenCodeTurnSettledEmissionCoordinator {
   }): Promise<void> {
     const turnId = input.reconcileSummary?.latestUserMessageId
     const detail = compactDiagnostics([
+      bootstrapMcpFailureDetail(input.reconcileSummary),
       ...(input.previewSummary?.diagnostics ?? []),
       ...(input.reconcileSummary?.diagnostics ?? []),
     ])

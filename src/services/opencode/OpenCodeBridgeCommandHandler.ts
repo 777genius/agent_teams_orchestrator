@@ -23,6 +23,7 @@ import {
   observeOpenCodeDeliveryResponse,
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
+import { summarizeOpenCodeBootstrapMcpFailure } from './OpenCodeBootstrapMcpFailure.js'
 import { openCodeTurnSettledEmissionCoordinator } from './OpenCodeTurnSettledEmissionCoordinator.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import {
@@ -759,7 +760,7 @@ function readinessData(
 }
 
 function bridgeStateFromSummary(summary: OpenCodeSessionReconcileSummary): 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed' {
-  if (summary.staleReason || summary.errorCount > 0) {
+  if (summary.staleReason || summary.errorCount > 0 || summarizeBootstrapMcpFailure(summary)) {
     return 'failed'
   }
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
@@ -776,7 +777,8 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
   const evidence = [
     { kind: 'member_session_recorded', observedAt },
   ]
-  const failed = Boolean(summary.staleReason) || summary.errorCount > 0
+  const failed =
+    Boolean(summary.staleReason) || summary.errorCount > 0 || Boolean(summarizeBootstrapMcpFailure(summary))
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
@@ -785,6 +787,70 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
     evidence.push({ kind: 'member_ready', observedAt })
   }
   return evidence
+}
+
+function summarizeBootstrapMcpFailure(
+  summary: OpenCodeSessionReconcileSummary,
+): TeamDiagnostic | null {
+  const failure = summarizeOpenCodeBootstrapMcpFailure(summary)
+  if (!failure) {
+    return null
+  }
+
+  return teamDiagnostic(
+    'opencode_bootstrap_mcp_failed',
+    failure.message,
+    'error',
+  )
+}
+
+async function recreateSessionAfterBootstrapMcpFailure(params: {
+  record: OpenCodeSessionRecord
+  runId?: string | null
+  diagnostics: TeamDiagnostic[]
+}): Promise<OpenCodeSessionRecord> {
+  const bootstrapFailure = await withTimeout(
+    openCodeSessionBridge.reconcileSession(params.record, { limit: 80 }),
+    OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
+  ).then(reconciled => summarizeBootstrapMcpFailure(reconciled.summary))
+    .catch(error => {
+      params.diagnostics.push(
+        teamDiagnostic(
+          'opencode_send_bootstrap_reconcile_failed',
+          error instanceof Error ? error.message : String(error),
+          'warning',
+        ),
+      )
+      return null
+    })
+
+  if (!bootstrapFailure) {
+    return params.record
+  }
+
+  params.diagnostics.push(bootstrapFailure)
+  await openCodeSessionStore.markStale(
+    params.record.teamId,
+    params.record.laneId ?? 'primary',
+    params.record.memberName,
+    'bootstrap_app_mcp_unavailable',
+  )
+  const recreated = await openCodeSessionBridge.ensureSession({
+    teamId: params.record.teamId,
+    laneId: params.record.laneId,
+    memberName: params.record.memberName,
+    selectedModel: params.record.selectedModel,
+    projectPath: params.record.projectPath,
+    runId: params.runId,
+  })
+  params.diagnostics.push(
+    teamDiagnostic(
+      'opencode_send_session_recreated_after_bootstrap_mcp_failure',
+      'Recreated OpenCode session before message delivery because bootstrap MCP failed in the stored session.',
+      'warning',
+    ),
+  )
+  return recreated
 }
 
 function buildTeamLaunchData(params: {
@@ -1191,6 +1257,11 @@ async function runLaunch(envelope: BridgeEnvelope) {
     const { name, record, reconciled } = settled
     if (reconciled) {
       const launchState = bridgeStateFromSummary(reconciled.summary)
+      const bootstrapFailure = summarizeBootstrapMcpFailure(reconciled.summary)
+      const memberDiagnostics = [
+        ...reconciled.summary.diagnostics,
+        ...(bootstrapFailure ? [bootstrapFailure.message] : []),
+      ]
       members[name] = {
         sessionId: record.opencodeSessionId,
         launchState,
@@ -1205,10 +1276,10 @@ async function runLaunch(envelope: BridgeEnvelope) {
               ? { runtimePid: snapshot.host.pid }
               : {}),
         evidence: evidenceFromSummary(reconciled.summary),
-        diagnostics: reconciled.summary.diagnostics,
+        diagnostics: memberDiagnostics,
       }
       diagnostics.push(
-        ...reconciled.summary.diagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
+        ...memberDiagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
       )
     } else {
       members[name] = {
@@ -1315,6 +1386,11 @@ async function runReconcile(envelope: BridgeEnvelope) {
     }
     try {
       const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
+      const bootstrapFailure = summarizeBootstrapMcpFailure(reconciled.summary)
+      const memberDiagnostics = [
+        ...reconciled.summary.diagnostics,
+        ...(bootstrapFailure ? [bootstrapFailure.message] : []),
+      ]
       members[name] = {
         sessionId: record.opencodeSessionId,
         launchState: bridgeStateFromSummary(reconciled.summary),
@@ -1329,7 +1405,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
               ? { runtimePid: snapshot.host.pid }
               : {}),
         evidence: evidenceFromSummary(reconciled.summary),
-        diagnostics: reconciled.summary.diagnostics,
+        diagnostics: memberDiagnostics,
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
@@ -1495,6 +1571,11 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       ),
     )
   }
+  deliveryRecord = await recreateSessionAfterBootstrapMcpFailure({
+    record: deliveryRecord,
+    runId,
+    diagnostics: mcpDiagnostics,
+  })
   const initialMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
     attachIfMissing: true,
   })
