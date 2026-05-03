@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'bun:test'
-import { readFile, rm } from 'node:fs/promises'
-import { dirname } from 'node:path'
-import { getFlagSettingsInline, setFlagSettingsInline } from '../../bootstrap/state.js'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import {
+  getFlagSettingsInline,
+  getFlagSettingsPath,
+  setFlagSettingsInline,
+  setFlagSettingsPath,
+} from '../../bootstrap/state.js'
 
 import {
   buildPaneLauncherCommand,
+  buildAppManagedAnthropicApiKeyHelperSettingsFlag,
+  buildInheritedCliFlags,
+  buildInheritedEnvObject,
   buildInheritedEnvVars,
   shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
@@ -216,6 +225,295 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
+  it('uses app-managed Anthropic helper mode without forwarding competing auth carriers', () => {
+    const keys = [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE',
+      'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
+    ] as const
+    const originals = new Map<string, string | undefined>(
+      keys.map(key => [key, process.env[key]]),
+    )
+    const settingsPath =
+      '/tmp/team-runtime-auth/demo/runtime-settings-anthropic.json'
+
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-helper-should-not-forward'
+    process.env.ANTHROPIC_AUTH_TOKEN = 'proxy-token-should-not-forward'
+    process.env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR = '3'
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-token-should-not-forward'
+    process.env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR = '4'
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      settingsPath
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'anthropic' })
+
+      expect(env).toContain("ANTHROPIC_API_KEY=''")
+      expect(env).toContain("ANTHROPIC_AUTH_TOKEN=''")
+      expect(env).toContain("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR=''")
+      expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN=''")
+      expect(env).toContain("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=''")
+      expect(env).toContain('CLAUDE_TEAM_ANTHROPIC_AUTH_MODE=api_key_helper')
+      expect(env).toContain(
+        `CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH=${settingsPath}`,
+      )
+      expect(env).not.toContain('sk-ant-helper-should-not-forward')
+      expect(env).not.toContain('proxy-token-should-not-forward')
+
+      const flags = buildInheritedCliFlags({ provider: 'anthropic' })
+      expect(flags).toContain('--settings')
+      expect(flags).toContain(settingsPath)
+      expect(buildAppManagedAnthropicApiKeyHelperSettingsFlag('codex')).toBeNull()
+    } finally {
+      for (const key of keys) {
+        const original = originals.get(key)
+        if (original === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = original
+        }
+      }
+    }
+  })
+
+  it('keeps app-managed Anthropic helper auth scrubbed after extra env merges', () => {
+    const keys = [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE',
+      'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
+    ] as const
+    const originals = new Map<string, string | undefined>(
+      keys.map(key => [key, process.env[key]]),
+    )
+    const settingsPath =
+      '/tmp/team-runtime-auth/demo/runtime-settings-anthropic.json'
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      settingsPath
+
+    try {
+      const env = buildInheritedEnvObject({
+        provider: 'anthropic',
+        extraEnv: {
+          ANTHROPIC_API_KEY: 'sk-ant-extra-env-should-not-win',
+          ANTHROPIC_AUTH_TOKEN: 'extra-token-should-not-win',
+          CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '9',
+          CLAUDE_CODE_OAUTH_TOKEN: 'extra-oauth-token-should-not-win',
+          CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '10',
+        },
+      })
+
+      expect(env.ANTHROPIC_API_KEY).toBe('')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('')
+      expect(env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR).toBe('')
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR).toBe('')
+      expect(env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE).toBe('api_key_helper')
+      expect(env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH).toBe(
+        settingsPath,
+      )
+      expect(Object.values(env).join('\n')).not.toContain(
+        'sk-ant-extra-env-should-not-win',
+      )
+      expect(Object.values(env).join('\n')).not.toContain(
+        'extra-token-should-not-win',
+      )
+    } finally {
+      for (const key of keys) {
+        const original = originals.get(key)
+        if (original === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = original
+        }
+      }
+    }
+  })
+
+  it('does not leak Anthropic helper markers into non-Anthropic teammate envs', () => {
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalAuthMode = process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+    const originalSettingsPath =
+      process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      '/tmp/team-runtime-auth/demo/runtime-settings-anthropic.json'
+
+    try {
+      const env = buildInheritedEnvVars({ provider: 'codex' })
+
+      expect(env).not.toContain('CLAUDE_TEAM_ANTHROPIC_AUTH_MODE')
+      expect(env).not.toContain(
+        'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
+      )
+    } finally {
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+
+      if (originalAuthMode === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = originalAuthMode
+      }
+
+      if (originalSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+          originalSettingsPath
+      }
+    }
+  })
+
+  it('passes inline Codex forced-login settings instead of Anthropic helper settings to Codex teammates', () => {
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalAuthMode = process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+    const originalSettingsPath =
+      process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+    const helperDir = '/tmp/team-runtime-auth/mixed/runs/run-1'
+    const inheritedAnthropicSettingsPath = `${helperDir}/runtime-settings-anthropic.json`
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      `${helperDir}/settings.json`
+    setFlagSettingsPath(inheritedAnthropicSettingsPath)
+    setFlagSettingsInline({ codex: { forced_login_method: 'chatgpt' } })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'codex' })
+
+      expect(flags).toContain('--settings')
+      expect(flags).toContain('forced_login_method')
+      expect(flags).toContain('chatgpt')
+      expect(flags).not.toContain(inheritedAnthropicSettingsPath)
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+      if (originalAuthMode === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = originalAuthMode
+      }
+      if (originalSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+          originalSettingsPath
+      }
+    }
+  })
+
+  it('merges inherited settings with app-managed Anthropic helper settings into one child settings file', async () => {
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalAuthMode = process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+    const originalSettingsPath =
+      process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+    const tempDir = await mkdtemp(join(tmpdir(), 'anthropic-helper-settings-'))
+    const inheritedSettingsPath = join(tempDir, 'inherited.json')
+    const helperSettingsPath = join(tempDir, 'helper.json')
+
+    await writeFile(
+      inheritedSettingsPath,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              matcher: '',
+              hooks: [{ type: 'command', command: '/bin/sh inherited-stop.sh' }],
+            },
+          ],
+        },
+        codex: { forced_login_method: 'chatgpt' },
+      }),
+    )
+    await writeFile(
+      helperSettingsPath,
+      JSON.stringify({
+        apiKeyHelper: "'/tmp/team-runtime-auth/demo/helper.sh'",
+      }),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      helperSettingsPath
+
+    try {
+      const flag = buildAppManagedAnthropicApiKeyHelperSettingsFlag(
+        'anthropic',
+        inheritedSettingsPath,
+      )
+      expect(flag).toContain('--settings')
+      expect(flag).not.toContain(inheritedSettingsPath)
+
+      const outputPath = flag!
+        .replace(/^--settings\s+/, '')
+        .replace(/^'/, '')
+        .replace(/'$/, '')
+      const merged = JSON.parse(await readFile(outputPath, 'utf8'))
+
+      expect(merged.apiKeyHelper).toBe("'/tmp/team-runtime-auth/demo/helper.sh'")
+      expect(merged.codex.forced_login_method).toBe('chatgpt')
+      expect(merged.hooks.Stop).toHaveLength(1)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+
+      if (originalAuthMode === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = originalAuthMode
+      }
+
+      if (originalSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+          originalSettingsPath
+      }
+    }
+  })
+
   it('blanks unapproved Anthropic API keys for non-host-managed teammates', () => {
     const originalApiKey = process.env.ANTHROPIC_API_KEY
     const originalManagedByHost =
@@ -279,11 +577,13 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
   it('clears Codex API key env vars for ChatGPT-auth codex teammates', () => {
     const originalApiKey = process.env.OPENAI_API_KEY
     const originalCodexApiKey = process.env.CODEX_API_KEY
+    const originalCodexHome = process.env.CODEX_HOME
     const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
     const originalSettingsInline = getFlagSettingsInline()
 
     process.env.OPENAI_API_KEY = 'sk-openai-teammate'
     process.env.CODEX_API_KEY = 'sk-codex-teammate'
+    process.env.CODEX_HOME = '/tmp/codex-connected-home'
     process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
     setFlagSettingsInline({
       codex: {
@@ -298,6 +598,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
 
       expect(env).toContain("OPENAI_API_KEY=''")
       expect(env).toContain("CODEX_API_KEY=''")
+      expect(env).toContain('CODEX_HOME=/tmp/codex-connected-home')
       expect(env).not.toContain('OPENAI_API_KEY=sk-openai-teammate')
       expect(env).not.toContain('CODEX_API_KEY=sk-codex-teammate')
     } finally {
@@ -311,6 +612,12 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         delete process.env.CODEX_API_KEY
       } else {
         process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+
+      if (originalCodexHome === undefined) {
+        delete process.env.CODEX_HOME
+      } else {
+        process.env.CODEX_HOME = originalCodexHome
       }
 
       if (originalEntryProvider === undefined) {

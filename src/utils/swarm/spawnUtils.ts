@@ -3,12 +3,15 @@
  */
 
 import { mkdtemp, writeFile } from 'node:fs/promises'
+import { chmodSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
   getFlagMcpConfig,
+  getFlagSettingsInline,
   getFlagSettingsPath,
   getInlinePlugins,
   getMainLoopModelOverride,
@@ -64,9 +67,10 @@ export function buildInheritedCliFlags(options?: {
   permissionMode?: PermissionMode
   effortValue?: string
   strictMcpConfig?: boolean
+  provider?: TeammateProvider
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue, strictMcpConfig } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -93,8 +97,18 @@ export function buildInheritedCliFlags(options?: {
 
   // Propagate --settings if set via CLI
   const settingsPath = getFlagSettingsPath()
-  if (settingsPath) {
+  const settingsInline = getFlagSettingsInline()
+  const appManagedAnthropicSettingsFlag =
+    buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
+  const suppressAppManagedAnthropicPath =
+    provider !== 'anthropic' && isAppManagedAnthropicSettingsPath(settingsPath)
+  if (settingsPath && !appManagedAnthropicSettingsFlag && !suppressAppManagedAnthropicPath) {
     flags.push(`--settings ${quote([settingsPath])}`)
+  }
+  if (appManagedAnthropicSettingsFlag) {
+    flags.push(appManagedAnthropicSettingsFlag)
+  } else if (settingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+    flags.push(`--settings ${quote([JSON.stringify(settingsInline)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()
@@ -179,6 +193,9 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_GEMINI_BACKEND',
   'CLAUDE_CODE_CODEX_BACKEND',
   'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD',
+  'CODEX_HOME',
+  'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE',
+  'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
   // Custom API endpoint
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_API_KEY',
@@ -224,6 +241,18 @@ const TEAMMATE_ENV_VARS = [
   'CURL_CA_BUNDLE',
 ] as const
 
+const APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV = 'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE'
+const APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER = 'api_key_helper'
+const APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV =
+  'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH'
+const APP_MANAGED_ANTHROPIC_COMPETING_AUTH_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+] as const
+
 const PROVIDER_SELECTION_ENV_VARS = [
   'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_BEDROCK',
@@ -265,6 +294,111 @@ function isHostManagedAnthropicTeammateTarget(
     (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'anthropic' &&
     isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
   )
+}
+
+function isAppManagedAnthropicApiKeyHelperTarget(
+  provider: TeammateProvider | undefined,
+): boolean {
+  return (
+    isHostManagedAnthropicTeammateTarget(provider) &&
+    process.env[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] ===
+      APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER &&
+    typeof process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] === 'string' &&
+    process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV]!.trim().length > 0
+  )
+}
+
+export function buildAppManagedAnthropicApiKeyHelperSettingsFlag(
+  provider: TeammateProvider | undefined,
+  inheritedSettingsPath?: string | null,
+): string | null {
+  if (!isAppManagedAnthropicApiKeyHelperTarget(provider)) {
+    return null
+  }
+  const settingsPath = process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV]?.trim()
+  if (!settingsPath) {
+    return null
+  }
+  const mergedPath = materializeAppManagedAnthropicChildSettingsFile({
+    inheritedSettingsPath: inheritedSettingsPath?.trim() || null,
+    helperSettingsPath: settingsPath,
+    provider: provider ?? getCurrentTeammateProviderForEnvForwarding(),
+  })
+  return `--settings ${quote([mergedPath ?? settingsPath])}`
+}
+
+function isAppManagedAnthropicSettingsPath(settingsPath?: string | null): boolean {
+  const helperSettingsPath = process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV]?.trim()
+  if (
+    !settingsPath ||
+    !helperSettingsPath ||
+    process.env[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] !==
+      APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER
+  ) {
+    return false
+  }
+  return settingsPath === helperSettingsPath || dirname(settingsPath) === dirname(helperSettingsPath)
+}
+
+type JsonObject = Record<string, unknown>
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function mergeJsonSettingsObjects(target: JsonObject, source: JsonObject): JsonObject {
+  const merged: JsonObject = { ...target }
+  for (const [key, value] of Object.entries(source)) {
+    const current = merged[key]
+    if (isJsonObject(current) && isJsonObject(value)) {
+      merged[key] = mergeJsonSettingsObjects(current, value)
+      continue
+    }
+    merged[key] = value
+  }
+  return merged
+}
+
+function readSettingsJsonFile(filePath: string): JsonObject | null {
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    return isJsonObject(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function materializeAppManagedAnthropicChildSettingsFile(input: {
+  inheritedSettingsPath: string | null
+  helperSettingsPath: string
+  provider: TeammateProvider
+}): string | null {
+  const helperSettings = readSettingsJsonFile(input.helperSettingsPath)
+  if (!helperSettings) {
+    return null
+  }
+  const inheritedSettings =
+    input.inheritedSettingsPath && input.inheritedSettingsPath !== input.helperSettingsPath
+      ? readSettingsJsonFile(input.inheritedSettingsPath)
+      : null
+  const merged = inheritedSettings
+    ? mergeJsonSettingsObjects(inheritedSettings, helperSettings)
+    : helperSettings
+  const dir = dirname(input.helperSettingsPath)
+  const outputPath = join(dir, `child-runtime-settings-${input.provider}.json`)
+  const tmpPath = `${outputPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(merged, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+    chmodSync(tmpPath, 0o600)
+    renameSync(tmpPath, outputPath)
+    chmodSync(outputPath, 0o600)
+    return outputPath
+  } catch {
+    return null
+  }
 }
 
 export function shouldClearCodexApiKeysForTeammateSpawn(
@@ -332,6 +466,8 @@ export function buildInheritedEnvObject(options?: {
     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
   }
   const provider = options?.provider
+  const useAppManagedAnthropicHelper =
+    isAppManagedAnthropicApiKeyHelperTarget(provider)
   const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(provider)
   const clearAnthropicApiKey = shouldClearAnthropicApiKeyForTeammateSpawn({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
@@ -349,12 +485,18 @@ export function buildInheritedEnvObject(options?: {
     if (provider && PROVIDER_SELECTION_ENV_VAR_SET.has(key)) {
       continue
     }
+    if (
+      key.startsWith('CLAUDE_TEAM_ANTHROPIC_') &&
+      !useAppManagedAnthropicHelper
+    ) {
+      continue
+    }
     if (clearCodexApiKeys && (key === 'CODEX_API_KEY' || key === 'OPENAI_API_KEY')) {
       continue
     }
     if (
       key === 'ANTHROPIC_API_KEY' &&
-      !shouldForwardAnthropicAuthToken(provider)
+      (useAppManagedAnthropicHelper || !shouldForwardAnthropicAuthToken(provider))
     ) {
       continue
     }
@@ -364,7 +506,15 @@ export function buildInheritedEnvObject(options?: {
     }
   }
 
-  if (clearAnthropicApiKey) {
+  if (useAppManagedAnthropicHelper) {
+    for (const key of APP_MANAGED_ANTHROPIC_COMPETING_AUTH_ENV_VARS) {
+      envVars[key] = ''
+    }
+    envVars[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] =
+      APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER
+    envVars[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] =
+      process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] ?? ''
+  } else if (clearAnthropicApiKey) {
     // Explicitly blank the inherited shell env for pane/process teammates. Not
     // forwarding the key is insufficient because tmux/login shells and native
     // process spawns can still inherit ANTHROPIC_API_KEY from the parent env.
@@ -388,6 +538,7 @@ export function buildInheritedEnvObject(options?: {
   // ANTHROPIC_BASE_URL, but only for Anthropic-routed teammates.
   if (
     shouldForwardAnthropicAuthToken(provider) &&
+    !useAppManagedAnthropicHelper &&
     process.env.ANTHROPIC_AUTH_TOKEN
   ) {
     envVars.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN
@@ -405,6 +556,16 @@ export function buildInheritedEnvObject(options?: {
     // including anthropic, so model alias resolution cannot drift.
     envVars.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     envVars.CLAUDE_CODE_ENTRY_PROVIDER = getExplicitEntryProvider(provider)
+  }
+
+  if (useAppManagedAnthropicHelper) {
+    for (const key of APP_MANAGED_ANTHROPIC_COMPETING_AUTH_ENV_VARS) {
+      envVars[key] = ''
+    }
+    envVars[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] =
+      APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER
+    envVars[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] =
+      process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] ?? ''
   }
 
   return envVars

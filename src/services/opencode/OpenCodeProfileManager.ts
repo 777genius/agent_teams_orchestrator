@@ -219,6 +219,24 @@ export function buildManagedConfig(
           'agent_teams_*': 'allow',
         },
       },
+      'teammate-bootstrap': {
+        mode: 'primary',
+        description: 'Silent launch bootstrap agent restricted to Agent Teams MCP attach tools.',
+        tools: {
+          '*': false,
+          'agent-teams_*': true,
+          'agent_teams_*': true,
+          'mcp__agent-teams__*': true,
+          'mcp__agent_teams__*': true,
+        },
+        permission: {
+          '*': 'deny',
+          'agent-teams_*': 'allow',
+          'agent_teams_*': 'allow',
+          'mcp__agent-teams__*': 'allow',
+          'mcp__agent_teams__*': 'allow',
+        },
+      },
     },
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
     // so setting plugin here would shadow user and project extension points.
@@ -290,13 +308,47 @@ export function buildManagedConfigFingerprint(managedConfig: Record<string, unkn
   return hashString(JSON.stringify(normalizeManagedConfigForFingerprint(managedConfig)))
 }
 
+export function orderOpenCodeAuthSyncSources(input: {
+  globalAuthPath: string
+  globalAuthFingerprint: string | null
+  sourceAuthPath?: string
+  sourceAuthFingerprint?: string | null
+  sourceAuthSources?: Array<{ path: string; fingerprint: string | null }>
+}): string[] {
+  const sources: string[] = []
+  // App-managed global credentials can provide providers that the real OpenCode
+  // store does not know about, but they must not overwrite a freshly refreshed
+  // local OpenCode OAuth provider. Sync global first, then local source last.
+  if (input.globalAuthFingerprint) {
+    sources.push(input.globalAuthPath)
+  }
+  const sourceAuthSources = input.sourceAuthSources
+    ?? (input.sourceAuthPath
+      ? [{ path: input.sourceAuthPath, fingerprint: input.sourceAuthFingerprint ?? null }]
+      : [])
+  for (const source of sourceAuthSources) {
+    if (!source.fingerprint || sources.includes(source.path)) {
+      continue
+    }
+    sources.push(source.path)
+  }
+  return sources
+}
+
 export class OpenCodeProfileManager {
   private readonly paths = envPaths('claude-multimodel')
 
-  private getSourceAuthPath(): string {
+  private getSourceAuthPaths(): string[] {
     const xdgDataHome =
       process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
-    return path.join(xdgDataHome, 'opencode', 'auth.json')
+    return Array.from(new Set([
+      path.join(xdgDataHome, 'opencode', 'auth.json'),
+      // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
+      // isolated runtime directory. Always include the canonical user OpenCode
+      // auth store as the highest-priority source so a fresh `opencode auth`
+      // login can override stale app-global OAuth credentials.
+      path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+    ]))
   }
 
   getGlobalAuthPath(): string {
@@ -361,7 +413,15 @@ export class OpenCodeProfileManager {
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const globalAuthPath = this.getGlobalAuthPath()
-    const sourceAuthPath = this.getSourceAuthPath()
+    const sourceAuthSources = await Promise.all(
+      this.getSourceAuthPaths().map(async sourceAuthPath => {
+        const exists = await fileExists(sourceAuthPath)
+        return {
+          path: sourceAuthPath,
+          fingerprint: exists ? await readFingerprint(sourceAuthPath) : null,
+        }
+      }),
+    )
 
     await Promise.all([
       mkdir(homePath, { recursive: true }),
@@ -371,22 +431,22 @@ export class OpenCodeProfileManager {
     ])
 
     const globalAuthExists = await fileExists(globalAuthPath)
-    const sourceAuthExists = await fileExists(sourceAuthPath)
     const globalAuthFingerprint = globalAuthExists
       ? await readFingerprint(globalAuthPath)
       : null
-    const sourceAuthFingerprint = sourceAuthExists
-      ? await readFingerprint(sourceAuthPath)
+    const sourceAuthFingerprint = sourceAuthSources.some(source => source.fingerprint)
+      ? hashString(sourceAuthSources
+        .filter(source => source.fingerprint)
+        .map(source => `${source.path}:${source.fingerprint}`)
+        .join('\n'))
       : null
-    if (sourceAuthExists && sourceAuthFingerprint) {
+    for (const authSourcePath of orderOpenCodeAuthSyncSources({
+      globalAuthPath,
+      globalAuthFingerprint,
+      sourceAuthSources,
+    })) {
       await syncOpenCodeManagedAuthStore({
-        sourceAuthPath,
-        managedAuthPath,
-      })
-    }
-    if (globalAuthExists && globalAuthFingerprint) {
-      await syncOpenCodeManagedAuthStore({
-        sourceAuthPath: globalAuthPath,
+        sourceAuthPath: authSourcePath,
         managedAuthPath,
       })
     }
@@ -396,10 +456,11 @@ export class OpenCodeProfileManager {
       if (!managedAuthFingerprint) {
         return 'missing' as const
       }
-      const authSourcePaths = [
-        ...(sourceAuthFingerprint ? [sourceAuthPath] : []),
-        ...(globalAuthFingerprint ? [globalAuthPath] : []),
-      ]
+      const authSourcePaths = orderOpenCodeAuthSyncSources({
+        globalAuthPath,
+        globalAuthFingerprint,
+        sourceAuthSources,
+      })
       if (authSourcePaths.length === 0) {
         return 'ok' as const
       }
@@ -434,7 +495,7 @@ export class OpenCodeProfileManager {
       xdgCacheHome,
       globalAuthPath,
       managedAuthPath,
-      sourceAuthPath: sourceAuthExists ? sourceAuthPath : null,
+      sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
       sourceAuthFingerprint,
       managedAuthFingerprint,
       authState,

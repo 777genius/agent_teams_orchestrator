@@ -9,6 +9,7 @@ import {
   buildManagedConfigFingerprint,
   collectProjectBehaviorMetadata,
   OpenCodeProfileManager,
+  orderOpenCodeAuthSyncSources,
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
@@ -75,6 +76,22 @@ describe('OpenCodeProfileManager project behavior contract', () => {
             'agent_teams_*': 'allow',
           },
         },
+        'teammate-bootstrap': {
+          tools: {
+            '*': false,
+            'agent-teams_*': true,
+            'agent_teams_*': true,
+            'mcp__agent-teams__*': true,
+            'mcp__agent_teams__*': true,
+          },
+          permission: {
+            '*': 'deny',
+            'agent-teams_*': 'allow',
+            'agent_teams_*': 'allow',
+            'mcp__agent-teams__*': 'allow',
+            'mcp__agent_teams__*': 'allow',
+          },
+        },
       },
     })
   })
@@ -120,6 +137,42 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env.XDG_DATA_HOME = previousXdgDataHome
       }
     }
+  })
+
+  test('syncs app-global OpenCode auth before real local auth so fresh login wins conflicts', () => {
+    expect(
+      orderOpenCodeAuthSyncSources({
+        globalAuthPath: '/Users/test/Library/Application Support/claude-multimodel-nodejs/opencode/auth.json',
+        globalAuthFingerprint: 'old-global-openai',
+        sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
+        sourceAuthFingerprint: 'fresh-local-openai',
+      })
+    ).toEqual([
+      '/Users/test/Library/Application Support/claude-multimodel-nodejs/opencode/auth.json',
+      '/Users/test/.local/share/opencode/auth.json',
+    ])
+  })
+
+  test('keeps canonical user OpenCode auth after isolated XDG auth sources', () => {
+    expect(
+      orderOpenCodeAuthSyncSources({
+        globalAuthPath: '/Users/test/Library/Application Support/claude-multimodel-nodejs/opencode/auth.json',
+        globalAuthFingerprint: 'old-global-openai',
+        sourceAuthSources: [
+          {
+            path: '/tmp/isolated-xdg/opencode/auth.json',
+            fingerprint: null,
+          },
+          {
+            path: '/Users/test/.local/share/opencode/auth.json',
+            fingerprint: 'fresh-local-openai',
+          },
+        ],
+      })
+    ).toEqual([
+      '/Users/test/Library/Application Support/claude-multimodel-nodejs/opencode/auth.json',
+      '/Users/test/.local/share/opencode/auth.json',
+    ])
   })
 
   test('keeps managed config fingerprint stable across volatile app MCP environment values', async () => {

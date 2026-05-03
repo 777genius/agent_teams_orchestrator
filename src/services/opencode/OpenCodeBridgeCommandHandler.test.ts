@@ -1521,6 +1521,79 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
   })
 
+  test('retries launch bootstrap when assistant finishes after check-in but before member briefing', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    const promptAsync = mock(async () => {})
+    openCodeSessionBridge.promptAsync = promptAsync as typeof openCodeSessionBridge.promptAsync
+    const missingBriefingSummary = buildReconcileSummary({
+      sessionId: 'session-alice',
+      latestAssistantMessageId: 'msg-checkin-only',
+      latestAssistantText: 'Bootstrap check-in completed.',
+      toolCallCount: 1,
+      messages: [
+        buildCanonicalMessage({
+          id: 'msg-checkin-only',
+          role: 'assistant',
+          text: 'Bootstrap check-in completed.',
+          toolCalls: [
+            buildToolCall({
+              toolName: 'agent-teams_runtime_bootstrap_checkin',
+              status: 'completed',
+              output: { ok: true },
+            }),
+          ],
+        }),
+      ],
+    })
+    let reconcileAttempt = 0
+    const reconcileSession = mock(async record => {
+      reconcileAttempt += 1
+      return {
+        record,
+        summary:
+          reconcileAttempt === 1
+            ? missingBriefingSummary
+            : buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+      }
+    })
+    openCodeSessionBridge.reconcileSession =
+      reconcileSession as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-missing-briefing',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(promptAsync).toHaveBeenCalledTimes(2)
+    expect(promptAsync.mock.calls[1]?.[1]?.text).toContain(
+      'Missing required tools: member_briefing.',
+    )
+    expect(reconcileSession).toHaveBeenCalledTimes(2)
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+      'opencode_launch_bootstrap_retry_prompt_sent',
+    )
+  })
+
   test('marks launch failed when assistant finishes without required bootstrap MCP tools', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
@@ -1702,8 +1775,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       },
     ])
     expect(prompts.map(prompt => ({ memberName: prompt.memberName, agent: prompt.agent }))).toEqual([
-      { memberName: 'alice', agent: 'teammate' },
-      { memberName: 'bob', agent: 'teammate' },
+      { memberName: 'alice', agent: 'teammate-bootstrap' },
+      { memberName: 'bob', agent: 'teammate-bootstrap' },
     ])
     expectOpenCodeIdentityPrompt({
       text: prompts[0]?.text ?? '',
@@ -1799,10 +1872,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(prompts).toHaveLength(2)
     for (const prompt of prompts) {
-      expect(prompt.agent).toBe('teammate')
+      expect(prompt.agent).toBe('teammate-bootstrap')
       expect(prompt.text).toContain('<opencode_runtime_identity>')
       expect(prompt.text).toContain('agent-teams_runtime_bootstrap_checkin')
       expect(prompt.text).toContain('agent-teams_member_briefing')
+      expect(prompt.text).toContain('Do not use bash')
       expect(prompt.text).toContain('"runtimeProvider":"opencode"')
       expect(prompt.text).toContain('agent-teams_message_send')
       expect(prompt.text).toContain('Do not use SendMessage.')
@@ -2805,8 +2879,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
         },
       ])
       expect(prompts.map(prompt => ({ memberName: prompt.memberName, agent: prompt.agent }))).toEqual([
-        { memberName: 'bob', agent: 'teammate' },
-        { memberName: 'jack', agent: 'teammate' },
+        { memberName: 'bob', agent: 'teammate-bootstrap' },
+        { memberName: 'jack', agent: 'teammate-bootstrap' },
       ])
       expectOpenCodeIdentityPrompt({
         text: prompts[0]?.text ?? '',

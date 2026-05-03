@@ -26,7 +26,6 @@ import {
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
 import {
-  hasOpenCodeBootstrapMcpNotConnectedFailure,
   summarizeOpenCodeBootstrapMcpFailure,
   summarizeOpenCodeBootstrapMcpReadiness,
 } from './OpenCodeBootstrapMcpFailure.js'
@@ -51,15 +50,17 @@ import type {
 
 const BRIDGE_SCHEMA_VERSION = 1
 const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
-const OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS = 8_000
-const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 1_500
-const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 6_000
+const OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS = 20_000
+const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 3_000
+const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 10_000
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // This is intentionally longer than the UI wait budget: the app can return
 // acceptanceUnknown early while this bridge keeps observing the real turn.
 const OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS = 25_000
 const OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
+const OPEN_CODE_TEAMMATE_AGENT = 'teammate'
+const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT = 'teammate-bootstrap'
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -322,6 +323,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
     ...(purpose === 'launch'
       ? [
           'Launch bootstrap is a silent attach, not a user/team conversation turn.',
+          'Only use Agent Teams MCP tools for launch bootstrap. Do not use bash, file, task, web, skill, or no-op placeholder tools during launch bootstrap.',
           'After runtime_bootstrap_checkin and member_briefing both succeed, stop this turn immediately and wait for app-delivered messages or actionable task assignments.',
           'Do not call task_briefing, message_send, or cross_team_send just to announce readiness, say understood, report no tasks, or ask for work.',
           'If the briefing says there are no actionable tasks, stay idle silently.',
@@ -342,7 +344,16 @@ function buildOpenCodeBootstrapRetryPrompt(input: {
   memberName: string
   runId: string
   runtimeSessionId: string
+  completedTools?: string[]
+  missingTools?: string[]
 }): string {
+  const completedTools = input.completedTools?.length
+    ? input.completedTools.join(', ')
+    : 'none'
+  const missingTools = input.missingTools?.length
+    ? input.missingTools.join(', ')
+    : 'unknown'
+
   return [
     buildOpenCodeRuntimeIdentityBlock({
       ...input,
@@ -350,11 +361,14 @@ function buildOpenCodeBootstrapRetryPrompt(input: {
     }),
     '',
     '<opencode_bootstrap_retry>',
-    'The previous launch bootstrap tool calls failed because Agent Teams MCP was not connected.',
-    'The app has reattached Agent Teams MCP to this same OpenCode session.',
-    'Retry only runtime_bootstrap_checkin and member_briefing with the exact payloads above.',
+    'The previous launch bootstrap turn did not finish all required Agent Teams MCP tools.',
+    'The app has confirmed Agent Teams MCP is attached to this same OpenCode session.',
+    `Completed required tools: ${completedTools}.`,
+    `Missing required tools: ${missingTools}.`,
+    'Call only the missing required tool(s) now with the exact payloads above.',
+    'If runtime_bootstrap_checkin is missing, call it before member_briefing.',
     'Do not create tasks, send visible messages, or announce readiness.',
-    'Stop immediately after both bootstrap tools succeed.',
+    'Stop immediately after the missing bootstrap tool(s) succeed.',
     '</opencode_bootstrap_retry>',
   ].join('\n')
 }
@@ -1061,12 +1075,14 @@ function summarizeBootstrapMcpFailure(
   )
 }
 
-async function repairLaunchBootstrapMcpNotConnected(input: {
+async function retryLaunchBootstrapMcpFailure(input: {
   teamId: string
   memberName: string
   runId: string
   record: OpenCodeSessionRecord
   diagnostics: TeamDiagnostic[]
+  completedTools?: string[]
+  missingTools?: string[]
 }): Promise<{
   record: OpenCodeSessionRecord
   reconciled: { record?: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }
@@ -1107,8 +1123,10 @@ async function repairLaunchBootstrapMcpNotConnected(input: {
       memberName: input.memberName,
       runId: input.runId,
       runtimeSessionId: input.record.opencodeSessionId,
+      completedTools: input.completedTools,
+      missingTools: input.missingTools,
     }),
-    agent: 'teammate',
+    agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
   })
   input.diagnostics.push(
     teamDiagnostic(
@@ -1117,6 +1135,20 @@ async function repairLaunchBootstrapMcpNotConnected(input: {
       'info',
     ),
   )
+
+  await openCodeSessionBridge.observePreview(input.record, {
+    timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
+    idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
+  }).catch(error => {
+    input.diagnostics.push(
+      teamDiagnostic(
+        'opencode_launch_bootstrap_retry_preview_pending',
+        `${input.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+        'info',
+      ),
+    )
+    return null
+  })
 
   return withTimeout(
     openCodeSessionBridge.reconcileSession(input.record, { limit: 80 }),
@@ -1568,7 +1600,7 @@ async function runLaunchWithProvisioningSnapshot(
       const promptStartedAt = Date.now()
       await openCodeSessionBridge.promptAsync(record, {
         text: `${runtimeIdentityBlock}\n\n${prompt}`,
-        agent: 'teammate',
+        agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
       })
       memberTiming.promptMs = elapsedMs(promptStartedAt)
       promptedMembers.push({ name, record })
@@ -1616,13 +1648,16 @@ async function runLaunchWithProvisioningSnapshot(
       )
       memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
       let reconciledRecord = reconciled.record ?? record
-      if (hasOpenCodeBootstrapMcpNotConnectedFailure(reconciled.summary)) {
-        const repaired = await repairLaunchBootstrapMcpNotConnected({
+      const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(reconciled.summary)
+      if (bootstrapMcpReadiness.failure) {
+        const repaired = await retryLaunchBootstrapMcpFailure({
           teamId,
           memberName: name,
           runId,
           record: reconciledRecord,
           diagnostics: settleDiagnostics,
+          completedTools: bootstrapMcpReadiness.completedTools,
+          missingTools: bootstrapMcpReadiness.missingTools,
         })
         if (repaired) {
           reconciled = repaired.reconciled
@@ -2101,7 +2136,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     : null
 
   const deliveryText = identityReminder ? `${identityReminder}\n\n${text}` : text
-  const deliveryAgent = asString(body.agent) ?? 'teammate'
+  const deliveryAgent = asString(body.agent) ?? OPEN_CODE_TEAMMATE_AGENT
   const noReply = body.noReply === true
   let runtimePromptMessageId: string | null = null
   let turnSettled: OpenCodeTurnSettledSummary | null = null

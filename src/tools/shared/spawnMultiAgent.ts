@@ -8,11 +8,12 @@ import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, type WriteStream } from 'node:fs'
 import { access, readdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
   getFlagMcpConfig,
+  getFlagSettingsInline,
   getFlagSettingsPath,
   getInlinePlugins,
   getMainLoopModelOverride,
@@ -77,6 +78,7 @@ import {
 } from '../../utils/swarm/spawnInProcess.js'
 import {
   buildPaneLauncherCommand,
+  buildAppManagedAnthropicApiKeyHelperSettingsFlag,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
   probeTmuxTeammateSpawn,
@@ -1253,9 +1255,10 @@ function buildInheritedCliFlags(options?: {
   permissionMode?: PermissionMode
   effortValue?: string
   strictMcpConfig?: boolean
+  provider?: TeammateProvider
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue, strictMcpConfig } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -1287,8 +1290,25 @@ function buildInheritedCliFlags(options?: {
 
   // Propagate --settings if set via CLI
   const settingsPath = getFlagSettingsPath()
-  if (settingsPath) {
+  const settingsInline = getFlagSettingsInline()
+  const appManagedAnthropicSettingsFlag =
+    buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
+  const helperSettingsPath =
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH?.trim()
+  const suppressAppManagedAnthropicPath =
+    provider !== 'anthropic' &&
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE === 'api_key_helper' &&
+    !!settingsPath &&
+    !!helperSettingsPath &&
+    (settingsPath === helperSettingsPath ||
+      settingsPath.startsWith(`${dirname(helperSettingsPath)}/`))
+  if (settingsPath && !appManagedAnthropicSettingsFlag && !suppressAppManagedAnthropicPath) {
     flags.push(`--settings ${quote([settingsPath])}`)
+  }
+  if (appManagedAnthropicSettingsFlag) {
+    flags.push(appManagedAnthropicSettingsFlag)
+  } else if (settingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+    flags.push(`--settings ${quote([JSON.stringify(settingsInline)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()
@@ -1490,6 +1510,7 @@ async function handleSpawnSplitPane(
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     strictMcpConfig: Boolean(teamName),
+    provider,
   })
 
   if (crossesProviderBoundary(input.provider)) {
@@ -1780,6 +1801,7 @@ async function handleSpawnSeparateWindow(
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     strictMcpConfig: Boolean(teamName),
+    provider,
   })
 
   if (crossesProviderBoundary(input.provider)) {
@@ -2153,6 +2175,7 @@ async function handleSpawnNativeProcess(
     effortValue:
       typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     strictMcpConfig: Boolean(teamName),
+    provider,
   })
 
   if (crossesProviderBoundary(input.provider)) {
