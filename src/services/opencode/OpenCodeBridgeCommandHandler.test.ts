@@ -360,6 +360,7 @@ function mockRequiredMcpTools(): void {
 }
 
 const originalProbe = openCodeProvisioningProbe.probe
+const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
 const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalEnsureSession = openCodeSessionBridge.ensureSession
@@ -380,10 +381,28 @@ const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
 let previousRuntimeTurnSettledSpoolRoot: string | undefined
+let previousAppMcpToolProofCachePath: string | undefined
+let previousAppMcpToolProofCacheDisabled: string | undefined
+let appMcpToolProofCacheDir: string | null = null
 
-beforeEach(() => {
+beforeEach(async () => {
   previousRuntimeTurnSettledSpoolRoot = process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV]
+  previousAppMcpToolProofCachePath =
+    process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH
+  previousAppMcpToolProofCacheDisabled =
+    process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  appMcpToolProofCacheDir = await mkdtemp(path.join(os.tmpdir(), 'agent-teams-mcp-proof-'))
+  process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH = path.join(
+    appMcpToolProofCacheDir,
+    'proof-cache.json',
+  )
+  delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  __resetAppMcpToolProofCacheForTests()
   mockRequiredMcpTools()
+  openCodeProvisioningProbe.probeRetainingHost = (async projectPath => ({
+    snapshot: await openCodeProvisioningProbe.probe(projectPath),
+    release: async () => {},
+  })) as typeof openCodeProvisioningProbe.probeRetainingHost
   openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
     await openCodeSessionBridge.promptAsync(record, input)
     const runtimePromptMessageId = 'msg_test_turn_settled'
@@ -438,14 +457,26 @@ beforeEach(() => {
   })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
 })
 
-afterEach(() => {
+afterEach(async () => {
   if (previousRuntimeTurnSettledSpoolRoot == null) {
     delete process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV]
   } else {
     process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = previousRuntimeTurnSettledSpoolRoot
   }
+  if (previousAppMcpToolProofCachePath == null) {
+    delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH
+  } else {
+    process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH = previousAppMcpToolProofCachePath
+  }
+  if (previousAppMcpToolProofCacheDisabled == null) {
+    delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  } else {
+    process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED =
+      previousAppMcpToolProofCacheDisabled
+  }
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
+  openCodeProvisioningProbe.probeRetainingHost = originalProbeRetainingHost
   openCodeExecutionProbe.probeModel = originalProbeModel
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeSessionBridge.ensureSession = originalEnsureSession
@@ -465,6 +496,10 @@ afterEach(() => {
   Client.prototype.connect = originalClientConnect
   Client.prototype.listTools = originalClientListTools
   Client.prototype.close = originalClientClose
+  if (appMcpToolProofCacheDir) {
+    await rm(appMcpToolProofCacheDir, { recursive: true, force: true })
+    appMcpToolProofCacheDir = null
+  }
 })
 
 function buildEnvelope(command: string, body: Record<string, unknown>) {
@@ -497,6 +532,78 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
+  })
+
+  test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
+    let probeCalled = false
+    openCodeProvisioningProbe.probe = (async () => {
+      probeCalled = true
+      throw new Error('launch handshake should not probe OpenCode')
+    }) as typeof openCodeProvisioningProbe.probe
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.launchTeam',
+        expectedCapabilitySnapshotId: null,
+        expectedRunId: 'run-1',
+        expectedManifestHighWatermark: 0,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeCalled).toBe(false)
+    if (result.ok) {
+      expect(result.runtime.capabilitySnapshotId).toBeNull()
+      expect(result.data.server.runtime.capabilitySnapshotId).toBeNull()
+      expect(result.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(0)
+    }
+  })
+
+  test('lightweight launch handshake preserves the requested manifest high watermark', async () => {
+    let probeCalled = false
+    openCodeProvisioningProbe.probe = (async () => {
+      probeCalled = true
+      throw new Error('launch handshake should not probe OpenCode')
+    }) as typeof openCodeProvisioningProbe.probe
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.launchTeam',
+        expectedCapabilitySnapshotId: null,
+        expectedRunId: 'run-1',
+        expectedManifestHighWatermark: 17,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeCalled).toBe(false)
+    if (result.ok) {
+      expect(result.data.server.runtime.runtimeStoreManifestHighWatermark).toBe(17)
+    }
+  })
+
+  test('keeps full handshake when launch commands require a capability snapshot', async () => {
+    let probeCalled = false
+    openCodeProvisioningProbe.probe = (async () => {
+      probeCalled = true
+      return snapshot
+    }) as typeof openCodeProvisioningProbe.probe
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.launchTeam',
+        expectedCapabilitySnapshotId: 'opencode:expected',
+        expectedRunId: 'run-1',
+        expectedManifestHighWatermark: 0,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeCalled).toBe(true)
+    if (result.ok) {
+      expect(result.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
+      expect(result.data.server.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
+    }
   })
 
   test('executes host cleanup without provisioning a readiness host', async () => {
@@ -964,6 +1071,61 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(listToolsCalls).toBe(1)
   })
 
+  test('reuses a persisted MCP tool proof after bridge process memory reset', async () => {
+    let connectCalls = 0
+    let listToolsCalls = 0
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      connectCalls += 1
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        listToolsCalls += 1
+        return {
+          tools: requiredMockMcpTools(),
+        }
+      }
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+
+    const firstResult = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(firstResult.ok).toBe(true)
+    expect(connectCalls).toBe(1)
+    expect(listToolsCalls).toBe(1)
+
+    __resetAppMcpToolProofCacheForTests()
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      throw new Error('direct MCP proof should come from persisted cache')
+    }
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => {
+        throw new Error('direct MCP proof should come from persisted cache')
+      }
+
+    const secondResult = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(secondResult.ok).toBe(true)
+    if (!secondResult.ok) {
+      return
+    }
+    expect(secondResult.data.state).toBe('ready')
+    expect(secondResult.data.diagnostics).toContain(
+      'opencode_app_mcp_tool_proof_persisted_cache_hit',
+    )
+  })
+
   test('dedupes concurrent MCP tool proof requests for the same launch config', async () => {
     const deferredTools = createDeferred<{ tools: Array<{ name: string }> }>()
     let connectCalls = 0
@@ -1040,12 +1202,61 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toHaveLength(1)
     expect(ensureInputs[0]?.laneId).toBe('secondary:opencode:alice')
+    expect(ensureInputs[0]?.preparedProfile).toBe(snapshot.profile)
     expect(
       (result.data as { members: Record<string, { runtimePid?: number }> }).members.alice?.runtimePid,
     ).toBe(123)
     expect(Object.keys((result.data as { members: Record<string, unknown> }).members)).toEqual([
       'alice',
     ])
+  })
+
+  test('keeps the launch provisioning host retained until launch finishes', async () => {
+    let releaseCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      throw new Error('unretained probe should not be used for launch')
+    }
+    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
+      snapshot,
+      release: async () => {
+        releaseCalls += 1
+      },
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-retained-host',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: 'opencode_launch_member_timing' }),
+        expect.objectContaining({ code: 'opencode_launch_total_timing' }),
+      ]),
+    )
+    expect(releaseCalls).toBe(1)
   })
 
   test('launches provider-scoped OpenCode model ids that contain nested slashes', async () => {
@@ -1503,7 +1714,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       'perm-bob',
       'perm-shell',
     ])
-    expect(result.data.diagnostics).toEqual([
+    expect(result.data.diagnostics.filter(diagnostic => diagnostic.code !== 'opencode_launch_member_timing' && diagnostic.code !== 'opencode_launch_total_timing')).toEqual([
       {
         code: 'member_reconcile',
         message: 'bob: bob waiting for permission',
@@ -1799,7 +2010,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.bob?.evidence.map(item => item.kind)).toEqual([
       'member_session_recorded',
     ])
-    expect(result.data.diagnostics).toEqual([
+    expect(result.data.diagnostics.filter(diagnostic => diagnostic.code !== 'opencode_launch_member_timing' && diagnostic.code !== 'opencode_launch_total_timing')).toEqual([
       {
         code: 'member_reconcile',
         message: 'bob: bob session stale',

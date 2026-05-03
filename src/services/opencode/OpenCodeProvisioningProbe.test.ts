@@ -190,6 +190,128 @@ describe('OpenCodeProvisioningProbe', () => {
     expect(releaseCalls).toBe(1)
   })
 
+  test('can retain the live host for launch session creation', async () => {
+    let releaseCalls = 0
+    const retainedLeaseTeamIds: string[] = []
+    const releasedLeaseTeamIds: string[] = []
+    const ensureHostInputs: unknown[] = []
+
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: {
+        probe: async () => inventory,
+      },
+      hostManager: {
+        ensureHost: async (input) => {
+          ensureHostInputs.push(input)
+          return host
+        },
+        refreshResolvedConfigFingerprint: async () => 'resolved-fingerprint',
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHost: async () => {
+          releaseCalls += 1
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () =>
+            ({
+              username: 'belief',
+              plugin: [],
+              agent: {},
+              mode: {},
+              command: {},
+              default_agent: 'teammate',
+              share: 'disabled',
+              autoupdate: false,
+              snapshot: true,
+            }) satisfies OpenCodeConfigResponse,
+          getConfigProviders: async () =>
+            ({
+              providers: [{ id: 'openai', name: 'OpenAI' }],
+              default: { openai: 'gpt-5.4-mini' },
+            }) satisfies OpenCodeConfigProvidersResponse,
+          getProviders: async () =>
+            ({
+              all: [{ id: 'openai', name: 'OpenAI' }],
+              default: { openai: 'gpt-5.4-mini' },
+              connected: ['openai'],
+            }) satisfies OpenCodeProviderResponse,
+          getProviderAuth: async () =>
+            ({
+              openai: [{ type: 'oauth', label: 'ChatGPT Pro/Plus (browser)' }],
+            }) satisfies Record<string, OpenCodeProviderAuthMethod[]>,
+          listAgents: async () => [{ name: 'teammate', mode: 'primary' }],
+          getMcp: async () => ({ 'agent-teams': { connected: true } }),
+          addMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            throw new Error('not used')
+          },
+          getSession: async () => {
+            throw new Error('not used')
+          },
+          getSessionStatus: async () => {
+            throw new Error('not used')
+          },
+          getSessionMessages: async () => {
+            throw new Error('not used')
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => {
+            throw new Error('not used')
+          },
+          promptSessionAsync: async () => {
+            throw new Error('not used')
+          },
+          abortSession: async () => {
+            throw new Error('not used')
+          },
+        }),
+      },
+      mcpManager: {
+        ensureAppMcp: async () => ({
+          mcp: {
+            'agent-teams': { connected: true },
+          },
+          summary: {
+            serverName: 'agent-teams',
+            matchedServerName: 'agent-teams',
+            status: 'present',
+            connected: true,
+            launchSource: null,
+            availableServerNames: ['agent-teams'],
+            diagnostics: [],
+          },
+        }),
+      },
+    })
+
+    const retained = await probe.probeRetainingHost('/tmp/project')
+
+    expect(retained.snapshot.hostHealthy).toBe(true)
+    expect(ensureHostInputs).toEqual([
+      expect.objectContaining({
+        projectPath: '/tmp/project',
+        preparedProfile: profile,
+      }),
+    ])
+    expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releasedLeaseTeamIds).toEqual([])
+    expect(releaseCalls).toBe(0)
+
+    await retained.release()
+    await retained.release()
+
+    expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releaseCalls).toBe(1)
+  })
+
   test('surfaces provider mismatches between inventory and live host', async () => {
     const probe = new OpenCodeProvisioningProbe({
       inventoryService: {

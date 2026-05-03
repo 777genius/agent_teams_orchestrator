@@ -137,13 +137,14 @@ export class OpenCodeSessionBridge {
 
   private async createFreshSessionRecord(params: {
     identity: SessionIdentity
+    profile: OpenCodePreparedProfile
     selectedModel: string
     title?: string | null
-    projectPath?: string | null
     runId?: string | null
   }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
     const host = await this.hostManager.ensureHost({
-      projectPath: params.projectPath,
+      projectPath: params.profile.projectPath,
+      preparedProfile: params.profile,
     })
 
     try {
@@ -196,7 +197,11 @@ export class OpenCodeSessionBridge {
     return `${identity.teamId}::${identity.laneId}::${identity.memberName}`
   }
 
-  private async retainSessionHost(record: OpenCodeSessionRecord, runId?: string | null) {
+  private async retainSessionHost(
+    record: OpenCodeSessionRecord,
+    runId?: string | null,
+    profile?: OpenCodePreparedProfile,
+  ) {
     const sessionKey = this.buildSessionKey(record)
     if (this.retainedSessionHosts.get(sessionKey) === record.hostKey) {
       await this.hostManager.retainHostLease?.(record.hostKey, {
@@ -212,6 +217,7 @@ export class OpenCodeSessionBridge {
     const host = await this.hostManager.ensureHost({
       projectPath: record.projectPath,
       hostKey: record.hostKey,
+      preparedProfile: profile,
     })
     await this.hostManager.retainHostLease?.(record.hostKey, {
       teamId: record.teamId,
@@ -433,9 +439,10 @@ export class OpenCodeSessionBridge {
     selectedModel: string
     title?: string | null
     projectPath?: string | null
+    preparedProfile?: OpenCodePreparedProfile | null
     runId?: string | null
   }): Promise<OpenCodeSessionRecord> {
-    const profile = await this.prepareProfile(params.projectPath)
+    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath)
     const laneId = params.laneId?.trim() || 'primary'
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
     if (
@@ -446,7 +453,7 @@ export class OpenCodeSessionBridge {
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
       !existing.staleReason
     ) {
-      const host = await this.retainSessionHost(existing, params.runId)
+      const host = await this.retainSessionHost(existing, params.runId, profile)
       return host?.pid && host.pid > 0 ? { ...existing, runtimePid: host.pid } : existing
     }
 
@@ -477,9 +484,9 @@ export class OpenCodeSessionBridge {
         laneId,
         memberName: params.memberName,
       },
+      profile,
       selectedModel: params.selectedModel,
       title: params.title,
-      projectPath: profile.projectPath,
       runId: params.runId ?? null,
     })
     try {

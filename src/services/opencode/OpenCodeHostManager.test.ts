@@ -206,6 +206,35 @@ describe('OpenCodeHostManager', () => {
     expect(spawned.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
   })
 
+  test('keeps a healthy host usable when resolved fingerprint probing fails', async () => {
+    const spawned = createMockChildProcess()
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43120,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          throw new Error('fingerprint probe unavailable')
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const handle = await manager.ensureHost({ hostKey: 'host-key' })
+
+    expect(handle.state).toBe('healthy')
+    expect(handle.resolvedConfigFingerprint).toBeNull()
+  })
+
   test('drops a host from the registry when the child exits unexpectedly', async () => {
     const spawned = createMockChildProcess()
 
@@ -887,5 +916,70 @@ describe('OpenCodeHostManager', () => {
 
     expect(initialFingerprint).not.toBeNull()
     expect(refreshedFingerprint).toBe(initialFingerprint)
+  })
+
+  test('preserves the previous resolved fingerprint when refresh probing fails', async () => {
+    const spawned = createMockChildProcess()
+    let phase: 'initial' | 'refresh' = 'initial'
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43127,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (phase === 'refresh' && url.endsWith('/config')) {
+          throw new Error('fingerprint refresh unavailable')
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {
+              'agent-teams': {
+                connected: true,
+              },
+            },
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const handle = await manager.ensureHost({ hostKey: 'host-key' })
+    const initialFingerprint = handle.resolvedConfigFingerprint
+    phase = 'refresh'
+    const refreshedFingerprint = await manager.refreshResolvedConfigFingerprint('host-key')
+
+    expect(initialFingerprint).not.toBeNull()
+    expect(refreshedFingerprint).toBe(initialFingerprint)
+    expect(manager.getHost('host-key')?.resolvedConfigFingerprint).toBe(initialFingerprint)
   })
 })

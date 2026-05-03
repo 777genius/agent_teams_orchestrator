@@ -19,6 +19,8 @@ import type {
 
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
+const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
+const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
@@ -317,6 +319,31 @@ export class OpenCodeHostManager {
     return (this.deps.fetchJson ?? fetchJson)(url, init)
   }
 
+  private async fetchJsonWithTimeout(
+    url: string,
+    timeoutMs: number,
+    init?: RequestInit,
+  ): Promise<FetchJsonResult> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => {
+      controller.abort()
+    }, timeoutMs)
+
+    try {
+      return await this.fetchJson(url, {
+        ...init,
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`OpenCode host request timed out after ${timeoutMs}ms for ${url}`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
   private async allocateLoopbackPort(): Promise<number> {
     return (this.deps.allocateLoopbackPort ?? allocateLoopbackPort)()
   }
@@ -557,12 +584,11 @@ export class OpenCodeHostManager {
   }
 
   private async checkHealthyHostOnce(baseUrl: string): Promise<{ version: string | null } | null> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 1_000)
     try {
-      const result = await this.fetchJson(`${baseUrl}/global/health`, {
-        signal: controller.signal,
-      })
+      const result = await this.fetchJsonWithTimeout(
+        `${baseUrl}/global/health`,
+        OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+      )
       const data = result.data as { healthy?: boolean; version?: string }
       if (result.status === 200 && data?.healthy === true) {
         return {
@@ -572,8 +598,6 @@ export class OpenCodeHostManager {
       return null
     } catch {
       return null
-    } finally {
-      clearTimeout(timeout)
     }
   }
 
@@ -632,7 +656,10 @@ export class OpenCodeHostManager {
 
     while (Date.now() - startedAt < OPEN_CODE_HOST_HEALTH_TIMEOUT_MS) {
       try {
-        const result = await this.fetchJson(`${baseUrl}/global/health`)
+        const result = await this.fetchJsonWithTimeout(
+          `${baseUrl}/global/health`,
+          OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+        )
         const data = result.data as { healthy?: boolean; version?: string }
         if (result.status === 200 && data?.healthy === true) {
           return {
@@ -654,10 +681,22 @@ export class OpenCodeHostManager {
   private async getResolvedConfigFingerprint(baseUrl: string): Promise<string | null> {
     try {
       const [config, configProviders, agents, mcp] = await Promise.all([
-        this.fetchJson(`${baseUrl}/config`),
-        this.fetchJson(`${baseUrl}/config/providers`),
-        this.fetchJson(`${baseUrl}/agent`),
-        this.fetchJson(`${baseUrl}/mcp`),
+        this.fetchJsonWithTimeout(
+          `${baseUrl}/config`,
+          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+        ),
+        this.fetchJsonWithTimeout(
+          `${baseUrl}/config/providers`,
+          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+        ),
+        this.fetchJsonWithTimeout(
+          `${baseUrl}/agent`,
+          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+        ),
+        this.fetchJsonWithTimeout(
+          `${baseUrl}/mcp`,
+          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+        ),
       ])
 
       const fingerprintSource = {
@@ -816,8 +855,9 @@ export class OpenCodeHostManager {
     projectPath?: string | null
     hostKey?: string | null
     profileOptions?: OpenCodePrepareProfileOptions
+    preparedProfile?: OpenCodePreparedProfile
   } = {}): Promise<OpenCodeHostHandle> {
-    const profile = await this.prepareProfile(params.projectPath, params.profileOptions)
+    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath, params.profileOptions)
     const hostKey =
       params.hostKey?.trim()
       || `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
@@ -861,8 +901,10 @@ export class OpenCodeHostManager {
     }
 
     const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
-    entry.handle.resolvedConfigFingerprint = fingerprint
-    return fingerprint
+    if (fingerprint) {
+      entry.handle.resolvedConfigFingerprint = fingerprint
+    }
+    return entry.handle.resolvedConfigFingerprint
   }
 
   private async terminatePersistentHostRecord(

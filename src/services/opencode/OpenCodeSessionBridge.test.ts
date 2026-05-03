@@ -99,17 +99,24 @@ function buildPreviewSummary(
 describe('OpenCodeSessionBridge', () => {
   test('reuses an existing clean session record', async () => {
     let createSessionCalls = 0
+    let prepareProfileCalls = 0
     const retainedLeases: unknown[] = []
     const existing = buildRecord()
     const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async () => profile,
+      prepareProfile: async () => {
+        prepareProfileCalls += 1
+        return profile
+      },
       sessionStore: {
         get: async () => existing,
         upsert: async () => 'unchanged',
         markStale: async () => existing,
       },
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async input => {
+          expect(input?.preparedProfile).toBe(profile)
+          return host
+        },
         releaseHost: async () => {},
         retainHostLease: async (_hostKey, input) => {
           retainedLeases.push(input)
@@ -159,6 +166,7 @@ describe('OpenCodeSessionBridge', () => {
     })
 
     expect(record).toEqual({ ...existing, runtimePid: 123 })
+    expect(prepareProfileCalls).toBe(1)
     expect(createSessionCalls).toBe(0)
     expect(retainedLeases).toEqual([
       {
@@ -169,6 +177,76 @@ describe('OpenCodeSessionBridge', () => {
         sessionId: 'session-1',
       },
     ])
+  })
+
+  test('uses a caller-provided prepared profile without preparing it again', async () => {
+    let prepareProfileCalls = 0
+    let createSessionCalls = 0
+    const existing = buildRecord()
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        prepareProfileCalls += 1
+        throw new Error('prepareProfile should not be called')
+      },
+      sessionStore: {
+        get: async () => existing,
+        upsert: async () => 'unchanged',
+        markStale: async () => existing,
+      },
+      hostManager: {
+        ensureHost: async input => {
+          expect(input?.preparedProfile).toBe(profile)
+          return host
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCalls += 1
+            return { id: 'session-new' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      preparedProfile: profile,
+    })
+
+    expect(record).toEqual({ ...existing, runtimePid: 123 })
+    expect(prepareProfileCalls).toBe(0)
+    expect(createSessionCalls).toBe(0)
   })
 
   test('releaseSession drops the persistent host lease even after process restart', async () => {
@@ -312,8 +390,12 @@ describe('OpenCodeSessionBridge', () => {
   test('marks stale and creates a new session when the model changes', async () => {
     const staleReasons: string[] = []
     const upserts: OpenCodeSessionRecord[] = []
+    let prepareProfileCalls = 0
     const bridge = new OpenCodeSessionBridge({
-      prepareProfile: async () => profile,
+      prepareProfile: async () => {
+        prepareProfileCalls += 1
+        return profile
+      },
       sessionStore: {
         get: async () => buildRecord(),
         upsert: async record => {
@@ -326,7 +408,10 @@ describe('OpenCodeSessionBridge', () => {
         },
       },
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async input => {
+          expect(input?.preparedProfile).toBe(profile)
+          return host
+        },
         releaseHost: async () => {},
       },
       clientFactory: {
@@ -370,6 +455,7 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(staleReasons).toEqual(['model_changed:openai/gpt-5.4-mini->openai/gpt-5.4'])
     expect(record.opencodeSessionId).toBe('session-new')
+    expect(prepareProfileCalls).toBe(1)
     expect(upserts).toHaveLength(1)
   })
 

@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import nodePath from 'node:path'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -33,6 +35,10 @@ import {
   OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
   openCodeLedgerBridgeService,
 } from './OpenCodeLedgerBridgeService.js'
+import {
+  getClaudeConfigHomeDir,
+  isEnvDefinedFalsy,
+} from '../../utils/envUtils.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -186,6 +192,10 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map(item => asString(item)).filter((item): item is string => item !== null)
     : []
+}
+
+function asNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function assertUniqueOpenCodeMemberNames(items: unknown[], context: string): void {
@@ -350,11 +360,47 @@ function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
   }
 }
 
-function createRuntimePreconditionSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
+function createRuntimePreconditionSnapshot(
+  snapshot?: OpenCodeProvisioningSnapshot | null,
+  overrides: { runtimeStoreManifestHighWatermark?: number | null } = {},
+) {
   return {
     ...createRuntimeSnapshot(snapshot),
-    runtimeStoreManifestHighWatermark: RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
+    runtimeStoreManifestHighWatermark:
+      overrides.runtimeStoreManifestHighWatermark ?? RUNTIME_STORE_MANIFEST_HIGH_WATERMARK,
     activeRunId: null,
+  }
+}
+
+function shouldUseLightweightLaunchHandshake(body: Record<string, unknown>): boolean {
+  const requiredCommand = asString(body.requiredCommand)
+  const expectedCapabilitySnapshotId = asString(body.expectedCapabilitySnapshotId)
+  return requiredCommand === 'opencode.launchTeam' && !expectedCapabilitySnapshotId
+}
+
+function createBridgeServerIdentity(
+  snapshot?: OpenCodeProvisioningSnapshot | null,
+  overrides: { runtimeStoreManifestHighWatermark?: number | null } = {},
+) {
+  return {
+    schemaVersion: BRIDGE_SCHEMA_VERSION,
+    peer: 'agent_teams_orchestrator',
+    appVersion: '1.0.0',
+    gitSha: null,
+    buildId: null,
+    bridgeProtocol: {
+      minVersion: 1,
+      currentVersion: 1,
+      supportedCommands: SUPPORTED_COMMANDS,
+      opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
+    },
+    runtime: {
+      ...createRuntimePreconditionSnapshot(snapshot, overrides),
+    },
+    featureFlags: {
+      opencodeTeamLaunch: true,
+      opencodeStateChangingCommands: true,
+    },
   }
 }
 
@@ -416,6 +462,14 @@ function teamDiagnostic(
   severity: TeamDiagnostic['severity'] = 'info',
 ): TeamDiagnostic {
   return { code, message, severity }
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round(Date.now() - startedAt))
+}
+
+function formatMs(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value}ms` : 'n/a'
 }
 
 function reconcileFailedObservation(message: string): OpenCodeDeliveryResponseObservation {
@@ -519,27 +573,192 @@ type AppMcpToolProof = {
 // failures before OpenCode ever gets a chance to attach Agent Teams tools.
 const APP_MCP_PREFLIGHT_TIMEOUT_MS = 45_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 1
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_TTL_MS = 10 * 60_000
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_PATH_ENV =
+  'AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH'
+const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_DISABLED_ENV =
+  'AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED'
 
 type AppMcpToolProofCacheEntry = {
   expiresAt: number
   proof: AppMcpToolProof
 }
 
+type AppMcpToolProofPersistedCacheEntry = {
+  expiresAt: number
+  proof: AppMcpToolProof
+}
+
+type AppMcpToolProofPersistedCacheFile = {
+  version: typeof APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION
+  entries: Record<string, AppMcpToolProofPersistedCacheEntry>
+}
+
 const appMcpToolProofCache = new Map<string, AppMcpToolProofCacheEntry>()
 const appMcpToolProofInFlight = new Map<string, Promise<AppMcpToolProof>>()
 
-function createAppMcpToolProofCacheKey(
+async function createAppMcpToolProofCacheKey(
   launchConfig: ResolvedAppMcpLaunchConfig,
-): string {
+): Promise<string> {
   return hashStable({
     source: launchConfig.source,
     config: launchConfig.config,
+    commandFiles: await fingerprintAppMcpLaunchCommandFiles(launchConfig.config.command),
   })
 }
 
 export function __resetAppMcpToolProofCacheForTests(): void {
   appMcpToolProofCache.clear()
   appMcpToolProofInFlight.clear()
+}
+
+async function fingerprintAppMcpLaunchCommandFiles(
+  command: string[] | undefined,
+): Promise<Array<{ path: string; size: number; mtimeMs: number } | { path: string; missing: true }>> {
+  if (!command || command.length === 0) {
+    return []
+  }
+
+  const absolutePaths = uniqueSortedStrings(
+    command.filter(item => typeof item === 'string' && nodePath.isAbsolute(item)),
+  )
+
+  return Promise.all(absolutePaths.map(async item => {
+    try {
+      const stats = await stat(item)
+      return {
+        path: item,
+        size: stats.size,
+        mtimeMs: Math.trunc(stats.mtimeMs),
+      }
+    } catch {
+      return {
+        path: item,
+        missing: true as const,
+      }
+    }
+  }))
+}
+
+function appMcpToolProofPersistentCacheEnabled(): boolean {
+  return !isEnvDefinedFalsy(process.env[APP_MCP_TOOL_PROOF_PERSISTED_CACHE_DISABLED_ENV])
+}
+
+function getAppMcpToolProofPersistedCachePath(): string {
+  const override = process.env[APP_MCP_TOOL_PROOF_PERSISTED_CACHE_PATH_ENV]?.trim()
+  if (override) {
+    return override
+  }
+  return nodePath.join(
+    getClaudeConfigHomeDir(),
+    'opencode',
+    'app-mcp-tool-proof-cache.json',
+  )
+}
+
+async function readAppMcpToolProofPersistedCache(): Promise<AppMcpToolProofPersistedCacheFile> {
+  if (!appMcpToolProofPersistentCacheEnabled()) {
+    return {
+      version: APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION,
+      entries: {},
+    }
+  }
+
+  try {
+    const raw = await readFile(getAppMcpToolProofPersistedCachePath(), 'utf8')
+    const parsed = asRecord(JSON.parse(raw))
+    if (parsed?.version !== APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION) {
+      return {
+        version: APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION,
+        entries: {},
+      }
+    }
+    const entriesRecord = asRecord(parsed.entries) ?? {}
+    const entries: Record<string, AppMcpToolProofPersistedCacheEntry> = {}
+    const now = Date.now()
+    for (const [key, value] of Object.entries(entriesRecord)) {
+      const entry = asRecord(value)
+      const proof = asRecord(entry?.proof)
+      const expiresAt = typeof entry?.expiresAt === 'number' ? entry.expiresAt : 0
+      if (expiresAt <= now || !proof) {
+        continue
+      }
+      const normalizedProof = normalizeAppMcpToolProof(proof)
+      if (!normalizedProof?.ok) {
+        continue
+      }
+      entries[key] = {
+        expiresAt,
+        proof: normalizedProof,
+      }
+    }
+    return {
+      version: APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION,
+      entries,
+    }
+  } catch {
+    return {
+      version: APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION,
+      entries: {},
+    }
+  }
+}
+
+function normalizeAppMcpToolProof(value: Record<string, unknown>): AppMcpToolProof | null {
+  const ok = value.ok === true
+  const observedTools = asStringArray(value.observedTools).sort()
+  const missingTools = asStringArray(value.missingTools).sort()
+  const diagnostics = asStringArray(value.diagnostics)
+  const route = asString(value.route)
+  if (!ok) {
+    return null
+  }
+  return {
+    ok,
+    observedTools,
+    missingTools,
+    diagnostics,
+    route,
+  }
+}
+
+async function readPersistedAppMcpToolProof(
+  cacheKey: string,
+): Promise<AppMcpToolProof | null> {
+  const cache = await readAppMcpToolProofPersistedCache()
+  const entry = cache.entries[cacheKey]
+  if (!entry || entry.expiresAt <= Date.now()) {
+    return null
+  }
+  return {
+    ...entry.proof,
+    diagnostics: [
+      ...entry.proof.diagnostics,
+      'opencode_app_mcp_tool_proof_persisted_cache_hit',
+    ],
+  }
+}
+
+async function writePersistedAppMcpToolProof(
+  cacheKey: string,
+  proof: AppMcpToolProof,
+): Promise<void> {
+  if (!appMcpToolProofPersistentCacheEnabled() || !proof.ok) {
+    return
+  }
+
+  const cachePath = getAppMcpToolProofPersistedCachePath()
+  const cache = await readAppMcpToolProofPersistedCache()
+  cache.entries[cacheKey] = {
+    expiresAt: Date.now() + APP_MCP_TOOL_PROOF_PERSISTED_CACHE_TTL_MS,
+    proof,
+  }
+
+  await mkdir(nodePath.dirname(cachePath), { recursive: true })
+  const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  await writeFile(tmpPath, `${JSON.stringify(cache)}\n`, 'utf8')
+  await rename(tmpPath, cachePath)
 }
 
 async function proveAppMcpTools(
@@ -556,10 +775,19 @@ async function proveAppMcpTools(
   }
 
   const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
-  const cacheKey = createAppMcpToolProofCacheKey(launchConfig)
+  const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
   if (cached && cached.expiresAt > Date.now()) {
     return cached.proof
+  }
+
+  const persisted = await readPersistedAppMcpToolProof(cacheKey)
+  if (persisted) {
+    appMcpToolProofCache.set(cacheKey, {
+      expiresAt: Date.now() + APP_MCP_TOOL_PROOF_CACHE_TTL_MS,
+      proof: persisted,
+    })
+    return persisted
   }
 
   const inFlight = appMcpToolProofInFlight.get(cacheKey)
@@ -576,6 +804,7 @@ async function proveAppMcpTools(
           expiresAt: Date.now() + APP_MCP_TOOL_PROOF_CACHE_TTL_MS,
           proof,
         })
+        await writePersistedAppMcpToolProof(cacheKey, proof).catch(() => undefined)
       }
       return proof
     } catch (error) {
@@ -1153,7 +1382,37 @@ async function runLaunch(envelope: BridgeEnvelope) {
   }
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
 
-  const snapshot = await openCodeProvisioningProbe.probe(asString(body.projectPath) ?? envelope.cwd)
+  const probeStartedAt = Date.now()
+  const retainedProbe = await openCodeProvisioningProbe.probeRetainingHost(
+    asString(body.projectPath) ?? envelope.cwd,
+  )
+  const provisioningProbeMs = elapsedMs(probeStartedAt)
+  try {
+    return await runLaunchWithProvisioningSnapshot(envelope, retainedProbe.snapshot, {
+      provisioningProbeMs,
+    })
+  } finally {
+    await retainedProbe.release().catch(() => undefined)
+  }
+}
+
+async function runLaunchWithProvisioningSnapshot(
+  envelope: BridgeEnvelope,
+  snapshot: OpenCodeProvisioningSnapshot,
+  timings: { provisioningProbeMs?: number } = {},
+) {
+  const launchStartedAt = Date.now()
+  const body = envelope.body
+  const runId = asString(body.runId)
+  const laneId = asString(body.laneId)
+  const teamId = asString(body.teamId) ?? asString(body.teamName)
+  const selectedModel = asString(body.selectedModel)
+  const membersRaw = Array.isArray(body.members) ? body.members : []
+  if (!runId || !laneId || !teamId || !selectedModel || membersRaw.length === 0) {
+    throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
+  }
+  assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
+
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
@@ -1171,6 +1430,12 @@ async function runLaunch(envelope: BridgeEnvelope) {
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
   const promptedMembers: Array<{ name: string; record: OpenCodeSessionRecord }> = []
+  const memberTimings = new Map<string, {
+    ensureSessionMs?: number
+    promptMs?: number
+    previewMs?: number
+    reconcileMs?: number
+  }>()
 
   for (const item of membersRaw) {
     const member = asRecord(item)
@@ -1179,7 +1444,10 @@ async function runLaunch(envelope: BridgeEnvelope) {
     const prompt = asString(member?.prompt)
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
     let record: OpenCodeSessionRecord | null = null
+    const memberTiming = memberTimings.get(name) ?? {}
+    memberTimings.set(name, memberTiming)
     try {
+      const ensureStartedAt = Date.now()
       record = await openCodeSessionBridge.ensureSession({
         teamId,
         laneId,
@@ -1187,18 +1455,22 @@ async function runLaunch(envelope: BridgeEnvelope) {
         selectedModel: apiSelectedModel,
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
+        preparedProfile: snapshot.profile,
         runId,
       })
+      memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
       const runtimeIdentityBlock = buildOpenCodeRuntimeIdentityBlock({
         teamName: teamId,
         memberName: name,
         runId,
         runtimeSessionId: record.opencodeSessionId,
       })
+      const promptStartedAt = Date.now()
       await openCodeSessionBridge.promptAsync(record, {
         text: `${runtimeIdentityBlock}\n\n${prompt}`,
         agent: 'teammate',
       })
+      memberTiming.promptMs = elapsedMs(promptStartedAt)
       promptedMembers.push({ name, record })
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
@@ -1219,6 +1491,9 @@ async function runLaunch(envelope: BridgeEnvelope) {
 
   const settledMembers = await mapWithConcurrency(promptedMembers, 3, async ({ name, record }) => {
     const settleDiagnostics: TeamDiagnostic[] = []
+    const memberTiming = memberTimings.get(name) ?? {}
+    memberTimings.set(name, memberTiming)
+    const previewStartedAt = Date.now()
     const preview = await openCodeSessionBridge.observePreview(record, {
       timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
       idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
@@ -1230,12 +1505,16 @@ async function runLaunch(envelope: BridgeEnvelope) {
       ))
       return null
     })
+    memberTiming.previewMs = elapsedMs(previewStartedAt)
 
+    let reconcileStartedAt = Date.now()
     try {
+      reconcileStartedAt = Date.now()
       const reconciled = await withTimeout(
         openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
         OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
       )
+      memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
       const reconciledRecord = reconciled.record ?? record
       await openCodeTurnSettledEmissionCoordinator.emitLaunch({
         record: reconciledRecord,
@@ -1244,6 +1523,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
       })
       return { name, record: reconciledRecord, reconciled, diagnostics: settleDiagnostics }
     } catch (error) {
+      memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
       settleDiagnostics.push(teamDiagnostic(
         'member_launch_reconcile_pending',
         `${name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1301,6 +1581,19 @@ async function runLaunch(envelope: BridgeEnvelope) {
     }
     diagnostics.push(...settled.diagnostics)
   }
+
+  for (const [name, memberTiming] of memberTimings) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_launch_member_timing',
+      `member=${name} ensureSession=${formatMs(memberTiming.ensureSessionMs)} prompt=${formatMs(memberTiming.promptMs)} preview=${formatMs(memberTiming.previewMs)} reconcile=${formatMs(memberTiming.reconcileMs)}`,
+      'info',
+    ))
+  }
+  diagnostics.push(teamDiagnostic(
+    'opencode_launch_total_timing',
+    `total=${formatMs(elapsedMs(launchStartedAt))} provisioningProbe=${formatMs(timings.provisioningProbeMs)} members=${memberTimings.size}`,
+    'info',
+  ))
 
   return {
     snapshot,
@@ -2055,27 +2348,15 @@ async function runTranscript(envelope: BridgeEnvelope) {
 async function handleEnvelope(envelope: BridgeEnvelope) {
   switch (envelope.command) {
     case 'opencode.handshake': {
-      const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
-      const identity = {
-        schemaVersion: BRIDGE_SCHEMA_VERSION,
-        peer: 'agent_teams_orchestrator',
-        appVersion: '1.0.0',
-        gitSha: null,
-        buildId: null,
-        bridgeProtocol: {
-          minVersion: 1,
-          currentVersion: 1,
-          supportedCommands: SUPPORTED_COMMANDS,
-          opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
-        },
-        runtime: {
-          ...createRuntimePreconditionSnapshot(snapshot),
-        },
-        featureFlags: {
-          opencodeTeamLaunch: true,
-          opencodeStateChangingCommands: true,
-        },
-      }
+      const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
+      const snapshot = lightweightLaunchHandshake
+        ? null
+        : await openCodeProvisioningProbe.probe(envelope.cwd)
+      const identity = createBridgeServerIdentity(snapshot, {
+        runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
+          ? asNullableNumber(envelope.body.expectedManifestHighWatermark)
+          : undefined,
+      })
       const handshake = {
         schemaVersion: BRIDGE_SCHEMA_VERSION,
         requestId: envelope.requestId,

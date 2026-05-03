@@ -29,6 +29,11 @@ type CacheEntry = {
   snapshot: OpenCodeProvisioningSnapshot
 }
 
+type RetainedProvisioningProbe = {
+  snapshot: OpenCodeProvisioningSnapshot
+  release: () => Promise<void>
+}
+
 function cloneHost(handle: NonNullable<OpenCodeProvisioningSnapshot['host']>): NonNullable<OpenCodeProvisioningSnapshot['host']> {
   return {
     ...handle,
@@ -58,6 +63,24 @@ export class OpenCodeProvisioningProbe {
   constructor(private readonly deps: OpenCodeProvisioningProbeDeps = {}) {}
 
   async probe(projectPath?: string | null): Promise<OpenCodeProvisioningSnapshot> {
+    const result = await this.probeWithHost(projectPath, {
+      retainHost: false,
+      useCache: true,
+    })
+    return result.snapshot
+  }
+
+  async probeRetainingHost(projectPath?: string | null): Promise<RetainedProvisioningProbe> {
+    return this.probeWithHost(projectPath, {
+      retainHost: true,
+      useCache: false,
+    })
+  }
+
+  private async probeWithHost(
+    projectPath: string | null | undefined,
+    options: { retainHost: boolean; useCache: boolean },
+  ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await inventoryService.probe(projectPath)
     const cacheKey = [
@@ -66,9 +89,12 @@ export class OpenCodeProvisioningProbe {
       inventory.profile?.managedAuthFingerprint ?? 'none',
       inventory.profile?.managedConfigFingerprint ?? 'none',
     ].join('::')
-    const cached = this.cache.get(cacheKey)
+    const cached = options.useCache ? this.cache.get(cacheKey) : undefined
     if (cached && cached.expiresAt > Date.now()) {
-      return cached.snapshot
+      return {
+        snapshot: cached.snapshot,
+        release: async () => {},
+      }
     }
 
     if (!inventory.detected) {
@@ -93,7 +119,10 @@ export class OpenCodeProvisioningProbe {
         expiresAt: Date.now() + OPEN_CODE_PROVISIONING_CACHE_TTL_MS,
         snapshot,
       })
-      return snapshot
+      return {
+        snapshot,
+        release: async () => {},
+      }
     }
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
@@ -102,9 +131,19 @@ export class OpenCodeProvisioningProbe {
 
     let host
     const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
+    let released = false
+    const release = async () => {
+      if (released || !host) {
+        return
+      }
+      released = true
+      await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
+      await hostManager.releaseHost(host.hostKey)
+    }
     try {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
+        preparedProfile: inventory.profile ?? undefined,
       })
       await hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
     } catch (error) {
@@ -133,7 +172,10 @@ export class OpenCodeProvisioningProbe {
         expiresAt: Date.now() + OPEN_CODE_PROVISIONING_CACHE_TTL_MS,
         snapshot,
       })
-      return snapshot
+      return {
+        snapshot,
+        release,
+      }
     }
 
     const client = clientFactory.create(host.baseUrl)
@@ -234,7 +276,10 @@ export class OpenCodeProvisioningProbe {
         expiresAt: Date.now() + OPEN_CODE_PROVISIONING_CACHE_TTL_MS,
         snapshot,
       })
-      return snapshot
+      return {
+        snapshot,
+        release,
+      }
     } catch (error) {
       const diagnostics = [
         ...inventory.diagnostics,
@@ -263,10 +308,14 @@ export class OpenCodeProvisioningProbe {
         expiresAt: Date.now() + OPEN_CODE_PROVISIONING_CACHE_TTL_MS,
         snapshot,
       })
-      return snapshot
+      return {
+        snapshot,
+        release,
+      }
     } finally {
-      await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
-      await hostManager.releaseHost(host.hostKey)
+      if (!options.retainHost) {
+        await release()
+      }
     }
   }
 }
