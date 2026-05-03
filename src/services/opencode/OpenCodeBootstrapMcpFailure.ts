@@ -156,3 +156,31 @@ export function summarizeOpenCodeBootstrapMcpFailure(
 ): OpenCodeBootstrapMcpFailureSummary | null {
   return summarizeOpenCodeBootstrapMcpReadiness(summary).failure
 }
+
+export function hasOpenCodeBootstrapMcpNotConnectedFailure(
+  summary: OpenCodeSessionReconcileSummary,
+): boolean {
+  if (summarizeOpenCodeBootstrapMcpReadiness(summary).ready) {
+    return false
+  }
+  for (const message of summary.messages) {
+    for (const tool of message.toolCalls) {
+      const toolName = normalizeAgentTeamsToolName(tool.toolName)
+      if (!BOOTSTRAP_MCP_TOOL_NAMES.has(toolName)) {
+        continue
+      }
+      const output = compactToolOutput(tool)
+      if (
+        tool.isError ||
+        tool.status === 'errored' ||
+        output.includes('not connected') ||
+        output.includes('mcp not connected')
+      ) {
+        if (output.includes('not connected') || output.includes('mcp not connected')) {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}

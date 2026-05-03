@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { summarizeOpenCodeBootstrapMcpFailure } from './OpenCodeBootstrapMcpFailure.js'
+import {
+  hasOpenCodeBootstrapMcpNotConnectedFailure,
+  summarizeOpenCodeBootstrapMcpFailure,
+} from './OpenCodeBootstrapMcpFailure.js'
 
 import type {
   OpenCodeCanonicalMessage,
@@ -89,6 +92,7 @@ describe('OpenCodeBootstrapMcpFailure', () => {
       message:
         'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin',
     })
+    expect(hasOpenCodeBootstrapMcpNotConnectedFailure(summary)).toBe(true)
   })
 
   test('detects assistant completion without required bootstrap tool calls', () => {
@@ -127,5 +131,6 @@ describe('OpenCodeBootstrapMcpFailure', () => {
     ])
 
     expect(summarizeOpenCodeBootstrapMcpFailure(summary)).toBeNull()
+    expect(hasOpenCodeBootstrapMcpNotConnectedFailure(summary)).toBe(false)
   })
 })

@@ -26,6 +26,7 @@ import {
   type OpenCodeDeliveryResponseObservation,
 } from './OpenCodeDeliveryResponseObserver.js'
 import {
+  hasOpenCodeBootstrapMcpNotConnectedFailure,
   summarizeOpenCodeBootstrapMcpFailure,
   summarizeOpenCodeBootstrapMcpReadiness,
 } from './OpenCodeBootstrapMcpFailure.js'
@@ -333,6 +334,28 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
     'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
     'Do not use runtime_deliver_message for ordinary visible replies unless a runtime-delivery prompt explicitly provides runId/runtimeSessionId/idempotencyKey.',
     '</opencode_runtime_identity>',
+  ].join('\n')
+}
+
+function buildOpenCodeBootstrapRetryPrompt(input: {
+  teamName: string
+  memberName: string
+  runId: string
+  runtimeSessionId: string
+}): string {
+  return [
+    buildOpenCodeRuntimeIdentityBlock({
+      ...input,
+      purpose: 'launch',
+    }),
+    '',
+    '<opencode_bootstrap_retry>',
+    'The previous launch bootstrap tool calls failed because Agent Teams MCP was not connected.',
+    'The app has reattached Agent Teams MCP to this same OpenCode session.',
+    'Retry only runtime_bootstrap_checkin and member_briefing with the exact payloads above.',
+    'Do not create tasks, send visible messages, or announce readiness.',
+    'Stop immediately after both bootstrap tools succeed.',
+    '</opencode_bootstrap_retry>',
   ].join('\n')
 }
 
@@ -1038,6 +1061,83 @@ function summarizeBootstrapMcpFailure(
   )
 }
 
+async function repairLaunchBootstrapMcpNotConnected(input: {
+  teamId: string
+  memberName: string
+  runId: string
+  record: OpenCodeSessionRecord
+  diagnostics: TeamDiagnostic[]
+}): Promise<{
+  record: OpenCodeSessionRecord
+  reconciled: { record?: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }
+} | null> {
+  const mcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(input.record, {
+    attachIfMissing: true,
+  })
+  if (!mcpReady.ok) {
+    input.diagnostics.push(
+      teamDiagnostic(
+        'opencode_launch_mcp_repair_unavailable',
+        [
+          `OpenCode launch bootstrap MCP repair unavailable for ${input.memberName}`,
+          `(status=${mcpReady.status}, connected=${String(mcpReady.connected)}).`,
+          ...mcpReady.diagnostics,
+        ].join(' '),
+        'warning',
+      ),
+    )
+    return null
+  }
+
+  input.diagnostics.push(
+    teamDiagnostic(
+      mcpReady.status === 'attached'
+        ? 'opencode_launch_mcp_repair_reattached'
+        : 'opencode_launch_mcp_repair_ready',
+      mcpReady.status === 'attached'
+        ? `Reattached Agent Teams MCP before retrying launch bootstrap for ${input.memberName}.`
+        : `Agent Teams MCP is connected before retrying launch bootstrap for ${input.memberName}.`,
+      'info',
+    ),
+  )
+
+  await openCodeSessionBridge.promptAsync(input.record, {
+    text: buildOpenCodeBootstrapRetryPrompt({
+      teamName: input.teamId,
+      memberName: input.memberName,
+      runId: input.runId,
+      runtimeSessionId: input.record.opencodeSessionId,
+    }),
+    agent: 'teammate',
+  })
+  input.diagnostics.push(
+    teamDiagnostic(
+      'opencode_launch_bootstrap_retry_prompt_sent',
+      `Sent one launch bootstrap retry prompt to ${input.memberName}.`,
+      'info',
+    ),
+  )
+
+  return withTimeout(
+    openCodeSessionBridge.reconcileSession(input.record, { limit: 80 }),
+    OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
+  )
+    .then(reconciled => ({
+      record: reconciled.record ?? input.record,
+      reconciled,
+    }))
+    .catch(error => {
+      input.diagnostics.push(
+        teamDiagnostic(
+          'opencode_launch_bootstrap_retry_reconcile_pending',
+          `${input.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+          'warning',
+        ),
+      )
+      return null
+    })
+}
+
 async function recreateSessionAfterBootstrapMcpFailure(params: {
   record: OpenCodeSessionRecord
   runId?: string | null
@@ -1510,12 +1610,25 @@ async function runLaunchWithProvisioningSnapshot(
     let reconcileStartedAt = Date.now()
     try {
       reconcileStartedAt = Date.now()
-      const reconciled = await withTimeout(
+      let reconciled = await withTimeout(
         openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
         OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
       )
       memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
-      const reconciledRecord = reconciled.record ?? record
+      let reconciledRecord = reconciled.record ?? record
+      if (hasOpenCodeBootstrapMcpNotConnectedFailure(reconciled.summary)) {
+        const repaired = await repairLaunchBootstrapMcpNotConnected({
+          teamId,
+          memberName: name,
+          runId,
+          record: reconciledRecord,
+          diagnostics: settleDiagnostics,
+        })
+        if (repaired) {
+          reconciled = repaired.reconciled
+          reconciledRecord = repaired.record
+        }
+      }
       await openCodeTurnSettledEmissionCoordinator.emitLaunch({
         record: reconciledRecord,
         previewSummary: preview?.summary ?? null,

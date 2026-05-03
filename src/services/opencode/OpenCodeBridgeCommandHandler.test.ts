@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -1438,7 +1438,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
-  test('marks launch failed when required bootstrap MCP tools report Not connected', async () => {
+  test('reattaches MCP and retries launch bootstrap once when required tools report Not connected', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
@@ -1447,37 +1447,48 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: input.selectedModel,
         opencodeSessionId: `session-${input.memberName}`,
       })) as typeof openCodeSessionBridge.ensureSession
-    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
-    openCodeSessionBridge.reconcileSession = (async record => ({
-      record,
-      summary: buildReconcileSummary({
-        sessionId: record.opencodeSessionId,
-        latestAssistantMessageId: 'msg-bootstrap-failed',
-        latestAssistantText: 'Both calls returned "Not connected".',
-        messages: [
-          buildCanonicalMessage({
-            id: 'msg-bootstrap-failed',
-            role: 'assistant',
-            text: 'Both calls returned "Not connected".',
-            toolCalls: [
-              buildToolCall({
-                toolName: 'agent-teams_runtime_bootstrap_checkin',
-                status: 'errored',
-                outputText: 'Not connected',
-                isError: true,
-              }),
-              buildToolCall({
-                callId: 'tool-2',
-                toolName: 'agent-teams_member_briefing',
-                status: 'errored',
-                outputText: 'Not connected',
-                isError: true,
-              }),
-            ],
-          }),
-        ],
-      }),
-    })) as typeof openCodeSessionBridge.reconcileSession
+    const promptAsync = mock(async () => {})
+    openCodeSessionBridge.promptAsync = promptAsync as typeof openCodeSessionBridge.promptAsync
+    const failedSummary = buildReconcileSummary({
+      sessionId: 'session-alice',
+      latestAssistantMessageId: 'msg-bootstrap-failed',
+      latestAssistantText: 'Both calls returned "Not connected".',
+      messages: [
+        buildCanonicalMessage({
+          id: 'msg-bootstrap-failed',
+          role: 'assistant',
+          text: 'Both calls returned "Not connected".',
+          toolCalls: [
+            buildToolCall({
+              toolName: 'agent-teams_runtime_bootstrap_checkin',
+              status: 'errored',
+              outputText: 'Not connected',
+              isError: true,
+            }),
+            buildToolCall({
+              callId: 'tool-2',
+              toolName: 'agent-teams_member_briefing',
+              status: 'errored',
+              outputText: 'Not connected',
+              isError: true,
+            }),
+          ],
+        }),
+      ],
+    })
+    let reconcileAttempt = 0
+    const reconcileSession = mock(async record => {
+      reconcileAttempt += 1
+      return {
+        record,
+        summary:
+          reconcileAttempt === 1
+            ? failedSummary
+            : buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+      }
+    })
+    openCodeSessionBridge.reconcileSession =
+      reconcileSession as typeof openCodeSessionBridge.reconcileSession
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
       buildEnvelope('opencode.launchTeam', {
@@ -1495,14 +1506,19 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('failed')
-    expect(result.data.members.alice?.launchState).toBe('failed')
-    expect(result.data.members.alice?.diagnostics).toContain(
-      'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin, member_briefing',
-    )
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
       'member_session_recorded',
+      'bootstrap_confirmed',
+      'member_ready',
     ])
+    expect(promptAsync).toHaveBeenCalledTimes(2)
+    expect(promptAsync.mock.calls[1]?.[1]?.text).toContain('<opencode_bootstrap_retry>')
+    expect(reconcileSession).toHaveBeenCalledTimes(2)
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+      'opencode_launch_bootstrap_retry_prompt_sent',
+    )
   })
 
   test('marks launch failed when assistant finishes without required bootstrap MCP tools', async () => {
