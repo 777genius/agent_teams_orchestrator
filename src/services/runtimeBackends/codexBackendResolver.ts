@@ -6,6 +6,8 @@ export const CODEX_NATIVE_API_KEY_ENV_VAR = 'CODEX_API_KEY'
 export const OPENAI_API_KEY_ENV_VAR = 'OPENAI_API_KEY'
 export const CODEX_CLI_PATH_ENV_VAR = 'CODEX_CLI_PATH'
 export const CODEX_RUNTIME_BACKEND_ENV_VAR = 'CLAUDE_CODE_CODEX_BACKEND'
+export const CODEX_FORCED_LOGIN_METHOD_ENV_VAR =
+  'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD'
 export type CodexForcedLoginMethod = 'chatgpt' | 'api'
 export type CodexCliLoginState = 'logged_in' | 'not_logged_in' | 'unknown'
 export type CodexCliBinarySource = 'configured-env' | 'system-path'
@@ -75,11 +77,17 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 export function getCodexForcedLoginMethod(
   settingsInline: Record<string, unknown> | null = getFlagSettingsInline(),
+  env: NodeJS.ProcessEnv = process.env,
 ): CodexForcedLoginMethod | null {
   const codexSettings = asRecord(settingsInline)?.codex
   const forcedLoginMethod = asRecord(codexSettings)?.forced_login_method
-  return forcedLoginMethod === 'chatgpt' || forcedLoginMethod === 'api'
-    ? forcedLoginMethod
+  if (forcedLoginMethod === 'chatgpt' || forcedLoginMethod === 'api') {
+    return forcedLoginMethod
+  }
+
+  const envForcedLoginMethod = env[CODEX_FORCED_LOGIN_METHOD_ENV_VAR]?.trim()
+  return envForcedLoginMethod === 'chatgpt' || envForcedLoginMethod === 'api'
+    ? envForcedLoginMethod
     : null
 }
 
@@ -230,7 +238,7 @@ export function resolveCodexRuntimeSelection(params?: {
   const oauthAuthenticated = params?.oauthAuthenticated ?? false
   const forcedLoginMethod =
     params?.forcedLoginMethod
-    ?? getCodexForcedLoginMethod(params?.settingsInline ?? getFlagSettingsInline())
+    ?? getCodexForcedLoginMethod(params?.settingsInline ?? getFlagSettingsInline(), env)
   const apiKeyConfigured = params?.apiKeyConfigured ?? Boolean(getCodexApiKey(env))
   const nativeApiKeyConfigured = params?.nativeApiKeyConfigured ?? apiKeyConfigured
   const nativeBinaryResolution = resolveCodexCliBinary({ env })
