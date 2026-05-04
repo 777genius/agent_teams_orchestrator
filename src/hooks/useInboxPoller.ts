@@ -182,6 +182,18 @@ type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text
 const GENERIC_QUEUED_MAILBOX_META_PROMPT =
   'Process the queued teammate mailbox attachment for this turn.'
 
+export type OrdinaryUserDirectReplyProtocol =
+  | 'send_message'
+  | 'agent_teams_message_send'
+
+export function resolveOrdinaryUserDirectReplyProtocol(
+  entryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER,
+): OrdinaryUserDirectReplyProtocol {
+  return entryProvider?.trim().toLowerCase() === 'codex'
+    ? 'agent_teams_message_send'
+    : 'send_message'
+}
+
 export function getQueuedMailboxMetaPrompt({
   pendingMessages,
   isTeammateSession,
@@ -314,25 +326,129 @@ export function shouldSkipBootstrapReadinessWait(params: {
 
 export function getOrdinaryInlineHandoffPrompt({
   from,
+  memberName,
+  messageId,
+  replyProtocol = resolveOrdinaryUserDirectReplyProtocol(),
   text,
+  teamName,
   timestamp,
 }: {
   from: string
+  memberName?: string
+  messageId?: string
+  replyProtocol?: OrdinaryUserDirectReplyProtocol
   text: string
+  teamName?: string
   timestamp: string
 }): string {
+  const isUserMessage = from.trim().toLowerCase() === 'user'
+  const normalizedTeamName = teamName?.trim()
+  const normalizedMemberName = memberName?.trim()
+  const normalizedMessageId = messageId?.trim()
+  const canExplainMcpReply =
+    replyProtocol === 'agent_teams_message_send' &&
+    isUserMessage &&
+    Boolean(normalizedTeamName) &&
+    Boolean(normalizedMemberName) &&
+    Boolean(normalizedMessageId)
+
   return [
     'Process this queued mailbox message now.',
     `Sender: "${from}".`,
     `Timestamp: "${timestamp}".`,
-    from.toLowerCase() === 'user'
-      ? 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
+    isUserMessage
+      ? canExplainMcpReply
+        ? `If this is a human direct message, reply via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${normalizedTeamName}", to="user", from="${normalizedMemberName}", text, summary, source="runtime_delivery", and relayOfMessageId="${normalizedMessageId}". Do not use SendMessage for this Codex-native handoff. If neither MCP tool name is available before any visible-message tool attempt, write exactly the concise reply text as normal assistant text so the runtime can relay it. This handoff delivery rule supersedes older SendMessage-only wording inside queued_mailbox_message.`
+        : 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
       : 'If this message requires a reply, use SendMessage to the sender.',
     '',
     '<queued_mailbox_message>',
     text,
     '</queued_mailbox_message>',
   ].join('\n')
+}
+
+function isPrefixedAgentTeamsMessageSendToolName(name: string): boolean {
+  const normalized = name.trim().toLowerCase()
+  return (
+    normalized === 'agent-teams_message_send' ||
+    normalized === 'agent_teams_message_send' ||
+    normalized === 'mcp__agent-teams__message_send' ||
+    normalized === 'mcp__agent_teams__message_send'
+  )
+}
+
+function hasMatchingAgentTeamsMessageSendTeamName(
+  input: { teamName?: unknown },
+  expectedTeamName?: string,
+): boolean {
+  if (!expectedTeamName?.trim()) {
+    return false
+  }
+  return (
+    typeof input.teamName === 'string' &&
+    input.teamName.trim() === expectedTeamName.trim()
+  )
+}
+
+function hasConflictingAgentTeamsMessageSendTeamName(
+  input: { teamName?: unknown },
+  expectedTeamName?: string,
+): boolean {
+  return (
+    Boolean(expectedTeamName?.trim()) &&
+    typeof input.teamName === 'string' &&
+    input.teamName.trim() !== expectedTeamName?.trim()
+  )
+}
+
+function isUserReplyToolUse(
+  block: unknown,
+  expectedTeamName?: string,
+): block is {
+  id: string
+  input: { to: string; teamName?: unknown }
+  name: string
+  type: 'tool_use'
+} {
+  if (
+    typeof block !== 'object' ||
+    block == null ||
+    !('type' in block) ||
+    block.type !== 'tool_use' ||
+    !('id' in block) ||
+    typeof block.id !== 'string' ||
+    !('name' in block) ||
+    typeof block.name !== 'string' ||
+    !('input' in block) ||
+    typeof block.input !== 'object' ||
+    block.input == null ||
+    !('to' in block.input) ||
+    typeof block.input.to !== 'string'
+  ) {
+    return false
+  }
+
+  if (block.input.to.trim().toLowerCase() !== 'user') {
+    return false
+  }
+
+  const hasPrefixedAgentTeamsName = isPrefixedAgentTeamsMessageSendToolName(
+    block.name,
+  )
+  if (
+    hasPrefixedAgentTeamsName &&
+    hasConflictingAgentTeamsMessageSendTeamName(block.input, expectedTeamName)
+  ) {
+    return false
+  }
+
+  return (
+    block.name === SEND_MESSAGE_TOOL_NAME ||
+    hasPrefixedAgentTeamsName ||
+    (block.name.trim().toLowerCase() === 'message_send' &&
+      hasMatchingAgentTeamsMessageSendTeamName(block.input, expectedTeamName))
+  )
 }
 
 export function extractTaskRefFromMailboxText(text: string): string | undefined {
@@ -684,9 +800,11 @@ export function findBootstrapAttemptOutcome({
 export function findOrdinaryDirectReplyOutcome({
   messages,
   submitUserMessageUuid,
+  teamName,
 }: {
   messages: AppState['messages']
   submitUserMessageUuid: string
+  teamName?: string
 }): OrdinaryAttemptOutcome {
   const startIndex = messages.findIndex(
     message => message.type === 'user' && message.uuid === submitUserMessageUuid,
@@ -727,14 +845,7 @@ export function findOrdinaryDirectReplyOutcome({
       if (block.type !== 'tool_use') {
         continue
       }
-      if (
-        block.name === SEND_MESSAGE_TOOL_NAME &&
-        typeof block.input === 'object' &&
-        block.input !== null &&
-        'to' in block.input &&
-        typeof block.input.to === 'string' &&
-        block.input.to.toLowerCase() === 'user'
-      ) {
+      if (isUserReplyToolUse(block, teamName)) {
         pendingUserReplyToolUseIds.add(block.id)
       }
     }
@@ -901,9 +1012,11 @@ function isFatalBootstrapAttemptExecutionError(
 export function findOrdinaryDirectReplyFallback({
   messages,
   submitUserMessageUuid,
+  teamName,
 }: {
   messages: AppState['messages']
   submitUserMessageUuid: string
+  teamName?: string
 }): OrdinaryDirectReplyFallback | null {
   const startIndex = messages.findIndex(
     message => message.type === 'user' && message.uuid === submitUserMessageUuid,
@@ -938,15 +1051,7 @@ export function findOrdinaryDirectReplyFallback({
     }
 
     for (const block of message.message.content) {
-      if (
-        block.type === 'tool_use' &&
-        block.name === SEND_MESSAGE_TOOL_NAME &&
-        typeof block.input === 'object' &&
-        block.input !== null &&
-        'to' in block.input &&
-        typeof block.input.to === 'string' &&
-        block.input.to.toLowerCase() === 'user'
-      ) {
+      if (isUserReplyToolUse(block, teamName)) {
         sawUserSendMessageAttempt = true
       }
     }
@@ -1077,11 +1182,13 @@ export function getOrdinaryProcessingAction({
   messages,
   processingOrdinaryMessage,
   recoveryAttemptCount = 0,
+  teamName,
 }: {
   attempt?: OrdinaryAttemptState
   messages: AppState['messages']
   processingOrdinaryMessage?: PendingInboxMirrorMessage
   recoveryAttemptCount?: number
+  teamName?: string
 }): OrdinaryProcessingAction {
   if (!processingOrdinaryMessage?.messageId) {
     return { type: 'noop' }
@@ -1094,6 +1201,7 @@ export function getOrdinaryProcessingAction({
   const outcome = findOrdinaryDirectReplyOutcome({
     messages,
     submitUserMessageUuid: attempt.submitUserMessageUuid,
+    ...(teamName ? { teamName } : {}),
   })
   const executionError = findOrdinaryAttemptExecutionError({
     messages,
@@ -1104,7 +1212,7 @@ export function getOrdinaryProcessingAction({
     submitUserMessageUuid: attempt.submitUserMessageUuid,
   })
   const requiresUserReply =
-    processingOrdinaryMessage.from.toLowerCase() === 'user'
+    processingOrdinaryMessage.from.trim().toLowerCase() === 'user'
 
   if (outcome === 'user_send_message') {
     return { type: 'finalize' }
@@ -1171,6 +1279,7 @@ export function getOrdinaryProcessingAction({
     const fallback = findOrdinaryDirectReplyFallback({
       messages,
       submitUserMessageUuid: attempt.submitUserMessageUuid,
+      ...(teamName ? { teamName } : {}),
     })
     if (fallback) {
       return { type: 'deliver_assistant_text', text: fallback.text }
@@ -2215,6 +2324,7 @@ export function useInboxPoller({
         recoveryAttemptCount:
           ordinaryRecoveryRef.current.get(processingOrdinaryMessage.messageId)
             ?.attemptCount ?? 0,
+        ...(teamName ? { teamName } : {}),
       })
 
       if (processingAction.type === 'schedule_recovery' && attempt) {
@@ -2846,8 +2956,11 @@ export function useInboxPoller({
               })
             : getOrdinaryInlineHandoffPrompt({
                 from: ordinaryPendingMessage.from,
+                memberName: agentName,
+                messageId: ordinaryPendingMessage.messageId,
                 text: ordinaryPendingMessage.text,
                 timestamp: ordinaryPendingMessage.timestamp,
+                ...(teamName ? { teamName } : {}),
               })
           : null
       // The bootstrap turn is submitted through handleIncomingPrompt(), which

@@ -16,6 +16,7 @@ import {
   getOrdinaryPendingMessage,
   getBootstrapPendingMessage,
   getQueuedMailboxMetaPrompt,
+  resolveOrdinaryUserDirectReplyProtocol,
   buildAgentErrorNotificationText,
   buildMailboxExecutionFailureLeadNotificationText,
   isBootstrapMemberBriefingCallableNow,
@@ -189,16 +190,75 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
     const prompt = getOrdinaryInlineHandoffPrompt({
       from: 'user',
+      memberName: 'jack',
+      messageId: 'mailbox-1',
+      replyProtocol: 'agent_teams_message_send',
       text: '<info_for_agent>reply via SendMessage</info_for_agent>\n\nТут?',
+      teamName: 'harbor-labs',
       timestamp: '2026-04-09T13:38:16.210Z',
     })
 
     expect(prompt).toContain('Process this queued mailbox message now.')
     expect(prompt).toContain('Sender: "user".')
     expect(prompt).toContain('Timestamp: "2026-04-09T13:38:16.210Z".')
+    expect(prompt).toContain('agent-teams_message_send')
+    expect(prompt).toContain('teamName="harbor-labs"')
+    expect(prompt).toContain('from="jack"')
+    expect(prompt).toContain('relayOfMessageId="mailbox-1"')
+    expect(prompt).toContain('supersedes older SendMessage-only wording')
     expect(prompt).toContain('<queued_mailbox_message>')
     expect(prompt).toContain('reply via SendMessage')
     expect(prompt).toContain('Тут?')
+  })
+
+  test('keeps SendMessage handoff for non-Codex user direct messages', () => {
+    const prompt = getOrdinaryInlineHandoffPrompt({
+      from: 'user',
+      memberName: 'jack',
+      messageId: 'mailbox-1',
+      replyProtocol: 'send_message',
+      text: 'Тут?',
+      teamName: 'harbor-labs',
+      timestamp: '2026-04-09T13:38:16.210Z',
+    })
+
+    expect(prompt).toContain('reply via SendMessage')
+    expect(prompt).not.toContain('agent-teams_message_send')
+    expect(prompt).not.toContain('relayOfMessageId="mailbox-1"')
+  })
+
+  test('falls back to SendMessage handoff when Codex MCP context is incomplete', () => {
+    const prompt = getOrdinaryInlineHandoffPrompt({
+      from: ' user ',
+      memberName: 'jack',
+      messageId: 'mailbox-1',
+      replyProtocol: 'agent_teams_message_send',
+      text: 'Тут?',
+      teamName: ' ',
+      timestamp: '2026-04-09T13:38:16.210Z',
+    })
+
+    expect(prompt).toContain('reply via SendMessage')
+    expect(prompt).not.toContain('agent-teams_message_send')
+    expect(prompt).not.toContain('relayOfMessageId="mailbox-1"')
+  })
+
+  test('resolves MCP handoff only for explicit Codex entry provider', () => {
+    expect(resolveOrdinaryUserDirectReplyProtocol('codex')).toBe(
+      'agent_teams_message_send',
+    )
+    expect(resolveOrdinaryUserDirectReplyProtocol('CODEx')).toBe(
+      'agent_teams_message_send',
+    )
+    expect(resolveOrdinaryUserDirectReplyProtocol('anthropic')).toBe(
+      'send_message',
+    )
+    expect(resolveOrdinaryUserDirectReplyProtocol('gemini')).toBe(
+      'send_message',
+    )
+    expect(resolveOrdinaryUserDirectReplyProtocol(undefined)).toBe(
+      'send_message',
+    )
   })
 
   test('builds an inline bootstrap handoff with explicit args and instructions', () => {
@@ -546,6 +606,188 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toBe('user_send_message')
   })
 
+  test('detects successful Agent Teams message_send to user as ordinary direct reply', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'jack',
+            relayOfMessageId: 'mailbox-regular',
+            source: 'runtime_delivery',
+            summary: 'Ответ',
+            teamName: 'harbor-labs',
+            text: 'На месте.',
+            to: ' user ',
+          },
+          name: 'agent-teams_message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-message-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('user_send_message')
+  })
+
+  test('accepts bare message_send only when teamName matches ordinary direct context', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'jack',
+            summary: 'Ответ',
+            teamName: 'harbor-labs',
+            text: 'На месте.',
+            to: 'user',
+          },
+          name: 'message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-message-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'harbor-labs',
+      }),
+    ).toBe('user_send_message')
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'other-team',
+      }),
+    ).toBe('none')
+  })
+
+  test('does not finalize prefixed Agent Teams message_send when explicit teamName conflicts', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'jack',
+            summary: 'Ответ',
+            teamName: 'other-team',
+            text: 'На месте.',
+            to: 'user',
+          },
+          name: 'mcp__agent-teams__message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-message-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'harbor-labs',
+      }),
+    ).toBe('none')
+  })
+
+  test('does not treat cross_team_send as the direct user reply for an ordinary DM', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'Запросил у внешней команды, вернусь с ответом.', type: 'text' } as never,
+        {
+          id: 'tool-cross-team-send',
+          input: {
+            teamName: 'harbor-labs',
+            text: 'Нужна проверка по этому вопросу.',
+            toTeam: 'other-team',
+          },
+          name: 'mcp__agent-teams__cross_team_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-cross-team-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'harbor-labs',
+      }),
+    ).toBe('none')
+    expect(
+      findOrdinaryDirectReplyFallback({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'harbor-labs',
+      }),
+    ).toEqual({ text: 'Запросил у внешней команды, вернусь с ответом.' })
+  })
+
   test('does not treat plain assistant text as ordinary direct reply', () => {
     const submitted = createUserMessage({
       content: 'ordinary handoff',
@@ -610,6 +852,71 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         submitUserMessageUuid: 'ordinary-uuid',
       }),
     ).toBeNull()
+  })
+
+  test('does not fallback plain text when Agent Teams message_send to user was attempted', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'Отвечаю через MCP.', type: 'text' } as never,
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'jack',
+            summary: 'Ответ',
+            teamName: 'harbor-labs',
+            text: 'На месте.',
+            to: 'user',
+          },
+          name: 'mcp__agent-teams__message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyFallback({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBeNull()
+  })
+
+  test('does not suppress plain-text fallback for bare message_send from another team', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'На месте.', type: 'text' } as never,
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'jack',
+            summary: 'Ответ',
+            teamName: 'other-team',
+            text: 'На месте.',
+            to: 'user',
+          },
+          name: 'message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+
+    expect(
+      findOrdinaryDirectReplyFallback({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+        teamName: 'harbor-labs',
+      }),
+    ).toEqual({ text: 'На месте.' })
   })
 
   test('does not treat an errored member_briefing result as bootstrap success', () => {
@@ -1028,7 +1335,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'finalize' })
   })
 
-  test('lifecycle - ordinary direct row relays plain text instead of ignoring it', () => {
+  test('lifecycle - ordinary direct row relays plain text for trimmed user sender', () => {
     const submitted = createUserMessage({
       content: 'ordinary handoff',
       isMeta: true,
@@ -1052,7 +1359,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
           id: 'row-regular',
           messageId: 'mailbox-regular',
           mailboxClaimedBySessionId: 'session-1',
-          from: 'user',
+          from: ' user ',
           status: 'processing',
           timestamp: '2026-04-09T13:00:00.000Z',
           text: 'Тут?',
