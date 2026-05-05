@@ -889,6 +889,81 @@ describe('executeCodexNativeTurn', () => {
     })
   })
 
+  test('emits codex turn-settled event for team leads from app state identity', async () => {
+    const events: CodexNativeTurnSettledEvent[] = []
+
+    await collectMessages(
+      executeCodexNativeTurn(
+        baseParams({
+          cwd: '/tmp/alpha',
+          initialAppState: {
+            fastMode: false,
+            teamContext: {
+              teamName: 'alpha',
+              teamFilePath: '/tmp/alpha/team.json',
+              leadAgentId: 'team-lead@alpha',
+              teammates: {
+                'team-lead@alpha': {
+                  name: 'team-lead',
+                  tmuxSessionName: 'alpha',
+                  tmuxPaneId: '%1',
+                  cwd: '/tmp/alpha',
+                  spawnedAt: 1,
+                },
+              },
+            },
+          } as never,
+        }),
+        {
+          runExec: async function* () {
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: 'thread-lead',
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+          runtimeTurnSettledEmitter: {
+            async emit(event) {
+              events.push(event)
+            },
+          },
+        },
+      ),
+    )
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      provider: 'codex',
+      agentId: 'team-lead@alpha',
+      agentName: 'team-lead',
+      teamName: 'alpha',
+      cwd: '/tmp/alpha',
+      outcome: 'success',
+      threadId: 'thread-lead',
+    })
+  })
+
   test('emits codex turn-settled before yielding the terminal result', async () => {
     setDynamicTeamContext({
       agentId: 'jack@alpha',

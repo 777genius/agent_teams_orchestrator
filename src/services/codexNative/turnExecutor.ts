@@ -32,6 +32,7 @@ import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import {
   buildCodexNativeTurnSettledEvent,
   emitCodexNativeTurnSettledBestEffort,
+  type CodexNativeTurnSettledIdentity,
   type CodexNativeTurnSettledEmitterPort,
   type CodexNativeTurnSettledOutcome,
 } from './runtimeTurnSettledEmitter.js'
@@ -370,6 +371,36 @@ function buildResultSuccessMessage(params: {
   }
 }
 
+function trimOptional(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
+}
+
+function resolveTurnSettledIdentityFromAppState(
+  appState: AppState,
+): CodexNativeTurnSettledIdentity | undefined {
+  const teamContext = appState.teamContext
+  if (!teamContext) {
+    return undefined
+  }
+
+  const teamName = trimOptional(teamContext.teamName)
+  const leadAgentId = trimOptional(teamContext.leadAgentId)
+  const agentId = trimOptional(teamContext.selfAgentId) ?? leadAgentId
+  const agentName =
+    trimOptional(teamContext.selfAgentName) ??
+    (leadAgentId
+      ? trimOptional(teamContext.teammates?.[leadAgentId]?.name)
+      : undefined) ??
+    'team-lead'
+
+  if (!teamName || !agentId || !agentName) {
+    return undefined
+  }
+
+  return { agentId, agentName, teamName }
+}
+
 export async function* executeCodexNativeTurn(
   params: ExecuteCodexNativeTurnParams,
   deps: ExecuteCodexNativeTurnDeps = {},
@@ -388,6 +419,7 @@ export async function* executeCodexNativeTurn(
       outcome: input.outcome,
       threadId: input.threadId,
       detail: input.detail,
+      identity: resolveTurnSettledIdentityFromAppState(params.initialAppState),
     })
     if (!event) {
       return

@@ -35,16 +35,31 @@ export interface CodexNativeTurnSettledEmitterPort {
   emit(event: CodexNativeTurnSettledEvent): Promise<void>
 }
 
+export interface CodexNativeTurnSettledIdentity {
+  agentId?: string | null
+  agentName?: string | null
+  teamName?: string | null
+}
+
+function trimOptional(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
+}
+
 export function buildCodexNativeTurnSettledEvent(input: {
   cwd: string
   outcome: CodexNativeTurnSettledOutcome
   threadId?: string | null
   detail?: string
   now?: () => Date
+  identity?: CodexNativeTurnSettledIdentity
 }): CodexNativeTurnSettledEvent | null {
-  const agentId = getAgentId()?.trim()
-  const agentName = getAgentName()?.trim()
-  const teamName = getTeamName()?.trim()
+  const agentId =
+    trimOptional(getAgentId()) ?? trimOptional(input.identity?.agentId)
+  const agentName =
+    trimOptional(getAgentName()) ?? trimOptional(input.identity?.agentName)
+  const teamName =
+    trimOptional(getTeamName()) ?? trimOptional(input.identity?.teamName)
   if (!agentId || !agentName || !teamName) {
     return null
   }
