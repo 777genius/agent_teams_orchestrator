@@ -1591,6 +1591,29 @@ async function runLaunchWithProvisioningSnapshot(
         runId,
       })
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
+      const mcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
+        attachIfMissing: true,
+      })
+      if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
+        record = { ...record, runtimePid: mcpReady.runtimePid }
+      }
+      for (const diagnostic of mcpReady.diagnostics) {
+        diagnostics.push(teamDiagnostic('opencode_launch_mcp_ready_detail', `${name}: ${diagnostic}`, 'info'))
+      }
+      if (mcpReady.status === 'attached') {
+        diagnostics.push(teamDiagnostic(
+          'opencode_launch_mcp_attached',
+          `Attached Agent Teams MCP before launch bootstrap for ${name}.`,
+          'info',
+        ))
+      }
+      if (!mcpReady.ok) {
+        throw new Error([
+          `OpenCode app MCP was not ready for ${name} before launch bootstrap`,
+          `(status=${mcpReady.status}, connected=${String(mcpReady.connected)}).`,
+          ...mcpReady.diagnostics,
+        ].join(' '))
+      }
       const runtimeIdentityBlock = buildOpenCodeRuntimeIdentityBlock({
         teamName: teamId,
         memberName: name,

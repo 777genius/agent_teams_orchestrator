@@ -72,12 +72,46 @@ function compactToolOutput(tool: OpenCodeCanonicalToolCall): string {
     .toLowerCase()
 }
 
+function compactToolDisplayOutput(tool: OpenCodeCanonicalToolCall): string {
+  const values: string[] = []
+  collectDiagnosticText(tool.outputText, values)
+  collectDiagnosticText(tool.outputPreview, values)
+  collectDiagnosticText(tool.output, values)
+  return values
+    .filter(value => value.trim())
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500)
+}
+
 function isFailedBootstrapToolCall(tool: OpenCodeCanonicalToolCall): boolean {
   if (tool.isError || tool.status === 'errored') {
     return true
   }
   const output = compactToolOutput(tool)
   return output.includes('not connected') || output.includes('mcp not connected')
+}
+
+function summarizeFailedBootstrapToolOutputs(
+  summary: OpenCodeSessionReconcileSummary,
+  failedTools: string[],
+): string[] {
+  const failedToolSet = new Set(failedTools)
+  const outputs: string[] = []
+  for (const message of summary.messages) {
+    for (const tool of message.toolCalls) {
+      const toolName = normalizeAgentTeamsToolName(tool.toolName)
+      if (!failedToolSet.has(toolName) || !isFailedBootstrapToolCall(tool)) {
+        continue
+      }
+      const output = compactToolDisplayOutput(tool)
+      if (output) {
+        outputs.push(`${toolName}: ${output}`)
+      }
+    }
+  }
+  return [...new Set(outputs)].slice(0, 3)
 }
 
 export function summarizeOpenCodeBootstrapMcpReadiness(
@@ -115,6 +149,10 @@ export function summarizeOpenCodeBootstrapMcpReadiness(
     [...runningTools].every(toolName => successfulTools.has(toolName))
 
   if (failedWithoutLaterSuccess.length > 0) {
+    const failedToolOutputs = summarizeFailedBootstrapToolOutputs(summary, failedWithoutLaterSuccess)
+    const outputSuffix = failedToolOutputs.length > 0
+      ? ` (${failedToolOutputs.join('; ')})`
+      : ''
     return {
       ready: false,
       completedTools,
@@ -123,7 +161,7 @@ export function summarizeOpenCodeBootstrapMcpReadiness(
       failure: {
         failedTools: failedWithoutLaterSuccess,
         missingTools,
-        message: `OpenCode bootstrap MCP tool failed before required attach completed: ${failedWithoutLaterSuccess.join(', ')}`,
+        message: `OpenCode bootstrap MCP tool failed before required attach completed: ${failedWithoutLaterSuccess.join(', ')}${outputSuffix}`,
       },
     }
   }

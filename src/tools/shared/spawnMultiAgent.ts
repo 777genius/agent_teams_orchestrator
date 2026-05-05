@@ -101,6 +101,8 @@ import {
 import {
   ensureTeammateRuntimePaths,
   getTeammateRuntimePaths,
+  readTeammateRuntimeEvents,
+  TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV,
   TEAMMATE_RUNTIME_EVENTS_ENV,
   waitForTeammateRuntimeEvent,
   writeTeammateRuntimeEvent,
@@ -681,12 +683,144 @@ function getBootstrapExpectedAfterForTeammate(
   return byName?.bootstrapExpectedAfter ?? null
 }
 
+const BOOTSTRAP_CONFIRMED_RUNTIME_SOURCE = 'member_briefing_tool_success'
+
+function parseBootstrapRuntimeEventDetail(
+  detail: string | undefined,
+): Record<string, unknown> {
+  if (!detail) {
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(detail) as unknown
+    return parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function getBootstrapRuntimeEventField(
+  event: Awaited<ReturnType<typeof readTeammateRuntimeEvents>>[number],
+  detail: Record<string, unknown>,
+  field: 'source' | 'bootstrapProofToken',
+): string | undefined {
+  const direct = event[field]
+  if (typeof direct === 'string' && direct.trim()) {
+    return direct.trim()
+  }
+  const nested = detail[field]
+  return typeof nested === 'string' && nested.trim() ? nested.trim() : undefined
+}
+
+async function hasBootstrapRuntimeEventConfirmation(
+  teamName: string,
+  teammateId: string,
+  bootstrapExpectedAfter?: string | null,
+  teammateName?: string | null,
+): Promise<boolean> {
+  let teamFile: Awaited<ReturnType<typeof readTeamFileAsync>>
+  try {
+    teamFile = await readTeamFileAsync(teamName)
+  } catch {
+    teamFile = null
+  }
+  const normalizedTargetName = normalizeTeammateIdentity(
+    teammateName ?? teammateId,
+  )
+  const member =
+    teamFile?.members.find(candidate => candidate.agentId === teammateId) ??
+    teamFile?.members.find(
+      candidate =>
+        normalizeTeammateIdentity(candidate.name) === normalizedTargetName,
+    )
+  const runtimeEventsPath =
+    member?.bootstrapRuntimeEventsPath ??
+    getTeammateRuntimePaths({
+      teamName,
+      agentName: member?.name ?? teammateName ?? teammateId,
+    }).eventsPath
+  const expectedProofToken = member?.bootstrapProofToken?.trim()
+  const boundaryMs = bootstrapExpectedAfter
+    ? Date.parse(bootstrapExpectedAfter)
+    : Number.NaN
+  if (!expectedProofToken && !Number.isFinite(boundaryMs)) {
+    return false
+  }
+  const allowedIdentities = buildBootstrapConfirmationIdentitySet([
+    teammateId,
+    teammateName,
+    member?.name,
+  ])
+
+  let events: Awaited<ReturnType<typeof readTeammateRuntimeEvents>>
+  try {
+    events = await readTeammateRuntimeEvents(runtimeEventsPath)
+  } catch {
+    return false
+  }
+
+  return events.some(event => {
+    if (event.type !== 'bootstrap_confirmed') {
+      return false
+    }
+    if (event.teamName && event.teamName !== teamName) {
+      return false
+    }
+
+    const eventAgentId = event.agentId?.trim()
+    const eventAgentName = event.agentName?.trim()
+    const matchesIdentity =
+      (eventAgentId &&
+        (allowedIdentities.has(eventAgentId.toLowerCase()) ||
+          allowedIdentities.has(normalizeTeammateIdentity(eventAgentId)))) ||
+      (eventAgentName &&
+        (allowedIdentities.has(eventAgentName.toLowerCase()) ||
+          allowedIdentities.has(normalizeTeammateIdentity(eventAgentName))))
+    if (!matchesIdentity) {
+      return false
+    }
+
+    if (Number.isFinite(boundaryMs)) {
+      const eventMs = Date.parse(event.timestamp)
+      if (!Number.isFinite(eventMs) || eventMs < boundaryMs) {
+        return false
+      }
+    }
+
+    const detail = parseBootstrapRuntimeEventDetail(event.detail)
+    const source = getBootstrapRuntimeEventField(event, detail, 'source')
+    if (source !== BOOTSTRAP_CONFIRMED_RUNTIME_SOURCE) {
+      return false
+    }
+
+    const eventProofToken = getBootstrapRuntimeEventField(
+      event,
+      detail,
+      'bootstrapProofToken',
+    )
+    return expectedProofToken ? eventProofToken === expectedProofToken : true
+  })
+}
+
 export async function hasBootstrapConfirmation(
   teamName: string,
   teammateId: string,
   bootstrapExpectedAfter?: string | null,
   teammateName?: string | null,
 ): Promise<boolean> {
+  if (
+    await hasBootstrapRuntimeEventConfirmation(
+      teamName,
+      teammateId,
+      bootstrapExpectedAfter,
+      teammateName,
+    )
+  ) {
+    return true
+  }
+
   if (
     await hasBootstrapTranscriptConfirmation(
       teamName,
@@ -1551,11 +1685,19 @@ async function handleSpawnSplitPane(
       ? await createSpawnReadySentinel()
       : undefined
   const launchBoundaryIso = new Date().toISOString()
+  const bootstrapProofToken = randomUUID()
+  const runtimePaths = getTeammateRuntimePaths({
+    teamName,
+    agentName: sanitizedName,
+  })
+  await ensureTeammateRuntimePaths(runtimePaths)
   try {
     const envStr = buildInheritedEnvVars({
       provider,
       extraEnv: {
         ...worktreeEnv(worktreeInfo),
+        [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
+        [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
         ...(startupReadySentinel
           ? {
               [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
@@ -1645,6 +1787,8 @@ async function handleSpawnSplitPane(
       planModeRequired: plan_mode_required,
       joinedAt: Date.now(),
       bootstrapExpectedAfter: launchBoundaryIso,
+      bootstrapProofToken,
+      bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
       tmuxPaneId: paneId,
       cwd: workingDir,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
@@ -1839,11 +1983,19 @@ async function handleSpawnSeparateWindow(
   })
   const startupReadySentinel = await createSpawnReadySentinel()
   const launchBoundaryIso = new Date().toISOString()
+  const bootstrapProofToken = randomUUID()
+  const runtimePaths = getTeammateRuntimePaths({
+    teamName,
+    agentName: sanitizedName,
+  })
+  await ensureTeammateRuntimePaths(runtimePaths)
   try {
     const envStr = buildInheritedEnvVars({
       provider,
       extraEnv: {
         ...worktreeEnv(worktreeInfo),
+        [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
+        [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
         [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
       },
     })
@@ -1933,6 +2085,8 @@ async function handleSpawnSeparateWindow(
       planModeRequired: plan_mode_required,
       joinedAt: Date.now(),
       bootstrapExpectedAfter: launchBoundaryIso,
+      bootstrapProofToken,
+      bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
       tmuxPaneId: paneId,
       cwd: workingDir,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
@@ -2207,6 +2361,7 @@ async function handleSpawnNativeProcess(
   const { command, args: commandArgs } = getTeammateCommandArgv()
   const argv = [...commandArgs, ...teammateArgs, ...parseArguments(inheritedFlags)]
   const launchBoundaryIso = new Date().toISOString()
+  const bootstrapProofToken = randomUUID()
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
   let stdoutLog: WriteStream | undefined
@@ -2248,6 +2403,7 @@ async function handleSpawnNativeProcess(
             [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
               startupReadySentinel.filePath,
             [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
+            [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
           },
         }),
       },
@@ -2387,6 +2543,8 @@ async function handleSpawnNativeProcess(
         planModeRequired: plan_mode_required,
         joinedAt: Date.now(),
         bootstrapExpectedAfter: launchBoundaryIso,
+        bootstrapProofToken,
+        bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
         tmuxPaneId: processPaneId,
         runtimePid,
         cwd: workingDir,

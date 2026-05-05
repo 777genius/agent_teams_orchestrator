@@ -90,7 +90,7 @@ describe('OpenCodeBootstrapMcpFailure', () => {
       failedTools: ['runtime_bootstrap_checkin'],
       missingTools: ['runtime_bootstrap_checkin', 'member_briefing'],
       message:
-        'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin',
+        'OpenCode bootstrap MCP tool failed before required attach completed: runtime_bootstrap_checkin (runtime_bootstrap_checkin: MCP Not connected)',
     })
     expect(hasOpenCodeBootstrapMcpNotConnectedFailure(summary)).toBe(true)
   })

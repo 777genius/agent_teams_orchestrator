@@ -8,6 +8,8 @@ import { getTeamDir, sanitizeName } from './teamHelpers.js'
 
 export const TEAMMATE_RUNTIME_EVENTS_ENV =
   'CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH'
+export const TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV =
+  'CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN'
 
 export type TeammateRuntimeEventType =
   | 'process_spawned'
@@ -31,6 +33,10 @@ export type TeammateRuntimeEvent = {
   agentId?: string
   runId?: string
   cwd?: string
+  source?: string
+  bootstrapProofToken?: string
+  bootstrapMessageId?: string
+  bootstrapMirrorId?: string
   detail?: string
 }
 
@@ -70,6 +76,10 @@ export async function writeTeammateRuntimeEvent(params: {
   agentId?: string
   runId?: string
   cwd?: string
+  source?: string
+  bootstrapProofToken?: string
+  bootstrapMessageId?: string
+  bootstrapMirrorId?: string
   detail?: string
 }): Promise<void> {
   const eventsPath = params.eventsPath ?? process.env[TEAMMATE_RUNTIME_EVENTS_ENV]
@@ -87,6 +97,16 @@ export async function writeTeammateRuntimeEvent(params: {
     ...(params.agentId ? { agentId: params.agentId } : {}),
     ...(params.runId ? { runId: params.runId } : {}),
     ...(params.cwd ? { cwd: params.cwd } : {}),
+    ...(params.source ? { source: params.source } : {}),
+    ...(params.bootstrapProofToken
+      ? { bootstrapProofToken: params.bootstrapProofToken }
+      : {}),
+    ...(params.bootstrapMessageId
+      ? { bootstrapMessageId: params.bootstrapMessageId }
+      : {}),
+    ...(params.bootstrapMirrorId
+      ? { bootstrapMirrorId: params.bootstrapMirrorId }
+      : {}),
     ...(params.detail ? { detail: params.detail } : {}),
   }
 

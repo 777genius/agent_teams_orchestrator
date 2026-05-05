@@ -254,10 +254,15 @@ import { mkdir, readFile, unlink, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import {
+  getAgentId,
   getAgentName,
   getTeamName,
   isTeammate,
 } from '../../utils/teammate.js'
+import {
+  TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV,
+  writeTeammateRuntimeEvent,
+} from '../../utils/swarm/teammateRuntimeEvents.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 import {
@@ -1912,7 +1917,29 @@ export const fetchToolsForClient = memoizeWithLRU(
                     handleElicitation: context.handleElicitation,
                   })
 
+                  const bootstrapProofToken =
+                    process.env[TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]?.trim()
                   if (bootstrapCall.bootstrapContext) {
+                    if (
+                      bootstrapProofToken &&
+                      client.name === 'agent-teams' &&
+                      tool.name === 'member_briefing' &&
+                      (mcpResult as { isError?: boolean }).isError !== true
+                    ) {
+                      void writeTeammateRuntimeEvent({
+                        type: 'bootstrap_confirmed',
+                        teamName: bootstrapCall.bootstrapContext.teamName,
+                        agentName: bootstrapCall.bootstrapContext.memberName,
+                        agentId: getAgentId(),
+                        runId: getSessionId(),
+                        source: 'member_briefing_tool_success',
+                        bootstrapProofToken,
+                        bootstrapMessageId:
+                          bootstrapCall.bootstrapContext.bootstrapMessageId,
+                        bootstrapMirrorId:
+                          bootstrapCall.bootstrapContext.bootstrapMirrorId,
+                      })
+                    }
                     clearBootstrapMemberBriefingLoopState(
                       bootstrapCall.bootstrapContext,
                     )

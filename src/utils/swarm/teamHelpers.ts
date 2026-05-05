@@ -85,6 +85,8 @@ export type TeamFile = {
     planModeRequired?: boolean
     joinedAt: number
     bootstrapExpectedAfter?: string
+    bootstrapProofToken?: string
+    bootstrapRuntimeEventsPath?: string
     tmuxPaneId: string
     cwd: string
     worktreePath?: string
@@ -362,6 +364,8 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.planModeRequired === b.planModeRequired &&
     a.joinedAt === b.joinedAt &&
     a.bootstrapExpectedAfter === b.bootstrapExpectedAfter &&
+    a.bootstrapProofToken === b.bootstrapProofToken &&
+    a.bootstrapRuntimeEventsPath === b.bootstrapRuntimeEventsPath &&
     a.tmuxPaneId === b.tmuxPaneId &&
     a.cwd === b.cwd &&
     a.worktreePath === b.worktreePath &&
