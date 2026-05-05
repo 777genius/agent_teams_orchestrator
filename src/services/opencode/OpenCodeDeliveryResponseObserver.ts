@@ -83,7 +83,9 @@ function normalizeToolName(name: string | null): string {
   return String(name || '')
     .trim()
     .replace(/^mcp__agent-teams__/, '')
+    .replace(/^mcp__agent_teams__/, '')
     .replace(/^agent-teams_/, '')
+    .replace(/^agent_teams_/, '')
     .toLowerCase()
 }
 
@@ -103,6 +105,7 @@ function messagePreview(message: OpenCodeCanonicalMessage | null): string | null
 
 function isMeaningfulNonVisibleTool(toolName: string): boolean {
   if (toolName.startsWith('task_')) return true
+  if (toolName === 'member_work_sync_report') return true
   return EXECUTION_TOOL_NAMES.has(toolName)
 }
 

@@ -298,6 +298,78 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.toolCallNames).toContain('task_start')
   })
 
+  test('classifies member work sync report as non-visible response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report',
+          role: 'assistant',
+          parentId: 'user-work-sync-report',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_non_visible_tool')
+    expect(observed.toolCallNames).toContain('member_work_sync_report')
+  })
+
+  test('normalizes underscore-prefixed member work sync report tools', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-underscore',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-underscore',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-underscore". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-underscore',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-underscore',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-underscore',
+              toolName: 'mcp__agent_teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: null,
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_non_visible_tool')
+    expect(observed.toolCallNames).toContain('member_work_sync_report')
+  })
+
   test('normalizes plain message_send as a visible reply and reports missing relay correlation', () => {
     const observed = observeOpenCodeDeliveryResponse({
       inboundMessageId: 'msg-inbound-4',
