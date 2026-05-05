@@ -1,17 +1,18 @@
 import { randomUUID } from 'crypto'
-import { mkdir, rm, stat, writeFile } from 'fs/promises'
+import { mkdir, rename, rm, stat, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { errorMessage, getErrnoCode } from 'src/utils/errors.js'
 import { getTeamDir } from 'src/utils/swarm/teamHelpers.js'
-import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { TeamBootstrapJournal } from './teamBootstrapJournal.js'
+import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 
 const BOOTSTRAP_LOCK_TIMEOUT_MS = 10_000
 const BOOTSTRAP_LOCK_STALE_MS = 5 * 60_000
+const BOOTSTRAP_LOCK_RECLAIM_GUARD_STALE_MS = 30_000
 const BOOTSTRAP_LOCK_RETRY_BASE_MS = 25
 const BOOTSTRAP_LOCK_SLOW_WAIT_MS = 100
 const MAX_BOOTSTRAP_LOCK_METADATA_BYTES = 64 * 1024
-const MAX_BOOTSTRAP_STATE_BYTES = 256 * 1024
+const MAX_BOOTSTRAP_RECLAIM_GUARD_METADATA_BYTES = 16 * 1024
 
 type BootstrapLockMetadata = {
   pid: number
@@ -22,12 +23,10 @@ type BootstrapLockMetadata = {
   nonce: string
 }
 
-type PersistedBootstrapOwnership = {
-  runId?: unknown
-  requestHash?: unknown
-  ownerPid?: unknown
-  ownerStartedAt?: unknown
-  terminal?: unknown
+type BootstrapReclaimGuardMetadata = {
+  pid: number
+  createdAt: number
+  nonce: string
 }
 
 function sleep(ms: number): Promise<void> {
@@ -55,17 +54,21 @@ function getBootstrapLockMetadataPath(teamName: string): string {
   return join(getBootstrapLockDir(teamName), 'metadata.json')
 }
 
-function getBootstrapStatePath(teamName: string): string {
-  return join(getTeamDir(teamName), 'bootstrap-state.json')
+function getBootstrapLockReclaimGuardDir(teamName: string): string {
+  return join(getTeamDir(teamName), '.bootstrap.lock.reclaiming')
 }
 
-async function readLockMetadata(
-  teamName: string,
+function getBootstrapLockReclaimGuardMetadataPath(teamName: string): string {
+  return join(getBootstrapLockReclaimGuardDir(teamName), 'metadata.json')
+}
+
+async function readLockMetadataFile(
+  filePath: string,
 ): Promise<BootstrapLockMetadata | null> {
   try {
     const raw = JSON.parse(
       await readBoundRegularUtf8File({
-        filePath: getBootstrapLockMetadataPath(teamName),
+        filePath,
         maxBytes: MAX_BOOTSTRAP_LOCK_METADATA_BYTES,
         messages: {
           notRegular:
@@ -92,44 +95,142 @@ async function readLockMetadata(
   }
 }
 
-async function readBootstrapOwnership(
+async function readLockMetadata(
   teamName: string,
-): Promise<PersistedBootstrapOwnership | null> {
+): Promise<BootstrapLockMetadata | null> {
+  return readLockMetadataFile(getBootstrapLockMetadataPath(teamName))
+}
+
+async function readReclaimGuardMetadata(
+  teamName: string,
+): Promise<BootstrapReclaimGuardMetadata | null> {
   try {
-    return JSON.parse(
+    const raw = JSON.parse(
       await readBoundRegularUtf8File({
-        filePath: getBootstrapStatePath(teamName),
-        maxBytes: MAX_BOOTSTRAP_STATE_BYTES,
+        filePath: getBootstrapLockReclaimGuardMetadataPath(teamName),
+        maxBytes: MAX_BOOTSTRAP_RECLAIM_GUARD_METADATA_BYTES,
         messages: {
           notRegular:
-            'persisted deterministic bootstrap state must be a regular file and must not be a symlink',
-          oversized: 'persisted deterministic bootstrap state is too large',
+            'deterministic bootstrap lock reclaim guard metadata must be a regular file and must not be a symlink',
+          oversized:
+            'deterministic bootstrap lock reclaim guard metadata is too large',
           invalid:
-            'persisted deterministic bootstrap state changed while being validated or could not be read safely',
+            'deterministic bootstrap lock reclaim guard metadata changed while being validated or could not be read safely',
         },
       }),
-    ) as PersistedBootstrapOwnership
+    ) as Partial<BootstrapReclaimGuardMetadata>
+    if (
+      typeof raw.pid !== 'number' ||
+      typeof raw.createdAt !== 'number' ||
+      typeof raw.nonce !== 'string'
+    ) {
+      return null
+    }
+    return raw as BootstrapReclaimGuardMetadata
   } catch {
     return null
   }
 }
 
-function ownershipCorrelates(
-  metadata: BootstrapLockMetadata | null,
-  state: PersistedBootstrapOwnership | null,
+function lockMetadataMatches(
+  left: BootstrapLockMetadata,
+  right: BootstrapLockMetadata | null,
 ): boolean {
-  if (!metadata || !state) {
-    return state === null
-  }
-  if (state.terminal && typeof state.terminal === 'object') {
-    return true
-  }
   return (
-    state.runId === metadata.runId &&
-    state.requestHash === metadata.requestHash &&
-    state.ownerPid === metadata.pid &&
-    state.ownerStartedAt === metadata.ownerStartedAt
+    right !== null &&
+    right.pid === left.pid &&
+    right.runId === left.runId &&
+    right.requestHash === left.requestHash &&
+    right.ownerStartedAt === left.ownerStartedAt &&
+    right.createdAt === left.createdAt &&
+    right.nonce === left.nonce
   )
+}
+
+function buildReclaimedLockDir(lockDir: string): string {
+  return `${lockDir}.reclaimed.${process.pid}.${Date.now()}.${randomUUID()}`
+}
+
+async function isBootstrapLockReclaimGuardActive(
+  teamName: string,
+): Promise<boolean> {
+  const guardDir = getBootstrapLockReclaimGuardDir(teamName)
+  try {
+    const [guardStat, metadata] = await Promise.all([
+      stat(guardDir),
+      readReclaimGuardMetadata(teamName),
+    ])
+
+    if (metadata && !isProcessAlive(metadata.pid)) {
+      await rm(guardDir, { recursive: true, force: true })
+      return false
+    }
+
+    if (Date.now() - guardStat.mtimeMs < BOOTSTRAP_LOCK_RECLAIM_GUARD_STALE_MS) {
+      return true
+    }
+
+    await rm(guardDir, { recursive: true, force: true })
+    return false
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
+
+async function tryAcquireBootstrapLockReclaimGuard(
+  teamName: string,
+): Promise<{ nonce: string } | null> {
+  const guardDir = getBootstrapLockReclaimGuardDir(teamName)
+  const nonce = randomUUID()
+
+  while (true) {
+    try {
+      await mkdir(guardDir)
+      try {
+        await writeFile(
+          getBootstrapLockReclaimGuardMetadataPath(teamName),
+          JSON.stringify(
+            {
+              pid: process.pid,
+              createdAt: Date.now(),
+              nonce,
+            } satisfies BootstrapReclaimGuardMetadata,
+            null,
+            2,
+          ),
+          { encoding: 'utf8', mode: 0o600 },
+        )
+      } catch (error) {
+        await rm(guardDir, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+      return { nonce }
+    } catch (error) {
+      if (getErrnoCode(error) !== 'EEXIST') {
+        throw error
+      }
+      if (await isBootstrapLockReclaimGuardActive(teamName)) {
+        return null
+      }
+    }
+  }
+}
+
+async function releaseBootstrapLockReclaimGuard(
+  teamName: string,
+  nonce: string,
+): Promise<void> {
+  const metadata = await readReclaimGuardMetadata(teamName)
+  if (!metadata || metadata.nonce !== nonce) {
+    return
+  }
+  await rm(getBootstrapLockReclaimGuardDir(teamName), {
+    recursive: true,
+    force: true,
+  }).catch(() => {})
 }
 
 async function reclaimStaleBootstrapLock(params: {
@@ -137,14 +238,18 @@ async function reclaimStaleBootstrapLock(params: {
   lockDir: string
   journal: TeamBootstrapJournal
 }): Promise<boolean> {
+  const guard = await tryAcquireBootstrapLockReclaimGuard(params.teamName)
+  if (!guard) {
+    return false
+  }
+
   try {
-    const [lockStat, metadata, ownership] = await Promise.all([
+    const [lockStat, metadata] = await Promise.all([
       stat(params.lockDir),
       readLockMetadata(params.teamName),
-      readBootstrapOwnership(params.teamName),
     ])
     const ageMs = Date.now() - lockStat.mtimeMs
-    if (ageMs < BOOTSTRAP_LOCK_STALE_MS) {
+    if (!metadata && ageMs < BOOTSTRAP_LOCK_STALE_MS) {
       return false
     }
 
@@ -152,18 +257,42 @@ async function reclaimStaleBootstrapLock(params: {
       return false
     }
 
-    if (!ownershipCorrelates(metadata, ownership)) {
-      return false
+    if (metadata) {
+      const currentMetadata = await readLockMetadata(params.teamName)
+      if (!currentMetadata || !lockMetadataMatches(metadata, currentMetadata)) {
+        return false
+      }
+      if (isProcessAlive(currentMetadata.pid)) {
+        return false
+      }
+    } else {
+      const currentLockStat = await stat(params.lockDir)
+      if (Date.now() - currentLockStat.mtimeMs < BOOTSTRAP_LOCK_STALE_MS) {
+        return false
+      }
     }
 
-    await rm(params.lockDir, { recursive: true, force: true })
+    const reclaimedLockDir = buildReclaimedLockDir(params.lockDir)
+    await rename(params.lockDir, reclaimedLockDir)
+    if (metadata) {
+      const reclaimedMetadata = await readLockMetadataFile(
+        join(reclaimedLockDir, 'metadata.json'),
+      )
+      if (!lockMetadataMatches(metadata, reclaimedMetadata)) {
+        await rename(reclaimedLockDir, params.lockDir)
+        return false
+      }
+    }
+    await rm(reclaimedLockDir, { recursive: true, force: true }).catch(() => {})
     await params.journal.append({
       ts: Date.now(),
       type: 'lock',
       runId: metadata?.runId ?? 'unknown',
       action: 'reclaimed',
       ownerPid: metadata?.pid,
-      detail: 'reclaimed stale bootstrap lock after dead owner verification',
+      detail: metadata
+        ? 'reclaimed bootstrap lock after dead owner verification'
+        : 'reclaimed stale bootstrap lock with missing or invalid metadata',
     })
     return true
   } catch (error) {
@@ -173,6 +302,8 @@ async function reclaimStaleBootstrapLock(params: {
     throw new Error(
       `Failed to reclaim stale bootstrap lock ${params.lockDir}: ${errorMessage(error)}`,
     )
+  } finally {
+    await releaseBootstrapLockReclaimGuard(params.teamName, guard.nonce)
   }
 }
 
@@ -211,11 +342,32 @@ export async function withBootstrapOwnershipLock<T>(params: {
   let attempt = 0
   const journal = new TeamBootstrapJournal(params.teamName)
   const nonce = randomUUID()
+  const timeoutMs = params.timeoutMs ?? BOOTSTRAP_LOCK_TIMEOUT_MS
 
   await mkdir(teamDir, { recursive: true })
 
+  const waitBeforeRetry = async (): Promise<void> => {
+    if (Date.now() - start >= timeoutMs) {
+      throw new Error(
+        `Timed out waiting for bootstrap ownership lock for "${params.teamName}" after ${timeoutMs}ms`,
+      )
+    }
+
+    attempt += 1
+    const waitMs = Math.min(
+      BOOTSTRAP_LOCK_SLOW_WAIT_MS,
+      BOOTSTRAP_LOCK_RETRY_BASE_MS * Math.max(1, attempt),
+    )
+    await sleep(waitMs)
+  }
+
   while (true) {
     try {
+      if (await isBootstrapLockReclaimGuardActive(params.teamName)) {
+        await waitBeforeRetry()
+        continue
+      }
+
       await mkdir(lockDir)
       try {
         await writeFile(
@@ -260,19 +412,7 @@ export async function withBootstrapOwnershipLock<T>(params: {
         continue
       }
 
-      const timeoutMs = params.timeoutMs ?? BOOTSTRAP_LOCK_TIMEOUT_MS
-      if (Date.now() - start >= timeoutMs) {
-        throw new Error(
-          `Timed out waiting for bootstrap ownership lock for "${params.teamName}" after ${timeoutMs}ms`,
-        )
-      }
-
-      attempt += 1
-      const waitMs = Math.min(
-        BOOTSTRAP_LOCK_SLOW_WAIT_MS,
-        BOOTSTRAP_LOCK_RETRY_BASE_MS * Math.max(1, attempt),
-      )
-      await sleep(waitMs)
+      await waitBeforeRetry()
     }
   }
 
