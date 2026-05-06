@@ -50,9 +50,10 @@ import type {
 
 const BRIDGE_SCHEMA_VERSION = 1
 const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
-const OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS = 20_000
-const OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS = 3_000
-const OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS = 10_000
+// App-managed bootstrap deliberately bypasses the launch-time model tool-call
+// requirement for OpenCode only. Bump this when changing the injected context
+// or the candidate proof shape so the desktop app can reject stale evidence.
+const OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION = 1
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // This is intentionally longer than the UI wait budget: the app can return
@@ -115,8 +116,28 @@ type LaunchMemberDraft = {
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
   pendingPermissionRequestIds?: string[]
   runtimePid?: number
+  bootstrapEvidenceSource?: 'runtime_bootstrap_checkin' | 'app_managed_bootstrap'
+  bootstrapMode?: 'model_tool_checkin' | 'app_managed_context'
+  appManagedBootstrapCandidate?: OpenCodeAppManagedBootstrapCandidate
   evidence: Array<{ kind: string; observedAt: string }>
   diagnostics: string[]
+}
+
+type OpenCodeAppManagedBootstrapCandidate = {
+  schemaVersion: 1
+  source: 'app_managed_bootstrap'
+  teamName: string
+  memberName: string
+  runId: string
+  laneId: string
+  runtimeSessionId: string
+  messageID: string
+  contextHash: string
+  briefingHash: string
+  injectionVerifiedAt: string
+  candidateAt: string
+  model?: string
+  agent?: string
 }
 
 type SendMessageCommandData = {
@@ -223,6 +244,97 @@ function hashStable(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(normalizeStable(value))).digest('hex')
 }
 
+function hashText(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+function buildOpenCodeAppManagedBootstrapMessageID(input: {
+  teamName: string
+  memberName: string
+  runId: string
+  laneId: string
+  runtimeSessionId: string
+  contextHash: string
+}): string {
+  const digest = hashStable({
+    purpose: 'opencode-app-managed-bootstrap-message-id-v1',
+    teamName: input.teamName,
+    memberName: input.memberName,
+    runId: input.runId,
+    laneId: input.laneId,
+    runtimeSessionId: input.runtimeSessionId,
+    contextHash: input.contextHash,
+  })
+  return `msgagtboot${digest.slice(0, 48)}`
+}
+
+function buildOpenCodeAppManagedBootstrapContextText(input: {
+  teamName: string
+  memberName: string
+  runId: string
+  laneId: string
+  runtimeSessionId: string
+  prompt: string
+}): string {
+  const runtimeIdentity = {
+    teamName: input.teamName,
+    memberName: input.memberName,
+    runtimeProvider: 'opencode',
+    runtimeSessionId: input.runtimeSessionId,
+    runId: input.runId,
+    laneId: input.laneId,
+  }
+  return [
+    '<agent_teams_app_managed_bootstrap>',
+    'AGENT_TEAMS_APP_MANAGED_BOOTSTRAP_V1',
+    'This OpenCode teammate session was created, attached to Agent Teams MCP, and bootstrapped by the desktop app.',
+    'The app has already injected your team/member context and will verify runtime availability outside of the model turn.',
+    'Do not call runtime_bootstrap_checkin or member_briefing just to prove launch readiness.',
+    'When a real user, lead, teammate, task, or runtime-delivery message arrives, answer or act on that message normally.',
+    'For visible replies, use the exposed Agent Teams message_send tool when available. Do not use SendMessage.',
+    `Runtime identity: ${xmlEscape(JSON.stringify(runtimeIdentity))}`,
+    '<member_briefing_context>',
+    xmlEscape(input.prompt),
+    '</member_briefing_context>',
+    '</agent_teams_app_managed_bootstrap>',
+  ].join('\n')
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// OpenCode can report a session before the app MCP attach is visible inside
+// that session. Use a small bounded wait here, but keep launch availability
+// gated by committed desktop-side evidence, not by this readiness check alone.
+async function waitForLaunchSessionAppMcpReady(
+  record: OpenCodeSessionRecord,
+  options: { attachIfMissing?: boolean } = {},
+): Promise<Awaited<ReturnType<typeof openCodeSessionBridge.ensureSessionAppMcpReady>>> {
+  const delays = [0, 250, 750, 1_500]
+  const attachIfMissing = options.attachIfMissing ?? true
+  let latest: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSessionAppMcpReady>> | null = null
+  for (const [index, delay] of delays.entries()) {
+    if (delay > 0) {
+      await delayMs(delay)
+    }
+    latest = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
+      attachIfMissing: attachIfMissing && (index === 0 || latest?.connected !== true),
+    })
+    if (latest.ok) {
+      return latest
+    }
+  }
+  return latest ?? openCodeSessionBridge.ensureSessionAppMcpReady(record, { attachIfMissing })
+}
+
 function normalizeStable(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(item => normalizeStable(item))
@@ -292,7 +404,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
   runtimeSessionId: string
   purpose?: 'launch' | 'reminder'
 }): string {
-  const purpose = input.purpose ?? 'launch'
+  const purpose = input.purpose ?? 'reminder'
   const checkinPayload = {
     teamName: input.teamName,
     runId: input.runId,
@@ -309,22 +421,16 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
     '<opencode_runtime_identity>',
     'You are an OpenCode teammate managed by the desktop app.',
     purpose === 'launch'
-      ? 'Your first app-team MCP action must be runtime bootstrap check-in.'
+      ? 'Launch bootstrap is app-managed. This context is an identity attachment, not a request to prove readiness with bootstrap tools.'
       : 'Runtime identity reminder for this delivered app message. This session is already attached by the app; do not call runtime_bootstrap_checkin just to answer this delivered message unless the app explicitly asks you to re-check in.',
+    `Attached runtime context: ${JSON.stringify(checkinPayload)}`,
     purpose === 'launch'
-      ? `Call the exposed Agent Teams runtime_bootstrap_checkin tool, usually agent-teams_runtime_bootstrap_checkin or mcp__agent-teams__runtime_bootstrap_checkin, with: ${JSON.stringify(checkinPayload)}`
-      : `Attached runtime context: ${JSON.stringify(checkinPayload)}`,
-    purpose === 'launch'
-      ? 'After check-in succeeds, request your teammate rules.'
+      ? 'Do not call member_briefing just to prove launch readiness. Wait for app-delivered messages or actionable task assignments.'
       : 'Do not call member_briefing just to answer this delivered message unless the app explicitly asks you to refresh teammate rules.',
-    purpose === 'launch'
-      ? `Call the exposed Agent Teams member_briefing tool, usually agent-teams_member_briefing or mcp__agent-teams__member_briefing, with: ${JSON.stringify(briefingPayload)}`
-      : `Attached teammate context: ${JSON.stringify(briefingPayload)}`,
+    `Attached teammate context: ${JSON.stringify(briefingPayload)}`,
     ...(purpose === 'launch'
       ? [
           'Launch bootstrap is a silent attach, not a user/team conversation turn.',
-          'Only use Agent Teams MCP tools for launch bootstrap. Do not use bash, file, task, web, skill, or no-op placeholder tools during launch bootstrap.',
-          'After runtime_bootstrap_checkin and member_briefing both succeed, stop this turn immediately and wait for app-delivered messages or actionable task assignments.',
           'Do not call task_briefing, message_send, or cross_team_send just to announce readiness, say understood, report no tasks, or ask for work.',
           'If the briefing says there are no actionable tasks, stay idle silently.',
         ]
@@ -336,40 +442,6 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
     'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
     'Do not use runtime_deliver_message for ordinary visible replies unless a runtime-delivery prompt explicitly provides runId/runtimeSessionId/idempotencyKey.',
     '</opencode_runtime_identity>',
-  ].join('\n')
-}
-
-function buildOpenCodeBootstrapRetryPrompt(input: {
-  teamName: string
-  memberName: string
-  runId: string
-  runtimeSessionId: string
-  completedTools?: string[]
-  missingTools?: string[]
-}): string {
-  const completedTools = input.completedTools?.length
-    ? input.completedTools.join(', ')
-    : 'none'
-  const missingTools = input.missingTools?.length
-    ? input.missingTools.join(', ')
-    : 'unknown'
-
-  return [
-    buildOpenCodeRuntimeIdentityBlock({
-      ...input,
-      purpose: 'launch',
-    }),
-    '',
-    '<opencode_bootstrap_retry>',
-    'The previous launch bootstrap turn did not finish all required Agent Teams MCP tools.',
-    'The app has confirmed Agent Teams MCP is attached to this same OpenCode session.',
-    `Completed required tools: ${completedTools}.`,
-    `Missing required tools: ${missingTools}.`,
-    'Call only the missing required tool(s) now with the exact payloads above.',
-    'If runtime_bootstrap_checkin is missing, call it before member_briefing.',
-    'Do not create tasks, send visible messages, or announce readiness.',
-    'Stop immediately after the missing bootstrap tool(s) succeed.',
-    '</opencode_bootstrap_retry>',
   ].join('\n')
 }
 
@@ -409,10 +481,8 @@ function createRuntimePreconditionSnapshot(
   }
 }
 
-function shouldUseLightweightLaunchHandshake(body: Record<string, unknown>): boolean {
-  const requiredCommand = asString(body.requiredCommand)
-  const expectedCapabilitySnapshotId = asString(body.expectedCapabilitySnapshotId)
-  return requiredCommand === 'opencode.launchTeam' && !expectedCapabilitySnapshotId
+function shouldUseLightweightLaunchHandshake(_body: Record<string, unknown>): boolean {
+  return false
 }
 
 function createBridgeServerIdentity(
@@ -430,6 +500,7 @@ function createBridgeServerIdentity(
       currentVersion: 1,
       supportedCommands: SUPPORTED_COMMANDS,
       opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
+      opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
@@ -1075,101 +1146,6 @@ function summarizeBootstrapMcpFailure(
   )
 }
 
-async function retryLaunchBootstrapMcpFailure(input: {
-  teamId: string
-  memberName: string
-  runId: string
-  record: OpenCodeSessionRecord
-  diagnostics: TeamDiagnostic[]
-  completedTools?: string[]
-  missingTools?: string[]
-}): Promise<{
-  record: OpenCodeSessionRecord
-  reconciled: { record?: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }
-} | null> {
-  const mcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(input.record, {
-    attachIfMissing: true,
-  })
-  if (!mcpReady.ok) {
-    input.diagnostics.push(
-      teamDiagnostic(
-        'opencode_launch_mcp_repair_unavailable',
-        [
-          `OpenCode launch bootstrap MCP repair unavailable for ${input.memberName}`,
-          `(status=${mcpReady.status}, connected=${String(mcpReady.connected)}).`,
-          ...mcpReady.diagnostics,
-        ].join(' '),
-        'warning',
-      ),
-    )
-    return null
-  }
-
-  input.diagnostics.push(
-    teamDiagnostic(
-      mcpReady.status === 'attached'
-        ? 'opencode_launch_mcp_repair_reattached'
-        : 'opencode_launch_mcp_repair_ready',
-      mcpReady.status === 'attached'
-        ? `Reattached Agent Teams MCP before retrying launch bootstrap for ${input.memberName}.`
-        : `Agent Teams MCP is connected before retrying launch bootstrap for ${input.memberName}.`,
-      'info',
-    ),
-  )
-
-  await openCodeSessionBridge.promptAsync(input.record, {
-    text: buildOpenCodeBootstrapRetryPrompt({
-      teamName: input.teamId,
-      memberName: input.memberName,
-      runId: input.runId,
-      runtimeSessionId: input.record.opencodeSessionId,
-      completedTools: input.completedTools,
-      missingTools: input.missingTools,
-    }),
-    agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
-  })
-  input.diagnostics.push(
-    teamDiagnostic(
-      'opencode_launch_bootstrap_retry_prompt_sent',
-      `Sent one launch bootstrap retry prompt to ${input.memberName}.`,
-      'info',
-    ),
-  )
-
-  await openCodeSessionBridge.observePreview(input.record, {
-    timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
-    idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
-  }).catch(error => {
-    input.diagnostics.push(
-      teamDiagnostic(
-        'opencode_launch_bootstrap_retry_preview_pending',
-        `${input.memberName}: ${error instanceof Error ? error.message : String(error)}`,
-        'info',
-      ),
-    )
-    return null
-  })
-
-  return withTimeout(
-    openCodeSessionBridge.reconcileSession(input.record, { limit: 80 }),
-    OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
-  )
-    .then(reconciled => ({
-      record: reconciled.record ?? input.record,
-      reconciled,
-    }))
-    .catch(error => {
-      input.diagnostics.push(
-        teamDiagnostic(
-          'opencode_launch_bootstrap_retry_reconcile_pending',
-          `${input.memberName}: ${error instanceof Error ? error.message : String(error)}`,
-          'warning',
-        ),
-      )
-      return null
-    })
-}
-
 async function recreateSessionAfterBootstrapMcpFailure(params: {
   record: OpenCodeSessionRecord
   runId?: string | null
@@ -1256,6 +1232,13 @@ function buildTeamLaunchData(params: {
         {
           sessionId: member.sessionId,
           launchState: member.launchState,
+          ...(member.bootstrapEvidenceSource
+            ? { bootstrapEvidenceSource: member.bootstrapEvidenceSource }
+            : {}),
+          ...(member.bootstrapMode ? { bootstrapMode: member.bootstrapMode } : {}),
+          ...(member.appManagedBootstrapCandidate
+            ? { appManagedBootstrapCandidate: member.appManagedBootstrapCandidate }
+            : {}),
           ...(member.pendingPermissionRequestIds?.length
             ? { pendingPermissionRequestIds: [...new Set(member.pendingPermissionRequestIds)] }
             : {}),
@@ -1561,12 +1544,9 @@ async function runLaunchWithProvisioningSnapshot(
   await assertOpenCodeLaunchMcpReady(snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
-  const promptedMembers: Array<{ name: string; record: OpenCodeSessionRecord }> = []
   const memberTimings = new Map<string, {
     ensureSessionMs?: number
-    promptMs?: number
-    previewMs?: number
-    reconcileMs?: number
+    injectionMs?: number
   }>()
 
   for (const item of membersRaw) {
@@ -1589,11 +1569,10 @@ async function runLaunchWithProvisioningSnapshot(
         projectPath: snapshot.projectPath,
         preparedProfile: snapshot.profile,
         runId,
+        fresh: true,
       })
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
-      const mcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(record, {
-        attachIfMissing: true,
-      })
+      let mcpReady = await waitForLaunchSessionAppMcpReady(record)
       if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
         record = { ...record, runtimePid: mcpReady.runtimePid }
       }
@@ -1606,6 +1585,44 @@ async function runLaunchWithProvisioningSnapshot(
           `Attached Agent Teams MCP before launch bootstrap for ${name}.`,
           'info',
         ))
+        // If MCP was attached after the session was created, the existing
+        // OpenCode session may not see the new tools. Recreate once before
+        // injecting app-managed bootstrap context to avoid a hidden bad session.
+        await openCodeSessionStore.markStale(
+          teamId,
+          laneId,
+          name,
+          'app_mcp_attached_after_session_create',
+        ).catch(error => {
+          diagnostics.push(teamDiagnostic(
+            'opencode_launch_mcp_recreate_mark_stale_failed',
+            `${name}: ${error instanceof Error ? error.message : String(error)}`,
+            'warning',
+          ))
+        })
+        record = await openCodeSessionBridge.ensureSession({
+          teamId,
+          laneId,
+          memberName: name,
+          selectedModel: apiSelectedModel,
+          title: `${teamId} - ${name}`,
+          projectPath: snapshot.projectPath,
+          preparedProfile: snapshot.profile,
+          runId,
+          fresh: true,
+        })
+        diagnostics.push(teamDiagnostic(
+          'opencode_launch_session_recreated_after_mcp_attach',
+          `Recreated OpenCode session for ${name} after Agent Teams MCP attach so launch bootstrap sees the newly attached tools.`,
+          'info',
+        ))
+        mcpReady = await waitForLaunchSessionAppMcpReady(record, { attachIfMissing: false })
+        if (mcpReady.runtimePid && mcpReady.runtimePid > 0 && record.runtimePid !== mcpReady.runtimePid) {
+          record = { ...record, runtimePid: mcpReady.runtimePid }
+        }
+        for (const diagnostic of mcpReady.diagnostics) {
+          diagnostics.push(teamDiagnostic('opencode_launch_mcp_ready_detail', `${name}: ${diagnostic}`, 'info'))
+        }
       }
       if (!mcpReady.ok) {
         throw new Error([
@@ -1614,19 +1631,81 @@ async function runLaunchWithProvisioningSnapshot(
           ...mcpReady.diagnostics,
         ].join(' '))
       }
-      const runtimeIdentityBlock = buildOpenCodeRuntimeIdentityBlock({
+      const contextText = buildOpenCodeAppManagedBootstrapContextText({
         teamName: teamId,
         memberName: name,
         runId,
+        laneId,
         runtimeSessionId: record.opencodeSessionId,
+        prompt,
       })
-      const promptStartedAt = Date.now()
-      await openCodeSessionBridge.promptAsync(record, {
-        text: `${runtimeIdentityBlock}\n\n${prompt}`,
+      const contextHash = hashText(contextText)
+      const briefingHash = hashStable({
+        purpose: 'opencode-app-managed-bootstrap-briefing-v1',
+        teamName: teamId,
+        memberName: name,
+        runId,
+        laneId,
+        prompt,
+      })
+      const messageID = buildOpenCodeAppManagedBootstrapMessageID({
+        teamName: teamId,
+        memberName: name,
+        runId,
+        laneId,
+        runtimeSessionId: record.opencodeSessionId,
+        contextHash,
+      })
+      const injectionStartedAt = Date.now()
+      const injected = await openCodeSessionBridge.injectAppManagedBootstrapContext(record, {
+        messageID,
+        text: contextText,
         agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+        contextHash,
+        briefingHash,
       })
-      memberTiming.promptMs = elapsedMs(promptStartedAt)
-      promptedMembers.push({ name, record })
+      memberTiming.injectionMs = elapsedMs(injectionStartedAt)
+      const candidateAt = nowIso()
+      const candidate: OpenCodeAppManagedBootstrapCandidate = {
+        schemaVersion: 1,
+        source: 'app_managed_bootstrap',
+        teamName: teamId,
+        memberName: name,
+        runId,
+        laneId,
+        runtimeSessionId: injected.runtimeSessionId,
+        messageID: injected.messageID,
+        contextHash: injected.contextHash,
+        briefingHash: injected.briefingHash,
+        injectionVerifiedAt: injected.injectionVerifiedAt,
+        candidateAt,
+        model: apiSelectedModel,
+        agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+      }
+      const memberDiagnostics = [
+        injected.alreadyPresent
+          ? 'OpenCode app-managed bootstrap context was already present and verified.'
+          : 'OpenCode app-managed bootstrap context was injected and verified.',
+      ]
+      members[name] = {
+        sessionId: record.opencodeSessionId,
+        launchState: 'created',
+        bootstrapEvidenceSource: 'app_managed_bootstrap',
+        bootstrapMode: 'app_managed_context',
+        appManagedBootstrapCandidate: candidate,
+        ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
+          ? { runtimePid: record.runtimePid }
+          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
+            ? { runtimePid: snapshot.host.pid }
+            : {}),
+        evidence: [{ kind: 'app_managed_bootstrap_context_injected', observedAt: candidateAt }],
+        diagnostics: memberDiagnostics,
+      }
+      diagnostics.push(teamDiagnostic(
+        'opencode_app_managed_bootstrap_context_verified',
+        `${name}: ${memberDiagnostics[0]}`,
+        'info',
+      ))
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
       members[name] = {
@@ -1644,119 +1723,10 @@ async function runLaunchWithProvisioningSnapshot(
     }
   }
 
-  const settledMembers = await mapWithConcurrency(promptedMembers, 3, async ({ name, record }) => {
-    const settleDiagnostics: TeamDiagnostic[] = []
-    const memberTiming = memberTimings.get(name) ?? {}
-    memberTimings.set(name, memberTiming)
-    const previewStartedAt = Date.now()
-    const preview = await openCodeSessionBridge.observePreview(record, {
-      timeoutMs: OPENCODE_LAUNCH_PREVIEW_TIMEOUT_MS,
-      idleTimeoutMs: OPENCODE_LAUNCH_PREVIEW_IDLE_TIMEOUT_MS,
-    }).catch(error => {
-      settleDiagnostics.push(teamDiagnostic(
-        'member_launch_preview_timeout',
-        `${name}: ${error instanceof Error ? error.message : String(error)}`,
-        'info',
-      ))
-      return null
-    })
-    memberTiming.previewMs = elapsedMs(previewStartedAt)
-
-    let reconcileStartedAt = Date.now()
-    try {
-      reconcileStartedAt = Date.now()
-      let reconciled = await withTimeout(
-        openCodeSessionBridge.reconcileSession(record, { limit: 50 }),
-        OPENCODE_LAUNCH_RECONCILE_TIMEOUT_MS,
-      )
-      memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
-      let reconciledRecord = reconciled.record ?? record
-      const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(reconciled.summary)
-      if (bootstrapMcpReadiness.failure) {
-        const repaired = await retryLaunchBootstrapMcpFailure({
-          teamId,
-          memberName: name,
-          runId,
-          record: reconciledRecord,
-          diagnostics: settleDiagnostics,
-          completedTools: bootstrapMcpReadiness.completedTools,
-          missingTools: bootstrapMcpReadiness.missingTools,
-        })
-        if (repaired) {
-          reconciled = repaired.reconciled
-          reconciledRecord = repaired.record
-        }
-      }
-      await openCodeTurnSettledEmissionCoordinator.emitLaunch({
-        record: reconciledRecord,
-        previewSummary: preview?.summary ?? null,
-        reconcileSummary: reconciled.summary,
-      })
-      return { name, record: reconciledRecord, reconciled, diagnostics: settleDiagnostics }
-    } catch (error) {
-      memberTiming.reconcileMs = elapsedMs(reconcileStartedAt)
-      settleDiagnostics.push(teamDiagnostic(
-        'member_launch_reconcile_pending',
-        `${name}: ${error instanceof Error ? error.message : String(error)}`,
-        'warning',
-      ))
-      await openCodeTurnSettledEmissionCoordinator.emitLaunch({
-        record,
-        previewSummary: preview?.summary ?? null,
-        reconcileSummary: null,
-      })
-      return { name, record, reconciled: null, diagnostics: settleDiagnostics }
-    }
-  })
-
-  for (const settled of settledMembers) {
-    const { name, record, reconciled } = settled
-    if (reconciled) {
-      const launchState = bridgeStateFromSummary(reconciled.summary)
-      const bootstrapFailure = summarizeBootstrapMcpFailure(reconciled.summary)
-      const memberDiagnostics = [
-        ...reconciled.summary.diagnostics,
-        ...(bootstrapFailure ? [bootstrapFailure.message] : []),
-      ]
-      members[name] = {
-        sessionId: record.opencodeSessionId,
-        launchState,
-        ...(reconciled.summary.pendingPermissionRequestIds.length > 0
-          ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
-          : {}),
-        ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
-          ? { runtimePid: reconciled.record.runtimePid }
-          : typeof record.runtimePid === 'number' && record.runtimePid > 0
-            ? { runtimePid: record.runtimePid }
-            : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
-              ? { runtimePid: snapshot.host.pid }
-              : {}),
-        evidence: evidenceFromSummary(reconciled.summary),
-        diagnostics: memberDiagnostics,
-      }
-      diagnostics.push(
-        ...memberDiagnostics.map(message => teamDiagnostic('member_reconcile', `${name}: ${message}`, 'warning')),
-      )
-    } else {
-      members[name] = {
-        sessionId: record.opencodeSessionId,
-        launchState: 'created',
-        ...(typeof record.runtimePid === 'number' && record.runtimePid > 0
-          ? { runtimePid: record.runtimePid }
-          : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
-            ? { runtimePid: snapshot.host.pid }
-            : {}),
-        evidence: [{ kind: 'member_prompt_accepted', observedAt: nowIso() }],
-        diagnostics: settled.diagnostics.map(diagnostic => diagnostic.message),
-      }
-    }
-    diagnostics.push(...settled.diagnostics)
-  }
-
   for (const [name, memberTiming] of memberTimings) {
     diagnostics.push(teamDiagnostic(
       'opencode_launch_member_timing',
-      `member=${name} ensureSession=${formatMs(memberTiming.ensureSessionMs)} prompt=${formatMs(memberTiming.promptMs)} preview=${formatMs(memberTiming.previewMs)} reconcile=${formatMs(memberTiming.reconcileMs)}`,
+      `member=${name} ensureSession=${formatMs(memberTiming.ensureSessionMs)} injection=${formatMs(memberTiming.injectionMs)}`,
       'info',
     ))
   }

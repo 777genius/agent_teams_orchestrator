@@ -30,6 +30,7 @@ export type OpenCodeClient = {
   getSession(id: string): Promise<OpenCodeSessionSummary>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatus>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
+  getSessionMessage?(id: string, messageID: string): Promise<OpenCodeMessage | null>
   getPermissions(): Promise<OpenCodePendingPermission[]>
   listExperimentalToolIds(input?: { directory?: string | null; workspace?: string | null }): Promise<string[]>
   listExperimentalTools(input: {
@@ -197,6 +198,24 @@ export class OpenCodeClientFactory {
         request<OpenCodeMessage[]>(
           `/session/${id}/message${typeof limit === 'number' ? `?limit=${limit}` : ''}`,
         ),
+      getSessionMessage: async (id, messageID) => {
+        try {
+          return await request<OpenCodeMessage>(
+            `/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageID)}`,
+          )
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('(404 ')) {
+            const messages = await request<OpenCodeMessage[]>(
+              `/session/${encodeURIComponent(id)}/message`,
+            ).catch(() => [])
+            return messages.find(message => {
+              const info = message.info && typeof message.info === 'object' ? message.info : null
+              return info?.id === messageID
+            }) ?? null
+          }
+          throw error
+        }
+      },
       getPermissions: () =>
         request<OpenCodePendingPermission[]>('/permission', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
       listExperimentalToolIds: input =>

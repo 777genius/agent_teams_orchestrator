@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -85,6 +87,34 @@ function parseProviderScopedModel(selectedModel: string): {
 
 function getMessageId(message: OpenCodeMessage): string | null {
   return asString(asRecord(message.info)?.id)
+}
+
+function getMessageText(message: OpenCodeMessage): string {
+  return message.parts
+    .map(part => typeof part.text === 'string' ? part.text : '')
+    .filter(text => text.length > 0)
+    .join('\n')
+}
+
+function getMessageRole(message: OpenCodeMessage): string | null {
+  const info = asRecord(message.info)
+  return typeof info?.role === 'string' ? info.role : null
+}
+
+function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
+  return message.parts.some((part) => {
+    const record = asRecord(part)
+    const type = typeof record?.type === 'string' ? record.type : ''
+    return type === 'tool' || type === 'permission'
+  })
+}
+
+function hashText(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 export class OpenCodeSessionBridge {
@@ -193,8 +223,10 @@ export class OpenCodeSessionBridge {
     }
   }
 
-  private buildSessionKey(identity: SessionIdentity): string {
-    return `${identity.teamId}::${identity.laneId}::${identity.memberName}`
+  private buildSessionKey(
+    identity: Pick<SessionIdentity, 'teamId' | 'memberName'> & { laneId?: string | null },
+  ): string {
+    return `${identity.teamId}::${identity.laneId?.trim() || 'primary'}::${identity.memberName}`
   }
 
   private async retainSessionHost(
@@ -441,6 +473,7 @@ export class OpenCodeSessionBridge {
     projectPath?: string | null
     preparedProfile?: OpenCodePreparedProfile | null
     runId?: string | null
+    fresh?: boolean
   }): Promise<OpenCodeSessionRecord> {
     const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath)
     const laneId = params.laneId?.trim() || 'primary'
@@ -451,6 +484,7 @@ export class OpenCodeSessionBridge {
       existing.projectPath === profile.projectPath &&
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
+      params.fresh !== true &&
       !existing.staleReason
     ) {
       const host = await this.retainSessionHost(existing, params.runId, profile)
@@ -459,7 +493,9 @@ export class OpenCodeSessionBridge {
 
     if (existing) {
       const staleReason =
-        existing.selectedModel !== params.selectedModel
+        params.fresh === true
+          ? 'fresh_launch_requested'
+          : existing.selectedModel !== params.selectedModel
           ? `model_changed:${existing.selectedModel}->${params.selectedModel}`
           : existing.projectPath !== profile.projectPath
             ? 'project_path_changed'
@@ -517,6 +553,18 @@ export class OpenCodeSessionBridge {
     })
   }
 
+  private async getSessionMessage(
+    client: ReturnType<typeof openCodeClientFactory.create>,
+    sessionId: string,
+    messageID: string,
+  ): Promise<OpenCodeMessage | null> {
+    if (client.getSessionMessage) {
+      return client.getSessionMessage(sessionId, messageID)
+    }
+    const messages = await client.getSessionMessages(sessionId)
+    return messages.find(message => getMessageId(message) === messageID) ?? null
+  }
+
   async sendMessage(
     record: OpenCodeSessionRecord,
     params: {
@@ -535,6 +583,115 @@ export class OpenCodeSessionBridge {
         model: parseProviderScopedModel(record.selectedModel),
         parts: [{ type: 'text', text: params.text }],
       })
+    })
+  }
+
+  async injectAppManagedBootstrapContext(
+    record: OpenCodeSessionRecord,
+    params: {
+      messageID: string
+      text: string
+      agent?: string
+      contextHash: string
+      briefingHash: string
+    },
+  ): Promise<{
+    messageID: string
+    runtimeSessionId: string
+    contextHash: string
+    briefingHash: string
+    injectionVerifiedAt: string
+    alreadyPresent: boolean
+  }> {
+    return this.withSessionHost(record, async ({ baseUrl }) => {
+      const client = this.clientFactory.create(baseUrl)
+      const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
+        if (!message) {
+          throw new Error(`OpenCode app-managed bootstrap context was not found after ${phase}`)
+        }
+        const actualId = getMessageId(message)
+        if (actualId !== params.messageID) {
+          throw new Error(
+            `OpenCode app-managed bootstrap context id mismatch after ${phase}: expected ${params.messageID}, got ${actualId ?? 'missing'}`,
+          )
+        }
+        const actualHash = hashText(getMessageText(message))
+        if (actualHash !== params.contextHash) {
+          throw new Error(
+            `OpenCode app-managed bootstrap context hash mismatch after ${phase}: expected ${params.contextHash}, got ${actualHash}`,
+          )
+        }
+      }
+
+      const existing = await this.getSessionMessage(client, record.opencodeSessionId, params.messageID)
+      if (existing) {
+        assertMessageMatches(existing, 'read-before-send')
+        return {
+          messageID: params.messageID,
+          runtimeSessionId: record.opencodeSessionId,
+          contextHash: params.contextHash,
+          briefingHash: params.briefingHash,
+          injectionVerifiedAt: buildNowIso(),
+          alreadyPresent: true,
+        }
+      }
+
+      const beforeMessages = await client.getSessionMessages(record.opencodeSessionId, 20)
+        .catch(() => [] as OpenCodeMessage[])
+      const beforeMessageIds = new Set(
+        beforeMessages.map(message => getMessageId(message)).filter((id): id is string => id !== null),
+      )
+      // This is a context injection, not a model turn. noReply keeps bootstrap
+      // deterministic; the side-effect check below protects against OpenCode
+      // accidentally producing assistant/tool output that could be mistaken for
+      // launch readiness or a visible teammate reply.
+      await client.sendSessionMessage(record.opencodeSessionId, {
+        messageID: params.messageID,
+        ...(params.agent ? { agent: params.agent } : {}),
+        noReply: true,
+        model: parseProviderScopedModel(record.selectedModel),
+        parts: [{ type: 'text', text: params.text }],
+      })
+
+      let written: OpenCodeMessage | null = null
+      for (const delay of [0, 100, 250, 500]) {
+        if (delay > 0) {
+          await delayMs(delay)
+        }
+        written = await this.getSessionMessage(client, record.opencodeSessionId, params.messageID)
+        if (written) {
+          break
+        }
+      }
+      assertMessageMatches(written, 'read-after-send')
+      const recentMessages = await client.getSessionMessages(record.opencodeSessionId, 20)
+        .catch(() => [] as OpenCodeMessage[])
+      const sideEffect = recentMessages.find((message) => {
+        const id = getMessageId(message)
+        if (!id || id === params.messageID || beforeMessageIds.has(id)) {
+          return false
+        }
+        const parentId = asString(asRecord(message.info)?.parentID)
+        if (parentId !== params.messageID) {
+          return false
+        }
+        const role = getMessageRole(message)
+        return role === 'assistant' || messageHasNoReplySideEffectParts(message)
+      })
+      if (sideEffect) {
+        throw new Error(
+          `OpenCode app-managed noReply bootstrap produced a side-effect message ${getMessageId(sideEffect) ?? 'unknown'}`,
+        )
+      }
+
+      return {
+        messageID: params.messageID,
+        runtimeSessionId: record.opencodeSessionId,
+        contextHash: params.contextHash,
+        briefingHash: params.briefingHash,
+        injectionVerifiedAt: buildNowIso(),
+        alreadyPresent: false,
+      }
     })
   }
 

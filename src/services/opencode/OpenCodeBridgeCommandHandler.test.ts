@@ -1638,6 +1638,72 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(callOrder).toEqual(['mcp:alice', 'prompt:alice'])
   })
 
+  test('recreates launch session after app MCP is attached before bootstrap prompt', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    let ensureCount = 0
+    const callOrder: string[] = []
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureCount += 1
+      const record = buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${ensureCount}`,
+      })
+      callOrder.push(`ensure:${record.opencodeSessionId}`)
+      return record
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      callOrder.push(`mcp:${record.opencodeSessionId}`)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: record.opencodeSessionId === 'session-1' ? 'attached' : 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionStore.markStale = (async (_teamId, _laneId, _memberName, reason) => {
+      callOrder.push(`stale:${reason}`)
+      return null
+    }) as typeof openCodeSessionStore.markStale
+    openCodeSessionBridge.promptAsync = (async record => {
+      callOrder.push(`prompt:${record.opencodeSessionId}`)
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-mcp-attached-recreate',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(callOrder).toEqual([
+      'ensure:session-1',
+      'mcp:session-1',
+      'stale:app_mcp_attached_after_session_create',
+      'ensure:session-2',
+      'mcp:session-2',
+      'prompt:session-2',
+    ])
+    if (result.ok) {
+      expect(result.data.members.alice?.sessionId).toBe('session-2')
+      expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+        'opencode_launch_session_recreated_after_mcp_attach',
+      )
+    }
+  })
+
   test('does not send launch bootstrap prompt when session app MCP cannot attach', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>

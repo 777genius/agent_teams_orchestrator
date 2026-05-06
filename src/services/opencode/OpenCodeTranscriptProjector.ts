@@ -8,6 +8,7 @@ import type {
   OpenCodeMessagePart,
   OpenCodeTranscriptProjection,
 } from './types.js'
+import { isOpenCodeAppManagedBootstrapMessage } from './OpenCodeAppManagedBootstrapMessage.js'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -301,7 +302,9 @@ export class OpenCodeTranscriptProjector {
     sessionId: string
     messages: OpenCodeMessage[]
   }): OpenCodeTranscriptProjection {
-    const messages = params.messages.map(projectMessage)
+    const messages = params.messages
+      .filter(message => !isOpenCodeAppManagedBootstrapMessage(message))
+      .map(projectMessage)
     return {
       sessionId: params.sessionId,
       messageCount: messages.length,
