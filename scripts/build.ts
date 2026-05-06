@@ -384,7 +384,6 @@ if (compile) {
     '--outfile',
     outfile,
     '--minify',
-    '--bytecode',
     '--packages',
     'bundle',
     '--conditions',
