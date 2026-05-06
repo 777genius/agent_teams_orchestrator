@@ -3,13 +3,13 @@ import { type ChildProcess } from 'node:child_process'
 import net from 'node:net'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import envPaths from 'env-paths'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { sleep } from '../../utils/sleep.js'
 import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type {
   OpenCodeHostHandle,
@@ -215,7 +215,7 @@ async function fetchJson(
 }
 
 function defaultPersistentRegistryPath(): string {
-  const paths = envPaths('claude-multimodel')
+  const paths = resolveClaudeMultimodelPaths()
   return path.join(paths.data, 'opencode', 'host-registry.json')
 }
 

@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readlink, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -13,6 +13,10 @@ import {
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+} from './OpenCodeManagedPaths.js'
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
@@ -135,6 +139,47 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         delete process.env.XDG_DATA_HOME
       } else {
         process.env.XDG_DATA_HOME = previousXdgDataHome
+      }
+    }
+  })
+
+  test('keeps generated OpenCode dependency caches outside per-profile HOME', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data')
+    const appCacheHome = path.join(tempDir, 'app-cache')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    try {
+      const manager = new OpenCodeProfileManager()
+      const profile = await manager.prepareProfile(path.join(tempDir, 'project'))
+      const profileNodeModulesPath = path.join(profile.xdgConfigHome, 'opencode', 'node_modules')
+      const sharedNodeModulesPath = path.join(profile.xdgCacheHome, 'config-node_modules')
+      const nodeModulesStat = await lstat(profileNodeModulesPath)
+      const nodeModulesTarget = await readlink(profileNodeModulesPath)
+      const appMcpConfig = (
+        profile.managedConfig.mcp as Record<string, { environment?: Record<string, string> }>
+      )?.['agent-teams']
+
+      expect(profile.profileRootPath.startsWith(path.join(appDataHome, 'opencode', 'profiles'))).toBe(true)
+      expect(profile.xdgCacheHome).toBe(path.join(appCacheHome, 'opencode', 'shared-cache'))
+      expect(profile.env.NPM_CONFIG_CACHE).toBe(path.join(profile.xdgCacheHome, 'npm'))
+      expect(profile.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
+      expect(profile.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(appCacheHome)
+      expect(appMcpConfig?.environment?.[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
+      expect(appMcpConfig?.environment?.[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(appCacheHome)
+      expect(nodeModulesStat.isSymbolicLink()).toBe(true)
+      expect(path.resolve(path.dirname(profileNodeModulesPath), nodeModulesTarget)).toBe(sharedNodeModulesPath)
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
       }
     }
   })

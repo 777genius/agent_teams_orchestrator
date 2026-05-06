@@ -1,5 +1,4 @@
 import { Database } from 'bun:sqlite'
-import envPaths from 'env-paths'
 import { stat } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -8,6 +7,7 @@ import {
   isOpenCodeWorkspaceSameOrDescendant,
   normalizeOpenCodeFilePath,
 } from './OpenCodeBridgePath.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeMessage, OpenCodeSessionRecord } from './types.js'
 
@@ -168,7 +168,7 @@ export class OpenCodeOfflineSessionReader {
     if (!isSafeProfileRootKey(profileRootKey)) {
       return null
     }
-    const profileRoot = path.join(envPaths('claude-multimodel').data, 'opencode', 'profiles')
+    const profileRoot = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'profiles')
     const dbPath = path.resolve(
       profileRoot,
       profileRootKey,

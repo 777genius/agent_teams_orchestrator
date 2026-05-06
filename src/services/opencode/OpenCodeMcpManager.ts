@@ -1,6 +1,10 @@
 import path from 'node:path'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+} from './OpenCodeManagedPaths.js'
 
 import type {
   OpenCodeAppMcpLaunchSource,
@@ -34,10 +38,14 @@ const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'LC_ALL',
   'CLAUDE_TEAM_CONTROL_URL',
   'AGENT_TEAMS_MCP_CLAUDE_DIR',
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
 ] as const
 const OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS = [
   'CLAUDE_TEAM_CONTROL_URL',
   'AGENT_TEAMS_MCP_CLAUDE_DIR',
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
 ] as const
 
 export type ResolvedAppMcpLaunchConfig = {

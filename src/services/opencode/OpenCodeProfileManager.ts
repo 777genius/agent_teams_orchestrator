@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, stat } from 'node:fs/promises'
+import { lstat, mkdir, readlink, readdir, readFile, rm, stat, symlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import envPaths from 'env-paths'
 import type { Dirent } from 'node:fs'
 
 import { getCwd } from '../../utils/cwd.js'
@@ -23,6 +22,11 @@ import {
 import {
   readOpenCodeManagedRuntimePreferences,
 } from './OpenCodeManagedPreferences.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+  resolveClaudeMultimodelPaths,
+} from './OpenCodeManagedPaths.js'
 import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
@@ -82,6 +86,40 @@ async function fileExists(filePath: string): Promise<boolean> {
     return true
   } catch {
     return false
+  }
+}
+
+async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
+  await mkdir(targetPath, { recursive: true })
+  await mkdir(path.dirname(linkPath), { recursive: true })
+
+  try {
+    const existing = await lstat(linkPath)
+    if (existing.isSymbolicLink()) {
+      const currentTarget = await readlink(linkPath)
+      const resolvedTarget = path.resolve(path.dirname(linkPath), currentTarget)
+      if (resolvedTarget === targetPath) {
+        return
+      }
+    }
+    await rm(linkPath, { recursive: true, force: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+
+  try {
+    await symlink(targetPath, linkPath, 'dir')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw error
+    }
+    const currentTarget = await readlink(linkPath)
+    const resolvedTarget = path.resolve(path.dirname(linkPath), currentTarget)
+    if (resolvedTarget !== targetPath) {
+      throw error
+    }
   }
 }
 
@@ -284,6 +322,28 @@ export function buildManagedConfig(
   return config
 }
 
+function applyManagedPathEnvironmentToMcpConfig(
+  managedConfig: Record<string, unknown>,
+  environment: Record<string, string>,
+): void {
+  const mcpConfig = asRecord(managedConfig.mcp)
+  if (!(OPEN_CODE_APP_MCP_SERVER_NAME in mcpConfig)) {
+    return
+  }
+
+  const appMcpConfig = {
+    ...asRecord(mcpConfig[OPEN_CODE_APP_MCP_SERVER_NAME]),
+  }
+  appMcpConfig.environment = {
+    ...asRecord(appMcpConfig.environment),
+    ...environment,
+  }
+  managedConfig.mcp = {
+    ...mcpConfig,
+    [OPEN_CODE_APP_MCP_SERVER_NAME]: appMcpConfig,
+  }
+}
+
 function normalizeManagedConfigForFingerprint(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(item => normalizeManagedConfigForFingerprint(item))
@@ -336,7 +396,7 @@ export function orderOpenCodeAuthSyncSources(input: {
 }
 
 export class OpenCodeProfileManager {
-  private readonly paths = envPaths('claude-multimodel')
+  private readonly paths = resolveClaudeMultimodelPaths()
 
   private getSourceAuthPaths(): string[] {
     const xdgDataHome =
@@ -406,11 +466,18 @@ export class OpenCodeProfileManager {
       defaultModelId: managedRuntimePreferences.defaultModelId,
       modelOutputLimitOverrides: options.modelOutputLimitOverrides,
     })
+    applyManagedPathEnvironmentToMcpConfig(managedConfig, {
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+    })
     const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')
     const xdgConfigHome = path.join(profileRootPath, 'config')
     const xdgDataHome = path.join(profileRootPath, 'data')
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
+    const sharedNpmCachePath = path.join(xdgCacheHome, 'npm')
+    const sharedOpenCodeNodeModulesPath = path.join(xdgCacheHome, 'config-node_modules')
+    const profileOpenCodeNodeModulesPath = path.join(xdgConfigHome, 'opencode', 'node_modules')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
     const globalAuthPath = this.getGlobalAuthPath()
     const sourceAuthSources = await Promise.all(
@@ -428,7 +495,9 @@ export class OpenCodeProfileManager {
       mkdir(xdgConfigHome, { recursive: true }),
       mkdir(path.join(xdgDataHome, 'opencode'), { recursive: true }),
       mkdir(xdgCacheHome, { recursive: true }),
+      mkdir(sharedNpmCachePath, { recursive: true }),
     ])
+    await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
 
     const globalAuthExists = await fileExists(globalAuthPath)
     const globalAuthFingerprint = globalAuthExists
@@ -506,6 +575,9 @@ export class OpenCodeProfileManager {
         XDG_CONFIG_HOME: xdgConfigHome,
         XDG_DATA_HOME: xdgDataHome,
         XDG_CACHE_HOME: xdgCacheHome,
+        NPM_CONFIG_CACHE: sharedNpmCachePath,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
         OPENCODE_DISABLE_CLAUDE_CODE: '1',
         OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
       }),

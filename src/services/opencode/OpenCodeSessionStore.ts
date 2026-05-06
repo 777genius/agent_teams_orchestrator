@@ -1,9 +1,9 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import envPaths from 'env-paths'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -40,7 +40,7 @@ export class OpenCodeSessionStore {
   private readonly lockPath: string
 
   constructor(filePath?: string) {
-    const paths = envPaths('claude-multimodel')
+    const paths = resolveClaudeMultimodelPaths()
     this.filePath = filePath ?? path.join(paths.data, 'opencode', 'session-store.json')
     this.lockPath = `${this.filePath}.lock`
   }

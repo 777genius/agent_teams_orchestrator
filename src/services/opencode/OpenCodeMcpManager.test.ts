@@ -6,6 +6,10 @@ import {
   OpenCodeMcpManager,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
+import {
+  CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
+  CLAUDE_MULTIMODEL_DATA_HOME_ENV,
+} from './OpenCodeManagedPaths.js'
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
@@ -314,6 +318,8 @@ describe('OpenCodeMcpManager', () => {
         PATH: '/usr/local/bin:/usr/bin',
         CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
         AGENT_TEAMS_MCP_CLAUDE_DIR: '/Users/test/.claude',
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: '/Users/test/Library/Application Support/claude-multimodel-nodejs',
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: '/Users/test/Library/Caches/claude-multimodel-nodejs',
       },
       pathExists: async () => false,
     })
@@ -328,6 +334,8 @@ describe('OpenCodeMcpManager', () => {
         PATH: '/usr/local/bin:/usr/bin',
         CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
         AGENT_TEAMS_MCP_CLAUDE_DIR: '/Users/test/.claude',
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: '/Users/test/Library/Application Support/claude-multimodel-nodejs',
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: '/Users/test/Library/Caches/claude-multimodel-nodejs',
       },
     })
     expect(result.config.environment?.SAFE_ENV).toBeUndefined()
