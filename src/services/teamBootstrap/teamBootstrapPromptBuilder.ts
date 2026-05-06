@@ -3,6 +3,7 @@ import { readTeamFileAsync, sanitizeName } from 'src/utils/swarm/teamHelpers.js'
 import { listTasks } from 'src/utils/tasks.js'
 import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import type { TeamBootstrapSpec } from './teamBootstrapTypes.js'
+import { buildNativeAppManagedBootstrapPrivatePrompt } from './nativeAppManagedBootstrapContext.js'
 
 export function buildAgentLanguageInstruction(agentLanguage?: string): string {
   const trimmed = agentLanguage?.trim()
@@ -91,6 +92,10 @@ export async function buildDeterministicBootstrapMemberPrompt(params: {
   leadName?: string
   assignedWorkMembers?: Set<string>
 }): Promise<string> {
+  if (params.member.nativeAppManagedBootstrap) {
+    return buildNativeAppManagedBootstrapPrivatePrompt()
+  }
+
   // Native persistent-teammate bootstrap only. OpenCode runtime identity and
   // member_briefing(runtimeProvider: "opencode") are injected by the bridge.
   const displayName = params.spec.team.displayName?.trim() || params.spec.team.name

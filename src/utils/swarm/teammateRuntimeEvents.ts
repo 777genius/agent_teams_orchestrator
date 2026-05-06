@@ -18,6 +18,7 @@ export type TeammateRuntimeEventType =
   | 'runtime_ready'
   | 'inbox_poller_ready'
   | 'bootstrap_submitted'
+  | 'bootstrap_context_loaded'
   | 'bootstrap_confirmed'
   | 'heartbeat'
   | 'failed'
@@ -35,6 +36,8 @@ export type TeammateRuntimeEvent = {
   cwd?: string
   source?: string
   bootstrapProofToken?: string
+  contextHash?: string
+  briefingHash?: string
   bootstrapMessageId?: string
   bootstrapMirrorId?: string
   detail?: string
@@ -78,6 +81,8 @@ export async function writeTeammateRuntimeEvent(params: {
   cwd?: string
   source?: string
   bootstrapProofToken?: string
+  contextHash?: string
+  briefingHash?: string
   bootstrapMessageId?: string
   bootstrapMirrorId?: string
   detail?: string
@@ -101,6 +106,8 @@ export async function writeTeammateRuntimeEvent(params: {
     ...(params.bootstrapProofToken
       ? { bootstrapProofToken: params.bootstrapProofToken }
       : {}),
+    ...(params.contextHash ? { contextHash: params.contextHash } : {}),
+    ...(params.briefingHash ? { briefingHash: params.briefingHash } : {}),
     ...(params.bootstrapMessageId
       ? { bootstrapMessageId: params.bootstrapMessageId }
       : {}),

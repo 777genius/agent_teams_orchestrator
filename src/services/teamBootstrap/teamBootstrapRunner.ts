@@ -628,6 +628,10 @@ export async function runTeamBootstrap(params: {
                 ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
                 ...(member.agentType ? { agent_type: member.agentType } : {}),
                 ...(member.description ? { description: member.description } : {}),
+                ...(member.nativeAppManagedBootstrap
+                  ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
+                  : {}),
+                bootstrapRunId: params.request.runId,
                 ...(member.useSplitPane !== undefined
                   ? { use_splitpane: member.useSplitPane }
                   : {}),

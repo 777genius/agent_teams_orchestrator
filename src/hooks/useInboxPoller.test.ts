@@ -1220,6 +1220,172 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'schedule_cooldown' })
   })
 
+  test('lifecycle - native app-managed bootstrap finalizes after private response proof', () => {
+    const submitted = createUserMessage({
+      content: '<agent_teams_native_app_managed_bootstrap_check>',
+      isMeta: true,
+      uuid: 'native-bootstrap-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'Startup context received.', type: 'text' } as never,
+      ],
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          nativeAppManaged: {
+            bootstrapProofToken: 'proof-token',
+            briefingHash: 'briefing-hash',
+            contextHash: 'context-hash',
+            runId: 'run-native-bootstrap',
+          },
+          status: 'in_flight',
+          submitUserMessageUuid: 'native-bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: '<agent_teams_native_app_managed_bootstrap_check>',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
+  })
+
+  test('lifecycle - native app-managed bootstrap treats non-error prose as proof', () => {
+    const submitted = createUserMessage({
+      content: '<agent_teams_native_app_managed_bootstrap_check>',
+      isMeta: true,
+      uuid: 'native-bootstrap-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: 'Startup context received. I see no API errors.', type: 'text' } as never,
+      ],
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          nativeAppManaged: {
+            bootstrapProofToken: 'proof-token',
+            briefingHash: 'briefing-hash',
+            contextHash: 'context-hash',
+            runId: 'run-native-bootstrap',
+          },
+          status: 'in_flight',
+          submitUserMessageUuid: 'native-bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: '<agent_teams_native_app_managed_bootstrap_check>',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
+  })
+
+  test('lifecycle - native app-managed bootstrap keeps empty assistant turn retryable', () => {
+    const submitted = createUserMessage({
+      content: '<agent_teams_native_app_managed_bootstrap_check>',
+      isMeta: true,
+      uuid: 'native-bootstrap-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        { text: '(no content)', type: 'text' } as never,
+      ],
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          nativeAppManaged: {
+            bootstrapProofToken: 'proof-token',
+            briefingHash: 'briefing-hash',
+            contextHash: 'context-hash',
+            runId: 'run-native-bootstrap',
+          },
+          status: 'in_flight',
+          submitUserMessageUuid: 'native-bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: '<agent_teams_native_app_managed_bootstrap_check>',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown' })
+  })
+
+  test('lifecycle - native app-managed bootstrap fails on terminal provider error', () => {
+    const submitted = createUserMessage({
+      content: '<agent_teams_native_app_managed_bootstrap_check>',
+      isMeta: true,
+      uuid: 'native-bootstrap-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Please run /login',
+      errorDetails: 'API Error: 401 invalid authentication credentials',
+    })
+
+    expect(
+      getBootstrapProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          nativeAppManaged: {
+            bootstrapProofToken: 'proof-token',
+            briefingHash: 'briefing-hash',
+            contextHash: 'context-hash',
+            runId: 'run-native-bootstrap',
+          },
+          status: 'in_flight',
+          submitUserMessageUuid: 'native-bootstrap-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingBootstrapMessage: {
+          id: 'row-1',
+          messageId: 'mailbox-1',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: '<agent_teams_native_app_managed_bootstrap_check>',
+        },
+      }),
+    ).toEqual({
+      type: 'fail',
+      detail: 'API Error: 401 invalid authentication credentials',
+    })
+  })
+
   test('lifecycle - in-flight row without post-submit activity stays in processing', () => {
     const submitted = createUserMessage({
       content: 'bootstrap handoff',

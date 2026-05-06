@@ -211,7 +211,7 @@ describe('team bootstrap early-failure durability', () => {
     if (result.ok) {
       throw new Error('expected fatal bootstrap result')
     }
-    expect(result.error).toContain('boom')
+    expect((result as { ok: false; error: string }).error).toContain('boom')
 
     const teamDir = path.join(
       tempDir,
@@ -231,6 +231,115 @@ describe('team bootstrap early-failure durability', () => {
 })
 
 describe('team bootstrap readiness contract', () => {
+  test('passes native app-managed bootstrap context to teammate spawn', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-native-'))
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    const teamName = `team-${Date.now()}`
+    const agentId = `alice@${teamName}`
+    const nativeAppManagedBootstrap = {
+      schemaVersion: 1 as const,
+      mode: 'startup_context_file' as const,
+      contextText: '<context>native briefing</context>',
+      contextHash: 'a'.repeat(64),
+      briefingHash: 'b'.repeat(64),
+      generatedAt: '2026-05-01T19:56:38.000Z',
+    }
+    let capturedNativeContextHash: string | undefined
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            {
+              name: 'alice',
+              agentId,
+              bootstrapExpectedAfter: '2026-05-01T19:56:38.000Z',
+            },
+          ],
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async input => {
+        capturedNativeContextHash =
+          input.nativeAppManagedBootstrap?.contextHash
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name: 'alice',
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: 'process:1234',
+            backend_type: 'process',
+            runtime_pid: 1234,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId: 'run-native-context',
+        requestHash: 'hash-native-context',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+            provider: 'anthropic',
+            nativeAppManagedBootstrap,
+          },
+        ],
+        bootstrapTimeoutMs: 50,
+        continueOnPartialFailure: false,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    expect(capturedNativeContextHash).toBe(nativeAppManagedBootstrap.contextHash)
+  })
+
   test('registered teammate without bootstrap confirmation fails instead of completed', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-ready-'))
     tempDirs.push(tempDir)

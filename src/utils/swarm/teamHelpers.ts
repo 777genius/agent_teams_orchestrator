@@ -86,6 +86,10 @@ export type TeamFile = {
     joinedAt: number
     bootstrapExpectedAfter?: string
     bootstrapProofToken?: string
+    bootstrapRunId?: string
+    bootstrapProofMode?: 'member_briefing_tool' | 'native_app_managed_context'
+    bootstrapContextHash?: string
+    bootstrapBriefingHash?: string
     bootstrapRuntimeEventsPath?: string
     tmuxPaneId: string
     cwd: string
@@ -365,6 +369,10 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.joinedAt === b.joinedAt &&
     a.bootstrapExpectedAfter === b.bootstrapExpectedAfter &&
     a.bootstrapProofToken === b.bootstrapProofToken &&
+    a.bootstrapRunId === b.bootstrapRunId &&
+    a.bootstrapProofMode === b.bootstrapProofMode &&
+    a.bootstrapContextHash === b.bootstrapContextHash &&
+    a.bootstrapBriefingHash === b.bootstrapBriefingHash &&
     a.bootstrapRuntimeEventsPath === b.bootstrapRuntimeEventsPath &&
     a.tmuxPaneId === b.tmuxPaneId &&
     a.cwd === b.cwd &&

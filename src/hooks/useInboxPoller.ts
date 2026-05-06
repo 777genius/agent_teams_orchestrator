@@ -18,7 +18,6 @@ import type { Tool } from '../Tool.js'
 import { isInProcessTeammateTask } from '../tasks/InProcessTeammateTask/types.js'
 import { assembleToolPool, getAllBaseTools } from '../tools.js'
 import { SEND_MESSAGE_TOOL_NAME } from '../tools/SendMessageTool/constants.js'
-import { isDeferredTool } from '../tools/ToolSearchTool/prompt.js'
 import type { PermissionUpdate } from '../types/permissions.js'
 import { logForDebugging } from '../utils/debug.js'
 import {
@@ -88,6 +87,12 @@ import {
   processMailboxPermissionResponse,
   processSandboxPermissionResponse,
 } from './useSwarmPermissionPoller.js'
+import type { GetNativeAppManagedBootstrapContextInjection } from './useNativeAppManagedBootstrapContextInjection.js'
+import {
+  buildNativeAppManagedBootstrapPrivatePrompt,
+  isNativeAppManagedBootstrapInstructionText,
+  NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,
+} from '../services/teamBootstrap/nativeAppManagedBootstrapContext.js'
 
 /**
  * Get the agent name to poll for messages.
@@ -145,6 +150,11 @@ export type InboxPromptSubmitResult = {
   userMessageUuid?: string
 }
 
+export type InboxPromptSubmitOptions = {
+  isMeta?: boolean
+  prefixMessages?: AppState['messages']
+}
+
 export type AgentErrorUserNotification = Pick<
   TeammateMessage,
   'messageId' | 'from' | 'text' | 'timestamp' | 'color' | 'summary' | 'messageKind'
@@ -160,8 +170,9 @@ type Props = {
   // Dead code elimination: parameter named onSubmitMessage to avoid "teammate" string in external builds
   onSubmitMessage: (
     formatted: string,
-    options?: { isMeta?: boolean },
+    options?: InboxPromptSubmitOptions,
   ) => InboxPromptSubmitResult
+  getNativeAppManagedBootstrapContextInjection?: GetNativeAppManagedBootstrapContextInjection
   onAgentErrorNotification: (message: AgentErrorUserNotification) => void
 }
 
@@ -174,8 +185,8 @@ type PendingInboxMirrorMessage = Pick<
   | 'text'
   | 'timestamp'
   | 'status'
-  | 'messageKind'
->
+> &
+  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind'>>
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
 
@@ -429,7 +440,8 @@ function isUserReplyToolUse(
     return false
   }
 
-  if (block.input.to.trim().toLowerCase() !== 'user') {
+  const toolInput = block.input as { to: string; teamName?: unknown }
+  if (toolInput.to.trim().toLowerCase() !== 'user') {
     return false
   }
 
@@ -438,7 +450,7 @@ function isUserReplyToolUse(
   )
   if (
     hasPrefixedAgentTeamsName &&
-    hasConflictingAgentTeamsMessageSendTeamName(block.input, expectedTeamName)
+    hasConflictingAgentTeamsMessageSendTeamName(toolInput, expectedTeamName)
   ) {
     return false
   }
@@ -447,7 +459,7 @@ function isUserReplyToolUse(
     block.name === SEND_MESSAGE_TOOL_NAME ||
     hasPrefixedAgentTeamsName ||
     (block.name.trim().toLowerCase() === 'message_send' &&
-      hasMatchingAgentTeamsMessageSendTeamName(block.input, expectedTeamName))
+      hasMatchingAgentTeamsMessageSendTeamName(toolInput, expectedTeamName))
   )
 }
 
@@ -627,6 +639,13 @@ function findBootstrapMemberBriefingTool(
   return tools.find(tool => isMemberBriefingToolName(tool.name))
 }
 
+function isDeferredBootstrapTool(tool: BootstrapToolDescriptor): boolean {
+  if (tool.alwaysLoad === true) {
+    return false
+  }
+  return tool.isMcp === true || tool.shouldDefer === true
+}
+
 export function isBootstrapMemberBriefingCallableNow({
   toolSearchEnabledOptimistic,
   tools,
@@ -643,7 +662,7 @@ export function isBootstrapMemberBriefingCallableNow({
     return true
   }
 
-  return !isDeferredTool(tool)
+  return !isDeferredBootstrapTool(tool)
 }
 
 export function getBootstrapReadinessDecision({
@@ -795,6 +814,101 @@ export function findBootstrapAttemptOutcome({
   }
 
   return 'none'
+}
+
+type NativeAppManagedBootstrapAttemptOutcome =
+  | { type: 'confirmed' }
+  | { type: 'fatal'; detail: string }
+  | { type: 'none' }
+
+function normalizeAssistantText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function isUsableNativeAppManagedBootstrapText(text: string): boolean {
+  const normalized = normalizeAssistantText(text).toLowerCase()
+  return (
+    normalized.length > 0 &&
+    normalized !== '(no content)' &&
+    normalized !== 'no response requested.' &&
+    getNativeAppManagedBootstrapFatalText(text) == null
+  )
+}
+
+function getNativeAppManagedBootstrapFatalText(text: string): string | null {
+  const trimmed = text.trim()
+  const normalized = normalizeAssistantText(trimmed).toLowerCase()
+  if (!normalized) {
+    return null
+  }
+  const terminalPrefixes = [
+    'api error',
+    'apierror',
+    'token refresh failed',
+    'unauthorized',
+    'authentication_error',
+    'invalid authentication',
+    'forbidden',
+  ]
+  return terminalPrefixes.some(prefix => normalized.startsWith(prefix))
+    ? trimmed
+    : null
+}
+
+export function findNativeAppManagedBootstrapAttemptOutcome({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): NativeAppManagedBootstrapAttemptOutcome {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return { type: 'none' }
+  }
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        continue
+      }
+      break
+    }
+    if (message.type !== 'assistant') {
+      continue
+    }
+    if (message.isApiErrorMessage === true) {
+      const errorDetails =
+        'errorDetails' in message && typeof message.errorDetails === 'string'
+          ? message.errorDetails
+          : undefined
+      const text = extractAssistantText(message)
+      return { type: 'fatal', detail: errorDetails || text || 'API error' }
+    }
+
+    const textParts: string[] = []
+    for (const block of message.message.content) {
+      if (block.type === 'text' && typeof block.text === 'string') {
+        textParts.push(block.text)
+      }
+    }
+    const text = textParts.join('\n\n')
+    if (isUsableNativeAppManagedBootstrapText(text)) {
+      return { type: 'confirmed' }
+    }
+    const fatalText = getNativeAppManagedBootstrapFatalText(text)
+    if (fatalText) {
+      return { type: 'fatal', detail: fatalText }
+    }
+  }
+
+  return { type: 'none' }
 }
 
 export function findOrdinaryDirectReplyOutcome({
@@ -1078,6 +1192,12 @@ type BootstrapAttemptState = {
   cooldownUntil: number
   status: 'in_flight' | 'cooling_down'
   timer: ReturnType<typeof setTimeout> | null
+  nativeAppManaged?: {
+    contextHash: string
+    briefingHash: string
+    bootstrapProofToken: string
+    runId: string
+  }
 }
 type BootstrapReadinessWaitState = {
   startedAt: number
@@ -1136,6 +1256,43 @@ export function getBootstrapProcessingAction({
 
   if (!attempt) {
     return { type: 'reset_to_pending' }
+  }
+
+  if (attempt.nativeAppManaged) {
+    const nativeOutcome = findNativeAppManagedBootstrapAttemptOutcome({
+      messages,
+      submitUserMessageUuid: attempt.submitUserMessageUuid,
+    })
+    if (nativeOutcome.type === 'confirmed') {
+      return { type: 'finalize' }
+    }
+    if (nativeOutcome.type === 'fatal') {
+      return { type: 'fail', detail: nativeOutcome.detail }
+    }
+    const executionError = findBootstrapAttemptExecutionError({
+      messages,
+      submitUserMessageUuid: attempt.submitUserMessageUuid,
+    })
+    if (
+      executionError &&
+      isFatalBootstrapAttemptExecutionError(executionError)
+    ) {
+      return { type: 'fail', detail: executionError.detail }
+    }
+
+    if (attempt.status === 'in_flight') {
+      if (
+        !hasAttemptObservedPostSubmitActivity({
+          messages,
+          submitUserMessageUuid: attempt.submitUserMessageUuid,
+        })
+      ) {
+        return { type: 'noop' }
+      }
+      return { type: 'schedule_cooldown' }
+    }
+
+    return { type: 'noop' }
   }
 
   const outcome = findBootstrapAttemptOutcome({
@@ -1314,6 +1471,7 @@ export function useInboxPoller({
   getMessages,
   transcriptActivitySignature,
   onSubmitMessage,
+  getNativeAppManagedBootstrapContextInjection,
   onAgentErrorNotification,
 }: Props): void {
   // Assign to original name for clarity within the function
@@ -1404,13 +1562,16 @@ export function useInboxPoller({
         }))
       }
 
-      const mirroredMessageIds = new Set(
+      const mirroredMessageIds = new Set<string>(
         currentAppState.inbox.messages
           .filter(message =>
             isLiveInboxMirrorMessageOwnedBySession(message, sessionId),
           )
           .map(message => message.messageId)
-          .filter((messageId): messageId is string => !!messageId),
+          .filter(
+            (messageId): messageId is string =>
+              typeof messageId === 'string' && messageId.length > 0,
+          ),
       )
       const { regularClaimed: claimedRegularMessages, protocolUnread: unread } =
         await readAndClaimInteractiveMailboxSnapshot(
@@ -2009,9 +2170,12 @@ export function useInboxPoller({
                   backendType === 'process' ||
                   parsed.paneId!.trim().startsWith('process:')
                 ) {
-                  const expectedAgentId = Object.entries(
+                  const teammateEntries = Object.entries(
                     currentAppState.teamContext?.teammates ?? {},
-                  ).find(([, teammate]) => teammate.name === parsed.from)?.[0] ??
+                  ) as Array<[string, { name?: string }]>
+                  const expectedAgentId = teammateEntries.find(
+                    ([, teammate]) => teammate.name === parsed.from,
+                  )?.[0] ??
                     (teamName
                       ? readTeamFile(teamName)?.members.find(
                           member => member.name === parsed.from,
@@ -2056,9 +2220,11 @@ export function useInboxPoller({
 
           const teammateToRemove = parsed.from
           if (teammateToRemove && currentAppState.teamContext?.teammates) {
-            const teammateId = Object.entries(
+            const teammateId = (Object.entries(
               currentAppState.teamContext.teammates,
-            ).find(([, t]) => t.name === teammateToRemove)?.[0]
+            ) as Array<[string, { name?: string }]>).find(
+              ([, t]) => t.name === teammateToRemove,
+            )?.[0]
 
             if (teammateId) {
               if (teamName) {
@@ -2670,7 +2836,24 @@ export function useInboxPoller({
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
-            runId: sessionId,
+            runId: attempt.nativeAppManaged?.runId ?? sessionId,
+            ...(attempt.nativeAppManaged
+              ? {
+                  source: NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,
+                  bootstrapProofToken:
+                    attempt.nativeAppManaged.bootstrapProofToken,
+                  contextHash: attempt.nativeAppManaged.contextHash,
+                  briefingHash: attempt.nativeAppManaged.briefingHash,
+                  detail: JSON.stringify({
+                    source: NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,
+                    bootstrapProofToken:
+                      attempt.nativeAppManaged.bootstrapProofToken,
+                    contextHash: attempt.nativeAppManaged.contextHash,
+                    briefingHash: attempt.nativeAppManaged.briefingHash,
+                    runId: attempt.nativeAppManaged.runId,
+                  }),
+                }
+              : {}),
           })
         }
 
@@ -2726,7 +2909,7 @@ export function useInboxPoller({
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
-            runId: sessionId,
+            runId: attempt.nativeAppManaged?.runId ?? sessionId,
             detail,
           })
         }
@@ -2873,14 +3056,19 @@ export function useInboxPoller({
 
       const bootstrapPrompt =
         bootstrapPendingMessage != null
-          ? getBootstrapInlineHandoffPrompt({
-              bootstrapInstructionText: bootstrapPendingMessage.text,
-              memberName: currentAppState.teamContext?.selfAgentName,
-              teamName: currentAppState.teamContext?.teamName,
-            })
+          ? isNativeAppManagedBootstrapInstructionText(bootstrapPendingMessage.text)
+            ? buildNativeAppManagedBootstrapPrivatePrompt()
+            : getBootstrapInlineHandoffPrompt({
+                bootstrapInstructionText: bootstrapPendingMessage.text,
+                memberName: currentAppState.teamContext?.selfAgentName,
+                teamName: currentAppState.teamContext?.teamName,
+              })
           : null
 
       if (bootstrapPendingMessage?.messageId) {
+        const nativeAppManagedBootstrap = isNativeAppManagedBootstrapInstructionText(
+          bootstrapPendingMessage.text,
+        )
         const effectiveTools = assembleToolPool(
           currentAppState.toolPermissionContext,
           currentAppState.mcp.tools,
@@ -2895,7 +3083,7 @@ export function useInboxPoller({
           teamName: currentAppState.teamContext?.teamName,
           memberName: currentAppState.teamContext?.selfAgentName,
           toolCallableNow: memberBriefingCallableNow,
-        })
+        }) || nativeAppManagedBootstrap
         const readinessWait = bootstrapReadinessWaitsRef.current.get(
           bootstrapPendingMessage.messageId,
         )
@@ -2977,12 +3165,44 @@ export function useInboxPoller({
           isTeammateSession: isTeammate(),
         })
 
-      const submitted = onSubmitTeammateMessage(prompt, { isMeta: true })
+      const nativeBootstrapInjection =
+        bootstrapPendingMessage != null &&
+        isNativeAppManagedBootstrapInstructionText(bootstrapPendingMessage.text)
+          ? await getNativeAppManagedBootstrapContextInjection?.()
+          : null
+      if (
+        bootstrapPendingMessage != null &&
+        isNativeAppManagedBootstrapInstructionText(bootstrapPendingMessage.text) &&
+        !nativeBootstrapInjection
+      ) {
+        if (isTeammate()) {
+          void writeTeammateRuntimeEvent({
+            type: 'failed',
+            teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: sessionId,
+            detail: 'Native app-managed bootstrap context was unavailable.',
+          })
+        }
+        return
+      }
+
+      const submitted = onSubmitTeammateMessage(prompt, {
+        isMeta: true,
+        ...(nativeBootstrapInjection
+          ? { prefixMessages: nativeBootstrapInjection.prefixMessages }
+          : {}),
+      })
       if (!submitted.accepted) {
         logForDebugging(
           `[InboxPoller] Submission rejected, keeping messages queued`,
         )
         return
+      }
+
+      if (nativeBootstrapInjection) {
+        await nativeBootstrapInjection.markContextLoaded()
       }
 
       if (bootstrapPendingMessage?.messageId && submitted.userMessageUuid) {
@@ -2992,7 +3212,7 @@ export function useInboxPoller({
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
-            runId: sessionId,
+            runId: nativeBootstrapInjection?.runId ?? sessionId,
           })
         }
         bootstrapAttemptsRef.current.set(bootstrapPendingMessage.messageId, {
@@ -3001,6 +3221,17 @@ export function useInboxPoller({
           cooldownUntil: 0,
           status: 'in_flight',
           timer: null,
+          ...(nativeBootstrapInjection
+            ? {
+                nativeAppManaged: {
+                  contextHash: nativeBootstrapInjection.contextHash,
+                  briefingHash: nativeBootstrapInjection.briefingHash,
+                  bootstrapProofToken:
+                    nativeBootstrapInjection.bootstrapProofToken,
+                  runId: nativeBootstrapInjection.runId,
+                },
+              }
+            : {}),
         })
 
         const bootstrapRowId = bootstrapPendingMessage.id
@@ -3052,6 +3283,7 @@ export function useInboxPoller({
     focusedInputDialog,
     getMessages,
     onSubmitTeammateMessage,
+    getNativeAppManagedBootstrapContextInjection,
     setAppState,
     inboxStateSignature,
     store,

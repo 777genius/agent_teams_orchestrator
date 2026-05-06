@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -371,6 +371,144 @@ describe('spawnMultiAgent bootstrap confirmation', () => {
     } finally {
       switchSession(previousSessionId, previousProjectDir)
       await rm(projectDir, { recursive: true, force: true })
+    }
+  })
+
+  it('counts matching native app-managed runtime proof as bootstrap confirmation', async () => {
+    const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const configDir = await mkdtemp(join(tmpdir(), 'spawn-native-proof-ok-'))
+    const teamName = `native-proof-team-${Date.now()}`
+    const boundary = '2026-05-01T19:56:38.000Z'
+    const bootstrapRunId = 'run-native-proof'
+    const proofToken = 'native-proof-token'
+    const contextHash = 'a'.repeat(64)
+    const briefingHash = 'b'.repeat(64)
+    const runtimeEventsPath = join(configDir, 'runtime', 'bob.runtime.jsonl')
+
+    try {
+      process.env.CLAUDE_CONFIG_DIR = configDir
+      await mkdir(join(configDir, 'teams', teamName), { recursive: true })
+      await mkdir(join(configDir, 'runtime'), { recursive: true })
+      await writeFile(
+        join(configDir, 'teams', teamName, 'config.json'),
+        JSON.stringify({
+          name: teamName,
+          members: [
+            {
+              name: 'bob',
+              agentId: `bob@${teamName}`,
+              bootstrapExpectedAfter: boundary,
+              bootstrapProofToken: proofToken,
+              bootstrapRunId,
+              bootstrapProofMode: 'native_app_managed_context',
+              bootstrapContextHash: contextHash,
+              bootstrapBriefingHash: briefingHash,
+              bootstrapRuntimeEventsPath: runtimeEventsPath,
+            },
+          ],
+        }),
+      )
+      await writeFile(
+        runtimeEventsPath,
+        `${JSON.stringify({
+          version: 1,
+          type: 'bootstrap_confirmed',
+          timestamp: '2026-05-01T19:56:56.000Z',
+          pid: 1234,
+          teamName,
+          agentName: 'bob',
+          agentId: `bob@${teamName}`,
+          runId: bootstrapRunId,
+          source: 'native_app_managed_bootstrap_private_turn',
+          bootstrapProofToken: proofToken,
+          contextHash,
+          briefingHash,
+        })}\n`,
+      )
+
+      expect(
+        await hasBootstrapConfirmation(
+          teamName,
+          `bob@${teamName}`,
+          boundary,
+          'bob',
+        ),
+      ).toBe(true)
+    } finally {
+      if (previousClaudeConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir
+      }
+      await rm(configDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not count native app-managed runtime proof with mismatched hashes', async () => {
+    const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const configDir = await mkdtemp(join(tmpdir(), 'spawn-native-proof-mismatch-'))
+    const teamName = `native-proof-team-${Date.now()}`
+    const boundary = '2026-05-01T19:56:38.000Z'
+    const bootstrapRunId = 'run-native-proof'
+    const proofToken = 'native-proof-token'
+    const runtimeEventsPath = join(configDir, 'runtime', 'bob.runtime.jsonl')
+
+    try {
+      process.env.CLAUDE_CONFIG_DIR = configDir
+      await mkdir(join(configDir, 'teams', teamName), { recursive: true })
+      await mkdir(join(configDir, 'runtime'), { recursive: true })
+      await writeFile(
+        join(configDir, 'teams', teamName, 'config.json'),
+        JSON.stringify({
+          name: teamName,
+          members: [
+            {
+              name: 'bob',
+              agentId: `bob@${teamName}`,
+              bootstrapExpectedAfter: boundary,
+              bootstrapProofToken: proofToken,
+              bootstrapRunId,
+              bootstrapProofMode: 'native_app_managed_context',
+              bootstrapContextHash: 'a'.repeat(64),
+              bootstrapBriefingHash: 'b'.repeat(64),
+              bootstrapRuntimeEventsPath: runtimeEventsPath,
+            },
+          ],
+        }),
+      )
+      await writeFile(
+        runtimeEventsPath,
+        `${JSON.stringify({
+          version: 1,
+          type: 'bootstrap_confirmed',
+          timestamp: '2026-05-01T19:56:56.000Z',
+          pid: 1234,
+          teamName,
+          agentName: 'bob',
+          agentId: `bob@${teamName}`,
+          runId: bootstrapRunId,
+          source: 'native_app_managed_bootstrap_private_turn',
+          bootstrapProofToken: proofToken,
+          contextHash: 'c'.repeat(64),
+          briefingHash: 'b'.repeat(64),
+        })}\n`,
+      )
+
+      expect(
+        await hasBootstrapConfirmation(
+          teamName,
+          `bob@${teamName}`,
+          boundary,
+          'bob',
+        ),
+      ).toBe(false)
+    } finally {
+      if (previousClaudeConfigDir === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir
+      }
+      await rm(configDir, { recursive: true, force: true })
     }
   })
 

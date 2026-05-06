@@ -169,7 +169,7 @@ import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js';
 import { resolveAgentTools } from '../tools/AgentTool/agentToolUtils.js';
 import { resumeAgentBackground } from '../tools/AgentTool/resumeAgent.js';
 import { useMainLoopModel } from '../hooks/useMainLoopModel.js';
-import { useAppState, useSetAppState, useAppStateStore } from '../state/AppState.js';
+import { useAppState, useSetAppState, useAppStateStore, type AppState } from '../state/AppState.js';
 import type { ContentBlockParam, ImageBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs';
 import type { ProcessUserInputContext } from '../utils/processUserInput/processUserInput.js';
 import type { PastedContent } from '../utils/config.js';
@@ -195,6 +195,7 @@ import {
   useInboxPoller,
 } from '../hooks/useInboxPoller.js';
 import type { AgentErrorUserNotification, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
+import { useNativeAppManagedBootstrapContextInjection } from '../hooks/useNativeAppManagedBootstrapContextInjection.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/index.js') : null;
@@ -4027,6 +4028,7 @@ export function REPL({
   // can correlate the submitted meta turn with the later transcript outcome.
   const handleIncomingPrompt = useCallback((content: string, options?: {
     isMeta?: boolean;
+    prefixMessages?: AppState['messages'];
   }): InboxPromptSubmitResult => {
     if (queryGuard.isActive) return {
       accepted: false
@@ -4050,12 +4052,15 @@ export function REPL({
       content,
       isMeta: options?.isMeta ? true : undefined
     });
-    void onQuery([userMessage], newAbortController, true, [], mainLoopModel);
+    void onQuery([...(options?.prefixMessages ?? []), userMessage], newAbortController, true, [], mainLoopModel);
     return {
       accepted: true,
       userMessageUuid: userMessage.uuid
     };
   }, [onQuery, mainLoopModel, store]);
+
+  const { getNativeAppManagedBootstrapContextInjection } =
+    useNativeAppManagedBootstrapContextInjection();
 
   const handleAgentErrorNotification = useCallback((message: AgentErrorUserNotification) => {
     setMessages(prev => [...prev, createAttachmentMessage({
@@ -4090,6 +4095,7 @@ export function REPL({
     focusedInputDialog,
     getMessages: () => messagesRef.current,
     onSubmitMessage: handleIncomingPrompt,
+    getNativeAppManagedBootstrapContextInjection,
     onAgentErrorNotification: handleAgentErrorNotification,
     transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
   });

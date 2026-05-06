@@ -7,6 +7,7 @@ import {
   buildTeamBootstrapRequestFromSpec,
   readTeamBootstrapSpec,
 } from './teamBootstrapSpec.js'
+import { hashNativeBootstrapText } from './nativeAppManagedBootstrapContext.js'
 import { PROVIDER_DEFAULT_MODEL_SELECTION } from './teamBootstrapModelSelection.js'
 import type { TeamBootstrapRequest, TeamBootstrapSpec } from './teamBootstrapTypes.js'
 
@@ -286,6 +287,206 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).not.toContain(PROVIDER_DEFAULT_MODEL_SELECTION)
     expect(request.members[0]?.prompt).not.toContain('Model override')
     expect(request.requestHash).toBe(omittedModelRequest.requestHash)
+  })
+
+  test('accepts native app-managed bootstrap for anthropic and codex members', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    const anthropicContext = 'anthropic native context'
+    const codexContext = 'codex native context'
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-native-context',
+      mode: 'launch',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'native-ready-team',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'alice',
+          provider: 'anthropic',
+          nativeAppManagedBootstrap: {
+            schemaVersion: 1,
+            mode: 'startup_context_file',
+            contextText: anthropicContext,
+            contextHash: hashNativeBootstrapText(anthropicContext),
+            briefingHash: hashNativeBootstrapText('alice briefing'),
+            generatedAt: '2026-05-06T00:00:00.000Z',
+          },
+        },
+        {
+          name: 'bob',
+          provider: 'codex',
+          nativeAppManagedBootstrap: {
+            schemaVersion: 1,
+            mode: 'startup_context_file',
+            contextText: codexContext,
+            contextHash: hashNativeBootstrapText(codexContext),
+            briefingHash: hashNativeBootstrapText('bob briefing'),
+            generatedAt: '2026-05-06T00:00:00.000Z',
+          },
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members[0]?.nativeAppManagedBootstrap?.contextText).toBe(
+      anthropicContext,
+    )
+    expect(request.members[0]?.prompt).toContain(
+      '<agent_teams_native_app_managed_bootstrap_check>',
+    )
+    expect(request.members[0]?.prompt).not.toContain('Your FIRST action')
+    expect(request.members[1]?.nativeAppManagedBootstrap?.contextText).toBe(
+      codexContext,
+    )
+  })
+
+  test('rejects native app-managed bootstrap for unsupported providers', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-native-gemini.json')
+    const contextText = 'gemini native context'
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-native-gemini',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'native-ready-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [
+          {
+            name: 'zoe',
+            provider: 'gemini',
+            nativeAppManagedBootstrap: {
+              schemaVersion: 1,
+              mode: 'startup_context_file',
+              contextText,
+              contextHash: hashNativeBootstrapText(contextText),
+              briefingHash: hashNativeBootstrapText('zoe briefing'),
+              generatedAt: '2026-05-06T00:00:00.000Z',
+            },
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /only supported for anthropic\/codex/,
+    )
+  })
+
+  test('rejects native app-managed bootstrap hash mismatch and invalid generatedAt', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-native-invalid.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-native-invalid',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'native-ready-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [
+          {
+            name: 'alice',
+            provider: 'anthropic',
+            nativeAppManagedBootstrap: {
+              schemaVersion: 1,
+              mode: 'startup_context_file',
+              contextText: 'native context',
+              contextHash: '0'.repeat(64),
+              briefingHash: hashNativeBootstrapText('alice briefing'),
+              generatedAt: 'not-a-date',
+            },
+          },
+        ],
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /contextHash does not match contextText|generatedAt must be a valid ISO timestamp/,
+    )
+  })
+
+  test('request hash changes when native app-managed context hash changes', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+    const baseSpec = {
+      version: 1,
+      runId: 'run-native-hash',
+      mode: 'launch',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'native-ready-team',
+        cwd: workspaceDir,
+      },
+      lead: {},
+    } satisfies Omit<TeamBootstrapSpec, 'members'>
+
+    const requestA = await buildTeamBootstrapRequestFromSpec({
+      ...baseSpec,
+      members: [
+        {
+          name: 'alice',
+          provider: 'codex',
+          nativeAppManagedBootstrap: {
+            schemaVersion: 1,
+            mode: 'startup_context_file',
+            contextText: 'native context A',
+            contextHash: hashNativeBootstrapText('native context A'),
+            briefingHash: hashNativeBootstrapText('alice briefing'),
+            generatedAt: '2026-05-06T00:00:00.000Z',
+          },
+        },
+      ],
+    })
+    const requestB = await buildTeamBootstrapRequestFromSpec({
+      ...baseSpec,
+      members: [
+        {
+          name: 'alice',
+          provider: 'codex',
+          nativeAppManagedBootstrap: {
+            schemaVersion: 1,
+            mode: 'startup_context_file',
+            contextText: 'native context B',
+            contextHash: hashNativeBootstrapText('native context B'),
+            briefingHash: hashNativeBootstrapText('alice briefing'),
+            generatedAt: '2026-05-06T00:00:00.000Z',
+          },
+        },
+      ],
+    })
+
+    expect(requestA.requestHash).not.toBe(requestB.requestHash)
   })
 
   test('rejects OpenCode teammates in primary bootstrap specs so they use bridge lanes', async () => {

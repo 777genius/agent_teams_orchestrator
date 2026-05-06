@@ -2,6 +2,15 @@ import type { TeamBootstrapPhase } from './teamBootstrapStateMachine.js'
 
 export type BootstrapProvider = 'anthropic' | 'codex' | 'gemini'
 
+export type NativeAppManagedBootstrapSpec = {
+  schemaVersion: 1
+  mode: 'startup_context_file'
+  contextText: string
+  contextHash: string
+  briefingHash: string
+  generatedAt: string
+}
+
 export type TeamBootstrapSpec = {
   version: 1
   runId: string
@@ -35,6 +44,7 @@ export type TeamBootstrapSpec = {
     useSplitPane?: boolean
     planModeRequired?: boolean
     description?: string
+    nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
   }>
   launch?: {
     bootstrapTimeoutMs?: number
@@ -87,6 +97,7 @@ export type NormalizedBootstrapMember = {
   useSplitPane?: boolean
   planModeRequired?: boolean
   description?: string
+  nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
 }
 
 export type BootstrapMemberLifecycleStatus =

@@ -108,6 +108,14 @@ import {
   writeTeammateRuntimeEvent,
 } from '../../utils/swarm/teammateRuntimeEvents.js'
 import {
+  prepareNativeAppManagedBootstrapContextFile,
+  type NativeAppManagedBootstrapSpec,
+} from '../../services/teamBootstrap/nativeAppManagedBootstrapContext.js'
+import {
+  parseBootstrapRuntimeProofDetail,
+  validateBootstrapRuntimeProofEnvelope,
+} from '../../services/teamBootstrap/bootstrapProofValidation.js'
+import {
   readTeamFileAsync,
   sanitizeAgentName,
   sanitizeName,
@@ -683,37 +691,6 @@ function getBootstrapExpectedAfterForTeammate(
   return byName?.bootstrapExpectedAfter ?? null
 }
 
-const BOOTSTRAP_CONFIRMED_RUNTIME_SOURCE = 'member_briefing_tool_success'
-
-function parseBootstrapRuntimeEventDetail(
-  detail: string | undefined,
-): Record<string, unknown> {
-  if (!detail) {
-    return {}
-  }
-  try {
-    const parsed = JSON.parse(detail) as unknown
-    return parsed && typeof parsed === 'object'
-      ? (parsed as Record<string, unknown>)
-      : {}
-  } catch {
-    return {}
-  }
-}
-
-function getBootstrapRuntimeEventField(
-  event: Awaited<ReturnType<typeof readTeammateRuntimeEvents>>[number],
-  detail: Record<string, unknown>,
-  field: 'source' | 'bootstrapProofToken',
-): string | undefined {
-  const direct = event[field]
-  if (typeof direct === 'string' && direct.trim()) {
-    return direct.trim()
-  }
-  const nested = detail[field]
-  return typeof nested === 'string' && nested.trim() ? nested.trim() : undefined
-}
-
 async function hasBootstrapRuntimeEventConfirmation(
   teamName: string,
   teammateId: string,
@@ -789,18 +766,33 @@ async function hasBootstrapRuntimeEventConfirmation(
       }
     }
 
-    const detail = parseBootstrapRuntimeEventDetail(event.detail)
-    const source = getBootstrapRuntimeEventField(event, detail, 'source')
-    if (source !== BOOTSTRAP_CONFIRMED_RUNTIME_SOURCE) {
+    const detail = parseBootstrapRuntimeProofDetail(event.detail)
+    const nativeMember = member as
+      | {
+          bootstrapProofMode?: string
+          bootstrapRunId?: string
+          bootstrapContextHash?: string
+          bootstrapBriefingHash?: string
+        }
+      | undefined
+    if (
+      !validateBootstrapRuntimeProofEnvelope({
+        event,
+        detail,
+        expected: {
+          teamName,
+          boundaryMs,
+          proofToken: expectedProofToken,
+          proofMode: nativeMember?.bootstrapProofMode?.trim(),
+          runId: nativeMember?.bootstrapRunId?.trim(),
+          contextHash: nativeMember?.bootstrapContextHash?.trim(),
+          briefingHash: nativeMember?.bootstrapBriefingHash?.trim(),
+        },
+      })
+    ) {
       return false
     }
-
-    const eventProofToken = getBootstrapRuntimeEventField(
-      event,
-      detail,
-      'bootstrapProofToken',
-    )
-    return expectedProofToken ? eventProofToken === expectedProofToken : true
+    return true
   })
 }
 
@@ -905,6 +897,8 @@ export type SpawnTeammateConfig = {
   agent_type?: string
   isolation?: 'worktree'
   description?: string
+  nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+  bootstrapRunId?: string
   /** request_id of the API call whose response contained the tool_use that
    *  spawned this teammate. Threaded through to TeammateAgentContext for
    *  lineage tracing on tengu_api_* events. */
@@ -925,6 +919,8 @@ type SpawnInput = {
   agent_type?: string
   isolation?: 'worktree'
   description?: string
+  nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+  bootstrapRunId?: string
   invokingRequestId?: string
   worktreeInfo?: TeammateWorktreeInfo
 }
@@ -1686,16 +1682,28 @@ async function handleSpawnSplitPane(
       : undefined
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
+  const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
   const runtimePaths = getTeammateRuntimePaths({
     teamName,
     agentName: sanitizedName,
   })
   await ensureTeammateRuntimePaths(runtimePaths)
+  const nativeAppManagedBootstrapEnv =
+    await prepareNativeAppManagedBootstrapContextFile({
+      teamName,
+      memberName: sanitizedName,
+      agentId: teammateId,
+      provider,
+      runId: bootstrapRunId,
+      bootstrapProofToken,
+      spec: input.nativeAppManagedBootstrap,
+    })
   try {
     const envStr = buildInheritedEnvVars({
       provider,
       extraEnv: {
         ...worktreeEnv(worktreeInfo),
+        ...nativeAppManagedBootstrapEnv,
         [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
         [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
         ...(startupReadySentinel
@@ -1788,7 +1796,15 @@ async function handleSpawnSplitPane(
       joinedAt: Date.now(),
       bootstrapExpectedAfter: launchBoundaryIso,
       bootstrapProofToken,
+      bootstrapRunId,
       bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+      ...(input.nativeAppManagedBootstrap
+        ? {
+            bootstrapProofMode: 'native_app_managed_context',
+            bootstrapContextHash: input.nativeAppManagedBootstrap.contextHash,
+            bootstrapBriefingHash: input.nativeAppManagedBootstrap.briefingHash,
+          }
+        : {}),
       tmuxPaneId: paneId,
       cwd: workingDir,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
@@ -1984,16 +2000,28 @@ async function handleSpawnSeparateWindow(
   const startupReadySentinel = await createSpawnReadySentinel()
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
+  const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
   const runtimePaths = getTeammateRuntimePaths({
     teamName,
     agentName: sanitizedName,
   })
   await ensureTeammateRuntimePaths(runtimePaths)
+  const nativeAppManagedBootstrapEnv =
+    await prepareNativeAppManagedBootstrapContextFile({
+      teamName,
+      memberName: sanitizedName,
+      agentId: teammateId,
+      provider,
+      runId: bootstrapRunId,
+      bootstrapProofToken,
+      spec: input.nativeAppManagedBootstrap,
+    })
   try {
     const envStr = buildInheritedEnvVars({
       provider,
       extraEnv: {
         ...worktreeEnv(worktreeInfo),
+        ...nativeAppManagedBootstrapEnv,
         [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
         [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
         [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
@@ -2086,7 +2114,15 @@ async function handleSpawnSeparateWindow(
       joinedAt: Date.now(),
       bootstrapExpectedAfter: launchBoundaryIso,
       bootstrapProofToken,
+      bootstrapRunId,
       bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+      ...(input.nativeAppManagedBootstrap
+        ? {
+            bootstrapProofMode: 'native_app_managed_context',
+            bootstrapContextHash: input.nativeAppManagedBootstrap.contextHash,
+            bootstrapBriefingHash: input.nativeAppManagedBootstrap.briefingHash,
+          }
+        : {}),
       tmuxPaneId: paneId,
       cwd: workingDir,
       ...(worktreeInfo ? { worktreePath: worktreeInfo.worktreePath } : {}),
@@ -2362,11 +2398,22 @@ async function handleSpawnNativeProcess(
   const argv = [...commandArgs, ...teammateArgs, ...parseArguments(inheritedFlags)]
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
+  const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
   let stdoutLog: WriteStream | undefined
   let stderrLog: WriteStream | undefined
   const startupReadySentinel = await createSpawnReadySentinel()
+  const nativeAppManagedBootstrapEnv =
+    await prepareNativeAppManagedBootstrapContextFile({
+      teamName,
+      memberName: sanitizedName,
+      agentId: teammateId,
+      provider,
+      runId: bootstrapRunId,
+      bootstrapProofToken,
+      spec: input.nativeAppManagedBootstrap,
+    })
 
   try {
     stdoutLog = createWriteStream(runtimePaths.stdoutPath, {
@@ -2399,6 +2446,7 @@ async function handleSpawnNativeProcess(
           provider,
           extraEnv: {
             ...worktreeEnv(worktreeInfo),
+            ...nativeAppManagedBootstrapEnv,
             [TEAMMATE_RUNTIME_ENV]: 'headless',
             [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
               startupReadySentinel.filePath,
@@ -2544,7 +2592,15 @@ async function handleSpawnNativeProcess(
         joinedAt: Date.now(),
         bootstrapExpectedAfter: launchBoundaryIso,
         bootstrapProofToken,
+        bootstrapRunId,
         bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+        ...(input.nativeAppManagedBootstrap
+          ? {
+              bootstrapProofMode: 'native_app_managed_context',
+              bootstrapContextHash: input.nativeAppManagedBootstrap.contextHash,
+              bootstrapBriefingHash: input.nativeAppManagedBootstrap.briefingHash,
+            }
+          : {}),
         tmuxPaneId: processPaneId,
         runtimePid,
         cwd: workingDir,
@@ -3072,6 +3128,17 @@ async function handleSpawn(
     // Check if in-process mode is enabled via feature flag
     if (spawnDeps.isInProcessEnabled() && !forceSeparateProcess) {
       return await handleSpawnInProcess(spawnInput, context)
+    }
+
+    if (
+      shouldUseNativeProcessBackendForSpawn({
+        separateProcessRequired: forceSeparateProcess,
+      })
+    ) {
+      logForDebugging(
+        `[handleSpawn] Using native process backend for ${input.name ?? input.agent_type ?? 'teammate'} because auto mode requires a launch-owned process runtime`,
+      )
+      return await handleSpawnNativeProcess(spawnInput, context)
     }
 
     // Pre-flight: ensure a pane backend is available before attempting pane-based spawn.

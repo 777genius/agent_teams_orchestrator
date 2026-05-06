@@ -15,8 +15,18 @@ import {
 } from './teamBootstrapPromptBuilder.js'
 import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
+import { hashNativeBootstrapText } from './nativeAppManagedBootstrapContext.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
+
+const nativeAppManagedBootstrapSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  mode: z.literal('startup_context_file'),
+  contextText: z.string().trim().min(1).max(24_000),
+  contextHash: z.string().trim().regex(/^[a-f0-9]{64}$/),
+  briefingHash: z.string().trim().regex(/^[a-f0-9]{64}$/),
+  generatedAt: z.string().trim().min(1),
+})
 
 const bootstrapMemberSchema = z.strictObject({
   name: z.string().trim().min(1),
@@ -32,6 +42,7 @@ const bootstrapMemberSchema = z.strictObject({
   description: z.string().trim().min(1).optional(),
   useSplitPane: z.boolean().optional(),
   planModeRequired: z.boolean().optional(),
+  nativeAppManagedBootstrap: nativeAppManagedBootstrapSchema.optional(),
 })
 
 const bootstrapSpecSchema = z.strictObject({
@@ -112,6 +123,33 @@ const bootstrapSpecSchema = z.strictObject({
       continue
     }
     seenNormalizedNames.set(normalizedName, index)
+
+    if (member.nativeAppManagedBootstrap) {
+      if (member.provider && member.provider !== 'anthropic' && member.provider !== 'codex') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['members', index, 'nativeAppManagedBootstrap'],
+          message: 'Native app-managed bootstrap is only supported for anthropic/codex members',
+        })
+      }
+      if (
+        hashNativeBootstrapText(member.nativeAppManagedBootstrap.contextText) !==
+        member.nativeAppManagedBootstrap.contextHash
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['members', index, 'nativeAppManagedBootstrap', 'contextHash'],
+          message: 'Native app-managed bootstrap contextHash does not match contextText',
+        })
+      }
+      if (!Number.isFinite(Date.parse(member.nativeAppManagedBootstrap.generatedAt))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['members', index, 'nativeAppManagedBootstrap', 'generatedAt'],
+          message: 'Native app-managed bootstrap generatedAt must be a valid ISO timestamp',
+        })
+      }
+    }
   }
 })
 
@@ -138,6 +176,9 @@ function normalizeMember(
       ? { planModeRequired: member.planModeRequired }
       : {}),
     ...(member.description ? { description: member.description } : {}),
+    ...(member.nativeAppManagedBootstrap
+      ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
+      : {}),
   }
 }
 
@@ -176,6 +217,13 @@ export function buildRequestHash(
       useSplitPane: member.useSplitPane ?? false,
       planModeRequired: member.planModeRequired ?? false,
       description: member.description ?? null,
+      nativeAppManagedBootstrap: member.nativeAppManagedBootstrap
+        ? {
+            mode: member.nativeAppManagedBootstrap.mode,
+            contextHash: member.nativeAppManagedBootstrap.contextHash,
+            briefingHash: member.nativeAppManagedBootstrap.briefingHash,
+          }
+        : null,
     }))
     .sort((a, b) => compareStableStrings(a.normalizedName, b.normalizedName))
 

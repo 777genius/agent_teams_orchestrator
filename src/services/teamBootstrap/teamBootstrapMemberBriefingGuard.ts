@@ -1,5 +1,6 @@
 import type { AppState } from '../../state/AppState.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { isNativeAppManagedBootstrapInstructionText } from './nativeAppManagedBootstrapContext.js'
 
 const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
   'Your FIRST action: call MCP tool member_briefing'
@@ -147,6 +148,9 @@ export function isBootstrapMailboxInstructionText(text: string): boolean {
     return false
   }
   if (normalized.includes(BOOTSTRAP_MEMBER_BRIEFING_MARKER)) {
+    return true
+  }
+  if (isNativeAppManagedBootstrapInstructionText(normalized)) {
     return true
   }
   return (
