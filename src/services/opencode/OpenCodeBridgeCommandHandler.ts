@@ -20,6 +20,7 @@ import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   observeOpenCodeDeliveryResponse,
@@ -222,6 +223,40 @@ function asStringArray(value: unknown): string[] {
 
 function asNullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
+  if (value === undefined || value === null) {
+    return []
+  }
+  if (!Array.isArray(value)) {
+    throw new Error('OpenCode attachment parts must be an array.')
+  }
+
+  return value.map((item, index): OpenCodePromptPart => {
+    const record = asRecord(item)
+    if (!record || record.type !== 'file') {
+      throw new Error(`OpenCode attachment part at index ${index} must be a file part.`)
+    }
+    const mime = asString(record.mime)
+    const url = asString(record.url)
+    const filename = asString(record.filename)
+    if (!mime || !url || !filename) {
+      throw new Error(`OpenCode file part at index ${index} is missing mime, url, or filename.`)
+    }
+    if (mime !== 'image/png' && mime !== 'image/jpeg' && mime !== 'image/webp') {
+      throw new Error(`OpenCode file part at index ${index} has unsupported MIME: ${mime}`)
+    }
+    if (!url.startsWith(`data:${mime};base64,`)) {
+      throw new Error(`OpenCode file part at index ${index} must use a matching data URL.`)
+    }
+    return {
+      type: 'file',
+      mime,
+      url,
+      filename,
+    }
+  })
 }
 
 function assertUniqueOpenCodeMemberNames(items: unknown[], context: string): void {
@@ -2077,6 +2112,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   const text = asString(body.text)
+  const fileParts = parseOpenCodePromptFileParts(body.fileParts ?? body.parts)
   if (!teamId || !laneId || !memberName || !text) {
     throw new Error('opencode.sendMessage requires teamId/teamName, laneId, memberName and text')
   }
@@ -2239,12 +2275,14 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   if (noReply) {
     await openCodeSessionBridge.promptAsync(deliveryRecord, {
       text: deliveryText,
+      parts: fileParts,
       agent: deliveryAgent,
       noReply: true,
     })
   } else {
     const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
       text: deliveryText,
+      parts: fileParts,
       agent: deliveryAgent,
       noReply: false,
       timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,

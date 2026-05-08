@@ -46,6 +46,10 @@ type SessionIdentity = {
   memberName: string
 }
 
+export type OpenCodePromptPart =
+  | { type: 'text'; text: string }
+  | { type: 'file'; mime: string; url: string; filename: string }
+
 export type OpenCodeSessionAppMcpReadyResult = {
   ok: boolean
   runtimePid?: number
@@ -111,6 +115,22 @@ function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function buildOpenCodePromptParts(params: {
+  text: string
+  parts?: OpenCodePromptPart[]
+}): Array<Record<string, unknown>> {
+  const providedParts = params.parts ?? []
+  if (providedParts.length === 0) {
+    return [{ type: 'text', text: params.text }]
+  }
+
+  const hasTextPart = providedParts.some(part => part.type === 'text')
+  return [
+    ...(hasTextPart ? [] : [{ type: 'text', text: params.text }]),
+    ...providedParts,
+  ]
 }
 
 function delayMs(ms: number): Promise<void> {
@@ -569,6 +589,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     params: {
       text: string
+      parts?: OpenCodePromptPart[]
       agent?: string
       noReply?: boolean
       system?: string
@@ -581,7 +602,10 @@ export class OpenCodeSessionBridge {
         noReply: params.noReply,
         system: params.system,
         model: parseProviderScopedModel(record.selectedModel),
-        parts: [{ type: 'text', text: params.text }],
+        parts: buildOpenCodePromptParts({
+          text: params.text,
+          parts: params.parts,
+        }),
       })
     })
   }
@@ -699,6 +723,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     params: {
       text: string
+      parts?: OpenCodePromptPart[]
       agent?: string
       noReply?: boolean
       system?: string
@@ -711,7 +736,10 @@ export class OpenCodeSessionBridge {
         noReply: params.noReply,
         system: params.system,
         model: parseProviderScopedModel(record.selectedModel),
-        parts: [{ type: 'text', text: params.text }],
+        parts: buildOpenCodePromptParts({
+          text: params.text,
+          parts: params.parts,
+        }),
       })
     })
   }
@@ -720,6 +748,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     params: {
       text: string
+      parts?: OpenCodePromptPart[]
       agent?: string
       noReply?: boolean
       system?: string
@@ -750,7 +779,10 @@ export class OpenCodeSessionBridge {
           noReply: params.noReply,
           system: params.system,
           model: parseProviderScopedModel(record.selectedModel),
-          parts: [{ type: 'text', text: params.text }],
+          parts: buildOpenCodePromptParts({
+            text: params.text,
+            parts: params.parts,
+          }),
         })
         observation.markPromptAcceptedByEndpoint()
         return {
