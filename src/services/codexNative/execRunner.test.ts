@@ -183,6 +183,38 @@ describe('buildCodexNativeExecArgs', () => {
       '-',
     ])
   })
+
+  test('passes image paths before stdin marker', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Look at the screenshot.',
+        cwd: '/tmp/demo',
+        imagePaths: ['/tmp/red.png', '/tmp/blue.jpg'],
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '--image',
+      '/tmp/red.png',
+      '--image',
+      '/tmp/blue.jpg',
+      '-',
+    ])
+  })
+
+  test('rejects non-absolute image paths before building args', () => {
+    expect(() =>
+      buildCodexNativeExecArgs({
+        prompt: 'Look at the screenshot.',
+        cwd: '/tmp/demo',
+        imagePaths: ['relative.png'],
+      }),
+    ).toThrow(/must be absolute/)
+  })
 })
 
 describe('runCodexNativeExec', () => {

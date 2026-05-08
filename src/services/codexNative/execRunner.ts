@@ -1,4 +1,6 @@
 import { type ChildProcess } from 'node:child_process'
+import { statSync } from 'node:fs'
+import path from 'node:path'
 import { PassThrough, type Readable } from 'node:stream'
 import readline from 'node:readline'
 
@@ -25,6 +27,7 @@ export type CodexNativeExecRunnerOptions = {
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
   disabledFeatures?: string[]
+  imagePaths?: string[]
   ignoreUserConfig?: boolean
   abortSignal?: AbortSignal
   timeoutMs?: number | null
@@ -161,8 +164,40 @@ export function buildCodexNativeExecArgs(
     args.push('--add-dir', directory)
   }
 
+  for (const imagePath of options.imagePaths ?? []) {
+    assertCodexNativeImagePathSyntax(imagePath)
+    args.push('--image', imagePath)
+  }
+
   args.push('-')
   return args
+}
+
+export function assertCodexNativeImagePathSyntax(imagePath: string): void {
+  if (typeof imagePath !== 'string' || imagePath.trim().length === 0) {
+    throw new Error('Codex native image path must be a non-empty absolute path.')
+  }
+  if (imagePath.includes('\0')) {
+    throw new Error('Codex native image path contains an invalid NUL byte.')
+  }
+  if (!path.isAbsolute(imagePath)) {
+    throw new Error('Codex native image path must be absolute.')
+  }
+}
+
+function assertReadableCodexNativeImagePaths(imagePaths: string[] | undefined): void {
+  for (const imagePath of imagePaths ?? []) {
+    assertCodexNativeImagePathSyntax(imagePath)
+    let stat
+    try {
+      stat = statSync(imagePath)
+    } catch {
+      throw new Error(`Codex native image file is missing or unreadable: ${imagePath}`)
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Codex native image path is not a file: ${imagePath}`)
+    }
+  }
 }
 
 function isCodexAnalyticsHtmlContinuation(line: string): boolean {
@@ -345,6 +380,8 @@ export async function* runCodexNativeExec(
     throw new Error('Codex native runtime requires the codex CLI binary.')
   }
   const executablePath = binaryResolution.executablePath
+  assertReadableCodexNativeImagePaths(options.imagePaths)
+  const execArgs = buildCodexNativeExecArgs(options)
 
   const identity: CodexNativeBinaryIdentity = {
     executablePath,
@@ -369,7 +406,7 @@ export async function* runCodexNativeExec(
   }
 
   const child =
-    deps.spawnProcess?.(executablePath, buildCodexNativeExecArgs(options), {
+    deps.spawnProcess?.(executablePath, execArgs, {
       cwd: options.cwd,
       env,
       signal: options.abortSignal,
@@ -378,7 +415,7 @@ export async function* runCodexNativeExec(
       stdout: 'pipe',
       stderr: 'pipe',
     }) ??
-    spawnPortableCli(executablePath, buildCodexNativeExecArgs(options), {
+    spawnPortableCli(executablePath, execArgs, {
       cwd: options.cwd,
       env,
       signal: options.abortSignal,

@@ -180,25 +180,73 @@ export function resolveCodexNativeExecTimeoutPolicy(
   }
 }
 
+type CodexNativePreparedImageBlock = {
+  type: 'image'
+  source?: {
+    type?: string
+    path?: string
+  }
+  path?: string
+}
+
+function extractCodexNativePreparedImagePath(
+  block: ContentBlockParam,
+): string | null {
+  const imageBlock = block as CodexNativePreparedImageBlock
+  if (imageBlock.type !== 'image') {
+    return null
+  }
+  if (
+    imageBlock.source?.type === 'file' &&
+    typeof imageBlock.source.path === 'string'
+  ) {
+    return imageBlock.source.path
+  }
+  if (typeof imageBlock.path === 'string') {
+    return imageBlock.path
+  }
+  return null
+}
+
 function toCodexNativePromptText(
   prompt: string | ContentBlockParam[],
-): { ok: true; text: string } | { ok: false; error: string } {
+): { ok: true; text: string; imagePaths: string[] } | { ok: false; error: string } {
   if (typeof prompt === 'string') {
     return {
       ok: true,
       text: prompt,
+      imagePaths: [],
     }
   }
 
-  if (prompt.some(block => block.type !== 'text')) {
+  const textBlocks: ContentBlockParam[] = []
+  const imagePaths: string[] = []
+  for (const block of prompt) {
+    if (block.type === 'text') {
+      textBlocks.push(block)
+      continue
+    }
+
+    if (block.type === 'image') {
+      const imagePath = extractCodexNativePreparedImagePath(block)
+      if (!imagePath) {
+        return {
+          ok: false,
+          error:
+            'Codex native image attachments require prepared file paths. Base64 image blocks are not supported by this runtime path.',
+        }
+      }
+      imagePaths.push(imagePath)
+      continue
+    }
+
     return {
       ok: false,
-      error:
-        'Codex native phase 0 only supports text-only prompts. Images, documents, and structured input are not wired yet.',
+      error: `Codex native does not support ${block.type} attachments yet. Send text or images only.`,
     }
   }
 
-  const text = extractTextContent(prompt, '\n').trim()
+  const text = extractTextContent(textBlocks, '\n').trim()
   if (!text) {
     return {
       ok: false,
@@ -209,6 +257,7 @@ function toCodexNativePromptText(
   return {
     ok: true,
     text,
+    imagePaths,
   }
 }
 
@@ -500,6 +549,7 @@ export async function* executeCodexNativeTurn(
       forcedLoginMethod === 'chatgpt' ? undefined : (getCodexNativeApiKey() ?? undefined)
     const iterator = runExec({
       prompt: resolvedPrompt.text,
+      imagePaths: resolvedPrompt.imagePaths,
       cwd: params.cwd,
       model: params.model,
       reasoningEffort: mapEffortToCodexNativeReasoningEffort(

@@ -516,7 +516,7 @@ describe('executeCodexNativeTurn', () => {
     expect(persistenceCalls.at(-1)).toBe('flush')
   })
 
-  test('rejects non-text prompts conservatively', async () => {
+  test('rejects inline image prompts without prepared file paths conservatively', async () => {
     const params = baseParams({
       prompt: [
         {
@@ -542,7 +542,7 @@ describe('executeCodexNativeTurn', () => {
         content: [
           {
             type: 'text',
-            text: expect.stringContaining('text-only prompts'),
+            text: expect.stringContaining('prepared file paths'),
           },
         ],
       },
@@ -551,7 +551,7 @@ describe('executeCodexNativeTurn', () => {
       type: 'result',
       subtype: 'error_during_execution',
       is_error: true,
-      errors: [expect.stringContaining('text-only prompts')],
+      errors: [expect.stringContaining('prepared file paths')],
     })
   })
 
