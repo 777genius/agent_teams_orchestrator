@@ -484,8 +484,18 @@ function createRuntimePreconditionSnapshot(
   }
 }
 
-function shouldUseLightweightLaunchHandshake(_body: Record<string, unknown>): boolean {
-  return false
+function shouldUseLightweightLaunchHandshake(body: Record<string, unknown>): boolean {
+  if (body.requiredCommand !== 'opencode.launchTeam') {
+    return false
+  }
+  if (asString(body.expectedCapabilitySnapshotId)) {
+    return false
+  }
+  const preconditions = asRecord(body.preconditions)
+  if (asString(preconditions?.expectedCapabilitySnapshotId)) {
+    return false
+  }
+  return true
 }
 
 function createBridgeServerIdentity(
