@@ -353,12 +353,18 @@ export async function* runCodexNativeExec(
   }
 
   const env: NodeJS.ProcessEnv = { ...process.env }
-  const credentialSource: CodexNativeCredentialSource = options.apiKey
-    ? 'explicit-api-key'
-    : env.CODEX_API_KEY
-      ? 'ambient-process-env'
-      : 'none'
-  if (options.apiKey) {
+  if (options.forcedLoginMethod === 'chatgpt') {
+    delete env.OPENAI_API_KEY
+    delete env.CODEX_API_KEY
+  }
+
+  const credentialSource: CodexNativeCredentialSource =
+    options.apiKey && options.forcedLoginMethod !== 'chatgpt'
+      ? 'explicit-api-key'
+      : env.CODEX_API_KEY || env.OPENAI_API_KEY
+        ? 'ambient-process-env'
+        : 'none'
+  if (options.apiKey && options.forcedLoginMethod !== 'chatgpt') {
     env.CODEX_API_KEY = options.apiKey
   }
 

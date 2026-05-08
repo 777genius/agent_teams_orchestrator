@@ -15,6 +15,16 @@ import type {
 } from './teamBootstrapTypes.js'
 
 const MAX_BOOTSTRAP_STATE_BYTES = 256 * 1024
+const MAX_BOOTSTRAP_FAILURE_REASON_CHARS = 500
+
+function sanitizeBootstrapFailureReason(reason: string): string {
+  return reason
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_-]{32,})\b/g, '[redacted]')
+    .replace(/\/[^\s"'`]+/g, '[path]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_BOOTSTRAP_FAILURE_REASON_CHARS)
+}
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(dirname(filePath), { recursive: true })
@@ -128,16 +138,22 @@ export class TeamBootstrapStateStore {
     this.state = {
       ...this.state,
       updatedAt: timestamp,
-      members: this.state.members.map(member =>
-        member.name === memberName
-          ? {
-              ...member,
-              status: 'spawn_started',
-              lastAttemptAt: timestamp,
-              lastObservedAt: timestamp,
-            }
-          : member,
-      ),
+      members: this.state.members.map(member => {
+        if (member.name !== memberName) {
+          return member
+        }
+        const memberWithoutPreviousRuntime: BootstrapMemberState = { ...member }
+        delete memberWithoutPreviousRuntime.failureReason
+        delete memberWithoutPreviousRuntime.agentId
+        delete memberWithoutPreviousRuntime.backendType
+        delete memberWithoutPreviousRuntime.runtimePid
+        return {
+          ...memberWithoutPreviousRuntime,
+          status: 'spawn_started',
+          lastAttemptAt: timestamp,
+          lastObservedAt: timestamp,
+        }
+      }),
     }
     await writeJsonAtomic(this.statePath, this.state)
     await this.journal.append({
@@ -161,26 +177,32 @@ export class TeamBootstrapStateStore {
     now: () => number,
   ): Promise<void> {
     const timestamp = now()
+    const failureReason = result.failureReason
+      ? sanitizeBootstrapFailureReason(result.failureReason)
+      : undefined
     this.state = {
       ...this.state,
       updatedAt: timestamp,
-      members: this.state.members.map(member =>
-        member.name === memberName
-          ? {
-              ...member,
-              status: result.status,
-              lastObservedAt: timestamp,
-              ...(result.agentId ? { agentId: result.agentId } : {}),
-              ...(result.backendType ? { backendType: result.backendType } : {}),
-              ...(typeof result.runtimePid === 'number' && result.runtimePid > 0
-                ? { runtimePid: result.runtimePid }
-                : {}),
-              ...(result.failureReason
-                ? { failureReason: result.failureReason }
-                : {}),
-            }
-          : member,
-      ),
+      members: this.state.members.map(member => {
+        if (member.name !== memberName) {
+          return member
+        }
+        const memberWithoutFailure: BootstrapMemberState = { ...member }
+        delete memberWithoutFailure.failureReason
+        return {
+          ...memberWithoutFailure,
+          status: result.status,
+          lastObservedAt: timestamp,
+          ...(result.agentId ? { agentId: result.agentId } : {}),
+          ...(result.backendType ? { backendType: result.backendType } : {}),
+          ...(typeof result.runtimePid === 'number' && result.runtimePid > 0
+            ? { runtimePid: result.runtimePid }
+            : {}),
+          ...(result.status === 'failed' && failureReason
+            ? { failureReason }
+            : {}),
+        }
+      }),
     }
     await writeJsonAtomic(this.statePath, this.state)
     await this.journal.append({
@@ -194,7 +216,7 @@ export class TeamBootstrapStateStore {
           : result.status === 'registered'
             ? 'spawn_succeeded'
             : 'classified',
-      ...(result.failureReason ? { detail: result.failureReason } : {}),
+      ...(failureReason ? { detail: failureReason } : {}),
     })
   }
 
@@ -203,6 +225,9 @@ export class TeamBootstrapStateStore {
     now: () => number,
   ): Promise<void> {
     const timestamp = now()
+    const sanitizedReason = terminal?.reason
+      ? sanitizeBootstrapFailureReason(terminal.reason)
+      : undefined
     const nextPhase: TeamBootstrapPhase =
       terminal?.status === 'canceled'
         ? 'canceled'
@@ -221,6 +246,7 @@ export class TeamBootstrapStateStore {
       updatedAt: timestamp,
       terminal: {
         ...terminal,
+        ...(sanitizedReason ? { reason: sanitizedReason } : { reason: undefined }),
         finishedAt: terminal?.finishedAt ?? timestamp,
       },
     }

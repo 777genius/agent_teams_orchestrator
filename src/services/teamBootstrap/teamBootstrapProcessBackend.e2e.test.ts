@@ -111,7 +111,7 @@ const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
 const markerPath = process.env.FAKE_TEAMMATE_SPAWN_MARKER
 const mode = process.env.FAKE_TEAMMATE_MODE || 'success'
 
-async function writeEvent(type, detail) {
+async function writeEvent(type, detail, extra = {}) {
   if (!eventsPath) return
   await mkdir(dirname(eventsPath), { recursive: true })
   await appendFile(
@@ -126,6 +126,7 @@ async function writeEvent(type, detail) {
       agentId,
       cwd: process.cwd(),
       detail,
+      ...extra,
     }) + '\n',
   )
 }
@@ -255,6 +256,37 @@ try {
 
   const promptMessage = await waitForBootstrapPrompt()
   await writeEvent('inbox_poller_ready', 'initial poll observed bootstrap prompt')
+  await writeEvent('bootstrap_prompt_observed', 'bootstrap prompt observed')
+  await writeEvent('bootstrap_submit_attempted', 'submitting bootstrap prompt')
+  if (mode === 'submit-rejected-terminal') {
+    await writeEvent('bootstrap_submit_rejected', 'fatal submit rejection', {
+      retryable: false,
+    })
+    await sleep(60_000)
+    process.exit(0)
+  }
+  if (mode === 'accepted-without-uuid') {
+    await writeEvent(
+      'bootstrap_submit_accepted_without_uuid',
+      'accepted but missing message id',
+      { retryable: false },
+    )
+    await sleep(60_000)
+    process.exit(0)
+  }
+  if (mode === 'submit-rejected-then-accepted') {
+    await writeEvent('bootstrap_submit_rejected', 'cooldown before retry', {
+      retryable: true,
+      attempt: 1,
+    })
+    await sleep(50)
+    await writeEvent('bootstrap_submit_attempted', 'retrying bootstrap prompt', {
+      attempt: 2,
+    })
+  }
+  if (mode === 'corrupt-event-before-submit' && eventsPath) {
+    await appendFile(eventsPath, '{"type":\n')
+  }
   await writeEvent(
     'bootstrap_submitted',
     'messageId=' + String(promptMessage.messageId || 'missing'),
@@ -347,7 +379,7 @@ describe('supervised process teammate backend e2e', () => {
         __handleSpawnNativeProcessForTests(input, context),
     })
 
-    const result = await runTeamBootstrap({
+    const bootstrapResult = await runTeamBootstrap({
       request: {
         version: 1,
         runId: 'process-e2e-run-1',
@@ -399,13 +431,13 @@ describe('supervised process teammate backend e2e', () => {
       },
     })
 
-    expect(result.ok).toBe(true)
-    if (!result.ok) {
-      throw new Error(result.error)
+    if (!bootstrapResult.ok) {
+      throw new Error(bootstrapResult.error)
     }
-    expect(result.summary.terminalStatus).toBe('completed')
-    expect(result.summary.registeredMembers).toEqual(['alice'])
-    expect(result.summary.failedMembers).toEqual([])
+    expect(bootstrapResult.ok).toBe(true)
+    expect(bootstrapResult.summary.terminalStatus).toBe('completed')
+    expect(bootstrapResult.summary.registeredMembers).toEqual(['alice'])
+    expect(bootstrapResult.summary.failedMembers).toEqual([])
     expect(completed).toHaveLength(1)
     expect(completed[0]).toMatchObject({
       status: 'completed',
@@ -491,6 +523,142 @@ describe('supervised process teammate backend e2e', () => {
 
     expect(thrown?.message).toContain('workspace trust is not accepted')
     expect(await pathExists(fixture.markerPath)).toBe(false)
+  })
+
+  it('keeps retryable bootstrap submit rejection pending until a later submit succeeds', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'submit-rejected-then-accepted',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'bootstrap_submit_rejected',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const rejected = events.find(event => event.type === 'bootstrap_submit_rejected')
+    expect(rejected?.retryable).toBe(true)
+    expect(events.map(event => event.type)).toContain('bootstrap_submitted')
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('treats non-retryable bootstrap submit rejection as a terminal spawn failure', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'submit-rejected-terminal',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('fatal submit rejection')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await readTeammateRuntimeEvents(runtimePaths.eventsPath)
+    const rejected = events.find(event => event.type === 'bootstrap_submit_rejected')
+    expect(rejected?.retryable).toBe(false)
+  })
+
+  it('treats accepted bootstrap submit without a message id as terminal', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'accepted-without-uuid',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('accepted but missing message id')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await readTeammateRuntimeEvents(runtimePaths.eventsPath)
+    expect(events.map(event => event.type)).toContain(
+      'bootstrap_submit_accepted_without_uuid',
+    )
+  })
+
+  it('ignores malformed runtime event lines while waiting for bootstrap submit proof', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'corrupt-event-before-submit',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    expect(events.map(event => event.type)).toContain('bootstrap_submitted')
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
   it('surfaces immediate process crashes with stderr tail and failure event', async () => {
@@ -705,6 +873,10 @@ async function createFixture(options: {
     | 'hold-child'
     | 'stdin-sensitive'
     | 'member-name-confirmation'
+    | 'submit-rejected-then-accepted'
+    | 'submit-rejected-terminal'
+    | 'accepted-without-uuid'
+    | 'corrupt-event-before-submit'
 }): Promise<{
   teamName: string
   projectRealpath: string

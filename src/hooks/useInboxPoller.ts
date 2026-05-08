@@ -43,7 +43,7 @@ import {
 } from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
-import { writeTeammateRuntimeEvent } from '../utils/swarm/teammateRuntimeEvents.js'
+import { writeChildOwnedTeammateRuntimeEvent } from '../utils/swarm/teammateRuntimeEvents.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
 import {
@@ -1493,6 +1493,7 @@ export function useInboxPoller({
   const bootstrapAttemptsRef = useRef<Map<string, BootstrapAttemptState>>(
     new Map(),
   )
+  const observedBootstrapTransportRef = useRef<Set<string>>(new Set())
   const ordinaryAttemptsRef = useRef<Map<string, OrdinaryAttemptState>>(
     new Map(),
   )
@@ -1514,6 +1515,7 @@ export function useInboxPoller({
         }
       }
       bootstrapAttemptsRef.current.clear()
+      observedBootstrapTransportRef.current.clear()
       for (const attempt of ordinaryAttemptsRef.current.values()) {
         if (attempt.timer) {
           clearTimeout(attempt.timer)
@@ -2447,6 +2449,7 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         bootstrapAttemptsRef.current.delete(messageId)
+        observedBootstrapTransportRef.current.delete(messageId)
       }
     }
     for (const [messageId, attempt] of ordinaryAttemptsRef.current.entries()) {
@@ -2830,13 +2833,17 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId)
+        observedBootstrapTransportRef.current.delete(
+          processingBootstrapMessage.messageId,
+        )
         if (isTeammate()) {
-          void writeTeammateRuntimeEvent({
+          void writeChildOwnedTeammateRuntimeEvent({
             type: 'bootstrap_confirmed',
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
             runId: attempt.nativeAppManaged?.runId ?? sessionId,
+            bootstrapRunId: attempt.nativeAppManaged?.runId,
             ...(attempt.nativeAppManaged
               ? {
                   source: NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,
@@ -2902,14 +2909,18 @@ export function useInboxPoller({
           clearTimeout(attempt.timer)
         }
         bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId)
+        observedBootstrapTransportRef.current.delete(
+          processingBootstrapMessage.messageId,
+        )
         const detail = `Bootstrap failed after teammate startup: ${processingAction.detail}`
         if (isTeammate()) {
-          void writeTeammateRuntimeEvent({
+          void writeChildOwnedTeammateRuntimeEvent({
             type: 'failed',
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
             runId: attempt.nativeAppManaged?.runId ?? sessionId,
+            bootstrapRunId: attempt.nativeAppManaged?.runId,
             detail,
           })
         }
@@ -2971,8 +2982,24 @@ export function useInboxPoller({
         // Leave the row in the existing "processing" state during cooldown so
         // the idle delivery path does not immediately resubmit the same
         // bootstrap prompt in a tight loop when the model fails to comply.
+        if (isTeammate()) {
+          void writeChildOwnedTeammateRuntimeEvent({
+            type: 'bootstrap_submit_deferred',
+            teamName,
+            agentName,
+            agentId: currentAppState.teamContext?.selfAgentId,
+            runId: attempt.nativeAppManaged?.runId ?? sessionId,
+            bootstrapRunId: attempt.nativeAppManaged?.runId,
+            bootstrapMirrorId: processingBootstrapMessage.messageId,
+            source: 'useInboxPoller',
+            detail: 'bootstrap retry cooldown scheduled',
+          })
+        }
         const timer = setTimeout(() => {
           bootstrapAttemptsRef.current.delete(processingBootstrapMessage.messageId!)
+          observedBootstrapTransportRef.current.delete(
+            processingBootstrapMessage.messageId!,
+          )
           setAppState(prev => ({
             ...prev,
             inbox: {
@@ -3176,16 +3203,52 @@ export function useInboxPoller({
         !nativeBootstrapInjection
       ) {
         if (isTeammate()) {
-          void writeTeammateRuntimeEvent({
+          void writeChildOwnedTeammateRuntimeEvent({
             type: 'failed',
             teamName,
             agentName,
             agentId: currentAppState.teamContext?.selfAgentId,
             runId: sessionId,
+            source: 'useInboxPoller',
             detail: 'Native app-managed bootstrap context was unavailable.',
           })
         }
         return
+      }
+
+      const bootstrapTransportBase =
+        bootstrapPendingMessage?.messageId && isTeammate()
+          ? {
+              teamName,
+              agentName,
+              agentId: currentAppState.teamContext?.selfAgentId,
+              runId: nativeBootstrapInjection?.runId ?? sessionId,
+              bootstrapRunId: nativeBootstrapInjection?.runId,
+              bootstrapMirrorId: bootstrapPendingMessage.messageId,
+              source: 'useInboxPoller',
+            }
+          : null
+
+      if (
+        bootstrapTransportBase &&
+        !observedBootstrapTransportRef.current.has(
+          bootstrapTransportBase.bootstrapMirrorId,
+        )
+      ) {
+        observedBootstrapTransportRef.current.add(
+          bootstrapTransportBase.bootstrapMirrorId,
+        )
+        void writeChildOwnedTeammateRuntimeEvent({
+          type: 'bootstrap_prompt_observed',
+          ...bootstrapTransportBase,
+        })
+      }
+
+      if (bootstrapTransportBase) {
+        void writeChildOwnedTeammateRuntimeEvent({
+          type: 'bootstrap_submit_attempted',
+          ...bootstrapTransportBase,
+        })
       }
 
       const submitted = onSubmitTeammateMessage(prompt, {
@@ -3195,6 +3258,14 @@ export function useInboxPoller({
           : {}),
       })
       if (!submitted.accepted) {
+        if (bootstrapTransportBase) {
+          void writeChildOwnedTeammateRuntimeEvent({
+            type: 'bootstrap_submit_rejected',
+            ...bootstrapTransportBase,
+            retryable: true,
+            detail: 'submit rejected by local prompt handler',
+          })
+        }
         logForDebugging(
           `[InboxPoller] Submission rejected, keeping messages queued`,
         )
@@ -3202,17 +3273,52 @@ export function useInboxPoller({
       }
 
       if (nativeBootstrapInjection) {
-        await nativeBootstrapInjection.markContextLoaded()
+        try {
+          await nativeBootstrapInjection.markContextLoaded()
+          if (bootstrapTransportBase) {
+            void writeChildOwnedTeammateRuntimeEvent({
+              type: 'bootstrap_context_loaded',
+              ...bootstrapTransportBase,
+              bootstrapProofToken: nativeBootstrapInjection.bootstrapProofToken,
+              contextHash: nativeBootstrapInjection.contextHash,
+              briefingHash: nativeBootstrapInjection.briefingHash,
+            })
+          }
+        } catch (error) {
+          if (bootstrapTransportBase) {
+            void writeChildOwnedTeammateRuntimeEvent({
+              type: 'failed',
+              ...bootstrapTransportBase,
+              detail: `Native app-managed bootstrap context load failed: ${String(error)}`,
+            })
+          }
+          return
+        }
+      }
+
+      if (bootstrapTransportBase && !submitted.userMessageUuid) {
+        void writeChildOwnedTeammateRuntimeEvent({
+          type: 'bootstrap_submit_accepted_without_uuid',
+          ...bootstrapTransportBase,
+          retryable: false,
+          detail: 'submit accepted without userMessageUuid',
+        })
+        return
       }
 
       if (bootstrapPendingMessage?.messageId && submitted.userMessageUuid) {
         if (isTeammate()) {
-          void writeTeammateRuntimeEvent({
+          void writeChildOwnedTeammateRuntimeEvent({
             type: 'bootstrap_submitted',
-            teamName,
-            agentName,
-            agentId: currentAppState.teamContext?.selfAgentId,
-            runId: nativeBootstrapInjection?.runId ?? sessionId,
+            ...(bootstrapTransportBase ?? {
+              teamName,
+              agentName,
+              agentId: currentAppState.teamContext?.selfAgentId,
+              runId: nativeBootstrapInjection?.runId ?? sessionId,
+              bootstrapRunId: nativeBootstrapInjection?.runId,
+              source: 'useInboxPoller',
+            }),
+            bootstrapMessageId: submitted.userMessageUuid,
           })
         }
         bootstrapAttemptsRef.current.set(bootstrapPendingMessage.messageId, {
@@ -3306,7 +3412,7 @@ export function useInboxPoller({
       void poll().finally(() => {
         if (!didWriteInboxPollerReadyRef.current && isTeammate()) {
           didWriteInboxPollerReadyRef.current = true
-          void writeTeammateRuntimeEvent({
+          void writeChildOwnedTeammateRuntimeEvent({
             type: 'inbox_poller_ready',
             teamName: currentAppState.teamContext?.teamName,
             agentName,

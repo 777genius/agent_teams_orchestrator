@@ -882,6 +882,15 @@ async function getInputPrompt(prompt: string, inputFormat: 'text' | 'stream-json
   if (!process.stdin.isTTY &&
   // Input hijacking breaks MCP.
   !process.argv.includes('mcp')) {
+    if (
+      inputFormat === 'text' &&
+      process.env[TEAMMATE_RUNTIME_ENV] === 'headless'
+    ) {
+      // Headless process teammates inherit a long-lived stdin pipe from the app.
+      // Treat only text prompts as argv-managed input here; stream-json still
+      // owns stdin for SDK/JSON sessions and must keep the old behavior.
+      return prompt;
+    }
     if (inputFormat === 'stream-json') {
       return process.stdin;
     }

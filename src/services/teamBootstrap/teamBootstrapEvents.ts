@@ -5,6 +5,17 @@ import type { TeamBootstrapPhase } from './teamBootstrapStateMachine.js'
 
 type EmitPayload = Record<string, unknown>
 
+const MAX_BOOTSTRAP_PROGRESS_REASON_CHARS = 500
+
+function sanitizeBootstrapProgressReason(reason: string): string {
+  return reason
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_-]{32,})\b/g, '[redacted]')
+    .replace(/\/[^\s"'`]+/g, '[path]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_BOOTSTRAP_PROGRESS_REASON_CHARS)
+}
+
 export type TeamBootstrapProgressSink = {
   started(expectedMembers: string[]): Promise<void>
   phaseChanged(phase: TeamBootstrapPhase): Promise<void>
@@ -84,7 +95,7 @@ export class TeamBootstrapProgressEmitter implements TeamBootstrapProgressSink {
       ...(payload.agentId ? { agent_id: payload.agentId } : {}),
       ...(payload.teammateId ? { teammate_id: payload.teammateId } : {}),
       ...(payload.backendType ? { backend_type: payload.backendType } : {}),
-      ...(payload.reason ? { reason: payload.reason } : {}),
+      ...(payload.reason ? { reason: sanitizeBootstrapProgressReason(payload.reason) } : {}),
     })
   }
 
@@ -99,12 +110,15 @@ export class TeamBootstrapProgressEmitter implements TeamBootstrapProgressSink {
       status: payload.status,
       expected_members: payload.expectedMembers,
       registered_members: payload.registeredMembers,
-      failed_members: payload.failedMembers,
+      failed_members: payload.failedMembers.map(member => ({
+        ...member,
+        reason: sanitizeBootstrapProgressReason(member.reason),
+      })),
     })
   }
 
   async failed(reason: string): Promise<void> {
-    await this.emit({ event: 'failed', reason })
+    await this.emit({ event: 'failed', reason: sanitizeBootstrapProgressReason(reason) })
   }
 }
 

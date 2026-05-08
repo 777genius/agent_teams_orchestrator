@@ -320,6 +320,7 @@ describe('executeCodexNativeTurn', () => {
     const previousOpenAiKey = process.env.OPENAI_API_KEY
     const previousSettings = getFlagSettingsInline()
     let observedDisabledFeatures: string[] | undefined
+    let observedApiKey: string | null | undefined
 
     try {
       process.env.CODEX_API_KEY = 'sk-test'
@@ -334,6 +335,7 @@ describe('executeCodexNativeTurn', () => {
         executeCodexNativeTurn(baseParams(), {
           runExec: async function* (options) {
             observedDisabledFeatures = options.disabledFeatures
+            observedApiKey = options.apiKey
             yield {
               type: 'normalized_event',
               event: {
@@ -355,7 +357,7 @@ describe('executeCodexNativeTurn', () => {
                 version: 'codex-cli 0.117.0',
               },
               threadId: null,
-              credentialSource: 'explicit-api-key',
+              credentialSource: 'none',
               completionPolicy: 'ephemeral',
               finalHistoryCompleteness: 'live-only',
               finalUsageAuthority: 'live-turn-completed',
@@ -365,6 +367,7 @@ describe('executeCodexNativeTurn', () => {
       )
 
       expect(observedDisabledFeatures).toEqual([])
+      expect(observedApiKey).toBeUndefined()
     } finally {
       if (previousCodeKey === undefined) {
         delete process.env.CODEX_API_KEY

@@ -23,7 +23,8 @@ import {
 } from 'src/utils/swarm/teamHelpers.js'
 import {
   getTeammateRuntimePaths,
-  readTeammateRuntimeEvents,
+  readRecentTeammateRuntimeEvents,
+  type TeammateRuntimeEvent,
 } from 'src/utils/swarm/teammateRuntimeEvents.js'
 import type { TeamBootstrapProgressSink } from './teamBootstrapEvents.js'
 import { withBootstrapOwnershipLock } from './teamBootstrapLock.js'
@@ -321,40 +322,131 @@ function buildSummary(params: {
   }
 }
 
+function isCurrentProcessBootstrapEvent(
+  event: TeammateRuntimeEvent,
+  params: {
+    teamName: string
+    memberName: string
+    runtimePid?: number
+    bootstrapRunId?: string | null
+    bootstrapExpectedAfter?: string | null
+  },
+): boolean {
+  if (event.teamName && event.teamName !== params.teamName) {
+    return false
+  }
+  if (event.agentName && event.agentName !== params.memberName) {
+    return false
+  }
+  if (typeof params.runtimePid === 'number' && event.pid !== params.runtimePid) {
+    return false
+  }
+  if (
+    params.bootstrapRunId &&
+    event.bootstrapRunId &&
+    event.bootstrapRunId !== params.bootstrapRunId
+  ) {
+    return false
+  }
+  if (params.bootstrapExpectedAfter) {
+    const boundaryMs = Date.parse(params.bootstrapExpectedAfter)
+    if (Number.isFinite(boundaryMs)) {
+      const eventMs = Date.parse(event.timestamp)
+      if (!Number.isFinite(eventMs) || eventMs < boundaryMs) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+function isTerminalProcessBootstrapTransportEvent(
+  event: TeammateRuntimeEvent,
+): boolean {
+  if (event.type === 'failed' || event.type === 'exited') {
+    return true
+  }
+  if (event.type === 'bootstrap_submit_accepted_without_uuid') {
+    return true
+  }
+  return event.type === 'bootstrap_submit_rejected' && event.retryable === false
+}
+
+function isBootstrapTransportStageEvent(event: TeammateRuntimeEvent): boolean {
+  return (
+    event.type === 'process_spawned' ||
+    event.type === 'stdout_attached' ||
+    event.type === 'cli_started' ||
+    event.type === 'runtime_ready' ||
+    event.type === 'inbox_poller_ready' ||
+    event.type === 'mailbox_bootstrap_written' ||
+    event.type === 'bootstrap_prompt_observed' ||
+    event.type === 'bootstrap_submit_attempted' ||
+    event.type === 'bootstrap_submit_deferred' ||
+    event.type === 'bootstrap_submit_rejected' ||
+    event.type === 'bootstrap_submit_accepted_without_uuid' ||
+    event.type === 'bootstrap_submitted' ||
+    event.type === 'failed' ||
+    event.type === 'exited'
+  )
+}
+
+function describeBootstrapTransportStage(event: TeammateRuntimeEvent): string {
+  return event.detail ? `${event.type}: ${event.detail}` : event.type
+}
+
+function describeTerminalBootstrapFailure(event: TeammateRuntimeEvent): string {
+  return event.detail ?? `Runtime transport failed before bootstrap confirmation: ${event.type}`
+}
+
+async function readProcessBootstrapRuntimeEvents(params: {
+  teamName: string
+  memberName: string
+  backendType?: string
+  runtimePid?: number
+  bootstrapRunId?: string | null
+  bootstrapExpectedAfter?: string | null
+}): Promise<TeammateRuntimeEvent[]> {
+  if (params.backendType !== 'process') {
+    return []
+  }
+
+  const eventsPath = getTeammateRuntimePaths({
+    teamName: params.teamName,
+    agentName: params.memberName,
+  }).eventsPath
+  const events = await readRecentTeammateRuntimeEvents(eventsPath)
+  return events.filter(event => isCurrentProcessBootstrapEvent(event, params))
+}
+
 async function readBootstrapRuntimeFailure(params: {
   teamName: string
   memberName: string
   backendType?: string
   runtimePid?: number
+  bootstrapRunId?: string | null
   bootstrapExpectedAfter?: string | null
 }): Promise<string | null> {
-  if (params.backendType !== 'process' && typeof params.runtimePid !== 'number') {
-    return null
-  }
+  const failure = [
+    ...(await readProcessBootstrapRuntimeEvents(params)),
+  ].reverse().find(isTerminalProcessBootstrapTransportEvent)
 
-  const boundaryMs = params.bootstrapExpectedAfter
-    ? Date.parse(params.bootstrapExpectedAfter)
-    : Number.NaN
-  const eventsPath = getTeammateRuntimePaths({
-    teamName: params.teamName,
-    agentName: params.memberName,
-  }).eventsPath
-  const events = await readTeammateRuntimeEvents(eventsPath)
-  const failure = [...events].reverse().find(event => {
-    if (event.type !== 'failed') {
-      return false
-    }
-    if (typeof params.runtimePid === 'number' && event.pid !== params.runtimePid) {
-      return false
-    }
-    if (Number.isFinite(boundaryMs)) {
-      const eventMs = Date.parse(event.timestamp)
-      return Number.isFinite(eventMs) && eventMs >= boundaryMs
-    }
-    return true
-  })
+  return failure ? describeTerminalBootstrapFailure(failure) : null
+}
 
-  return failure?.detail ?? null
+async function readLastBootstrapTransportStage(params: {
+  teamName: string
+  memberName: string
+  backendType?: string
+  runtimePid?: number
+  bootstrapRunId?: string | null
+  bootstrapExpectedAfter?: string | null
+}): Promise<string | null> {
+  const lastStage = [
+    ...(await readProcessBootstrapRuntimeEvents(params)),
+  ].reverse().find(isBootstrapTransportStageEvent)
+
+  return lastStage ? describeBootstrapTransportStage(lastStage) : null
 }
 
 async function waitForRequiredBootstrapConfirmations(params: {
@@ -368,6 +460,7 @@ async function waitForRequiredBootstrapConfirmations(params: {
       bootstrapExpectedAfter?: string | null
       backendType?: string
       runtimePid?: number
+      bootstrapRunId?: string | null
     }
   >
   timeoutStartedAt: number
@@ -381,6 +474,7 @@ async function waitForRequiredBootstrapConfirmations(params: {
       bootstrapExpectedAfter?: string | null
       backendType?: string
       runtimePid?: number
+      bootstrapRunId?: string | null
     }
   >()
   const confirmedMembers = new Set<string>()
@@ -396,6 +490,7 @@ async function waitForRequiredBootstrapConfirmations(params: {
       bootstrapExpectedAfter: registered.bootstrapExpectedAfter ?? null,
       backendType: registered.backendType,
       runtimePid: registered.runtimePid,
+      bootstrapRunId: registered.bootstrapRunId,
     })
   }
 
@@ -427,6 +522,7 @@ async function waitForRequiredBootstrapConfirmations(params: {
         memberName,
         backendType: pendingMember.backendType,
         runtimePid: pendingMember.runtimePid,
+        bootstrapRunId: pendingMember.bootstrapRunId,
         bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
       })
       if (runtimeFailure) {
@@ -454,14 +550,23 @@ async function waitForRequiredBootstrapConfirmations(params: {
     const elapsedMs = params.monotonicNow() - params.timeoutStartedAt
     const remainingMs = params.request.bootstrapTimeoutMs - elapsedMs
     if (remainingMs <= 0) {
-      for (const memberName of pending.keys()) {
+      for (const [memberName, pendingMember] of pending) {
         if (
           params.failedMembers.some(failed => failed.name === memberName)
         ) {
           continue
         }
-        const reason =
-          'Teammate was registered but did not bootstrap-confirm before timeout.'
+        const lastStage = await readLastBootstrapTransportStage({
+          teamName: params.request.teamName,
+          memberName,
+          backendType: pendingMember.backendType,
+          runtimePid: pendingMember.runtimePid,
+          bootstrapRunId: pendingMember.bootstrapRunId,
+          bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
+        })
+        const reason = lastStage
+          ? `Teammate was registered but did not bootstrap-confirm before timeout. Last transport stage: ${lastStage}`
+          : 'Teammate was registered but did not bootstrap-confirm before timeout.'
         params.failedMembers.push({ name: memberName, reason })
         await params.stateStore.markMemberResult(
           memberName,
@@ -750,6 +855,7 @@ export async function runTeamBootstrap(params: {
                   bootstrapExpectedAfter: member.bootstrapExpectedAfter ?? null,
                   backendType: member.backendType,
                   runtimePid: member.runtimePid,
+                  bootstrapRunId: member.bootstrapRunId ?? null,
                 },
               ] as const,
             ]

@@ -976,6 +976,77 @@ describe('runCodexNativeExec', () => {
     }
   })
 
+  test('scrubs ambient native credentials when ChatGPT login is forced', async () => {
+    const originalCodexApiKey = process.env.CODEX_API_KEY
+    const originalOpenAiApiKey = process.env.OPENAI_API_KEY
+    process.env.CODEX_API_KEY = 'ambient-native-key'
+    process.env.OPENAI_API_KEY = 'ambient-openai-key'
+    let observedEnv: NodeJS.ProcessEnv | undefined
+
+    try {
+      const process = new FakeCodexProcess()
+      const iterator = runCodexNativeExec(
+        {
+          prompt: 'Reply only with OK',
+          cwd: '/tmp/demo',
+          ephemeral: false,
+          forcedLoginMethod: 'chatgpt',
+        },
+        {
+          which: () => '/usr/local/bin/codex',
+          resolveVersion: () => 'codex-cli 0.117.0',
+          spawnProcess: (_executablePath, _args, options) => {
+            observedEnv = options.env
+            return process as never
+          },
+        },
+      )
+
+      await iterator.next()
+      const remaining = (async () => {
+        while (true) {
+          const next = await iterator.next()
+          if (next.done) {
+            return next.value
+          }
+        }
+      })()
+
+      process.stdout.write(
+        '{"type":"thread.started","thread_id":"thread-3"}\n{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}\n',
+      )
+      process.stdout.end()
+      process.stderr.end()
+      process.emit('close', 0, null)
+
+      await expect(remaining).resolves.toEqual({
+        identity: {
+          executablePath: '/usr/local/bin/codex',
+          executableSource: 'system-path',
+          version: 'codex-cli 0.117.0',
+        },
+        threadId: 'thread-3',
+        credentialSource: 'none',
+        completionPolicy: 'persistent',
+        finalHistoryCompleteness: 'explicit-hydration-required',
+        finalUsageAuthority: 'live-turn-completed',
+      })
+      expect(observedEnv?.CODEX_API_KEY).toBeUndefined()
+      expect(observedEnv?.OPENAI_API_KEY).toBeUndefined()
+    } finally {
+      if (originalCodexApiKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+      if (originalOpenAiApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAiApiKey
+      }
+    }
+  })
+
   test('uses CODEX_CLI_PATH before PATH lookup when spawning codex exec', async () => {
     const originalCodexCliPath = process.env.CODEX_CLI_PATH
     process.env.CODEX_CLI_PATH = '/opt/codex/bin/codex.cmd'

@@ -495,8 +495,9 @@ export async function* executeCodexNativeTurn(
     const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
       resolvedPrompt.text,
     )
-    const apiKey = getCodexNativeApiKey() ?? undefined
     const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
+    const apiKey =
+      forcedLoginMethod === 'chatgpt' ? undefined : (getCodexNativeApiKey() ?? undefined)
     const iterator = runExec({
       prompt: resolvedPrompt.text,
       cwd: params.cwd,

@@ -104,8 +104,9 @@ import {
   readTeammateRuntimeEvents,
   TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV,
   TEAMMATE_RUNTIME_EVENTS_ENV,
+  waitForBootstrapSubmissionOutcome,
   waitForTeammateRuntimeEvent,
-  writeTeammateRuntimeEvent,
+  writeParentOwnedTeammateRuntimeEvent,
 } from '../../utils/swarm/teammateRuntimeEvents.js'
 import {
   prepareNativeAppManagedBootstrapContextFile,
@@ -1682,6 +1683,9 @@ async function handleSpawnSplitPane(
       : undefined
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
+  // This id fences transport/evidence rows for one concrete process launch.
+  // It prevents stale runtime JSONL from a previous process with the same
+  // member name from satisfying this launch.
   const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
   const runtimePaths = getTeammateRuntimePaths({
     teamName,
@@ -2477,14 +2481,16 @@ async function handleSpawnNativeProcess(
     ;(child.stdout as { unref?: () => void } | null)?.unref?.()
     ;(child.stderr as { unref?: () => void } | null)?.unref?.()
     child.once('close', (code, signal) => {
-      void writeTeammateRuntimeEvent({
+      void writeParentOwnedTeammateRuntimeEvent({
         type: 'exited',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail:
           code !== null
             ? `process exited with code ${code}`
@@ -2495,48 +2501,56 @@ async function handleSpawnNativeProcess(
       finishRuntimeLogStreams([stdoutLog, stderrLog])
     })
     child.once('error', error => {
-      void writeTeammateRuntimeEvent({
+      void writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail: `process error: ${error.message}`,
       })
     })
-    await writeTeammateRuntimeEvent({
+    await writeParentOwnedTeammateRuntimeEvent({
       type: 'process_spawned',
       eventsPath: runtimePaths.eventsPath,
       pid: runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
-      cwd: workingDir,
-      detail: `command=${command} args=${argv.length}`,
+      runId: getSessionId(),
+      bootstrapRunId,
+      source: 'spawnMultiAgent.process',
+      detail: 'process spawned',
     })
-    await writeTeammateRuntimeEvent({
+    await writeParentOwnedTeammateRuntimeEvent({
       type: 'stdout_attached',
       eventsPath: runtimePaths.eventsPath,
       pid: runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
-      cwd: workingDir,
-      detail: `stdout=${runtimePaths.stdoutPath} stderr=${runtimePaths.stderrPath}`,
+      runId: getSessionId(),
+      bootstrapRunId,
+      source: 'spawnMultiAgent.process',
+      detail: 'stdout and stderr attached',
     })
     const spawnFailure = await probeNativeProcessTeammateSpawn(child, teammateId)
     if (spawnFailure) {
       killProcessTree(runtimePid, 'SIGTERM')
-      await writeTeammateRuntimeEvent({
+      await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail: spawnFailure,
       })
       const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
@@ -2563,14 +2577,16 @@ async function handleSpawnNativeProcess(
       ]
         .filter(Boolean)
         .join('\n')
-      await writeTeammateRuntimeEvent({
+      await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail,
       })
       throw new Error(
@@ -2634,6 +2650,19 @@ async function handleSpawnNativeProcess(
       },
       teamName,
     )
+    // The app wrote the prompt into the teammate mailbox. The child still has
+    // to observe and submit it; this event is progress evidence, not readiness.
+    await writeParentOwnedTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath: runtimePaths.eventsPath,
+      pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      runId: getSessionId(),
+      bootstrapRunId,
+      source: 'spawnMultiAgent.process',
+    })
 
     const inboxPollerReady = await waitForTeammateRuntimeEvent({
       eventsPath: runtimePaths.eventsPath,
@@ -2643,15 +2672,23 @@ async function handleSpawnNativeProcess(
       isStillAlive: () => isProcessAlive(runtimePid),
     })
     if (!inboxPollerReady.ok) {
-      killProcessTree(runtimePid, 'SIGTERM')
-      await writeTeammateRuntimeEvent({
+      // After team metadata registration, cleanup goes through the process
+      // backend guard so a reused pid cannot be killed without matching the
+      // expected agent/team identity.
+      await killProcessBackendRuntime(processPaneId, {
+        expectedAgentId: teammateId,
+        teamName,
+      })
+      await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail: inboxPollerReady.reason,
       })
       throw new Error(
@@ -2659,27 +2696,38 @@ async function handleSpawnNativeProcess(
       )
     }
 
-    const bootstrapSubmitted = await waitForTeammateRuntimeEvent({
+    const bootstrapSubmitted = await waitForBootstrapSubmissionOutcome({
       eventsPath: runtimePaths.eventsPath,
-      type: 'bootstrap_submitted',
       timeoutMs: 15_000,
       pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      bootstrapRunId,
+      sinceMs: Date.parse(launchBoundaryIso),
       isStillAlive: () => isProcessAlive(runtimePid),
     })
-    if (!bootstrapSubmitted.ok) {
-      killProcessTree(runtimePid, 'SIGTERM')
+    if (bootstrapSubmitted.type !== 'submitted') {
+      // Same guarded cleanup path as above: bootstrap transport failure is
+      // terminal for this launch, but process termination must remain scoped.
+      await killProcessBackendRuntime(processPaneId, {
+        expectedAgentId: teammateId,
+        teamName,
+      })
       const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
       const detail = stderrTail
         ? `${bootstrapSubmitted.reason}\nLast stderr:\n${stderrTail}`
         : bootstrapSubmitted.reason
-      await writeTeammateRuntimeEvent({
+      await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
         pid: runtimePid,
         teamName,
         agentName: sanitizedName,
         agentId: teammateId,
-        cwd: workingDir,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
         detail,
       })
       throw new Error(
