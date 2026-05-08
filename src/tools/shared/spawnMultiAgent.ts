@@ -1315,6 +1315,7 @@ export function shouldDetachNativeProcessBackend(
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
+const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 45_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
@@ -2698,7 +2699,10 @@ async function handleSpawnNativeProcess(
 
     const bootstrapSubmitted = await waitForBootstrapSubmissionOutcome({
       eventsPath: runtimePaths.eventsPath,
-      timeoutMs: 15_000,
+      // Process-backend teammates may need a full model turn after the mailbox
+      // row is written before the child records bootstrap_submitted. Keep this
+      // bounded, but avoid killing slow Anthropic/Codex teammates at 15s.
+      timeoutMs: PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS,
       pid: runtimePid,
       teamName,
       agentName: sanitizedName,

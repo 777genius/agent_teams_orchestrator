@@ -60,6 +60,9 @@ const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // acceptanceUnknown early while this bridge keeps observing the real turn.
 const OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS = 25_000
 const OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
+const OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS = 6_000
+const OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_ENV =
+  'AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS'
 const OPEN_CODE_TEAMMATE_AGENT = 'teammate'
 const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT = 'teammate-bootstrap'
 const SUPPORTED_COMMANDS = [
@@ -591,6 +594,96 @@ function reconcileFailedObservation(message: string): OpenCodeDeliveryResponseOb
     visibleReplyCorrelation: null,
     latestAssistantPreview: null,
     reason: message,
+  }
+}
+
+function isMessageSendToolErrorObservation(
+  observation: OpenCodeDeliveryResponseObservation | undefined,
+): boolean {
+  return observation?.state === 'tool_error' &&
+    observation.toolCallNames.includes('message_send')
+}
+
+function shouldContinueMessageSendToolErrorFallbackGrace(
+  observation: OpenCodeDeliveryResponseObservation | undefined,
+): boolean {
+  if (!observation) return false
+  if (isMessageSendToolErrorObservation(observation)) return true
+  return observation.state === 'pending' ||
+    observation.state === 'empty_assistant_turn' ||
+    observation.state === 'prompt_delivered_no_assistant_message'
+}
+
+function messageSendToolErrorFallbackGraceMs(): number {
+  const configured = Number(process.env[OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_ENV])
+  if (Number.isFinite(configured) && configured >= 0) {
+    return Math.min(Math.round(configured), 10_000)
+  }
+  return OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS
+}
+
+async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
+  record: OpenCodeSessionRecord
+  inboundMessageId: string | null
+  prePromptCursor: string | null
+  timeoutMs: number
+  limit?: number
+  diagnosticCode: string
+}): Promise<{
+  record: OpenCodeSessionRecord
+  summary: OpenCodeSessionReconcileSummary
+  responseObservation: OpenCodeDeliveryResponseObservation
+  diagnostics: TeamDiagnostic[]
+}> {
+  const fallbackGraceMs = messageSendToolErrorFallbackGraceMs()
+  const startedAt = Date.now()
+  const pollIntervalMs = Math.min(1_000, Math.max(1, Math.floor(fallbackGraceMs / 4)))
+  let attemptCount = 0
+  let reconciled: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>> | null = null
+  let responseObservation: OpenCodeDeliveryResponseObservation | null = null
+
+  do {
+    const elapsedMs = Math.max(0, Date.now() - startedAt)
+    const waitMs = Math.min(pollIntervalMs, Math.max(0, fallbackGraceMs - elapsedMs))
+    if (waitMs > 0) {
+      await delayMs(waitMs)
+    }
+    attemptCount += 1
+    reconciled = await withTimeout(
+      openCodeSessionBridge.reconcileSession(
+        input.record,
+        typeof input.limit === 'number' ? { limit: input.limit } : undefined,
+      ),
+      input.timeoutMs,
+    )
+    responseObservation = observeOpenCodeDeliveryResponse({
+      inboundMessageId: input.inboundMessageId,
+      prePromptCursor: input.prePromptCursor,
+      summary: reconciled.summary,
+    })
+  } while (
+    shouldContinueMessageSendToolErrorFallbackGrace(responseObservation) &&
+    Date.now() - startedAt < fallbackGraceMs
+  )
+
+  if (!reconciled || !responseObservation) {
+    throw new Error('OpenCode message_send tool_error fallback reobserve did not run')
+  }
+
+  return {
+    record: reconciled.record,
+    summary: reconciled.summary,
+    responseObservation,
+    diagnostics: [
+      teamDiagnostic(
+        `${input.diagnosticCode}_message_send_tool_error_fallback_grace`,
+        `Reconciled OpenCode session during ${fallbackGraceMs}ms message_send tool_error fallback grace (${attemptCount} attempt${attemptCount === 1 ? '' : 's'}).`,
+        'info',
+      ),
+      ...reconciled.summary.diagnostics.map(message =>
+        teamDiagnostic(input.diagnosticCode, message, 'info'),
+      ),
+    ],
   }
 }
 
@@ -2181,6 +2274,41 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       prePromptCursor,
       summary: reconciled.summary,
     })
+    if (isMessageSendToolErrorObservation(responseObservation)) {
+      try {
+        const reobserved = await reobserveAfterMessageSendToolErrorFallbackGrace({
+          record: reconciled.record,
+          inboundMessageId: asString(body.messageId),
+          prePromptCursor,
+          timeoutMs: OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
+          limit: 50,
+          diagnosticCode: 'opencode_send_reconcile',
+        })
+        emitRecord = reobserved.record
+        reconcileSummary = reobserved.summary
+        responseObservation = reobserved.responseObservation
+        runtimePid =
+          typeof reobserved.record.runtimePid === 'number' && reobserved.record.runtimePid > 0
+            ? reobserved.record.runtimePid
+            : runtimePid
+        reconcileDiagnostics = [
+          ...reconcileDiagnostics,
+          ...reobserved.diagnostics,
+        ]
+      } catch (fallbackError) {
+        const fallbackMessage = fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError)
+        reconcileDiagnostics = [
+          ...reconcileDiagnostics,
+          teamDiagnostic(
+            'opencode_send_reconcile_message_send_tool_error_fallback_failed',
+            fallbackMessage,
+            'warning',
+          ),
+        ]
+      }
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     reconcileDiagnostics = [
@@ -2258,6 +2386,7 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
       openCodeSessionBridge.reconcileSession(record, { limit: 80 }),
       OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
     )
+    let observeRecord = limited.record
     runtimePid =
       typeof limited.record.runtimePid === 'number' && limited.record.runtimePid > 0
         ? limited.record.runtimePid
@@ -2278,6 +2407,7 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
         openCodeSessionBridge.reconcileSession(limited.record),
         OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
       )
+      observeRecord = full.record
       runtimePid =
         typeof full.record.runtimePid === 'number' && full.record.runtimePid > 0
           ? full.record.runtimePid
@@ -2292,6 +2422,35 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
         prePromptCursor: asString(body.prePromptCursor),
         summary: full.summary,
       })
+    }
+    if (isMessageSendToolErrorObservation(responseObservation)) {
+      try {
+        const reobserved = await reobserveAfterMessageSendToolErrorFallbackGrace({
+          record: observeRecord,
+          inboundMessageId: messageId,
+          prePromptCursor: asString(body.prePromptCursor),
+          timeoutMs: OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
+          limit: 80,
+          diagnosticCode: 'opencode_observe_reconcile',
+        })
+        runtimePid =
+          typeof reobserved.record.runtimePid === 'number' && reobserved.record.runtimePid > 0
+            ? reobserved.record.runtimePid
+            : runtimePid
+        responseObservation = reobserved.responseObservation
+        diagnostics.push(...reobserved.diagnostics)
+      } catch (fallbackError) {
+        const fallbackMessage = fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError)
+        diagnostics.push(
+          teamDiagnostic(
+            'opencode_observe_reconcile_message_send_tool_error_fallback_failed',
+            fallbackMessage,
+            'warning',
+          ),
+        )
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)

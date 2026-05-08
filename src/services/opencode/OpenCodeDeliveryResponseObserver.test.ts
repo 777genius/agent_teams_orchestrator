@@ -480,6 +480,147 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.reason).toBe('meaningful_tool_call_failed')
   })
 
+  test('classifies plain assistant continuation after errored message_send as fallback response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-fallback',
+      summary: summary([
+        message({
+          id: 'user-fallback',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-fallback". Please reply.',
+        }),
+        message({
+          id: 'assistant-fallback-error',
+          role: 'assistant',
+          parentId: 'user-fallback',
+          toolCalls: [
+            {
+              callId: 'tool-message-fallback-error',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'errored',
+              input: { relayOfMessageId: 'msg-inbound-fallback' },
+              output: null,
+              outputText: 'Not connected',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: true,
+            },
+          ],
+        }),
+        message({
+          id: 'assistant-fallback-text',
+          role: 'assistant',
+          parentId: 'assistant-fallback-error',
+          text: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_plain_text')
+    expect(observed.assistantMessageId).toBe('assistant-fallback-text')
+    expect(observed.latestAssistantPreview).toBe('GAUNTLET_CONCURRENT_TOM_OK_1')
+    expect(observed.toolCallNames).toContain('message_send')
+    expect(observed.visibleReplyCorrelation).toBe('plain_assistant_text')
+  })
+
+  test('classifies sibling plain assistant continuation after errored message_send as fallback response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-sibling-fallback',
+      summary: summary([
+        message({
+          id: 'user-sibling-fallback',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-sibling-fallback". Please reply.',
+        }),
+        message({
+          id: 'assistant-sibling-fallback-error',
+          role: 'assistant',
+          parentId: 'user-sibling-fallback',
+          toolCalls: [
+            {
+              callId: 'tool-message-sibling-fallback-error',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'errored',
+              input: { relayOfMessageId: 'msg-inbound-sibling-fallback' },
+              output: null,
+              outputText: 'Not connected',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: true,
+            },
+          ],
+        }),
+        message({
+          id: 'assistant-sibling-fallback-text',
+          role: 'assistant',
+          parentId: 'user-sibling-fallback',
+          text: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+          previewText: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_plain_text')
+    expect(observed.assistantMessageId).toBe('assistant-sibling-fallback-text')
+    expect(observed.latestAssistantPreview).toBe('GAUNTLET_CONCURRENT_TOM_OK_1')
+    expect(observed.toolCallNames).toContain('message_send')
+    expect(observed.visibleReplyCorrelation).toBe('plain_assistant_text')
+  })
+
+  test('does not treat assistant text after a nested user turn as fallback response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-inbound-nested-user',
+      summary: summary([
+        message({
+          id: 'user-nested-root',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-inbound-nested-user". Please reply.',
+        }),
+        message({
+          id: 'assistant-nested-error',
+          role: 'assistant',
+          parentId: 'user-nested-root',
+          toolCalls: [
+            {
+              callId: 'tool-message-nested-error',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'errored',
+              input: { relayOfMessageId: 'msg-inbound-nested-user' },
+              output: null,
+              outputText: 'Not connected',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: true,
+            },
+          ],
+        }),
+        message({
+          id: 'user-nested-followup',
+          role: 'user',
+          parentId: 'assistant-nested-error',
+          text: 'Unrelated user follow-up.',
+        }),
+        message({
+          id: 'assistant-nested-followup-text',
+          role: 'assistant',
+          parentId: 'user-nested-followup',
+          text: 'This belongs to the nested user follow-up.',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.assistantMessageId).toBe('assistant-nested-error')
+    expect(observed.latestAssistantPreview).toBeNull()
+    expect(observed.toolCallNames).toContain('message_send')
+  })
+
   test('treats multiple retry prompts with the same inbound message id as one logical delivery', () => {
     const observed = observeOpenCodeDeliveryResponse({
       inboundMessageId: 'msg-inbound-retry',

@@ -4420,6 +4420,130 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.runtimePid).toBe(789)
   })
 
+  test('reobserves message_send tool errors before returning plain-text fallback proof', async () => {
+    const previousFallbackGrace =
+      process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS
+    process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS = '80'
+    const record = buildRecord({
+      laneId: 'secondary:opencode:tom',
+      memberName: 'tom',
+      opencodeSessionId: 'session-tom',
+    })
+    let reconcileCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async () => undefined) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async (sessionRecord, options) => {
+      if (options?.limit === 80) {
+        return {
+          record: sessionRecord,
+          summary: buildReconcileSummary({
+            sessionId: sessionRecord.opencodeSessionId,
+          }),
+        }
+      }
+      reconcileCalls += 1
+      const prompt = buildCanonicalMessage({
+        id: 'msg_test_turn_settled',
+        role: 'user',
+        text: 'The inbound app messageId is "message-fallback". Please reply.',
+      })
+      const toolError = buildCanonicalMessage({
+        id: 'assistant-tool-error',
+        parentId: 'msg_test_turn_settled',
+        role: 'assistant',
+        toolCalls: [
+          buildToolCall({
+            callId: 'tool-message-send-error',
+            toolName: 'agent-teams_message_send',
+            status: 'errored',
+            input: {
+              relayOfMessageId: 'message-fallback',
+              text: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+            },
+            outputText: 'Not connected',
+            isError: true,
+          }),
+        ],
+      })
+      const fallback = buildCanonicalMessage({
+        id: 'assistant-plain-fallback',
+        parentId: 'msg_test_turn_settled',
+        role: 'assistant',
+        text: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+        previewText: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+      })
+      const pendingFallback = buildCanonicalMessage({
+        id: 'assistant-pending-fallback',
+        parentId: 'msg_test_turn_settled',
+        role: 'assistant',
+      })
+      return {
+        record: sessionRecord,
+        summary: buildReconcileSummary({
+          sessionId: sessionRecord.opencodeSessionId,
+          latestUserMessageId: prompt.id,
+          latestAssistantMessageId:
+            reconcileCalls > 2
+              ? fallback.id
+              : reconcileCalls > 1
+                ? pendingFallback.id
+                : toolError.id,
+          latestAssistantPreview: reconcileCalls > 2 ? fallback.previewText : null,
+          rawStatus: reconcileCalls === 2 ? 'busy' : 'idle',
+          durableState: reconcileCalls === 2 ? 'running' : 'idle',
+          messages: reconcileCalls > 2
+            ? [prompt, toolError, fallback]
+            : reconcileCalls > 1
+              ? [prompt, pendingFallback]
+              : [prompt, toolError],
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    try {
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.sendMessage', {
+          teamId: 'team-a',
+          teamName: 'team-a',
+          laneId: 'secondary:opencode:tom',
+          memberName: 'tom',
+          projectPath: '/tmp/project',
+          text: 'hello tom',
+          messageId: 'message-fallback',
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(reconcileCalls).toBe(3)
+      expect(result.data.responseObservation).toMatchObject({
+        state: 'responded_plain_text',
+        assistantMessageId: 'assistant-plain-fallback',
+        latestAssistantPreview: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+        visibleReplyCorrelation: 'plain_assistant_text',
+      })
+      const fallbackDiagnostic = result.data.diagnostics.find(
+        diagnostic =>
+          diagnostic.code ===
+          'opencode_send_reconcile_message_send_tool_error_fallback_grace',
+      )
+      expect(fallbackDiagnostic?.severity).toBe('info')
+      expect(fallbackDiagnostic?.message).toContain(
+        'Reconciled OpenCode session during 80ms message_send tool_error fallback grace',
+      )
+    } finally {
+      if (previousFallbackGrace === undefined) {
+        delete process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS
+      } else {
+        process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS =
+          previousFallbackGrace
+      }
+    }
+  }, 15_000)
+
   test('emits runtime turn-settled spool from the production send-message command path', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-send-spool-test-'))
     process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = path.join(tempDir, 'runtime-turn-settled')

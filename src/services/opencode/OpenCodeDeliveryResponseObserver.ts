@@ -209,14 +209,25 @@ function findDeliveredUserMessages(input: ObserveOpenCodeDeliveryResponseInput):
   return { messages: [], usedCursorFallback: false, needsFullHistory: true }
 }
 
-function directAssistantChildren(
+function assistantResponseChain(
   summary: OpenCodeSessionReconcileSummary,
   userMessage: OpenCodeCanonicalMessage,
 ): OpenCodeCanonicalMessage[] {
   if (!userMessage.id) return []
-  return summary.messages.filter(
-    message => message.role === 'assistant' && message.parentId === userMessage.id,
-  )
+  const responseParentIds = new Set([userMessage.id])
+  const responseMessages: OpenCodeCanonicalMessage[] = []
+
+  for (const message of summary.messages) {
+    if (message.role !== 'assistant' || !message.parentId || !responseParentIds.has(message.parentId)) {
+      continue
+    }
+    responseMessages.push(message)
+    if (message.id) {
+      responseParentIds.add(message.id)
+    }
+  }
+
+  return responseMessages
 }
 
 function buildObservation(input: Partial<OpenCodeDeliveryResponseObservation> & {
@@ -433,7 +444,7 @@ export function observeOpenCodeDeliveryResponse(
     const observation = classifyChildren({
       inboundMessageId,
       userMessage,
-      children: directAssistantChildren(input.summary, userMessage),
+      children: assistantResponseChain(input.summary, userMessage),
       rawStatus: input.summary.rawStatus,
     })
     if (!best || RESPONSE_STATE_PRIORITY[observation.state] > RESPONSE_STATE_PRIORITY[best.state]) {
