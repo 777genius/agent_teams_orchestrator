@@ -34,6 +34,7 @@ import { addToHistory } from './history.js';
 import type { Root } from './ink.js';
 import { launchRepl } from './replLauncher.js';
 import { hasGrowthBookEnvOverride, initializeGrowthBook, refreshGrowthBookAfterAuthChange } from './services/analytics/growthbook.js';
+import { shouldBypassStdinForHeadlessTeammateTextInput } from './utils/headlessInputPrompt.js';
 import { fetchBootstrapData } from './services/api/bootstrap.js';
 import { type DownloadResult, downloadSessionFiles, type FilesApiConfig, parseFileSpecs } from './services/api/filesApi.js';
 import { prefetchPassesEligibility } from './services/api/referral.js';
@@ -878,13 +879,18 @@ export async function main() {
   await run();
   profileCheckpoint('main_after_run');
 }
-async function getInputPrompt(prompt: string, inputFormat: 'text' | 'stream-json'): Promise<string | AsyncIterable<string>> {
+async function getInputPrompt(prompt: string, inputFormat: 'text' | 'stream-json', options: {
+  isHeadlessTeammateRuntime?: boolean;
+} = {}): Promise<string | AsyncIterable<string>> {
   if (!process.stdin.isTTY &&
   // Input hijacking breaks MCP.
   !process.argv.includes('mcp')) {
     if (
-      inputFormat === 'text' &&
-      process.env[TEAMMATE_RUNTIME_ENV] === 'headless'
+      shouldBypassStdinForHeadlessTeammateTextInput({
+        inputFormat,
+        isHeadlessTeammateRuntime: options.isHeadlessTeammateRuntime,
+        teammateRuntimeEnv: process.env[TEAMMATE_RUNTIME_ENV],
+      })
     ) {
       // Headless process teammates inherit a long-lived stdin pipe from the app.
       // Treat only text prompts as argv-managed input here; stream-json still
@@ -1919,7 +1925,9 @@ async function run(): Promise<CommanderCommand> {
       process.exit(1);
     }
     const effectivePrompt = prompt || '';
-    let inputPrompt = await getInputPrompt(effectivePrompt, (inputFormat ?? 'text') as 'text' | 'stream-json');
+    let inputPrompt = await getInputPrompt(effectivePrompt, (inputFormat ?? 'text') as 'text' | 'stream-json', {
+      isHeadlessTeammateRuntime,
+    });
     profileCheckpoint('action_after_input_prompt');
 
     // Activate proactive mode BEFORE getTools() so SleepTool.isEnabled()

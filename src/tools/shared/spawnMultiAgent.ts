@@ -1316,6 +1316,8 @@ export function shouldDetachNativeProcessBackend(
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
 const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 45_000
+const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
+const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
@@ -2709,6 +2711,8 @@ async function handleSpawnNativeProcess(
       agentId: teammateId,
       bootstrapRunId,
       sinceMs: Date.parse(launchBoundaryIso),
+      retryableSubmitGraceMs: PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS,
+      retryableSubmitFreshMs: PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS,
       isStillAlive: () => isProcessAlive(runtimePid),
     })
     if (bootstrapSubmitted.type !== 'submitted') {

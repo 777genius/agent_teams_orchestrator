@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import {
   readTeammateRuntimeEvents,
+  waitForBootstrapSubmissionOutcome,
   waitForTeammateRuntimeEvent,
   writeTeammateRuntimeEvent,
 } from './teammateRuntimeEvents.js'
@@ -126,5 +127,106 @@ describe('teammateRuntimeEvents helpers', () => {
     if (!result.ok) {
       expect(result.reason).toContain('timed out waiting for runtime_ready')
     }
+  })
+
+  it('does not extend bootstrap submission timeout without retryable rejection', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    const startedAt = Date.now()
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      retryableSubmitGraceMs: 200,
+      pollIntervalMs: 10,
+      pid: 1234,
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+    expect(Date.now() - startedAt).toBeLessThan(150)
+  })
+
+  it('extends bootstrap submission wait for fresh retryable submit rejection', async () => {
+    const eventsPath = await createRuntimeLogPath()
+
+    setTimeout(() => {
+      void writeTeammateRuntimeEvent({
+        type: 'bootstrap_submit_rejected',
+        eventsPath,
+        pid: 1234,
+        retryable: true,
+        detail: 'submit rejected by local prompt handler',
+      })
+    }, 5)
+    setTimeout(() => {
+      void writeTeammateRuntimeEvent({
+        type: 'bootstrap_submitted',
+        eventsPath,
+        pid: 1234,
+      })
+    }, 60)
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 20,
+      retryableSubmitGraceMs: 200,
+      retryableSubmitFreshMs: 100,
+      pollIntervalMs: 10,
+      pid: 1234,
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('submitted')
+  })
+
+  it('does not extend indefinitely for stale retryable submit rejection', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submit_rejected',
+      eventsPath,
+      pid: 1234,
+      retryable: true,
+      detail: 'old submit rejection',
+    })
+    await new Promise(resolve => setTimeout(resolve, 30))
+
+    const startedAt = Date.now()
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 10,
+      retryableSubmitGraceMs: 200,
+      retryableSubmitFreshMs: 5,
+      pollIntervalMs: 10,
+      pid: 1234,
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+    expect(Date.now() - startedAt).toBeLessThan(150)
+  })
+
+  it('keeps fatal submit rejection terminal before bootstrap submission', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submit_rejected',
+      eventsPath,
+      pid: 1234,
+      retryable: false,
+      detail: 'fatal submit rejection',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 1_000,
+      retryableSubmitGraceMs: 1_000,
+      pollIntervalMs: 10,
+      pid: 1234,
+      isStillAlive: () => true,
+    })
+
+    expect(result).toMatchObject({
+      type: 'terminal_failure',
+      reason: 'fatal submit rejection',
+    })
   })
 })

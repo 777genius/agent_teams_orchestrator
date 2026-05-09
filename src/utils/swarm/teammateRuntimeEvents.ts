@@ -389,6 +389,18 @@ function selectLastRelevantBootstrapTransportEvent(
   return selected
 }
 
+function isFreshRetryableBootstrapSubmitRejection(
+  event: TeammateRuntimeEvent | undefined,
+  nowMs: number,
+  freshMs: number,
+): boolean {
+  if (!event || event.type !== 'bootstrap_submit_rejected' || event.retryable !== true) {
+    return false
+  }
+  const eventMs = Date.parse(event.timestamp)
+  return Number.isFinite(eventMs) && nowMs - eventMs <= freshMs
+}
+
 export async function waitForBootstrapSubmissionOutcome(params: {
   eventsPath: string
   timeoutMs: number
@@ -400,13 +412,22 @@ export async function waitForBootstrapSubmissionOutcome(params: {
   bootstrapMirrorId?: string
   sinceMs?: number
   pollIntervalMs?: number
+  retryableSubmitGraceMs?: number
+  retryableSubmitFreshMs?: number
   isStillAlive?: () => boolean
 }): Promise<BootstrapSubmissionOutcome> {
   const startedAt = Date.now()
   const pollIntervalMs = params.pollIntervalMs ?? 250
+  const retryableSubmitGraceMs = Math.max(0, params.retryableSubmitGraceMs ?? 0)
+  const retryableSubmitFreshMs = Math.max(
+    0,
+    params.retryableSubmitFreshMs ?? 10_000,
+  )
+  const baseDeadlineMs = startedAt + params.timeoutMs
+  const finalDeadlineMs = baseDeadlineMs + retryableSubmitGraceMs
   let lastStage: TeammateRuntimeEvent | undefined
 
-  while (Date.now() - startedAt < params.timeoutMs) {
+  while (Date.now() < finalDeadlineMs) {
     if (params.isStillAlive && !params.isStillAlive()) {
       return {
         type: 'terminal_failure',
@@ -442,7 +463,21 @@ export async function waitForBootstrapSubmissionOutcome(params: {
     lastStage =
       selectLastRelevantBootstrapTransportEvent(events) ?? lastStage
 
-    await sleep(pollIntervalMs)
+    const nowMs = Date.now()
+    if (
+      nowMs >= baseDeadlineMs &&
+      !isFreshRetryableBootstrapSubmitRejection(
+        lastStage,
+        nowMs,
+        retryableSubmitFreshMs,
+      )
+    ) {
+      break
+    }
+
+    const activeDeadlineMs =
+      nowMs < baseDeadlineMs ? baseDeadlineMs : finalDeadlineMs
+    await sleep(Math.min(pollIntervalMs, Math.max(1, activeDeadlineMs - nowMs)))
   }
 
   return {

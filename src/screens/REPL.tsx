@@ -194,7 +194,8 @@ import {
   getBootstrapTranscriptActivitySignature,
   useInboxPoller,
 } from '../hooks/useInboxPoller.js';
-import type { AgentErrorUserNotification, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
+import type { AgentErrorUserNotification, InboxPromptSubmitOptions, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
+import { decideIncomingPromptAdmission, getBlockingIncomingPromptQueueModes } from '../utils/incomingPromptAdmission.js';
 import { useNativeAppManagedBootstrapContextInjection } from '../hooks/useNativeAppManagedBootstrapContextInjection.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -4026,33 +4027,25 @@ export function REPL({
   // Submits incoming prompts from teammate messages or tasks mode as new turns.
   // Returns acceptance plus the created user-message UUID so bootstrap delivery
   // can correlate the submitted meta turn with the later transcript outcome.
-  const handleIncomingPrompt = useCallback((content: string, options?: {
-    isMeta?: boolean;
-    prefixMessages?: AppState['messages'];
-  }): InboxPromptSubmitResult => {
-    if (queryGuard.isActive) return {
-      accepted: false,
-      rejectionReason: 'query_active',
-      queryGuardActive: true,
-      queryGuardStatus: queryGuard.status,
-      commandQueueLength: getCommandQueueLength(),
-      commandQueueModes: Array.from(new Set(getCommandQueue().map(cmd => String(cmd.mode ?? 'unknown')))),
-    };
-
-    // Defer to user-queued commands — user input always takes priority
-    // over system messages (teammate messages, task list items, etc.)
+  const handleIncomingPrompt = useCallback((content: string, options?: InboxPromptSubmitOptions): InboxPromptSubmitResult => {
     // Read from the module-level store at call time (not the render-time
     // snapshot) to avoid a stale closure — this callback's deps don't
     // include the queue.
     const commandQueue = getCommandQueue();
-    if (commandQueue.some(cmd => cmd.mode === 'prompt' || cmd.mode === 'bash')) {
+    const commandQueueModes = Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown'))));
+    const decision = decideIncomingPromptAdmission({
+      submissionKind: options?.submissionKind ?? 'runtime_delivery',
+      queryGuardStatus: queryGuard.status,
+      blockingQueueModes: getBlockingIncomingPromptQueueModes(commandQueueModes),
+    });
+    if (!decision.accepted) {
       return {
         accepted: false,
-        rejectionReason: 'command_queue_busy',
-        queryGuardActive: false,
+        rejectionReason: decision.rejectionReason,
+        queryGuardActive: queryGuard.isActive,
         queryGuardStatus: queryGuard.status,
         commandQueueLength: commandQueue.length,
-        commandQueueModes: Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown')))),
+        commandQueueModes,
       };
     }
     const newAbortController = createAbortController();
@@ -4148,7 +4141,9 @@ export function REPL({
     useTaskListWatcher({
       taskListId,
       isLoading,
-      onSubmitTask: handleIncomingPrompt
+      onSubmitTask: (prompt: string) => handleIncomingPrompt(prompt, {
+        submissionKind: 'task'
+      })
     });
 
     // Loop mode: auto-tick when enabled (via /job command)
@@ -4163,7 +4158,8 @@ export function REPL({
       hasActiveLocalJsxUI: isShowingLocalJSXCommand,
       isInPlanMode: toolPermissionContext.mode === 'plan',
       onSubmitTick: (prompt: string) => handleIncomingPrompt(prompt, {
-        isMeta: true
+        isMeta: true,
+        submissionKind: 'tick'
       }).accepted,
       onQueueTick: (prompt: string) => enqueue({
         mode: 'prompt',

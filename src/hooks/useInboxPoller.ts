@@ -24,6 +24,7 @@ import {
   findInProcessTeammateTaskId,
   handlePlanApprovalResponse,
 } from '../utils/inProcessTeammateHelpers.js'
+import type { IncomingPromptSubmissionKind } from '../utils/incomingPromptAdmission.js'
 import { createAssistantMessage } from '../utils/messages.js'
 import {
   permissionModeFromString,
@@ -158,6 +159,7 @@ export type InboxPromptSubmitResult = {
 export type InboxPromptSubmitOptions = {
   isMeta?: boolean
   prefixMessages?: AppState['messages']
+  submissionKind?: IncomingPromptSubmissionKind
 }
 
 export type AgentErrorUserNotification = Pick<
@@ -3301,6 +3303,7 @@ export function useInboxPoller({
 
       const submitted = onSubmitTeammateMessage(prompt, {
         isMeta: true,
+        submissionKind: bootstrapPendingMessage ? 'bootstrap' : 'mailbox',
         ...(nativeBootstrapInjection
           ? { prefixMessages: nativeBootstrapInjection.prefixMessages }
           : {}),
