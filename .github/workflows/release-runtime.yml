@@ -83,7 +83,7 @@ jobs:
             platform: linux-x64
             archive_name: agent-teams-runtime-linux-x64.tar.gz
             binary_name: claude-multimodel
-          - runner: windows-latest
+          - runner: windows-2022
             platform: win32-x64
             archive_name: agent-teams-runtime-win32-x64.zip
             binary_name: claude-multimodel.exe
