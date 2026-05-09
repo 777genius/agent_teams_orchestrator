@@ -18,7 +18,11 @@ import {
   getAnthropicRuntimeReasoningEfforts,
   getAnthropicVisibleRuntimeModels,
 } from './anthropicCatalog.js'
-import { buildAnthropicRuntimeStatus } from './anthropicStatus.js'
+import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './anthropicSubscriptionRateLimits.js'
+import {
+  buildAnthropicRuntimeStatus,
+  isAnthropicSubscriptionAuthMethod,
+} from './anthropicStatus.js'
 import {
   resolveCodexCliBinary,
   resolveCodexRuntimeSelection,
@@ -38,6 +42,7 @@ import type {
   RuntimeProviderModelCatalog,
   RuntimeProviderId,
   RuntimeProviderStatus,
+  RuntimeProviderSubscriptionRateLimitSnapshot,
   RuntimeStatusPayload,
 } from './types.js'
 
@@ -207,13 +212,30 @@ function getAnthropicAuthenticated(): {
 
 type RuntimeStatusRegistryDeps = {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
+  getAnthropicSubscriptionRateLimits?: (
+    authMethod: string | null,
+  ) =>
+    | RuntimeProviderSubscriptionRateLimitSnapshot
+    | null
+    | Promise<RuntimeProviderSubscriptionRateLimitSnapshot | null>
 }
 
-async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
+async function buildAnthropicStatus(
+  deps: RuntimeStatusRegistryDeps = {},
+): Promise<RuntimeProviderStatus> {
   const anthropicAuth = getAnthropicAuthenticated()
   const modelCatalog = await getAnthropicRuntimeModelCatalog()
   const reasoningEfforts = getAnthropicRuntimeReasoningEfforts(modelCatalog)
   const fastMode = getAnthropicRuntimeFastModeCapability()
+  const subscriptionRateLimits = isAnthropicSubscriptionAuthMethod(
+    anthropicAuth.authMethod,
+  )
+    ? deps.getAnthropicSubscriptionRateLimits
+      ? await deps.getAnthropicSubscriptionRateLimits(anthropicAuth.authMethod)
+      : await getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus({
+          authMethod: anthropicAuth.authMethod,
+        })
+    : null
   return buildAnthropicRuntimeStatus({
     auth: anthropicAuth,
     modelCatalog,
@@ -221,6 +243,7 @@ async function buildAnthropicStatus(): Promise<RuntimeProviderStatus> {
     reasoningEfforts,
     fastMode,
     extensions: buildExtensionCapabilities(),
+    subscriptionRateLimits,
   })
 }
 
@@ -528,7 +551,7 @@ export async function getUnifiedRuntimeStatusPayload(
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
 
   if (!providerFilter || providerFilter === 'anthropic') {
-    providers.anthropic = await buildAnthropicStatus()
+    providers.anthropic = await buildAnthropicStatus(deps)
   }
 
   if (!providerFilter || providerFilter === 'codex') {

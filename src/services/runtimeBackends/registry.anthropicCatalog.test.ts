@@ -1,6 +1,62 @@
 import { describe, expect, test } from 'bun:test'
 
 import { buildAnthropicRuntimeStatus } from './anthropicStatus.js'
+import type { RuntimeProviderModelCatalog } from './types.js'
+
+const baseCatalog: RuntimeProviderModelCatalog = {
+  schemaVersion: 1,
+  providerId: 'anthropic',
+  source: 'static-fallback',
+  status: 'ready',
+  fetchedAt: '2026-04-21T00:00:00.000Z',
+  staleAt: '2026-04-21T00:10:00.000Z',
+  defaultModelId: 'haiku',
+  defaultLaunchModel: 'haiku',
+  models: [],
+  diagnostics: {
+    configReadState: 'skipped',
+    appServerState: 'degraded',
+  },
+}
+
+function buildMinimalAnthropicStatus(
+  authMethod: string | null,
+  subscriptionRateLimits = {
+    primary: {
+      usedPercent: 25,
+      windowDurationMins: 300,
+      resetsAt: 1_777_777_000,
+    },
+    secondary: {
+      usedPercent: 50,
+      windowDurationMins: 10_080,
+      resetsAt: 1_777_999_000,
+    },
+  },
+) {
+  return buildAnthropicRuntimeStatus({
+    auth: {
+      authenticated: authMethod !== null,
+      authMethod,
+    },
+    modelCatalog: baseCatalog,
+    visibleModels: ['haiku'],
+    reasoningEfforts: [],
+    fastMode: {
+      supported: true,
+      available: false,
+      reason: null,
+      source: 'runtime',
+    },
+    extensions: {
+      plugins: { status: 'supported', ownership: 'shared', reason: null },
+      mcp: { status: 'supported', ownership: 'shared', reason: null },
+      skills: { status: 'supported', ownership: 'shared', reason: null },
+      apiKeys: { status: 'supported', ownership: 'shared', reason: null },
+    },
+    subscriptionRateLimits,
+  })
+}
 
 describe('runtime backend registry Anthropic catalog integration', () => {
   test('anthropic runtime status exposes the normalized model catalog and parity metadata', () => {
@@ -104,5 +160,27 @@ describe('runtime backend registry Anthropic catalog integration', () => {
         source: 'runtime',
       },
     })
+  })
+
+  test('exposes subscription rate limits for Anthropic subscription auth', () => {
+    expect(buildMinimalAnthropicStatus('claude.ai').subscriptionRateLimits).toEqual({
+      primary: {
+        usedPercent: 25,
+        windowDurationMins: 300,
+        resetsAt: 1_777_777_000,
+      },
+      secondary: {
+        usedPercent: 50,
+        windowDurationMins: 10_080,
+        resetsAt: 1_777_999_000,
+      },
+    })
+    expect(buildMinimalAnthropicStatus('oauth_token').subscriptionRateLimits).not.toBeNull()
+  })
+
+  test('hides subscription rate limits for Anthropic API key auth', () => {
+    expect(buildMinimalAnthropicStatus('api_key').subscriptionRateLimits).toBeNull()
+    expect(buildMinimalAnthropicStatus('api_key_helper').subscriptionRateLimits).toBeNull()
+    expect(buildMinimalAnthropicStatus(null).subscriptionRateLimits).toBeNull()
   })
 })

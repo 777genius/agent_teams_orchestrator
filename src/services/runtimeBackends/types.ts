@@ -114,6 +114,17 @@ export type RuntimeProviderCapabilities = {
   }
 }
 
+export type RuntimeProviderSubscriptionRateLimitWindow = {
+  usedPercent: number
+  windowDurationMins: number | null
+  resetsAt: number | null
+}
+
+export type RuntimeProviderSubscriptionRateLimitSnapshot = {
+  primary: RuntimeProviderSubscriptionRateLimitWindow | null
+  secondary: RuntimeProviderSubscriptionRateLimitWindow | null
+}
+
 export type RuntimeBackendOptionStatus = {
   id: RuntimeBackendId
   label: string
@@ -157,6 +168,7 @@ export type RuntimeProviderStatus = {
   models: string[]
   modelCatalog?: RuntimeProviderModelCatalog | null
   runtimeCapabilities?: RuntimeProviderCapabilities
+  subscriptionRateLimits?: RuntimeProviderSubscriptionRateLimitSnapshot | null
   backend: {
     kind: string
     label: string

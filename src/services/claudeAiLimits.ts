@@ -147,11 +147,11 @@ export let currentLimits: ClaudeAILimits = {
  * response (unlike currentLimits.utilization which is only set when a warning
  * threshold fires). Exposed to statusline scripts via getRawUtilization().
  */
-type RawWindowUtilization = {
+export type RawWindowUtilization = {
   utilization: number // 0-1 fraction
   resets_at: number // unix epoch seconds
 }
-type RawUtilization = {
+export type RawUtilization = {
   five_hour?: RawWindowUtilization
   seven_day?: RawWindowUtilization
 }
@@ -217,7 +217,13 @@ async function makeTestQuery() {
     .asResponse()
 }
 
-export async function checkQuotaStatus(): Promise<void> {
+type CheckQuotaStatusOptions = {
+  allowNonInteractive?: boolean
+}
+
+export async function checkQuotaStatus(
+  options: CheckQuotaStatusOptions = {},
+): Promise<void> {
   // Skip network requests if nonessential traffic is disabled
   if (isEssentialTrafficOnly()) {
     return
@@ -231,7 +237,7 @@ export async function checkQuotaStatus(): Promise<void> {
   // In non-interactive mode (-p), the real query follows immediately and
   // extractQuotaStatusFromHeaders() will update limits from its response
   // headers (claude.ts), so skip this pre-check API call.
-  if (getIsNonInteractiveSession()) {
+  if (!options.allowNonInteractive && getIsNonInteractiveSession()) {
     return
   }
 

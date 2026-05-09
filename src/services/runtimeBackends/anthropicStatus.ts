@@ -2,12 +2,19 @@ import type {
   RuntimeExtensionCapabilities,
   RuntimeProviderCapabilities,
   RuntimeProviderModelCatalog,
+  RuntimeProviderSubscriptionRateLimitSnapshot,
   RuntimeProviderStatus,
 } from './types.js'
 
 type AnthropicAuthenticatedState = {
   authenticated: boolean
   authMethod: string | null
+}
+
+export function isAnthropicSubscriptionAuthMethod(
+  authMethod: string | null | undefined,
+): boolean {
+  return authMethod === 'claude.ai' || authMethod === 'oauth_token'
 }
 
 export function buildAnthropicRuntimeStatus(params: {
@@ -17,6 +24,7 @@ export function buildAnthropicRuntimeStatus(params: {
   reasoningEfforts: NonNullable<RuntimeProviderCapabilities['reasoningEffort']>['values']
   fastMode: NonNullable<RuntimeProviderCapabilities['fastMode']>
   extensions: RuntimeExtensionCapabilities
+  subscriptionRateLimits?: RuntimeProviderSubscriptionRateLimitSnapshot | null
 }): RuntimeProviderStatus {
   return {
     providerId: 'anthropic',
@@ -39,6 +47,9 @@ export function buildAnthropicRuntimeStatus(params: {
     externalRuntimeDiagnostics: [],
     models: params.visibleModels,
     modelCatalog: params.modelCatalog,
+    subscriptionRateLimits: isAnthropicSubscriptionAuthMethod(params.auth.authMethod)
+      ? (params.subscriptionRateLimits ?? null)
+      : null,
     runtimeCapabilities: {
       modelCatalog: {
         dynamic: true,
