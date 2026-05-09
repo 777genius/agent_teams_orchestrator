@@ -148,6 +148,11 @@ export function isMemberBriefingToolName(name: string): boolean {
 export type InboxPromptSubmitResult = {
   accepted: boolean
   userMessageUuid?: string
+  rejectionReason?: 'query_active' | 'command_queue_busy'
+  queryGuardActive?: boolean
+  queryGuardStatus?: 'idle' | 'dispatching' | 'running'
+  commandQueueLength?: number
+  commandQueueModes?: string[]
 }
 
 export type InboxPromptSubmitOptions = {
@@ -174,6 +179,37 @@ type Props = {
   ) => InboxPromptSubmitResult
   getNativeAppManagedBootstrapContextInjection?: GetNativeAppManagedBootstrapContextInjection
   onAgentErrorNotification: (message: AgentErrorUserNotification) => void
+}
+
+function formatPromptSubmitRejectionDetail(submitted: InboxPromptSubmitResult): string {
+  const reason = submitted.rejectionReason ?? 'unknown'
+  const queueLength =
+    typeof submitted.commandQueueLength === 'number' && Number.isFinite(submitted.commandQueueLength)
+      ? submitted.commandQueueLength
+      : undefined
+  const queueModes = submitted.commandQueueModes?.length
+    ? submitted.commandQueueModes.join(',')
+    : undefined
+  return [
+    `submit rejected by local prompt handler`,
+    `reason=${reason}`,
+    typeof submitted.queryGuardActive === 'boolean'
+      ? `queryGuardActive=${submitted.queryGuardActive}`
+      : undefined,
+    submitted.queryGuardStatus ? `queryGuardStatus=${submitted.queryGuardStatus}` : undefined,
+    queueLength != null ? `commandQueueLength=${queueLength}` : undefined,
+    queueModes ? `commandQueueModes=${queueModes}` : undefined,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join('; ')
+}
+
+function formatBootstrapMessageAgeMs(timestamp: string | undefined, now: number): string | undefined {
+  const parsed = timestamp ? Date.parse(timestamp) : Number.NaN
+  if (!Number.isFinite(parsed)) {
+    return undefined
+  }
+  return String(Math.max(0, now - parsed))
 }
 
 type PendingInboxMirrorMessage = Pick<
@@ -3241,6 +3277,13 @@ export function useInboxPoller({
         void writeChildOwnedTeammateRuntimeEvent({
           type: 'bootstrap_prompt_observed',
           ...bootstrapTransportBase,
+          detail: [
+            `pendingMessages=${pendingMessages.length}`,
+            `bootstrapMessageAgeMs=${formatBootstrapMessageAgeMs(bootstrapPendingMessage?.timestamp, now) ?? 'unknown'}`,
+            `nativeAppManaged=${bootstrapPendingMessage != null && isNativeAppManagedBootstrapInstructionText(bootstrapPendingMessage.text) ? 'true' : 'false'}`,
+            `nativeContextLoaded=${nativeBootstrapInjection ? 'true' : 'false'}`,
+            `transcriptActivitySignature=${transcriptActivitySignature ? 'present' : 'empty'}`,
+          ].join('; '),
         })
       }
 
@@ -3248,6 +3291,11 @@ export function useInboxPoller({
         void writeChildOwnedTeammateRuntimeEvent({
           type: 'bootstrap_submit_attempted',
           ...bootstrapTransportBase,
+          detail: [
+            `promptChars=${prompt.length}`,
+            `prefixMessages=${nativeBootstrapInjection?.prefixMessages.length ?? 0}`,
+            `pendingMessages=${pendingMessages.length}`,
+          ].join('; '),
         })
       }
 
@@ -3259,15 +3307,20 @@ export function useInboxPoller({
       })
       if (!submitted.accepted) {
         if (bootstrapTransportBase) {
+          const detail = [
+            formatPromptSubmitRejectionDetail(submitted),
+            `promptChars=${prompt.length}`,
+            `prefixMessages=${nativeBootstrapInjection?.prefixMessages.length ?? 0}`,
+          ].join('; ')
           void writeChildOwnedTeammateRuntimeEvent({
             type: 'bootstrap_submit_rejected',
             ...bootstrapTransportBase,
             retryable: true,
-            detail: 'submit rejected by local prompt handler',
+            detail,
           })
         }
         logForDebugging(
-          `[InboxPoller] Submission rejected, keeping messages queued`,
+          `[InboxPoller] Submission rejected, keeping messages queued: ${formatPromptSubmitRejectionDetail(submitted)}`,
         )
         return
       }

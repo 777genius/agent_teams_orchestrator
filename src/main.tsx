@@ -1254,7 +1254,15 @@ async function run(): Promise<CommanderCommand> {
             agentName: teammateOpts.agentName,
             agentId: teammateOpts.agentId,
             runId: getSessionId(),
-            cwd: getCwd()
+            cwd: getCwd(),
+            detail: [
+              `teammateRuntime=${isHeadlessTeammateRuntime ? 'headless' : 'default'}`,
+              `env=${process.env[TEAMMATE_RUNTIME_ENV] ?? 'unset'}`,
+              `inputFormat=${inputFormat ?? 'text'}`,
+              `outputFormat=${outputFormat ?? 'text'}`,
+              `stdoutIsTTY=${process.stdout.isTTY ? 'true' : 'false'}`,
+              `stdinIsTTY=${process.stdin.isTTY ? 'true' : 'false'}`,
+            ].join('; ')
           });
         }
       }

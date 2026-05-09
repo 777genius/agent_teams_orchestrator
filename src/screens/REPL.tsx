@@ -4031,7 +4031,12 @@ export function REPL({
     prefixMessages?: AppState['messages'];
   }): InboxPromptSubmitResult => {
     if (queryGuard.isActive) return {
-      accepted: false
+      accepted: false,
+      rejectionReason: 'query_active',
+      queryGuardActive: true,
+      queryGuardStatus: queryGuard.status,
+      commandQueueLength: getCommandQueueLength(),
+      commandQueueModes: Array.from(new Set(getCommandQueue().map(cmd => String(cmd.mode ?? 'unknown')))),
     };
 
     // Defer to user-queued commands — user input always takes priority
@@ -4039,9 +4044,15 @@ export function REPL({
     // Read from the module-level store at call time (not the render-time
     // snapshot) to avoid a stale closure — this callback's deps don't
     // include the queue.
-    if (getCommandQueue().some(cmd => cmd.mode === 'prompt' || cmd.mode === 'bash')) {
+    const commandQueue = getCommandQueue();
+    if (commandQueue.some(cmd => cmd.mode === 'prompt' || cmd.mode === 'bash')) {
       return {
-        accepted: false
+        accepted: false,
+        rejectionReason: 'command_queue_busy',
+        queryGuardActive: false,
+        queryGuardStatus: queryGuard.status,
+        commandQueueLength: commandQueue.length,
+        commandQueueModes: Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown')))),
       };
     }
     const newAbortController = createAbortController();
