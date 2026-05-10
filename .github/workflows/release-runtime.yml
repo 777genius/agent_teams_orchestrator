@@ -196,7 +196,7 @@ jobs:
           echo "archive_name=$versioned_archive_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload packaged runtime artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: runtime-${{ matrix.platform }}
           path: release/${{ steps.versioned-archive.outputs.archive_name }}
@@ -220,7 +220,7 @@ jobs:
           bun-version: 1.3.11
 
       - name: Download packaged runtime artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: runtime-*
           path: release-flat
