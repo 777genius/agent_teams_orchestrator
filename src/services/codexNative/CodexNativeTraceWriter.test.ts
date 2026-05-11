@@ -4,12 +4,14 @@ import { tmpdir } from 'os'
 import path from 'path'
 
 import { CodexNativeTraceWriter } from './CodexNativeTraceWriter.js'
+import { getTeamTaskLogFreshnessSignalFilePath } from '../boardTaskActivity/TaskLogFreshnessSignal.js'
 
 const TRACE_ENV = 'AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT'
 const TRACE_WRITE_ENV = 'CLAUDE_CODE_CODEX_NATIVE_TRACE_WRITE_ENABLED'
 
 let runtimeRoot: string
 let projectDir: string
+let previousClaudeConfigDir: string | undefined
 
 function traceSegment(value: string): string {
   return encodeURIComponent(value)
@@ -27,11 +29,18 @@ describe('CodexNativeTraceWriter', () => {
   beforeEach(async () => {
     runtimeRoot = await mkdtemp(path.join(tmpdir(), 'codex-native-runtime-'))
     projectDir = await mkdtemp(path.join(tmpdir(), 'codex-native-project-'))
+    previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = runtimeRoot
     process.env[TRACE_ENV] = runtimeRoot
     delete process.env[TRACE_WRITE_ENV]
   })
 
   afterEach(async () => {
+    if (previousClaudeConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir
+    }
     delete process.env[TRACE_ENV]
     delete process.env[TRACE_WRITE_ENV]
     await rm(runtimeRoot, { recursive: true, force: true })
@@ -124,12 +133,19 @@ describe('CodexNativeTraceWriter', () => {
       stdoutEventCount: 2,
     })
 
-    const freshnessPath = path.join(
-      projectDir,
-      '.board-task-log-freshness',
-      `${encodeURIComponent('8421e1bb-2f3b-4656-9983-6e0fd4b15963')}.json`
+    const freshnessPath = getTeamTaskLogFreshnessSignalFilePath(
+      'vector-room-131313',
+      '8421e1bb-2f3b-4656-9983-6e0fd4b15963'
     )
     expect((await readFile(freshnessPath, 'utf8')).includes('codex-native-trace')).toBe(true)
+
+    let legacyProjectFreshnessExists = true
+    try {
+      await stat(path.join(projectDir, '.board-task-log-freshness'))
+    } catch {
+      legacyProjectFreshnessExists = false
+    }
+    expect(legacyProjectFreshnessExists).toBe(false)
   })
 
   test('does not create trace files when the writer feature gate is disabled', async () => {
@@ -157,5 +173,33 @@ describe('CodexNativeTraceWriter', () => {
       missingTraceRoot = true
     }
     expect(missingTraceRoot).toBe(true)
+  })
+
+  test('does not fall back to cwd freshness when task id has no team name', async () => {
+    const writer = new CodexNativeTraceWriter({ cwd: projectDir, codexVersion: '0.125.0' })
+    await writer.recordStdoutLine(
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'mcp_1',
+          type: 'mcp_tool_call',
+          server: 'agent-teams',
+          tool: 'task_start',
+          arguments: {
+            taskId: 'task-without-team',
+          },
+          status: 'in_progress',
+        },
+      })
+    )
+    await writer.finish({ outcome: 'success', exitCode: 0, signal: null })
+
+    let legacyProjectFreshnessExists = true
+    try {
+      await stat(path.join(projectDir, '.board-task-log-freshness'))
+    } catch {
+      legacyProjectFreshnessExists = false
+    }
+    expect(legacyProjectFreshnessExists).toBe(false)
   })
 })

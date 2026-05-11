@@ -467,7 +467,8 @@ export class CodexNativeTraceWriter {
 
   private async touchFreshnessThrottled(force: boolean): Promise<void> {
     const taskId = this.taskHint.taskId
-    if (!taskId) {
+    const teamName = this.taskHint.teamName ?? this.contextTeamName
+    if (!taskId || !teamName) {
       return
     }
     const now = Date.now()
@@ -478,7 +479,7 @@ export class CodexNativeTraceWriter {
     await touchBoardTaskLogFreshnessSignal({
       projectDir: this.params.cwd,
       taskId,
-      ...(this.taskHint.teamName ? { teamName: this.taskHint.teamName } : {}),
+      teamName,
       provider: 'codex',
       source: 'codex-native-trace',
     }).catch(() => undefined)

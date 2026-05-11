@@ -4,8 +4,11 @@ import { basename, join, relative, sep } from 'path'
 
 import { type Entry } from '../../types/logs.js'
 import { getProjectsDir } from '../../utils/sessionStoragePortable.js'
+import { getTeamName } from '../../utils/teammate.js'
+import { getTeamDir } from '../../utils/swarm/teamHelpers.js'
 
 export const BOARD_TASK_LOG_FRESHNESS_DIRNAME = '.board-task-log-freshness'
+export const TEAM_TASK_LOG_FRESHNESS_DIRNAME = 'task-log-freshness'
 const BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX = '.json'
 const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
 
@@ -42,6 +45,10 @@ export function collectBoardTaskCanonicalIdsFromEntries(entries: readonly Entry[
 
 export function getBoardTaskLogFreshnessDir(projectDir: string): string {
   return join(projectDir, BOARD_TASK_LOG_FRESHNESS_DIRNAME)
+}
+
+export function getTeamTaskLogFreshnessDir(teamName: string): string {
+  return join(getTeamDir(teamName), TEAM_TASK_LOG_FRESHNESS_DIRNAME)
 }
 
 function isWindowsReservedArtifactSegment(segment: string): boolean {
@@ -98,6 +105,16 @@ export function getBoardTaskLogFreshnessSignalFilePath(
   )
 }
 
+export function getTeamTaskLogFreshnessSignalFilePath(
+  teamName: string,
+  taskId: string,
+): string {
+  return join(
+    getTeamTaskLogFreshnessDir(teamName),
+    `${encodeBoardTaskLogFreshnessTaskId(taskId)}${BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX}`,
+  )
+}
+
 export function deriveBoardTaskLogFreshnessProjectDirFromTranscriptPath(
   transcriptPath: string,
   projectsDir: string = getProjectsDir(),
@@ -128,23 +145,27 @@ export async function touchBoardTaskLogFreshnessSignals(params: {
     return
   }
 
-  const projectDir = deriveBoardTaskLogFreshnessProjectDirFromTranscriptPath(
-    params.transcriptPath,
-  )
-  if (!projectDir) {
-    return
-  }
+  const teamName = getTeamName()
+  const projectDir = teamName
+    ? null
+    : deriveBoardTaskLogFreshnessProjectDirFromTranscriptPath(params.transcriptPath)
+  if (!teamName && !projectDir) return
 
-  const freshnessDir = getBoardTaskLogFreshnessDir(projectDir)
+  const freshnessDir = teamName
+    ? getTeamTaskLogFreshnessDir(teamName)
+    : getBoardTaskLogFreshnessDir(projectDir!)
   await mkdir(freshnessDir, { recursive: true, mode: 0o700 })
 
   const updatedAt = new Date().toISOString()
   await Promise.all(
     taskIds.map(taskId =>
       writeFile(
-        getBoardTaskLogFreshnessSignalFilePath(projectDir, taskId),
+        teamName
+          ? getTeamTaskLogFreshnessSignalFilePath(teamName, taskId)
+          : getBoardTaskLogFreshnessSignalFilePath(projectDir!, taskId),
         JSON.stringify({
           taskId,
+          ...(teamName ? { teamName } : {}),
           updatedAt,
           transcriptFile: basename(params.transcriptPath),
         }),
@@ -166,11 +187,15 @@ export async function touchBoardTaskLogFreshnessSignal(params: {
     return
   }
 
-  const freshnessDir = getBoardTaskLogFreshnessDir(params.projectDir)
+  const freshnessDir = params.teamName
+    ? getTeamTaskLogFreshnessDir(params.teamName)
+    : getBoardTaskLogFreshnessDir(params.projectDir)
   await mkdir(freshnessDir, { recursive: true, mode: 0o700 })
 
   await writeFile(
-    getBoardTaskLogFreshnessSignalFilePath(params.projectDir, taskId),
+    params.teamName
+      ? getTeamTaskLogFreshnessSignalFilePath(params.teamName, taskId)
+      : getBoardTaskLogFreshnessSignalFilePath(params.projectDir, taskId),
     JSON.stringify({
       taskId,
       ...(params.teamName ? { teamName: params.teamName } : {}),
