@@ -1,6 +1,58 @@
 import { describe, expect, test } from 'bun:test'
 
 describe('runtime backend registry with agent_teams capabilities', () => {
+  test('anthropic runtime status treats Bedrock as external runtime auth', async () => {
+    const envKeys = [
+      'AWS_PROFILE',
+      'AWS_REGION',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+    process.env.AWS_PROFILE = 'cc'
+    process.env.AWS_REGION = 'us-east-1'
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+      const anthropic = payload.providers.anthropic
+
+      expect(anthropic?.authenticated).toBe(true)
+      expect(anthropic?.authMethod).toBe('aws_credentials')
+      expect(anthropic?.canLoginFromUi).toBe(false)
+      expect(anthropic?.selectedBackendId).toBe('bedrock')
+      expect(anthropic?.resolvedBackendId).toBe('bedrock')
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'bedrock',
+        label: 'Amazon Bedrock',
+        endpointLabel: 'AWS region us-east-1',
+        authMethodDetail: 'aws_credentials',
+      })
+      expect(anthropic?.statusMessage).toBe('Configured for Amazon Bedrock')
+      expect(anthropic?.subscriptionRateLimits).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
   test('codex runtime status exposes native-only provider-aware extension capabilities', async () => {
     const originalCodexBackend = process.env.CLAUDE_CODE_CODEX_BACKEND
     const originalCodexApiKey = process.env.CODEX_API_KEY

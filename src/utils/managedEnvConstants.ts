@@ -18,6 +18,7 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_GEMINI',
   'CLAUDE_CODE_ENTRY_PROVIDER',
   'CLAUDE_CODE_GEMINI_BACKEND',
@@ -72,6 +73,103 @@ const PROVIDER_MANAGED_ENV_PREFIXES = [
   // prefix-matched to avoid drift on each launch.
   'VERTEX_REGION_CLAUDE_',
 ]
+
+const ANTHROPIC_MODEL_ENV_VARS = new Set([
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+])
+
+const ANTHROPIC_FIRST_PARTY_ENV_VARS = new Set([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+])
+
+const BEDROCK_ENV_VARS = new Set([
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'AWS_BEARER_TOKEN_BEDROCK',
+])
+
+const VERTEX_ENV_VARS = new Set([
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+  'ANTHROPIC_VERTEX_BASE_URL',
+  'ANTHROPIC_VERTEX_PROJECT_ID',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_PROJECT_ID',
+  'GCLOUD_PROJECT',
+  'CLOUD_ML_REGION',
+])
+
+const FOUNDRY_ENV_VARS = new Set([
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_SKIP_FOUNDRY_AUTH',
+  'ANTHROPIC_FOUNDRY_BASE_URL',
+  'ANTHROPIC_FOUNDRY_RESOURCE',
+  'ANTHROPIC_FOUNDRY_API_KEY',
+])
+
+function isAnthropicModelEnvVar(upper: string): boolean {
+  return (
+    ANTHROPIC_MODEL_ENV_VARS.has(upper) ||
+    upper.startsWith('VERTEX_REGION_CLAUDE_')
+  )
+}
+
+function isAnthropicBackendEnvVar(upper: string): boolean {
+  return (
+    ANTHROPIC_FIRST_PARTY_ENV_VARS.has(upper) ||
+    BEDROCK_ENV_VARS.has(upper) ||
+    VERTEX_ENV_VARS.has(upper) ||
+    FOUNDRY_ENV_VARS.has(upper) ||
+    isAnthropicModelEnvVar(upper)
+  )
+}
+
+/**
+ * Host-managed Anthropic launches still need to honor Claude Code's official
+ * Anthropic backends from user/policy settings. The host owns the top-level
+ * provider choice, while Bedrock, Vertex, Foundry, and first-party auth remain
+ * legitimate Anthropic runtime backends.
+ */
+export function isAllowedHostManagedProviderSettingsEnvVar(
+  key: string,
+  entryProvider: string | null | undefined,
+): boolean {
+  const upper = key.toUpperCase()
+  const normalizedEntryProvider = entryProvider?.trim().toLowerCase()
+
+  switch (normalizedEntryProvider) {
+    case 'anthropic':
+      return isAnthropicBackendEnvVar(upper)
+    case 'bedrock':
+      return BEDROCK_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
+    case 'vertex':
+      return VERTEX_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
+    case 'foundry':
+      return FOUNDRY_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
+    default:
+      return false
+  }
+}
 
 export function isProviderManagedEnvVar(key: string): boolean {
   const upper = key.toUpperCase()

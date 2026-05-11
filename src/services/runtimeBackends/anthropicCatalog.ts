@@ -16,6 +16,7 @@ import {
   isFastModeEnabled,
   isFastModeSupportedByModel,
 } from '../../utils/fastMode.js'
+import { getAPIProvider } from '../../utils/model/providers.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import type {
   RuntimeProviderModelCatalog,
@@ -720,6 +721,20 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
     const fetchedAt = new Date().toISOString()
     const liveStaleAt = new Date(Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS).toISOString()
     const fallbackStaleAt = new Date(Date.now() + ANTHROPIC_FALLBACK_CACHE_TTL_MS).toISOString()
+    const apiProvider = getAPIProvider()
+    if (apiProvider !== 'firstParty') {
+      return cacheAnthropicCatalog(
+        createStaticAnthropicRuntimeModelCatalog({
+          fetchedAt,
+          staleAt: fallbackStaleAt,
+          status: 'stale',
+          message: `Using the static Anthropic catalog because model listing is not available through the ${apiProvider} runtime backend.`,
+          code: 'anthropic-external-backend-catalog',
+        }),
+        ANTHROPIC_FALLBACK_CACHE_TTL_MS,
+      )
+    }
+
     const auth = getAuthHeaders()
 
     if (auth.error) {

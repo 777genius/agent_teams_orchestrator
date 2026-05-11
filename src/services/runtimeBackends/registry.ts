@@ -1,6 +1,8 @@
 import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
 import { getGlobalConfig } from '../../utils/config.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
+import { getAPIProvider, type APIProvider } from '../../utils/model/providers.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
@@ -20,6 +22,7 @@ import {
 } from './anthropicCatalog.js'
 import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './anthropicSubscriptionRateLimits.js'
 import {
+  type AnthropicRuntimeBackendInfo,
   buildAnthropicRuntimeStatus,
   isAnthropicSubscriptionAuthMethod,
 } from './anthropicStatus.js'
@@ -186,10 +189,86 @@ function buildCodexOptionStatus(
   }
 }
 
+function getExternalAnthropicBackendInfo(
+  apiProvider: APIProvider,
+): AnthropicRuntimeBackendInfo | null {
+  switch (apiProvider) {
+    case 'bedrock': {
+      const usesBearerToken = Boolean(process.env.AWS_BEARER_TOKEN_BEDROCK?.trim())
+      const skipsAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH)
+      const authMethodDetail = usesBearerToken
+        ? 'bedrock_api_key'
+        : skipsAuth
+          ? 'bedrock_skip_auth'
+          : 'aws_credentials'
+      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null
+      return {
+        id: 'bedrock',
+        label: 'Amazon Bedrock',
+        endpointLabel: region ? `AWS region ${region}` : 'Amazon Bedrock',
+        authMethodDetail,
+        statusMessage: 'Configured for Amazon Bedrock',
+        detailMessage:
+          'Authentication is handled by AWS credentials, AWS SSO, Bedrock API keys, or the configured Bedrock gateway.',
+      }
+    }
+    case 'vertex': {
+      const authMethodDetail =
+        isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
+          ? 'vertex_skip_auth'
+          : 'gcp_credentials'
+      const projectId =
+        process.env.GOOGLE_CLOUD_PROJECT ||
+        process.env.GOOGLE_CLOUD_PROJECT_ID ||
+        process.env.GCLOUD_PROJECT ||
+        process.env.ANTHROPIC_VERTEX_PROJECT_ID ||
+        null
+      return {
+        id: 'vertex',
+        label: 'Google Vertex AI',
+        endpointLabel: process.env.CLOUD_ML_REGION
+          ? `Vertex region ${process.env.CLOUD_ML_REGION}`
+          : 'Google Vertex AI',
+        projectId,
+        authMethodDetail,
+        statusMessage: 'Configured for Google Vertex AI',
+        detailMessage:
+          'Authentication is handled by Google ADC, service account credentials, gcloud auth, or the configured Vertex gateway.',
+      }
+    }
+    case 'foundry': {
+      const authMethodDetail = process.env.ANTHROPIC_FOUNDRY_API_KEY
+        ? 'foundry_api_key'
+        : isEnvTruthy(process.env.CLAUDE_CODE_SKIP_FOUNDRY_AUTH)
+          ? 'foundry_skip_auth'
+          : 'azure_credentials'
+      return {
+        id: 'foundry',
+        label: 'Azure AI Foundry',
+        endpointLabel: process.env.ANTHROPIC_FOUNDRY_RESOURCE ?? 'Azure AI Foundry',
+        authMethodDetail,
+        statusMessage: 'Configured for Azure AI Foundry',
+        detailMessage:
+          'Authentication is handled by Azure credentials, a Foundry API key, or the configured Foundry gateway.',
+      }
+    }
+    default:
+      return null
+  }
+}
+
 function getAnthropicAuthenticated(): {
   authenticated: boolean
   authMethod: string | null
 } {
+  const externalBackend = getExternalAnthropicBackendInfo(getAPIProvider())
+  if (externalBackend) {
+    return {
+      authenticated: true,
+      authMethod: externalBackend.authMethodDetail,
+    }
+  }
+
   const { source: authTokenSource, hasToken } = getAuthTokenSource()
   const { source: apiKeySource } = getAnthropicApiKeyWithSource()
   const authenticated = hasToken || apiKeySource !== 'none'
@@ -223,6 +302,7 @@ type RuntimeStatusRegistryDeps = {
 async function buildAnthropicStatus(
   deps: RuntimeStatusRegistryDeps = {},
 ): Promise<RuntimeProviderStatus> {
+  const externalBackend = getExternalAnthropicBackendInfo(getAPIProvider())
   const anthropicAuth = getAnthropicAuthenticated()
   const modelCatalog = await getAnthropicRuntimeModelCatalog()
   const reasoningEfforts = getAnthropicRuntimeReasoningEfforts(modelCatalog)
@@ -244,6 +324,7 @@ async function buildAnthropicStatus(
     fastMode,
     extensions: buildExtensionCapabilities(),
     subscriptionRateLimits,
+    backend: externalBackend,
   })
 }
 

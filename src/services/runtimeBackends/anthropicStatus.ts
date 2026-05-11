@@ -1,4 +1,5 @@
 import type {
+  AnthropicRuntimeBackendId,
   RuntimeExtensionCapabilities,
   RuntimeProviderCapabilities,
   RuntimeProviderModelCatalog,
@@ -9,6 +10,16 @@ import type {
 type AnthropicAuthenticatedState = {
   authenticated: boolean
   authMethod: string | null
+}
+
+export type AnthropicRuntimeBackendInfo = {
+  id: AnthropicRuntimeBackendId
+  label: string
+  endpointLabel: string | null
+  projectId?: string | null
+  authMethodDetail: string | null
+  statusMessage: string
+  detailMessage: string | null
 }
 
 export function isAnthropicSubscriptionAuthMethod(
@@ -25,24 +36,30 @@ export function buildAnthropicRuntimeStatus(params: {
   fastMode: NonNullable<RuntimeProviderCapabilities['fastMode']>
   extensions: RuntimeExtensionCapabilities
   subscriptionRateLimits?: RuntimeProviderSubscriptionRateLimitSnapshot | null
+  backend?: AnthropicRuntimeBackendInfo | null
 }): RuntimeProviderStatus {
+  const backend = params.backend ?? null
   return {
     providerId: 'anthropic',
     displayName: 'Anthropic',
     supported: true,
     authenticated: params.auth.authenticated,
     authMethod: params.auth.authMethod,
-    verificationState: 'verified',
-    canLoginFromUi: true,
+    verificationState: backend ? 'unknown' : 'verified',
+    canLoginFromUi: backend ? false : true,
     capabilities: {
       teamLaunch: true,
       oneShot: true,
       extensions: params.extensions,
     },
-    statusMessage: params.auth.authenticated ? null : 'Not connected',
-    detailMessage: null,
-    selectedBackendId: null,
-    resolvedBackendId: null,
+    statusMessage: backend
+      ? backend.statusMessage
+      : params.auth.authenticated
+        ? null
+        : 'Not connected',
+    detailMessage: backend?.detailMessage ?? null,
+    selectedBackendId: backend?.id ?? null,
+    resolvedBackendId: backend?.id ?? null,
     availableBackends: [],
     externalRuntimeDiagnostics: [],
     models: params.visibleModels,
@@ -62,6 +79,14 @@ export function buildAnthropicRuntimeStatus(params: {
       },
       fastMode: params.fastMode,
     },
-    backend: null,
+    backend: backend
+      ? {
+          kind: backend.id,
+          label: backend.label,
+          endpointLabel: backend.endpointLabel,
+          projectId: backend.projectId ?? null,
+          authMethodDetail: backend.authMethodDetail,
+        }
+      : null,
   }
 }

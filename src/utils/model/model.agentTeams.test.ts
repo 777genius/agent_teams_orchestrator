@@ -13,6 +13,7 @@ import {
   getPublicModelDisplayName,
   parseUserSpecifiedModel,
 } from './model.js';
+import { getAPIProvider } from './providers.js';
 import { getFastModeModel, isFastModeSupportedByModel } from '../fastMode.js';
 import { CODEX_MODELS, DEFAULT_CODEX_MODEL, isCodexModel } from './codex.js';
 
@@ -63,6 +64,8 @@ afterEach(() => {
   setFlagSettingsInline(null);
   delete process.env.CLAUDE_CODE_USE_OPENAI;
   delete process.env.CLAUDE_CODE_USE_BEDROCK;
+  delete process.env.CLAUDE_CODE_USE_VERTEX;
+  delete process.env.CLAUDE_CODE_USE_FOUNDRY;
   delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   delete process.env.ANTHROPIC_MODEL;
   delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
@@ -71,6 +74,15 @@ afterEach(() => {
 });
 
 describe('model access fallback with agent_teams capabilities', () => {
+  it('keeps Anthropic host-managed selection compatible with Bedrock settings', () => {
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic';
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+
+    expect(getAPIProvider()).toBe('bedrock');
+    expect(getDefaultOpusModel()).toContain('opus-4-6');
+  });
+
   it('falls back to the first allowed codex default model', () => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1';
     setAgentTeamsCapabilitiesForTesting(

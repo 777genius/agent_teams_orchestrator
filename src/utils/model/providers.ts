@@ -20,7 +20,7 @@ function getEntryProviderOverride():
   const raw = process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase()
   switch (raw) {
     case 'anthropic':
-      return 'firstParty'
+      return getAnthropicProviderFromEnv() ?? 'firstParty'
     case 'codex':
     case 'openai':
       return 'openai'
@@ -37,23 +37,33 @@ function getEntryProviderOverride():
   }
 }
 
-export function getAPIProvider(): APIProvider {
-  const entryProviderOverride = getEntryProviderOverride()
-  if (entryProviderOverride) {
-    return entryProviderOverride
-  }
-
+function getAnthropicProviderFromEnv(): Extract<
+  APIProvider,
+  'bedrock' | 'vertex' | 'foundry'
+> | null {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
     ? 'bedrock'
     : isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)
       ? 'vertex'
       : isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
         ? 'foundry'
-        : isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
-          ? 'openai'
-          : isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
-            ? 'gemini'
-          : 'firstParty'
+        : null
+}
+
+export function getAPIProvider(): APIProvider {
+  const entryProviderOverride = getEntryProviderOverride()
+  if (entryProviderOverride) {
+    return entryProviderOverride
+  }
+
+  return (
+    getAnthropicProviderFromEnv() ??
+    (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
+      ? 'openai'
+      : isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
+        ? 'gemini'
+        : 'firstParty')
+  )
 }
 
 export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {

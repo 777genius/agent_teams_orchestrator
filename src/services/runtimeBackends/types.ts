@@ -1,8 +1,12 @@
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
+export type AnthropicRuntimeBackendId = 'bedrock' | 'vertex' | 'foundry'
 export type GeminiRuntimeBackendId = 'auto' | 'api' | 'cli-sdk'
 export type CodexRuntimeBackendId = 'codex-native'
-export type RuntimeBackendId = GeminiRuntimeBackendId | CodexRuntimeBackendId
+export type RuntimeBackendId =
+  | AnthropicRuntimeBackendId
+  | GeminiRuntimeBackendId
+  | CodexRuntimeBackendId
 
 export type RuntimeCapabilityInfo = {
   id: string
