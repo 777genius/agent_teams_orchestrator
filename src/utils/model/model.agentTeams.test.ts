@@ -63,12 +63,14 @@ afterEach(() => {
   clearAgentTeamsStateForTesting();
   setFlagSettingsInline(null);
   delete process.env.CLAUDE_CODE_USE_OPENAI;
+  delete process.env.CLAUDE_CODE_USE_GEMINI;
   delete process.env.CLAUDE_CODE_USE_BEDROCK;
   delete process.env.CLAUDE_CODE_USE_VERTEX;
   delete process.env.CLAUDE_CODE_USE_FOUNDRY;
   delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   delete process.env.ANTHROPIC_MODEL;
   delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  delete process.env.ANTHROPIC_AWS_WORKSPACE_ID;
   delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   delete process.env.CLAUDE_CODE_ENTRY_PROVIDER;
 });
@@ -81,6 +83,31 @@ describe('model access fallback with agent_teams capabilities', () => {
 
     expect(getAPIProvider()).toBe('bedrock');
     expect(getDefaultOpusModel()).toContain('opus-4-6');
+  });
+
+  it('keeps Claude Platform on AWS as launch metadata without adding a new API provider', () => {
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'claude-platform-aws';
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123';
+
+    expect(getAPIProvider()).toBe('firstParty');
+  });
+
+  it('keeps Bedrock ahead of Claude Platform on AWS for backend selection', () => {
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic';
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123';
+
+    expect(getAPIProvider()).toBe('bedrock');
+  });
+
+  it('does not let Claude Platform on AWS env override explicit Codex routing', () => {
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex';
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123';
+
+    expect(getAPIProvider()).toBe('openai');
   });
 
   it('falls back to the first allowed codex default model', () => {

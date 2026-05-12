@@ -32,6 +32,8 @@ function getEntryProviderOverride():
       return 'vertex'
     case 'foundry':
       return 'foundry'
+    case 'claude-platform-aws':
+      return 'firstParty'
     default:
       return null
   }

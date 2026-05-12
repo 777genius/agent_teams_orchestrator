@@ -17,6 +17,7 @@ export type AnthropicRuntimeBackendInfo = {
   label: string
   endpointLabel: string | null
   projectId?: string | null
+  authenticated?: boolean
   authMethodDetail: string | null
   statusMessage: string
   detailMessage: string | null

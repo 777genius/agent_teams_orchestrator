@@ -26,6 +26,7 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   // Endpoint config (base URLs, project/resource identifiers)
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_BEDROCK_BASE_URL',
+  'ANTHROPIC_AWS_WORKSPACE_ID',
   'ANTHROPIC_VERTEX_BASE_URL',
   'ANTHROPIC_FOUNDRY_BASE_URL',
   'ANTHROPIC_FOUNDRY_RESOURCE',
@@ -41,6 +42,7 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_AWS_API_KEY',
   'AWS_BEARER_TOKEN_BEDROCK',
   'ANTHROPIC_FOUNDRY_API_KEY',
   'GEMINI_API_KEY',
@@ -107,6 +109,11 @@ const BEDROCK_ENV_VARS = new Set([
   'AWS_BEARER_TOKEN_BEDROCK',
 ])
 
+const CLAUDE_PLATFORM_AWS_ENV_VARS = new Set([
+  'ANTHROPIC_AWS_WORKSPACE_ID',
+  'ANTHROPIC_AWS_API_KEY',
+])
+
 const VERTEX_ENV_VARS = new Set([
   'CLAUDE_CODE_USE_VERTEX',
   'CLAUDE_CODE_SKIP_VERTEX_AUTH',
@@ -138,6 +145,7 @@ function isAnthropicBackendEnvVar(upper: string): boolean {
   return (
     ANTHROPIC_FIRST_PARTY_ENV_VARS.has(upper) ||
     BEDROCK_ENV_VARS.has(upper) ||
+    CLAUDE_PLATFORM_AWS_ENV_VARS.has(upper) ||
     VERTEX_ENV_VARS.has(upper) ||
     FOUNDRY_ENV_VARS.has(upper) ||
     isAnthropicModelEnvVar(upper)
@@ -162,6 +170,8 @@ export function isAllowedHostManagedProviderSettingsEnvVar(
       return isAnthropicBackendEnvVar(upper)
     case 'bedrock':
       return BEDROCK_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
+    case 'claude-platform-aws':
+      return CLAUDE_PLATFORM_AWS_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
     case 'vertex':
       return VERTEX_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
     case 'foundry':

@@ -193,6 +193,44 @@ function buildCodexOptionStatus(
   }
 }
 
+function getClaudePlatformAwsBackendInfo(): AnthropicRuntimeBackendInfo | null {
+  const workspaceId = process.env.ANTHROPIC_AWS_WORKSPACE_ID?.trim()
+  if (!workspaceId) {
+    return null
+  }
+
+  const region =
+    (process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION)?.trim() || null
+  const usesApiKey = Boolean(process.env.ANTHROPIC_AWS_API_KEY?.trim())
+  if (!region) {
+    return {
+      id: 'claude-platform-aws',
+      label: 'Claude Platform on AWS',
+      endpointLabel: 'AWS region not configured',
+      projectId: workspaceId,
+      authenticated: false,
+      authMethodDetail: 'aws_platform_configuration_incomplete',
+      statusMessage: 'Claude Platform on AWS requires AWS_REGION or AWS_DEFAULT_REGION',
+      detailMessage:
+        'Set AWS_REGION or AWS_DEFAULT_REGION to the region bound to the Claude Platform on AWS workspace.',
+    }
+  }
+
+  return {
+    id: 'claude-platform-aws',
+    label: 'Claude Platform on AWS',
+    endpointLabel: `AWS region ${region}`,
+    projectId: workspaceId,
+    authenticated: false,
+    authMethodDetail: usesApiKey
+      ? 'aws_platform_api_key_transport_unavailable'
+      : 'aws_platform_sigv4_transport_unavailable',
+    statusMessage: 'Claude Platform on AWS transport is not enabled',
+    detailMessage:
+      'Claude Platform on AWS was detected, but this runtime does not include the AnthropicAws request transport yet. Amazon Bedrock remains supported through CLAUDE_CODE_USE_BEDROCK.',
+  }
+}
+
 function getExternalAnthropicBackendInfo(
   apiProvider: APIProvider,
 ): AnthropicRuntimeBackendInfo | null {
@@ -257,7 +295,9 @@ function getExternalAnthropicBackendInfo(
       }
     }
     default:
-      return null
+      return apiProvider === 'firstParty'
+        ? getClaudePlatformAwsBackendInfo()
+        : null
   }
 }
 
@@ -268,7 +308,7 @@ function getAnthropicAuthenticated(): {
   const externalBackend = getExternalAnthropicBackendInfo(getAPIProvider())
   if (externalBackend) {
     return {
-      authenticated: true,
+      authenticated: externalBackend.authenticated ?? true,
       authMethod: externalBackend.authMethodDetail,
     }
   }

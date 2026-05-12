@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 describe('runtime backend registry with agent_teams capabilities', () => {
   test('anthropic runtime status treats Bedrock as external runtime auth', async () => {
     const envKeys = [
+      'ANTHROPIC_AWS_WORKSPACE_ID',
       'AWS_PROFILE',
       'AWS_REGION',
       'CLAUDE_CODE_ENTRY_PROVIDER',
@@ -16,6 +17,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
     process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
     process.env.AWS_PROFILE = 'cc'
     process.env.AWS_REGION = 'us-east-1'
 
@@ -41,6 +43,169 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       })
       expect(anthropic?.statusMessage).toBe('Configured for Amazon Bedrock')
       expect(anthropic?.subscriptionRateLimits).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  test('anthropic runtime status detects Claude Platform on AWS without prompting login', async () => {
+    const envKeys = [
+      'ANTHROPIC_AWS_API_KEY',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'AWS_DEFAULT_REGION',
+      'AWS_REGION',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'claude-platform-aws'
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123'
+    process.env.AWS_REGION = 'us-west-2'
+    delete process.env.ANTHROPIC_AWS_API_KEY
+    delete process.env.AWS_DEFAULT_REGION
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+      const anthropic = payload.providers.anthropic
+
+      expect(anthropic?.authenticated).toBe(false)
+      expect(anthropic?.authMethod).toBe('aws_platform_sigv4_transport_unavailable')
+      expect(anthropic?.canLoginFromUi).toBe(false)
+      expect(anthropic?.selectedBackendId).toBe('claude-platform-aws')
+      expect(anthropic?.resolvedBackendId).toBe('claude-platform-aws')
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'claude-platform-aws',
+        label: 'Claude Platform on AWS',
+        endpointLabel: 'AWS region us-west-2',
+        projectId: 'wrkspc_123',
+        authMethodDetail: 'aws_platform_sigv4_transport_unavailable',
+      })
+      expect(anthropic?.statusMessage).toBe(
+        'Claude Platform on AWS transport is not enabled',
+      )
+      expect(anthropic?.detailMessage).toContain('AnthropicAws request transport')
+      expect(anthropic?.subscriptionRateLimits).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  test('anthropic runtime status detects Claude Platform on AWS API key env', async () => {
+    const envKeys = [
+      'ANTHROPIC_AWS_API_KEY',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'AWS_DEFAULT_REGION',
+      'AWS_REGION',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'claude-platform-aws'
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123'
+    process.env.ANTHROPIC_AWS_API_KEY = 'aws-platform-key'
+    process.env.AWS_DEFAULT_REGION = 'us-east-2'
+    delete process.env.AWS_REGION
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+      const anthropic = payload.providers.anthropic
+
+      expect(anthropic?.authenticated).toBe(false)
+      expect(anthropic?.authMethod).toBe('aws_platform_api_key_transport_unavailable')
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'claude-platform-aws',
+        endpointLabel: 'AWS region us-east-2',
+        authMethodDetail: 'aws_platform_api_key_transport_unavailable',
+      })
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  test('anthropic runtime status reports missing Claude Platform on AWS region without prompting login', async () => {
+    const envKeys = [
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'AWS_DEFAULT_REGION',
+      'AWS_REGION',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'claude-platform-aws'
+    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_123'
+    delete process.env.AWS_DEFAULT_REGION
+    delete process.env.AWS_REGION
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+      const anthropic = payload.providers.anthropic
+
+      expect(anthropic?.authenticated).toBe(false)
+      expect(anthropic?.canLoginFromUi).toBe(false)
+      expect(anthropic?.selectedBackendId).toBe('claude-platform-aws')
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'claude-platform-aws',
+        label: 'Claude Platform on AWS',
+        endpointLabel: 'AWS region not configured',
+        projectId: 'wrkspc_123',
+        authMethodDetail: 'aws_platform_configuration_incomplete',
+      })
+      expect(anthropic?.statusMessage).toContain('AWS_REGION')
+      expect(anthropic?.detailMessage).toContain('AWS_REGION')
     } finally {
       for (const key of envKeys) {
         const value = originalEnv.get(key)
