@@ -615,6 +615,7 @@ describe('OpenCodeSessionBridge', () => {
   test('posts prompt_async with app-owned message id and waits for OpenCode turn-settled observation', async () => {
     const promptBodies: unknown[] = []
     const observationMarks: string[] = []
+    const hookEvents: string[] = []
     const bridge = new OpenCodeSessionBridge({
       hostManager: {
         ensureHost: async () => host,
@@ -701,10 +702,20 @@ describe('OpenCodeSessionBridge', () => {
       agent: 'teammate',
       timeoutMs: 500,
       idleTimeoutMs: 100,
+      onPromptSubmitting: async event => {
+        hookEvents.push(`submitting:${event.sessionId}:${event.runtimePromptMessageId}`)
+      },
+      onPromptAccepted: async event => {
+        hookEvents.push(`accepted:${event.sessionId}:${event.runtimePromptMessageId}`)
+      },
+      onTurnObserved: async event => {
+        hookEvents.push(`turn:${event.sessionId}:${event.turnSettled.outcome}`)
+      },
     })
 
     expect(result.runtimePromptMessageId).toBe('msg_prompt_1')
     expect(result.turnSettled.outcome).toBe('success')
+    expect(result.hookDiagnostics).toEqual([])
     expect(promptBodies).toEqual([
       {
         messageID: 'msg_prompt_1',
@@ -717,6 +728,100 @@ describe('OpenCodeSessionBridge', () => {
         },
         parts: [{ type: 'text', text: 'Continue task' }],
       },
+    ])
+    expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
+    expect(hookEvents).toEqual([
+      'submitting:session-1:msg_prompt_1',
+      'accepted:session-1:msg_prompt_1',
+      'turn:session-1:success',
+    ])
+  })
+
+  test('keeps accepted prompt state when the accepted hook fails', async () => {
+    const observationMarks: string[] = []
+    let promptCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      turnSettledObserver: {
+        observe: () => ({
+          runtimePromptMessageId: 'msg_prompt_hook',
+          turnId: 'msg_prompt_hook',
+          markPromptSubmitting: () => {
+            observationMarks.push('submitting')
+          },
+          markPromptAcceptedByEndpoint: () => {
+            observationMarks.push('accepted')
+          },
+          markPromptRejectedByEndpoint: error => {
+            observationMarks.push(`rejected:${String(error)}`)
+          },
+          waitForSettled: async () => ({
+            outcome: 'success',
+            sessionId: 'session-1',
+            runtimePromptMessageId: 'msg_prompt_hook',
+            turnId: 'msg_prompt_hook',
+            endpoint: '/event',
+            streamConnected: true,
+            observedEventCount: 2,
+            matchedEventCount: 2,
+            assistantActivityCount: 1,
+            promptPersisted: true,
+            latestEventType: 'session.status',
+            latestAssistantMessageId: 'msg-assistant-1',
+            diagnostics: [],
+          }),
+          dispose: () => {
+            observationMarks.push('disposed')
+          },
+        }),
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {
+            promptCalls += 1
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.promptAsyncWithTurnSettled(buildRecord(), {
+      text: 'Continue task',
+      onPromptAccepted: async () => {
+        throw new Error('store write failed after accept')
+      },
+    })
+
+    expect(promptCalls).toBe(1)
+    expect(result.hookDiagnostics).toEqual([
+      'OpenCode prompt accepted hook failed - store write failed after accept',
     ])
     expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
   })

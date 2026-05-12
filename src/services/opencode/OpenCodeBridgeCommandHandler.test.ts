@@ -8,6 +8,7 @@ import {
   __resetAppMcpToolProofCacheForTests,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
+import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
@@ -376,6 +377,9 @@ const originalProjectLogMessages = openCodeSessionBridge.projectLogMessages
 const originalList = openCodeSessionStore.list
 const originalGet = openCodeSessionStore.get
 const originalMarkStale = openCodeSessionStore.markStale
+const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
+const originalOutcomeQuery = openCodeCommandOutcomeStore.query
+const originalOutcomePrune = openCodeCommandOutcomeStore.prune
 const originalBackfillTaskLedger = openCodeLedgerBridgeService.backfill
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
@@ -398,14 +402,56 @@ beforeEach(async () => {
   )
   delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
   __resetAppMcpToolProofCacheForTests()
+  openCodeCommandOutcomeStore.upsert = (async patch => ({
+    schemaVersion: 1,
+    command: 'opencode.sendMessage',
+    requestId: patch.requestId,
+    ...(patch.deliveryAttemptId ? { deliveryAttemptId: patch.deliveryAttemptId } : {}),
+    teamId: patch.teamId,
+    teamName: patch.teamName,
+    laneId: patch.laneId,
+    memberName: patch.memberName,
+    runId: patch.runId ?? null,
+    projectPath: patch.projectPath,
+    messageId: patch.messageId ?? null,
+    payloadHash: patch.payloadHash ?? null,
+    status: patch.status,
+    safeToRetry: false,
+    sessionId: patch.sessionId ?? null,
+    runtimePid: patch.runtimePid ?? null,
+    prePromptCursor: patch.prePromptCursor ?? null,
+    runtimePromptMessageId: patch.runtimePromptMessageId ?? null,
+    acceptedAt: patch.acceptedAt ?? null,
+    turnObservedAt: patch.turnObservedAt ?? null,
+    completedAt: patch.completedAt ?? null,
+    error: patch.error ?? null,
+    diagnostics: patch.diagnostics ?? [],
+    ...(patch.sendMessageData ? { sendMessageData: patch.sendMessageData } : {}),
+    createdAt: '2026-04-21T00:00:00.000Z',
+    updatedAt: '2026-04-21T00:00:00.000Z',
+  })) as typeof openCodeCommandOutcomeStore.upsert
+  openCodeCommandOutcomeStore.query = (async () => ({
+    record: null,
+    diagnostics: [],
+  })) as typeof openCodeCommandOutcomeStore.query
+  openCodeCommandOutcomeStore.prune = (async () => 0) as typeof openCodeCommandOutcomeStore.prune
   mockRequiredMcpTools()
   openCodeProvisioningProbe.probeRetainingHost = (async projectPath => ({
     snapshot: await openCodeProvisioningProbe.probe(projectPath),
     release: async () => {},
   })) as typeof openCodeProvisioningProbe.probeRetainingHost
   openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
-    await openCodeSessionBridge.promptAsync(record, input)
     const runtimePromptMessageId = 'msg_test_turn_settled'
+    await input.onPromptSubmitting?.({
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+      baseUrl: 'http://127.0.0.1:4096',
+    })
+    await openCodeSessionBridge.promptAsync(record, input)
+    await input.onPromptAccepted?.({
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+    })
     const turnSettled: OpenCodeTurnSettledSummary = {
       outcome: 'success',
       sessionId: record.opencodeSessionId,
@@ -421,7 +467,12 @@ beforeEach(async () => {
       latestAssistantMessageId: 'msg-assistant-1',
       diagnostics: [],
     }
-    return { runtimePromptMessageId, turnSettled }
+    await input.onTurnObserved?.({
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+      turnSettled,
+    })
+    return { runtimePromptMessageId, turnSettled, hookDiagnostics: [] }
   }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
   openCodeHostManager.reconcilePersistentHosts = (async () => ({
     cleaned: 0,
@@ -492,6 +543,9 @@ afterEach(async () => {
   openCodeSessionStore.list = originalList
   openCodeSessionStore.get = originalGet
   openCodeSessionStore.markStale = originalMarkStale
+  openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
+  openCodeCommandOutcomeStore.query = originalOutcomeQuery
+  openCodeCommandOutcomeStore.prune = originalOutcomePrune
   openCodeLedgerBridgeService.backfill = originalBackfillTaskLedger
   Client.prototype.connect = originalClientConnect
   Client.prototype.listTools = originalClientListTools

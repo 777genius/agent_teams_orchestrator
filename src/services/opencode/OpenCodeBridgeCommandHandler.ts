@@ -6,10 +6,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   type OpenCodeBridgeCommandEvidence,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
+import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   type ResolvedAppMcpLaunchConfig,
@@ -19,6 +21,7 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -37,12 +40,20 @@ import {
   openCodeLedgerBridgeService,
 } from './OpenCodeLedgerBridgeService.js'
 import {
+  openCodeCommandOutcomeStore,
+  type OpenCodeCommandOutcomePatch,
+  type OpenCodeCommandOutcomeRecord,
+  type OpenCodeCommandOutcomeSendMessageData,
+  type OpenCodeCommandOutcomeStatus,
+} from './OpenCodeCommandOutcomeStore.js'
+import {
   getClaudeConfigHomeDir,
   isEnvDefinedFalsy,
 } from '../../utils/envUtils.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
+  OpenCodeMessage,
   OpenCodePendingPermission,
   OpenCodeProvisioningSnapshot,
   OpenCodeSessionRecord,
@@ -155,6 +166,29 @@ type SendMessageCommandData = {
   diagnostics: TeamDiagnostic[]
 }
 
+type CommandStatusCommandData = {
+  status:
+    | 'unknown'
+    | 'received'
+    | 'prompt_submitting'
+    | 'prompt_accepted'
+    | 'turn_observed'
+    | 'reconciled'
+    | 'failed_before_accept'
+    | 'failed_after_accept'
+    | 'precondition_mismatch'
+  safeToRetry: boolean
+  accepted: boolean
+  originalRequestId?: string
+  deliveryAttemptId?: string
+  sessionId?: string
+  runtimePid?: number
+  runtimePromptMessageId?: string
+  prePromptCursor?: string | null
+  sendMessageData?: SendMessageCommandData
+  diagnostics: string[]
+}
+
 type ObserveMessageDeliveryCommandData = {
   observed: boolean
   sessionId?: string
@@ -163,6 +197,281 @@ type ObserveMessageDeliveryCommandData = {
   snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
+}
+
+type SendMessageOutcomeBase = {
+  requestId: string
+  body: Record<string, unknown>
+  teamId: string
+  teamName: string
+  laneId: string
+  memberName: string
+  projectPath: string
+  runId: string | null
+}
+
+function teamDiagnosticToOutcomeString(diagnostic: TeamDiagnostic): string {
+  return `${diagnostic.code}: ${diagnostic.message}`
+}
+
+function toOutcomeSendMessageData(data: SendMessageCommandData): OpenCodeCommandOutcomeSendMessageData | undefined {
+  if (data.accepted !== true) {
+    return undefined
+  }
+  return {
+    accepted: true,
+    ...(data.sessionId ? { sessionId: data.sessionId } : {}),
+    memberName: data.memberName,
+    ...(typeof data.runtimePid === 'number' && data.runtimePid > 0
+      ? { runtimePid: data.runtimePid }
+      : {}),
+    ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
+    ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
+    diagnostics: data.diagnostics,
+  }
+}
+
+async function markSendMessageOutcome(
+  base: SendMessageOutcomeBase,
+  input: {
+    status: OpenCodeCommandOutcomeStatus
+    sessionId?: string | null
+    runtimePid?: number | null
+    prePromptCursor?: string | null
+    runtimePromptMessageId?: string | null
+    acceptedAt?: string | null
+    turnObservedAt?: string | null
+    completedAt?: string | null
+    error?: string | null
+    diagnostics?: string[]
+    sendMessageData?: SendMessageCommandData
+  },
+): Promise<void> {
+  const patch: OpenCodeCommandOutcomePatch = {
+    requestId: base.requestId,
+    status: input.status,
+    teamId: base.teamId,
+    teamName: base.teamName,
+    laneId: base.laneId,
+    memberName: base.memberName,
+    projectPath: base.projectPath,
+    runId: base.runId,
+    deliveryAttemptId: asString(base.body.deliveryAttemptId) ?? undefined,
+    messageId: asString(base.body.messageId),
+    payloadHash: asString(base.body.payloadHash),
+    sessionId: input.sessionId ?? undefined,
+    runtimePid: input.runtimePid ?? undefined,
+    prePromptCursor: input.prePromptCursor ?? undefined,
+    runtimePromptMessageId: input.runtimePromptMessageId ?? undefined,
+    acceptedAt: input.acceptedAt ?? undefined,
+    turnObservedAt: input.turnObservedAt ?? undefined,
+    completedAt: input.completedAt ?? undefined,
+    error: input.error ?? undefined,
+    diagnostics: input.diagnostics,
+    sendMessageData: input.sendMessageData ? toOutcomeSendMessageData(input.sendMessageData) : undefined,
+  }
+  await openCodeCommandOutcomeStore.upsert(patch)
+}
+
+function commandStatusFromOutcomeStatus(
+  status: OpenCodeCommandOutcomeStatus,
+): CommandStatusCommandData['status'] {
+  if (
+    status === 'received' ||
+    status === 'preconditions_checked' ||
+    status === 'session_resolved' ||
+    status === 'mcp_ready'
+  ) {
+    return 'received'
+  }
+  return status
+}
+
+function isAcceptedOutcomeStatus(status: CommandStatusCommandData['status']): boolean {
+  return (
+    status === 'prompt_accepted' ||
+    status === 'turn_observed' ||
+    status === 'reconciled' ||
+    status === 'failed_after_accept'
+  )
+}
+
+function outcomeSendMessageDataToCommandData(
+  data: OpenCodeCommandOutcomeSendMessageData | undefined,
+): SendMessageCommandData | undefined {
+  if (!data) {
+    return undefined
+  }
+  return {
+    accepted: true,
+    ...(data.sessionId ? { sessionId: data.sessionId } : {}),
+    memberName: data.memberName,
+    ...(typeof data.runtimePid === 'number' && data.runtimePid > 0
+      ? { runtimePid: data.runtimePid }
+      : {}),
+    ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
+    ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
+    diagnostics: data.diagnostics,
+  }
+}
+
+function messageMatchesRuntimePromptId(message: OpenCodeMessage, runtimePromptMessageId: string): boolean {
+  const info = asRecord(message.info)
+  return asString(info?.id) === runtimePromptMessageId && asString(info?.role) === 'user'
+}
+
+function commandStatusMismatchReason(
+  record: OpenCodeCommandOutcomeRecord,
+  body: Record<string, unknown>,
+): string | null {
+  const expectedCommand = asString(body.originalCommand)
+  if (expectedCommand && expectedCommand !== 'opencode.sendMessage') {
+    return 'originalCommand mismatch'
+  }
+  const teamId = asString(body.teamId)
+  if (teamId && teamId !== record.teamId) {
+    return 'teamId mismatch'
+  }
+  const teamName = asString(body.teamName)
+  if (teamName && teamName !== record.teamName) {
+    return 'teamName mismatch'
+  }
+  const laneId = asString(body.laneId)
+  if (laneId && laneId !== record.laneId) {
+    return 'laneId mismatch'
+  }
+  const memberName = asString(body.memberName)
+  if (memberName && memberName !== record.memberName) {
+    return 'memberName mismatch'
+  }
+  const messageId = asString(body.messageId)
+  if (messageId && messageId !== record.messageId) {
+    return 'messageId mismatch'
+  }
+  const payloadHash = asString(body.payloadHash)
+  if (payloadHash && payloadHash !== record.payloadHash) {
+    return 'payloadHash mismatch'
+  }
+  const projectPath = asString(body.projectPath)
+  if (projectPath && projectPath !== record.projectPath) {
+    return 'projectPath mismatch'
+  }
+  const runId = asString(body.runId)
+  if (runId && runId !== record.runId) {
+    return 'runId mismatch'
+  }
+  return null
+}
+
+async function findPromptAcceptedEvidenceReadOnly(input: {
+  record: OpenCodeCommandOutcomeRecord
+  runtimePromptMessageId: string
+}): Promise<{
+  accepted: boolean
+  source: 'offline_sqlite' | 'active_host' | null
+  diagnostics: string[]
+}> {
+  const diagnostics: string[] = []
+  const sessionRecord = await openCodeSessionStore.get(
+    input.record.teamId,
+    input.record.laneId,
+    input.record.memberName,
+  )
+  if (!sessionRecord) {
+    return {
+      accepted: false,
+      source: null,
+      diagnostics: ['OpenCode command status could not find the stored session record.'],
+    }
+  }
+  if (input.record.sessionId && sessionRecord.opencodeSessionId !== input.record.sessionId) {
+    return {
+      accepted: false,
+      source: null,
+      diagnostics: [
+        `OpenCode command status session mismatch: outcome=${input.record.sessionId}, store=${sessionRecord.opencodeSessionId}.`,
+      ],
+    }
+  }
+
+  const offline = await openCodeOfflineSessionReader.readSession(sessionRecord)
+  if (offline) {
+    diagnostics.push(...offline.diagnostics)
+    if (offline.messages.some(message => messageMatchesRuntimePromptId(message, input.runtimePromptMessageId))) {
+      return {
+        accepted: true,
+        source: 'offline_sqlite',
+        diagnostics,
+      }
+    }
+  }
+
+  const activeHost = openCodeHostManager.getHost(sessionRecord.hostKey)
+  if (!activeHost) {
+    return {
+      accepted: false,
+      source: null,
+      diagnostics: [...diagnostics, 'OpenCode command status found no already-active host for live transcript proof.'],
+    }
+  }
+
+  try {
+    const client = openCodeClientFactory.create(activeHost.baseUrl)
+    const message = client.getSessionMessage
+      ? await client.getSessionMessage(sessionRecord.opencodeSessionId, input.runtimePromptMessageId)
+      : null
+    if (message && messageMatchesRuntimePromptId(message, input.runtimePromptMessageId)) {
+      return {
+        accepted: true,
+        source: 'active_host',
+        diagnostics,
+      }
+    }
+    if (!client.getSessionMessage) {
+      const messages = await client.getSessionMessages(sessionRecord.opencodeSessionId, 100)
+      if (messages.some(candidate => messageMatchesRuntimePromptId(candidate, input.runtimePromptMessageId))) {
+        return {
+          accepted: true,
+          source: 'active_host',
+          diagnostics,
+        }
+      }
+    }
+  } catch (error) {
+    diagnostics.push(
+      `OpenCode command status live transcript proof failed - ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+
+  return {
+    accepted: false,
+    source: null,
+    diagnostics,
+  }
+}
+
+async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<OpenCodeProvisioningSnapshot> {
+  const inventory = await openCodeInventoryService.probe(projectPath)
+  return {
+    detected: inventory.detected,
+    hostHealthy: false,
+    projectPath: inventory.projectPath,
+    models: [...inventory.models],
+    profile: inventory.profile,
+    host: null,
+    config: null,
+    configProviders: null,
+    providers: null,
+    providerAuth: null,
+    agents: [],
+    mcp: null,
+    appMcp: null,
+    probeError: inventory.probeError,
+    diagnostics: [
+      ...inventory.diagnostics,
+      'OpenCode command status used read-only inventory snapshot; host state was not probed.',
+    ],
+  }
 }
 
 const REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_NAMES = [
@@ -2116,19 +2425,39 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   if (!teamId || !laneId || !memberName || !text) {
     throw new Error('opencode.sendMessage requires teamId/teamName, laneId, memberName and text')
   }
+  const projectPath = asString(body.projectPath) ?? envelope.cwd
+  const runId = asString(body.runId)
+  const outcomeBase: SendMessageOutcomeBase = {
+    requestId: envelope.requestId,
+    body,
+    teamId,
+    teamName: asString(body.teamName) ?? teamId,
+    laneId,
+    memberName,
+    projectPath,
+    runId,
+  }
+  await markSendMessageOutcome(outcomeBase, {
+    status: 'received',
+  })
 
-  const snapshot = await openCodeProvisioningProbe.probe(
-    asString(body.projectPath) ?? envelope.cwd,
-  )
+  const snapshot = await openCodeProvisioningProbe.probe(projectPath)
   validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
+  await markSendMessageOutcome(outcomeBase, {
+    status: 'preconditions_checked',
+  })
   const record = await openCodeSessionStore.get(teamId, laneId, memberName)
   if (!record) {
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'failed_before_accept',
+      completedAt: nowIso(),
+      error: `No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`,
+    })
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
-  const runId = asString(body.runId)
   let deliveryRecord = record
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
@@ -2154,6 +2483,13 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     runId,
     diagnostics: mcpDiagnostics,
   })
+  await markSendMessageOutcome(outcomeBase, {
+    status: 'session_resolved',
+    sessionId: deliveryRecord.opencodeSessionId,
+    runtimePid: deliveryRecord.runtimePid ?? null,
+    prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
+    diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+  })
   const initialMcpReady = await openCodeSessionBridge.ensureSessionAppMcpReady(deliveryRecord, {
     attachIfMissing: true,
   })
@@ -2175,6 +2511,13 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         teamDiagnostic('opencode_send_mcp_ready_detail', message, 'info'),
       ),
     )
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'mcp_ready',
+      sessionId: deliveryRecord.opencodeSessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
+      diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+    })
   } else {
     mcpDiagnostics.push(
       teamDiagnostic(
@@ -2221,6 +2564,15 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       const responseObservation = reconcileFailedObservation(
         diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
       )
+      await markSendMessageOutcome(outcomeBase, {
+        status: 'failed_before_accept',
+        sessionId: deliveryRecord.opencodeSessionId,
+        runtimePid: deliveryRecord.runtimePid ?? null,
+        prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
+        completedAt: nowIso(),
+        error: responseObservation.reason ?? 'OpenCode app MCP unavailable',
+        diagnostics: diagnostics.map(teamDiagnosticToOutcomeString),
+      })
       return {
         snapshot,
         data: {
@@ -2254,6 +2606,13 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         teamDiagnostic('opencode_send_mcp_ready_detail', message, 'info'),
       ),
     )
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'mcp_ready',
+      sessionId: deliveryRecord.opencodeSessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor: deliveryRecord.lastCanonicalCursor ?? null,
+      diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+    })
   }
   const prePromptCursor = deliveryRecord.lastCanonicalCursor ?? null
 
@@ -2272,24 +2631,79 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   const noReply = body.noReply === true
   let runtimePromptMessageId: string | null = null
   let turnSettled: OpenCodeTurnSettledSummary | null = null
-  if (noReply) {
-    await openCodeSessionBridge.promptAsync(deliveryRecord, {
-      text: deliveryText,
-      parts: fileParts,
-      agent: deliveryAgent,
-      noReply: true,
-    })
-  } else {
-    const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
-      text: deliveryText,
-      parts: fileParts,
-      agent: deliveryAgent,
-      noReply: false,
-      timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
-      idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
-    })
-    runtimePromptMessageId = prompted.runtimePromptMessageId
-    turnSettled = prompted.turnSettled
+  let promptEndpointAccepted = false
+  try {
+    if (noReply) {
+      await openCodeSessionBridge.promptAsync(deliveryRecord, {
+        text: deliveryText,
+        parts: fileParts,
+        agent: deliveryAgent,
+        noReply: true,
+      })
+      promptEndpointAccepted = true
+    } else {
+      const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
+        text: deliveryText,
+        parts: fileParts,
+        agent: deliveryAgent,
+        noReply: false,
+        timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
+        idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
+        onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_submitting',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+          })
+        },
+        onPromptAccepted: async ({ sessionId, runtimePromptMessageId }) => {
+          promptEndpointAccepted = true
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_accepted',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            acceptedAt: nowIso(),
+          })
+        },
+        onTurnObserved: async ({ sessionId, runtimePromptMessageId }) => {
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'turn_observed',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            turnObservedAt: nowIso(),
+          })
+        },
+      })
+      runtimePromptMessageId = prompted.runtimePromptMessageId
+      turnSettled = prompted.turnSettled
+      if (prompted.hookDiagnostics.length > 0) {
+        mcpDiagnostics.push(
+          ...prompted.hookDiagnostics.map(message =>
+            teamDiagnostic('opencode_send_outcome_hook_failed', message, 'warning'),
+          ),
+        )
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await markSendMessageOutcome(outcomeBase, {
+      status: promptEndpointAccepted ? 'failed_after_accept' : 'failed_before_accept',
+      sessionId: deliveryRecord.opencodeSessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor,
+      runtimePromptMessageId,
+      completedAt: nowIso(),
+      error: message,
+      diagnostics: [...mcpDiagnostics.map(teamDiagnosticToOutcomeString), message],
+    }).catch(() => undefined)
+    throw error
   }
 
   let runtimePid =
@@ -2379,22 +2793,44 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     })
   }
 
+  const finalData: SendMessageCommandData = {
+    accepted: true,
+    sessionId: deliveryRecord.opencodeSessionId,
+    memberName,
+    ...(runtimePid ? { runtimePid } : {}),
+    prePromptCursor,
+    ...(responseObservation
+      ? {
+          snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
+          responseObservation,
+        }
+      : {}),
+    diagnostics: reconcileDiagnostics,
+  }
+  try {
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'reconciled',
+      sessionId: deliveryRecord.opencodeSessionId,
+      runtimePid: runtimePid ?? null,
+      prePromptCursor,
+      runtimePromptMessageId,
+      completedAt: nowIso(),
+      sendMessageData: finalData,
+      diagnostics: reconcileDiagnostics.map(teamDiagnosticToOutcomeString),
+    })
+  } catch (error) {
+    finalData.diagnostics.push(
+      teamDiagnostic(
+        'opencode_send_outcome_reconciled_store_failed',
+        error instanceof Error ? error.message : String(error),
+        'warning',
+      ),
+    )
+  }
+
   return {
     snapshot,
-    data: {
-      accepted: true,
-      sessionId: deliveryRecord.opencodeSessionId,
-      memberName,
-      ...(runtimePid ? { runtimePid } : {}),
-      prePromptCursor,
-      ...(responseObservation
-        ? {
-            snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
-            responseObservation,
-          }
-        : {}),
-      diagnostics: reconcileDiagnostics,
-    },
+    data: finalData,
   }
 }
 
@@ -2693,6 +3129,115 @@ async function runTranscript(envelope: BridgeEnvelope) {
   }
 }
 
+async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
+  snapshot: OpenCodeProvisioningSnapshot
+  data: CommandStatusCommandData
+}> {
+  const body = envelope.body
+  const snapshot = await buildCommandStatusReadOnlySnapshot(asString(body.projectPath) ?? envelope.cwd)
+  const originalRequestId = asString(body.originalRequestId) ?? asString(body.requestId)
+  const deliveryAttemptId = asString(body.deliveryAttemptId)
+  if (!originalRequestId && !deliveryAttemptId) {
+    return {
+      snapshot,
+      data: {
+        status: 'unknown',
+        safeToRetry: false,
+        accepted: false,
+        diagnostics: ['opencode.commandStatus requires originalRequestId or deliveryAttemptId.'],
+      },
+    }
+  }
+
+  const query = await openCodeCommandOutcomeStore.query({
+    requestId: originalRequestId,
+    deliveryAttemptId,
+  })
+  if (!query.record) {
+    const preconditionMismatch = query.diagnostics.some(diagnostic =>
+      diagnostic.includes('matched different requestId and deliveryAttemptId'),
+    )
+    return {
+      snapshot,
+      data: {
+        status: preconditionMismatch ? 'precondition_mismatch' : 'unknown',
+        safeToRetry: false,
+        accepted: false,
+        ...(originalRequestId ? { originalRequestId } : {}),
+        ...(deliveryAttemptId ? { deliveryAttemptId } : {}),
+        diagnostics: query.diagnostics.length
+          ? query.diagnostics
+          : ['No orchestrator-side command outcome record matched the requested OpenCode command.'],
+      },
+    }
+  }
+
+  const mismatchReason = commandStatusMismatchReason(query.record, body)
+  if (mismatchReason) {
+    return {
+      snapshot,
+      data: {
+        status: 'precondition_mismatch',
+        safeToRetry: false,
+        accepted: false,
+        originalRequestId: query.record.requestId,
+        ...(query.record.deliveryAttemptId ? { deliveryAttemptId: query.record.deliveryAttemptId } : {}),
+        diagnostics: [...query.diagnostics, `OpenCode command status ${mismatchReason}.`],
+      },
+    }
+  }
+
+  let status = commandStatusFromOutcomeStatus(query.record.status)
+  let accepted = isAcceptedOutcomeStatus(status)
+  const diagnostics = [...query.diagnostics, ...query.record.diagnostics]
+
+  if (status === 'prompt_submitting' && query.record.runtimePromptMessageId) {
+    const proof = await findPromptAcceptedEvidenceReadOnly({
+      record: query.record,
+      runtimePromptMessageId: query.record.runtimePromptMessageId,
+    })
+    diagnostics.push(...proof.diagnostics)
+    if (proof.accepted) {
+      status = 'prompt_accepted'
+      accepted = true
+      diagnostics.push(`OpenCode prompt acceptance recovered from ${proof.source}.`)
+    }
+  }
+
+  const safeToRetry = accepted
+    ? false
+    : status === 'prompt_submitting'
+      ? false
+      : status === 'failed_before_accept'
+        ? true
+        : query.record.safeToRetry
+
+  return {
+    snapshot,
+    data: {
+      status,
+      safeToRetry,
+      accepted,
+      originalRequestId: query.record.requestId,
+      ...(query.record.deliveryAttemptId ? { deliveryAttemptId: query.record.deliveryAttemptId } : {}),
+      ...(query.record.sessionId ? { sessionId: query.record.sessionId } : {}),
+      ...(typeof query.record.runtimePid === 'number' && query.record.runtimePid > 0
+        ? { runtimePid: query.record.runtimePid }
+        : {}),
+      ...(query.record.runtimePromptMessageId
+        ? { runtimePromptMessageId: query.record.runtimePromptMessageId }
+        : {}),
+      ...(query.record.prePromptCursor !== null
+        ? { prePromptCursor: query.record.prePromptCursor }
+        : {}),
+      ...(query.record.sendMessageData
+        ? { sendMessageData: outcomeSendMessageDataToCommandData(query.record.sendMessageData) }
+        : {}),
+      diagnostics,
+    },
+  }
+}
+
 async function handleEnvelope(envelope: BridgeEnvelope) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -2759,16 +3304,8 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       })
       return { snapshot, data: result }
     }
-    case 'opencode.commandStatus': {
-      const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
-      return {
-        snapshot,
-        data: {
-          status: 'unknown',
-          diagnostics: ['No orchestrator-side command status ledger is persisted yet.'],
-        },
-      }
-    }
+    case 'opencode.commandStatus':
+      return runCommandStatus(envelope)
     case 'opencode.recoverDeliveryJournal': {
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
       return {

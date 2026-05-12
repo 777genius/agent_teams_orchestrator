@@ -219,6 +219,67 @@ describe('OpenCodeSnapshotEvidenceProviderService', () => {
     expect(result.diagnostics.join('\n')).toContain('snapshot-path-not-touched: src/other.ts')
   })
 
+  test('reads snapshot patch evidence by patch hash even when the patch part is after the step window', async () => {
+    await mkdir(path.join(worktree, 'docs'), { recursive: true })
+    await writeFile(path.join(worktree, 'docs/a.md'), '---\ntitle: Old\n---\n\nBody\n')
+    const before = writeTree()
+    await writeFile(path.join(worktree, 'docs/a.md'), '---\ntitle: New\n---\n\nBody\n')
+    const after = writeTree()
+    const offline = {
+      ...offlineFixture(before, after),
+      patchParts: [
+        {
+          partId: 'patch-part-1',
+          messageId: 'assistant-1',
+          sessionId: 'session-1',
+          partOrder: 3,
+          timeCreated: 1200,
+          hash: before,
+          files: [path.join(worktree, 'docs/a.md')],
+          relativeFiles: ['docs/a.md'],
+        },
+      ],
+      rawParts: [
+        partRow('000-step-start', 'assistant-1', { type: 'step-start', snapshot: before }),
+        partRow('part-edit', 'assistant-1', { type: 'tool', tool: 'edit' }),
+        partRow('zzz-step-finish', 'assistant-1', { type: 'step-finish', snapshot: after }),
+        partRow('zzz-patch', 'assistant-1', {
+          type: 'patch',
+          hash: before,
+          files: [path.join(worktree, 'docs/a.md')],
+        }),
+      ],
+    }
+
+    const result = await provider().readSessionEvidence({
+      workspaceRoot: worktree,
+      sessionRecord: sessionRecord(),
+      offline,
+      changes: [
+        change({
+          sourceTool: 'snapshot_patch',
+          sourcePartId: 'patch-part-1',
+          sourceImportKey: `opencode\0session-1\0patch-part-1\0${path.join(worktree, 'docs/a.md')}`,
+          filePath: path.join(worktree, 'docs/a.md'),
+          relativePath: 'docs/a.md',
+        }),
+      ],
+      touchedRelativePaths: ['docs/a.md'],
+    })
+
+    expect(result.supported).toBe(true)
+    if (!result.supported) {
+      return
+    }
+    expect(result.files).toHaveLength(1)
+    expect(result.files[0]).toMatchObject({
+      relativePath: 'docs/a.md',
+      beforeContent: '---\ntitle: Old\n---\n\nBody\n',
+      afterContent: '---\ntitle: New\n---\n\nBody\n',
+      operation: 'modify',
+    })
+  })
+
   test('does not use first-start/last-finish when a toolpart is outside the window', async () => {
     await mkdir(path.join(worktree, 'src'), { recursive: true })
     await writeFile(path.join(worktree, 'src/file.ts'), 'before\n')

@@ -8,6 +8,7 @@ import * as lockfile from '../../utils/lockfile.js'
 import { sleep } from '../../utils/sleep.js'
 import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
+import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
@@ -741,7 +742,7 @@ export class OpenCodeHostManager {
     }
 
     return spawnPortableCli(
-      Bun.which('opencode') ?? 'opencode',
+      resolveOpenCodeBinaryPath() ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
       {
         cwd: profile.projectPath,

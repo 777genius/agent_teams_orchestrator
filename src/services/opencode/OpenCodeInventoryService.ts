@@ -4,6 +4,7 @@ import stripAnsi from 'strip-ansi'
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getCwd } from '../../utils/cwd.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
+import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
 import type {
@@ -11,6 +12,7 @@ import type {
   OpenCodeAgentSummary,
   OpenCodeConnectedProvider,
   OpenCodeInventorySnapshot,
+  OpenCodeModelMetadata,
   OpenCodePreparedProfile,
 } from './types.js'
 
@@ -72,6 +74,108 @@ function parseOpenCodeConnectedProviderLine(
 
 export function parseOpenCodeModelsOutput(output: string): string[] {
   return getTrimmedNonEmptyLines(output).filter(line => /^[a-z0-9-]+\/\S+$/i.test(line))
+}
+
+function collectFiniteNumbers(value: unknown): number[] {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return [value]
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(collectFiniteNumbers)
+  }
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).flatMap(collectFiniteNumbers)
+  }
+  return []
+}
+
+function isFreeCost(cost: unknown): boolean {
+  const numbers = collectFiniteNumbers(cost)
+  return numbers.length > 0 && numbers.every(value => value === 0)
+}
+
+function findJsonBlockEnd(lines: readonly string[], startIndex: number): number {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let lineIndex = startIndex; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex] ?? ''
+    for (const char of line) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (char === '\\') {
+        escaped = inString
+        continue
+      }
+      if (char === '"') {
+        inString = !inString
+        continue
+      }
+      if (inString) {
+        continue
+      }
+      if (char === '{') depth += 1
+      if (char === '}') depth -= 1
+    }
+    if (depth === 0 && lineIndex >= startIndex) {
+      return lineIndex
+    }
+  }
+  return startIndex
+}
+
+export function parseOpenCodeModelsVerboseOutput(output: string): {
+  models: string[]
+  modelMetadata: OpenCodeModelMetadata[]
+} {
+  const lines = stripAnsi(output).split(/\r?\n/g).map(line => line.trim()).filter(Boolean)
+  const models: string[] = []
+  const modelMetadata: OpenCodeModelMetadata[] = []
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    if (!/^[a-z0-9-]+\/\S+$/i.test(line)) {
+      continue
+    }
+    models.push(line)
+    const nextLine = lines[index + 1]
+    if (!nextLine?.startsWith('{')) {
+      continue
+    }
+    const blockEnd = findJsonBlockEnd(lines, index + 1)
+    const block = lines.slice(index + 1, blockEnd + 1).join('\n')
+    try {
+      const raw = JSON.parse(block) as Record<string, unknown>
+      modelMetadata.push({
+        id: line,
+        cost: raw.cost ?? null,
+        free: isFreeCost(raw.cost),
+        raw,
+      })
+      index = blockEnd
+    } catch {
+      // Keep the plain model id even if one metadata block is malformed.
+    }
+  }
+
+  return {
+    models,
+    modelMetadata,
+  }
+}
+
+export function isOpenCodeModelFree(
+  modelId: string,
+  modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
+): boolean {
+  const metadata = modelMetadata?.find(item => item.id === modelId)
+  if (metadata) {
+    return metadata.free
+  }
+  const normalized = modelId.toLowerCase()
+  return normalized.includes(':free') || normalized.endsWith('-free')
 }
 
 export function parseOpenCodeProvidersOutput(output: string): {
@@ -209,7 +313,7 @@ export class OpenCodeInventoryService {
       return cached.snapshot
     }
 
-    const binaryPath = Bun.which('opencode')
+    const binaryPath = resolveOpenCodeBinaryPath()
     if (!binaryPath) {
       const missingSnapshot: OpenCodeInventorySnapshot = {
         detected: false,
@@ -220,6 +324,7 @@ export class OpenCodeInventoryService {
         connectedProviders: [],
         availableProviders: [],
         models: [],
+        modelMetadata: [],
         agents: [],
         authStorePath: null,
         probeError: null,
@@ -233,10 +338,10 @@ export class OpenCodeInventoryService {
     }
 
     const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath)
-    const [versionResult, providersResult, modelsResult, agentsResult] = await Promise.all([
+    const [versionResult, providersResult, modelsVerboseResult, agentsResult] = await Promise.all([
       this.execOpenCode(binaryPath, ['--version'], profile),
       this.execOpenCode(binaryPath, ['providers', 'list'], profile),
-      this.execOpenCode(binaryPath, ['models'], profile),
+      this.execOpenCode(binaryPath, ['models', '--verbose'], profile),
       this.execOpenCode(binaryPath, ['agent', 'list'], profile),
     ])
 
@@ -279,7 +384,21 @@ export class OpenCodeInventoryService {
       ...cliConnectedProviders,
       ...managedAuthProviders,
     ])
-    const models = modelsResult.code === 0 ? parseOpenCodeModelsOutput(modelsResult.stdout) : []
+    const verboseModels =
+      modelsVerboseResult.code === 0
+        ? parseOpenCodeModelsVerboseOutput(modelsVerboseResult.stdout)
+        : { models: [], modelMetadata: [] }
+    let models = verboseModels.models
+    let modelMetadata = verboseModels.modelMetadata
+    let modelsResult = modelsVerboseResult
+    if (models.length === 0) {
+      const fallbackModelsResult = await this.execOpenCode(binaryPath, ['models'], profile)
+      modelsResult = fallbackModelsResult
+      models = fallbackModelsResult.code === 0
+        ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
+        : []
+      modelMetadata = []
+    }
     const agents = agentsResult.code === 0 ? parseOpenCodeAgentListOutput(agentsResult.stdout) : []
 
     const availableProviders = Array.from(
@@ -321,6 +440,7 @@ export class OpenCodeInventoryService {
       connectedProviders,
       availableProviders,
       models,
+      modelMetadata,
       agents,
       authStorePath: providerParse.authStorePath ?? profile.managedAuthPath,
       probeError: diagnostics.length > 0 ? diagnostics[0] ?? 'OpenCode probe failed' : null,

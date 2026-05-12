@@ -50,6 +50,23 @@ export type OpenCodePromptPart =
   | { type: 'text'; text: string }
   | { type: 'file'; mime: string; url: string; filename: string }
 
+export type OpenCodePromptAsyncWithTurnSettledHooks = {
+  onPromptSubmitting?: (event: {
+    sessionId: string
+    runtimePromptMessageId: string
+    baseUrl: string
+  }) => Promise<void>
+  onPromptAccepted?: (event: {
+    sessionId: string
+    runtimePromptMessageId: string
+  }) => Promise<void>
+  onTurnObserved?: (event: {
+    sessionId: string
+    runtimePromptMessageId: string
+    turnSettled: OpenCodeTurnSettledSummary
+  }) => Promise<void>
+}
+
 export type OpenCodeSessionAppMcpReadyResult = {
   ok: boolean
   runtimePid?: number
@@ -754,10 +771,11 @@ export class OpenCodeSessionBridge {
       system?: string
       timeoutMs?: number
       idleTimeoutMs?: number
-    },
+    } & OpenCodePromptAsyncWithTurnSettledHooks,
   ): Promise<{
     runtimePromptMessageId: string
     turnSettled: OpenCodeTurnSettledSummary
+    hookDiagnostics: string[]
   }> {
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
@@ -771,8 +789,15 @@ export class OpenCodeSessionBridge {
         idleTimeoutMs: params.idleTimeoutMs,
       })
       const client = this.clientFactory.create(baseUrl)
+      const hookDiagnostics: string[] = []
+      let endpointAccepted = false
       try {
         observation.markPromptSubmitting()
+        await params.onPromptSubmitting?.({
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId: observation.runtimePromptMessageId,
+          baseUrl,
+        })
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: observation.runtimePromptMessageId,
           agent: params.agent,
@@ -784,13 +809,39 @@ export class OpenCodeSessionBridge {
             parts: params.parts,
           }),
         })
+        endpointAccepted = true
         observation.markPromptAcceptedByEndpoint()
+        try {
+          await params.onPromptAccepted?.({
+            sessionId: record.opencodeSessionId,
+            runtimePromptMessageId: observation.runtimePromptMessageId,
+          })
+        } catch (error) {
+          hookDiagnostics.push(
+            `OpenCode prompt accepted hook failed - ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        const turnSettled = await observation.waitForSettled()
+        try {
+          await params.onTurnObserved?.({
+            sessionId: record.opencodeSessionId,
+            runtimePromptMessageId: observation.runtimePromptMessageId,
+            turnSettled,
+          })
+        } catch (error) {
+          hookDiagnostics.push(
+            `OpenCode turn observed hook failed - ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
         return {
           runtimePromptMessageId: observation.runtimePromptMessageId,
-          turnSettled: await observation.waitForSettled(),
+          turnSettled,
+          hookDiagnostics,
         }
       } catch (error) {
-        observation.markPromptRejectedByEndpoint(error)
+        if (!endpointAccepted) {
+          observation.markPromptRejectedByEndpoint(error)
+        }
         throw error
       } finally {
         observation.dispose()

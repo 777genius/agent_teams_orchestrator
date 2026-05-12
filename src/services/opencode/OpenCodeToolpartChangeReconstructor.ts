@@ -56,7 +56,7 @@ export type ReconstructedOpenCodeToolChange = {
   toolUseId: string
   sourcePartId: string
   sourceMessageId: string
-  sourceTool: 'write' | 'edit' | 'apply_patch'
+  sourceTool: 'write' | 'edit' | 'apply_patch' | 'snapshot_patch'
   sourceImportKey: string
   filePath: string
   relativePath: string
@@ -127,6 +127,13 @@ type ReconstructedFileState = {
   text: string | null
   textAvailability: 'full-text' | 'metadata-only' | 'unavailable'
   exists: boolean
+}
+
+type SourcePartSortKey = {
+  messageTimeCreated: number
+  messageIdSort: string
+  messagePartOrder: number
+  partId: string
 }
 
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
@@ -351,6 +358,21 @@ function buildSourceImportKey(params: {
   return ['opencode', params.sessionId, params.partId, params.normalizedPath.comparisonKey].join('\0')
 }
 
+function compareSourcePartSortKey(
+  left: SourcePartSortKey | undefined,
+  right: SourcePartSortKey | undefined,
+): number {
+  if (!left && !right) return 0
+  if (!left) return 1
+  if (!right) return -1
+  return (
+    left.messageTimeCreated - right.messageTimeCreated ||
+    left.messageIdSort.localeCompare(right.messageIdSort) ||
+    left.messagePartOrder - right.messagePartOrder ||
+    left.partId.localeCompare(right.partId)
+  )
+}
+
 export class OpenCodeToolpartChangeReconstructor {
   reconstruct(params: {
     teamName: string
@@ -400,8 +422,20 @@ export class OpenCodeToolpartChangeReconstructor {
     }
 
     const toolparts = this.extractToolparts(parsedParts, messagesById, messageTimeById, diagnostics)
+    const sourcePartSortKeys = this.buildSourcePartSortKeys(
+      parsedParts.map(item => item.row),
+      messageTimeById,
+    )
     const fileStates = new Map<string, ReconstructedFileState>()
     const changes: ReconstructedOpenCodeToolChange[] = []
+    changes.push(...this.reconstructSnapshotPatchChanges({
+      rows: parsedParts,
+      messagesById,
+      partsByMessageId,
+      toolparts,
+      params,
+      diagnostics,
+    }))
 
     for (const toolpart of toolparts.sort((left, right) => {
       return (
@@ -776,7 +810,156 @@ export class OpenCodeToolpartChangeReconstructor {
       })
     }
 
-    return { changes, notices, diagnostics }
+    return {
+      changes: changes
+        .map((change, index) => ({ change, index }))
+        .sort((left, right) =>
+          compareSourcePartSortKey(
+            sourcePartSortKeys.get(left.change.sourcePartId),
+            sourcePartSortKeys.get(right.change.sourcePartId),
+          ) || left.index - right.index
+        )
+        .map(({ change }) => change),
+      notices,
+      diagnostics,
+    }
+  }
+
+  private reconstructSnapshotPatchChanges(input: {
+    rows: Array<{ row: OpenCodeSqlitePartRow; data: Record<string, unknown> }>
+    messagesById: Map<string, Record<string, unknown>>
+    partsByMessageId: Map<string, Record<string, unknown>[]>
+    toolparts: Toolpart[]
+    params: {
+      teamName: string
+      memberName: string
+      sessionId: string
+      projectPath: string
+      requestedTask?: OpenCodeTaskRef
+      deliveryContext?: OpenCodeDeliveryContextV1 | null
+      attributionMode?: OpenCodeLedgerAttributionMode
+      laneId?: string | null
+    }
+    diagnostics: string[]
+  }): ReconstructedOpenCodeToolChange[] {
+    const touchedByToolpart = this.buildToolpartTouchedPathIndex(input.toolparts, input.params.projectPath)
+    const changes: ReconstructedOpenCodeToolChange[] = []
+
+    for (const { row, data } of input.rows) {
+      if (data.type !== 'patch') {
+        continue
+      }
+      const files = Array.isArray(data.files)
+        ? data.files.filter((file): file is string => typeof file === 'string' && file.length > 0)
+        : []
+      if (files.length === 0) {
+        continue
+      }
+      const assistantMessage = input.messagesById.get(row.message_id)
+      const parentUserMessageId = asString(assistantMessage?.parentID)
+      const taskContextResolution = this.resolveTaskContext({
+        toolpart: {
+          partId: row.id,
+          parentUserMessageId,
+        },
+        partsByMessageId: input.partsByMessageId,
+        params: input.params,
+        diagnostics: input.diagnostics,
+      })
+      if (taskContextResolution.type === 'skipped') {
+        if (taskContextResolution.notice) {
+          input.diagnostics.push(taskContextResolution.notice.message)
+        }
+        continue
+      }
+      const taskContext = taskContextResolution.context
+      const coveredPaths = touchedByToolpart.byMessage.get(row.message_id) ?? new Set<string>()
+      const skipWholePatch = touchedByToolpart.messagesWithApplyPatch.has(row.message_id)
+
+      for (const filePath of files) {
+        const normalizedPath = normalizeOpenCodeFilePath({
+          projectPath: input.params.projectPath,
+          filePath,
+        })
+        if ('skipped' in normalizedPath) {
+          input.diagnostics.push(`OpenCode snapshot patch part ${row.id} skipped ${filePath} - ${normalizedPath.diagnostic}`)
+          continue
+        }
+        if (skipWholePatch || coveredPaths.has(normalizedPath.relativePath)) {
+          continue
+        }
+        changes.push({
+          taskId: taskContext.taskRef.taskId,
+          taskRef: taskContext.taskRef.taskId,
+          taskRefKind: 'canonical',
+          teamName: taskContext.taskRef.teamName,
+          memberName: input.params.memberName,
+          sessionId: input.params.sessionId,
+          ...(parentUserMessageId ? { parentUserMessageId } : {}),
+          assistantMessageId: row.message_id,
+          toolUseId: row.id,
+          sourcePartId: row.id,
+          sourceMessageId: row.message_id,
+          sourceTool: 'snapshot_patch',
+          sourceImportKey: buildSourceImportKey({
+            sessionId: input.params.sessionId,
+            partId: row.id,
+            normalizedPath,
+          }),
+          filePath: normalizedPath.absolutePath,
+          relativePath: normalizedPath.relativePath,
+          beforeContent: null,
+          afterContent: null,
+          operation: 'modify',
+          confidence: 'medium',
+          attributionMethod: taskContext.method,
+          beforeState: {
+            exists: true,
+            unavailableReason: 'opencode-snapshot-patch-before-content-unavailable',
+          },
+          afterState: {
+            exists: true,
+            unavailableReason: 'opencode-snapshot-patch-after-content-unavailable',
+          },
+          evidenceProof: 'metadata-only-fallback',
+          timestamp: toIsoTimestamp(row.time_created, row.time_created),
+          warnings: [
+            'OpenCode snapshot patch was captured without a matching file toolpart; full review depends on snapshot evidence.',
+            ...(taskContext.warning ? [taskContext.warning] : []),
+          ],
+        })
+      }
+    }
+
+    return changes
+  }
+
+  private buildToolpartTouchedPathIndex(
+    toolparts: Toolpart[],
+    projectPath: string,
+  ): { byMessage: Map<string, Set<string>>; messagesWithApplyPatch: Set<string> } {
+    const byMessage = new Map<string, Set<string>>()
+    const messagesWithApplyPatch = new Set<string>()
+    for (const toolpart of toolparts) {
+      if (toolpart.tool === 'apply_patch') {
+        messagesWithApplyPatch.add(toolpart.messageId)
+        continue
+      }
+      if (!toolpart.filePath) {
+        continue
+      }
+      const normalizedPath = normalizeOpenCodeFilePath({
+        projectPath,
+        filePath: toolpart.filePath,
+      })
+      if ('skipped' in normalizedPath) {
+        continue
+      }
+      const bucket = byMessage.get(toolpart.messageId) ?? new Set<string>()
+      bucket.add(normalizedPath.relativePath)
+      byMessage.set(toolpart.messageId, bucket)
+    }
+    return { byMessage, messagesWithApplyPatch }
   }
 
   private extractToolparts(
@@ -914,8 +1097,25 @@ export class OpenCodeToolpartChangeReconstructor {
     return result
   }
 
+  private buildSourcePartSortKeys(
+    rows: OpenCodeSqlitePartRow[],
+    messageTimeById: Map<string, number>,
+  ): Map<string, SourcePartSortKey> {
+    const partOrderById = this.buildMessagePartOrderById(rows)
+    const result = new Map<string, SourcePartSortKey>()
+    for (const row of rows) {
+      result.set(row.id, {
+        messageTimeCreated: messageTimeById.get(row.message_id) ?? row.time_created,
+        messageIdSort: row.message_id,
+        messagePartOrder: partOrderById.get(row.id) ?? 0,
+        partId: row.id,
+      })
+    }
+    return result
+  }
+
   private resolveTaskContext(input: {
-    toolpart: Toolpart
+    toolpart: Pick<Toolpart, 'partId' | 'parentUserMessageId'>
     partsByMessageId: Map<string, Record<string, unknown>[]>
     params: {
       teamName: string

@@ -12,7 +12,11 @@ import {
   buildOpenCodeDetailMessage,
   buildOpenCodeStatusMessage,
 } from '../opencode/OpenCodeDiagnostics.js'
-import { openCodeInventoryService } from '../opencode/OpenCodeInventoryService.js'
+import {
+  isOpenCodeModelFree,
+  openCodeInventoryService,
+} from '../opencode/OpenCodeInventoryService.js'
+import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
   getAnthropicRuntimeFastModeCapability,
@@ -297,6 +301,7 @@ type RuntimeStatusRegistryDeps = {
     | RuntimeProviderSubscriptionRateLimitSnapshot
     | null
     | Promise<RuntimeProviderSubscriptionRateLimitSnapshot | null>
+  getOpenCodeInventorySnapshot?: () => Promise<OpenCodeInventorySnapshot>
 }
 
 async function buildAnthropicStatus(
@@ -374,9 +379,48 @@ function filterCodexModelCatalog(
   }
 }
 
-async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
-  const snapshot = await openCodeInventoryService.probe()
+async function buildOpenCodeStatus(
+  deps: RuntimeStatusRegistryDeps = {},
+): Promise<RuntimeProviderStatus> {
+  const snapshot = deps.getOpenCodeInventorySnapshot
+    ? await deps.getOpenCodeInventorySnapshot()
+    : await openCodeInventoryService.probe()
   const authenticated = snapshot.connectedProviders.length > 0
+  const fetchedAt = new Date()
+  const defaultModel = snapshot.models.find(model => model === 'opencode/big-pickle')
+    ?? snapshot.models[0]
+    ?? null
+  const modelCatalog: RuntimeProviderModelCatalog = {
+    schemaVersion: 1,
+    providerId: 'opencode',
+    source: 'app-server',
+    status: snapshot.detected ? 'ready' : 'unavailable',
+    fetchedAt: fetchedAt.toISOString(),
+    staleAt: new Date(fetchedAt.getTime() + 10 * 60 * 1000).toISOString(),
+    defaultModelId: defaultModel,
+    defaultLaunchModel: defaultModel,
+    models: snapshot.models.map(model => ({
+      id: model,
+      launchModel: model,
+      displayName: model,
+      hidden: false,
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      inputModalities: ['text'],
+      supportsPersonality: true,
+      isDefault: model === defaultModel,
+      upgrade: false,
+      source: 'app-server',
+      badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata) ? 'Free' : null,
+      statusMessage: null,
+    })),
+    diagnostics: {
+      configReadState: snapshot.detected ? 'ready' : 'skipped',
+      appServerState: snapshot.detected ? 'healthy' : 'runtime-missing',
+      message: snapshot.probeError,
+      code: snapshot.probeError ? 'opencode-probe-error' : null,
+    },
+  }
 
   return {
     providerId: 'opencode',
@@ -431,6 +475,13 @@ async function buildOpenCodeStatus(): Promise<RuntimeProviderStatus> {
       },
     ],
     models: snapshot.models,
+    modelCatalog,
+    runtimeCapabilities: {
+      modelCatalog: {
+        dynamic: true,
+        source: 'app-server',
+      },
+    },
     backend: snapshot.detected
       ? {
           kind: 'opencode-cli',
@@ -720,7 +771,7 @@ export async function getUnifiedRuntimeStatusPayload(
   }
 
   if (!providerFilter || providerFilter === 'opencode') {
-    providers.opencode = await buildOpenCodeStatus()
+    providers.opencode = await buildOpenCodeStatus(deps)
   }
 
   return {

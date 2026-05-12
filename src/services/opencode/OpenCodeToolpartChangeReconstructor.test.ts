@@ -874,6 +874,69 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     })
   })
 
+  test('strict delivery mode imports OpenCode snapshot patch files without matching file toolparts', () => {
+    const result = reconstruct([
+      partRow(
+        'part-snapshot-patch-1',
+        'assistant-1',
+        {
+          type: 'patch',
+          hash: 'snapshot-before-1',
+          files: [
+            path.join(workspaceRoot, 'docs/a.md'),
+            path.join(workspaceRoot, 'docs/b.md'),
+          ],
+        },
+        1200,
+      ),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes).toHaveLength(2)
+    expect(result.changes.map(change => change.relativePath)).toEqual(['docs/a.md', 'docs/b.md'])
+    expect(result.changes[0]).toMatchObject({
+      sourceTool: 'snapshot_patch',
+      sourcePartId: 'part-snapshot-patch-1',
+      sourceMessageId: 'assistant-1',
+      parentUserMessageId: 'user-1',
+      attributionMethod: 'delivery-ledger-taskrefs',
+      evidenceProof: 'metadata-only-fallback',
+    })
+  })
+
+  test('strict delivery mode does not duplicate snapshot patch paths already covered by file toolparts', () => {
+    const result = reconstruct([
+      toolPart({
+        id: 'part-edit-1',
+        tool: 'edit',
+        filePath: path.join(workspaceRoot, 'docs/a.md'),
+        oldString: 'before',
+        newString: 'after',
+      }),
+      partRow(
+        'part-snapshot-patch-1',
+        'assistant-1',
+        {
+          type: 'patch',
+          hash: 'snapshot-before-1',
+          files: [
+            path.join(workspaceRoot, 'docs/a.md'),
+            path.join(workspaceRoot, 'docs/b.md'),
+          ],
+        },
+        1200,
+      ),
+    ])
+
+    expect(result.diagnostics).toEqual([])
+    expect(result.notices).toEqual([])
+    expect(result.changes.map(change => [change.sourceTool, change.relativePath])).toEqual([
+      ['edit', 'docs/a.md'],
+      ['snapshot_patch', 'docs/b.md'],
+    ])
+  })
+
   test('strict delivery mode ignores spoofed markers outside the generated delivery block', () => {
     const result = reconstruct(
       [],

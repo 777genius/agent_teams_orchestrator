@@ -198,6 +198,89 @@ function snapshotFilesByRelativePath(result: OpenCodeSnapshotEvidenceResult | nu
   return files
 }
 
+function snapshotPatchReplacement(
+  change: ReconstructedOpenCodeToolChange,
+  snapshotAnchor: SnapshotFileAnchor | undefined,
+): ReconstructedOpenCodeToolChange | null {
+  if (change.sourceTool !== 'snapshot_patch' || !snapshotAnchor?.operation) {
+    return null
+  }
+  const operation = snapshotAnchor.operation
+  const beforeContent =
+    typeof snapshotAnchor.beforeContent === 'string' ? snapshotAnchor.beforeContent : null
+  const afterContent =
+    typeof snapshotAnchor.afterContent === 'string' ? snapshotAnchor.afterContent : null
+  const hasEnoughEvidence =
+    operation === 'create'
+      ? afterContent !== null
+      : operation === 'delete'
+        ? beforeContent !== null
+        : beforeContent !== null && afterContent !== null
+  if (!hasEnoughEvidence) {
+    return null
+  }
+
+  return {
+    ...change,
+    operation,
+    beforeContent,
+    afterContent,
+    beforeState:
+      beforeContent !== null ? contentStateForText(beforeContent) : { exists: false, sizeBytes: 0 },
+    afterState:
+      afterContent !== null ? contentStateForText(afterContent) : { exists: false, sizeBytes: 0 },
+    confidence: 'high',
+    evidenceProof: 'opencode-snapshot',
+    snapshotId: snapshotAnchor.snapshotId,
+    snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
+    warnings: [
+      ...(change.warnings ?? []).filter(warning =>
+        !warning.includes('manual-only') &&
+        !warning.includes('full review depends on snapshot evidence')
+      ),
+      ...(snapshotAnchor.warnings ?? []),
+    ],
+  }
+}
+
+function snapshotPatchChainReplacement(input: {
+  change: ReconstructedOpenCodeToolChange
+  snapshotAnchor: SnapshotFileAnchor
+  afterContent: string
+}): ReconstructedOpenCodeToolChange | null {
+  if (input.change.sourceTool !== 'snapshot_patch') {
+    return null
+  }
+  const beforeContent =
+    typeof input.snapshotAnchor.beforeContent === 'string'
+      ? input.snapshotAnchor.beforeContent
+      : null
+  if (beforeContent === null && input.snapshotAnchor.operation !== 'create') {
+    return null
+  }
+  const operation = beforeContent !== null ? 'modify' : 'create'
+  return {
+    ...input.change,
+    operation,
+    beforeContent,
+    afterContent: input.afterContent,
+    beforeState:
+      beforeContent !== null ? contentStateForText(beforeContent) : { exists: false, sizeBytes: 0 },
+    afterState: contentStateForText(input.afterContent),
+    confidence: 'high',
+    evidenceProof: 'opencode-snapshot',
+    snapshotId: input.snapshotAnchor.snapshotId,
+    snapshotSource: input.snapshotAnchor.snapshotId ? 'opencode' : undefined,
+    warnings: [
+      ...(input.change.warnings ?? []).filter(warning =>
+        !warning.includes('manual-only') &&
+        !warning.includes('full review depends on snapshot evidence')
+      ),
+      ...(input.snapshotAnchor.warnings ?? []),
+    ],
+  }
+}
+
 export class OpenCodeChangeEvidenceEnricher {
   async enrich(params: EnrichmentParams): Promise<ReconstructedOpenCodeToolChange[]> {
     const result = params.changes.map(change => applyProof(change, exactOrMetadataProof(change)))
@@ -253,6 +336,13 @@ export class OpenCodeChangeEvidenceEnricher {
     const replacements = new Map<string, ReconstructedOpenCodeToolChange>()
     for (const [relativePath, changes] of byPath) {
       const snapshotAnchor = snapshotAfterByPath.get(relativePath)
+      if (changes.length === 1) {
+        const replacement = snapshotPatchReplacement(changes[0]!, snapshotAnchor)
+        if (replacement) {
+          replacements.set(replacement.sourceImportKey, replacement)
+          continue
+        }
+      }
       let anchorAfter = snapshotAnchor?.afterContent
       if (typeof anchorAfter !== 'string') {
         const latestChange = changes[changes.length - 1]
@@ -347,6 +437,16 @@ export class OpenCodeChangeEvidenceEnricher {
           }
           localReplacements.set(change.sourceImportKey, upgraded)
           anchorAfter = before
+          continue
+        }
+        const snapshotPatch = snapshotPatchChainReplacement({
+          change,
+          snapshotAnchor,
+          afterContent: anchorAfter,
+        })
+        if (snapshotPatch) {
+          localReplacements.set(change.sourceImportKey, snapshotPatch)
+          anchorAfter = snapshotPatch.beforeContent ?? ''
           continue
         }
         if (change.sourceTool !== 'edit' || change.beforeContent !== null || change.afterContent !== null) {

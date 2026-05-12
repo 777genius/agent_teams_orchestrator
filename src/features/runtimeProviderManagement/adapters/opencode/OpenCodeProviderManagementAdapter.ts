@@ -7,7 +7,10 @@ import {
   upsertOpenCodeApiAuthCredential,
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
-import { openCodeInventoryService } from '../../../../services/opencode/OpenCodeInventoryService.js'
+import {
+  isOpenCodeModelFree,
+  openCodeInventoryService,
+} from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { setOpenCodeManagedDefaultModel } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
@@ -1556,6 +1559,7 @@ function buildRuntimeProviderModel(input: {
   providerEntry?: OpenCodeProviderListEntry
   defaultModelId: string | null
   availability?: ProviderModelAvailability
+  inventory: OpenCodeInventorySnapshot
 }): RuntimeProviderModel {
   const nestedModelId = input.modelId.slice(`${input.providerId}/`.length)
   return {
@@ -1563,7 +1567,7 @@ function buildRuntimeProviderModel(input: {
     providerId: input.providerId,
     displayName: nestedModelId || input.modelId,
     sourceLabel: getProviderDisplayName(input.providerId, input.providerEntry),
-    free: input.modelId.toLowerCase().includes(':free'),
+    free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
     default: input.defaultModelId === input.modelId,
     availability: input.availability ?? 'untested',
   }
@@ -1598,6 +1602,7 @@ function buildProviderModelsView(input: {
       modelId,
       providerEntry: entries.get(input.providerId),
       defaultModelId,
+      inventory: input.inventory,
     }))
     .filter(model => providerModelMatchesQuery(model, query))
 

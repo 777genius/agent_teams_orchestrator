@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   parseOpenCodeAgentListOutput,
+  isOpenCodeModelFree,
   parseOpenCodeModelsOutput,
+  parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
 } from './OpenCodeInventoryService.js'
 
@@ -68,5 +70,31 @@ describe('OpenCodeInventoryService parsers', () => {
       { id: 'build', mode: 'primary' },
       { id: 'explore', mode: 'subagent' },
     ])
+  })
+
+  test('parses verbose model metadata and detects free cost', () => {
+    const parsed = parseOpenCodeModelsVerboseOutput(`
+opencode/big-pickle
+{
+  "cost": {
+    "input": 0,
+    "output": 0,
+    "cache": { "read": 0, "write": 0 }
+  },
+  "limit": { "context": 200000 }
+}
+openai/gpt-5.4
+{
+  "cost": {
+    "input": 1.25,
+    "output": 10
+  }
+}
+`)
+
+    expect(parsed.models).toEqual(['opencode/big-pickle', 'openai/gpt-5.4'])
+    expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
+    expect(isOpenCodeModelFree('openai/gpt-5.4', parsed.modelMetadata)).toBe(false)
+    expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(true)
   })
 })

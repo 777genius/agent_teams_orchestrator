@@ -227,6 +227,98 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
+  test('upgrades snapshot patch placeholders when snapshot evidence proves before and after text', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [
+        change({
+          sourceTool: 'snapshot_patch',
+          sourcePartId: 'part-patch',
+          sourceImportKey: 'opencode\0session-1\0part-patch\0/repo/src/file.ts',
+          oldString: undefined,
+          newString: undefined,
+          warnings: [
+            'OpenCode snapshot patch was captured without a matching file toolpart; full review depends on snapshot evidence.',
+          ],
+        }),
+      ],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'modify',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        snapshotId: 'snapshot-proof',
+      }),
+      diagnostics,
+    })
+
+    expect(diagnostics).toEqual([])
+    expect(result[0]).toMatchObject({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      operation: 'modify',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotId: 'snapshot-proof',
+      snapshotSource: 'opencode',
+      warnings: [],
+    })
+  })
+
+  test('upgrades snapshot patch placeholders before later same-path edit toolparts', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [
+        change({
+          sourceTool: 'snapshot_patch',
+          sourcePartId: 'part-patch',
+          sourceImportKey: 'opencode\0session-1\0part-patch\0/repo/src/file.ts',
+          oldString: undefined,
+          newString: undefined,
+          warnings: [
+            'OpenCode snapshot patch was captured without a matching file toolpart; full review depends on snapshot evidence.',
+          ],
+        }),
+        change({
+          sourcePartId: 'part-edit',
+          sourceImportKey: 'opencode\0session-1\0part-edit\0/repo/src/file.ts',
+          oldString: 'value = 2',
+          newString: 'value = 3',
+        }),
+      ],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'modify',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 3;\n',
+        snapshotId: 'snapshot-proof',
+      }),
+      diagnostics,
+    })
+
+    expect(diagnostics).toEqual([])
+    expect(result[0]).toMatchObject({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      operation: 'modify',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      warnings: [],
+    })
+    expect(result[1]).toMatchObject({
+      beforeContent: 'export const value = 2;\n',
+      afterContent: 'export const value = 3;\n',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+    })
+  })
+
   test('does not use snapshot evidence without SQLite snapshot windows', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({

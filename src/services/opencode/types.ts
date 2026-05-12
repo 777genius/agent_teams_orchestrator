@@ -64,6 +64,13 @@ export type OpenCodeAgentSummary = {
   mode: OpenCodeAgentMode
 }
 
+export type OpenCodeModelMetadata = {
+  id: string
+  cost: unknown | null
+  free: boolean
+  raw: Record<string, unknown>
+}
+
 export type OpenCodeInventorySnapshot = {
   detected: boolean
   binaryPath: string | null
@@ -73,6 +80,7 @@ export type OpenCodeInventorySnapshot = {
   connectedProviders: OpenCodeConnectedProvider[]
   availableProviders: string[]
   models: string[]
+  modelMetadata?: OpenCodeModelMetadata[]
   agents: OpenCodeAgentSummary[]
   authStorePath: string | null
   probeError: string | null

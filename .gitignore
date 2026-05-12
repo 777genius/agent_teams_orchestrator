@@ -7,3 +7,6 @@ dist/
 openclaw/
 competitors/*/.venv/
 competitors/*/.pytest_cache/
+
+# Local release operator notes
+/ORCHESTRATOR_RELEASE_RUNBOOK.local.md

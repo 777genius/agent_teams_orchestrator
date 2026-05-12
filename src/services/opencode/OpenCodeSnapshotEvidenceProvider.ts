@@ -61,6 +61,31 @@ function groupChangesByWindow(input: SnapshotSessionEvidenceInput, diagnostics: 
       diagnostics.push(`snapshot-window-missing: no OpenCode snapshot window for message ${change.sourceMessageId}.`)
       continue
     }
+    if (change.sourceTool === 'snapshot_patch') {
+      const patchPart = input.offline.patchParts.find(part =>
+        part.partId === change.sourcePartId &&
+        part.messageId === change.sourceMessageId &&
+        part.relativeFiles.includes(change.relativePath)
+      )
+      if (!patchPart) {
+        diagnostics.push(`snapshot-window-missing: no OpenCode patch part for ${change.sourcePartId}.`)
+        continue
+      }
+      const matching = windows.filter(window => window.fromSnapshot === patchPart.hash)
+      if (matching.length === 0) {
+        diagnostics.push(`snapshot-window-missing: snapshot patch ${change.sourcePartId} did not match an OpenCode snapshot window.`)
+        continue
+      }
+      if (matching.length > 1) {
+        diagnostics.push(`snapshot-window-path-ambiguous: snapshot patch ${change.sourcePartId} matched multiple OpenCode snapshot windows.`)
+        continue
+      }
+      const window = matching[0]
+      const bucket = result.get(window.windowId) ?? { window, changes: [] }
+      bucket.changes.push(change)
+      result.set(window.windowId, bucket)
+      continue
+    }
     const order = orderByPart.get(change.sourcePartId)
     if (order === undefined) {
       diagnostics.push(`snapshot-window-missing: no part order for toolpart ${change.sourcePartId}.`)
