@@ -76,6 +76,10 @@ export function parseOpenCodeModelsOutput(output: string): string[] {
   return getTrimmedNonEmptyLines(output).filter(line => /^[a-z0-9-]+\/\S+$/i.test(line))
 }
 
+export function getOpenCodeVerboseModelsArgs(): string[] {
+  return ['models', '--verbose']
+}
+
 function collectFiniteNumbers(value: unknown): number[] {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return [value]
@@ -92,6 +96,24 @@ function collectFiniteNumbers(value: unknown): number[] {
 function isFreeCost(cost: unknown): boolean {
   const numbers = collectFiniteNumbers(cost)
   return numbers.length > 0 && numbers.every(value => value === 0)
+}
+
+function isExplicitFreeOpenCodeModelId(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase()
+  return (
+    normalized.startsWith('opencode/')
+    || normalized.includes(':free')
+    || normalized.endsWith('-free')
+    || normalized.endsWith('/free')
+  )
+}
+
+function getModelContextLimit(limits: unknown): number | null {
+  if (!limits || typeof limits !== 'object' || Array.isArray(limits)) {
+    return null
+  }
+  const context = (limits as Record<string, unknown>).context
+  return typeof context === 'number' && Number.isFinite(context) ? context : null
 }
 
 function findJsonBlockEnd(lines: readonly string[], startIndex: number): number {
@@ -148,10 +170,13 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
     const block = lines.slice(index + 1, blockEnd + 1).join('\n')
     try {
       const raw = JSON.parse(block) as Record<string, unknown>
+      const limits = raw.limit ?? raw.limits ?? null
       modelMetadata.push({
         id: line,
         cost: raw.cost ?? null,
-        free: isFreeCost(raw.cost),
+        context: getModelContextLimit(limits),
+        limits,
+        free: isFreeCost(raw.cost) && isExplicitFreeOpenCodeModelId(line),
         raw,
       })
       index = blockEnd
@@ -171,11 +196,7 @@ export function isOpenCodeModelFree(
   modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
 ): boolean {
   const metadata = modelMetadata?.find(item => item.id === modelId)
-  if (metadata) {
-    return metadata.free
-  }
-  const normalized = modelId.toLowerCase()
-  return normalized.includes(':free') || normalized.endsWith('-free')
+  return metadata?.free === true
 }
 
 export function parseOpenCodeProvidersOutput(output: string): {
@@ -341,7 +362,7 @@ export class OpenCodeInventoryService {
     const [versionResult, providersResult, modelsVerboseResult, agentsResult] = await Promise.all([
       this.execOpenCode(binaryPath, ['--version'], profile),
       this.execOpenCode(binaryPath, ['providers', 'list'], profile),
-      this.execOpenCode(binaryPath, ['models', '--verbose'], profile),
+      this.execOpenCode(binaryPath, getOpenCodeVerboseModelsArgs(), profile),
       this.execOpenCode(binaryPath, ['agent', 'list'], profile),
     ])
 

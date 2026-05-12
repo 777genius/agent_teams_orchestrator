@@ -289,26 +289,29 @@ function expectOpenCodeIdentityPrompt(input: {
   runId: string
   originalPrompt: string
 }): void {
-  expect(input.text).toContain('agent-teams_message_send')
+  expect(input.text).toContain('message_send')
   expect(input.text).toContain('"runtimeProvider":"opencode"')
   expect(input.text).toContain(`"teamName":"${input.teamName}"`)
   expect(input.text).toContain(`"memberName":"${input.memberName}"`)
   expect(input.text).toContain(`"runId":"${input.runId}"`)
   expect(input.text).toContain(`"runtimeSessionId":"${input.runtimeSessionId}"`)
   expect(input.text).toContain(input.originalPrompt)
-  if (input.text.includes('Your first app-team MCP action must be runtime bootstrap check-in.')) {
-    expect(input.text).toContain('agent-teams_runtime_bootstrap_checkin')
-    expect(input.text).toContain('agent-teams_member_briefing')
-    expect(input.text).toContain('Launch bootstrap is a silent attach')
-    expect(input.text).toContain('stop this turn immediately')
-    expect(input.text).toContain('stay idle silently')
+  if (input.text.includes('<agent_teams_app_managed_bootstrap>')) {
+    expect(input.text).toContain('AGENT_TEAMS_APP_MANAGED_BOOTSTRAP_V1')
+    expect(input.text).toContain('"laneId"')
+    expect(input.text).toContain('Do not call runtime_bootstrap_checkin')
+    expect(input.text).toContain('member_briefing')
+    expect(input.text).not.toContain('Your first app-team MCP action must be runtime bootstrap check-in.')
   } else {
-    expect(input.text).not.toContain('If check-in is needed')
+    expect(input.text).toContain('<opencode_runtime_identity>')
+    expect(input.text).toContain('agent-teams_message_send')
     expect(input.text).toContain('do not call runtime_bootstrap_checkin just to answer')
     expect(input.text).toContain('Do not call member_briefing just to answer')
-    expect(input.text).toContain('Do not send unrelated readiness')
+    expect(input.text).not.toContain('"laneId"')
   }
-  expect(input.text).not.toContain('"laneId"')
+  expect(input.text).toContain('Do not use SendMessage.')
+  expect(input.text).not.toContain('Call SendMessage')
+  expect(input.text).not.toContain('Use SendMessage')
 }
 
 const REQUIRED_MOCK_MCP_TOOL_NAMES = [
@@ -366,6 +369,7 @@ const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
+const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
@@ -440,6 +444,21 @@ beforeEach(async () => {
     snapshot: await openCodeProvisioningProbe.probe(projectPath),
     release: async () => {},
   })) as typeof openCodeProvisioningProbe.probeRetainingHost
+  openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+    await openCodeSessionBridge.promptAsync(record, {
+      text: input.text,
+      agent: input.agent,
+      noReply: true,
+    })
+    return {
+      messageID: input.messageID,
+      runtimeSessionId: record.opencodeSessionId,
+      contextHash: input.contextHash,
+      briefingHash: input.briefingHash,
+      injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+      alreadyPresent: false,
+    }
+  }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
   openCodeSessionBridge.promptAsyncWithTurnSettled = (async (record, input) => {
     const runtimePromptMessageId = 'msg_test_turn_settled'
     await input.onPromptSubmitting?.({
@@ -532,6 +551,7 @@ afterEach(async () => {
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
+  openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
   openCodeSessionBridge.promptAsync = originalPromptAsync
   openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
   openCodeSessionBridge.reconcileSession = originalReconcileSession
@@ -1359,8 +1379,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: 'openrouter/moonshotai/kimi-k2',
       },
     ])
-    expect(result.data.teamLaunchState).toBe('ready')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
   test('launches raw OpenCode model ids that contain slashes when the catalog match is unique', async () => {
@@ -1409,8 +1430,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: 'openrouter/moonshotai/kimi-k2',
       },
     ])
-    expect(result.data.teamLaunchState).toBe('ready')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
   test('uses the OpenCode session runtime pid during launch before host fallback', async () => {
@@ -1488,11 +1510,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
-      'member_session_recorded',
+      'app_managed_bootstrap_context_injected',
     ])
   })
 
-  test('reattaches MCP and retries launch bootstrap once when required tools report Not connected', async () => {
+  test('injects app-managed bootstrap without retrying stale model bootstrap errors', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
@@ -1560,22 +1582,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('ready')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
-      'member_session_recorded',
-      'bootstrap_confirmed',
-      'member_ready',
+      'app_managed_bootstrap_context_injected',
     ])
-    expect(promptAsync).toHaveBeenCalledTimes(2)
-    expect(promptAsync.mock.calls[1]?.[1]?.text).toContain('<opencode_bootstrap_retry>')
-    expect(reconcileSession).toHaveBeenCalledTimes(2)
+    expect(promptAsync).toHaveBeenCalledTimes(1)
+    expect(promptAsync.mock.calls[0]?.[1]?.text).toContain('<agent_teams_app_managed_bootstrap>')
+    expect(reconcileSession).not.toHaveBeenCalled()
     expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
-      'opencode_launch_bootstrap_retry_prompt_sent',
+      'opencode_app_managed_bootstrap_context_verified',
     )
   })
 
-  test('retries launch bootstrap when assistant finishes after check-in but before member briefing', async () => {
+  test('does not require model bootstrap briefing before app-managed launch context is accepted', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
@@ -1636,15 +1656,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('ready')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
-    expect(promptAsync).toHaveBeenCalledTimes(2)
-    expect(promptAsync.mock.calls[1]?.[1]?.text).toContain(
-      'Missing required tools: member_briefing.',
-    )
-    expect(reconcileSession).toHaveBeenCalledTimes(2)
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(promptAsync).toHaveBeenCalledTimes(1)
+    expect(promptAsync.mock.calls[0]?.[1]?.text).toContain('<agent_teams_app_managed_bootstrap>')
+    expect(reconcileSession).not.toHaveBeenCalled()
     expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
-      'opencode_launch_bootstrap_retry_prompt_sent',
+      'opencode_app_managed_bootstrap_context_verified',
     )
   })
 
@@ -1802,7 +1820,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
   })
 
-  test('marks launch failed when assistant finishes without required bootstrap MCP tools', async () => {
+  test('does not require assistant bootstrap tools after app-managed context injection', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
@@ -1847,13 +1865,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('failed')
-    expect(result.data.members.alice?.launchState).toBe('failed')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.diagnostics).toContain(
-      'OpenCode bootstrap MCP did not complete required tools before assistant response: runtime_bootstrap_checkin, member_briefing',
+      'OpenCode app-managed bootstrap context was injected and verified.',
     )
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
-      'member_session_recorded',
+      'app_managed_bootstrap_context_injected',
     ])
   })
 
@@ -1893,19 +1911,17 @@ describe('OpenCodeBridgeCommandHandler', () => {
       sessionId: 'session-alice',
       launchState: 'created',
       runtimePid: 812,
-      diagnostics: ['alice: not visible yet'],
+      diagnostics: ['OpenCode app-managed bootstrap context was injected and verified.'],
     })
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
-      'member_prompt_accepted',
+      'app_managed_bootstrap_context_injected',
     ])
-    expect(result.data.diagnostics).toContainEqual({
-      code: 'member_launch_reconcile_pending',
-      message: 'alice: not visible yet',
-      severity: 'warning',
-    })
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+      'opencode_app_managed_bootstrap_context_verified',
+    )
   })
 
-  test('aggregates a multi-member OpenCode lane with ready and permission-blocked members', async () => {
+  test('aggregates a multi-member OpenCode lane after app-managed bootstrap injection', async () => {
     const ensureInputs: Array<{ laneId: string; memberName: string; selectedModel: string }> = []
     const prompts: Array<{ memberName: string; text: string; agent: string }> = []
     openCodeProvisioningProbe.probe = async () => snapshot
@@ -2002,22 +2018,19 @@ describe('OpenCodeBridgeCommandHandler', () => {
       runId: 'run-1',
       originalPrompt: 'Bob join',
     })
-    expect(result.data.teamLaunchState).toBe('permission_blocked')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.runtimePid).toBe(701)
-    expect(result.data.members.bob?.launchState).toBe('permission_blocked')
+    expect(result.data.members.bob?.launchState).toBe('created')
     expect(result.data.members.bob?.runtimePid).toBe(702)
-    expect(result.data.members.bob?.pendingPermissionRequestIds).toEqual([
-      'perm-bob',
-      'perm-shell',
-    ])
-    expect(result.data.diagnostics.filter(diagnostic => diagnostic.code !== 'opencode_launch_member_timing' && diagnostic.code !== 'opencode_launch_total_timing')).toEqual([
-      {
-        code: 'member_reconcile',
-        message: 'bob: bob waiting for permission',
-        severity: 'warning',
-      },
-    ])
+    expect(result.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toEqual(
+      expect.arrayContaining([
+        'opencode_app_managed_bootstrap_context_verified',
+        'opencode_launch_member_timing',
+        'opencode_launch_total_timing',
+      ]),
+    )
   })
 
   test('prepends runtime identity to realistic OpenCode launch prompts without native SendMessage routing', async () => {
@@ -2081,24 +2094,24 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(prompts).toHaveLength(2)
     for (const prompt of prompts) {
       expect(prompt.agent).toBe('teammate-bootstrap')
-      expect(prompt.text).toContain('<opencode_runtime_identity>')
-      expect(prompt.text).toContain('agent-teams_runtime_bootstrap_checkin')
-      expect(prompt.text).toContain('agent-teams_member_briefing')
-      expect(prompt.text).toContain('Do not use bash')
+      expect(prompt.text).toContain('<agent_teams_app_managed_bootstrap>')
+      expect(prompt.text).toContain('AGENT_TEAMS_APP_MANAGED_BOOTSTRAP_V1')
+      expect(prompt.text).toContain('Do not call runtime_bootstrap_checkin')
+      expect(prompt.text).toContain('member_briefing')
       expect(prompt.text).toContain('"runtimeProvider":"opencode"')
-      expect(prompt.text).toContain('agent-teams_message_send')
+      expect(prompt.text).toContain('message_send')
       expect(prompt.text).toContain('Do not use SendMessage.')
       expect(prompt.text).toContain('Known failure modes include plain assistant replies')
       expect(prompt.text).not.toContain('Call SendMessage')
       expect(prompt.text).not.toContain('Use SendMessage')
-      expect(prompt.text).not.toContain('"laneId"')
-      expect(prompt.text.indexOf('<opencode_runtime_identity>')).toBeLessThan(
+      expect(prompt.text).toContain('"laneId"')
+      expect(prompt.text.indexOf('<agent_teams_app_managed_bootstrap>')).toBeLessThan(
         prompt.text.indexOf('Team launch context:')
       )
     }
-    expect(result.data.teamLaunchState).toBe('ready')
-    expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(result.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.bob?.launchState).toBe('created')
+    expect(result.data.members.jack?.launchState).toBe('created')
   })
 
   test('keeps OpenCode peers visible when one launch member prompt delivery fails', async () => {
@@ -2160,9 +2173,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
     expect(promptAttempts).toEqual(['alice', 'bob', 'zoe'])
-    expect(reconciledMembers).toEqual(['alice', 'zoe'])
+    expect(reconciledMembers).toEqual([])
     expect(result.data.teamLaunchState).toBe('failed')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.bob).toMatchObject({
       sessionId: 'session-bob',
       launchState: 'failed',
@@ -2172,7 +2185,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
       'member_launch_failed',
     ])
-    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.zoe?.launchState).toBe('created')
     expect(result.data.diagnostics).toContainEqual({
       code: 'member_launch_failed',
       message: 'bob: bob prompt delivery failed',
@@ -2234,9 +2247,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(ensureInputs).toEqual(['alice', 'bob', 'zoe'])
     expect(promptAttempts).toEqual(['alice', 'zoe'])
-    expect(reconciledMembers).toEqual(['alice', 'zoe'])
+    expect(reconciledMembers).toEqual([])
     expect(result.data.teamLaunchState).toBe('failed')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.runtimePid).toBe(1101)
     expect(result.data.members.bob).toMatchObject({
       sessionId: 'failed:team-a:primary:bob',
@@ -2247,7 +2260,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.bob?.evidence.map(entry => entry.kind)).toEqual([
       'member_launch_failed',
     ])
-    expect(result.data.members.zoe?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.zoe?.launchState).toBe('created')
     expect(result.data.members.zoe?.runtimePid).toBe(1103)
     expect(result.data.diagnostics).toContainEqual({
       code: 'member_launch_failed',
@@ -2256,7 +2269,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   })
 
-  test('keeps ready peers visible when one OpenCode lane member reconciles as failed', async () => {
+  test('keeps launch context visible without reconcile-time failure coupling', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
@@ -2301,20 +2314,16 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('failed')
-    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
-    expect(result.data.members.bob?.launchState).toBe('failed')
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.bob?.launchState).toBe('created')
     expect(result.data.members.bob?.runtimePid).toBe(123)
     expect(result.data.members.bob?.evidence.map(item => item.kind)).toEqual([
-      'member_session_recorded',
+      'app_managed_bootstrap_context_injected',
     ])
-    expect(result.data.diagnostics.filter(diagnostic => diagnostic.code !== 'opencode_launch_member_timing' && diagnostic.code !== 'opencode_launch_total_timing')).toEqual([
-      {
-        code: 'member_reconcile',
-        message: 'bob: bob session stale',
-        severity: 'warning',
-      },
-    ])
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+      'opencode_app_managed_bootstrap_context_verified',
+    )
   })
 
   test('rejects launch before creating sessions when the raw selected model is unknown', async () => {
@@ -3106,13 +3115,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
         runId: 'run-opencode-primary',
         originalPrompt: 'Jack OpenCode join',
       })
-      expect(result.data.teamLaunchState).toBe('ready')
-      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
-      expect(result.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(result.data.teamLaunchState).toBe('launching')
+      expect(result.data.members.bob?.launchState).toBe('created')
+      expect(result.data.members.jack?.launchState).toBe('created')
       expect(result.data.durableCheckpoints.map(checkpoint => checkpoint.name)).toEqual([
         'required_tools_proven',
         'delivery_ready',
-        'run_ready',
       ])
     })
 
@@ -3165,8 +3173,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
         },
       ])
       expect(Object.keys(result.data.members)).toEqual(['bob'])
-      expect(result.data.teamLaunchState).toBe('ready')
-      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+      expect(result.data.teamLaunchState).toBe('launching')
+      expect(result.data.members.bob?.launchState).toBe('created')
       expect(result.data.members.alice).toBeUndefined()
     })
 
@@ -3278,8 +3286,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
       expect(bobResult.data.members.jack).toBeUndefined()
       expect(jackResult.data.members.bob).toBeUndefined()
-      expect(bobResult.data.teamLaunchState).toBe('ready')
-      expect(jackResult.data.teamLaunchState).toBe('ready')
+      expect(bobResult.data.teamLaunchState).toBe('launching')
+      expect(jackResult.data.teamLaunchState).toBe('launching')
     })
 
     test('keeps failed and ready mixed-team OpenCode secondary lane launches isolated', async () => {
@@ -3373,10 +3381,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ])
       expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
       expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
-      expect(bobResult.data.teamLaunchState).toBe('failed')
-      expect(bobResult.data.members.bob?.launchState).toBe('failed')
-      expect(jackResult.data.teamLaunchState).toBe('ready')
-      expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(bobResult.data.teamLaunchState).toBe('launching')
+      expect(bobResult.data.members.bob?.launchState).toBe('created')
+      expect(jackResult.data.teamLaunchState).toBe('launching')
+      expect(jackResult.data.members.jack?.launchState).toBe('created')
       expect(jackResult.data.members.bob).toBeUndefined()
     })
 
@@ -3476,13 +3484,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ])
       expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
       expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
-      expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
-      expect(bobResult.data.members.bob?.launchState).toBe('permission_blocked')
-      expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual([
-        'perm-bob',
-      ])
-      expect(jackResult.data.teamLaunchState).toBe('ready')
-      expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+      expect(bobResult.data.teamLaunchState).toBe('launching')
+      expect(bobResult.data.members.bob?.launchState).toBe('created')
+      expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
+      expect(jackResult.data.teamLaunchState).toBe('launching')
+      expect(jackResult.data.members.jack?.launchState).toBe('created')
       expect(jackResult.data.members.bob).toBeUndefined()
     })
 
@@ -3785,7 +3791,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         return
       }
       expect(result.data.teamLaunchState).toBe('launching')
-      expect(result.data.members.bob?.launchState).toBe('confirmed_alive')
+      expect(result.data.members.bob?.launchState).toBe('created')
       expect(result.data.members.tom?.launchState).toBe('created')
       expect(result.data.durableCheckpoints.map(checkpoint => checkpoint.name)).not.toContain(
         'run_ready',
@@ -3833,10 +3839,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.teamLaunchState).toBe('permission_blocked')
-    expect(result.data.members.alice?.launchState).toBe('permission_blocked')
-    expect(result.data.members.alice?.pendingPermissionRequestIds).toEqual(['perm-1', 'perm-2'])
-    expect(result.data.members.alice?.diagnostics).toEqual(['waiting for permission approval'])
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.pendingPermissionRequestIds).toBeUndefined()
+    expect(result.data.members.alice?.diagnostics).toEqual([
+      'OpenCode app-managed bootstrap context was injected and verified.',
+    ])
   })
 
   test('includes permission-blocked evidence when durable state is blocked before request ids materialize', async () => {
@@ -3878,9 +3886,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(result.data.members.alice?.launchState).toBe('permission_blocked')
+    expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toContain(
-      'permission_blocked',
+      'app_managed_bootstrap_context_injected',
     )
   })
 

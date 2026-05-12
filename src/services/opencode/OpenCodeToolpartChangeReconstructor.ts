@@ -136,6 +136,11 @@ type SourcePartSortKey = {
   partId: string
 }
 
+type NormalizedSnapshotPatchFile = {
+  filePath: string
+  normalizedPath: NormalizedOpenCodeFilePath
+}
+
 const MAX_TEXT_BLOB_BYTES = 1024 * 1024
 const OPENCODE_APP_DELIVERY_START = '<opencode_app_message_delivery>'
 const OPENCODE_APP_DELIVERY_END = '</opencode_app_message_delivery>'
@@ -875,17 +880,25 @@ export class OpenCodeToolpartChangeReconstructor {
       const taskContext = taskContextResolution.context
       const coveredPaths = touchedByToolpart.byMessage.get(row.message_id) ?? new Set<string>()
       const skipWholePatch = touchedByToolpart.messagesWithApplyPatch.has(row.message_id)
+      const normalizedFiles = this.normalizeSnapshotPatchFiles({
+        partId: row.id,
+        projectPath: input.params.projectPath,
+        files,
+        diagnostics: input.diagnostics,
+      })
+      const splitNewlinePathFragments = this.findSplitNewlinePathFragments(
+        normalizedFiles.map(file => file.normalizedPath.relativePath),
+        coveredPaths,
+      )
 
-      for (const filePath of files) {
-        const normalizedPath = normalizeOpenCodeFilePath({
-          projectPath: input.params.projectPath,
-          filePath,
-        })
-        if ('skipped' in normalizedPath) {
-          input.diagnostics.push(`OpenCode snapshot patch part ${row.id} skipped ${filePath} - ${normalizedPath.diagnostic}`)
+      for (const [index, { normalizedPath }] of normalizedFiles.entries()) {
+        if (skipWholePatch || coveredPaths.has(normalizedPath.relativePath)) {
           continue
         }
-        if (skipWholePatch || coveredPaths.has(normalizedPath.relativePath)) {
+        if (splitNewlinePathFragments.has(index)) {
+          input.diagnostics.push(
+            `OpenCode snapshot patch part ${row.id} skipped split newline path fragment ${normalizedPath.relativePath}.`,
+          )
           continue
         }
         changes.push({
@@ -932,6 +945,52 @@ export class OpenCodeToolpartChangeReconstructor {
     }
 
     return changes
+  }
+
+  private normalizeSnapshotPatchFiles(input: {
+    partId: string
+    projectPath: string
+    files: string[]
+    diagnostics: string[]
+  }): NormalizedSnapshotPatchFile[] {
+    const normalizedFiles: NormalizedSnapshotPatchFile[] = []
+    for (const filePath of input.files) {
+      const normalizedPath = normalizeOpenCodeFilePath({
+        projectPath: input.projectPath,
+        filePath,
+      })
+      if ('skipped' in normalizedPath) {
+        input.diagnostics.push(`OpenCode snapshot patch part ${input.partId} skipped ${filePath} - ${normalizedPath.diagnostic}`)
+        continue
+      }
+      normalizedFiles.push({ filePath, normalizedPath })
+    }
+    return normalizedFiles
+  }
+
+  private findSplitNewlinePathFragments(
+    relativePaths: string[],
+    coveredPaths: Set<string>,
+  ): Set<number> {
+    const coveredNewlinePaths = new Set([...coveredPaths].filter(relativePath => relativePath.includes('\n')))
+    const fragmentIndexes = new Set<number>()
+    if (coveredNewlinePaths.size === 0 || relativePaths.length < 2) {
+      return fragmentIndexes
+    }
+
+    for (let start = 0; start < relativePaths.length; start += 1) {
+      let combined = relativePaths[start] ?? ''
+      for (let end = start + 1; end < relativePaths.length; end += 1) {
+        combined = `${combined}\n${relativePaths[end] ?? ''}`
+        if (!coveredNewlinePaths.has(combined)) {
+          continue
+        }
+        for (let index = start; index <= end; index += 1) {
+          fragmentIndexes.add(index)
+        }
+      }
+    }
+    return fragmentIndexes
   }
 
   private buildToolpartTouchedPathIndex(

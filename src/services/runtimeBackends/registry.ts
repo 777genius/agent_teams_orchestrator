@@ -430,6 +430,9 @@ async function buildOpenCodeStatus(
   const defaultModel = snapshot.models.find(model => model === 'opencode/big-pickle')
     ?? snapshot.models[0]
     ?? null
+  const metadataByModelId = new Map(
+    snapshot.modelMetadata?.map(metadata => [metadata.id, metadata]) ?? [],
+  )
   const modelCatalog: RuntimeProviderModelCatalog = {
     schemaVersion: 1,
     providerId: 'opencode',
@@ -439,21 +442,32 @@ async function buildOpenCodeStatus(
     staleAt: new Date(fetchedAt.getTime() + 10 * 60 * 1000).toISOString(),
     defaultModelId: defaultModel,
     defaultLaunchModel: defaultModel,
-    models: snapshot.models.map(model => ({
-      id: model,
-      launchModel: model,
-      displayName: model,
-      hidden: false,
-      supportedReasoningEfforts: [],
-      defaultReasoningEffort: null,
-      inputModalities: ['text'],
-      supportsPersonality: true,
-      isDefault: model === defaultModel,
-      upgrade: false,
-      source: 'app-server',
-      badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata) ? 'Free' : null,
-      statusMessage: null,
-    })),
+    models: snapshot.models.map(model => {
+      const metadata = metadataByModelId.get(model) ?? null
+      return {
+        id: model,
+        launchModel: model,
+        displayName: model,
+        hidden: false,
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: null,
+        inputModalities: ['text'],
+        supportsPersonality: true,
+        isDefault: model === defaultModel,
+        upgrade: false,
+        source: 'app-server',
+        badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata) ? 'Free' : null,
+        statusMessage: null,
+        metadata: metadata
+          ? {
+              cost: metadata.cost,
+              context: metadata.context,
+              limits: metadata.limits,
+              free: metadata.free,
+            }
+          : null,
+      }
+    }),
     diagnostics: {
       configReadState: snapshot.detected ? 'ready' : 'skipped',
       appServerState: snapshot.detected ? 'healthy' : 'runtime-missing',

@@ -13,7 +13,7 @@ import {
 import { FILE_EDIT_TOOL_NAME } from '../tools/FileEditTool/constants.js'
 import { inputSchema as editInputSchema } from '../tools/FileEditTool/types.js'
 import { FileReadTool } from '../tools/FileReadTool/FileReadTool.js'
-import { FILE_READ_TOOL_NAME } from '../tools/FileReadTool/prompt.js'
+import { FILE_READ_TOOL_NAME } from '../tools/FileReadTool/constants.js'
 import { FileWriteTool } from '../tools/FileWriteTool/FileWriteTool.js'
 import { FILE_WRITE_TOOL_NAME } from '../tools/FileWriteTool/prompt.js'
 import { GlobTool } from '../tools/GlobTool/GlobTool.js'

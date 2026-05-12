@@ -67,6 +67,8 @@ export type OpenCodeAgentSummary = {
 export type OpenCodeModelMetadata = {
   id: string
   cost: unknown | null
+  context: number | null
+  limits: unknown | null
   free: boolean
   raw: Record<string, unknown>
 }

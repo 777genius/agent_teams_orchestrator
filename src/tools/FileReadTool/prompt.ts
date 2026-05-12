@@ -1,13 +1,14 @@
 import { isPDFSupported } from '../../utils/pdfUtils.js'
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
+import {
+  FILE_READ_TOOL_NAME,
+  FILE_UNCHANGED_STUB,
+} from './constants.js'
 
-// Use a string constant for tool names to avoid circular dependencies
-export const FILE_READ_TOOL_NAME = 'Read'
-
-export const FILE_UNCHANGED_STUB =
-  'File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.'
-
-export const MAX_LINES_TO_READ = 2000
+export {
+  FILE_READ_TOOL_NAME,
+  FILE_UNCHANGED_STUB,
+}
 
 export const DESCRIPTION = 'Read a file from the local filesystem.'
 
@@ -34,7 +35,7 @@ Assume this tool is able to read all files on the machine. If the User provides 
 
 Usage:
 - The file_path parameter must be an absolute path, not a relative path
-- By default, it reads up to ${MAX_LINES_TO_READ} lines starting from the beginning of the file${maxSizeInstruction}
+- By default, it reads up to 2000 lines starting from the beginning of the file${maxSizeInstruction}
 ${offsetInstruction}
 ${lineFormat}
 - This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.${

@@ -2,13 +2,6 @@ import { feature } from 'bun:bundle'
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { ToolUseContext } from '../../Tool.js'
-import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
-import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
-import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
-import { GLOB_TOOL_NAME } from '../../tools/GlobTool/prompt.js'
-import { GREP_TOOL_NAME } from '../../tools/GrepTool/prompt.js'
-import { WEB_FETCH_TOOL_NAME } from '../../tools/WebFetchTool/prompt.js'
-import { WEB_SEARCH_TOOL_NAME } from '../../tools/WebSearchTool/prompt.js'
 import type { Message } from '../../types/message.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { getMainLoopModel } from '../../utils/model/model.js'
@@ -36,6 +29,14 @@ import {
 export const TIME_BASED_MC_CLEARED_MESSAGE = '[Old tool result content cleared]'
 
 const IMAGE_MAX_TOKEN_SIZE = 2000
+
+const FILE_READ_TOOL_NAME = 'Read'
+const GREP_TOOL_NAME = 'Grep'
+const GLOB_TOOL_NAME = 'Glob'
+const WEB_SEARCH_TOOL_NAME = 'WebSearch'
+const WEB_FETCH_TOOL_NAME = 'WebFetch'
+const FILE_EDIT_TOOL_NAME = 'Edit'
+const FILE_WRITE_TOOL_NAME = 'Write'
 
 // Only compact these tools
 const COMPACTABLE_TOOLS = new Set<string>([

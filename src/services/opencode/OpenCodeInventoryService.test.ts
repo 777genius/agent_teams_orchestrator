@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  getOpenCodeVerboseModelsArgs,
   parseOpenCodeAgentListOutput,
   isOpenCodeModelFree,
   parseOpenCodeModelsOutput,
@@ -9,6 +10,10 @@ import {
 } from './OpenCodeInventoryService.js'
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('queries the full OpenCode model inventory, not only the opencode provider', () => {
+    expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
+  })
+
   test('parses provider credentials from boxed CLI output', () => {
     const output = `
 ┌  Credentials /tmp/opencode/auth.json
@@ -86,15 +91,31 @@ opencode/big-pickle
 openai/gpt-5.4
 {
   "cost": {
-    "input": 1.25,
-    "output": 10
+    "input": 0,
+    "output": 0
+  }
+}
+openrouter/openai/gpt-oss-20b:free
+{
+  "cost": {
+    "input": 0,
+    "output": 0
   }
 }
 `)
 
-    expect(parsed.models).toEqual(['opencode/big-pickle', 'openai/gpt-5.4'])
+    expect(parsed.models).toEqual([
+      'opencode/big-pickle',
+      'openai/gpt-5.4',
+      'openrouter/openai/gpt-oss-20b:free',
+    ])
+    expect(parsed.modelMetadata[0]?.context).toBe(200000)
+    expect(parsed.modelMetadata[0]?.limits).toEqual({ context: 200000 })
     expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
     expect(isOpenCodeModelFree('openai/gpt-5.4', parsed.modelMetadata)).toBe(false)
-    expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(true)
+    expect(isOpenCodeModelFree('openrouter/openai/gpt-oss-20b:free', parsed.modelMetadata)).toBe(
+      true,
+    )
+    expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
   })
 })

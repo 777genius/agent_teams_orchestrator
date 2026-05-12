@@ -84,6 +84,12 @@ export type RuntimeProviderModelCatalogItem = {
   source: RuntimeProviderModelCatalogSource
   badgeLabel?: string | null
   statusMessage?: string | null
+  metadata?: {
+    cost?: unknown | null
+    context?: number | null
+    limits?: unknown | null
+    free?: boolean
+  } | null
 }
 
 export type RuntimeProviderModelCatalog = {

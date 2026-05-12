@@ -77,7 +77,6 @@ import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
 import { getDefaultFileReadingLimits } from './limits.js'
 import {
   DESCRIPTION,
-  FILE_READ_TOOL_NAME,
   FILE_UNCHANGED_STUB,
   LINE_FORMAT_INSTRUCTION,
   OFFSET_INSTRUCTION_DEFAULT,
@@ -92,6 +91,8 @@ import {
   renderToolUseTag,
   userFacingName,
 } from './UI.js'
+
+const FILE_READ_TOOL_NAME = 'Read'
 
 // Device files that would hang the process: infinite output or blocking input.
 // Checked by path only (no I/O). Safe devices like /dev/null are intentionally omitted.

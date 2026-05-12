@@ -399,14 +399,21 @@ describe('runtime backend registry with agent_teams capabilities', () => {
             {
               id: 'opencode/big-pickle',
               cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              context: 200000,
+              limits: { context: 200000, output: 128000 },
               free: true,
-              raw: { cost: { input: 0, output: 0, cache: { read: 0, write: 0 } } },
+              raw: {
+                cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                limit: { context: 200000, output: 128000 },
+              },
             },
             {
               id: 'openai/gpt-5.4',
               cost: { input: 1.25, output: 10 },
+              context: 1050000,
+              limits: { context: 1050000 },
               free: false,
-              raw: { cost: { input: 1.25, output: 10 } },
+              raw: { cost: { input: 1.25, output: 10 }, limit: { context: 1050000 } },
             },
           ],
           agents: [
@@ -433,6 +440,15 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         opencode?.modelCatalog?.models.find(model => model.id === 'opencode/big-pickle')
           ?.badgeLabel,
       ).toBe('Free')
+      expect(
+        opencode?.modelCatalog?.models.find(model => model.id === 'opencode/big-pickle')
+          ?.metadata,
+      ).toEqual({
+        cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        context: 200000,
+        limits: { context: 200000, output: 128000 },
+        free: true,
+      })
       expect(
         opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
           ?.badgeLabel,

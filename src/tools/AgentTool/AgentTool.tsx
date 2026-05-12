@@ -44,7 +44,7 @@ import { assertNotWindowsReservedBasename } from '../../utils/windowsReservedNam
 import { createAgentWorktree, hasWorktreeChanges, removeAgentWorktree } from '../../utils/worktree.js';
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js';
 import { BackgroundHint } from '../BashTool/UI.js';
-import { FILE_READ_TOOL_NAME } from '../FileReadTool/prompt.js';
+import { FILE_READ_TOOL_NAME } from '../FileReadTool/constants.js';
 import {
   spawnTeammate,
   type DuplicateSkippedOutput,

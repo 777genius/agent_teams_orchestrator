@@ -172,7 +172,7 @@ export async function runtimeStatus(opts: {
       printProviderStatus(provider)
     }
   } else {
-    process.stdout.write(jsonStringify(payload, null, 2) + '\n')
+    await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n')
   }
 
   process.exit(0)

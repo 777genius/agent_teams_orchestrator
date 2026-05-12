@@ -937,6 +937,42 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     ])
   })
 
+  test('strict delivery mode skips snapshot patch files that are newline path fragments covered by a file toolpart', () => {
+    const result = reconstruct([
+      toolPart({
+        id: 'part-edit-newline',
+        tool: 'edit',
+        filePath: path.join(workspaceRoot, 'docs', 'new\nline.md'),
+        oldString: 'before',
+        newString: 'after',
+      }),
+      partRow(
+        'part-snapshot-patch-1',
+        'assistant-1',
+        {
+          type: 'patch',
+          hash: 'snapshot-before-1',
+          files: [
+            path.join(workspaceRoot, 'docs', 'new'),
+            'line.md',
+          ],
+        },
+        1200,
+      ),
+    ])
+
+    expect(result.notices).toEqual([])
+    expect(result.changes.map(change => [change.sourceTool, change.relativePath])).toEqual([
+      ['edit', 'docs/new\nline.md'],
+    ])
+    expect(result.diagnostics.join('\n')).toContain(
+      'OpenCode snapshot patch part part-snapshot-patch-1 skipped split newline path fragment docs/new.',
+    )
+    expect(result.diagnostics.join('\n')).toContain(
+      'OpenCode snapshot patch part part-snapshot-patch-1 skipped split newline path fragment line.md.',
+    )
+  })
+
   test('strict delivery mode ignores spoofed markers outside the generated delivery block', () => {
     const result = reconstruct(
       [],
