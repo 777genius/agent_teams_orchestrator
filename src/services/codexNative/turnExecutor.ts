@@ -29,6 +29,7 @@ import {
 } from '../runtimeBackends/codexBackendResolver.js'
 import { runCodexNativeExec } from './execRunner.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
+import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
   buildCodexNativeTurnSettledEvent,
   emitCodexNativeTurnSettledBestEffort,
@@ -561,7 +562,10 @@ export async function* executeCodexNativeTurn(
       ephemeral: shouldUseEphemeralCodexNativeThread(),
       apiKey,
       forcedLoginMethod,
-      configOverrides: buildCodexNativeMcpConfigOverrides(),
+      configOverrides: [
+        ...buildCodexNativeMcpConfigOverrides(),
+        ...buildCodexNativeWorkspaceTrustConfigOverrides(),
+      ],
       disabledFeatures: resolveCodexNativeDisabledFeatures({
         apiKey,
         forcedLoginMethod,

@@ -383,6 +383,67 @@ describe('executeCodexNativeTurn', () => {
     }
   })
 
+  test('passes validated workspace trust settings to native config overrides', async () => {
+    const previousSettings = getFlagSettingsInline()
+    let observedConfigOverrides: string[] | undefined
+
+    try {
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'chatgpt',
+          agent_teams_workspace_trust: {
+            config_overrides: [
+              'projects."/tmp/project".trust_level="trusted"',
+              'forced_login_method="api"',
+              'projects."/private/tmp/project".trust_level="trusted"',
+            ],
+          },
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedConfigOverrides = options.configOverrides
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'none',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedConfigOverrides).toEqual([
+        'projects."/tmp/project".trust_level="trusted"',
+        'projects."/private/tmp/project".trust_level="trusted"',
+      ])
+    } finally {
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
   test('passes explicit user config isolation to native exec', async () => {
     const previousIgnoreUserConfig =
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG

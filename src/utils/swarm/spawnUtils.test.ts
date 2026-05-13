@@ -404,7 +404,16 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
       `${helperDir}/settings.json`
     setFlagSettingsPath(inheritedAnthropicSettingsPath)
-    setFlagSettingsInline({ codex: { forced_login_method: 'chatgpt' } })
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+        agent_teams_workspace_trust: {
+          config_overrides: [
+            'projects."/tmp/project".trust_level="trusted"',
+          ],
+        },
+      },
+    })
 
     try {
       const flags = buildInheritedCliFlags({ provider: 'codex' })
@@ -412,6 +421,8 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       expect(flags).toContain('--settings')
       expect(flags).toContain('forced_login_method')
       expect(flags).toContain('chatgpt')
+      expect(flags).toContain('agent_teams_workspace_trust')
+      expect(flags).toContain('projects')
       expect(flags).not.toContain(inheritedAnthropicSettingsPath)
     } finally {
       setFlagSettingsPath(originalFlagSettingsPath)
