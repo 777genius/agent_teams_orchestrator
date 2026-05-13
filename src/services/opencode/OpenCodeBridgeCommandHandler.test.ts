@@ -6156,4 +6156,83 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(result.error.message).toContain('laneId is required')
   })
+
+  test('uses sessionId to select an exact transcript when multiple member lanes exist', async () => {
+    const selectedRecord = buildRecord({
+      laneId: 'secondary:opencode:alice:alt',
+      memberName: 'alice',
+      opencodeSessionId: 'session-alt',
+    })
+    const projectedRecords: OpenCodeSessionRecord[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.list = (async () => [
+      buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
+      selectedRecord,
+    ]) as typeof openCodeSessionStore.list
+    openCodeSessionBridge.projectLogMessages = (async record => {
+      projectedRecords.push(record)
+      return {
+        record,
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          messages: [],
+        }),
+        logProjection: {
+          sessionId: record.opencodeSessionId,
+          durableState: 'idle',
+          sourceMessageCount: 0,
+          projectedMessageCount: 0,
+          syntheticMessageCount: 0,
+          toolCallCount: 0,
+          errorCount: 0,
+          diagnostics: [],
+          messages: [],
+        },
+      }
+    }) as typeof openCodeSessionBridge.projectLogMessages
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.getRuntimeTranscript', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        sessionId: 'session-alt',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(projectedRecords.map(record => record.opencodeSessionId)).toEqual(['session-alt'])
+    expect(result.data.sessionId).toBe('session-alt')
+  })
+
+  test('rejects transcript sessionId when the selected lane points at a different session', async () => {
+    openCodeSessionStore.get = (async () =>
+      buildRecord({
+        laneId: 'secondary:opencode:alice',
+        memberName: 'alice',
+        opencodeSessionId: 'session-current',
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.projectLogMessages = (async () => {
+      throw new Error('projectLogMessages should not run')
+    }) as typeof openCodeSessionBridge.projectLogMessages
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.getRuntimeTranscript', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'alice',
+        laneId: 'secondary:opencode:alice',
+        sessionId: 'session-old',
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('does not match sessionId session-old')
+  })
 })

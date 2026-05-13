@@ -3191,18 +3191,29 @@ async function runTranscript(envelope: BridgeEnvelope) {
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
+  const sessionId = asString(body.sessionId)
   if (!teamId || !memberName) {
     throw new Error('opencode.getRuntimeTranscript requires teamId/teamName and memberName')
   }
+  const matchesSession = (candidate: OpenCodeSessionRecord): boolean =>
+    !sessionId || candidate.opencodeSessionId === sessionId
   const record = laneId
     ? await openCodeSessionStore.get(teamId, laneId, memberName)
     : (await openCodeSessionStore.list()).find(
-      candidate => candidate.teamId === teamId && candidate.memberName === memberName,
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName && matchesSession(candidate),
     ) ?? null
+  if (laneId && record && !matchesSession(record)) {
+    throw new Error(
+      `Stored OpenCode session record for ${teamId}/${laneId}/${memberName} does not match sessionId ${sessionId}`,
+    )
+  }
   if (!laneId) {
     const candidateCount = (await openCodeSessionStore.list()).filter(
-      candidate => candidate.teamId === teamId && candidate.memberName === memberName,
+      candidate => candidate.teamId === teamId && candidate.memberName === memberName && matchesSession(candidate),
     ).length
+    if (sessionId && candidateCount === 0) {
+      throw new Error(`No stored OpenCode session record for ${teamId}/${memberName} with session ${sessionId}`)
+    }
     if (candidateCount > 1) {
       throw new Error(`Multiple OpenCode lanes exist for ${teamId}/${memberName}; laneId is required`)
     }

@@ -441,19 +441,33 @@ async function resolveOpenCodeSessionRecordForCli(opts: {
   team: string
   member: string
   lane?: string
+  sessionId?: string
 }) {
   const laneId = opts.lane?.trim()
+  const sessionId = opts.sessionId?.trim()
+  const matchesSession = (record: { opencodeSessionId: string }): boolean =>
+    !sessionId || record.opencodeSessionId === sessionId
+
   if (laneId) {
     const record = await openCodeSessionStore.get(opts.team, laneId, opts.member)
     if (!record) {
       throw new Error(`No stored OpenCode session record for ${opts.team}/${laneId}/${opts.member}`)
     }
+    if (!matchesSession(record)) {
+      throw new Error(
+        `Stored OpenCode session record for ${opts.team}/${laneId}/${opts.member} does not match --session-id ${sessionId}`,
+      )
+    }
     return record
   }
 
-  const records = (await openCodeSessionStore.list()).filter(record =>
-    record.teamId === opts.team && record.memberName === opts.member
-  )
+  const records = (await openCodeSessionStore.list()).filter(record => {
+    return record.teamId === opts.team && record.memberName === opts.member && matchesSession(record)
+  })
+
+  if (sessionId && records.length === 0) {
+    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member} with session ${sessionId}`)
+  }
 
   if (records.length > 1) {
     throw new Error(
@@ -545,6 +559,7 @@ export async function runtimeTranscript(opts: {
   member: string
   lane?: string
   limit?: number
+  sessionId?: string
   projectionOnly?: boolean
   output?: string
 }): Promise<void> {
