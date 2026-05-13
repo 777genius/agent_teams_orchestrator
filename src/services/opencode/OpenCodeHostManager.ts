@@ -22,6 +22,7 @@ const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500
+const OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS = 2_000
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
@@ -30,6 +31,15 @@ const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
     retries: 30,
     minTimeout: 5,
     maxTimeout: 100,
+  },
+}
+const PERSISTENT_HOST_STARTUP_LOCK_OPTIONS = {
+  stale: 30_000,
+  update: 5_000,
+  retries: {
+    retries: 120,
+    minTimeout: 100,
+    maxTimeout: 500,
   },
 }
 
@@ -132,6 +142,10 @@ export type OpenCodePersistentHostReconcileResult = {
 
 function hashJson(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value) ?? '').digest('hex')
+}
+
+function hashText(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 function normalizeResolvedFingerprintValue(
@@ -375,6 +389,10 @@ export class OpenCodeHostManager {
     return (this.deps.now ?? (() => new Date()))()
   }
 
+  private nowMs(): number {
+    return this.now().getTime()
+  }
+
   private nowIso(): string {
     return this.now().toISOString()
   }
@@ -462,6 +480,31 @@ export class OpenCodeHostManager {
     let release: (() => Promise<void>) | undefined
     try {
       release = await lockfile.lock(lockPath, PERSISTENT_REGISTRY_LOCK_OPTIONS)
+      return await callback()
+    } finally {
+      if (release) {
+        await release()
+      }
+    }
+  }
+
+  private async withPersistentHostStartupLock<T>(
+    hostKey: string,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return callback()
+    }
+
+    const lockDir = path.join(path.dirname(registryPath), 'host-startup-locks')
+    await mkdir(lockDir, { recursive: true })
+    const lockPath = path.join(lockDir, `${hashText(hostKey)}.lock`)
+    await writeFile(lockPath, '', { flag: 'a' })
+
+    let release: (() => Promise<void>) | undefined
+    try {
+      release = await lockfile.lock(lockPath, PERSISTENT_HOST_STARTUP_LOCK_OPTIONS)
       return await callback()
     } finally {
       if (release) {
@@ -653,9 +696,9 @@ export class OpenCodeHostManager {
   }
 
   private async waitForHealthyHost(baseUrl: string): Promise<{ version: string | null }> {
-    const startedAt = Date.now()
+    const startedAt = this.nowMs()
 
-    while (Date.now() - startedAt < OPEN_CODE_HOST_HEALTH_TIMEOUT_MS) {
+    while (this.nowMs() - startedAt < OPEN_CODE_HOST_HEALTH_TIMEOUT_MS) {
       try {
         const result = await this.fetchJsonWithTimeout(
           `${baseUrl}/global/health`,
@@ -785,6 +828,34 @@ export class OpenCodeHostManager {
     })
   }
 
+  private async forceKillSpawnedHostProcess(child: ChildProcess): Promise<void> {
+    const pid = child.pid
+    try {
+      if (pid) {
+        this.killProcess(pid, 'SIGTERM')
+      } else {
+        child.kill('SIGTERM')
+      }
+    } catch {
+      // Best effort.
+    }
+
+    if (!pid) {
+      return
+    }
+
+    await this.sleepMs(250).catch(() => undefined)
+    if (!this.isProcessAlive(pid)) {
+      return
+    }
+
+    try {
+      this.killProcess(pid, 'SIGKILL')
+    } catch {
+      // Best effort.
+    }
+  }
+
   private async createHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
@@ -837,17 +908,13 @@ export class OpenCodeHostManager {
       handle.version = health.version
       handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(baseUrl)
       handle.state = 'healthy'
-      await this.upsertPersistentHost(handle).catch(() => undefined)
+      await this.upsertPersistentHost(handle)
       return handle
     } catch (error) {
       handle.state = 'degraded'
       diagnostics.push(error instanceof Error ? error.message : String(error))
       this.hosts.delete(hostKey)
-      if (child.pid) {
-        this.killProcess(child.pid, 'SIGTERM')
-      } else {
-        child.kill('SIGTERM')
-      }
+      await this.forceKillSpawnedHostProcess(child)
       throw error
     }
   }
@@ -881,8 +948,10 @@ export class OpenCodeHostManager {
 
     this.pendingRefCounts.set(hostKey, 1)
     const createPromise = (async () => {
-      const adopted = await this.adoptPersistentHost(hostKey, profile)
-      return adopted ?? this.createHost(hostKey, profile)
+      return this.withPersistentHostStartupLock(hostKey, async () => {
+        const adopted = await this.adoptPersistentHost(hostKey, profile)
+        return adopted ?? this.createHost(hostKey, profile)
+      })
     })().finally(() => {
       this.pendingHosts.delete(hostKey)
       this.pendingRefCounts.delete(hostKey)
@@ -917,9 +986,13 @@ export class OpenCodeHostManager {
     const pid = entry?.handle.pid ?? record.pid
 
     try {
-      await this.fetchJson(`${baseUrl}/global/dispose`, {
-        method: 'POST',
-      })
+      await this.fetchJsonWithTimeout(
+        `${baseUrl}/global/dispose`,
+        OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS,
+        {
+          method: 'POST',
+        },
+      )
     } catch {
       // Best effort.
     }
@@ -980,6 +1053,38 @@ export class OpenCodeHostManager {
     )
     await this.removePersistentHost(hostKey).catch(() => undefined)
     return true
+  }
+
+  async disposeUnregisteredOwnedHosts(): Promise<{
+    disposed: number
+    kept: number
+    diagnostics: string[]
+  }> {
+    const registry = await this.readPersistentRegistry()
+    let disposed = 0
+    let kept = 0
+    const diagnostics: string[] = []
+
+    for (const [hostKey, entry] of Array.from(this.hosts.entries())) {
+      if (!entry.ownedByProcess) {
+        kept += 1
+        continue
+      }
+      if (registry.hosts[hostKey]) {
+        kept += 1
+        continue
+      }
+
+      try {
+        if (await this.disposeHost(hostKey)) {
+          disposed += 1
+        }
+      } catch (error) {
+        diagnostics.push(error instanceof Error ? error.message : String(error))
+      }
+    }
+
+    return { disposed, kept, diagnostics }
   }
 
   async reconcilePersistentHosts(

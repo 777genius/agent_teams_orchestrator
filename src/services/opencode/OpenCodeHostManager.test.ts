@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -61,6 +61,20 @@ function createMockChildProcess(pid = 4242): {
     child: emitter,
     killedSignals,
   }
+}
+
+function createDeferred<T = void>(): {
+  promise: Promise<T>
+  resolve: (value: T | PromiseLike<T>) => void
+  reject: (reason?: unknown) => void
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+  return { promise, resolve, reject }
 }
 
 describe('OpenCodeHostManager', () => {
@@ -363,6 +377,422 @@ describe('OpenCodeHostManager', () => {
       expect(adopted.pid).toBe(created.pid)
       expect(adopted.baseUrl).toBe(created.baseUrl)
       expect(adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('serializes persistent host startup across managers so late callers adopt the first host', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43131)
+    const healthProbeStarted = createDeferred()
+    const allowHealthProbe = createDeferred()
+    let spawnCount = 0
+
+    const fetchJson = (waitForHealth: boolean) => async (url: string) => {
+      if (url.endsWith('/global/health')) {
+        if (waitForHealth) {
+          healthProbeStarted.resolve()
+          await allowHealthProbe.promise
+        }
+        return {
+          status: 200,
+          data: { healthy: true, version: '1.4.0' },
+        }
+      }
+      if (url.endsWith('/config')) {
+        return {
+          status: 200,
+          data: { server: { port: 43131 }, default_agent: 'teammate' },
+        }
+      }
+      if (url.endsWith('/config/providers')) {
+        return {
+          status: 200,
+          data: { providers: [], default: {} },
+        }
+      }
+      if (url.endsWith('/agent')) {
+        return {
+          status: 200,
+          data: [{ name: 'teammate', mode: 'primary' }],
+        }
+      }
+      if (url.endsWith('/mcp')) {
+        return {
+          status: 200,
+          data: {},
+        }
+      }
+      return {
+        status: 200,
+        data: { ok: true },
+      }
+    }
+
+    try {
+      const firstManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43131,
+        spawnHostProcess: () => {
+          spawnCount += 1
+          return spawned.child
+        },
+        fetchJson: fetchJson(true),
+        isProcessAlive: pid => pid === spawned.child.pid,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+      const secondManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43132,
+        spawnHostProcess: () => {
+          throw new Error('second manager should adopt the first persistent host')
+        },
+        fetchJson: fetchJson(false),
+        isProcessAlive: pid => pid === spawned.child.pid,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+
+      const firstPromise = firstManager.ensureHost({ hostKey: 'host-key' })
+      await healthProbeStarted.promise
+      const secondPromise = secondManager.ensureHost({ hostKey: 'host-key' })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      allowHealthProbe.resolve()
+
+      const [first, second] = await Promise.all([firstPromise, secondPromise])
+
+      expect(spawnCount).toBe(1)
+      expect(second.pid).toBe(first.pid)
+      expect(second.baseUrl).toBe(first.baseUrl)
+      expect(second.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+    } finally {
+      allowHealthProbe.resolve()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('releases persistent host startup lock when host creation fails', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43133)
+    let spawnCount = 0
+
+    const fetchJson = async (url: string) => {
+      if (url.endsWith('/global/health')) {
+        return {
+          status: 200,
+          data: { healthy: true, version: '1.4.0' },
+        }
+      }
+      if (url.endsWith('/config')) {
+        return {
+          status: 200,
+          data: { server: { port: 43133 }, default_agent: 'teammate' },
+        }
+      }
+      if (url.endsWith('/config/providers')) {
+        return {
+          status: 200,
+          data: { providers: [], default: {} },
+        }
+      }
+      if (url.endsWith('/agent')) {
+        return {
+          status: 200,
+          data: [{ name: 'teammate', mode: 'primary' }],
+        }
+      }
+      if (url.endsWith('/mcp')) {
+        return {
+          status: 200,
+          data: {},
+        }
+      }
+      return {
+        status: 200,
+        data: { ok: true },
+      }
+    }
+
+    try {
+      const failingManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43133,
+        spawnHostProcess: () => {
+          throw new Error('spawn failed')
+        },
+        fetchJson,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+      await expect(failingManager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
+        'spawn failed',
+      )
+
+      const succeedingManager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43133,
+        spawnHostProcess: () => {
+          spawnCount += 1
+          return spawned.child
+        },
+        fetchJson,
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+      })
+      const host = await succeedingManager.ensureHost({ hostKey: 'host-key' })
+
+      expect(spawnCount).toBe(1)
+      expect(host.pid).toBe(spawned.child.pid)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('force-kills a spawned host when startup verification fails', async () => {
+    const spawned = createMockChildProcess(43134)
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+    let nowMs = 0
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43134,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 503,
+            data: { healthy: false },
+          }
+        }
+        return {
+          status: 200,
+          data: {},
+        }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      killProcess: (pid, signal) => {
+        killedSignals.push({ pid, signal })
+      },
+      now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
+      sleepMs: async () => {
+        nowMs += 16_000
+      },
+      persistentRegistryPath: null,
+    })
+
+    await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
+      'OpenCode host did not become healthy',
+    )
+
+    expect(manager.getHost('host-key')).toBeNull()
+    expect(killedSignals).toEqual([
+      { pid: 43134, signal: 'SIGTERM' },
+      { pid: 43134, signal: 'SIGKILL' },
+    ])
+  })
+
+  test('force-kills a healthy spawned host when persistent registry write fails', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    await mkdir(registryPath)
+    const spawned = createMockChildProcess(43135)
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43135,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43135 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      killProcess: (pid, signal) => {
+        killedSignals.push({ pid, signal })
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+    })
+
+    try {
+      await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow()
+
+      expect(manager.getHost('host-key')).toBeNull()
+      expect(killedSignals).toEqual([
+        { pid: 43135, signal: 'SIGTERM' },
+        { pid: 43135, signal: 'SIGKILL' },
+      ])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('disposes owned hosts that have not reached the persistent registry', async () => {
+    const spawned = createMockChildProcess(43136)
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43136,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43136 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        if (url.endsWith('/global/dispose')) {
+          return {
+            status: 200,
+            data: { ok: true },
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      killProcess: (pid, signal) => {
+        killedSignals.push({ pid, signal })
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    await manager.ensureHost({ hostKey: 'host-key' })
+    const result = await manager.disposeUnregisteredOwnedHosts()
+
+    expect(result).toEqual({ disposed: 1, kept: 0, diagnostics: [] })
+    expect(manager.getHost('host-key')).toBeNull()
+    expect(killedSignals).toEqual([
+      { pid: 43136, signal: 'SIGTERM' },
+      { pid: 43136, signal: 'SIGKILL' },
+    ])
+  })
+
+  test('keeps owned hosts that are already registered persistently during signal cleanup', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43137)
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43137,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43137 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      killProcess: (pid, signal) => {
+        killedSignals.push({ pid, signal })
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: registryPath,
+    })
+
+    try {
+      await manager.ensureHost({ hostKey: 'host-key' })
+      const result = await manager.disposeUnregisteredOwnedHosts()
+
+      expect(result).toEqual({ disposed: 0, kept: 1, diagnostics: [] })
+      expect(manager.getHost('host-key')?.pid).toBe(43137)
+      expect(killedSignals).toEqual([])
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

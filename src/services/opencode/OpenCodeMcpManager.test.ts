@@ -116,6 +116,62 @@ describe('OpenCodeMcpManager', () => {
     )
   })
 
+  test('uses resolved config to verify an existing app MCP server when /mcp omits environment', async () => {
+    let addCalls = 0
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => ({
+            'agent-teams': {
+              status: 'connected',
+            },
+          }),
+          getConfig: async () => ({
+            mcp: {
+              'agent-teams': {
+                type: 'local',
+                command: ['node', '/tmp/agent-teams-mcp.js'],
+                environment: {
+                  AGENT_TEAMS_MCP_CLAUDE_DIR: '/tmp/current-claude-root',
+                },
+              },
+            },
+          }),
+          addMcp: async () => {
+            addCalls += 1
+            return {}
+          },
+        }),
+      },
+      env: {
+        AGENT_TEAMS_MCP_CLAUDE_DIR: '/tmp/current-claude-root',
+      },
+      resolveLaunchConfig: async () => ({
+        source: 'env-override',
+        config: {
+          type: 'local',
+          command: ['node', '/tmp/agent-teams-mcp.js'],
+          environment: {
+            AGENT_TEAMS_MCP_CLAUDE_DIR: '/tmp/current-claude-root',
+          },
+          enabled: true,
+          timeout: 8000,
+        },
+      }),
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(result.summary.status).toBe('present')
+    expect(result.summary.connected).toBe(true)
+    expect(result.summary.diagnostics).toEqual([])
+    expect(addCalls).toBe(0)
+  })
+
   test('attaches the app MCP server when missing', async () => {
     let addCalls = 0
     let attached = false

@@ -184,6 +184,97 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('repairs profile node_modules when a real directory was left behind', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-repair')
+    const appCacheHome = path.join(tempDir, 'app-cache-repair')
+    const projectPath = path.join(tempDir, 'project-repair')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    try {
+      await mkdir(projectPath, { recursive: true })
+      const manager = new OpenCodeProfileManager()
+      const firstProfile = await manager.prepareProfile(projectPath)
+      const profileNodeModulesPath = path.join(
+        firstProfile.xdgConfigHome,
+        'opencode',
+        'node_modules',
+      )
+      await rm(profileNodeModulesPath, { recursive: true, force: true })
+      await mkdir(profileNodeModulesPath, { recursive: true })
+      await writeFile(path.join(profileNodeModulesPath, 'stale.txt'), 'stale directory\n', 'utf8')
+
+      const repairedProfile = await manager.prepareProfile(projectPath)
+      const repairedStat = await lstat(profileNodeModulesPath)
+      const repairedTarget = await readlink(profileNodeModulesPath)
+
+      expect(repairedProfile.profileRootKey).toBe(firstProfile.profileRootKey)
+      expect(repairedStat.isSymbolicLink()).toBe(true)
+      expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
+        path.join(repairedProfile.xdgCacheHome, 'config-node_modules'),
+      )
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
+  test('serializes concurrent profile preparation for the same project profile', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-concurrent')
+    const appCacheHome = path.join(tempDir, 'app-cache-concurrent')
+    const projectPath = path.join(tempDir, 'project-concurrent')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    try {
+      await mkdir(projectPath, { recursive: true })
+      const manager = new OpenCodeProfileManager()
+      const firstProfile = await manager.prepareProfile(projectPath)
+      const profileNodeModulesPath = path.join(
+        firstProfile.xdgConfigHome,
+        'opencode',
+        'node_modules',
+      )
+      await rm(profileNodeModulesPath, { recursive: true, force: true })
+      await mkdir(profileNodeModulesPath, { recursive: true })
+
+      const profiles = await Promise.all(
+        Array.from({ length: 8 }, () => manager.prepareProfile(projectPath)),
+      )
+      const repairedStat = await lstat(profileNodeModulesPath)
+      const repairedTarget = await readlink(profileNodeModulesPath)
+
+      expect(new Set(profiles.map(profile => profile.profileRootKey))).toEqual(
+        new Set([firstProfile.profileRootKey]),
+      )
+      expect(repairedStat.isSymbolicLink()).toBe(true)
+      expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
+        path.join(firstProfile.xdgCacheHome, 'config-node_modules'),
+      )
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
   test('syncs app-global OpenCode auth before real local auth so fresh login wins conflicts', () => {
     expect(
       orderOpenCodeAuthSyncSources({

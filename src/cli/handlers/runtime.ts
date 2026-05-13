@@ -4,6 +4,7 @@ import {
   getUnifiedRuntimeStatusPayload,
 } from '../../services/runtimeBackends/registry.js'
 import { openCodeExecutionProbe } from '../../services/opencode/OpenCodeExecutionProbe.js'
+import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
 import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvisioningProbe.js'
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
@@ -595,10 +596,38 @@ export async function runtimeOpenCodeCommand(opts: {
   input: string
   json?: boolean
 }): Promise<void> {
-  const raw = await readFile(opts.input, 'utf8')
-  const envelope = JSON.parse(raw) as unknown
-  const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
-  await writeStdoutAndDrain(jsonStringify(result) + '\n')
+  let signalCleanupPromise: Promise<void> | null = null
+  const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
+    if (signalCleanupPromise) {
+      return
+    }
+    const watchdog = setTimeout(() => process.exit(exitCode), 5_000)
+    watchdog.unref?.()
+    signalCleanupPromise = openCodeHostManager.disposeUnregisteredOwnedHosts()
+      .catch(() => undefined)
+      .finally(() => {
+        clearTimeout(watchdog)
+        process.exit(exitCode)
+      })
+  }
+  const onSigterm = () => cleanupUnregisteredHostsAndExit(143)
+  const onSigint = () => cleanupUnregisteredHostsAndExit(130)
+  process.once('SIGTERM', onSigterm)
+  process.once('SIGINT', onSigint)
+
+  try {
+    const raw = await readFile(opts.input, 'utf8')
+    const envelope = JSON.parse(raw) as unknown
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    if (signalCleanupPromise) {
+      await signalCleanupPromise
+      return
+    }
+    await writeStdoutAndDrain(jsonStringify(result) + '\n')
+  } finally {
+    process.off('SIGTERM', onSigterm)
+    process.off('SIGINT', onSigint)
+  }
   process.exit(0)
 }
 

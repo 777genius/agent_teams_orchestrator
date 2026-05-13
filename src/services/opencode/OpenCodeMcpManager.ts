@@ -54,6 +54,7 @@ export type ResolvedAppMcpLaunchConfig = {
 }
 
 type OpenCodeMcpClient = {
+  getConfig?(): Promise<unknown>
   getMcp(): Promise<OpenCodeMcpResponse>
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
   connectMcp?(name: string): Promise<OpenCodeMcpResponse>
@@ -326,6 +327,22 @@ function getMatchedAppMcpEntry(mcp: OpenCodeMcpResponse): {
   }
 }
 
+function getMatchedAppMcpConfigEntry(config: unknown): OpenCodeMcpStatusEntry | null {
+  const record = asRecord(config)
+  const mcp = asRecord(record?.mcp)
+  if (!mcp) {
+    return null
+  }
+
+  for (const serverName of OPEN_CODE_APP_MCP_SERVER_ALIASES) {
+    const entry = asRecord(mcp[serverName])
+    if (entry) {
+      return entry
+    }
+  }
+  return null
+}
+
 function getEntryEnvironment(entry: OpenCodeMcpStatusEntry | null): Record<string, string> | null {
   const candidates = [
     entry,
@@ -515,10 +532,26 @@ export class OpenCodeMcpManager {
         })
       if (shouldVerifyExistingConfig) {
         launchConfig = await this.resolveLaunchConfig()
-        const compatibility = appMcpConfigMatchesRequiredRuntime(
+        let compatibility = appMcpConfigMatchesRequiredRuntime(
           existingMatch.entry,
           launchConfig.config,
         )
+        if (!compatibility.ok && typeof client.getConfig === 'function') {
+          try {
+            const configEntry = getMatchedAppMcpConfigEntry(await client.getConfig())
+            if (configEntry) {
+              const configCompatibility = appMcpConfigMatchesRequiredRuntime(
+                configEntry,
+                launchConfig.config,
+              )
+              if (configCompatibility.ok) {
+                compatibility = configCompatibility
+              }
+            }
+          } catch {
+            // Best effort: fall back to the /mcp compatibility result.
+          }
+        }
         if (!compatibility.ok) {
           if (typeof client.addMcp !== 'function') {
             return {

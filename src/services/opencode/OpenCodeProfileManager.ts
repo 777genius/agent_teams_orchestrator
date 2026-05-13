@@ -89,37 +89,82 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+function getErrnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code
+}
+
+async function isDirectorySymlinkTo(linkPath: string, targetPath: string): Promise<boolean> {
+  let existing: Awaited<ReturnType<typeof lstat>>
+  try {
+    existing = await lstat(linkPath)
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+  if (!existing.isSymbolicLink()) {
+    return false
+  }
+
+  try {
+    const currentTarget = await readlink(linkPath)
+    return path.resolve(path.dirname(linkPath), currentTarget) === path.resolve(targetPath)
+  } catch (error) {
+    if (getErrnoCode(error) === 'EINVAL' || getErrnoCode(error) === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
+
 async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
-  try {
-    const existing = await lstat(linkPath)
-    if (existing.isSymbolicLink()) {
-      const currentTarget = await readlink(linkPath)
-      const resolvedTarget = path.resolve(path.dirname(linkPath), currentTarget)
-      if (resolvedTarget === targetPath) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await isDirectorySymlinkTo(linkPath, targetPath)) {
+      return
+    }
+
+    await rm(linkPath, { recursive: true, force: true }).catch(error => {
+      if (getErrnoCode(error) !== 'ENOENT') {
+        throw error
+      }
+    })
+
+    try {
+      await symlink(targetPath, linkPath, 'dir')
+      return
+    } catch (error) {
+      if (getErrnoCode(error) !== 'EEXIST') {
+        throw error
+      }
+      if (await isDirectorySymlinkTo(linkPath, targetPath)) {
         return
       }
     }
-    await rm(linkPath, { recursive: true, force: true })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error
-    }
   }
 
+  if (await isDirectorySymlinkTo(linkPath, targetPath)) {
+    return
+  }
+  await rm(linkPath, { recursive: true, force: true })
   try {
     await symlink(targetPath, linkPath, 'dir')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-      throw error
+    if (getErrnoCode(error) === 'EEXIST' && await isDirectorySymlinkTo(linkPath, targetPath)) {
+      return
     }
-    const currentTarget = await readlink(linkPath)
-    const resolvedTarget = path.resolve(path.dirname(linkPath), currentTarget)
-    if (resolvedTarget !== targetPath) {
-      throw error
-    }
+    throw error
+  }
+}
+
+async function runAfterSettled(previous: Promise<void> | undefined): Promise<void> {
+  try {
+    await previous
+  } catch {
+    // The next profile preparation should not be blocked by an earlier failure.
   }
 }
 
@@ -396,6 +441,8 @@ export function orderOpenCodeAuthSyncSources(input: {
 }
 
 export class OpenCodeProfileManager {
+  private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
+
   private readonly paths = resolveClaudeMultimodelPaths()
 
   private getSourceAuthPaths(): string[] {
@@ -446,12 +493,35 @@ export class OpenCodeProfileManager {
     }
   }
 
+  private async withProfilePreparationLock<T>(
+    profileRootKey: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey)
+    let release!: () => void
+    const current = new Promise<void>(resolve => {
+      release = resolve
+    })
+    OpenCodeProfileManager.profilePreparationLocks.set(profileRootKey, current)
+
+    await runAfterSettled(previous)
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey) === current) {
+        OpenCodeProfileManager.profilePreparationLocks.delete(profileRootKey)
+      }
+    }
+  }
+
   async prepareProfile(
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
   ): Promise<OpenCodePreparedProfile> {
     const resolvedProjectPath = this.getProjectPath(projectPath)
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
+    return this.withProfilePreparationLock(profileRootKey, async () => {
     const profileRootPath = path.join(
       this.paths.data,
       'opencode',
@@ -582,6 +652,7 @@ export class OpenCodeProfileManager {
         OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
       }),
     }
+    })
   }
 }
 

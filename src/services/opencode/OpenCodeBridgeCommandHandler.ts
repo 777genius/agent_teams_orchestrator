@@ -1944,6 +1944,80 @@ async function assertOpenCodeLaunchMcpReady(
   }
 }
 
+async function cleanupFailedLaunchSession(
+  record: OpenCodeSessionRecord,
+): Promise<TeamDiagnostic[]> {
+  const diagnostics: TeamDiagnostic[] = []
+  try {
+    await openCodeSessionStore.markStale(
+      record.teamId,
+      record.laneId,
+      record.memberName,
+      'launch_failed',
+    )
+  } catch (error) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_launch_failed_session_mark_stale_failed',
+      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+      'warning',
+    ))
+  }
+
+  try {
+    await openCodeSessionBridge.releaseSession(record)
+  } catch (error) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_launch_failed_session_release_failed',
+      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+      'warning',
+    ))
+  }
+
+  try {
+    await openCodeSessionStore.delete(record.teamId, record.laneId, record.memberName)
+  } catch (error) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_launch_failed_session_delete_failed',
+      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+      'warning',
+    ))
+  }
+  return diagnostics
+}
+
+async function markStaleAndReleaseSession(
+  record: OpenCodeSessionRecord,
+  staleReason: string,
+  diagnosticPrefix: string,
+): Promise<TeamDiagnostic[]> {
+  const diagnostics: TeamDiagnostic[] = []
+  try {
+    await openCodeSessionStore.markStale(
+      record.teamId,
+      record.laneId,
+      record.memberName,
+      staleReason,
+    )
+  } catch (error) {
+    diagnostics.push(teamDiagnostic(
+      `${diagnosticPrefix}_mark_stale_failed`,
+      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+      'warning',
+    ))
+  }
+
+  try {
+    await openCodeSessionBridge.releaseSession(record)
+  } catch (error) {
+    diagnostics.push(teamDiagnostic(
+      `${diagnosticPrefix}_release_failed`,
+      `${record.memberName}: ${error instanceof Error ? error.message : String(error)}`,
+      'warning',
+    ))
+  }
+  return diagnostics
+}
+
 async function runLaunch(envelope: BridgeEnvelope) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -2167,6 +2241,9 @@ async function runLaunchWithProvisioningSnapshot(
       ))
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
+      const cleanupDiagnostics = record
+        ? await cleanupFailedLaunchSession(record)
+        : []
       members[name] = {
         sessionId: record?.opencodeSessionId ?? `failed:${teamId}:${laneId}:${name}`,
         launchState: 'failed',
@@ -2179,6 +2256,7 @@ async function runLaunchWithProvisioningSnapshot(
         diagnostics: [reason],
       }
       diagnostics.push(teamDiagnostic('member_launch_failed', `${name}: ${reason}`, 'error'))
+      diagnostics.push(...cleanupDiagnostics)
     }
   }
 
@@ -2561,21 +2639,26 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       attachIfMissing: true,
     })
     if (!recreatedMcpReady.ok) {
+      const mcpUnavailableDiagnostic = teamDiagnostic(
+        'opencode_send_mcp_unavailable',
+        [
+          `OpenCode app MCP unavailable for ${teamId}/${laneId}/${memberName} after session recreate`,
+          `(status=${recreatedMcpReady.status}, connected=${String(recreatedMcpReady.connected)}).`,
+          ...recreatedMcpReady.diagnostics,
+        ].join(' '),
+        'error',
+      )
+      const cleanupDiagnostics = await markStaleAndReleaseSession(
+        deliveryRecord,
+        'app_mcp_unavailable_after_recreate',
+        'opencode_send_unavailable_session_cleanup',
+      )
       const diagnostics = [
         ...mcpDiagnostics,
-        teamDiagnostic(
-          'opencode_send_mcp_unavailable',
-          [
-            `OpenCode app MCP unavailable for ${teamId}/${laneId}/${memberName} after session recreate`,
-            `(status=${recreatedMcpReady.status}, connected=${String(recreatedMcpReady.connected)}).`,
-            ...recreatedMcpReady.diagnostics,
-          ].join(' '),
-          'error',
-        ),
+        mcpUnavailableDiagnostic,
+        ...cleanupDiagnostics,
       ]
-      const responseObservation = reconcileFailedObservation(
-        diagnostics[diagnostics.length - 1]?.message ?? 'OpenCode app MCP unavailable',
-      )
+      const responseObservation = reconcileFailedObservation(mcpUnavailableDiagnostic.message)
       await markSendMessageOutcome(outcomeBase, {
         status: 'failed_before_accept',
         sessionId: deliveryRecord.opencodeSessionId,
