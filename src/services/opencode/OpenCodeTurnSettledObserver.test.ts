@@ -87,7 +87,7 @@ describe('OpenCodeTurnSettledObserver', () => {
       outcome: 'success',
       runtimePromptMessageId: 'msg_prompt_1',
       promptPersisted: true,
-      assistantActivityCount: 2,
+      assistantActivityCount: 1,
       latestAssistantMessageId: 'msg-assistant-1',
       latestEventType: 'session.status',
       streamConnected: true,
@@ -105,7 +105,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 500,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
     observation.markPromptSubmitting()
@@ -118,8 +118,9 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
     expect(summary.assistantActivityCount).toBe(0)
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(90)
-    expect(summary.diagnostics.join('\n')).toContain('waiting for idle grace window')
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100)
+    expect(summary.diagnostics.join('\n')).toContain('waiting for full turn timeout')
+    expect(summary.diagnostics.join('\n')).toContain('before 120ms timeout')
   })
 
   test('falls back to global event stream when local endpoint is unavailable', async () => {
@@ -133,6 +134,7 @@ describe('OpenCodeTurnSettledObserver', () => {
           return buildSseResponse([
             'data: {"directory":"/tmp/project","payload":{"type":"message.updated","properties":{"info":{"id":"msg_prompt_3","role":"user","sessionID":"session-1"}}}}\n\n',
             'data: {"directory":"/tmp/project","payload":{"type":"message.updated","properties":{"info":{"id":"msg-assistant-2","role":"assistant","sessionID":"session-1"}}}}\n\n',
+            'data: {"directory":"/tmp/project","payload":{"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-2"}}}}\n\n',
             'data: {"directory":"/tmp/project","payload":{"type":"session.idle","properties":{"sessionID":"session-1"}}}\n\n',
           ])
         }
@@ -173,7 +175,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
     let settled = false
@@ -191,6 +193,7 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     stream.send('data: {"type":"message.updated","properties":{"info":{"id":"msg_prompt_3b","role":"user","sessionID":"session-1"}}}\n\n')
     stream.send('data: {"type":"message.updated","properties":{"info":{"id":"msg-assistant-3b","role":"assistant","sessionID":"session-1"}}}\n\n')
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-3b"}}}\n\n')
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await waitPromise
 
@@ -209,7 +212,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
     let settled = false
@@ -227,12 +230,48 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(settled).toBe(false)
 
     stream.send('data: {"type":"message.updated","properties":{"info":{"id":"msg-assistant-3e","role":"assistant","sessionID":"session-1"}}}\n\n')
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-3e"}}}\n\n')
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await waitPromise
 
     expect(summary.outcome).toBe('success')
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3e')
-    expect(summary.diagnostics.join('\n')).toContain('waiting for idle grace window')
+    expect(summary.diagnostics.join('\n')).toContain('waiting for full turn timeout')
+  })
+
+  test('does not treat an empty assistant message shell as completed activity', async () => {
+    const stream = buildControlledSseResponse()
+    const observer = new OpenCodeTurnSettledObserver({
+      promptMessageIdFactory: () => 'msg_prompt_3g',
+      fetchImpl: async () => stream.response,
+    })
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096',
+      sessionId: 'session-1',
+      timeoutMs: 1_000,
+      idleTimeoutMs: 100,
+    })
+    let settled = false
+    const waitPromise = observation.waitForSettled().then(summary => {
+      settled = true
+      return summary
+    })
+
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"message.updated","properties":{"info":{"id":"msg_prompt_3g","role":"user","sessionID":"session-1"}}}\n\n')
+    stream.send('data: {"type":"message.updated","properties":{"info":{"id":"msg-assistant-3g","role":"assistant","sessionID":"session-1","parentID":"msg_prompt_3g"}}}\n\n')
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    expect(settled).toBe(false)
+
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-3g"}}}\n\n')
+    stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
+    const summary = await waitPromise
+
+    expect(summary.outcome).toBe('success')
+    expect(summary.assistantActivityCount).toBe(1)
+    expect(summary.latestAssistantMessageId).toBe('msg-assistant-3g')
   })
 
   test('does not count assistant activity before current prompt evidence', async () => {
@@ -244,7 +283,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
 
@@ -258,10 +297,10 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
     expect(summary.assistantActivityCount).toBe(0)
-    expect(summary.diagnostics.join('\n')).toContain('ignored assistant activity')
+    expect(summary.diagnostics.join('\n')).toContain('ignored assistant message shell')
   })
 
-  test('counts assistant activity before prompt persistence when parent points at current prompt', async () => {
+  test('tracks assistant shell before prompt persistence but waits for real part activity', async () => {
     const stream = buildControlledSseResponse()
     const observer = new OpenCodeTurnSettledObserver({
       promptMessageIdFactory: () => 'msg_prompt_3d',
@@ -270,7 +309,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
 
@@ -280,8 +319,8 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('success')
-    expect(summary.assistantActivityCount).toBe(1)
+    expect(summary.outcome).toBe('idle_without_assistant_activity')
+    expect(summary.assistantActivityCount).toBe(0)
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3d')
   })
 
@@ -294,7 +333,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
 
@@ -321,7 +360,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
     let settled = false
@@ -356,7 +395,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096',
       sessionId: 'session-1',
-      timeoutMs: 1_000,
+      timeoutMs: 120,
       idleTimeoutMs: 100,
     })
     let settled = false
@@ -424,6 +463,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     await waitForTick()
 
     observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-assistant-4b"}}}\n\n')
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await observation.waitForSettled()
 

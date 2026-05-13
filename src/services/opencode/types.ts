@@ -206,6 +206,7 @@ export type OpenCodeProvisioningSnapshot = {
   hostHealthy: boolean
   projectPath: string
   models?: string[]
+  modelMetadata?: OpenCodeModelMetadata[]
   profile: OpenCodePreparedProfile | null
   host: OpenCodeHostHandle | null
   config: OpenCodeConfigResponse | null

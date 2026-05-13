@@ -108,6 +108,10 @@ function isExplicitFreeOpenCodeModelId(modelId: string): boolean {
   )
 }
 
+export function isOpenCodeBuiltinProviderModelId(modelId: string | null | undefined): boolean {
+  return modelId?.trim().toLowerCase().startsWith('opencode/') === true
+}
+
 function getModelContextLimit(limits: unknown): number | null {
   if (!limits || typeof limits !== 'object' || Array.isArray(limits)) {
     return null
@@ -197,6 +201,25 @@ export function isOpenCodeModelFree(
 ): boolean {
   const metadata = modelMetadata?.find(item => item.id === modelId)
   return metadata?.free === true
+}
+
+export function isOpenCodeBuiltinFreeModelId(
+  modelId: string | null | undefined,
+  modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
+): boolean {
+  const normalizedModelId = modelId?.trim()
+  return Boolean(
+    normalizedModelId
+      && isOpenCodeBuiltinProviderModelId(normalizedModelId)
+      && isOpenCodeModelFree(normalizedModelId, modelMetadata),
+  )
+}
+
+export function hasOpenCodeBuiltinFreeModel(
+  models: readonly string[],
+  modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
+): boolean {
+  return models.some(model => isOpenCodeBuiltinFreeModelId(model, modelMetadata))
 }
 
 export function parseOpenCodeProvidersOutput(output: string): {

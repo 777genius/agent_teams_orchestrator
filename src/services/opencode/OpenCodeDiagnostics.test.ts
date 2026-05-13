@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildOpenCodeCapabilityInfo,
   buildOpenCodeDetailMessage,
+  buildOpenCodeStatusMessage,
 } from './OpenCodeDiagnostics.js'
 
 import type { OpenCodeInventorySnapshot, OpenCodePreparedProfile } from './types.js'
@@ -58,5 +59,35 @@ describe('OpenCodeDiagnostics', () => {
       enabled: true,
     })
     expect(buildOpenCodeDetailMessage(snapshot)).toContain('project plugins 1')
+  })
+
+  test('treats built-in free OpenCode models as launch-ready without credentials', () => {
+    const freeSnapshot: OpenCodeInventorySnapshot = {
+      ...snapshot,
+      connectedProviders: [],
+      availableProviders: ['opencode'],
+      models: ['opencode/big-pickle'],
+      modelMetadata: [
+        {
+          id: 'opencode/big-pickle',
+          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+          context: 200000,
+          limits: { context: 200000, output: 128000 },
+          free: true,
+          raw: {
+            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            limit: { context: 200000, output: 128000 },
+          },
+        },
+      ],
+    }
+
+    expect(buildOpenCodeStatusMessage(freeSnapshot)).toBeNull()
+    expect(buildOpenCodeCapabilityInfo(freeSnapshot)).toContainEqual({
+      id: 'builtin-free-models',
+      label: '1 built-in free model',
+      enabled: true,
+    })
+    expect(buildOpenCodeDetailMessage(freeSnapshot)).toContain('1 built-in free model')
   })
 })

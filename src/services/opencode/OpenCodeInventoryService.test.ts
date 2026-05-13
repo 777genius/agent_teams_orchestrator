@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   getOpenCodeVerboseModelsArgs,
+  isOpenCodeBuiltinFreeModelId,
   parseOpenCodeAgentListOutput,
   isOpenCodeModelFree,
   parseOpenCodeModelsOutput,
@@ -111,6 +112,8 @@ openrouter/openai/gpt-oss-20b:free
     ])
     expect(parsed.modelMetadata[0]?.context).toBe(200000)
     expect(parsed.modelMetadata[0]?.limits).toEqual({ context: 200000 })
+    expect(isOpenCodeBuiltinFreeModelId('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
+    expect(isOpenCodeBuiltinFreeModelId(' openai/gpt-5.4 ', parsed.modelMetadata)).toBe(false)
     expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
     expect(isOpenCodeModelFree('openai/gpt-5.4', parsed.modelMetadata)).toBe(false)
     expect(isOpenCodeModelFree('openrouter/openai/gpt-oss-20b:free', parsed.modelMetadata)).toBe(

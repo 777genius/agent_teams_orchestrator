@@ -62,6 +62,7 @@ type ObservationState = {
   matchedEventCount: number
   assistantActivityCount: number
   promptPersisted: boolean
+  assistantMessageObserved: boolean
   pendingSessionErrorDiagnostic: string | null
   latestEventType: string | null
   latestAssistantMessageId: string | null
@@ -110,6 +111,7 @@ export class OpenCodeTurnSettledObserver {
       matchedEventCount: 0,
       assistantActivityCount: 0,
       promptPersisted: false,
+      assistantMessageObserved: false,
       pendingSessionErrorDiagnostic: null,
       latestEventType: null,
       latestAssistantMessageId: null,
@@ -170,19 +172,12 @@ export class OpenCodeTurnSettledObserver {
       idleTimer = setTimeout(() => {
         if (state.promptState === 'accepted' && state.assistantActivityCount > 0) {
           settle('success', `OpenCode turn settled after ${idleTimeoutMs}ms without new events`)
-          return
-        }
-        if (state.promptState === 'accepted' && state.promptPersisted) {
-          settle(
-            'idle_without_assistant_activity',
-            `OpenCode prompt persisted but no assistant activity was observed for ${idleTimeoutMs}ms`,
-          )
         }
       }, idleTimeoutMs)
-      idleTimer.unref?.()
     }
 
-    const hasCurrentPromptEvidence = () => state.promptPersisted || state.assistantActivityCount > 0
+    const hasCurrentPromptEvidence = () =>
+      state.promptPersisted || state.assistantMessageObserved || state.assistantActivityCount > 0
 
     const recordUnattributedSessionError = (diagnostic: string, reason: string) => {
       state.pendingSessionErrorDiagnostic = diagnostic
@@ -272,7 +267,7 @@ export class OpenCodeTurnSettledObserver {
           return
         }
         state.diagnostics.push(
-          'OpenCode observed deprecated session.idle without assistant activity; waiting for idle grace window',
+          'OpenCode observed deprecated session.idle without assistant activity; waiting for full turn timeout',
         )
         return
       }
@@ -291,7 +286,7 @@ export class OpenCodeTurnSettledObserver {
             return
           }
           state.diagnostics.push(
-            'OpenCode observed session.status idle without assistant activity; waiting for idle grace window',
+            'OpenCode observed session.status idle without assistant activity; waiting for full turn timeout',
           )
         }
         return
@@ -309,10 +304,17 @@ export class OpenCodeTurnSettledObserver {
           return
         }
         if (role === 'assistant') {
-          recordAssistantActivity(messageId, {
-            parentId: getOpenCodeSseMessageParentId(event.properties),
-            source: 'message',
-          })
+          if (
+            state.promptPersisted ||
+            getOpenCodeSseMessageParentId(event.properties) === runtimePromptMessageId
+          ) {
+            state.assistantMessageObserved = true
+            state.latestAssistantMessageId = messageId
+            return
+          }
+          state.diagnostics.push(
+            'OpenCode ignored assistant message shell without current prompt evidence',
+          )
         }
         return
       }
@@ -335,11 +337,19 @@ export class OpenCodeTurnSettledObserver {
           settle('prompt_rejected')
         } else if (!state.streamConnected) {
           settle('stream_unavailable', `OpenCode turn-settled observer timed out after ${timeoutMs}ms`)
+        } else if (
+          state.promptState === 'accepted' &&
+          hasCurrentPromptEvidence() &&
+          state.assistantActivityCount === 0
+        ) {
+          settle(
+            'idle_without_assistant_activity',
+            `OpenCode prompt had no assistant activity before ${timeoutMs}ms timeout`,
+          )
         } else {
           settle('timeout', `OpenCode turn-settled observer timed out after ${timeoutMs}ms`)
         }
       }, timeoutMs)
-      timeoutTimer.unref?.()
 
       try {
         for (const endpoint of ENDPOINTS) {
