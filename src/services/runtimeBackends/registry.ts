@@ -13,6 +13,7 @@ import {
   buildOpenCodeStatusMessage,
 } from '../opencode/OpenCodeDiagnostics.js'
 import {
+  hasOpenCodeBuiltinFreeModel,
   isOpenCodeModelFree,
   openCodeInventoryService,
 } from '../opencode/OpenCodeInventoryService.js'
@@ -425,7 +426,12 @@ async function buildOpenCodeStatus(
   const snapshot = deps.getOpenCodeInventorySnapshot
     ? await deps.getOpenCodeInventorySnapshot()
     : await openCodeInventoryService.probe()
-  const authenticated = snapshot.connectedProviders.length > 0
+  const hasConnectedProvider = snapshot.connectedProviders.length > 0
+  const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(
+    snapshot.models,
+    snapshot.modelMetadata,
+  )
+  const authenticated = hasConnectedProvider || hasBuiltinFreeModel
   const fetchedAt = new Date()
   const defaultModel = snapshot.models.find(model => model === 'opencode/big-pickle')
     ?? snapshot.models[0]
@@ -481,7 +487,11 @@ async function buildOpenCodeStatus(
     displayName: 'OpenCode (75+ LLM providers)',
     supported: snapshot.detected,
     authenticated,
-    authMethod: authenticated ? 'opencode_managed' : null,
+    authMethod: hasConnectedProvider
+      ? 'opencode_managed'
+      : hasBuiltinFreeModel
+        ? 'opencode_builtin_free'
+        : null,
     verificationState: !snapshot.detected
       ? 'offline'
       : snapshot.probeError && snapshot.models.length === 0 && !authenticated
@@ -540,7 +550,9 @@ async function buildOpenCodeStatus(
       ? {
           kind: 'opencode-cli',
           label: 'OpenCode CLI',
-          authMethodDetail: snapshot.profile?.authState ?? null,
+          authMethodDetail: hasBuiltinFreeModel && !hasConnectedProvider
+            ? 'built-in free models'
+            : snapshot.profile?.authState ?? null,
         }
       : null,
     capabilitiesInfo: buildOpenCodeCapabilityInfo(snapshot),

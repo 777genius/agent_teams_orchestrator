@@ -864,6 +864,44 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
+  test('compatibility mode without execution probe allows built-in free OpenCode models without connected providers', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        models: ['opencode/big-pickle'],
+        configProviders: {
+          providers: [],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'big-pickle',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('ready')
+    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.modelId).toBe('opencode/big-pickle')
+    expect(executionProbeCalled).toBe(false)
+  })
+
   test('compatibility provider rejection returns before starting MCP tool proof', async () => {
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({
@@ -2829,7 +2867,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(ensureSessionCalls).toBe(0)
   })
 
-  test('rejects launch with no connected providers before MCP proof or session creation', async () => {
+  test('rejects launch with a disconnected selected provider before MCP proof or session creation', async () => {
     let connectCalls = 0
     let ensureSessionCalls = 0
     openCodeProvisioningProbe.probe = async () =>
@@ -2868,9 +2906,57 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (result.ok) {
       return
     }
-    expect(result.error.message).toContain('No connected OpenCode providers found')
+    expect(result.error.message).toContain(
+      'OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected',
+    )
     expect(connectCalls).toBe(0)
     expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('allows launch for built-in free OpenCode models without connected providers', async () => {
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        models: ['opencode/big-pickle'],
+        configProviders: {
+          providers: [],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    let ensureSessionCalls = 0
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-opencode-free',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'big-pickle',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(ensureSessionCalls).toBe(1)
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.bob?.model).toBe('big-pickle')
+    expect(result.data.members.bob?.launchState).toBe('created')
   })
 
   test('rejects launch before creating sessions when the capability snapshot precondition is stale', async () => {

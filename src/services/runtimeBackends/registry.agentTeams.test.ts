@@ -460,4 +460,85 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     },
     15_000,
   )
+
+  test(
+    'opencode runtime status treats built-in free models as launchable without connected providers',
+    async () => {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: async () => ({
+          detected: true,
+          binaryPath: '/opt/homebrew/bin/opencode',
+          version: '1.14.48',
+          projectPath: '/tmp/project',
+          profile: {
+            projectPath: '/tmp/project',
+            profileRootKey: 'abc123',
+            profileRootPath: '/tmp/profile',
+            projectBehaviorFingerprint: 'behavior-v1',
+            behaviorSources: ['AGENTS.md', 'opencode.json'],
+            homePath: '/tmp/profile/home',
+            xdgConfigHome: '/tmp/profile/config',
+            xdgDataHome: '/tmp/profile/data',
+            xdgCacheHome: '/tmp/profile/cache',
+            managedConfig: {
+              default_agent: 'teammate',
+              share: 'disabled',
+              autoupdate: false,
+              snapshot: false,
+            },
+            managedConfigFingerprint: 'managed-config-v1',
+            managedAuthPath: '/tmp/profile/data/opencode/auth.json',
+            sourceAuthPath: '/Users/test/.local/share/opencode/auth.json',
+            sourceAuthFingerprint: null,
+            managedAuthFingerprint: null,
+            authState: 'missing',
+            env: {},
+          },
+          connectedProviders: [],
+          availableProviders: ['opencode'],
+          models: ['opencode/big-pickle'],
+          modelMetadata: [
+            {
+              id: 'opencode/big-pickle',
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              context: 200000,
+              limits: { context: 200000, output: 128000 },
+              free: true,
+              raw: {
+                cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                limit: { context: 200000, output: 128000 },
+              },
+            },
+          ],
+          agents: [
+            { id: 'teammate', mode: 'primary' },
+          ],
+          authStorePath: '/tmp/profile/data/opencode/auth.json',
+          probeError: null,
+          diagnostics: [],
+        }),
+      })
+      const opencode = payload.providers.opencode
+
+      expect(opencode?.supported).toBe(true)
+      expect(opencode?.authenticated).toBe(true)
+      expect(opencode?.authMethod).toBe('opencode_builtin_free')
+      expect(opencode?.statusMessage).toBeNull()
+      expect(opencode?.capabilities.teamLaunch).toBe(true)
+      expect(opencode?.backend?.authMethodDetail).toBe('built-in free models')
+      expect(
+        opencode?.capabilitiesInfo?.find((item) => item.id === 'builtin-free-models'),
+      ).toEqual({
+        id: 'builtin-free-models',
+        label: '1 built-in free model',
+        enabled: true,
+      })
+    },
+    15_000,
+  )
 })

@@ -1,4 +1,9 @@
 import type { RuntimeCapabilityInfo } from '../runtimeBackends/types.js'
+import {
+  hasOpenCodeBuiltinFreeModel,
+  isOpenCodeBuiltinProviderModelId,
+  isOpenCodeModelFree,
+} from './OpenCodeInventoryService.js'
 import type { OpenCodeInventorySnapshot } from './types.js'
 
 function countProjectPluginSources(snapshot: OpenCodeInventorySnapshot): number {
@@ -7,12 +12,19 @@ function countProjectPluginSources(snapshot: OpenCodeInventorySnapshot): number 
   ).length ?? 0
 }
 
+function formatBuiltinFreeModelCount(count: number): string {
+  return `${count} built-in free model${count === 1 ? '' : 's'}`
+}
+
 export function buildOpenCodeCapabilityInfo(
   snapshot: OpenCodeInventorySnapshot,
 ): RuntimeCapabilityInfo[] {
   const uniqueConnectedProviders = Array.from(
     new Set(snapshot.connectedProviders.map(provider => provider.id)),
   )
+  const builtinFreeModelCount = snapshot.models.filter(model =>
+    isOpenCodeBuiltinProviderModelId(model) && isOpenCodeModelFree(model, snapshot.modelMetadata)
+  ).length
   const projectPluginSourceCount = countProjectPluginSources(snapshot)
 
   return [
@@ -36,6 +48,11 @@ export function buildOpenCodeCapabilityInfo(
       enabled: uniqueConnectedProviders.length > 0,
     },
     {
+      id: 'builtin-free-models',
+      label: formatBuiltinFreeModelCount(builtinFreeModelCount),
+      enabled: builtinFreeModelCount > 0,
+    },
+    {
       id: 'models',
       label: `${snapshot.models.length} inventory models`,
       enabled: snapshot.models.length > 0,
@@ -56,15 +73,23 @@ export function buildOpenCodeCapabilityInfo(
 export function buildOpenCodeStatusMessage(
   snapshot: OpenCodeInventorySnapshot,
 ): string | null {
+  const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(
+    snapshot.models,
+    snapshot.modelMetadata,
+  )
   if (!snapshot.detected) {
     return 'OpenCode CLI not found'
   }
 
-  if (snapshot.probeError && snapshot.models.length === 0 && snapshot.connectedProviders.length === 0) {
+  if (
+    snapshot.probeError
+    && snapshot.models.length === 0
+    && snapshot.connectedProviders.length === 0
+  ) {
     return 'OpenCode probe incomplete'
   }
 
-  if (snapshot.connectedProviders.length === 0) {
+  if (snapshot.connectedProviders.length === 0 && !hasBuiltinFreeModel) {
     return 'No OpenCode providers connected'
   }
 
@@ -87,6 +112,13 @@ export function buildOpenCodeDetailMessage(
         .filter((value, index, values) => values.indexOf(value) === index)
         .join(', ')}`,
     )
+  }
+
+  const builtinFreeModelCount = snapshot.models.filter(model =>
+    isOpenCodeBuiltinProviderModelId(model) && isOpenCodeModelFree(model, snapshot.modelMetadata)
+  ).length
+  if (builtinFreeModelCount > 0) {
+    detailParts.push(formatBuiltinFreeModelCount(builtinFreeModelCount))
   }
 
   if (snapshot.authStorePath) {

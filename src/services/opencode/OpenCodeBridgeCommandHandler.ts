@@ -11,7 +11,10 @@ import {
   type OpenCodeBridgeCommandEvidence,
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
-import { openCodeInventoryService } from './OpenCodeInventoryService.js'
+import {
+  isOpenCodeBuiltinProviderModelId,
+  openCodeInventoryService,
+} from './OpenCodeInventoryService.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   type ResolvedAppMcpLaunchConfig,
@@ -1476,6 +1479,10 @@ function readinessData(
   ])).sort()
   const appMcpConnected = snapshot.appMcp?.connected === true || snapshot.appMcp?.status === 'present' || snapshot.appMcp?.status === 'attached'
   const requiredToolsPresent = appMcpConnected && toolProof.ok
+  const usesBuiltinOpenCodeProvider =
+    isOpenCodeBuiltinProviderModelId(selectedModel)
+    || isOpenCodeBuiltinProviderModelId(executionOutcome?.modelId)
+  const hasLaunchProvider = connectedProviders.length > 0 || usesBuiltinOpenCodeProvider
   const diagnostics = [
     ...snapshot.diagnostics,
     ...(executionOutcome?.diagnostics ?? []),
@@ -1493,7 +1500,7 @@ function readinessData(
     state = 'unknown_error'
     launchAllowed = false
     missing.push(snapshot.probeError ?? 'OpenCode host is not healthy')
-  } else if (connectedProviders.length === 0) {
+  } else if (!hasLaunchProvider) {
     state = 'not_authenticated'
     launchAllowed = false
     missing.push('No connected OpenCode providers found')
@@ -1770,6 +1777,9 @@ function getSelectedModelProviderConnectionFailure(
   if (connectedProviders.has(providerId)) {
     return null
   }
+  if (providerId === 'opencode') {
+    return null
+  }
   return `OpenCode provider "${providerId}" for selected model "${selectedModel}" is not connected`
 }
 
@@ -1865,7 +1875,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
     snapshot,
     data: readinessData(
       snapshot,
-      selectedModel,
+      executionModel ?? selectedModel,
       executionOutcome,
       toolProof,
       requireSelectedModel,
@@ -1907,15 +1917,11 @@ function isAppMcpConnected(snapshot: OpenCodeProvisioningSnapshot): boolean {
 function assertOpenCodeLaunchRuntimeAvailable(
   snapshot: OpenCodeProvisioningSnapshot,
 ): void {
-  const connectedProviders = snapshot.providers?.connected ?? []
   if (!snapshot.detected) {
     throw new Error('OpenCode CLI not detected')
   }
   if (!snapshot.hostHealthy) {
     throw new Error(snapshot.probeError ?? 'OpenCode host is not healthy')
-  }
-  if (connectedProviders.length === 0) {
-    throw new Error('No connected OpenCode providers found')
   }
 }
 
