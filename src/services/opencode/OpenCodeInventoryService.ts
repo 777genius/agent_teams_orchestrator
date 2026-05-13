@@ -203,13 +203,23 @@ export function isOpenCodeModelFree(
   return metadata?.free === true
 }
 
+export function isOpenCodeBuiltinFreeModelId(
+  modelId: string | null | undefined,
+  modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
+): boolean {
+  const normalizedModelId = modelId?.trim()
+  return Boolean(
+    normalizedModelId
+      && isOpenCodeBuiltinProviderModelId(normalizedModelId)
+      && isOpenCodeModelFree(normalizedModelId, modelMetadata),
+  )
+}
+
 export function hasOpenCodeBuiltinFreeModel(
   models: readonly string[],
   modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
 ): boolean {
-  return models.some(model =>
-    isOpenCodeBuiltinProviderModelId(model) && isOpenCodeModelFree(model, modelMetadata)
-  )
+  return models.some(model => isOpenCodeBuiltinFreeModelId(model, modelMetadata))
 }
 
 export function parseOpenCodeProvidersOutput(output: string): {

@@ -1,8 +1,7 @@
 import type { RuntimeCapabilityInfo } from '../runtimeBackends/types.js'
 import {
   hasOpenCodeBuiltinFreeModel,
-  isOpenCodeBuiltinProviderModelId,
-  isOpenCodeModelFree,
+  isOpenCodeBuiltinFreeModelId,
 } from './OpenCodeInventoryService.js'
 import type { OpenCodeInventorySnapshot } from './types.js'
 
@@ -23,7 +22,7 @@ export function buildOpenCodeCapabilityInfo(
     new Set(snapshot.connectedProviders.map(provider => provider.id)),
   )
   const builtinFreeModelCount = snapshot.models.filter(model =>
-    isOpenCodeBuiltinProviderModelId(model) && isOpenCodeModelFree(model, snapshot.modelMetadata)
+    isOpenCodeBuiltinFreeModelId(model, snapshot.modelMetadata)
   ).length
   const projectPluginSourceCount = countProjectPluginSources(snapshot)
 
@@ -115,7 +114,7 @@ export function buildOpenCodeDetailMessage(
   }
 
   const builtinFreeModelCount = snapshot.models.filter(model =>
-    isOpenCodeBuiltinProviderModelId(model) && isOpenCodeModelFree(model, snapshot.modelMetadata)
+    isOpenCodeBuiltinFreeModelId(model, snapshot.modelMetadata)
   ).length
   if (builtinFreeModelCount > 0) {
     detailParts.push(formatBuiltinFreeModelCount(builtinFreeModelCount))

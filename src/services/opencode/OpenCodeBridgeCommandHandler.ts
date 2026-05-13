@@ -12,7 +12,8 @@ import {
   validateOpenCodeBridgeStateChangingPreconditions,
 } from './OpenCodeBridgePreconditions.js'
 import {
-  isOpenCodeBuiltinProviderModelId,
+  hasOpenCodeBuiltinFreeModel,
+  isOpenCodeBuiltinFreeModelId,
   openCodeInventoryService,
 } from './OpenCodeInventoryService.js'
 import {
@@ -460,6 +461,7 @@ async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<
     hostHealthy: false,
     projectPath: inventory.projectPath,
     models: [...inventory.models],
+    modelMetadata: [...(inventory.modelMetadata ?? [])],
     profile: inventory.profile,
     host: null,
     config: null,
@@ -1479,10 +1481,11 @@ function readinessData(
   ])).sort()
   const appMcpConnected = snapshot.appMcp?.connected === true || snapshot.appMcp?.status === 'present' || snapshot.appMcp?.status === 'attached'
   const requiredToolsPresent = appMcpConnected && toolProof.ok
-  const usesBuiltinOpenCodeProvider =
-    isOpenCodeBuiltinProviderModelId(selectedModel)
-    || isOpenCodeBuiltinProviderModelId(executionOutcome?.modelId)
-  const hasLaunchProvider = connectedProviders.length > 0 || usesBuiltinOpenCodeProvider
+  const hasAuthFreeOpenCodeProvider =
+    isOpenCodeBuiltinFreeModelId(selectedModel, snapshot.modelMetadata)
+    || isOpenCodeBuiltinFreeModelId(executionOutcome?.modelId, snapshot.modelMetadata)
+    || hasOpenCodeBuiltinFreeModel(models, snapshot.modelMetadata)
+  const hasLaunchProvider = connectedProviders.length > 0 || hasAuthFreeOpenCodeProvider
   const diagnostics = [
     ...snapshot.diagnostics,
     ...(executionOutcome?.diagnostics ?? []),
@@ -1777,7 +1780,10 @@ function getSelectedModelProviderConnectionFailure(
   if (connectedProviders.has(providerId)) {
     return null
   }
-  if (providerId === 'opencode') {
+  if (
+    providerId === 'opencode'
+    && isOpenCodeBuiltinFreeModelId(selectedModel, snapshot.modelMetadata)
+  ) {
     return null
   }
   return `OpenCode provider "${providerId}" for selected model "${selectedModel}" is not connected`
