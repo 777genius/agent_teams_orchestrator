@@ -641,6 +641,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
+    expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(1)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {

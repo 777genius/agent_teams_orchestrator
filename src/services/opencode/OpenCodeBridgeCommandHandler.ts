@@ -70,6 +70,7 @@ const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
 // requirement for OpenCode only. Bump this when changing the injected context
 // or the candidate proof shape so the desktop app can reject stale evidence.
 const OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION = 1
+const OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION = 1
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // This is intentionally longer than the UI wait budget: the app can return
@@ -867,6 +868,7 @@ function createBridgeServerIdentity(
       supportedCommands: SUPPORTED_COMMANDS,
       opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
+      opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
