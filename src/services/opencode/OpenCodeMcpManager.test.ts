@@ -4,6 +4,7 @@ import path from 'node:path'
 import {
   getCandidateClaudeTeamRootsForBridgeRoot,
   OpenCodeMcpManager,
+  resolveOpenCodeBridgeRepoRootForStartDir,
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
 import {
@@ -473,5 +474,18 @@ describe('OpenCodeMcpManager', () => {
     expect(normalizedRoots.some(root => root.endsWith('/repo/claude_team'))).toBe(
       true,
     )
+  })
+
+  test('resolves the runtime repo root from bundled dist entrypoints', () => {
+    const root = resolveOpenCodeBridgeRepoRootForStartDir(
+      '/repo/agent_teams_orchestrator/dist/local-cli-dev',
+      {
+        pathExists: targetPath =>
+          normalizePath(targetPath) === '/repo/agent_teams_orchestrator/package.json',
+        readText: () => JSON.stringify({ name: 'claude-multimodel' }),
+      },
+    )
+
+    expect(normalizePath(root ?? '')).toBe('/repo/agent_teams_orchestrator')
   })
 })

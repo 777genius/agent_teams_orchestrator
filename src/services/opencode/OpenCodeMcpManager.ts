@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
@@ -129,7 +130,62 @@ async function defaultPathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+function readTextFileSync(targetPath: string): string | null {
+  try {
+    return readFileSync(targetPath, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+export function resolveOpenCodeBridgeRepoRootForStartDir(
+  startDir: string,
+  deps: {
+    pathExists?: (targetPath: string) => boolean
+    readText?: (targetPath: string) => string | null
+  } = {},
+): string | null {
+  const pathExists = deps.pathExists ?? existsSync
+  const readText = deps.readText ?? readTextFileSync
+  let current = path.resolve(startDir)
+
+  while (true) {
+    const packageJsonPath = path.join(current, 'package.json')
+    if (pathExists(packageJsonPath)) {
+      try {
+        const parsed = JSON.parse(readText(packageJsonPath) ?? '{}') as { name?: unknown }
+        if (parsed.name === 'claude-multimodel') {
+          return current
+        }
+      } catch {
+        // Keep walking: parent directories may contain the real runtime package.
+      }
+    }
+
+    const parent = path.dirname(current)
+    if (parent === current) {
+      return null
+    }
+    current = parent
+  }
+}
+
 function getOpenCodeBridgeRepoRoot(): string {
+  const argvEntrypoint =
+    typeof process.argv[1] === 'string' && process.argv[1].trim().length > 0
+      ? path.dirname(process.argv[1])
+      : null
+  const candidateStartDirs = [import.meta.dir, argvEntrypoint].filter(
+    (value): value is string => Boolean(value),
+  )
+
+  for (const startDir of candidateStartDirs) {
+    const repoRoot = resolveOpenCodeBridgeRepoRootForStartDir(startDir)
+    if (repoRoot) {
+      return repoRoot
+    }
+  }
+
   return path.resolve(import.meta.dir, '../../..')
 }
 
