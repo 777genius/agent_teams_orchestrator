@@ -162,6 +162,7 @@ type OpenCodeAppManagedBootstrapCandidate = {
 
 type SendMessageCommandData = {
   accepted: boolean
+  runId?: string
   sessionId?: string
   memberName: string
   runtimePid?: number
@@ -170,6 +171,9 @@ type SendMessageCommandData = {
   snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation?: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
+  idempotencyKey?: string
+  manifestHighWatermark?: number | null
+  runtimeStoreManifestHighWatermark?: number | null
 }
 
 type CommandStatusCommandData = {
@@ -2543,7 +2547,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   })
 
   const snapshot = await openCodeProvisioningProbe.probe(projectPath)
-  validateOpenCodeBridgeStateChangingPreconditions({
+  const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
@@ -2857,6 +2861,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     const acceptedRuntimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
     const finalData: SendMessageCommandData = {
       accepted: true,
+      ...(runId ? { runId } : {}),
       sessionId: deliveryRecord.opencodeSessionId,
       memberName,
       ...(acceptedRuntimePid ? { runtimePid: acceptedRuntimePid } : {}),
@@ -2870,6 +2875,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
           'info',
         ),
       ],
+      ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+      manifestHighWatermark: commandEvidence.manifestHighWatermark,
+      runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
     }
     await markSendMessageOutcome(outcomeBase, {
       status: 'prompt_accepted',
@@ -2978,6 +2986,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
 
   const finalData: SendMessageCommandData = {
     accepted: true,
+    ...(runId ? { runId } : {}),
     sessionId: deliveryRecord.opencodeSessionId,
     memberName,
     ...(runtimePid ? { runtimePid } : {}),
@@ -2988,8 +2997,11 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
           snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
           responseObservation,
         }
-      : {}),
+        : {}),
     diagnostics: reconcileDiagnostics,
+    ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+    manifestHighWatermark: commandEvidence.manifestHighWatermark,
+    runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
   }
   try {
     await markSendMessageOutcome(outcomeBase, {
