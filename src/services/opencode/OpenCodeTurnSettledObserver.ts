@@ -70,7 +70,7 @@ type ObservationState = {
   terminal: OpenCodeTurnSettledSummary | null
 }
 
-function buildPromptMessageId(): string {
+export function buildOpenCodeRuntimePromptMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, '')}`
 }
 
@@ -99,7 +99,7 @@ export class OpenCodeTurnSettledObserver {
   }): OpenCodeTurnSettledObservation {
     const runtimePromptMessageId =
       params.runtimePromptMessageId?.trim() ||
-      (this.deps.promptMessageIdFactory ?? buildPromptMessageId)()
+      (this.deps.promptMessageIdFactory ?? buildOpenCodeRuntimePromptMessageId)()
     const turnId = runtimePromptMessageId
     const state: ObservationState = {
       promptState: 'created',

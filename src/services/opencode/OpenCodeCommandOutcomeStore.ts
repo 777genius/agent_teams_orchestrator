@@ -31,6 +31,7 @@ export type OpenCodeCommandOutcomeSendMessageData = {
   memberName: string
   runtimePid?: number
   prePromptCursor?: string | null
+  runtimePromptMessageId?: string
   responseObservation?: OpenCodeDeliveryResponseObservation
   diagnostics: OpenCodeCommandOutcomeDiagnostic[]
 }

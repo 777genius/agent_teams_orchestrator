@@ -388,6 +388,7 @@ const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppM
 const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
+const originalPromptAsyncUntilAccepted = openCodeSessionBridge.promptAsyncUntilAccepted
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalObservePreview = openCodeSessionBridge.observePreview
 const originalAbort = openCodeSessionBridge.abort
@@ -510,6 +511,20 @@ beforeEach(async () => {
     })
     return { runtimePromptMessageId, turnSettled, hookDiagnostics: [] }
   }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
+  openCodeSessionBridge.promptAsyncUntilAccepted = (async (record, input) => {
+    const runtimePromptMessageId = 'msg_test_acceptance'
+    await input.onPromptSubmitting?.({
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+      baseUrl: 'http://127.0.0.1:4096',
+    })
+    await openCodeSessionBridge.promptAsync(record, input)
+    await input.onPromptAccepted?.({
+      sessionId: record.opencodeSessionId,
+      runtimePromptMessageId,
+    })
+    return { runtimePromptMessageId, hookDiagnostics: [] }
+  }) as typeof openCodeSessionBridge.promptAsyncUntilAccepted
   openCodeHostManager.reconcilePersistentHosts = (async () => ({
     cleaned: 0,
     remaining: 0,
@@ -572,6 +587,7 @@ afterEach(async () => {
   openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
   openCodeSessionBridge.promptAsync = originalPromptAsync
   openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
+  openCodeSessionBridge.promptAsyncUntilAccepted = originalPromptAsyncUntilAccepted
   openCodeSessionBridge.reconcileSession = originalReconcileSession
   openCodeSessionBridge.observePreview = originalObservePreview
   openCodeSessionBridge.abort = originalAbort
@@ -5059,6 +5075,79 @@ describe('OpenCodeBridgeCommandHandler', () => {
       })
     } finally {
       await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('returns after prompt acceptance in acceptance settlement mode without reconciling inline', async () => {
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+    })
+    let reconcileCalls = 0
+    let postAcceptanceReconcileCalls = 0
+    let promptAccepted = false
+    try {
+      openCodeProvisioningProbe.probe = async () => snapshot
+      openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.promptAsync = (async () => undefined) as typeof openCodeSessionBridge.promptAsync
+      openCodeSessionBridge.promptAsyncUntilAccepted = (async (_record, input) => {
+        const runtimePromptMessageId = 'msg_test_acceptance'
+        await input.onPromptSubmitting?.({
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId,
+          baseUrl: 'http://127.0.0.1:4096',
+        })
+        await input.onPromptAccepted?.({
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId,
+        })
+        promptAccepted = true
+        return { runtimePromptMessageId, hookDiagnostics: [] }
+      }) as typeof openCodeSessionBridge.promptAsyncUntilAccepted
+      openCodeSessionBridge.reconcileSession = (async () => {
+        reconcileCalls += 1
+        if (promptAccepted) {
+          postAcceptanceReconcileCalls += 1
+        }
+        return {
+          record,
+          summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+        }
+      }) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.sendMessage', {
+          teamId: 'team-a',
+          teamName: 'team-a',
+          laneId: 'secondary:opencode:bob',
+          memberName: 'bob',
+          projectPath: '/tmp/project',
+          text: 'hello bob',
+          messageId: 'message-acceptance',
+          settlementMode: 'acceptance',
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(result.data).toMatchObject({
+        accepted: true,
+        sessionId: 'session-bob',
+        memberName: 'bob',
+        prePromptCursor: record.lastCanonicalCursor,
+        runtimePromptMessageId: 'msg_test_acceptance',
+      })
+      expect(result.data.responseObservation).toBeUndefined()
+      expect(reconcileCalls).toBe(1)
+      expect(postAcceptanceReconcileCalls).toBe(0)
+      const diagnosticCodes = result.data.diagnostics.map(diagnostic => diagnostic.code)
+      expect(diagnosticCodes).toContain('opencode_send_settlement_acceptance')
+    } finally {
+      openCodeSessionBridge.reconcileSession = originalReconcileSession
+      openCodeSessionBridge.promptAsyncUntilAccepted = originalPromptAsyncUntilAccepted
     }
   })
 

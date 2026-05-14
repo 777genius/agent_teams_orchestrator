@@ -165,6 +165,7 @@ type SendMessageCommandData = {
   memberName: string
   runtimePid?: number
   prePromptCursor?: string | null
+  runtimePromptMessageId?: string
   snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation?: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
@@ -198,6 +199,7 @@ type ObserveMessageDeliveryCommandData = {
   sessionId?: string
   memberName: string
   runtimePid?: number
+  runtimePromptMessageId?: string
   snapshotBoundary?: OpenCodeSnapshotBoundary
   responseObservation: OpenCodeDeliveryResponseObservation
   diagnostics: TeamDiagnostic[]
@@ -230,6 +232,7 @@ function toOutcomeSendMessageData(data: SendMessageCommandData): OpenCodeCommand
       ? { runtimePid: data.runtimePid }
       : {}),
     ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
+    ...(data.runtimePromptMessageId ? { runtimePromptMessageId: data.runtimePromptMessageId } : {}),
     ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
     diagnostics: data.diagnostics,
   }
@@ -314,6 +317,7 @@ function outcomeSendMessageDataToCommandData(
       ? { runtimePid: data.runtimePid }
       : {}),
     ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
+    ...(data.runtimePromptMessageId ? { runtimePromptMessageId: data.runtimePromptMessageId } : {}),
     ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
     diagnostics: data.diagnostics,
   }
@@ -985,6 +989,8 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
   record: OpenCodeSessionRecord
   inboundMessageId: string | null
   prePromptCursor: string | null
+  runtimePromptMessageId?: string | null
+  sessionId?: string | null
   timeoutMs: number
   limit?: number
   diagnosticCode: string
@@ -1011,13 +1017,16 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
     reconciled = await withTimeout(
       openCodeSessionBridge.reconcileSession(
         input.record,
-        typeof input.limit === 'number' ? { limit: input.limit } : undefined,
+        typeof input.limit === 'number' || input.sessionId
+          ? { limit: input.limit, sessionId: input.sessionId }
+          : undefined,
       ),
       input.timeoutMs,
     )
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: input.inboundMessageId,
       prePromptCursor: input.prePromptCursor,
+      runtimePromptMessageId: input.runtimePromptMessageId,
       summary: reconciled.summary,
     })
   } while (
@@ -2724,6 +2733,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   const deliveryText = identityReminder ? `${identityReminder}\n\n${text}` : text
   const deliveryAgent = asString(body.agent) ?? OPEN_CODE_TEAMMATE_AGENT
   const noReply = body.noReply === true
+  const settlementMode = body.settlementMode === 'acceptance' ? 'acceptance' : 'observed'
   let runtimePromptMessageId: string | null = null
   let turnSettled: OpenCodeTurnSettledSummary | null = null
   let promptEndpointAccepted = false
@@ -2736,6 +2746,46 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         noReply: true,
       })
       promptEndpointAccepted = true
+    } else if (settlementMode === 'acceptance') {
+      const prompted = await openCodeSessionBridge.promptAsyncUntilAccepted(deliveryRecord, {
+        text: deliveryText,
+        parts: fileParts,
+        agent: deliveryAgent,
+        noReply: false,
+        onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_submitting',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            diagnostics: mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+          })
+        },
+        onPromptAccepted: async ({ sessionId, runtimePromptMessageId }) => {
+          promptEndpointAccepted = true
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'prompt_accepted',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            acceptedAt: nowIso(),
+            diagnostics: [
+              ...mcpDiagnostics.map(teamDiagnosticToOutcomeString),
+              'opencode_send_settlement_acceptance',
+            ],
+          })
+        },
+      })
+      runtimePromptMessageId = prompted.runtimePromptMessageId
+      if (prompted.hookDiagnostics.length > 0) {
+        mcpDiagnostics.push(
+          ...prompted.hookDiagnostics.map(message =>
+            teamDiagnostic('opencode_send_outcome_hook_failed', message, 'warning'),
+          ),
+        )
+      }
     } else {
       const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
         text: deliveryText,
@@ -2801,6 +2851,40 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     throw error
   }
 
+  if (!noReply && settlementMode === 'acceptance') {
+    const acceptedRuntimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
+    const finalData: SendMessageCommandData = {
+      accepted: true,
+      sessionId: deliveryRecord.opencodeSessionId,
+      memberName,
+      ...(acceptedRuntimePid ? { runtimePid: acceptedRuntimePid } : {}),
+      prePromptCursor,
+      ...(runtimePromptMessageId ? { runtimePromptMessageId } : {}),
+      diagnostics: [
+        ...mcpDiagnostics,
+        teamDiagnostic(
+          'opencode_send_settlement_acceptance',
+          'OpenCode prompt_async accepted; response observation will continue through durable app-side ledger reconciliation.',
+          'info',
+        ),
+      ],
+    }
+    await markSendMessageOutcome(outcomeBase, {
+      status: 'prompt_accepted',
+      sessionId: deliveryRecord.opencodeSessionId,
+      runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+      prePromptCursor,
+      runtimePromptMessageId,
+      acceptedAt: nowIso(),
+      sendMessageData: finalData,
+      diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
+    }).catch(() => undefined)
+    return {
+      snapshot,
+      data: finalData,
+    }
+  }
+
   let runtimePid =
     typeof deliveryRecord.runtimePid === 'number' && deliveryRecord.runtimePid > 0
       ? deliveryRecord.runtimePid
@@ -2829,6 +2913,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: asString(body.messageId),
       prePromptCursor,
+      runtimePromptMessageId,
       summary: reconciled.summary,
     })
     if (isMessageSendToolErrorObservation(responseObservation)) {
@@ -2837,6 +2922,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
           record: reconciled.record,
           inboundMessageId: asString(body.messageId),
           prePromptCursor,
+          runtimePromptMessageId,
           timeoutMs: OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
           limit: 50,
           diagnosticCode: 'opencode_send_reconcile',
@@ -2894,6 +2980,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     memberName,
     ...(runtimePid ? { runtimePid } : {}),
     prePromptCursor,
+    ...(runtimePromptMessageId ? { runtimePromptMessageId } : {}),
     ...(responseObservation
       ? {
           snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
@@ -2938,6 +3025,8 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
   const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
   const messageId = asString(body.messageId)
+  const requestedSessionId = asString(body.sessionId)
+  const runtimePromptMessageId = asString(body.runtimePromptMessageId)
   if (!teamId || !laneId || !memberName || !messageId) {
     throw new Error(
       'opencode.observeMessageDelivery requires teamId/teamName, laneId, memberName and messageId',
@@ -2962,7 +3051,10 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
   let responseObservation: OpenCodeDeliveryResponseObservation
   try {
     const limited = await withTimeout(
-      openCodeSessionBridge.reconcileSession(record, { limit: 80 }),
+      openCodeSessionBridge.reconcileSession(record, {
+        limit: 80,
+        sessionId: requestedSessionId,
+      }),
       OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
     )
     let observeRecord = limited.record
@@ -2978,12 +3070,15 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: messageId,
       prePromptCursor: asString(body.prePromptCursor),
+      runtimePromptMessageId,
       summary: limited.summary,
     })
 
     if (responseObservation.needsFullHistory === true) {
       const full = await withTimeout(
-        openCodeSessionBridge.reconcileSession(limited.record),
+        openCodeSessionBridge.reconcileSession(limited.record, {
+          sessionId: requestedSessionId,
+        }),
         OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
       )
       observeRecord = full.record
@@ -2999,6 +3094,7 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
       responseObservation = observeOpenCodeDeliveryResponse({
         inboundMessageId: messageId,
         prePromptCursor: asString(body.prePromptCursor),
+        runtimePromptMessageId,
         summary: full.summary,
       })
     }
@@ -3008,6 +3104,8 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
           record: observeRecord,
           inboundMessageId: messageId,
           prePromptCursor: asString(body.prePromptCursor),
+          runtimePromptMessageId,
+          sessionId: requestedSessionId,
           timeoutMs: OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
           limit: 80,
           diagnosticCode: 'opencode_observe_reconcile',
@@ -3041,9 +3139,10 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
     snapshot,
     data: {
       observed: true,
-      sessionId: record.opencodeSessionId,
+      sessionId: requestedSessionId ?? record.opencodeSessionId,
       memberName,
       ...(runtimePid ? { runtimePid } : {}),
+      ...(runtimePromptMessageId ? { runtimePromptMessageId } : {}),
       snapshotBoundary: buildSnapshotBoundaryStatus({ snapshot, responseObservation }),
       responseObservation,
       diagnostics,

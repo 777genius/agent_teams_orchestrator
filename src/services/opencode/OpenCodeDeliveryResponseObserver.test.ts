@@ -836,6 +836,48 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.reason).toBe('delivered_prompt_anchor_not_found')
   })
 
+  test('prefers exact runtime prompt message id over ambiguous text and cursor matches', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-app',
+      prePromptCursor: 'cursor-before-delivery',
+      runtimePromptMessageId: 'user-exact-runtime-prompt',
+      summary: summary([
+        message({
+          id: 'cursor-before-delivery',
+          role: 'assistant',
+          text: 'Previous assistant turn.',
+        }),
+        message({
+          id: 'user-wrong-text-match',
+          role: 'user',
+          text: 'Old retry mentions msg-app but is not the accepted prompt.',
+        }),
+        message({
+          id: 'assistant-wrong-text-match',
+          role: 'assistant',
+          parentId: 'user-wrong-text-match',
+          text: 'stale reply',
+        }),
+        message({
+          id: 'user-exact-runtime-prompt',
+          role: 'user',
+          text: 'Runtime delivery prompt with redacted app id.',
+        }),
+        message({
+          id: 'assistant-exact-runtime-prompt',
+          role: 'assistant',
+          parentId: 'user-exact-runtime-prompt',
+          text: 'current reply',
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_plain_text')
+    expect(observed.deliveredUserMessageId).toBe('user-exact-runtime-prompt')
+    expect(observed.assistantMessageId).toBe('assistant-exact-runtime-prompt')
+    expect(observed.latestAssistantPreview).toBe('current reply')
+  })
+
   test('real fixture matches delivered prompt by inbound message id instead of latest user', () => {
     const observed = observeOpenCodeDeliveryResponse({
       inboundMessageId: 'a999f8e3-f0e9-407d-8680-ec9be463ea24',

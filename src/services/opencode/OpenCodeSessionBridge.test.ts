@@ -826,6 +826,85 @@ describe('OpenCodeSessionBridge', () => {
     expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
   })
 
+  test('posts prompt_async with app-owned message id without waiting for turn-settled in acceptance mode', async () => {
+    const promptBodies: unknown[] = []
+    const hookEvents: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      turnSettledObserver: {
+        observe: () => {
+          throw new Error('turn-settled observer must not be attached in acceptance-only mode')
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async (_sessionId, body) => {
+            promptBodies.push(body)
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Accept fast',
+      agent: 'teammate',
+      onPromptSubmitting: async event => {
+        hookEvents.push(`submitting:${event.sessionId}:${event.runtimePromptMessageId}`)
+      },
+      onPromptAccepted: async event => {
+        hookEvents.push(`accepted:${event.sessionId}:${event.runtimePromptMessageId}`)
+      },
+    })
+
+    expect(result.runtimePromptMessageId).toMatch(/^msg_/)
+    expect(result.hookDiagnostics).toEqual([])
+    expect(promptBodies).toEqual([
+      {
+        messageID: result.runtimePromptMessageId,
+        agent: 'teammate',
+        noReply: false,
+        system: undefined,
+        model: {
+          providerID: 'openai',
+          modelID: 'gpt-5.4-mini',
+        },
+        parts: [{ type: 'text', text: 'Accept fast' }],
+      },
+    ])
+    expect(hookEvents).toEqual([
+      `submitting:session-1:${result.runtimePromptMessageId}`,
+      `accepted:session-1:${result.runtimePromptMessageId}`,
+    ])
+  })
+
   test('rejects noReply prompt_async before attaching turn-settled observation', async () => {
     let hostEnsured = false
     const bridge = new OpenCodeSessionBridge({

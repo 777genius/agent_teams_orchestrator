@@ -41,6 +41,7 @@ export type OpenCodeDeliveryResponseObservation = {
 export type ObserveOpenCodeDeliveryResponseInput = {
   inboundMessageId?: string | null
   prePromptCursor?: string | null
+  runtimePromptMessageId?: string | null
   summary: OpenCodeSessionReconcileSummary
 }
 
@@ -178,10 +179,18 @@ function findDeliveredUserMessages(input: ObserveOpenCodeDeliveryResponseInput):
 } {
   const inboundMessageId = input.inboundMessageId?.trim() || null
   const prePromptCursor = input.prePromptCursor?.trim() || null
+  const runtimePromptMessageId = input.runtimePromptMessageId?.trim() || null
   const userMessages = input.summary.messages.filter(
     (message): message is OpenCodeCanonicalMessage & { id: string } =>
       message.role === 'user' && typeof message.id === 'string' && message.id.length > 0,
   )
+
+  if (runtimePromptMessageId) {
+    const exact = userMessages.filter(message => message.id === runtimePromptMessageId)
+    if (exact.length > 0) {
+      return { messages: exact, usedCursorFallback: false, needsFullHistory: false }
+    }
+  }
 
   if (inboundMessageId) {
     const exact = userMessages.filter(message => message.text.includes(inboundMessageId))

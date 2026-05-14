@@ -10,7 +10,10 @@ import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
-import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
+import {
+  buildOpenCodeRuntimePromptMessageId,
+  openCodeTurnSettledObserver,
+} from './OpenCodeTurnSettledObserver.js'
 
 import type {
   OpenCodeAuthState,
@@ -888,10 +891,64 @@ export class OpenCodeSessionBridge {
     })
   }
 
+  async promptAsyncUntilAccepted(
+    record: OpenCodeSessionRecord,
+    params: {
+      text: string
+      parts?: OpenCodePromptPart[]
+      agent?: string
+      noReply?: boolean
+      system?: string
+    } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted'>,
+  ): Promise<{
+    runtimePromptMessageId: string
+    hookDiagnostics: string[]
+  }> {
+    if (params.noReply) {
+      throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
+    }
+    return this.withSessionHost(record, async ({ baseUrl }) => {
+      const runtimePromptMessageId = buildOpenCodeRuntimePromptMessageId()
+      const client = this.clientFactory.create(baseUrl)
+      const hookDiagnostics: string[] = []
+      await params.onPromptSubmitting?.({
+        sessionId: record.opencodeSessionId,
+        runtimePromptMessageId,
+        baseUrl,
+      })
+      await client.promptSessionAsync(record.opencodeSessionId, {
+        messageID: runtimePromptMessageId,
+        agent: params.agent,
+        noReply: false,
+        system: params.system,
+        model: parseProviderScopedModel(record.selectedModel),
+        parts: buildOpenCodePromptParts({
+          text: params.text,
+          parts: params.parts,
+        }),
+      })
+      try {
+        await params.onPromptAccepted?.({
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId,
+        })
+      } catch (error) {
+        hookDiagnostics.push(
+          `OpenCode prompt accepted hook failed - ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      return {
+        runtimePromptMessageId,
+        hookDiagnostics,
+      }
+    })
+  }
+
   async reconcileSession(
     record: OpenCodeSessionRecord,
     options: {
       limit?: number
+      sessionId?: string | null
     } = {},
   ): Promise<{
     record: OpenCodeSessionRecord
@@ -946,7 +1003,8 @@ export class OpenCodeSessionBridge {
         }),
       ])
       const messageDiagnostics: string[] = []
-      let messages = await client.getSessionMessages(record.opencodeSessionId, options.limit)
+      const targetSessionId = options.sessionId?.trim() || record.opencodeSessionId
+      let messages = await client.getSessionMessages(targetSessionId, options.limit)
       if (
         typeof options.limit === 'number'
         && record.lastCanonicalCursor
@@ -955,17 +1013,17 @@ export class OpenCodeSessionBridge {
         messageDiagnostics.push(
           `Stored cursor ${record.lastCanonicalCursor} was missing from the latest ${options.limit} messages, rebuilding full OpenCode session history`,
         )
-        messages = await client.getSessionMessages(record.opencodeSessionId)
+        messages = await client.getSessionMessages(targetSessionId)
       }
-      const rawStatus = statusMap[record.opencodeSessionId] ?? null
+      const rawStatus = statusMap[targetSessionId] ?? null
       const summary = this.eventTranslator.reconcileSessionMessages({
-        sessionId: record.opencodeSessionId,
+        sessionId: targetSessionId,
         rawStatus,
         messages,
       })
       summary.profileAuthState = profile.authState
       const pendingPermissionRequestIds = normalizeOpenCodePermissions(pendingPermissions)
-        .filter(permission => permission.sessionId === record.opencodeSessionId)
+        .filter(permission => permission.sessionId === targetSessionId)
         .map(permission => permission.requestId)
       summary.pendingPermissionRequestIds = pendingPermissionRequestIds
       if (pendingPermissionRequestIds.length > 0) {
@@ -990,18 +1048,23 @@ export class OpenCodeSessionBridge {
         lastKnownDurableState: summary.durableState,
         resolvedBehaviorFingerprint: resolvedConfigFingerprint ?? record.resolvedBehaviorFingerprint,
       })
+      const isCurrentSession = targetSessionId === record.opencodeSessionId
 
       if (
-        nextRecord.lastCanonicalCursor !== record.lastCanonicalCursor
-        || nextRecord.lastKnownRawStatus !== record.lastKnownRawStatus
-        || nextRecord.lastKnownDurableState !== record.lastKnownDurableState
-        || nextRecord.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
+        isCurrentSession &&
+        (
+          nextRecord.lastCanonicalCursor !== record.lastCanonicalCursor
+          || nextRecord.lastKnownRawStatus !== record.lastKnownRawStatus
+          || nextRecord.lastKnownDurableState !== record.lastKnownDurableState
+          || nextRecord.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
+        )
       ) {
         await this.sessionStore.upsert(nextRecord)
       }
 
+      const reconciledRecord = isCurrentSession ? nextRecord : record
       return {
-        record: runtimePid ? { ...nextRecord, runtimePid } : nextRecord,
+        record: runtimePid ? { ...reconciledRecord, runtimePid } : reconciledRecord,
         summary,
       }
     })
