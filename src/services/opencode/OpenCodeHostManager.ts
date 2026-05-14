@@ -273,6 +273,19 @@ function isOpenCodePreflightHostLease(lease: PersistentHostLeaseRecord): boolean
   return lease.teamId === OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID
 }
 
+type UnrefableHandle = { unref?: () => void } | null | undefined
+
+function unrefHandle(handle: UnrefableHandle): void {
+  handle?.unref?.()
+}
+
+function unrefChildProcessHandle(child: ChildProcess): void {
+  unrefHandle(child)
+  unrefHandle(child.stdout as UnrefableHandle)
+  unrefHandle(child.stderr as UnrefableHandle)
+  unrefHandle(child.stdin as UnrefableHandle)
+}
+
 function normalizePersistentHostLeases(
   value: unknown,
 ): Record<string, PersistentHostLeaseRecord> {
@@ -790,7 +803,9 @@ export class OpenCodeHostManager {
       {
         cwd: profile.projectPath,
         env: profile.env,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
       },
     )
   }
@@ -902,6 +917,7 @@ export class OpenCodeHostManager {
     }
     this.hosts.set(hostKey, entry)
     this.bindHostLifecycle(hostKey, entry)
+    unrefChildProcessHandle(child)
 
     try {
       const health = await this.waitForHealthyHost(baseUrl)

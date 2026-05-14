@@ -41,25 +41,41 @@ const baseProfile: OpenCodePreparedProfile = {
 function createMockChildProcess(pid = 4242): {
   child: ChildProcess
   killedSignals: Array<NodeJS.Signals | undefined>
+  unrefCalls: string[]
 } {
   const emitter = new EventEmitter() as ChildProcess
   const stdout = new PassThrough()
   const stderr = new PassThrough()
   const killedSignals: Array<NodeJS.Signals | undefined> = []
+  const unrefCalls: string[] = []
 
   Object.assign(emitter, {
     pid,
     stdout,
     stderr,
+    unref() {
+      unrefCalls.push('child')
+    },
     kill(signal?: NodeJS.Signals) {
       killedSignals.push(signal)
       return true
+    },
+  })
+  Object.assign(stdout, {
+    unref() {
+      unrefCalls.push('stdout')
+    },
+  })
+  Object.assign(stderr, {
+    unref() {
+      unrefCalls.push('stderr')
     },
   })
 
   return {
     child: emitter,
     killedSignals,
+    unrefCalls,
   }
 }
 
@@ -144,6 +160,7 @@ describe('OpenCodeHostManager', () => {
     expect(first).toBe(second)
     expect(first.state).toBe('healthy')
     expect(first.projectBehaviorFingerprint).toBe('behavior-v1')
+    expect(spawned.unrefCalls).toEqual(['child', 'stdout', 'stderr'])
 
     await manager.releaseHost('host-key')
     expect(manager.getHost('host-key')?.state).toBe('healthy')
