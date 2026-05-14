@@ -3,6 +3,16 @@ import type { ZodTypeAny } from 'zod/v4'
 
 export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
+export const EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const satisfies readonly EffortLevel[]
+
 export type AnyZodRawShape = Record<string, ZodTypeAny>
 
 export type InferShape<Schema extends AnyZodRawShape> = {
