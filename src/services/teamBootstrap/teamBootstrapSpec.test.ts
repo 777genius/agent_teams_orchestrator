@@ -103,6 +103,72 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members).toEqual([])
   })
 
+  test('accepts large startup bootstrap specs up to sixteen teammates', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-sixteen-members.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-sixteen-members',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'sixteen-ready-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: Array.from({ length: 16 }, (_, index) => ({
+          name: `member-${index + 1}`,
+          role: 'developer',
+          workflow: 'Handle assigned work.',
+        })),
+      }),
+      'utf8',
+    )
+
+    const request = await readTeamBootstrapSpec(specPath)
+
+    expect(request.members).toHaveLength(16)
+  })
+
+  test('rejects startup bootstrap specs above sixteen teammates', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    const specPath = join(tempRoot, 'bootstrap-too-many-members.json')
+    await mkdir(workspaceDir, { recursive: true })
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-too-many-members',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'too-many-team',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: Array.from({ length: 17 }, (_, index) => ({
+          name: `member-${index + 1}`,
+          role: 'developer',
+          workflow: 'Handle assigned work.',
+        })),
+      }),
+      'utf8',
+    )
+
+    await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
+      /expected array to have <=16 items/,
+    )
+  })
+
   test('preserves explicit member prompts when provided', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })

@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'crypto'
-import { lstat, mkdir, readFile, rename, writeFile } from 'fs/promises'
-import { dirname, join } from 'path'
+import { lstat, readFile } from 'fs/promises'
+import { join } from 'path'
 
 import { errorMessage } from '../../utils/errors.js'
 import { logForDebugging } from '../../utils/debug.js'
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { getTeamDir, sanitizeName } from '../../utils/swarm/teamHelpers.js'
 import type { BootstrapProvider } from './teamBootstrapTypes.js'
 
@@ -198,15 +199,11 @@ export async function prepareNativeAppManagedBootstrapContextFile(params: {
   }
 
   const dir = join(getTeamDir(params.teamName), 'runtime', 'native-bootstrap')
-  await mkdir(dir, { recursive: true })
   const finalPath = join(
     dir,
     `${sanitizeName(params.memberName)}-${randomUUID()}.native-bootstrap.json`,
   )
-  const tempPath = `${finalPath}.tmp`
-  await writeFile(tempPath, JSON.stringify(context), { encoding: 'utf8', mode: 0o600 })
-  await mkdir(dirname(finalPath), { recursive: true })
-  await rename(tempPath, finalPath)
+  await writeJsonFileAtomic(finalPath, context, { mode: 0o600 })
   return { [NATIVE_APP_MANAGED_BOOTSTRAP_CONTEXT_ENV]: finalPath }
 }
 

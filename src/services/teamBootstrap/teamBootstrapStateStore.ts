@@ -1,6 +1,6 @@
-import * as fs from 'fs/promises'
-import { dirname, join } from 'path'
+import { join } from 'path'
 import { getTeamDir } from 'src/utils/swarm/teamHelpers.js'
+import { writeJsonFileAtomic } from 'src/utils/atomicWrite.js'
 import {
   assertBootstrapPhaseTransition,
   isTerminalBootstrapPhase,
@@ -27,13 +27,10 @@ function sanitizeBootstrapFailureReason(reason: string): string {
 }
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-  await fs.mkdir(dirname(filePath), { recursive: true })
-  const tempPath = `${filePath}.tmp.${process.pid}.${Date.now()}`
-  await fs.writeFile(tempPath, JSON.stringify(value, null, 2), {
-    encoding: 'utf8',
+  await writeJsonFileAtomic(filePath, value, {
+    indent: 2,
     mode: 0o600,
   })
-  await fs.rename(tempPath, filePath)
 }
 
 function getBootstrapStatePath(teamName: string): string {
