@@ -379,6 +379,9 @@ function applyManagedPathEnvironmentToMcpConfig(
   const appMcpConfig = {
     ...asRecord(mcpConfig[OPEN_CODE_APP_MCP_SERVER_NAME]),
   }
+  if (appMcpConfig.type === 'remote') {
+    return
+  }
   appMcpConfig.environment = {
     ...asRecord(appMcpConfig.environment),
     ...environment,
@@ -401,7 +404,7 @@ function normalizeManagedConfigForFingerprint(value: unknown): unknown {
   return Object.keys(record).sort().reduce<Record<string, unknown>>((acc, key) => {
     // Environment values like PATH, TMPDIR, and control URLs are runtime
     // transport detail, not capability identity for production proof.
-    if (key === 'environment') {
+    if (key === 'environment' || (key === 'url' && record.type === 'remote')) {
       return acc
     }
     acc[key] = normalizeManagedConfigForFingerprint(record[key])

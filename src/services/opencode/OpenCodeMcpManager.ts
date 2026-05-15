@@ -26,6 +26,7 @@ const OPEN_CODE_APP_MCP_VERIFY_POLL_MS = 250
 const OPEN_CODE_MCP_ENTRY_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY'
 const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
 const OPEN_CODE_MCP_ARGS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON'
+const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
   'HOME',
@@ -102,6 +103,21 @@ function parseArgsJson(value: string | null): string[] | null {
       .map(item => asString(item))
       .filter((item): item is string => Boolean(item))
     return args.length > 0 ? args : null
+  } catch {
+    return null
+  }
+}
+
+function parseMcpRemoteUrl(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
+    }
+    return parsed.toString()
   } catch {
     return null
   }
@@ -273,9 +289,23 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   const env = deps.env ?? process.env
   const pathExists = deps.pathExists ?? defaultPathExists
   const forwardedEnvironment = buildForwardedEnvironment(env)
+  const remoteUrlOverride = parseMcpRemoteUrl(asString(env[OPEN_CODE_MCP_URL_ENV]))
   const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
   const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
   const argsOverride = parseArgsJson(asString(env[OPEN_CODE_MCP_ARGS_JSON_ENV]))
+
+  if (remoteUrlOverride) {
+    return {
+      source: 'env-override',
+      config: {
+        type: 'remote',
+        url: remoteUrlOverride,
+        enabled: true,
+        timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+        oauth: false,
+      },
+    }
+  }
 
   if (argsOverride) {
     return {
@@ -435,6 +465,22 @@ function getEntryCommand(entry: OpenCodeMcpStatusEntry | null): string[] | null 
   return null
 }
 
+function getEntryUrl(entry: OpenCodeMcpStatusEntry | null): string | null {
+  const candidates = [
+    entry,
+    asRecord(entry?.config),
+    asRecord(entry?.server),
+    asRecord(entry?.options),
+  ]
+  for (const candidate of candidates) {
+    const url = parseMcpRemoteUrl(asString(candidate?.url))
+    if (url) {
+      return url
+    }
+  }
+  return null
+}
+
 function appMcpConfigMatchesRequiredRuntime(
   entry: OpenCodeMcpStatusEntry | null,
   desiredConfig: OpenCodeMcpServerConfig,
@@ -467,6 +513,17 @@ function appMcpConfigMatchesRequiredRuntime(
       return {
         ok: false,
         reason: 'existing app MCP command does not match current launch command',
+      }
+    }
+  }
+
+  const desiredUrl = parseMcpRemoteUrl(asString(desiredConfig.url))
+  if (desiredUrl) {
+    const entryUrl = getEntryUrl(entry)
+    if (entryUrl !== desiredUrl) {
+      return {
+        ok: false,
+        reason: 'existing app MCP URL does not match current launch URL',
       }
     }
   }
@@ -580,12 +637,16 @@ export class OpenCodeMcpManager {
     if (existingMatch.matchedServerName) {
       const connected = inferMcpConnected(existingMatch.entry)
       let launchConfig: ResolvedAppMcpLaunchConfig | null = null
+      const currentEnv = this.deps.env ?? process.env
       const shouldVerifyExistingConfig =
         params.attachIfMissing === true
-        && OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
-          const value = (this.deps.env ?? process.env)[key]
-          return typeof value === 'string' && value.length > 0
-        })
+        && (
+          typeof currentEnv[OPEN_CODE_MCP_URL_ENV] === 'string'
+          || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
+            const value = currentEnv[key]
+            return typeof value === 'string' && value.length > 0
+          })
+        )
       if (shouldVerifyExistingConfig) {
         launchConfig = await this.resolveLaunchConfig()
         let compatibility = appMcpConfigMatchesRequiredRuntime(
