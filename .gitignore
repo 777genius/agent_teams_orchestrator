@@ -5,8 +5,12 @@ dist/
 /cli-dev
 /cli-dev.cmd
 openclaw/
-competitors/*/.venv/
-competitors/*/.pytest_cache/
+
+# Competitor directories are local upstream clones used for research only.
+# Do not track new clone contents or local edits there.
+/competitors/*
+!/competitors/README.md
+!/competitors/AGENTS.md
 
 # Local release operator notes
 /ORCHESTRATOR_RELEASE_RUNBOOK.local.md
