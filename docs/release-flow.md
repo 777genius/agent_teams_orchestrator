@@ -18,7 +18,7 @@ What lives here:
 What does **not** live here by default:
 - public delivery binaries for app users
 
-## 2. `claude_agent_teams_ui` release
+## 2. `agent-teams-ai` release
 
 Purpose:
 - public delivery channel for Electron builds
@@ -36,7 +36,7 @@ Important:
 ## Current contract
 
 - `agent_teams_orchestrator` tag identifies the source revision used to build the runtime
-- `claude_agent_teams_ui` release tag identifies where users download runtime artifacts
+- `agent-teams-ai` release tag identifies where users download runtime artifacts
 - `claude_team/runtime.lock.json` binds these two together:
   - `sourceRef` = private runtime source tag
   - `releaseTag` = public UI release that stores binary assets
@@ -53,7 +53,7 @@ Steps:
 5. Create and push an immutable git tag like `v0.0.3`
 6. Create a private GitHub Release for that tag
 
-This does **not** publish new runtime assets to `claude_agent_teams_ui`.
+This does **not** publish new runtime assets to `agent-teams-ai`.
 
 Important:
 - a private source release alone does **not** update what end users download
@@ -66,17 +66,37 @@ Use this when the runtime binary must be refreshed for public `pnpm dev` or pack
 Run the private workflow `release-runtime.yml` with:
 - `source_ref` = runtime source tag, for example `v0.0.3`
 - `runtime_version` = runtime version, for example `0.0.3`
-- `target_release_repo` = `777genius/claude_agent_teams_ui`
+- `target_release_repo` = `777genius/agent-teams-ai`
 - `target_release_tag` = existing public release, for example `v1.2.0`
 
 This builds the runtime from the private repo and uploads the versioned archives into the chosen public UI release.
 
 After publishing assets, also update `claude_team/runtime.lock.json` to the new runtime version if you want `pnpm dev` and packaged app flows to start using it.
 
+## Frontend-managed release
+
+The preferred production flow is for the frontend release workflow to coordinate runtime delivery:
+
+1. Push a frontend tag, for example `v1.3.0`.
+2. The frontend workflow reads `claude_team/runtime.lock.json`.
+3. If the runtime assets for that lock are missing from the frontend release, the workflow triggers this repo's private `release-runtime.yml` with `workflow_dispatch`.
+4. The frontend workflow finds and polls the exact orchestrator run name:
+   `runtime <runtime_version> -> <target_release_repo>@<target_release_tag>`.
+5. After the orchestrator run succeeds, the frontend workflow verifies all runtime assets exist in the frontend release.
+6. Platform packaging jobs download and unpack the matching runtime into `resources/runtime` before `electron-builder`.
+
+This keeps the packaged Electron app self-contained while still keeping the runtime source private.
+
+Required frontend secret:
+- `RUNTIME_BUILD_DISPATCH_TOKEN` with permission to dispatch and read Actions runs in `777genius/agent_teams_orchestrator`.
+
+Required orchestrator secret:
+- `BINARIES_PUBLISH_TOKEN` with permission to upload assets into the frontend release repo.
+
 ## Recommended rule
 
 - create a private orchestrator release whenever you want a clean source milestone
-- publish runtime assets into `claude_agent_teams_ui` only when the public app/dev delivery path actually needs new binaries
+- publish runtime assets into `agent-teams-ai` only when the public app/dev delivery path actually needs new binaries
 - if the new runtime adds commands or behavior expected by the UI, do **both**:
   - publish the runtime assets into the UI release
   - bump `claude_team/runtime.lock.json`
