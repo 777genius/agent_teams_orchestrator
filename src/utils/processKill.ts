@@ -71,23 +71,33 @@ export function killProcessTree(
 function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
   return new Promise(resolve => {
     let done = false
+    let child: ReturnType<typeof spawn> | null = null
     const finish = () => {
       if (done) return
       done = true
       clearTimeout(timeout)
       resolve()
     }
-    const timeout = setTimeout(finish, timeoutMs)
+    const timeout = setTimeout(() => {
+      try {
+        child?.kill('SIGKILL')
+      } catch {
+        // Best-effort cleanup.
+      }
+      finish()
+    }, timeoutMs)
     timeout.unref?.()
 
     try {
       const { command, args } = buildWindowsTaskkillInvocation(pid)
-      const child = spawn(command, args, {
+      child = spawn(command, args, {
         stdio: 'ignore',
+        detached: true,
         windowsHide: true,
       })
       child.once('error', finish)
       child.once('close', finish)
+      child.unref()
     } catch {
       finish()
     }

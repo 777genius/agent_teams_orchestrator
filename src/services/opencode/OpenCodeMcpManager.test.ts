@@ -420,6 +420,17 @@ describe('OpenCodeMcpManager', () => {
     })
   })
 
+  test('rejects invalid env override remote MCP URLs', async () => {
+    await expect(
+      resolveOpenCodeAppMcpLaunchConfig({
+        env: {
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'ws://127.0.0.1:41001/mcp',
+        },
+        pathExists: async () => false,
+      }),
+    ).rejects.toThrow('CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL must be an http(s) URL')
+  })
+
   test('reattaches an existing local app MCP server when the runtime provides a remote URL', async () => {
     let addCalls = 0
     let currentMcp: Record<string, Record<string, unknown>> = {
@@ -460,6 +471,56 @@ describe('OpenCodeMcpManager', () => {
     expect(addCalls).toBe(1)
     expect(result.summary.status).toBe('attached')
     expect(result.summary.diagnostics[0]).toContain('Reattached stale OpenCode app MCP server')
+    expect(currentMcp['agent-teams']).toMatchObject({
+      type: 'remote',
+      url: 'http://127.0.0.1:41002/mcp',
+      oauth: false,
+    })
+  })
+
+  test('reattaches an existing remote app MCP server when the runtime URL changed', async () => {
+    let addCalls = 0
+    let currentMcp: Record<string, Record<string, unknown>> = {
+      'agent-teams': {
+        connected: true,
+        type: 'remote',
+        url: 'http://127.0.0.1:41001/mcp',
+      },
+    }
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => currentMcp,
+          getConfig: async () => ({
+            mcp: currentMcp,
+          }),
+          addMcp: async (_name, config) => {
+            addCalls += 1
+            currentMcp = {
+              'agent-teams': {
+                connected: true,
+                ...config,
+              },
+            }
+            return currentMcp
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41002/mcp',
+      },
+      pathExists: async () => false,
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(addCalls).toBe(1)
+    expect(result.summary.status).toBe('attached')
+    expect(result.summary.diagnostics[0]).toContain('existing app MCP URL does not match')
     expect(currentMcp['agent-teams']).toMatchObject({
       type: 'remote',
       url: 'http://127.0.0.1:41002/mcp',

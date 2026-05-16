@@ -289,10 +289,15 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   const env = deps.env ?? process.env
   const pathExists = deps.pathExists ?? defaultPathExists
   const forwardedEnvironment = buildForwardedEnvironment(env)
-  const remoteUrlOverride = parseMcpRemoteUrl(asString(env[OPEN_CODE_MCP_URL_ENV]))
+  const remoteUrlOverrideRaw = asString(env[OPEN_CODE_MCP_URL_ENV])
+  const remoteUrlOverride = parseMcpRemoteUrl(remoteUrlOverrideRaw)
   const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
   const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
   const argsOverride = parseArgsJson(asString(env[OPEN_CODE_MCP_ARGS_JSON_ENV]))
+
+  if (remoteUrlOverrideRaw && !remoteUrlOverride) {
+    throw new Error(`${OPEN_CODE_MCP_URL_ENV} must be an http(s) URL`)
+  }
 
   if (remoteUrlOverride) {
     return {

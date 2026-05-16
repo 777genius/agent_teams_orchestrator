@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { join } from 'node:path'
 
-import { buildWindowsTaskkillInvocation, isProcessAlive } from './processKill.js'
+import { buildWindowsTaskkillInvocation, isProcessAlive, killProcessTreeAndWait } from './processKill.js'
 
 const originalSystemRoot = process.env.SystemRoot
 
@@ -35,5 +35,10 @@ describe('processKill', () => {
   it('treats invalid pids as not alive', () => {
     expect(isProcessAlive(0)).toBe(false)
     expect(isProcessAlive(-1)).toBe(false)
+  })
+
+  it('treats invalid pids as already stopped when waiting for process-tree cleanup', async () => {
+    await expect(killProcessTreeAndWait(0)).resolves.toBe(true)
+    await expect(killProcessTreeAndWait(-1)).resolves.toBe(true)
   })
 })

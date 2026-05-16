@@ -146,10 +146,20 @@ describe('OpenCodeProfileManager project behavior contract', () => {
   test('keeps generated OpenCode dependency caches outside per-profile HOME', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
     const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+    const previousMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+    const previousMcpArgsJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+    const previousMcpUrl = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
     const appDataHome = path.join(tempDir, 'app-data')
     const appCacheHome = path.join(tempDir, 'app-cache')
+    const mcpEntryPath = path.join(tempDir, 'agent-teams-mcp.js')
+    await writeFile(mcpEntryPath, 'process.stdin.resume()\n', 'utf8')
     process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = mcpEntryPath
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
     try {
       const manager = new OpenCodeProfileManager()
       const profile = await manager.prepareProfile(path.join(tempDir, 'project'))
@@ -180,6 +190,26 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
       } else {
         process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+      if (previousMcpCommand === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+      }
+      if (previousMcpEntry === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
+      }
+      if (previousMcpArgsJson === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = previousMcpArgsJson
+      }
+      if (previousMcpUrl === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = previousMcpUrl
       }
     }
   })
