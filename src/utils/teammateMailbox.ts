@@ -1121,6 +1121,25 @@ export function isPlanApprovalResponse(
   return null
 }
 
+export function isLegacyPlanApprovalResponseMessage(
+  messageText: string,
+): boolean {
+  try {
+    const parsed = jsonParse(messageText)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return false
+    }
+    const value = parsed as Record<string, unknown>
+    return (
+      value.type === 'plan_approval_response' &&
+      typeof value.request_id === 'string' &&
+      typeof value.approve === 'boolean'
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * Task assignment message sent when a task is assigned to a teammate
  */

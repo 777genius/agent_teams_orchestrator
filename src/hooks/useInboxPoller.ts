@@ -63,6 +63,7 @@ import {
 import { isInProcessTeammate } from '../utils/teammateContext.js'
 import {
   finalizeClaimedMessagesAsRead,
+  isLegacyPlanApprovalResponseMessage,
   isModeSetRequest,
   isPermissionRequest,
   isPermissionResponse,
@@ -1752,6 +1753,7 @@ export function useInboxPoller({
       const teamPermissionUpdates: TeammateMessage[] = []
       const modeSetRequests: TeammateMessage[] = []
       const planApprovalRequests: TeammateMessage[] = []
+      const planApprovalResponses: TeammateMessage[] = []
       const protocolMessagesHandledInline: TeammateMessage[] = []
       const protocolMessagesForLiveContext: TeammateMessage[] = []
 
@@ -1769,6 +1771,10 @@ export function useInboxPoller({
         const teamPermUpdate = isTeamPermissionUpdate(m.text)
         const modeSetReq = isModeSetRequest(m.text)
         const planApprovalReq = isPlanApprovalRequest(m.text)
+        const planApprovalResp = isPlanApprovalResponse(m.text)
+        const legacyPlanApprovalResp = isLegacyPlanApprovalResponseMessage(
+          m.text,
+        )
 
         if (permReq) {
           permissionRequests.push(m)
@@ -1788,6 +1794,8 @@ export function useInboxPoller({
           modeSetRequests.push(m)
         } else if (planApprovalReq) {
           planApprovalRequests.push(m)
+        } else if (planApprovalResp || legacyPlanApprovalResp) {
+          planApprovalResponses.push(m)
         }
       }
 
@@ -2178,6 +2186,10 @@ export function useInboxPoller({
           )
           protocolMessagesForLiveContext.push(m)
         }
+      }
+
+      if (planApprovalResponses.length > 0) {
+        protocolMessagesHandledInline.push(...planApprovalResponses)
       }
 
       if (shutdownRequests.length > 0 && isTeammate()) {

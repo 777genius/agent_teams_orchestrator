@@ -16,6 +16,8 @@ import {
   createCompatibilityInboxMessageId,
   finalizeClaimedMessagesAsRead,
   isAgentErrorNotificationMessage,
+  isLegacyPlanApprovalResponseMessage,
+  isPlanApprovalResponse,
   isSilentRegularMailboxMessageForLiveContext,
   isLiveInboxMirrorMessageOwnedBySession,
   readAndClaimInteractiveMailboxSnapshot,
@@ -123,6 +125,17 @@ describe('teammateMailbox', () => {
         timestamp: '2026-01-01T00:00:00.000Z',
       }),
     ).toBe('inbox-3d4d01c54fc0dc52')
+  })
+
+  it('classifies legacy plan approval responses without treating them as approvals', () => {
+    const legacyResponse = JSON.stringify({
+      type: 'plan_approval_response',
+      request_id: 'perm-1',
+      approve: true,
+    })
+
+    expect(isLegacyPlanApprovalResponseMessage(legacyResponse)).toBe(true)
+    expect(isPlanApprovalResponse(legacyResponse)).toBeNull()
   })
 
   it('writes canonical message ids for new mailbox rows', async () => {
