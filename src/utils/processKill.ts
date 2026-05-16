@@ -48,6 +48,7 @@ export function killProcessTree(
     const { command, args } = buildWindowsTaskkillInvocation(pid)
     const child = spawn(command, args, {
       stdio: 'ignore',
+      detached: true,
       windowsHide: true,
     })
     child.on('error', () => {
@@ -65,4 +66,71 @@ export function killProcessTree(
       // Best-effort cleanup.
     }
   }
+}
+
+function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
+  return new Promise(resolve => {
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(timeout)
+      resolve()
+    }
+    const timeout = setTimeout(finish, timeoutMs)
+    timeout.unref?.()
+
+    try {
+      const { command, args } = buildWindowsTaskkillInvocation(pid)
+      const child = spawn(command, args, {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      child.once('error', finish)
+      child.once('close', finish)
+    } catch {
+      finish()
+    }
+  })
+}
+
+async function waitForProcessExit(
+  pid: number,
+  timeoutMs: number,
+  pollMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true
+    }
+    await new Promise(resolve => setTimeout(resolve, pollMs))
+  }
+  return !isProcessAlive(pid)
+}
+
+export async function killProcessTreeAndWait(
+  pid: number | undefined,
+  signal: NodeJS.Signals = 'SIGTERM',
+  options: { timeoutMs?: number; pollMs?: number; taskkillTimeoutMs?: number } = {},
+): Promise<boolean> {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) {
+    return true
+  }
+
+  const timeoutMs = options.timeoutMs ?? 2_500
+  const pollMs = options.pollMs ?? 50
+
+  if (process.platform === 'win32') {
+    await runWindowsTaskkill(pid, options.taskkillTimeoutMs ?? timeoutMs)
+    return waitForProcessExit(pid, timeoutMs, pollMs)
+  }
+
+  try {
+    process.kill(pid, signal)
+  } catch {
+    return !isProcessAlive(pid)
+  }
+
+  return waitForProcessExit(pid, timeoutMs, pollMs)
 }
