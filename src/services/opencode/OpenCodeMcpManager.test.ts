@@ -50,6 +50,41 @@ describe('OpenCodeMcpManager', () => {
     expect(addCalls).toBe(0)
   })
 
+  test('ignores a blank remote URL env value when an app MCP server is already present', async () => {
+    let addCalls = 0
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => ({
+            'agent-teams': {
+              connected: true,
+            },
+          }),
+          addMcp: async () => {
+            addCalls += 1
+            return {}
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: '   ',
+      },
+      resolveLaunchConfig: async () => {
+        throw new Error('not used')
+      },
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(result.summary.status).toBe('present')
+    expect(result.summary.diagnostics).toEqual([])
+    expect(addCalls).toBe(0)
+  })
+
   test('reattaches an existing app MCP server when the forced Claude root changed', async () => {
     let addCalls = 0
     let currentMcp: Record<

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -409,6 +409,10 @@ const originalClientClose = Client.prototype.close
 let previousRuntimeTurnSettledSpoolRoot: string | undefined
 let previousAppMcpToolProofCachePath: string | undefined
 let previousAppMcpToolProofCacheDisabled: string | undefined
+let previousMcpCommand: string | undefined
+let previousMcpEntry: string | undefined
+let previousMcpArgsJson: string | undefined
+let previousMcpUrl: string | undefined
 let appMcpToolProofCacheDir: string | null = null
 
 beforeEach(async () => {
@@ -417,12 +421,22 @@ beforeEach(async () => {
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH
   previousAppMcpToolProofCacheDisabled =
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+  previousMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+  previousMcpArgsJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  previousMcpUrl = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   appMcpToolProofCacheDir = await mkdtemp(path.join(os.tmpdir(), 'agent-teams-mcp-proof-'))
   process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH = path.join(
     appMcpToolProofCacheDir,
     'proof-cache.json',
   )
   delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  const fakeMcpEntryPath = path.join(appMcpToolProofCacheDir, 'agent-teams-mcp.js')
+  await writeFile(fakeMcpEntryPath, 'process.stdin.resume()\n', 'utf8')
+  process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+  process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = fakeMcpEntryPath
+  delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   __resetAppMcpToolProofCacheForTests()
   openCodeCommandOutcomeStore.upsert = (async patch => ({
     schemaVersion: 1,
@@ -576,6 +590,26 @@ afterEach(async () => {
   } else {
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED =
       previousAppMcpToolProofCacheDisabled
+  }
+  if (previousMcpCommand == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+  }
+  if (previousMcpEntry == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
+  }
+  if (previousMcpArgsJson == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = previousMcpArgsJson
+  }
+  if (previousMcpUrl == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = previousMcpUrl
   }
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe

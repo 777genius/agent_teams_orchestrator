@@ -646,7 +646,7 @@ export class OpenCodeMcpManager {
       const shouldVerifyExistingConfig =
         params.attachIfMissing === true
         && (
-          typeof currentEnv[OPEN_CODE_MCP_URL_ENV] === 'string'
+          asString(currentEnv[OPEN_CODE_MCP_URL_ENV]) !== null
           || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
             const value = currentEnv[key]
             return typeof value === 'string' && value.length > 0
