@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-
-cd -P -- "$(dirname -- "$0")/.."
-
-bin/cortex eval "Cortex.Release.migrate()"

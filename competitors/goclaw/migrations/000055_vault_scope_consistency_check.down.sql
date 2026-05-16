@@ -1,1 +1,0 @@
-ALTER TABLE vault_documents DROP CONSTRAINT IF EXISTS vault_documents_scope_consistency;
