@@ -2,6 +2,10 @@
 
 Local competitor clones live here.
 
+These directories are upstream/reference clones, not product source. Do not edit
+competitor clone contents as part of normal product fixes. If a competitor needs
+to be refreshed, update it as an upstream snapshot and document the source.
+
 Current set:
 
 - `cortex`
