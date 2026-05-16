@@ -1927,6 +1927,52 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(callOrder).toEqual(['mcp:alice', 'prompt:alice'])
   })
 
+  test('proves app MCP tools through a remote URL override before launch', async () => {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'http://127.0.0.1:41009/mcp'
+    openCodeProvisioningProbe.probe = async () => snapshot
+    let connectedTransportName: string | null = null
+    ;(Client.prototype.connect as unknown as (transport: unknown) => Promise<void>) =
+      async transport => {
+        connectedTransportName = transport && typeof transport === 'object'
+          ? transport.constructor.name
+          : null
+      }
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
+      ok: true,
+      runtimePid: record.runtimePid,
+      status: 'present',
+      connected: true,
+      diagnostics: [],
+    })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-remote-mcp-proof',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(connectedTransportName).toBe('StreamableHTTPClientTransport')
+  })
+
   test('recreates launch session after app MCP is attached before bootstrap prompt', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     let ensureCount = 0
