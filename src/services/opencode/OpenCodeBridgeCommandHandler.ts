@@ -4,6 +4,8 @@ import nodePath from 'node:path'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
@@ -1405,6 +1407,50 @@ async function proveAppMcpTools(
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
 ): Promise<string[]> {
+  const remoteUrl = launchConfig.config.url
+  if (launchConfig.config.type === 'remote' || remoteUrl) {
+    if (!remoteUrl) {
+      throw new Error('Agent Teams MCP launch config is missing a remote URL')
+    }
+
+    const url = new URL(remoteUrl)
+    const transportOptions = launchConfig.config.headers
+      ? {
+          requestInit: {
+            headers: launchConfig.config.headers,
+          },
+        }
+      : undefined
+    const transports = [
+      () => new StreamableHTTPClientTransport(url, transportOptions),
+      () => new SSEClientTransport(url, transportOptions),
+    ]
+    let lastError: unknown = null
+
+    for (const createTransport of transports) {
+      const client = new Client({
+        name: 'agent-teams-opencode-readiness',
+        version: '1.0.0',
+      })
+      const transport = createTransport()
+      try {
+        await withTimeout(client.connect(transport), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+        const result = await withTimeout(client.listTools(), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+        return (result.tools ?? [])
+          .map(tool => tool.name)
+          .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+      } catch (error) {
+        lastError = error
+      } finally {
+        await client.close().catch(() => undefined)
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(String(lastError ?? 'Agent Teams MCP remote tools/list preflight failed'))
+  }
+
   const command = launchConfig.config.command
   if (!command || command.length === 0) {
     throw new Error('Agent Teams MCP launch config is missing a local command')

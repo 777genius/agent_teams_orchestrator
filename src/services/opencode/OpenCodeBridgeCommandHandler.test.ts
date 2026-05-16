@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -409,6 +409,10 @@ const originalClientClose = Client.prototype.close
 let previousRuntimeTurnSettledSpoolRoot: string | undefined
 let previousAppMcpToolProofCachePath: string | undefined
 let previousAppMcpToolProofCacheDisabled: string | undefined
+let previousMcpCommand: string | undefined
+let previousMcpEntry: string | undefined
+let previousMcpArgsJson: string | undefined
+let previousMcpUrl: string | undefined
 let appMcpToolProofCacheDir: string | null = null
 
 beforeEach(async () => {
@@ -417,12 +421,22 @@ beforeEach(async () => {
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH
   previousAppMcpToolProofCacheDisabled =
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+  previousMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+  previousMcpArgsJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  previousMcpUrl = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   appMcpToolProofCacheDir = await mkdtemp(path.join(os.tmpdir(), 'agent-teams-mcp-proof-'))
   process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_PATH = path.join(
     appMcpToolProofCacheDir,
     'proof-cache.json',
   )
   delete process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
+  const fakeMcpEntryPath = path.join(appMcpToolProofCacheDir, 'agent-teams-mcp.js')
+  await writeFile(fakeMcpEntryPath, 'process.stdin.resume()\n', 'utf8')
+  process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+  process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = fakeMcpEntryPath
+  delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
   __resetAppMcpToolProofCacheForTests()
   openCodeCommandOutcomeStore.upsert = (async patch => ({
     schemaVersion: 1,
@@ -576,6 +590,26 @@ afterEach(async () => {
   } else {
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED =
       previousAppMcpToolProofCacheDisabled
+  }
+  if (previousMcpCommand == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+  }
+  if (previousMcpEntry == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
+  }
+  if (previousMcpArgsJson == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON = previousMcpArgsJson
+  }
+  if (previousMcpUrl == null) {
+    delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL
+  } else {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = previousMcpUrl
   }
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
@@ -1891,6 +1925,105 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(callOrder).toEqual(['mcp:alice', 'prompt:alice'])
+  })
+
+  test('proves app MCP tools through a remote URL override before launch', async () => {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'http://127.0.0.1:41009/mcp'
+    openCodeProvisioningProbe.probe = async () => snapshot
+    let connectedTransportName: string | null = null
+    ;(Client.prototype.connect as unknown as (transport: unknown) => Promise<void>) =
+      async transport => {
+        connectedTransportName = transport && typeof transport === 'object'
+          ? transport.constructor.name
+          : null
+      }
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
+      ok: true,
+      runtimePid: record.runtimePid,
+      status: 'present',
+      connected: true,
+      diagnostics: [],
+    })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-remote-mcp-proof',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(connectedTransportName).toBe('StreamableHTTPClientTransport')
+  })
+
+  test('falls back to SSE when proving remote app MCP tools before launch', async () => {
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = 'http://127.0.0.1:41010/mcp'
+    openCodeProvisioningProbe.probe = async () => snapshot
+    const connectedTransportNames: string[] = []
+    ;(Client.prototype.connect as unknown as (transport: unknown) => Promise<void>) =
+      async transport => {
+        const name = transport && typeof transport === 'object'
+          ? transport.constructor.name
+          : 'unknown'
+        connectedTransportNames.push(name)
+        if (name === 'StreamableHTTPClientTransport') {
+          throw new Error('streamable unavailable')
+        }
+      }
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
+      ok: true,
+      runtimePid: record.runtimePid,
+      status: 'present',
+      connected: true,
+      diagnostics: [],
+    })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      record,
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-bootstrap-remote-mcp-sse-proof',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(connectedTransportNames).toEqual([
+      'StreamableHTTPClientTransport',
+      'SSEClientTransport',
+    ])
   })
 
   test('recreates launch session after app MCP is attached before bootstrap prompt', async () => {

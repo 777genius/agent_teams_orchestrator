@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { sleep } from '../../utils/sleep.js'
-import { killProcessTree } from '../../utils/processKill.js'
+import { killProcessTree, killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -24,6 +24,8 @@ const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500
 const OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS = 2_000
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
+const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
+const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
@@ -396,6 +398,19 @@ export class OpenCodeHostManager {
       return
     }
     killProcessTree(pid, signal)
+  }
+
+  private async killProcessAndWait(
+    pid: number,
+    signal: NodeJS.Signals,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    if (this.deps.killProcess) {
+      this.deps.killProcess(pid, signal)
+      await this.sleepMs(Math.min(timeoutMs, 250)).catch(() => undefined)
+      return !this.isProcessAlive(pid)
+    }
+    return killProcessTreeAndWait(pid, signal, { timeoutMs })
   }
 
   private now(): Date {
@@ -847,7 +862,9 @@ export class OpenCodeHostManager {
     const pid = child.pid
     try {
       if (pid) {
-        this.killProcess(pid, 'SIGTERM')
+        if (await this.killProcessAndWait(pid, 'SIGTERM', OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS)) {
+          return
+        }
       } else {
         child.kill('SIGTERM')
       }
@@ -859,13 +876,8 @@ export class OpenCodeHostManager {
       return
     }
 
-    await this.sleepMs(250).catch(() => undefined)
-    if (!this.isProcessAlive(pid)) {
-      return
-    }
-
     try {
-      this.killProcess(pid, 'SIGKILL')
+      await this.killProcessAndWait(pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
     } catch {
       // Best effort.
     }
@@ -1000,6 +1012,7 @@ export class OpenCodeHostManager {
     const entry = this.hosts.get(record.hostKey)
     const baseUrl = entry?.handle.baseUrl ?? record.baseUrl
     const pid = entry?.handle.pid ?? record.pid
+    let terminated = false
 
     try {
       await this.fetchJsonWithTimeout(
@@ -1015,26 +1028,31 @@ export class OpenCodeHostManager {
 
     if (entry?.child) {
       if (entry.child.pid) {
-        this.killProcess(entry.child.pid, 'SIGTERM')
+        terminated = await this.killProcessAndWait(
+          entry.child.pid,
+          'SIGTERM',
+          OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+        )
       } else {
         entry.child.kill('SIGTERM')
       }
     } else if (pid > 0 && this.isProcessAlive(pid)) {
       try {
-        this.killProcess(pid, 'SIGTERM')
+        terminated = await this.killProcessAndWait(
+          pid,
+          'SIGTERM',
+          OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS,
+        )
       } catch {
         // Best effort.
       }
     }
 
-    if (options.force && pid > 0) {
-      await this.sleepMs(250)
-      if (this.isProcessAlive(pid)) {
-        try {
-          this.killProcess(pid, 'SIGKILL')
-        } catch {
-          // Best effort.
-        }
+    if (options.force && pid > 0 && !terminated && this.isProcessAlive(pid)) {
+      try {
+        await this.killProcessAndWait(pid, 'SIGKILL', OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS)
+      } catch {
+        // Best effort.
       }
     }
 

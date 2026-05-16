@@ -50,6 +50,41 @@ describe('OpenCodeMcpManager', () => {
     expect(addCalls).toBe(0)
   })
 
+  test('ignores a blank remote URL env value when an app MCP server is already present', async () => {
+    let addCalls = 0
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => ({
+            'agent-teams': {
+              connected: true,
+            },
+          }),
+          addMcp: async () => {
+            addCalls += 1
+            return {}
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: '   ',
+      },
+      resolveLaunchConfig: async () => {
+        throw new Error('not used')
+      },
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(result.summary.status).toBe('present')
+    expect(result.summary.diagnostics).toEqual([])
+    expect(addCalls).toBe(0)
+  })
+
   test('reattaches an existing app MCP server when the forced Claude root changed', async () => {
     let addCalls = 0
     let currentMcp: Record<
@@ -400,6 +435,174 @@ describe('OpenCodeMcpManager', () => {
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
 
+  test('prefers env override remote MCP URL over local command overrides', async () => {
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/usr/local/bin/node',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp.js',
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config).toEqual({
+      type: 'remote',
+      url: 'http://127.0.0.1:41001/mcp',
+      enabled: true,
+      timeout: 30000,
+      oauth: false,
+    })
+  })
+
+  test('rejects invalid env override remote MCP URLs', async () => {
+    await expect(
+      resolveOpenCodeAppMcpLaunchConfig({
+        env: {
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'ws://127.0.0.1:41001/mcp',
+        },
+        pathExists: async () => false,
+      }),
+    ).rejects.toThrow('CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL must be an http(s) URL')
+  })
+
+  test('reattaches an existing local app MCP server when the runtime provides a remote URL', async () => {
+    let addCalls = 0
+    let currentMcp: Record<string, Record<string, unknown>> = {
+      'agent-teams': {
+        connected: true,
+        type: 'local',
+        command: ['node', '/tmp/agent-teams-mcp.js'],
+      },
+    }
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => currentMcp,
+          addMcp: async (_name, config) => {
+            addCalls += 1
+            currentMcp = {
+              'agent-teams': {
+                connected: true,
+                ...config,
+              },
+            }
+            return currentMcp
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41002/mcp',
+      },
+      pathExists: async () => false,
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(addCalls).toBe(1)
+    expect(result.summary.status).toBe('attached')
+    expect(result.summary.diagnostics[0]).toContain('Reattached stale OpenCode app MCP server')
+    expect(currentMcp['agent-teams']).toMatchObject({
+      type: 'remote',
+      url: 'http://127.0.0.1:41002/mcp',
+      oauth: false,
+    })
+  })
+
+  test('reattaches an existing remote app MCP server when the runtime URL changed', async () => {
+    let addCalls = 0
+    let currentMcp: Record<string, Record<string, unknown>> = {
+      'agent-teams': {
+        connected: true,
+        type: 'remote',
+        url: 'http://127.0.0.1:41001/mcp',
+      },
+    }
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => currentMcp,
+          getConfig: async () => ({
+            mcp: currentMcp,
+          }),
+          addMcp: async (_name, config) => {
+            addCalls += 1
+            currentMcp = {
+              'agent-teams': {
+                connected: true,
+                ...config,
+              },
+            }
+            return currentMcp
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41002/mcp',
+      },
+      pathExists: async () => false,
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(addCalls).toBe(1)
+    expect(result.summary.status).toBe('attached')
+    expect(result.summary.diagnostics[0]).toContain('existing app MCP URL does not match')
+    expect(currentMcp['agent-teams']).toMatchObject({
+      type: 'remote',
+      url: 'http://127.0.0.1:41002/mcp',
+      oauth: false,
+    })
+  })
+
+  test('uses resolved config URL when /mcp omits remote MCP config details', async () => {
+    let addCalls = 0
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => ({
+            'agent-teams': {
+              status: 'connected',
+            },
+          }),
+          getConfig: async () => ({
+            mcp: {
+              'agent-teams': {
+                type: 'remote',
+                url: 'http://127.0.0.1:41003/mcp',
+              },
+            },
+          }),
+          addMcp: async () => {
+            addCalls += 1
+            return {}
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41003/mcp',
+      },
+      pathExists: async () => false,
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(result.summary.status).toBe('present')
+    expect(result.summary.connected).toBe(true)
+    expect(addCalls).toBe(0)
+  })
+
   test('resolves env override MCP launch config with full args JSON', async () => {
     const result = await resolveOpenCodeAppMcpLaunchConfig({
       env: {
@@ -477,15 +680,16 @@ describe('OpenCodeMcpManager', () => {
   })
 
   test('resolves the runtime repo root from bundled dist entrypoints', () => {
+    const repoRoot = path.resolve('/repo/agent_teams_orchestrator')
     const root = resolveOpenCodeBridgeRepoRootForStartDir(
-      '/repo/agent_teams_orchestrator/dist/local-cli-dev',
+      path.join(repoRoot, 'dist', 'local-cli-dev'),
       {
         pathExists: targetPath =>
-          normalizePath(targetPath) === '/repo/agent_teams_orchestrator/package.json',
+          normalizePath(targetPath) === normalizePath(path.join(repoRoot, 'package.json')),
         readText: () => JSON.stringify({ name: 'claude-multimodel' }),
       },
     )
 
-    expect(normalizePath(root ?? '')).toBe('/repo/agent_teams_orchestrator')
+    expect(normalizePath(root ?? '')).toBe(normalizePath(repoRoot))
   })
 })
