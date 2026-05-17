@@ -18,9 +18,11 @@ let tempDir = ''
 let homeDir = ''
 let previousHome: string | undefined
 const LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS = 15_000
+const LEDGER_CLI_MODE_MATRIX_E2E_TIMEOUT_MS = 30_000
 const SNAPSHOT_PROJECT_ID = 'project-fixture'
 const supportsNewlineFilenames = process.platform !== 'win32'
 const newlinePathFixtureTest = supportsNewlineFilenames ? test : test.skip
+type SnapshotProofMode = 'off' | 'shadow' | 'single-change' | 'full'
 
 class FixtureOpenCodeOfflineSessionReader extends OpenCodeOfflineSessionReader {
   constructor(private readonly dbPath: string) {
@@ -414,6 +416,7 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   includeWriteOverwrite?: boolean
   includeApplyPatchUpdate?: boolean
   includeApplyPatchDelete?: boolean
+  includeSamePathEditChain?: boolean
 }): Promise<{ fromSnapshot: string; toSnapshot: string; gitDir: string }> {
   const profileDataDir = path.dirname(input.dbPath)
   const gitDir = path.join(profileDataDir, 'snapshot', SNAPSHOT_PROJECT_ID, hashFast(input.workspaceRoot))
@@ -445,6 +448,10 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
     await writeFile(path.join(input.workspaceRoot, '227', 'patch-update.ts'), 'export const patched = 1;\n', 'utf8')
   }
+  if (input.includeSamePathEditChain) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'chain.ts'), 'export const chain = 1;\n', 'utf8')
+  }
   const fromSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
   await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
   await writeFile(path.join(input.workspaceRoot, '227', 'index.html'), '<main>v1</main>\n', 'utf8')
@@ -466,6 +473,9 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   }
   if (input.includeApplyPatchUpdate) {
     await writeFile(path.join(input.workspaceRoot, '227', 'patch-update.ts'), 'export const patched = 2;\n', 'utf8')
+  }
+  if (input.includeSamePathEditChain) {
+    await writeFile(path.join(input.workspaceRoot, '227', 'chain.ts'), 'export const chain = 3;\n', 'utf8')
   }
   const toSnapshot = writeSnapshotTree(gitDir, input.workspaceRoot)
 
@@ -521,6 +531,38 @@ async function insertSnapshotOnlyEditToolpart(dbPath: string, workspaceRoot: str
         oldString: 'snapshot = 1',
         newString: 'snapshot = 2',
         callID: 'call-bob-edit-snapshot-only',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertSamePathEditChainToolparts(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-edit-chain-1',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_026,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'chain.ts'),
+        oldString: 'chain = 1',
+        newString: 'chain = 2',
+        callID: 'call-bob-edit-chain-1',
+      }),
+    })
+    insertPart(db, {
+      id: 'bob-edit-chain-2',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_027,
+      data: editToolPart({
+        filePath: path.join(workspaceRoot, '227', 'chain.ts'),
+        oldString: 'chain = 2',
+        newString: 'chain = 3',
+        callID: 'call-bob-edit-chain-2',
       }),
     })
   } finally {
@@ -998,8 +1040,14 @@ function runCliBackfill(input: {
   workspaceRoot: string
   deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
   dryRun?: boolean
+  homeDir?: string
+  snapshotProofMode?: SnapshotProofMode
 }) {
   const cliDev = cliDevCommand()
+  const env = childEnvForHome(input.homeDir ?? homeDir)
+  if (input.snapshotProofMode) {
+    env.OPENCODE_SNAPSHOT_PROOF_UPGRADE = input.snapshotProofMode
+  }
   return spawnSync(
     cliDev.command,
     [
@@ -1027,7 +1075,7 @@ function runCliBackfill(input: {
     ],
     {
       cwd: process.cwd(),
-      env: childEnvForHome(homeDir),
+      env,
       encoding: 'utf8',
     },
   )
@@ -1057,6 +1105,120 @@ async function readTaskChangeFreshness(projectDir: string, taskId: string): Prom
       'utf8',
     ),
   ) as Record<string, unknown>
+}
+
+function requireEvent(events: Array<Record<string, unknown>>, sourcePartId: string): Record<string, unknown> {
+  const event = events.find(candidate => candidate.sourcePartId === sourcePartId)
+  if (!event) {
+    throw new Error(`missing event ${sourcePartId}`)
+  }
+  return event
+}
+
+function contentHash(value: unknown): string | null {
+  return value && typeof value === 'object' && 'sha256' in value
+    ? String((value as { sha256?: unknown }).sha256 ?? '')
+    : null
+}
+
+function reviewEventFingerprint(events: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return events.map(event => ({
+    sourcePartId: event.sourcePartId,
+    source: event.source,
+    relativePath: event.relativePath,
+    operation: event.operation,
+    confidence: event.confidence,
+    evidenceProof: event.evidenceProof,
+    snapshotSource: event.snapshotSource ?? null,
+    beforeHash: contentHash(event.before),
+    afterHash: contentHash(event.after),
+    beforeState: event.beforeState ?? null,
+    afterState: event.afterState ?? null,
+    warnings: event.warnings ?? [],
+  })).sort((left, right) =>
+    String(left.sourcePartId).localeCompare(String(right.sourcePartId)) ||
+    String(left.relativePath).localeCompare(String(right.relativePath))
+  )
+}
+
+function bundleFileFingerprint(bundle: Record<string, unknown>): Array<Record<string, unknown>> {
+  return ((bundle.files ?? []) as Array<Record<string, unknown>>).map(file => ({
+    relativePath: file.relativePath,
+    latestOperation: file.latestOperation,
+    reviewability: file.reviewability,
+    contentAvailability: file.contentAvailability,
+    eventCount: file.eventCount,
+    createdInTask: file.createdInTask,
+    latestBeforeHash: file.latestBeforeHash ?? null,
+    latestAfterHash: file.latestAfterHash ?? null,
+  })).sort((left, right) => String(left.relativePath).localeCompare(String(right.relativePath)))
+}
+
+async function createSnapshotModeMatrixFixture(suffix: string): Promise<{
+  fixtureHomeDir: string
+  workspaceRoot: string
+  projectDir: string
+  deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
+}> {
+  const fixtureHomeDir = path.join(tempDir, `home-mode-${suffix}`)
+  const workspaceRoot = path.join(tempDir, `workspace-mode-${suffix}`)
+  const projectDir = path.join(tempDir, `claude-project-mode-${suffix}`)
+  const dataDir = envPathsDataDirForHome(fixtureHomeDir)
+  await mkdir(fixtureHomeDir, { recursive: true })
+  await mkdir(workspaceRoot, { recursive: true })
+  await mkdir(projectDir, { recursive: true })
+  const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+  await insertSnapshotOnlyEditToolpart(dbPath, workspaceRoot)
+  await insertSamePathEditChainToolparts(dbPath, workspaceRoot)
+  await createOpenCodeSnapshotGitStoreFixture({
+    dbPath,
+    workspaceRoot,
+    includeSnapshotOnlyEdit: true,
+    includeSamePathEditChain: true,
+  })
+  await createFixtureSessionStore(dataDir, workspaceRoot)
+  return {
+    fixtureHomeDir,
+    workspaceRoot,
+    projectDir,
+    deliveryContext: await createFixtureDeliveryContext(),
+  }
+}
+
+async function runSnapshotModeMatrixFixture(mode: SnapshotProofMode): Promise<{
+  result: {
+    outcome: string
+    importedEvents: number
+    diagnostics: string[]
+    snapshotProofMode?: SnapshotProofMode
+    snapshotShapeFingerprint?: string
+  }
+  events: Array<Record<string, unknown>>
+  bundle: Record<string, unknown>
+}> {
+  const fixture = await createSnapshotModeMatrixFixture(mode)
+  const cli = runCliBackfill({
+    projectDir: fixture.projectDir,
+    workspaceRoot: fixture.workspaceRoot,
+    deliveryContext: fixture.deliveryContext,
+    homeDir: fixture.fixtureHomeDir,
+    snapshotProofMode: mode,
+  })
+  expect(cli.status, `mode=${mode}\nstdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+  const stdout = JSON.parse(cli.stdout) as {
+    result: {
+      outcome: string
+      importedEvents: number
+      diagnostics: string[]
+      snapshotProofMode?: SnapshotProofMode
+      snapshotShapeFingerprint?: string
+    }
+  }
+  return {
+    result: stdout.result,
+    events: await readJsonlEvents(fixture.projectDir, 'task-1'),
+    bundle: await readTaskChangeBundle(fixture.projectDir, 'task-1'),
+  }
 }
 
 describe('OpenCode Ledger Bridge real fixture E2E', () => {
@@ -2069,6 +2231,110 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     })
     expect(await readJsonlEvents(projectDir, 'task-1')).toHaveLength(events.length)
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI snapshot proof mode matrix gates off shadow single-change and full behavior', async () => {
+    const off = await runSnapshotModeMatrixFixture('off')
+    const shadow = await runSnapshotModeMatrixFixture('shadow')
+    const singleChange = await runSnapshotModeMatrixFixture('single-change')
+    const full = await runSnapshotModeMatrixFixture('full')
+
+    expect(off.result).toMatchObject({
+      outcome: 'imported',
+      snapshotProofMode: 'off',
+      importedEvents: 7,
+    })
+    expect(shadow.result).toMatchObject({
+      outcome: 'imported',
+      snapshotProofMode: 'shadow',
+      importedEvents: 7,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(singleChange.result).toMatchObject({
+      outcome: 'imported',
+      snapshotProofMode: 'single-change',
+      importedEvents: 7,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(full.result).toMatchObject({
+      outcome: 'imported',
+      snapshotProofMode: 'full',
+      importedEvents: 7,
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+
+    expect(off.result.diagnostics).toContain(
+      'snapshot-upgrade-skipped/feature-flag-off: OpenCode snapshot proof upgrade is disabled.',
+    )
+    expect(shadow.result.diagnostics.some(diagnostic =>
+      diagnostic.startsWith('snapshot-proof-shadow:') &&
+      diagnostic.includes('wouldUpgrade=3') &&
+      diagnostic.includes('applied=0')
+    )).toBe(true)
+
+    expect(reviewEventFingerprint(shadow.events)).toEqual(reviewEventFingerprint(off.events))
+    expect(bundleFileFingerprint(shadow.bundle)).toEqual(bundleFileFingerprint(off.bundle))
+
+    const snapshotCandidateIds = new Set([
+      'bob-edit-snapshot-only',
+      'bob-edit-chain-1',
+      'bob-edit-chain-2',
+    ])
+    const stableFingerprint = (events: Array<Record<string, unknown>>) =>
+      reviewEventFingerprint(events.filter(event => !snapshotCandidateIds.has(String(event.sourcePartId))))
+    expect(stableFingerprint(singleChange.events)).toEqual(stableFingerprint(off.events))
+    expect(stableFingerprint(full.events)).toEqual(stableFingerprint(off.events))
+
+    const singleSnapshotOnly = requireEvent(singleChange.events, 'bob-edit-snapshot-only')
+    expect(singleSnapshotOnly).toMatchObject({
+      relativePath: '227/snapshot-only.js',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+      snapshotSource: 'opencode',
+    })
+    expect(singleSnapshotOnly.snapshotId).toBeTruthy()
+    expect(contentHash(singleSnapshotOnly.before)).toBeTruthy()
+    expect(contentHash(singleSnapshotOnly.after)).toBeTruthy()
+    expect(singleChange.result.diagnostics).toContain('snapshot-upgrade-skipped/single-change-only: 227/chain.ts')
+    for (const sourcePartId of ['bob-edit-chain-1', 'bob-edit-chain-2']) {
+      expect(requireEvent(singleChange.events, sourcePartId)).toMatchObject({
+        relativePath: '227/chain.ts',
+        confidence: 'medium',
+        evidenceProof: 'metadata-only-fallback',
+        before: null,
+        after: null,
+      })
+    }
+
+    for (const sourcePartId of ['bob-edit-chain-1', 'bob-edit-chain-2']) {
+      const event = requireEvent(full.events, sourcePartId)
+      expect(event).toMatchObject({
+        relativePath: '227/chain.ts',
+        confidence: 'high',
+        evidenceProof: 'inverse-edit-chain',
+        snapshotSource: 'opencode',
+      })
+      expect(event.snapshotId).toBeTruthy()
+      expect(contentHash(event.before)).toBeTruthy()
+      expect(contentHash(event.after)).toBeTruthy()
+    }
+
+    const singleFiles = (singleChange.bundle.files ?? []) as Array<Record<string, unknown>>
+    expect(singleFiles.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+    })
+    expect(singleFiles.find(file => file.relativePath === '227/chain.ts')).toMatchObject({
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
+      eventCount: 2,
+    })
+    const fullFiles = (full.bundle.files ?? []) as Array<Record<string, unknown>>
+    expect(fullFiles.find(file => file.relativePath === '227/chain.ts')).toMatchObject({
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      eventCount: 2,
+    })
+  }, LEDGER_CLI_MODE_MATRIX_E2E_TIMEOUT_MS)
 
   test('CLI command imports snapshot-backed write overwrite as full-text modify Changes row', async () => {
     const workspaceRoot = path.join(tempDir, 'workspace-cli-write-overwrite')
