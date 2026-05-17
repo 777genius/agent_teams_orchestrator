@@ -8,6 +8,7 @@ import {
   doesOpenCodeAuthStoreIncludeSource,
   mergeOpenCodeAuthStores,
   readOpenCodeAuthProviderSummaries,
+  reconcileOpenCodeManagedAuthStore,
   removeOpenCodeAuthCredential,
   syncOpenCodeManagedAuthStore,
   upsertOpenCodeApiAuthCredential,
@@ -100,6 +101,48 @@ describe('OpenCodeAuthStore', () => {
       openrouter: { type: 'api', key: 'sk-managed' },
       openai: { type: 'oauth' },
       anthropic: { type: 'api', key: 'sk-anthropic' },
+    })
+  })
+
+  test('reconciles managed auth to current sources and drops stale providers', async () => {
+    const globalAuthPath = path.join(tempDir, 'global-auth.json')
+    const localAuthPath = path.join(tempDir, 'local-auth.json')
+    const managedAuthPath = path.join(tempDir, 'managed', 'auth.json')
+
+    await mkdir(path.dirname(managedAuthPath), { recursive: true })
+    await writeFile(
+      globalAuthPath,
+      JSON.stringify({
+        openrouter: { type: 'api', key: 'global-key' },
+      }),
+      'utf8',
+    )
+    await writeFile(
+      localAuthPath,
+      JSON.stringify({
+        openai: { type: 'oauth', token: 'fresh-local' },
+      }),
+      'utf8',
+    )
+    await writeFile(
+      managedAuthPath,
+      JSON.stringify({
+        openrouter: { type: 'api', key: 'old-global-key' },
+        openai: { type: 'oauth', token: 'old-local' },
+        staleprovider: { type: 'api', key: 'stale' },
+      }),
+      'utf8',
+    )
+
+    await reconcileOpenCodeManagedAuthStore({
+      sourceAuthPaths: [globalAuthPath, localAuthPath],
+      managedAuthPath,
+    })
+
+    const reconciled = JSON.parse(await readFile(managedAuthPath, 'utf8')) as Record<string, unknown>
+    expect(reconciled).toEqual({
+      openrouter: { type: 'api', key: 'global-key' },
+      openai: { type: 'oauth', token: 'fresh-local' },
     })
   })
 

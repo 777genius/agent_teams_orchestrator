@@ -81,6 +81,45 @@ describe('OpenCodeEventTranslator', () => {
     ).toBe(true)
   })
 
+  test('preserves OpenCode retry status messages as diagnostics', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-retry',
+      rawStatus: {
+        type: 'retry',
+        attempt: 1,
+        message: 'Free usage exceeded, subscribe to Go https://opencode.ai/go',
+        next: 1779062400267,
+      },
+      messages: [
+        {
+          info: {
+            id: 'msg-user-retry',
+            role: 'user',
+            sessionID: 'session-retry',
+            time: { created: 250 },
+          },
+          parts: [{ type: 'text', text: 'Check your task' }],
+        },
+        {
+          info: {
+            id: 'msg-assistant-empty',
+            parentID: 'msg-user-retry',
+            role: 'assistant',
+            sessionID: 'session-retry',
+            time: { created: 251, completed: 252 },
+          },
+          parts: [],
+        },
+      ],
+    })
+
+    expect(summary.rawStatus).toBe('retry')
+    expect(summary.durableState).toBe('retrying')
+    expect(summary.diagnostics).toContain(
+      'OpenCode session status retry - attempt=1 - Free usage exceeded, subscribe to Go https://opencode.ai/go - next=2026-05-18T00:00:00.267Z',
+    )
+  })
+
   test('captures tool lifecycle and transcript blocks from assistant tool parts', () => {
     const summary = translator.reconcileSessionMessages({
       sessionId: 'session-1',

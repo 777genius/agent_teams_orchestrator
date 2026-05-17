@@ -4,6 +4,7 @@ import { isEnvTruthy } from '../../utils/envUtils.js'
 import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
 import { getAPIProvider, type APIProvider } from '../../utils/model/providers.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
+import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
 import { geminiApiBackend } from '../gemini/backends/apiBackend.js'
 import { geminiCliBackend } from '../gemini/backends/cliBackend.js'
@@ -51,6 +52,7 @@ import type {
   RuntimeProviderId,
   RuntimeProviderStatus,
   RuntimeProviderSubscriptionRateLimitSnapshot,
+  RuntimeStatusDetailLevel,
   RuntimeStatusPayload,
 } from './types.js'
 
@@ -73,6 +75,9 @@ const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
   'codex-native': 'Use the local codex exec JSON seam as the supported Codex runtime path',
 }
+
+const ANTHROPIC_SUMMARY_MODELS = ['opus', 'claude-opus-4-6', 'sonnet', 'haiku']
+const ANTHROPIC_SUMMARY_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'] as const
 
 function detectExternalBinary(
   binaryName: 'gemini' | 'codex',
@@ -374,12 +379,73 @@ async function buildAnthropicStatus(
   })
 }
 
+async function buildAnthropicSummaryStatus(
+  _deps: RuntimeStatusRegistryDeps = {},
+): Promise<RuntimeProviderStatus> {
+  const externalBackend = getExternalAnthropicBackendInfo(getAPIProvider())
+  const anthropicAuth = getAnthropicAuthenticated()
+  const fastMode = getAnthropicRuntimeFastModeCapability()
+  const backend = externalBackend ?? null
+
+  return {
+    providerId: 'anthropic',
+    displayName: 'Anthropic',
+    supported: true,
+    authenticated: anthropicAuth.authenticated,
+    authMethod: anthropicAuth.authMethod,
+    verificationState: backend ? 'unknown' : 'verified',
+    canLoginFromUi: backend ? false : true,
+    capabilities: {
+      teamLaunch: true,
+      oneShot: true,
+      extensions: buildExtensionCapabilities(),
+    },
+    statusMessage: backend
+      ? backend.statusMessage
+      : anthropicAuth.authenticated
+        ? null
+        : 'Not connected',
+    detailMessage: backend?.detailMessage ?? null,
+    selectedBackendId: backend?.id ?? null,
+    resolvedBackendId: backend?.id ?? null,
+    availableBackends: [],
+    externalRuntimeDiagnostics: [],
+    models: ANTHROPIC_SUMMARY_MODELS.filter(isModelAllowed),
+    subscriptionRateLimits: null,
+    runtimeCapabilities: {
+      modelCatalog: {
+        dynamic: true,
+        source: 'anthropic-models-api',
+      },
+      reasoningEffort: {
+        supported: true,
+        values: [...ANTHROPIC_SUMMARY_REASONING_EFFORTS],
+        configPassthrough: true,
+      },
+      fastMode,
+    },
+    backend: backend
+      ? {
+          kind: backend.id,
+          label: backend.label,
+          endpointLabel: backend.endpointLabel,
+          projectId: backend.projectId ?? null,
+          authMethodDetail: backend.authMethodDetail,
+        }
+      : null,
+  }
+}
+
 function getGeminiModels(): string[] {
   return filterDisplayModels(GEMINI_MODELS.map(model => model.id))
 }
 
 function filterDisplayModels(models: string[]): string[] {
   return models.filter(model => isModelAllowed(model))
+}
+
+function getCodexSummaryModels(): string[] {
+  return filterDisplayModels(CODEX_MODELS.map(model => model.id))
 }
 
 function filterCodexModelCatalog(
@@ -422,10 +488,24 @@ function filterCodexModelCatalog(
 
 async function buildOpenCodeStatus(
   deps: RuntimeStatusRegistryDeps = {},
+  options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeProviderStatus> {
+  const summary = options.detailLevel === 'summary'
   const snapshot = deps.getOpenCodeInventorySnapshot
     ? await deps.getOpenCodeInventorySnapshot()
-    : await openCodeInventoryService.probe()
+    : await openCodeInventoryService.probe(
+        null,
+        summary
+          ? { mode: 'summary', bypassCache: true }
+          : { mode: 'full' },
+      )
+  const runtimeModels =
+    summary && snapshot.detected && snapshot.models.length === 0
+      ? ['opencode/big-pickle']
+      : snapshot.models
+  const displaySnapshot = runtimeModels === snapshot.models
+    ? snapshot
+    : { ...snapshot, models: runtimeModels }
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
   const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(
     snapshot.models,
@@ -433,8 +513,8 @@ async function buildOpenCodeStatus(
   )
   const authenticated = hasConnectedProvider || hasBuiltinFreeModel
   const fetchedAt = new Date()
-  const defaultModel = snapshot.models.find(model => model === 'opencode/big-pickle')
-    ?? snapshot.models[0]
+  const defaultModel = runtimeModels.find(model => model === 'opencode/big-pickle')
+    ?? runtimeModels[0]
     ?? null
   const metadataByModelId = new Map(
     snapshot.modelMetadata?.map(metadata => [metadata.id, metadata]) ?? [],
@@ -448,7 +528,7 @@ async function buildOpenCodeStatus(
     staleAt: new Date(fetchedAt.getTime() + 10 * 60 * 1000).toISOString(),
     defaultModelId: defaultModel,
     defaultLaunchModel: defaultModel,
-    models: snapshot.models.map(model => {
+    models: runtimeModels.map(model => {
       const metadata = metadataByModelId.get(model) ?? null
       return {
         id: model,
@@ -482,7 +562,7 @@ async function buildOpenCodeStatus(
     },
   }
 
-  return {
+  const provider: RuntimeProviderStatus = {
     providerId: 'opencode',
     displayName: 'OpenCode (75+ LLM providers)',
     supported: snapshot.detected,
@@ -524,8 +604,8 @@ async function buildOpenCodeStatus(
         },
       }),
     },
-    statusMessage: buildOpenCodeStatusMessage(snapshot),
-    detailMessage: buildOpenCodeDetailMessage(snapshot),
+    statusMessage: authenticated ? null : buildOpenCodeStatusMessage(displaySnapshot),
+    detailMessage: buildOpenCodeDetailMessage(displaySnapshot),
     selectedBackendId: null,
     resolvedBackendId: null,
     availableBackends: [],
@@ -538,8 +618,7 @@ async function buildOpenCodeStatus(
         detailMessage: snapshot.binaryPath,
       },
     ],
-    models: snapshot.models,
-    modelCatalog,
+    models: runtimeModels,
     runtimeCapabilities: {
       modelCatalog: {
         dynamic: true,
@@ -555,8 +634,14 @@ async function buildOpenCodeStatus(
             : snapshot.profile?.authState ?? null,
         }
       : null,
-    capabilitiesInfo: buildOpenCodeCapabilityInfo(snapshot),
   }
+
+  if (!summary) {
+    provider.modelCatalog = modelCatalog
+    provider.capabilitiesInfo = buildOpenCodeCapabilityInfo(snapshot)
+  }
+
+  return provider
 }
 
 async function buildGeminiStatuses(): Promise<{
@@ -745,62 +830,109 @@ function buildCodexStatuses(): {
 export async function getUnifiedRuntimeStatusPayload(
   providerFilter?: RuntimeProviderId | null,
   deps: RuntimeStatusRegistryDeps = {},
+  options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeStatusPayload> {
+  const summary = options.detailLevel === 'summary'
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
 
   if (!providerFilter || providerFilter === 'anthropic') {
-    providers.anthropic = await buildAnthropicStatus(deps)
+    providers.anthropic = summary
+      ? await buildAnthropicSummaryStatus(deps)
+      : await buildAnthropicStatus(deps)
   }
 
   if (!providerFilter || providerFilter === 'codex') {
     const codex = buildCodexStatuses()
-    const modelCatalog = filterCodexModelCatalog(
-      await (deps.getCodexModelCatalog ?? getCodexRuntimeModelCatalog)(),
-    )
-    const codexModels = getVisibleCodexRuntimeModels(modelCatalog)
-    const modelCatalogDynamic =
-      modelCatalog.source === 'app-server' &&
-      (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
-    providers.codex = {
-      providerId: 'codex',
-      displayName: 'Codex',
-      supported: true,
-      authenticated: codex.authenticated,
-      authMethod: codex.authMethod,
-      verificationState: codex.verificationState,
-      canLoginFromUi: codex.canLoginFromUi,
-      capabilities: {
-        teamLaunch: true,
-        oneShot: true,
-        extensions: buildExtensionCapabilities({
-          plugins: {
-            status: 'unsupported',
-            ownership: 'shared',
-            reason:
-              'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
+    if (summary) {
+      providers.codex = {
+        providerId: 'codex',
+        displayName: 'Codex',
+        supported: true,
+        authenticated: codex.authenticated,
+        authMethod: codex.authMethod,
+        verificationState: codex.verificationState,
+        canLoginFromUi: codex.canLoginFromUi,
+        capabilities: {
+          teamLaunch: true,
+          oneShot: true,
+          extensions: buildExtensionCapabilities({
+            plugins: {
+              status: 'unsupported',
+              ownership: 'shared',
+              reason:
+                'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
+            },
+          }),
+        },
+        statusMessage: codex.statusMessage,
+        detailMessage: codex.detailMessage,
+        selectedBackendId: codex.selectedBackendId,
+        resolvedBackendId: codex.resolvedBackendId,
+        availableBackends: codex.availableBackends,
+        externalRuntimeDiagnostics: [detectCodexExternalBinary()],
+        models: getCodexSummaryModels(),
+        runtimeCapabilities: {
+          modelCatalog: {
+            dynamic: true,
+            source: 'app-server',
           },
-        }),
-      },
-      statusMessage: codex.statusMessage,
-      detailMessage: codex.detailMessage,
-      selectedBackendId: codex.selectedBackendId,
-      resolvedBackendId: codex.resolvedBackendId,
-      availableBackends: codex.availableBackends,
-      externalRuntimeDiagnostics: [detectCodexExternalBinary()],
-      models: codexModels,
-      modelCatalog,
-      runtimeCapabilities: {
-        modelCatalog: {
-          dynamic: modelCatalogDynamic,
-          source: modelCatalog.source,
+          reasoningEffort: {
+            supported: true,
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            configPassthrough: true,
+          },
         },
-        reasoningEffort: {
-          supported: true,
-          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
-          configPassthrough: true,
+        backend: codex.backend,
+      }
+    } else {
+      const modelCatalog = filterCodexModelCatalog(
+        await (deps.getCodexModelCatalog ?? getCodexRuntimeModelCatalog)(),
+      )
+      const codexModels = getVisibleCodexRuntimeModels(modelCatalog)
+      const modelCatalogDynamic =
+        modelCatalog.source === 'app-server' &&
+        (modelCatalog.status === 'ready' || modelCatalog.status === 'stale')
+      providers.codex = {
+        providerId: 'codex',
+        displayName: 'Codex',
+        supported: true,
+        authenticated: codex.authenticated,
+        authMethod: codex.authMethod,
+        verificationState: codex.verificationState,
+        canLoginFromUi: codex.canLoginFromUi,
+        capabilities: {
+          teamLaunch: true,
+          oneShot: true,
+          extensions: buildExtensionCapabilities({
+            plugins: {
+              status: 'unsupported',
+              ownership: 'shared',
+              reason:
+                'Plugins are not currently guaranteed for codex-native sessions in the multimodel runtime.',
+            },
+          }),
         },
-      },
-      backend: codex.backend,
+        statusMessage: codex.statusMessage,
+        detailMessage: codex.detailMessage,
+        selectedBackendId: codex.selectedBackendId,
+        resolvedBackendId: codex.resolvedBackendId,
+        availableBackends: codex.availableBackends,
+        externalRuntimeDiagnostics: [detectCodexExternalBinary()],
+        models: codexModels,
+        modelCatalog,
+        runtimeCapabilities: {
+          modelCatalog: {
+            dynamic: modelCatalogDynamic,
+            source: modelCatalog.source,
+          },
+          reasoningEffort: {
+            supported: true,
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            configPassthrough: true,
+          },
+        },
+        backend: codex.backend,
+      }
     }
   }
 
@@ -837,7 +969,9 @@ export async function getUnifiedRuntimeStatusPayload(
   }
 
   if (!providerFilter || providerFilter === 'opencode') {
-    providers.opencode = await buildOpenCodeStatus(deps)
+    providers.opencode = await buildOpenCodeStatus(deps, {
+      detailLevel: options.detailLevel,
+    })
   }
 
   return {

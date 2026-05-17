@@ -16,8 +16,8 @@ import {
 import {
   doesOpenCodeAuthStoreIncludeSource,
   mergeOpenCodeAuthStores,
+  reconcileOpenCodeManagedAuthStore,
   readOpenCodeAuthStore,
-  syncOpenCodeManagedAuthStore,
 } from './OpenCodeAuthStore.js'
 import {
   readOpenCodeManagedRuntimePreferences,
@@ -582,27 +582,21 @@ export class OpenCodeProfileManager {
         .map(source => `${source.path}:${source.fingerprint}`)
         .join('\n'))
       : null
-    for (const authSourcePath of orderOpenCodeAuthSyncSources({
+    const authSourcePaths = orderOpenCodeAuthSyncSources({
       globalAuthPath,
       globalAuthFingerprint,
       sourceAuthSources,
-    })) {
-      await syncOpenCodeManagedAuthStore({
-        sourceAuthPath: authSourcePath,
-        managedAuthPath,
-      })
-    }
+    })
+    await reconcileOpenCodeManagedAuthStore({
+      sourceAuthPaths: authSourcePaths,
+      managedAuthPath,
+    })
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
     const authState = await (async () => {
       if (!managedAuthFingerprint) {
         return 'missing' as const
       }
-      const authSourcePaths = orderOpenCodeAuthSyncSources({
-        globalAuthPath,
-        globalAuthFingerprint,
-        sourceAuthSources,
-      })
       if (authSourcePaths.length === 0) {
         return 'ok' as const
       }

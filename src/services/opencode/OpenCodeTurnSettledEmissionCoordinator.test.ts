@@ -421,7 +421,7 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     })
   })
 
-  test('emits launch error when bootstrap MCP tools are not connected', async () => {
+  test('emits legacy launch error when bootstrap MCP tools are not connected', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -432,7 +432,10 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     })
 
     await coordinator.emitLaunch({
-      record: buildRecord(),
+      record: buildRecord({
+        bootstrapMode: 'model_tool_checkin',
+        bootstrapEvidenceSource: 'runtime_bootstrap_checkin',
+      }),
       reconcileSummary: buildReconcileSummary({
         latestAssistantMessageId: 'msg-bootstrap-failed',
         latestAssistantText: 'Both calls returned "Not connected".',
@@ -466,7 +469,7 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
     })
   })
 
-  test('emits launch error when bootstrap assistant response omits required MCP tools', async () => {
+  test('emits app-managed launch success when assistant response omits legacy bootstrap tools', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -478,6 +481,45 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
 
     await coordinator.emitLaunch({
       record: buildRecord(),
+      reconcileSummary: buildReconcileSummary({
+        latestAssistantMessageId: 'msg-no-tools',
+        latestAssistantText:
+          "I don't have the agent-teams MCP tools available in my current toolset.",
+        messages: [
+          buildMessage({
+            id: 'msg-no-tools',
+            role: 'assistant',
+            text: "I don't have the agent-teams MCP tools available in my current toolset.",
+            toolCalls: [],
+          }),
+        ],
+        toolCallCount: 0,
+      }),
+    })
+
+    expect(events[0]).toMatchObject({
+      outcome: 'success',
+    })
+    expect(events[0]?.detail ?? '').not.toContain(
+      'OpenCode bootstrap MCP did not complete required tools before assistant response',
+    )
+  })
+
+  test('emits legacy launch error when bootstrap assistant response omits required MCP tools', async () => {
+    const events: OpenCodeRuntimeTurnSettledEvent[] = []
+    const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
+      emitter: {
+        emit: async event => {
+          events.push(event)
+        },
+      },
+    })
+
+    await coordinator.emitLaunch({
+      record: buildRecord({
+        bootstrapMode: 'model_tool_checkin',
+        bootstrapEvidenceSource: 'runtime_bootstrap_checkin',
+      }),
       reconcileSummary: buildReconcileSummary({
         latestAssistantMessageId: 'msg-no-tools',
         latestAssistantText:

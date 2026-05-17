@@ -397,6 +397,7 @@ const originalAnswerPermission = openCodeSessionBridge.answerPermission
 const originalProjectLogMessages = openCodeSessionBridge.projectLogMessages
 const originalList = openCodeSessionStore.list
 const originalGet = openCodeSessionStore.get
+const originalUpsert = openCodeSessionStore.upsert
 const originalMarkStale = openCodeSessionStore.markStale
 const originalDelete = openCodeSessionStore.delete
 const originalOutcomeUpsert = openCodeCommandOutcomeStore.upsert
@@ -571,6 +572,7 @@ beforeEach(async () => {
     connected: true,
     diagnostics: [],
   })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+  openCodeSessionStore.upsert = (async () => 'updated') as typeof openCodeSessionStore.upsert
   openCodeSessionStore.delete = (async () => true) as typeof openCodeSessionStore.delete
 })
 
@@ -630,6 +632,7 @@ afterEach(async () => {
   openCodeSessionBridge.projectLogMessages = originalProjectLogMessages
   openCodeSessionStore.list = originalList
   openCodeSessionStore.get = originalGet
+  openCodeSessionStore.upsert = originalUpsert
   openCodeSessionStore.markStale = originalMarkStale
   openCodeSessionStore.delete = originalDelete
   openCodeCommandOutcomeStore.upsert = originalOutcomeUpsert
@@ -1274,6 +1277,36 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.diagnostics.join('\n')).toContain('agent-teams_message_send')
   })
 
+  test('readiness does not require legacy OpenCode bootstrap MCP tools', async () => {
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: requiredMockMcpTools().filter(tool =>
+          tool.name !== 'runtime_bootstrap_checkin' && tool.name !== 'member_briefing'
+        ),
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('ready')
+    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.requiredToolsPresent).toBe(true)
+    expect(result.data.missing.join('\n')).not.toContain('runtime_bootstrap_checkin')
+    expect(result.data.missing.join('\n')).not.toContain('member_briefing')
+  })
+
   test('direct MCP proof compares plain names but readiness evidence emits canonical OpenCode ids', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
@@ -1502,6 +1535,52 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
   })
 
+  test('launch does not require legacy OpenCode bootstrap MCP tools in direct tool proof', async () => {
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: requiredMockMcpTools().filter(tool =>
+          tool.name !== 'runtime_bootstrap_checkin' && tool.name !== 'member_briefing'
+        ),
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-no-legacy-bootstrap-tools',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Join the team' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('launching')
+    expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
+    const diagnosticText = result.data.diagnostics.map(diagnostic => diagnostic.message).join('\n')
+    expect(diagnosticText).not.toContain('runtime_bootstrap_checkin')
+    expect(diagnosticText).not.toContain('member_briefing')
+  })
+
   test('keeps the launch provisioning host retained until launch finishes', async () => {
     let releaseCalls = 0
     openCodeProvisioningProbe.probe = async () => {
@@ -1649,6 +1728,57 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ])
     expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
+    expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
+  })
+
+  test('persists app-managed bootstrap metadata after launch injection', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionBridge.ensureSession = (async input =>
+      buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+        opencodeSessionId: `session-${input.memberName}`,
+      })) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionStore.upsert = (async record => {
+      upserts.push(record)
+      return 'updated'
+    }) as typeof openCodeSessionStore.upsert
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-app-managed-persisted',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', role: 'Developer', prompt: 'Alice join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(upserts).toHaveLength(1)
+    expect(upserts[0]).toMatchObject({
+      opencodeSessionId: 'session-alice',
+      bootstrapMode: 'app_managed_context',
+      bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: {
+        schemaVersion: 1,
+        briefingHash: expect.any(String),
+        contextHash: expect.any(String),
+        injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+        messageID: expect.any(String),
+        model: 'openrouter/minimax-m2.5-free',
+        agent: 'teammate-bootstrap',
+      },
+    })
+    expect(result.data.members.alice?.bootstrapEvidenceSource).toBe('app_managed_bootstrap')
     expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
   })
 
@@ -4250,6 +4380,105 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(jackResult.data.members.bob).toBeUndefined()
     })
 
+    test('treats app-managed reconcile without old bootstrap tool calls as confirmed alive', async () => {
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
+        buildRecord({
+          teamId,
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+          opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+        })) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: 'msg-no-bootstrap-tools',
+          latestAssistantText: 'ready without legacy bootstrap proof',
+          messages: [
+            buildCanonicalMessage({
+              id: 'msg-no-bootstrap-tools',
+              role: 'assistant',
+              text: 'ready without legacy bootstrap proof',
+              toolCalls: [],
+            }),
+          ],
+          toolCallCount: 0,
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-app-managed-reconcile',
+          laneId: 'secondary:opencode:alice',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(result.data.teamLaunchState).toBe('ready')
+      expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+      expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
+      expect(result.data.members.alice?.bootstrapEvidenceSource).toBe('app_managed_bootstrap')
+      expect(result.data.members.alice?.diagnostics ?? []).not.toContain(
+        'OpenCode bootstrap MCP did not complete required tools before assistant response: runtime_bootstrap_checkin, member_briefing',
+      )
+      expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+        'member_session_recorded',
+        'bootstrap_confirmed',
+        'member_ready',
+      ])
+    })
+
+    test('resolves inconsistent app-managed reconcile source from bootstrap mode', async () => {
+      openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+      openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
+        buildRecord({
+          teamId,
+          laneId: memberName ? laneIdOrMemberName : 'primary',
+          memberName: memberName ?? laneIdOrMemberName,
+          opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+          bootstrapMode: 'app_managed_context',
+          bootstrapEvidenceSource: 'runtime_bootstrap_checkin',
+        })) as typeof openCodeSessionStore.get
+      openCodeSessionBridge.reconcileSession = (async record => ({
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: 'msg-no-bootstrap-tools',
+          messages: [
+            buildCanonicalMessage({
+              id: 'msg-no-bootstrap-tools',
+              role: 'assistant',
+              toolCalls: [],
+            }),
+          ],
+          toolCallCount: 0,
+        }),
+      })) as typeof openCodeSessionBridge.reconcileSession
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.reconcileTeam', {
+          runId: 'run-app-managed-inconsistent-source',
+          laneId: 'secondary:opencode:alice',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free' }],
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(result.data.members.alice?.bootstrapMode).toBe('app_managed_context')
+      expect(result.data.members.alice?.bootstrapEvidenceSource).toBe('app_managed_bootstrap')
+      expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    })
+
     test('keeps a multi-member OpenCode lane launching until every member confirms bootstrap', async () => {
       openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
       openCodeSessionBridge.ensureSession = (async input =>
@@ -4647,13 +4876,24 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.runtimePid).toBe(888)
   })
 
-  test('keeps a reconciled lane pending until OpenCode emits an assistant bootstrap confirmation', async () => {
+  test('marks an app-managed reconciled lane ready from persisted injection evidence without assistant response', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
       buildRecord({
         laneId: memberName ? laneIdOrMemberName : 'primary',
         memberName: memberName ?? laneIdOrMemberName,
         opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+        bootstrapMode: 'app_managed_context',
+        bootstrapEvidenceSource: 'app_managed_bootstrap',
+        appManagedBootstrap: {
+          schemaVersion: 1,
+          messageID: 'msg-app-managed-bootstrap',
+          contextHash: 'context-hash',
+          briefingHash: 'briefing-hash',
+          injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+          model: 'openrouter/minimax-m2.5-free',
+          agent: 'teammate-bootstrap',
+        },
       })) as typeof openCodeSessionStore.get
     openCodeSessionBridge.reconcileSession = (async record => ({
       summary: buildReconcileSummary({
@@ -4681,6 +4921,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
+    expect(result.data.teamLaunchState).toBe('ready')
+    expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
+    expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
+      'member_session_recorded',
+      'app_managed_bootstrap_context_injected',
+      'bootstrap_confirmed',
+      'member_ready',
+    ])
+  })
+
+  test('keeps app-managed reconcile launching without injection evidence or assistant response', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async (teamId, laneIdOrMemberName, memberName) =>
+      buildRecord({
+        laneId: memberName ? laneIdOrMemberName : 'primary',
+        memberName: memberName ?? laneIdOrMemberName,
+        opencodeSessionId: `session-${memberName ?? laneIdOrMemberName}`,
+      })) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({
+        sessionId: record.opencodeSessionId,
+        latestAssistantMessageId: null,
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        messageCount: 0,
+        durableState: 'idle',
+        messages: [],
+      }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-app-managed-no-readiness-evidence',
+        laneId: 'secondary:opencode:alice',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        expectedMembers: [{ name: 'alice', model: 'openrouter/minimax-m2.5-free' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.teamLaunchState).toBe('launching')
     expect(result.data.members.alice?.launchState).toBe('created')
     expect(result.data.members.alice?.evidence.map(entry => entry.kind)).toEqual([
       'member_session_recorded',
@@ -5275,7 +5560,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         runtimePromptMessageId: 'msg_test_acceptance',
       })
       expect(result.data.responseObservation).toBeUndefined()
-      expect(reconcileCalls).toBe(1)
+      expect(reconcileCalls).toBe(0)
       expect(postAcceptanceReconcileCalls).toBe(0)
       const diagnosticCodes = result.data.diagnostics.map(diagnostic => diagnostic.code)
       expect(diagnosticCodes).toContain('opencode_send_settlement_acceptance')
@@ -5368,12 +5653,106 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   })
 
-  test('recreates OpenCode session before sending when bootstrap MCP failed in stored session', async () => {
+  test('does not recreate app-managed OpenCode session when old bootstrap MCP proof is absent', async () => {
+    const originalRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-app-managed',
+      lastCanonicalCursor: 'cursor-app-managed',
+    })
+    const staleReasons: string[] = []
+    const promptSessionIds: string[] = []
+    const mcpCheckedSessionIds: string[] = []
+    let ensureSessionCalls = 0
+    let reconcileCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => originalRecord) as typeof openCodeSessionStore.get
+    openCodeSessionStore.markStale = (async (_teamId, _laneId, _memberName, staleReason) => {
+      staleReasons.push(staleReason)
+      return { ...originalRecord, staleReason }
+    }) as typeof openCodeSessionStore.markStale
+    openCodeSessionBridge.ensureSession = (async () => {
+      ensureSessionCalls += 1
+      return buildRecord({ opencodeSessionId: 'session-should-not-be-created' })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.reconcileSession = (async record => {
+      reconcileCalls += 1
+      return {
+        record,
+        summary: buildReconcileSummary({
+          sessionId: record.opencodeSessionId,
+          latestAssistantMessageId: 'msg-bootstrap-failed',
+          messages: [
+            buildCanonicalMessage({
+              id: 'msg-bootstrap-failed',
+              role: 'assistant',
+              toolCalls: [
+                buildToolCall({
+                  toolName: 'agent-teams_runtime_bootstrap_checkin',
+                  status: 'errored',
+                  outputText: 'MCP Not connected',
+                  isError: true,
+                }),
+              ],
+            }),
+          ],
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      mcpCheckedSessionIds.push(record.opencodeSessionId)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptSessionIds.push(record.opencodeSessionId)
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-app-managed-send',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello bob',
+        messageId: 'message-app-managed-send',
+        settlementMode: 'acceptance',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(staleReasons).toEqual([])
+    expect(ensureSessionCalls).toBe(0)
+    expect(reconcileCalls).toBe(0)
+    expect(mcpCheckedSessionIds).toEqual(['session-bob-app-managed'])
+    expect(promptSessionIds).toEqual(['session-bob-app-managed'])
+    expect(result.data.sessionId).toBe('session-bob-app-managed')
+    expect(result.data.prePromptCursor).toBe('cursor-app-managed')
+    expect(result.data.diagnostics).not.toContainEqual({
+      code: 'opencode_send_session_recreated_after_bootstrap_mcp_failure',
+      message: 'Recreated OpenCode session before message delivery because bootstrap MCP failed in the stored session.',
+      severity: 'warning',
+    })
+  })
+
+  test('recreates legacy OpenCode session before sending when bootstrap MCP failed in stored session', async () => {
     const originalRecord = buildRecord({
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
       opencodeSessionId: 'session-bob-broken',
       lastCanonicalCursor: 'cursor-broken',
+      bootstrapMode: 'model_tool_checkin',
+      bootstrapEvidenceSource: 'runtime_bootstrap_checkin',
     })
     const freshRecord = buildRecord({
       laneId: 'secondary:opencode:bob',

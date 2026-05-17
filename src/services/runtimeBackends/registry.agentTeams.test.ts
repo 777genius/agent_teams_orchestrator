@@ -353,6 +353,168 @@ describe('runtime backend registry with agent_teams capabilities', () => {
   })
 
   test(
+    'summary runtime status omits full catalogs without losing live provider state',
+    async () => {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: async () => ({
+          detected: true,
+          binaryPath: '/opt/homebrew/bin/opencode',
+          version: '1.14.48',
+          projectPath: '/tmp/project',
+          profile: null,
+          connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }],
+          availableProviders: ['openrouter'],
+          models: ['opencode/big-pickle'],
+          modelMetadata: [],
+          agents: [],
+          authStorePath: null,
+          probeError: null,
+          diagnostics: [],
+        }),
+      }, { detailLevel: 'summary' })
+      const opencode = payload.providers.opencode
+
+      expect(opencode?.supported).toBe(true)
+      expect(opencode?.authenticated).toBe(true)
+      expect(opencode?.authMethod).toBe('opencode_managed')
+      expect(opencode?.models).toEqual(['opencode/big-pickle'])
+      expect(opencode).not.toHaveProperty('modelCatalog')
+      expect(opencode).not.toHaveProperty('capabilitiesInfo')
+      expect(opencode?.runtimeCapabilities?.modelCatalog).toEqual({
+        dynamic: true,
+        source: 'app-server',
+      })
+    },
+    30_000,
+  )
+
+  test(
+    'summary runtime status does not treat unverified OpenCode model labels as live auth',
+    async () => {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: async () => ({
+          detected: true,
+          binaryPath: '/opt/homebrew/bin/opencode',
+          version: '1.14.48',
+          projectPath: '/tmp/project',
+          profile: null,
+          connectedProviders: [],
+          availableProviders: ['opencode'],
+          models: ['opencode/big-pickle'],
+          modelMetadata: [],
+          agents: [],
+          authStorePath: null,
+          probeError: null,
+          diagnostics: [],
+        }),
+      }, { detailLevel: 'summary' })
+      const opencode = payload.providers.opencode
+
+      expect(opencode?.supported).toBe(true)
+      expect(opencode?.authenticated).toBe(false)
+      expect(opencode?.authMethod).toBe(null)
+      expect(opencode?.models).toEqual(['opencode/big-pickle'])
+      expect(opencode?.statusMessage).toBe('No OpenCode providers connected')
+      expect(opencode).not.toHaveProperty('modelCatalog')
+    },
+    15_000,
+  )
+
+  test('summary runtime status does not require Codex model catalog loading', async () => {
+    const registryModulePath = new URL('./registry.js', import.meta.url).href
+    const { getUnifiedRuntimeStatusPayload } = await import(
+      `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+    )
+
+    const payload = await getUnifiedRuntimeStatusPayload('codex', {
+      getCodexModelCatalog: async () => {
+        throw new Error('full catalog should not be read for summary status')
+      },
+    }, { detailLevel: 'summary' })
+    const codex = payload.providers.codex
+
+    expect(codex?.providerId).toBe('codex')
+    expect(codex?.models.length).toBeGreaterThan(0)
+    expect(codex).not.toHaveProperty('modelCatalog')
+    expect(codex?.runtimeCapabilities?.modelCatalog).toEqual({
+      dynamic: true,
+      source: 'app-server',
+    })
+  })
+
+  test('anthropic summary runtime status skips subscription rate limit refresh', async () => {
+    const envKeys = [
+      'ANTHROPIC_API_KEY',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+    const authModule = await import('../../utils/auth.js')
+    const clearOauthCache = () => {
+      const cacheHost = authModule.getClaudeAIOAuthTokens as unknown as {
+        cache?: { clear?: () => void }
+      }
+      cacheHost.cache?.clear?.()
+    }
+
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-oauth-token'
+    delete process.env.ANTHROPIC_API_KEY
+    delete process.env.CLAUDE_CODE_ENTRY_PROVIDER
+    delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    clearOauthCache()
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+      let rateLimitRefreshCalls = 0
+
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic', {
+        getAnthropicSubscriptionRateLimits: async () => {
+          rateLimitRefreshCalls += 1
+          throw new Error('summary status must not refresh subscription limits')
+        },
+      }, { detailLevel: 'summary' })
+      const anthropic = payload.providers.anthropic
+
+      expect(rateLimitRefreshCalls).toBe(0)
+      expect(anthropic?.authenticated).toBe(true)
+      expect(anthropic?.authMethod).toBe('oauth_token')
+      expect(anthropic?.subscriptionRateLimits).toBeNull()
+      expect(anthropic?.runtimeCapabilities?.modelCatalog).toEqual({
+        dynamic: true,
+        source: 'anthropic-models-api',
+      })
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+      clearOauthCache()
+    }
+  })
+
+  test(
     'opencode runtime status surfaces managed inventory safely',
     async () => {
       const registryModulePath = new URL('./registry.js', import.meta.url).href

@@ -455,8 +455,10 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(staleReasons).toEqual(['model_changed:openai/gpt-5.4-mini->openai/gpt-5.4'])
     expect(record.opencodeSessionId).toBe('session-new')
+    expect(record.bootstrapMode).toBe('app_managed_context')
     expect(prepareProfileCalls).toBe(1)
     expect(upserts).toHaveLength(1)
+    expect(upserts[0]?.bootstrapMode).toBe('app_managed_context')
   })
 
   test('releases a fresh host lease when session persistence fails', async () => {

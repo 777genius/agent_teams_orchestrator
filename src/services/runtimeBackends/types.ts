@@ -197,3 +197,5 @@ export type RuntimeStatusPayload = {
   schemaVersion: 2
   providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>>
 }
+
+export type RuntimeStatusDetailLevel = 'full' | 'summary'

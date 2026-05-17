@@ -42,6 +42,17 @@ import { readFile, writeFile } from 'node:fs/promises'
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 
+async function withRuntimeJsonStdoutGuard<T>(operation: () => Promise<T>): Promise<T> {
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) =>
+    process.stderr.write(...args)) as typeof process.stdout.write
+  try {
+    return await operation()
+  } finally {
+    process.stdout.write = originalWrite
+  }
+}
+
 const PROVIDER_DIRECTORY_FILTERS = new Set<string>([
   'all',
   'connected',
@@ -160,10 +171,17 @@ export async function runtimeStatus(opts: {
   json?: boolean
   text?: boolean
   provider?: RuntimeProviderTarget
+  summary?: boolean
 }): Promise<void> {
   const providerFilter =
     opts.provider && opts.provider !== 'all' ? opts.provider : undefined
-  const payload = await getUnifiedRuntimeStatusPayload(providerFilter)
+  const loadPayload = () =>
+    getUnifiedRuntimeStatusPayload(providerFilter, {}, {
+      detailLevel: opts.summary ? 'summary' : 'full',
+    })
+  const payload = opts.text
+    ? await loadPayload()
+    : await withRuntimeJsonStdoutGuard(loadPayload)
 
   if (opts.text) {
     const providerOrder: RuntimeProviderId[] = ['anthropic', 'codex', 'gemini', 'opencode']

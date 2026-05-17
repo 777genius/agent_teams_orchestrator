@@ -494,7 +494,6 @@ const REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_NAMES = [
   'cross_team_get_outbox',
   'cross_team_list_targets',
   'cross_team_send',
-  'member_briefing',
   'message_send',
   'process_list',
   'process_register',
@@ -504,7 +503,6 @@ const REQUIRED_AGENT_TEAMS_DIRECT_MCP_TOOL_NAMES = [
   'review_request',
   'review_request_changes',
   'review_start',
-  'runtime_bootstrap_checkin',
   'runtime_deliver_message',
   'runtime_task_event',
   'runtime_heartbeat',
@@ -1617,13 +1615,59 @@ function readinessData(
   }
 }
 
-function bridgeStateFromSummary(summary: OpenCodeSessionReconcileSummary): 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed' {
-  const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(summary)
-  if (summary.staleReason || summary.errorCount > 0 || bootstrapMcpReadiness.failure) {
+function isAppManagedOpenCodeBootstrap(
+  record: Pick<OpenCodeSessionRecord, 'bootstrapMode'>,
+): boolean {
+  // TODO(opencode-bootstrap): Legacy proof cleanup plan lives in
+  // docs/opencode-app-managed-bootstrap-legacy-cleanup-todo.md.
+  return record.bootstrapMode !== 'model_tool_checkin'
+}
+
+function resolvedOpenCodeBootstrapMode(
+  record: Pick<OpenCodeSessionRecord, 'bootstrapMode'>,
+): 'model_tool_checkin' | 'app_managed_context' {
+  return record.bootstrapMode === 'model_tool_checkin' ? 'model_tool_checkin' : 'app_managed_context'
+}
+
+function resolvedOpenCodeBootstrapEvidenceSource(
+  record: Pick<OpenCodeSessionRecord, 'bootstrapMode'>,
+): 'runtime_bootstrap_checkin' | 'app_managed_bootstrap' {
+  return record.bootstrapMode === 'model_tool_checkin'
+    ? 'runtime_bootstrap_checkin'
+    : 'app_managed_bootstrap'
+}
+
+function hasAppManagedOpenCodeBootstrapReadinessEvidence(
+  record: Pick<OpenCodeSessionRecord, 'appManagedBootstrap' | 'bootstrapEvidenceSource'>,
+  summary: Pick<OpenCodeSessionReconcileSummary, 'latestAssistantMessageId' | 'latestAssistantText' | 'latestAssistantPreview'>,
+): boolean {
+  return Boolean(
+    record.appManagedBootstrap ||
+    record.bootstrapEvidenceSource === 'app_managed_bootstrap' ||
+    summary.latestAssistantMessageId ||
+    summary.latestAssistantText ||
+    summary.latestAssistantPreview
+  )
+}
+
+function bridgeStateFromSummary(
+  record: OpenCodeSessionRecord,
+  summary: OpenCodeSessionReconcileSummary,
+): 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed' {
+  if (summary.staleReason || summary.errorCount > 0) {
     return 'failed'
   }
   if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
     return 'permission_blocked'
+  }
+  if (isAppManagedOpenCodeBootstrap(record)) {
+    return hasAppManagedOpenCodeBootstrapReadinessEvidence(record, summary)
+      ? 'confirmed_alive'
+      : 'created'
+  }
+  const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(summary)
+  if (bootstrapMcpReadiness.failure) {
+    return 'failed'
   }
   if (bootstrapMcpReadiness.ready) {
     return 'confirmed_alive'
@@ -1631,18 +1675,30 @@ function bridgeStateFromSummary(summary: OpenCodeSessionReconcileSummary): 'crea
   return 'created'
 }
 
-function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
+function evidenceFromSummary(record: OpenCodeSessionRecord, summary: OpenCodeSessionReconcileSummary) {
   const observedAt = nowIso()
   const evidence = [
     { kind: 'member_session_recorded', observedAt },
   ]
-  const bootstrapMcpReadiness = summarizeOpenCodeBootstrapMcpReadiness(summary)
-  const failed =
-    Boolean(summary.staleReason) || summary.errorCount > 0 || Boolean(bootstrapMcpReadiness.failure)
-  if (summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked') {
+  const permissionBlocked = summary.pendingPermissionRequestIds.length > 0 || summary.durableState === 'blocked'
+  const appManagedReady = isAppManagedOpenCodeBootstrap(record) &&
+    hasAppManagedOpenCodeBootstrapReadinessEvidence(record, summary)
+  const bootstrapMcpReadiness = isAppManagedOpenCodeBootstrap(record)
+    ? null
+    : summarizeOpenCodeBootstrapMcpReadiness(summary)
+  const failed = Boolean(summary.staleReason) ||
+    summary.errorCount > 0 ||
+    Boolean(bootstrapMcpReadiness?.failure)
+  if (permissionBlocked) {
     evidence.push({ kind: 'permission_blocked', observedAt })
   }
-  if (!failed && bootstrapMcpReadiness.ready) {
+  if (!failed && !permissionBlocked && appManagedReady) {
+    if (record.appManagedBootstrap || record.bootstrapEvidenceSource === 'app_managed_bootstrap') {
+      evidence.push({ kind: 'app_managed_bootstrap_context_injected', observedAt })
+    }
+    evidence.push({ kind: 'bootstrap_confirmed', observedAt })
+    evidence.push({ kind: 'member_ready', observedAt })
+  } else if (!failed && bootstrapMcpReadiness?.ready) {
     evidence.push({ kind: 'bootstrap_confirmed', observedAt })
     evidence.push({ kind: 'member_ready', observedAt })
   }
@@ -1650,8 +1706,12 @@ function evidenceFromSummary(summary: OpenCodeSessionReconcileSummary) {
 }
 
 function summarizeBootstrapMcpFailure(
+  record: OpenCodeSessionRecord,
   summary: OpenCodeSessionReconcileSummary,
 ): TeamDiagnostic | null {
+  if (isAppManagedOpenCodeBootstrap(record)) {
+    return null
+  }
   const failure = summarizeOpenCodeBootstrapMcpFailure(summary)
   if (!failure) {
     return null
@@ -1669,10 +1729,13 @@ async function recreateSessionAfterBootstrapMcpFailure(params: {
   runId?: string | null
   diagnostics: TeamDiagnostic[]
 }): Promise<OpenCodeSessionRecord> {
+  if (isAppManagedOpenCodeBootstrap(params.record)) {
+    return params.record
+  }
   const bootstrapFailure = await withTimeout(
     openCodeSessionBridge.reconcileSession(params.record, { limit: 80 }),
     OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
-  ).then(reconciled => summarizeBootstrapMcpFailure(reconciled.summary))
+  ).then(reconciled => summarizeBootstrapMcpFailure(params.record, reconciled.summary))
     .catch(error => {
       params.diagnostics.push(
         teamDiagnostic(
@@ -2260,6 +2323,23 @@ async function runLaunchWithProvisioningSnapshot(
       })
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
       const candidateAt = nowIso()
+      const appManagedBootstrap = {
+        schemaVersion: 1 as const,
+        messageID: injected.messageID,
+        contextHash: injected.contextHash,
+        briefingHash: injected.briefingHash,
+        injectionVerifiedAt: injected.injectionVerifiedAt,
+        model: apiSelectedModel,
+        agent: OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT,
+      }
+      record = {
+        ...record,
+        bootstrapMode: 'app_managed_context',
+        bootstrapEvidenceSource: 'app_managed_bootstrap',
+        appManagedBootstrap,
+        updatedAt: candidateAt,
+      }
+      await openCodeSessionStore.upsert(record)
       const candidate: OpenCodeAppManagedBootstrapCandidate = {
         schemaVersion: 1,
         source: 'app_managed_bootstrap',
@@ -2423,14 +2503,16 @@ async function runReconcile(envelope: BridgeEnvelope) {
     }
     try {
       const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 50 })
-      const bootstrapFailure = summarizeBootstrapMcpFailure(reconciled.summary)
+      const bootstrapFailure = summarizeBootstrapMcpFailure(record, reconciled.summary)
       const memberDiagnostics = [
         ...reconciled.summary.diagnostics,
         ...(bootstrapFailure ? [bootstrapFailure.message] : []),
       ]
       members[name] = {
         sessionId: record.opencodeSessionId,
-        launchState: bridgeStateFromSummary(reconciled.summary),
+        launchState: bridgeStateFromSummary(record, reconciled.summary),
+        bootstrapEvidenceSource: resolvedOpenCodeBootstrapEvidenceSource(record),
+        bootstrapMode: resolvedOpenCodeBootstrapMode(record),
         ...(reconciled.summary.pendingPermissionRequestIds.length > 0
           ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
           : {}),
@@ -2441,7 +2523,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
             : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
               ? { runtimePid: snapshot.host.pid }
               : {}),
-        evidence: evidenceFromSummary(reconciled.summary),
+        evidence: evidenceFromSummary(record, reconciled.summary),
         diagnostics: memberDiagnostics,
       }
     } catch (error) {
@@ -3257,7 +3339,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
       const reconciled = await openCodeSessionBridge.reconcileSession(laneRecord, { limit: 50 })
       members[laneRecord.memberName] = {
         sessionId: laneRecord.opencodeSessionId,
-        launchState: bridgeStateFromSummary(reconciled.summary),
+        launchState: bridgeStateFromSummary(laneRecord, reconciled.summary),
+        bootstrapEvidenceSource: resolvedOpenCodeBootstrapEvidenceSource(laneRecord),
+        bootstrapMode: resolvedOpenCodeBootstrapMode(laneRecord),
         ...(reconciled.summary.pendingPermissionRequestIds.length > 0
           ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
           : {}),
@@ -3268,7 +3352,7 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
             : typeof snapshot.host?.pid === 'number' && snapshot.host.pid > 0
               ? { runtimePid: snapshot.host.pid }
               : {}),
-        evidence: evidenceFromSummary(reconciled.summary),
+        evidence: evidenceFromSummary(laneRecord, reconciled.summary),
         diagnostics: reconciled.summary.diagnostics,
       }
       diagnostics.push(

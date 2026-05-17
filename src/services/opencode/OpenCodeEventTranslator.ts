@@ -6,6 +6,7 @@ import type {
   OpenCodeMessage,
   OpenCodeSessionReconcileSummary,
   OpenCodeSessionStatus,
+  OpenCodeSessionStatusInput,
 } from './types.js'
 
 type OpenCodeEventTranslatorDeps = {
@@ -25,6 +26,56 @@ function getLastMessageId(
   return null
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function normalizeOpenCodeSessionStatus(
+  rawStatus: OpenCodeSessionStatusInput | null,
+): {
+  status: OpenCodeSessionStatus | null
+  diagnostic: string | null
+} {
+  if (rawStatus === 'idle' || rawStatus === 'busy' || rawStatus === 'retry') {
+    return { status: rawStatus, diagnostic: null }
+  }
+
+  const record = asRecord(rawStatus)
+  if (!record) {
+    const value = asString(rawStatus)
+    return {
+      status: null,
+      diagnostic: value ? `OpenCode session status was unrecognized: ${value}` : null,
+    }
+  }
+
+  const rawType = asString(record.type) ?? asString(record.status)
+  const status =
+    rawType === 'idle' || rawType === 'busy' || rawType === 'retry'
+      ? rawType
+      : null
+  const message = asString(record.message)
+  const attempt = typeof record.attempt === 'number' ? record.attempt : null
+  const next = typeof record.next === 'number' ? record.next : null
+  const parts = [
+    status ? `OpenCode session status ${status}` : 'OpenCode session status was unrecognized',
+    attempt !== null ? `attempt=${attempt}` : null,
+    message,
+    next !== null ? `next=${new Date(next).toISOString()}` : null,
+  ].filter(Boolean)
+
+  return {
+    status,
+    diagnostic: parts.length > 0 ? parts.join(' - ') : null,
+  }
+}
+
 export class OpenCodeEventTranslator {
   constructor(private readonly deps: OpenCodeEventTranslatorDeps = {}) {}
 
@@ -34,7 +85,7 @@ export class OpenCodeEventTranslator {
 
   reconcileSessionMessages(params: {
     sessionId: string
-    rawStatus: OpenCodeSessionStatus | null
+    rawStatus: OpenCodeSessionStatusInput | null
     messages: OpenCodeMessage[]
   }): OpenCodeSessionReconcileSummary {
     const projection = this.transcriptProjector.projectSessionMessages({
@@ -43,6 +94,10 @@ export class OpenCodeEventTranslator {
     })
     const canonicalMessages = projection.messages
     const diagnostics: string[] = []
+    const normalizedStatus = normalizeOpenCodeSessionStatus(params.rawStatus)
+    if (normalizedStatus.diagnostic) {
+      diagnostics.push(normalizedStatus.diagnostic)
+    }
     const respondedParentIds = new Set<string>()
 
     for (const message of canonicalMessages) {
@@ -71,19 +126,19 @@ export class OpenCodeEventTranslator {
         : null
 
     let durableState: OpenCodeSessionReconcileSummary['durableState'] = 'unknown'
-    if (params.rawStatus === 'retry') {
+    if (normalizedStatus.status === 'retry') {
       durableState = 'retrying'
-    } else if (params.rawStatus === 'busy') {
+    } else if (normalizedStatus.status === 'busy') {
       durableState = 'running'
     } else if (latestAssistantMessage?.hasError) {
       durableState = 'error'
     } else if (replyPendingSinceMessageId) {
       durableState = 'reply_pending'
-    } else if (params.rawStatus === 'idle' || canonicalMessages.length > 0) {
+    } else if (normalizedStatus.status === 'idle' || canonicalMessages.length > 0) {
       durableState = 'idle'
     }
 
-    if (replyPendingSinceMessageId && params.rawStatus === 'idle') {
+    if (replyPendingSinceMessageId && normalizedStatus.status === 'idle') {
       diagnostics.push(
         `Latest user message ${replyPendingSinceMessageId} has no assistant reply while OpenCode session is idle`,
       )
@@ -104,7 +159,7 @@ export class OpenCodeEventTranslator {
     return {
       sessionId: params.sessionId,
       reconcileOutcome: 'reconciled',
-      rawStatus: params.rawStatus,
+      rawStatus: normalizedStatus.status,
       durableState,
       staleReason: null,
       profileAuthState: null,

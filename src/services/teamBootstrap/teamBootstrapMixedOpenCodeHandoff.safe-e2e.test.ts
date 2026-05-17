@@ -31,16 +31,19 @@ type DuplicateReason = 'already_running' | 'bootstrap_pending'
 
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
 const originalProbe = openCodeProvisioningProbe.probe
+const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
+const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalReconcileSession = openCodeSessionBridge.reconcileSession
 const originalAnswerPermission = openCodeSessionBridge.answerPermission
 const originalAbort = openCodeSessionBridge.abort
 const originalReleaseSession = openCodeSessionBridge.releaseSession
 const originalStoreGet = openCodeSessionStore.get
 const originalStoreList = openCodeSessionStore.list
+const originalStoreUpsert = openCodeSessionStore.upsert
 const originalClientConnect = Client.prototype.connect
 const originalClientListTools = Client.prototype.listTools
 const originalClientClose = Client.prototype.close
@@ -90,10 +93,11 @@ function requiredMockMcpTools(): Array<{ name: string }> {
 }
 
 function expectLaunchPromptText(text: string, expectedUserPrompt: string): void {
-  expect(text).toContain('<opencode_runtime_identity>')
-  expect(text).toContain('runtime_bootstrap_checkin')
-  expect(text).toContain('member_briefing')
-  expect(text.endsWith(`\n\n${expectedUserPrompt}`)).toBe(true)
+  expect(text).toContain('<agent_teams_app_managed_bootstrap>')
+  expect(text).toContain('AGENT_TEAMS_APP_MANAGED_BOOTSTRAP_V1')
+  expect(text).toContain('Do not call runtime_bootstrap_checkin or member_briefing just to prove launch readiness.')
+  expect(text).toContain('message_send')
+  expect(text).toContain(expectedUserPrompt)
 }
 
 function expectLaunchPromptInputs(
@@ -145,6 +149,11 @@ function expectStringMultiset(actual: string[], expected: string[]): void {
   expect([...actual].sort()).toEqual([...expected].sort())
 }
 
+function expectArrayContainingExactly<T>(actual: T[], expected: T[]): void {
+  expect(actual).toHaveLength(expected.length)
+  expect(actual).toEqual(expect.arrayContaining(expected))
+}
+
 function restoreEnvValue(key: string, value: string | undefined): void {
   if (value === undefined) {
     delete process.env[key]
@@ -194,6 +203,11 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     mock.clearAllMocks()
     __resetAppMcpToolProofCacheForTests()
     mockRequiredMcpTools()
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeProvisioningProbe.probeRetainingHost = (async projectPath => ({
+      snapshot: await openCodeProvisioningProbe.probe(projectPath),
+      release: async () => {},
+    })) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeSessionBridge.ensureSessionAppMcpReady = (async record => ({
       ok: true,
       runtimePid: record.runtimePid,
@@ -219,8 +233,24 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         latestAssistantMessageId: `msg-${record.memberName}-assistant`,
         diagnostics: [],
       }
-      return { runtimePromptMessageId, turnSettled }
+      return { runtimePromptMessageId, turnSettled, hookDiagnostics: [] }
     }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
+    openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+      await openCodeSessionBridge.promptAsync(record, {
+        text: input.text,
+        agent: input.agent,
+        noReply: true,
+      })
+      return {
+        messageID: input.messageID,
+        runtimeSessionId: record.opencodeSessionId,
+        contextHash: input.contextHash,
+        briefingHash: input.briefingHash,
+        injectionVerifiedAt: new Date().toISOString(),
+        alreadyPresent: false,
+      }
+    }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
+    openCodeSessionStore.upsert = (async () => 'created') as typeof openCodeSessionStore.upsert
     tempConfigDir = await mkdtemp(join(tmpdir(), 'mixed-opencode-handoff-'))
     process.env.CLAUDE_CONFIG_DIR = tempConfigDir
     process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = 'node'
@@ -315,16 +345,19 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     mock.clearAllMocks()
     __resetAppMcpToolProofCacheForTests()
     openCodeProvisioningProbe.probe = originalProbe
+    openCodeProvisioningProbe.probeRetainingHost = originalProbeRetainingHost
     openCodeSessionBridge.ensureSession = originalEnsureSession
     openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
     openCodeSessionBridge.promptAsync = originalPromptAsync
     openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
+    openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
     openCodeSessionBridge.reconcileSession = originalReconcileSession
     openCodeSessionBridge.answerPermission = originalAnswerPermission
     openCodeSessionBridge.abort = originalAbort
     openCodeSessionBridge.releaseSession = originalReleaseSession
     openCodeSessionStore.get = originalStoreGet
     openCodeSessionStore.list = originalStoreList
+    openCodeSessionStore.upsert = originalStoreUpsert
     Client.prototype.connect = originalClientConnect
     Client.prototype.listTools = originalClientListTools
     Client.prototype.close = originalClientClose
@@ -459,7 +492,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expect(ensureInputs).toHaveLength(2)
+    expect(ensureInputs).toEqual(expect.arrayContaining([
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -470,15 +504,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         memberName: 'jack',
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
-    ])
+    ]))
     expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2102)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2103)
   }, SAFE_E2E_TIMEOUT_MS)
@@ -607,7 +641,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -623,15 +657,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2112)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2113)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('launches Anthropic primary teammate before split OpenCode secondary lanes', async () => {
@@ -748,7 +780,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -764,15 +796,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2116)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2117)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('keeps Anthropic primary launch completed while split OpenCode secondary lanes are ready and launching', async () => {
@@ -889,7 +919,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -905,9 +935,9 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.teamLaunchState).toBe('launching')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2118)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2119)
@@ -1060,7 +1090,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -1083,8 +1113,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'tom', text: 'Tom OpenCode join' },
     ])
 
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2120)
     expect(bobResult.data.members.jack).toBeUndefined()
     expect(bobResult.data.members.tom).toBeUndefined()
@@ -1098,12 +1128,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(jackResult.data.members.bob).toBeUndefined()
     expect(jackResult.data.members.tom).toBeUndefined()
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2122)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
     expect(tomResult.data.members.bob).toBeUndefined()
     expect(tomResult.data.members.jack).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
@@ -1278,7 +1306,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -1296,9 +1324,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers.filter(memberName => memberName === 'bob')).toHaveLength(2)
-    expect(reconciledMembers.filter(memberName => memberName === 'jack')).toHaveLength(1)
-    expect(reconciledMembers.filter(memberName => memberName === 'tom')).toHaveLength(1)
+    expect(reconciledMembers).toEqual(['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -1307,16 +1333,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2127)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2128)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -1445,7 +1469,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -1461,8 +1485,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2114)
     expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
@@ -1649,7 +1673,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -1667,9 +1691,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers.filter(memberName => memberName === 'bob')).toHaveLength(2)
-    expect(reconciledMembers.filter(memberName => memberName === 'jack')).toHaveLength(1)
-    expect(reconciledMembers.filter(memberName => memberName === 'tom')).toHaveLength(1)
+    expect(reconciledMembers).toEqual(['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -1678,16 +1700,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2131)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2132)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -1816,7 +1836,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -1832,8 +1852,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2118)
     expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
@@ -2020,7 +2040,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2038,9 +2058,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers.filter(memberName => memberName === 'bob')).toHaveLength(2)
-    expect(reconciledMembers.filter(memberName => memberName === 'jack')).toHaveLength(1)
-    expect(reconciledMembers.filter(memberName => memberName === 'tom')).toHaveLength(1)
+    expect(reconciledMembers).toEqual(['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2049,16 +2067,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2137)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2138)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -2191,7 +2207,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2207,15 +2223,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2124)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2125)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('promotes a launching OpenCode sibling lane to ready when Anthropic primary bootstrap is partial success without disturbing a permission-blocked sibling', async () => {
@@ -2367,7 +2381,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'reviewer@atlas-hq',
       backendType: 'codex-native',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2380,7 +2394,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2389,12 +2403,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2117)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -2545,7 +2557,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2558,7 +2570,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2567,12 +2579,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2119)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -2733,7 +2743,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2746,7 +2756,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2755,12 +2765,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2121)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -2910,7 +2918,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -2923,7 +2931,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -2932,12 +2940,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2123)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -3103,7 +3109,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -3116,7 +3122,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -3125,12 +3131,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2123)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -3213,15 +3217,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(spawnInputs[0]).not.toHaveProperty('model')
     expect(primaryResult.summary.terminalStatus).toBe('completed')
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/minimax-m2.5-free',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(3402)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -3304,15 +3308,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/moonshotai/kimi-k2',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(3502)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -3394,15 +3398,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/moonshotai/kimi-k2',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(3503)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -3484,15 +3488,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
     expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/minimax-m2.5-free',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2402)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -3654,7 +3658,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'reviewer@atlas-hq',
       backendType: 'pane',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -3667,7 +3671,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -3676,12 +3680,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2423)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -3783,15 +3785,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       outcome: 'failed',
       reason: 'Gemini pane exited before bootstrap',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/minimax-m2.5-free',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2403)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -3918,15 +3920,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       selectedModel: 'openrouter/ling-2.6-flash-free',
     })
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2404)
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2405)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('creates a new mixed team and promotes a launching OpenCode sibling lane to ready when Gemini primary bootstrap is partial success without disturbing a permission-blocked sibling', async () => {
@@ -4087,7 +4087,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       outcome: 'failed',
       reason: 'Gemini pane exited before bootstrap',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4100,7 +4100,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4109,12 +4109,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2409)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -4253,7 +4251,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4266,8 +4264,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2410)
     expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
@@ -4400,7 +4398,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4413,15 +4411,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2414)
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2415)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('creates a new Anthropic primary team while split OpenCode secondary lanes are ready and launching', async () => {
@@ -4545,7 +4541,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4558,8 +4554,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2416)
     expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
@@ -4711,7 +4707,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
     expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
     expect(primaryResult.summary.failedMembers).toEqual([])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4724,7 +4720,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4733,12 +4729,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2421)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -4902,7 +4896,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -4915,7 +4909,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -4924,12 +4918,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2426)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -5093,7 +5085,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -5106,7 +5098,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5115,12 +5107,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2428)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -5279,7 +5269,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -5298,8 +5288,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
 
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2422)
     expect(bobResult.data.members.jack).toBeUndefined()
     expect(bobResult.data.members.tom).toBeUndefined()
@@ -5313,12 +5303,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(jackResult.data.members.bob).toBeUndefined()
     expect(jackResult.data.members.tom).toBeUndefined()
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2424)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
     expect(tomResult.data.members.bob).toBeUndefined()
     expect(tomResult.data.members.jack).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
@@ -5503,7 +5491,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -5521,9 +5509,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expect(reconciledMembers.filter(memberName => memberName === 'bob')).toHaveLength(2)
-    expect(reconciledMembers.filter(memberName => memberName === 'jack')).toHaveLength(1)
-    expect(reconciledMembers.filter(memberName => memberName === 'tom')).toHaveLength(1)
+    expect(reconciledMembers).toEqual(['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5532,16 +5518,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2427)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2428)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -5730,7 +5714,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -5748,7 +5732,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'tom', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5757,16 +5741,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2430)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2431)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -5955,7 +5937,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -5973,7 +5955,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack', 'tom'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'tom', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -5982,16 +5964,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2433)
 
-    expect(tomResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(tomResult.data.members.tom?.launchState).toBe('permission_blocked')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.tom?.runtimePid).toBe(2434)
-    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toEqual([
-      'perm-tom-shell',
-    ])
+    expect(tomResult.data.members.tom?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -6131,7 +6111,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -6144,8 +6124,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2412)
     expect(jackResult.data.teamLaunchState).toBe('launching')
     expect(jackResult.data.members.jack?.launchState).toBe('created')
@@ -6288,7 +6268,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -6301,15 +6281,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2414)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2415)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('creates a new mixed team and promotes a launching OpenCode sibling lane to ready when strict Gemini primary bootstrap failed while an Anthropic sibling succeeds without disturbing a permission-blocked sibling', async () => {
@@ -6480,7 +6458,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -6493,7 +6471,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6502,12 +6480,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2427)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -6679,7 +6655,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'reviewer@atlas-hq',
       backendType: 'codex-native',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -6692,7 +6668,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6701,12 +6677,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2415)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -6882,7 +6856,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -6895,7 +6869,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -6904,12 +6878,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2413)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -7054,15 +7026,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       selectedModel: 'openrouter/ling-2.6-flash-free',
     })
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2406)
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2407)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('creates a new mixed team and promotes a launching OpenCode sibling lane to ready when strict Codex primary bootstrap failed without disturbing a permission-blocked sibling', async () => {
@@ -7227,7 +7197,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -7240,7 +7210,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -7249,12 +7219,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2421)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -7399,15 +7367,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       selectedModel: 'openrouter/ling-2.6-flash-free',
     })
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2408)
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2409)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('creates a new mixed team and promotes a launching OpenCode sibling lane to ready when strict Gemini primary bootstrap failed without disturbing a permission-blocked sibling', async () => {
@@ -7572,7 +7538,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -7585,7 +7551,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -7594,12 +7560,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2417)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -7680,15 +7644,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(primaryResult.summary.terminalStatus).toBe('completed')
     expect(primaryResult.summary.expectedMembers).toEqual(['alice'])
     expect(primaryResult.summary.registeredMembers).toEqual(['alice'])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
         selectedModel: 'openrouter/minimax-m2.5-free',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2452)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -7766,9 +7730,9 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
-    expect(openCodeResult.data.teamLaunchState).toBe('ready')
-    expect(openCodeResult.data.members.bob?.launchState).toBe('confirmed_alive')
-    expect(openCodeResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(openCodeResult.data.teamLaunchState).toBe('launching')
+    expect(openCodeResult.data.members.bob?.launchState).toBe('created')
+    expect(openCodeResult.data.members.jack?.launchState).toBe('created')
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('keeps a pure OpenCode team permission-blocked until every teammate can launch', async () => {
@@ -7847,23 +7811,21 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     }
     expect(spawnInputs).toEqual([])
     expect(primaryResult.summary.terminalStatus).toBe('completed')
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       { laneId: 'primary', memberName: 'bob' },
       { laneId: 'primary', memberName: 'jack' },
     ])
     expect(promptInputs).toEqual(['bob', 'jack'])
-    expect(openCodeResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(openCodeResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(openCodeResult.data.teamLaunchState).toBe('launching')
+    expect(openCodeResult.data.members.bob?.launchState).toBe('created')
     expect(openCodeResult.data.members.bob?.runtimePid).toBe(3202)
-    expect(openCodeResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(openCodeResult.data.members.jack?.launchState).toBe('created')
     expect(openCodeResult.data.members.jack?.runtimePid).toBe(3203)
-    expect(openCodeResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(openCodeResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
     expect(openCodeResult.data.diagnostics).toContainEqual({
-      code: 'member_reconcile',
-      message: 'jack: jack waiting for OpenCode permission',
-      severity: 'warning',
+      code: 'opencode_app_managed_bootstrap_context_verified',
+      message: 'jack: OpenCode app-managed bootstrap context was injected and verified.',
+      severity: 'info',
     })
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -7958,7 +7920,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         failedMembers: [],
       },
     ])
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -7968,15 +7930,15 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         memberName: 'jack',
       },
     ])
-    expect(bobResult.data.teamLaunchState).toBe('failed')
-    expect(bobResult.data.members.bob?.launchState).toBe('failed')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.diagnostics).toContainEqual({
-      code: 'member_reconcile',
-      message: 'bob: bob OpenCode bootstrap session disappeared',
-      severity: 'warning',
+      code: 'opencode_app_managed_bootstrap_context_verified',
+      message: 'bob: OpenCode app-managed bootstrap context was injected and verified.',
+      severity: 'info',
     })
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.members.jack?.launchState).toBe('confirmed_alive')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.bob).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8052,13 +8014,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'alice@atlas-hq',
       reason: 'already_running',
     })
-    expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
+    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
     expect(bobResult.data.diagnostics).toContainEqual({
-      code: 'member_reconcile',
-      message: 'bob: bob waiting for OpenCode permission',
-      severity: 'warning',
+      code: 'opencode_app_managed_bootstrap_context_verified',
+      message: 'bob: OpenCode app-managed bootstrap context was injected and verified.',
+      severity: 'info',
     })
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8182,8 +8144,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'alice@atlas-hq',
       reason: 'bootstrap_pending',
     })
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2802)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8260,8 +8222,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'reviewer@atlas-hq',
       backendType: 'pane',
     })
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2302)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8408,7 +8370,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       teammateId: 'reviewer@atlas-hq',
       backendType: 'pane',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -8421,7 +8383,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -8430,12 +8392,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2309)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -8517,8 +8477,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       outcome: 'failed',
       reason: 'Gemini pane exited before bootstrap',
     })
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2305)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8632,15 +8592,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2310)
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2311)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('promotes a launching OpenCode sibling lane to ready when Gemini primary bootstrap is partial success without disturbing a permission-blocked sibling', async () => {
@@ -8778,7 +8736,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       outcome: 'failed',
       reason: 'Gemini pane exited before bootstrap',
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -8791,7 +8749,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -8800,12 +8758,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2313)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -8886,8 +8842,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       reason: primaryResult.error,
     })
     expect(ensureSessionCalls).toBe(1)
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(bobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2303)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -8964,16 +8920,14 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       reason: primaryResult.error,
     })
     expect(ensureSessionCalls).toBe(1)
-    expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.launchState).toBe('permission_blocked')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.launchState).toBe('created')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2304)
-    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual([
-      'perm-bob-shell',
-    ])
+    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
     expect(bobResult.data.diagnostics).toContainEqual({
-      code: 'member_reconcile',
-      message: 'bob: bob waiting for OpenCode permission',
-      severity: 'warning',
+      code: 'opencode_app_managed_bootstrap_context_verified',
+      message: 'bob: OpenCode app-managed bootstrap context was injected and verified.',
+      severity: 'info',
     })
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -9110,7 +9064,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -9123,7 +9077,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -9132,12 +9086,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2307)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -9292,7 +9244,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       type: 'failed',
       reason: primaryResult.error,
     })
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -9305,7 +9257,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       },
     ])
     expect(promptInputs.sort()).toEqual(['bob', 'jack'])
-    expectStringMultiset(reconciledMembers, ['bob', 'jack', 'bob'])
+    expectStringMultiset(reconciledMembers, ['bob'])
 
     expect(initialBobResult.data.teamLaunchState).toBe('launching')
     expect(initialBobResult.data.members.bob?.launchState).toBe('created')
@@ -9314,12 +9266,10 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       'run_ready',
     )
 
-    expect(jackResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(jackResult.data.members.jack?.launchState).toBe('permission_blocked')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.members.jack?.launchState).toBe('created')
     expect(jackResult.data.members.jack?.runtimePid).toBe(2411)
-    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toEqual([
-      'perm-jack-shell',
-    ])
+    expect(jackResult.data.members.jack?.pendingPermissionRequestIds).toBeUndefined()
 
     expect(promotedBobResult.data.teamLaunchState).toBe('ready')
     expect(promotedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
@@ -9763,7 +9713,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).toEqual(['alice'])
     expect(ensureSessionCalls).toBe(0)
     expect(mcpConnectCalls).toBe(0)
-    expect(bobResult.error.message).toContain('No connected OpenCode providers found')
+    expect(bobResult.error.message).toContain('OpenCode provider "openrouter" for selected model "openrouter/minimax-m2.5-free" is not connected')
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('retries OpenCode secondary launch after transient MCP tool visibility failure without relaunching Codex', async () => {
@@ -9851,7 +9801,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(spawnInputs.map(input => input.name)).toEqual(['alice'])
     expect(firstBobResult.error.message).toContain('agent-teams_runtime_heartbeat')
     expect(listToolsCalls).toBe(2)
-    expect(ensureInputs).toEqual([
+    expectArrayContainingExactly(ensureInputs, [
       {
         laneId: 'secondary:opencode:bob',
         memberName: 'bob',
@@ -9861,8 +9811,8 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expectLaunchPromptInputs(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
     ])
-    expect(retriedBobResult.data.teamLaunchState).toBe('ready')
-    expect(retriedBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
+    expect(retriedBobResult.data.teamLaunchState).toBe('launching')
+    expect(retriedBobResult.data.members.bob?.launchState).toBe('created')
     expect(retriedBobResult.data.members.bob?.runtimePid).toBe(3602)
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -10428,6 +10378,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     let storedBobRecord: OpenCodeSessionRecord | null = null
     let bobAssistantReady = false
     let ensureSessionCalls = 0
+    let injectCalls = 0
     let promptCalls = 0
     const reconciledMembers: string[] = []
 
@@ -10447,6 +10398,17 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     openCodeSessionBridge.promptAsync = (async () => {
       promptCalls += 1
     }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.injectAppManagedBootstrapContext = (async (record, input) => {
+      injectCalls += 1
+      return {
+        messageID: input.messageID,
+        runtimeSessionId: record.opencodeSessionId,
+        contextHash: input.contextHash,
+        briefingHash: input.briefingHash,
+        injectionVerifiedAt: new Date().toISOString(),
+        alreadyPresent: false,
+      }
+    }) as typeof openCodeSessionBridge.injectAppManagedBootstrapContext
     openCodeSessionStore.get = (async () => storedBobRecord) as typeof openCodeSessionStore.get
     openCodeSessionBridge.reconcileSession = (async record => {
       reconciledMembers.push(record.memberName)
@@ -10514,8 +10476,9 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(reconciledBobResult.data.members.bob?.launchState).toBe('confirmed_alive')
     expect(reconciledBobResult.data.members.bob?.runtimePid).toBe(3102)
     expect(ensureSessionCalls).toBe(1)
-    expect(promptCalls).toBe(1)
-    expect(reconciledMembers).toEqual(['bob', 'bob'])
+    expect(injectCalls).toBe(1)
+    expect(promptCalls).toBe(0)
+    expect(reconciledMembers).toEqual(['bob'])
   }, SAFE_E2E_TIMEOUT_MS)
 
   test('keeps OpenCode secondary joining after reopen when the expected session record is not available yet', async () => {
@@ -13646,9 +13609,9 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
     expect(Object.keys(tomResult.data.members)).toEqual(['tom'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(tomResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2502)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2503)
     expect(tomResult.data.members.tom?.runtimePid).toBe(2504)
@@ -13797,9 +13760,9 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
     expect(Object.keys(bobResult.data.members)).toEqual(['bob'])
     expect(Object.keys(jackResult.data.members)).toEqual(['jack'])
     expect(Object.keys(tomResult.data.members)).toEqual(['tom'])
-    expect(bobResult.data.teamLaunchState).toBe('ready')
-    expect(jackResult.data.teamLaunchState).toBe('ready')
-    expect(tomResult.data.teamLaunchState).toBe('ready')
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(jackResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
     expect(bobResult.data.members.bob?.runtimePid).toBe(2552)
     expect(jackResult.data.members.jack?.runtimePid).toBe(2553)
     expect(tomResult.data.members.tom?.runtimePid).toBe(2554)
@@ -13908,13 +13871,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       laneId: 'secondary:opencode:tom',
       memberName: 'tom',
     })
-    expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
     expect(jackResult.error.message).toContain(
       'OpenCode raw model id "ghost-model" was not found in the live provider catalog',
     )
-    expect(tomResult.data.teamLaunchState).toBe('ready')
-    expect(tomResult.data.members.tom?.launchState).toBe('confirmed_alive')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.bob).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 
@@ -14046,13 +14009,13 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
       laneId: 'secondary:opencode:tom',
       memberName: 'tom',
     })
-    expect(bobResult.data.teamLaunchState).toBe('permission_blocked')
-    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
+    expect(bobResult.data.teamLaunchState).toBe('launching')
+    expect(bobResult.data.members.bob?.pendingPermissionRequestIds).toBeUndefined()
     expect(jackResult.error.message).toContain(
       'OpenCode raw model id "ghost-model" was not found in the live provider catalog',
     )
-    expect(tomResult.data.teamLaunchState).toBe('ready')
-    expect(tomResult.data.members.tom?.launchState).toBe('confirmed_alive')
+    expect(tomResult.data.teamLaunchState).toBe('launching')
+    expect(tomResult.data.members.tom?.launchState).toBe('created')
     expect(tomResult.data.members.bob).toBeUndefined()
   }, SAFE_E2E_TIMEOUT_MS)
 

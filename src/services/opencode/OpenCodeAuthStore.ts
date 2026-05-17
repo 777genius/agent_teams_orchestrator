@@ -129,6 +129,26 @@ export async function syncOpenCodeManagedAuthStore(input: {
   })
 }
 
+export async function reconcileOpenCodeManagedAuthStore(input: {
+  sourceAuthPaths: readonly string[]
+  managedAuthPath: string
+}): Promise<void> {
+  await withAuthStoreWriteLock(input.managedAuthPath, async () => {
+    let expected: OpenCodeAuthStore = {}
+    for (const sourceAuthPath of input.sourceAuthPaths) {
+      expected = mergeOpenCodeAuthStores({
+        source: await readOpenCodeAuthStore(sourceAuthPath),
+        managed: expected,
+      })
+    }
+
+    const managed = await readOpenCodeAuthStore(input.managedAuthPath)
+    if (JSON.stringify(expected) !== JSON.stringify(managed)) {
+      await writeOpenCodeAuthStore(input.managedAuthPath, expected)
+    }
+  })
+}
+
 export async function upsertOpenCodeApiAuthCredential(input: {
   authPath: string
   providerId: string

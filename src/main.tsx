@@ -4245,9 +4245,10 @@ async function run(): Promise<CommanderCommand> {
   });
 
   const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
-  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').option('--summary', 'Output fast live status without full model catalog metadata').action(async (opts: {
     json?: boolean;
     text?: boolean;
+    summary?: boolean;
     provider?: 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all';
   }) => {
     const {

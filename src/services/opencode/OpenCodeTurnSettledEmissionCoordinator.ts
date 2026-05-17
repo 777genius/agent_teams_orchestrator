@@ -84,10 +84,17 @@ function hasErrorForPrompt(
     .some(message => message.role === 'assistant' && message.hasError)
 }
 
+function isAppManagedOpenCodeBootstrap(
+  record: Pick<OpenCodeSessionRecord, 'bootstrapMode'>,
+): boolean {
+  return record.bootstrapMode !== 'model_tool_checkin'
+}
+
 function bootstrapMcpFailureDetail(
+  record: OpenCodeSessionRecord,
   summary: OpenCodeSessionReconcileSummary | null | undefined,
 ): string | null {
-  if (!summary) {
+  if (!summary || isAppManagedOpenCodeBootstrap(record)) {
     return null
   }
   return summarizeOpenCodeBootstrapMcpFailure(summary)?.message ?? null
@@ -115,14 +122,33 @@ function outcomeFromDelivery(input: {
 }
 
 function outcomeFromLaunch(input: {
+  record: OpenCodeSessionRecord
   previewSummary?: OpenCodeSessionPreviewSummary | null
   reconcileSummary?: OpenCodeSessionReconcileSummary | null
 }): OpenCodeRuntimeTurnSettledOutcome {
+  if (input.reconcileSummary?.staleReason) {
+    return 'error'
+  }
   if (input.reconcileSummary?.errorCount && input.reconcileSummary.errorCount > 0) {
     return 'error'
   }
-  if (bootstrapMcpFailureDetail(input.reconcileSummary)) {
+  if (bootstrapMcpFailureDetail(input.record, input.reconcileSummary)) {
     return 'error'
+  }
+  if (isAppManagedOpenCodeBootstrap(input.record)) {
+    if (
+      input.reconcileSummary?.pendingPermissionRequestIds.length ||
+      input.reconcileSummary?.durableState === 'blocked'
+    ) {
+      return 'idle_without_assistant_activity'
+    }
+    if (input.previewSummary?.runtimeState === 'error') {
+      return 'error'
+    }
+    if (input.previewSummary?.streamConnected === false && !input.reconcileSummary) {
+      return 'stream_unavailable'
+    }
+    return 'success'
   }
   if (input.reconcileSummary && summarizeOpenCodeBootstrapMcpReadiness(input.reconcileSummary).ready) {
     return 'success'
@@ -202,7 +228,7 @@ export class OpenCodeTurnSettledEmissionCoordinator {
   }): Promise<void> {
     const turnId = input.reconcileSummary?.latestUserMessageId
     const detail = compactDiagnostics([
-      bootstrapMcpFailureDetail(input.reconcileSummary),
+      bootstrapMcpFailureDetail(input.record, input.reconcileSummary),
       ...(input.previewSummary?.diagnostics ?? []),
       ...(input.reconcileSummary?.diagnostics ?? []),
     ])

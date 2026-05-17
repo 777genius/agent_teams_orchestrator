@@ -25,6 +25,7 @@ import type {
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionReconcileSummary,
   OpenCodeSessionStatus,
+  OpenCodeSessionStatusInput,
   OpenCodeSessionSummary,
 } from './types.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
@@ -241,6 +242,7 @@ export class OpenCodeSessionBridge {
         sourceAuthFingerprint: host.profile.sourceAuthFingerprint,
         managedAuthFingerprint: host.profile.managedAuthFingerprint,
         projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+        bootstrapMode: 'app_managed_context',
         staleReason: null,
         createdAt: now,
         updatedAt: now,
@@ -883,7 +885,7 @@ export class OpenCodeSessionBridge {
     })
   }
 
-  async getRawStatus(record: OpenCodeSessionRecord): Promise<OpenCodeSessionStatus | null> {
+  async getRawStatus(record: OpenCodeSessionRecord): Promise<OpenCodeSessionStatusInput | null> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       const statusMap = await client.getSessionStatus()
@@ -1194,7 +1196,7 @@ export class OpenCodeSessionBridge {
     return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
       const client = this.clientFactory.create(baseUrl)
       const diagnostics = [...options.diagnostics]
-      let rawStatus: OpenCodeSessionStatus | null = null
+      let rawStatus: OpenCodeSessionStatusInput | null = null
       try {
         const statusMap = await client.getSessionStatus()
         rawStatus = statusMap[record.opencodeSessionId] ?? null

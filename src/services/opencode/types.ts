@@ -231,6 +231,35 @@ export type OpenCodeSessionSummary = {
 
 export type OpenCodeSessionStatus = 'idle' | 'busy' | 'retry'
 
+export type OpenCodeSessionStatusPayload = {
+  type?: string
+  status?: string
+  message?: string
+  attempt?: number
+  next?: number
+}
+
+export type OpenCodeSessionStatusInput =
+  | OpenCodeSessionStatus
+  | OpenCodeSessionStatusPayload
+  | string
+
+export type OpenCodeBootstrapMode = 'app_managed_context' | 'model_tool_checkin'
+
+export type OpenCodeBootstrapEvidenceSource =
+  | 'app_managed_bootstrap'
+  | 'runtime_bootstrap_checkin'
+
+export type OpenCodeAppManagedBootstrapRecord = {
+  schemaVersion: 1
+  messageID: string
+  contextHash: string
+  briefingHash: string
+  injectionVerifiedAt: string
+  model?: string
+  agent?: string
+}
+
 export type OpenCodePendingPermission = {
   id?: string
   requestID?: string
@@ -537,6 +566,9 @@ export type OpenCodeSessionRecord = {
   projectBehaviorFingerprint: string
   managedConfigFingerprint?: string
   opencodeVersion?: string
+  bootstrapMode?: OpenCodeBootstrapMode
+  bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource
+  appManagedBootstrap?: OpenCodeAppManagedBootstrapRecord
   staleReason: string | null
   createdAt: string
   updatedAt: string

@@ -10,7 +10,7 @@ import type {
   OpenCodeProviderAuthMethod,
   OpenCodeProviderResponse,
   OpenCodeServerDocResponse,
-  OpenCodeSessionStatus,
+  OpenCodeSessionStatusInput,
   OpenCodeSessionSummary,
 } from './types.js'
 
@@ -28,7 +28,7 @@ export type OpenCodeClient = {
   connectMcp?(name: string): Promise<OpenCodeMcpResponse>
   createSession(body?: { parentID?: string; title?: string }): Promise<OpenCodeSessionSummary>
   getSession(id: string): Promise<OpenCodeSessionSummary>
-  getSessionStatus(): Promise<Record<string, OpenCodeSessionStatus>>
+  getSessionStatus(): Promise<Record<string, OpenCodeSessionStatusInput>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
   getSessionMessage?(id: string, messageID: string): Promise<OpenCodeMessage | null>
   getPermissions(): Promise<OpenCodePendingPermission[]>
@@ -193,7 +193,7 @@ export class OpenCodeClientFactory {
           body: JSON.stringify(body ?? {}),
         }),
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
-      getSessionStatus: () => request<Record<string, OpenCodeSessionStatus>>('/session/status'),
+      getSessionStatus: () => request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),
       getSessionMessages: (id, limit) =>
         request<OpenCodeMessage[]>(
           `/session/${id}/message${typeof limit === 'number' ? `?limit=${limit}` : ''}`,

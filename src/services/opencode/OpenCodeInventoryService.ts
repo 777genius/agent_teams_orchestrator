@@ -19,8 +19,11 @@ import type {
 const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 
+type OpenCodeInventoryProbeMode = 'full' | 'summary'
+
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
+  mode?: OpenCodeInventoryProbeMode
 }
 
 type CacheEntry = {
@@ -199,7 +202,12 @@ export function isOpenCodeModelFree(
   modelId: string,
   modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
 ): boolean {
-  const metadata = modelMetadata?.find(item => item.id === modelId)
+  const normalizedModelId = modelId.trim()
+  if (normalizedModelId.toLowerCase().endsWith(':free')) {
+    return true
+  }
+
+  const metadata = modelMetadata?.find(item => item.id === normalizedModelId)
   return metadata?.free === true
 }
 
@@ -350,10 +358,12 @@ export class OpenCodeInventoryService {
     projectPath?: string | null,
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
+    const mode = options.mode ?? 'full'
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
-    const cacheKey = resolvedProjectPath
+    const cacheKey = `${resolvedProjectPath}\0${mode}`
     const cached = this.cache.get(cacheKey)
-    if (!options.bypassCache && cached && cached.expiresAt > Date.now()) {
+    const cacheEnabled = mode === 'full' && !options.bypassCache
+    if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
       return cached.snapshot
     }
 
@@ -374,19 +384,25 @@ export class OpenCodeInventoryService {
         probeError: null,
         diagnostics: ['OpenCode CLI not detected on PATH'],
       }
-      this.cache.set(cacheKey, {
-        expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS,
-        snapshot: missingSnapshot,
-      })
+      if (cacheEnabled) {
+        this.cache.set(cacheKey, {
+          expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS,
+          snapshot: missingSnapshot,
+        })
+      }
       return missingSnapshot
     }
 
     const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath)
-    const [versionResult, providersResult, modelsVerboseResult, agentsResult] = await Promise.all([
+    const [versionResult, providersResult, modelsResult, agentsResult] = await Promise.all([
       this.execOpenCode(binaryPath, ['--version'], profile),
       this.execOpenCode(binaryPath, ['providers', 'list'], profile),
-      this.execOpenCode(binaryPath, getOpenCodeVerboseModelsArgs(), profile),
-      this.execOpenCode(binaryPath, ['agent', 'list'], profile),
+      mode === 'summary'
+        ? Promise.resolve({ stdout: '', stderr: '', code: 0 })
+        : this.execOpenCode(binaryPath, getOpenCodeVerboseModelsArgs(), profile),
+      mode === 'summary'
+        ? Promise.resolve({ stdout: '', stderr: '', code: 0 })
+        : this.execOpenCode(binaryPath, ['agent', 'list'], profile),
     ])
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
@@ -429,15 +445,20 @@ export class OpenCodeInventoryService {
       ...managedAuthProviders,
     ])
     const verboseModels =
-      modelsVerboseResult.code === 0
-        ? parseOpenCodeModelsVerboseOutput(modelsVerboseResult.stdout)
-        : { models: [], modelMetadata: [] }
+      mode === 'summary'
+        ? {
+            models: [],
+            modelMetadata: [],
+          }
+        : modelsResult.code === 0
+          ? parseOpenCodeModelsVerboseOutput(modelsResult.stdout)
+          : { models: [], modelMetadata: [] }
     let models = verboseModels.models
     let modelMetadata = verboseModels.modelMetadata
-    let modelsResult = modelsVerboseResult
-    if (models.length === 0) {
+    let finalModelsResult = modelsResult
+    if (mode === 'full' && models.length === 0) {
       const fallbackModelsResult = await this.execOpenCode(binaryPath, ['models'], profile)
-      modelsResult = fallbackModelsResult
+      finalModelsResult = fallbackModelsResult
       models = fallbackModelsResult.code === 0
         ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
         : []
@@ -462,13 +483,13 @@ export class OpenCodeInventoryService {
         'Failed to query OpenCode providers',
       ))
     }
-    if (modelsResult.code !== 0) {
+    if (finalModelsResult.code !== 0) {
       diagnostics.push(this.getCommandFailureMessage(
-        modelsResult,
+        finalModelsResult,
         'Failed to query OpenCode models',
       ))
     }
-    if (agentsResult.code !== 0) {
+    if (mode === 'full' && agentsResult.code !== 0) {
       diagnostics.push(this.getCommandFailureMessage(
         agentsResult,
         'Failed to query OpenCode agents',
@@ -491,10 +512,12 @@ export class OpenCodeInventoryService {
       diagnostics,
     }
 
-    this.cache.set(cacheKey, {
-      expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS,
-      snapshot,
-    })
+    if (cacheEnabled) {
+      this.cache.set(cacheKey, {
+        expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS,
+        snapshot,
+      })
+    }
 
     return snapshot
   }
