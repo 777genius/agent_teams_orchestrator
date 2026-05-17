@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test'
 import path from 'node:path'
 
 import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher.js'
-import { OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC } from './OpenCodeChangeEvidence.js'
+import {
+  normalizeOpenCodeSnapshotProofUpgradeMode,
+  OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC,
+} from './OpenCodeChangeEvidence.js'
 
 import type { OpenCodeSnapshotEvidenceFile, OpenCodeSnapshotEvidenceProvider } from './OpenCodeChangeEvidence.js'
 import type { OpenCodeOfflineSessionReadResult } from './OpenCodeOfflineSessionReader.js'
@@ -132,6 +135,15 @@ function offlineFixture(overrides: Partial<OpenCodeOfflineSessionReadResult> = {
 }
 
 describe('OpenCodeChangeEvidenceEnricher', () => {
+  test('normalizes snapshot proof upgrade mode env values conservatively', () => {
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode(' OFF ')).toBe('off')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('shadow')).toBe('shadow')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('SINGLE-CHANGE')).toBe('single-change')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('full')).toBe('full')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('')).toBe('full')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('unexpected')).toBe('off')
+  })
+
   test('keeps metadata-only fallback when snapshot evidence is unavailable', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
@@ -526,5 +538,202 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       confidence: 'high',
       evidenceProof: 'opencode-snapshot',
     })
+  })
+
+  test('off mode does not read snapshot evidence or upgrade metadata-only changes', async () => {
+    const diagnostics: string[] = []
+    const throwingProvider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        throw new Error('unexpected probe')
+      },
+      async readSessionEvidence() {
+        throw new Error('unexpected snapshot read')
+      },
+    }
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change()],
+      offline: offlineFixture(),
+      snapshotProvider: throwingProvider,
+      snapshotProofMode: 'off',
+      diagnostics,
+    })
+
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics).toContain(
+      'snapshot-upgrade-skipped/feature-flag-off: OpenCode snapshot proof upgrade is disabled.',
+    )
+  })
+
+  test('shadow mode computes proof stats but returns original metadata-only changes', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change()],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider('export const value = 2;\n'),
+      snapshotProofMode: 'shadow',
+      diagnostics,
+    })
+
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics.some(diagnostic =>
+      diagnostic.startsWith('snapshot-proof-shadow:') &&
+      diagnostic.includes('wouldUpgrade=1') &&
+      diagnostic.includes('applied=0')
+    )).toBe(true)
+  })
+
+  test('single-change mode skips same-path chains without applying snapshot proof', async () => {
+    const diagnostics: string[] = []
+    const first = change({
+      sourcePartId: 'part-edit-1',
+      sourceImportKey: 'opencode\0session-1\0part-edit-1\0/repo/src/file.ts',
+      oldString: 'value = 1',
+      newString: 'value = 2',
+    })
+    const second = change({
+      sourcePartId: 'part-edit-2',
+      sourceImportKey: 'opencode\0session-1\0part-edit-2\0/repo/src/file.ts',
+      oldString: 'value = 2',
+      newString: 'value = 3',
+    })
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [first, second],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      snapshotProofMode: 'single-change',
+      diagnostics,
+    })
+
+    expect(result.map(item => item.evidenceProof)).toEqual([
+      'metadata-only-fallback',
+      'metadata-only-fallback',
+    ])
+    expect(diagnostics).toContain('snapshot-upgrade-skipped/single-change-only: src/file.ts')
+  })
+
+  test('fails closed when snapshot before boundary contradicts the verified inverse edit', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change()],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'modify',
+        beforeContent: 'export const value = 0;\n',
+        afterContent: 'export const value = 2;\n',
+      }),
+      diagnostics,
+    })
+
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics).toContain('snapshot-upgrade-skipped/path-chain-boundary-mismatch: src/file.ts')
+  })
+
+  test('removes only known baseline warnings after proof and preserves unrelated manual-only warnings', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [
+        change({
+          sourceTool: 'write',
+          beforeContent: null,
+          afterContent: 'export const value = 2;\n',
+          beforeState: {
+            exists: true,
+            unavailableReason: 'opencode-before-content-unavailable',
+          },
+          afterState: {
+            exists: true,
+            sha256: 'after-hash',
+            sizeBytes: 24,
+          },
+          operation: 'modify',
+          warnings: [
+            'OpenCode write overwrote an existing file before the bridge had a known baseline; reject is manual-only.',
+            'Task boundary warning: review remains manual-only.',
+          ],
+        }),
+      ],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'modify',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+      }),
+      diagnostics,
+    })
+
+    expect(result[0]?.warnings).toEqual([
+      'Task boundary warning: review remains manual-only.',
+    ])
+  })
+
+  test('keeps duplicate snapshot file anchors metadata-only', async () => {
+    const diagnostics: string[] = []
+    const duplicateProvider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        return {
+          supported: true,
+          shapeFingerprint: 'shape-v1',
+          adapterVersion: 1,
+        }
+      },
+      async readSessionEvidence() {
+        return {
+          supported: true,
+          shapeFingerprint: 'shape-v1',
+          adapterVersion: 1,
+          files: [
+            {
+              relativePath: 'src/file.ts',
+              afterContent: 'export const value = 2;\n',
+            },
+            {
+              relativePath: 'src/file.ts',
+              afterContent: 'export const value = 3;\n',
+            },
+          ],
+        }
+      },
+    }
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change()],
+      offline: offlineFixture(),
+      snapshotProvider: duplicateProvider,
+      diagnostics,
+    })
+
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics).toContain('snapshot-upgrade-skipped/duplicate-file-anchor: src/file.ts')
   })
 })

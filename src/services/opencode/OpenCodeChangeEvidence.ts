@@ -12,6 +12,12 @@ export type OpenCodeEvidenceProof =
 export type OpenCodeEvidencePipelineMode =
   | 'snapshot-auto'
 
+export type OpenCodeSnapshotProofUpgradeMode =
+  | 'off'
+  | 'shadow'
+  | 'single-change'
+  | 'full'
+
 export type OpenCodeSnapshotCaptureStatus =
   | 'captured'
   | 'pending'
@@ -102,6 +108,28 @@ export interface OpenCodeSnapshotEvidenceProvider {
 }
 
 export const DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE: OpenCodeEvidencePipelineMode = 'snapshot-auto'
+
+export const DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE: OpenCodeSnapshotProofUpgradeMode = 'full'
+
+export function normalizeOpenCodeSnapshotProofUpgradeMode(value: string | undefined): OpenCodeSnapshotProofUpgradeMode {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized) {
+    return DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE
+  }
+  if (normalized === '0' || normalized === 'off') {
+    return 'off'
+  }
+  if (normalized === 'shadow') {
+    return 'shadow'
+  }
+  if (normalized === 'single-change') {
+    return 'single-change'
+  }
+  if (normalized === 'full') {
+    return 'full'
+  }
+  return 'off'
+}
 
 export const OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC =
   'snapshot-provider-unavailable: OpenCode snapshot evidence provider is unavailable; using chain/metadata fallback.'

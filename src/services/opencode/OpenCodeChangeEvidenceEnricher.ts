@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto'
 
 import { normalizeOpenCodeFilePath } from './OpenCodeBridgePath.js'
 import {
+  DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE,
   OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC,
   type OpenCodeEvidenceProof,
+  type OpenCodeSnapshotProofUpgradeMode,
   type OpenCodeSnapshotEvidenceProvider,
   type OpenCodeSnapshotEvidenceResult,
 } from './OpenCodeChangeEvidence.js'
@@ -21,7 +23,24 @@ type EnrichmentParams = {
   evidenceMetadata?: {
     snapshotShapeFingerprint?: string
   }
+  snapshotProofMode?: OpenCodeSnapshotProofUpgradeMode
   diagnostics: string[]
+}
+
+type SnapshotUpgradeDiagnosticCode =
+  | 'snapshot-upgrade-skipped/feature-flag-off'
+  | 'snapshot-upgrade-skipped/no-file-anchor'
+  | 'snapshot-upgrade-skipped/postcondition-failed'
+  | 'snapshot-upgrade-skipped/single-change-only'
+  | 'snapshot-upgrade-skipped/path-chain-boundary-mismatch'
+  | 'snapshot-upgrade-skipped/duplicate-file-anchor'
+
+type SnapshotProofStats = {
+  attemptedChanges: number
+  wouldUpgradeChanges: number
+  appliedUpgrades: number
+  skippedChanges: number
+  skippedByReason: Map<string, number>
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -102,6 +121,11 @@ function normalizeRelativePathKey(value: string): string | null {
     : normalized
 }
 
+function changeRelativePathKey(workspaceRoot: string, change: ReconstructedOpenCodeToolChange): string | null {
+  return normalizeRelativePathKey(change.relativePath) ??
+    buildRelativePathKey(workspaceRoot, change.filePath)
+}
+
 function reverseEditFromAfter(input: {
   after: string
   oldString: string | undefined
@@ -179,13 +203,172 @@ type SnapshotFileAnchor = {
   warnings?: string[]
 }
 
-function snapshotFilesByRelativePath(result: OpenCodeSnapshotEvidenceResult | null): Map<string, SnapshotFileAnchor> {
+function pushSnapshotDiagnostic(
+  diagnostics: string[],
+  code: SnapshotUpgradeDiagnosticCode,
+  detail: string,
+): void {
+  diagnostics.push(`${code}: ${detail}`)
+}
+
+function incrementSkipped(stats: SnapshotProofStats, reason: SnapshotUpgradeDiagnosticCode, count = 1): void {
+  stats.skippedChanges += count
+  stats.skippedByReason.set(reason, (stats.skippedByReason.get(reason) ?? 0) + count)
+}
+
+function createSnapshotProofStats(changes: ReconstructedOpenCodeToolChange[]): SnapshotProofStats {
+  return {
+    attemptedChanges: changes.length,
+    wouldUpgradeChanges: 0,
+    appliedUpgrades: 0,
+    skippedChanges: 0,
+    skippedByReason: new Map(),
+  }
+}
+
+function pushShadowStats(diagnostics: string[], stats: SnapshotProofStats): void {
+  const skippedByReason = [...stats.skippedByReason.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(',')
+  diagnostics.push([
+    'snapshot-proof-shadow:',
+    `attempted=${stats.attemptedChanges}`,
+    `wouldUpgrade=${stats.wouldUpgradeChanges}`,
+    `applied=0`,
+    `skipped=${stats.skippedChanges}`,
+    skippedByReason ? `skippedByReason=${skippedByReason}` : undefined,
+  ].filter(Boolean).join(' '))
+}
+
+function isResolvedByFullTextProof(warning: string): boolean {
+  return (
+    warning === 'OpenCode edit was captured without a proven full-text baseline; apply/reject is manual-only.' ||
+    warning === 'OpenCode write overwrote an existing file before the bridge had a known baseline; reject is manual-only.' ||
+    warning === 'OpenCode apply_patch was captured without full before/after text; review is manual-only.' ||
+    warning === 'OpenCode toolpart content was unavailable or too large; review is manual-only.' ||
+    warning === 'OpenCode snapshot patch was captured without a matching file toolpart; full review depends on snapshot evidence.'
+  )
+}
+
+function stripResolvedWarnings(
+  existing: string[] | undefined,
+  snapshotWarnings: string[] | undefined,
+): string[] {
+  return [
+    ...(existing ?? []).filter(warning => !isResolvedByFullTextProof(warning)),
+    ...(snapshotWarnings ?? []),
+  ].filter(Boolean)
+}
+
+function isProvenCreate(change: ReconstructedOpenCodeToolChange): boolean {
+  return change.operation === 'create' &&
+    change.beforeState?.exists === false &&
+    change.afterContent !== null &&
+    !change.afterState?.unavailableReason
+}
+
+function isProvenModify(change: ReconstructedOpenCodeToolChange): boolean {
+  return change.operation === 'modify' &&
+    change.beforeContent !== null &&
+    change.afterContent !== null &&
+    !change.beforeState?.unavailableReason &&
+    !change.afterState?.unavailableReason
+}
+
+function isProvenDelete(change: ReconstructedOpenCodeToolChange): boolean {
+  return change.operation === 'delete' &&
+    change.beforeContent !== null &&
+    change.afterState?.exists === false &&
+    !change.beforeState?.unavailableReason
+}
+
+function isSnapshotReviewSafe(change: ReconstructedOpenCodeToolChange): boolean {
+  return change.evidenceProof !== undefined &&
+    change.evidenceProof !== 'metadata-only-fallback' &&
+    (isProvenCreate(change) || isProvenModify(change) || isProvenDelete(change))
+}
+
+function contentStateMatches(content: string, state: ReconstructedOpenCodeToolChange['beforeState'] | ReconstructedOpenCodeToolChange['afterState']): boolean {
+  const expected = contentStateForText(content)
+  return state?.sha256 === expected.sha256 && state?.sizeBytes === expected.sizeBytes
+}
+
+function assertUpgradePostconditions(input: {
+  original: ReconstructedOpenCodeToolChange
+  upgraded: ReconstructedOpenCodeToolChange
+}): boolean {
+  const { original, upgraded } = input
+  if (
+    original.sourceImportKey !== upgraded.sourceImportKey ||
+    original.taskId !== upgraded.taskId ||
+    original.teamName !== upgraded.teamName ||
+    original.memberName !== upgraded.memberName ||
+    original.sessionId !== upgraded.sessionId ||
+    original.sourcePartId !== upgraded.sourcePartId ||
+    original.sourceMessageId !== upgraded.sourceMessageId ||
+    original.relativePath !== upgraded.relativePath ||
+    !isSnapshotReviewSafe(upgraded)
+  ) {
+    return false
+  }
+  if (upgraded.beforeContent !== null && !contentStateMatches(upgraded.beforeContent, upgraded.beforeState)) {
+    return false
+  }
+  if (upgraded.afterContent !== null && !contentStateMatches(upgraded.afterContent, upgraded.afterState)) {
+    return false
+  }
+  return true
+}
+
+function needsSnapshotProof(change: ReconstructedOpenCodeToolChange): boolean {
+  if (change.evidenceProof === 'toolpart-chain') {
+    return false
+  }
+  if (isSnapshotReviewSafe(change)) {
+    return false
+  }
+  return (
+    change.sourceTool === 'write' ||
+    change.sourceTool === 'edit' ||
+    change.sourceTool === 'apply_patch' ||
+    change.sourceTool === 'snapshot_patch'
+  )
+}
+
+function mayApplySnapshotProof(input: {
+  mode: OpenCodeSnapshotProofUpgradeMode
+  changeCountForPathWindow: number
+}): boolean {
+  if (input.mode === 'off' || input.mode === 'shadow') {
+    return false
+  }
+  if (input.mode === 'single-change') {
+    return input.changeCountForPathWindow === 1
+  }
+  return input.mode === 'full'
+}
+
+function snapshotFilesByRelativePath(
+  result: OpenCodeSnapshotEvidenceResult | null,
+  diagnostics: string[],
+): Map<string, SnapshotFileAnchor> {
   const files = new Map<string, SnapshotFileAnchor>()
+  const duplicatePaths = new Set<string>()
   if (!result?.supported) {
     return files
   }
   for (const file of result.files) {
     if (typeof file.afterContent === 'string' || typeof file.beforeContent === 'string' || file.operation) {
+      if (duplicatePaths.has(file.relativePath)) {
+        continue
+      }
+      if (files.has(file.relativePath)) {
+        files.delete(file.relativePath)
+        duplicatePaths.add(file.relativePath)
+        pushSnapshotDiagnostic(diagnostics, 'snapshot-upgrade-skipped/duplicate-file-anchor', file.relativePath)
+        continue
+      }
       files.set(file.relativePath, {
         ...(typeof file.beforeContent === 'string' ? { beforeContent: file.beforeContent } : {}),
         ...(typeof file.afterContent === 'string' ? { afterContent: file.afterContent } : {}),
@@ -233,13 +416,7 @@ function snapshotPatchReplacement(
     evidenceProof: 'opencode-snapshot',
     snapshotId: snapshotAnchor.snapshotId,
     snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
-    warnings: [
-      ...(change.warnings ?? []).filter(warning =>
-        !warning.includes('manual-only') &&
-        !warning.includes('full review depends on snapshot evidence')
-      ),
-      ...(snapshotAnchor.warnings ?? []),
-    ],
+    warnings: stripResolvedWarnings(change.warnings, snapshotAnchor.warnings),
   }
 }
 
@@ -271,14 +448,36 @@ function snapshotPatchChainReplacement(input: {
     evidenceProof: 'opencode-snapshot',
     snapshotId: input.snapshotAnchor.snapshotId,
     snapshotSource: input.snapshotAnchor.snapshotId ? 'opencode' : undefined,
-    warnings: [
-      ...(input.change.warnings ?? []).filter(warning =>
-        !warning.includes('manual-only') &&
-        !warning.includes('full review depends on snapshot evidence')
-      ),
-      ...(input.snapshotAnchor.warnings ?? []),
-    ],
+    warnings: stripResolvedWarnings(input.change.warnings, input.snapshotAnchor.warnings),
   }
+}
+
+function recordReplacement(input: {
+  original: ReconstructedOpenCodeToolChange
+  replacement: ReconstructedOpenCodeToolChange | null
+  replacements: Map<string, ReconstructedOpenCodeToolChange>
+  diagnostics: string[]
+  stats: SnapshotProofStats
+  apply: boolean
+}): boolean {
+  if (!input.replacement) {
+    return false
+  }
+  input.stats.wouldUpgradeChanges += 1
+  if (!assertUpgradePostconditions({ original: input.original, upgraded: input.replacement })) {
+    incrementSkipped(input.stats, 'snapshot-upgrade-skipped/postcondition-failed')
+    pushSnapshotDiagnostic(
+      input.diagnostics,
+      'snapshot-upgrade-skipped/postcondition-failed',
+      input.original.sourceImportKey,
+    )
+    return false
+  }
+  if (input.apply) {
+    input.replacements.set(input.replacement.sourceImportKey, input.replacement)
+    input.stats.appliedUpgrades += 1
+  }
+  return true
 }
 
 export class OpenCodeChangeEvidenceEnricher {
@@ -287,6 +486,16 @@ export class OpenCodeChangeEvidenceEnricher {
     if (result.length === 0) {
       return result
     }
+    const snapshotProofMode = params.snapshotProofMode ?? DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE
+    if (snapshotProofMode === 'off') {
+      params.diagnostics.push('snapshot-upgrade-skipped/feature-flag-off: OpenCode snapshot proof upgrade is disabled.')
+      return result
+    }
+    const proofCandidates = result.filter(needsSnapshotProof)
+    if (proofCandidates.length === 0) {
+      return result
+    }
+    const stats = createSnapshotProofStats(proofCandidates)
     let snapshotResult: OpenCodeSnapshotEvidenceResult | null = null
     if (!params.snapshotProvider) {
       params.diagnostics.push(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
@@ -297,8 +506,10 @@ export class OpenCodeChangeEvidenceEnricher {
         workspaceRoot: params.workspaceRoot,
         sessionRecord: params.sessionRecord,
         offline: params.offline,
-        changes: params.changes,
-        touchedRelativePaths: params.changes.map(change => change.relativePath),
+        changes: result,
+        touchedRelativePaths: [...new Set(proofCandidates
+          .map(change => changeRelativePathKey(params.workspaceRoot, change))
+          .filter((relativePath): relativePath is string => !!relativePath))],
       }).catch(error => {
         params.diagnostics.push(`OpenCode snapshot evidence read failed - ${error instanceof Error ? error.message : String(error)}`)
         return null
@@ -314,18 +525,33 @@ export class OpenCodeChangeEvidenceEnricher {
       }
     }
 
-    const snapshotAfterByPath = snapshotFilesByRelativePath(snapshotResult)
+    const snapshotAfterByPath = snapshotFilesByRelativePath(snapshotResult, params.diagnostics)
 
     if (snapshotAfterByPath.size === 0) {
+      if (snapshotProofMode === 'shadow') {
+        pushShadowStats(params.diagnostics, stats)
+      }
       return result
     }
 
+    const candidateRelativePaths = new Set(proofCandidates
+      .map(change => changeRelativePathKey(params.workspaceRoot, change))
+      .filter((relativePath): relativePath is string => !!relativePath))
+    const candidateCountByPath = new Map<string, number>()
+    for (const change of proofCandidates) {
+      const relativePath = changeRelativePathKey(params.workspaceRoot, change)
+      if (!relativePath) {
+        continue
+      }
+      candidateCountByPath.set(relativePath, (candidateCountByPath.get(relativePath) ?? 0) + 1)
+    }
     const byPath = new Map<string, ReconstructedOpenCodeToolChange[]>()
     for (const change of result) {
-      const relativePath =
-        normalizeRelativePathKey(change.relativePath) ??
-        buildRelativePathKey(params.workspaceRoot, change.filePath)
+      const relativePath = changeRelativePathKey(params.workspaceRoot, change)
       if (!relativePath) {
+        continue
+      }
+      if (!candidateRelativePaths.has(relativePath)) {
         continue
       }
       const bucket = byPath.get(relativePath) ?? []
@@ -336,10 +562,31 @@ export class OpenCodeChangeEvidenceEnricher {
     const replacements = new Map<string, ReconstructedOpenCodeToolChange>()
     for (const [relativePath, changes] of byPath) {
       const snapshotAnchor = snapshotAfterByPath.get(relativePath)
+      const pathCandidateCount = candidateCountByPath.get(relativePath) ?? changes.length
+      if (!snapshotAnchor) {
+        incrementSkipped(stats, 'snapshot-upgrade-skipped/no-file-anchor', pathCandidateCount)
+        continue
+      }
+      const applyForPath = mayApplySnapshotProof({
+        mode: snapshotProofMode,
+        changeCountForPathWindow: changes.length,
+      })
+      if (snapshotProofMode === 'single-change' && changes.length !== 1) {
+        incrementSkipped(stats, 'snapshot-upgrade-skipped/single-change-only', pathCandidateCount)
+        pushSnapshotDiagnostic(params.diagnostics, 'snapshot-upgrade-skipped/single-change-only', relativePath)
+        continue
+      }
       if (changes.length === 1) {
-        const replacement = snapshotPatchReplacement(changes[0]!, snapshotAnchor)
-        if (replacement) {
-          replacements.set(replacement.sourceImportKey, replacement)
+        const change = changes[0]!
+        const replacement = snapshotPatchReplacement(change, snapshotAnchor)
+        if (recordReplacement({
+          original: change,
+          replacement,
+          replacements,
+          diagnostics: params.diagnostics,
+          stats,
+          apply: applyForPath,
+        })) {
           continue
         }
       }
@@ -352,20 +599,24 @@ export class OpenCodeChangeEvidenceEnricher {
           typeof snapshotAnchor?.beforeContent === 'string' &&
           snapshotAnchor.operation === 'delete'
         ) {
-          replacements.set(latestChange.sourceImportKey, {
-            ...latestChange,
-            beforeContent: snapshotAnchor.beforeContent,
-            afterContent: null,
-            beforeState: contentStateForText(snapshotAnchor.beforeContent),
-            afterState: { exists: false, sizeBytes: 0 },
-            confidence: 'high',
-            evidenceProof: 'opencode-snapshot',
-            snapshotId: snapshotAnchor.snapshotId,
-            snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
-            warnings: [
-              ...(latestChange.warnings ?? []).filter(warning => !warning.includes('manual-only')),
-              ...(snapshotAnchor.warnings ?? []),
-            ],
+          recordReplacement({
+            original: latestChange,
+            replacement: {
+              ...latestChange,
+              beforeContent: snapshotAnchor.beforeContent,
+              afterContent: null,
+              beforeState: contentStateForText(snapshotAnchor.beforeContent),
+              afterState: { exists: false, sizeBytes: 0 },
+              confidence: 'high',
+              evidenceProof: 'opencode-snapshot',
+              snapshotId: snapshotAnchor.snapshotId,
+              snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
+              warnings: stripResolvedWarnings(latestChange.warnings, snapshotAnchor.warnings),
+            },
+            replacements,
+            diagnostics: params.diagnostics,
+            stats,
+            apply: applyForPath,
           })
         }
         continue
@@ -374,8 +625,6 @@ export class OpenCodeChangeEvidenceEnricher {
       if (
         changes.length === 1 &&
         changes[0]?.sourceTool === 'write' &&
-        changes[0].operation === snapshotAnchor.operation &&
-        typeof snapshotAnchor.beforeContent === 'string' &&
         typeof snapshotAnchor.afterContent === 'string' &&
         (
           changes[0].afterContent === null ||
@@ -383,22 +632,48 @@ export class OpenCodeChangeEvidenceEnricher {
         )
       ) {
         const change = changes[0]
-        replacements.set(change.sourceImportKey, {
-          ...change,
-          beforeContent: snapshotAnchor.beforeContent,
-          afterContent: snapshotAnchor.afterContent,
-          beforeState: contentStateForText(snapshotAnchor.beforeContent),
-          afterState: contentStateForText(snapshotAnchor.afterContent),
-          confidence: 'high',
-          evidenceProof: 'opencode-snapshot',
-          snapshotId: snapshotAnchor.snapshotId,
-          snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
-          warnings: [
-            ...(change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
-            ...(snapshotAnchor.warnings ?? []),
-          ],
-        })
-        continue
+        const beforeContent = typeof snapshotAnchor.beforeContent === 'string'
+          ? snapshotAnchor.beforeContent
+          : null
+        const replacement =
+          snapshotAnchor.operation === 'create'
+            ? {
+                ...change,
+                operation: 'create' as const,
+                beforeContent: null,
+                afterContent: snapshotAnchor.afterContent,
+                beforeState: { exists: false, sizeBytes: 0 },
+                afterState: contentStateForText(snapshotAnchor.afterContent),
+                confidence: 'high' as const,
+                evidenceProof: 'opencode-snapshot' as const,
+                snapshotId: snapshotAnchor.snapshotId,
+                snapshotSource: snapshotAnchor.snapshotId ? 'opencode' as const : undefined,
+                warnings: stripResolvedWarnings(change.warnings, snapshotAnchor.warnings),
+              }
+            : change.operation === snapshotAnchor.operation && beforeContent !== null
+              ? {
+                  ...change,
+                  beforeContent,
+                  afterContent: snapshotAnchor.afterContent,
+                  beforeState: contentStateForText(beforeContent),
+                  afterState: contentStateForText(snapshotAnchor.afterContent),
+                  confidence: 'high' as const,
+                  evidenceProof: 'opencode-snapshot' as const,
+                  snapshotId: snapshotAnchor.snapshotId,
+                  snapshotSource: snapshotAnchor.snapshotId ? 'opencode' as const : undefined,
+                  warnings: stripResolvedWarnings(change.warnings, snapshotAnchor.warnings),
+                }
+              : null
+        if (recordReplacement({
+          original: change,
+          replacement,
+          replacements,
+          diagnostics: params.diagnostics,
+          stats,
+          apply: applyForPath,
+        })) {
+          continue
+        }
       }
       let verifiedFullPathChain = true
       for (let index = changes.length - 1; index >= 0; index -= 1) {
@@ -430,10 +705,7 @@ export class OpenCodeChangeEvidenceEnricher {
             evidenceProof: 'inverse-apply-patch-chain',
             snapshotId: snapshotAnchor.snapshotId,
             snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
-            warnings: [
-              ...(change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
-              ...(snapshotAnchor.warnings ?? []),
-            ],
+            warnings: stripResolvedWarnings(change.warnings, snapshotAnchor.warnings),
           }
           localReplacements.set(change.sourceImportKey, upgraded)
           anchorAfter = before
@@ -472,23 +744,44 @@ export class OpenCodeChangeEvidenceEnricher {
           evidenceProof: 'inverse-edit-chain',
           snapshotId: snapshotAnchor.snapshotId,
           snapshotSource: snapshotAnchor.snapshotId ? 'opencode' : undefined,
-          warnings: [
-            ...(change.warnings ?? []).filter(warning => !warning.includes('manual-only')),
-            ...(snapshotAnchor.warnings ?? []),
-          ],
+          warnings: stripResolvedWarnings(change.warnings, snapshotAnchor.warnings),
         }
         localReplacements.set(change.sourceImportKey, upgraded)
         anchorAfter = reversed.before
+      }
+      if (
+        verifiedFullPathChain &&
+        typeof snapshotAnchor.beforeContent === 'string' &&
+        anchorAfter !== snapshotAnchor.beforeContent
+      ) {
+        verifiedFullPathChain = false
+        incrementSkipped(stats, 'snapshot-upgrade-skipped/path-chain-boundary-mismatch', pathCandidateCount)
+        pushSnapshotDiagnostic(params.diagnostics, 'snapshot-upgrade-skipped/path-chain-boundary-mismatch', relativePath)
       }
       if (!verifiedFullPathChain) {
         params.diagnostics.push(`snapshot-window-path-ambiguous: ${relativePath} had a same-window toolpart chain that could not be fully verified.`)
         continue
       }
       for (const [sourceImportKey, replacement] of localReplacements) {
-        replacements.set(sourceImportKey, replacement)
+        const original = changes.find(change => change.sourceImportKey === sourceImportKey)
+        if (!original) {
+          continue
+        }
+        recordReplacement({
+          original,
+          replacement,
+          replacements,
+          diagnostics: params.diagnostics,
+          stats,
+          apply: applyForPath,
+        })
       }
     }
 
+    if (snapshotProofMode === 'shadow') {
+      pushShadowStats(params.diagnostics, stats)
+      return result
+    }
     if (replacements.size === 0) {
       return result
     }

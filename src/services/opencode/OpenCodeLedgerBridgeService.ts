@@ -10,10 +10,12 @@ import {
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import {
   DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE,
+  normalizeOpenCodeSnapshotProofUpgradeMode,
   type OpenCodeEvidencePipelineMode,
   type OpenCodeSnapshotBoundary,
   type OpenCodeSnapshotCaptureStatus,
   type OpenCodeSnapshotEvidenceProvider,
+  type OpenCodeSnapshotProofUpgradeMode,
 } from './OpenCodeChangeEvidence.js'
 import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
@@ -50,6 +52,7 @@ export type OpenCodeLedgerBridgeBackfillResult = {
   dryRun: boolean
   attributionMode: OpenCodeLedgerAttributionMode
   evidenceMode: OpenCodeEvidencePipelineMode
+  snapshotProofMode: OpenCodeSnapshotProofUpgradeMode
   scannedSessions: number
   scannedToolparts: number
   strictWindowCandidateCount?: number
@@ -538,6 +541,7 @@ export class OpenCodeLedgerBridgeService {
   async backfill(params: BackfillParams): Promise<OpenCodeLedgerBridgeBackfillResult> {
     const attributionMode = normalizeAttributionMode(params.attributionMode)
     const evidenceMode = DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE
+    const snapshotProofMode = normalizeOpenCodeSnapshotProofUpgradeMode(process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE)
     const result: OpenCodeLedgerBridgeBackfillResult = {
       schemaVersion: 1,
       providerId: 'opencode',
@@ -549,6 +553,7 @@ export class OpenCodeLedgerBridgeService {
       dryRun: params.dryRun === true,
       attributionMode,
       evidenceMode,
+      snapshotProofMode,
       scannedSessions: 0,
       scannedToolparts: 0,
       candidateEvents: 0,
@@ -715,6 +720,7 @@ export class OpenCodeLedgerBridgeService {
         offline,
         snapshotProvider: canTrySessionSnapshotEvidence ? this.snapshotEvidenceProvider : undefined,
         evidenceMetadata,
+        snapshotProofMode,
         diagnostics: result.diagnostics,
       }).catch(error => {
         result.diagnostics.push(`OpenCode evidence enrichment failed; using metadata-only fallback - ${error instanceof Error ? error.message : String(error)}`)
