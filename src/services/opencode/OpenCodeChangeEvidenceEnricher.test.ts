@@ -367,7 +367,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     expect(diagnostics).toContain(OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC)
   })
 
-  test('upgrades edit-only suffix using a captured snapshot after anchor', async () => {
+  test('keeps edit-only suffix metadata-only when snapshot before anchor is missing', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
       workspaceRoot,
@@ -378,13 +378,13 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       diagnostics,
     })
 
-    expect(diagnostics).toEqual([])
     expect(result[0]).toMatchObject({
-      beforeContent: 'export const value = 1;\n',
-      afterContent: 'export const value = 2;\n',
-      confidence: 'high',
-      evidenceProof: 'inverse-edit-chain',
+      beforeContent: null,
+      afterContent: null,
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
     })
+    expect(diagnostics).toContain('snapshot-upgrade-skipped/no-before-anchor: src/file.ts')
   })
 
   test('upgrades edit-only deletion with an empty newString only from a proven before anchor', async () => {
@@ -445,7 +445,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     )
   })
 
-  test('upgrades a contiguous edit chain from a captured snapshot after anchor', async () => {
+  test('upgrades a contiguous edit chain from captured snapshot before and after anchors', async () => {
     const diagnostics: string[] = []
     const first = change({
       sourcePartId: 'part-edit-1',
@@ -464,7 +464,12 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [first, second],
       offline: offlineFixture(),
-      snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 3;\n',
+        operation: 'modify',
+      }),
       snapshotProofMode: 'full',
       diagnostics,
     })
@@ -506,7 +511,12 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [first, second],
       offline: offlineFixture(),
-      snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 3;\n',
+        operation: 'modify',
+      }),
       snapshotProofMode: 'full',
       diagnostics,
     })
@@ -539,7 +549,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
-  test('upgrades apply_patch update only when a captured snapshot after anchor verifies the hunk', async () => {
+  test('upgrades apply_patch update only when captured snapshot before and after anchors verify the hunk', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({
       workspaceRoot,
@@ -558,7 +568,12 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
         }),
       ],
       offline: offlineFixture(),
-      snapshotProvider: snapshotProvider('export const value = 2;\n'),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        operation: 'modify',
+      }),
       diagnostics,
     })
 
@@ -673,7 +688,12 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       sessionRecord: sessionRecord(),
       changes: [change()],
       offline: offlineFixture(),
-      snapshotProvider: snapshotProvider('export const value = 2;\n'),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        operation: 'modify',
+      }),
       snapshotProofMode: 'shadow',
       diagnostics,
     })

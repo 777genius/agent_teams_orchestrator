@@ -626,7 +626,12 @@ describe('OpenCodeLedgerBridgeService', () => {
       { readSession: async () => editFixture },
       new OpenCodeToolpartChangeReconstructor(),
       new OpenCodeChangeEvidenceEnricher(),
-      snapshotProvider('src/existing.ts', 'export const value = 2;\n'),
+      snapshotProvider({
+        relativePath: 'src/existing.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        operation: 'modify',
+      }),
     )
 
     const result = await service.backfill({
@@ -783,7 +788,12 @@ describe('OpenCodeLedgerBridgeService', () => {
         { readSession: async () => editFixture },
         new OpenCodeToolpartChangeReconstructor(),
         new OpenCodeChangeEvidenceEnricher(),
-        snapshotProvider('src/existing.ts', 'export const value = 2;\n'),
+        snapshotProvider({
+          relativePath: 'src/existing.ts',
+          beforeContent: 'export const value = 1;\n',
+          afterContent: 'export const value = 2;\n',
+          operation: 'modify',
+        }),
       )
 
       const result = await service.backfill({
@@ -961,7 +971,12 @@ describe('OpenCodeLedgerBridgeService', () => {
       { readSession: async () => patchFixture },
       new OpenCodeToolpartChangeReconstructor(),
       new OpenCodeChangeEvidenceEnricher(),
-      snapshotProvider('src/existing.ts', 'export const value = 2;\n'),
+      snapshotProvider({
+        relativePath: 'src/existing.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 2;\n',
+        operation: 'modify',
+      }),
     )
 
     const result = await service.backfill({

@@ -32,6 +32,7 @@ type EnrichmentParams = {
 type SnapshotUpgradeDiagnosticCode =
   | 'snapshot-upgrade-skipped/feature-flag-off'
   | 'snapshot-upgrade-skipped/no-file-anchor'
+  | 'snapshot-upgrade-skipped/no-before-anchor'
   | 'snapshot-upgrade-skipped/postcondition-failed'
   | 'snapshot-upgrade-skipped/single-change-only'
   | 'snapshot-upgrade-skipped/path-chain-boundary-mismatch'
@@ -364,6 +365,16 @@ function mayApplySnapshotProof(input: {
     return input.changeCountForPathWindow === 1
   }
   return input.mode === 'full'
+}
+
+function needsSnapshotBeforeAnchorForInverseProof(change: ReconstructedOpenCodeToolChange): boolean {
+  if (change.beforeContent !== null && change.afterContent !== null) {
+    return false
+  }
+  return (
+    change.sourceTool === 'edit' ||
+    (change.sourceTool === 'apply_patch' && change.operation === 'modify')
+  )
 }
 
 function snapshotFilesByRelativePath(
@@ -699,6 +710,14 @@ export class OpenCodeChangeEvidenceEnricher {
         })) {
           continue
         }
+      }
+      if (
+        changes.some(needsSnapshotBeforeAnchorForInverseProof) &&
+        typeof snapshotAnchor.beforeContent !== 'string'
+      ) {
+        incrementSkipped(stats, 'snapshot-upgrade-skipped/no-before-anchor', pathCandidateCount)
+        pushSnapshotDiagnostic(params.diagnostics, 'snapshot-upgrade-skipped/no-before-anchor', relativePath)
+        continue
       }
       let verifiedFullPathChain = true
       for (let index = changes.length - 1; index >= 0; index -= 1) {
