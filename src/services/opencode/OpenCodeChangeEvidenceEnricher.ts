@@ -131,15 +131,29 @@ function changeRelativePathKey(workspaceRoot: string, change: ReconstructedOpenC
 
 function reverseEditFromAfter(input: {
   after: string
+  beforeAnchor?: string
   oldString: string | undefined
   newString: string | undefined
 }): { before: string } | null {
   if (
     typeof input.oldString !== 'string' ||
     typeof input.newString !== 'string' ||
-    input.oldString === input.newString ||
-    countOccurrences(input.after, input.newString) !== 1
+    input.oldString.length === 0 ||
+    input.oldString === input.newString
   ) {
+    return null
+  }
+  if (input.newString.length === 0) {
+    if (
+      typeof input.beforeAnchor !== 'string' ||
+      countOccurrences(input.beforeAnchor, input.oldString) !== 1 ||
+      input.beforeAnchor.replace(input.oldString, input.newString) !== input.after
+    ) {
+      return null
+    }
+    return { before: input.beforeAnchor }
+  }
+  if (countOccurrences(input.after, input.newString) !== 1) {
     return null
   }
   const before = input.after.replace(input.newString, input.oldString)
@@ -738,6 +752,7 @@ export class OpenCodeChangeEvidenceEnricher {
         }
         const reversed = reverseEditFromAfter({
           after: anchorAfter,
+          beforeAnchor: snapshotAnchor.beforeContent,
           oldString: change.oldString,
           newString: change.newString,
         })

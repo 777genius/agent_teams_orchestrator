@@ -387,6 +387,64 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
+  test('upgrades edit-only deletion with an empty newString only from a proven before anchor', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change({
+        oldString: ' value = 1',
+        newString: '',
+      })],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const;\n',
+        operation: 'modify',
+      }),
+      diagnostics,
+    })
+
+    expect(diagnostics).toEqual([])
+    expect(result[0]).toMatchObject({
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const;\n',
+      confidence: 'high',
+      evidenceProof: 'inverse-edit-chain',
+    })
+  })
+
+  test('keeps empty-newString edit deletion metadata-only when the before anchor is ambiguous', async () => {
+    const diagnostics: string[] = []
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change({
+        oldString: 'value = 1',
+        newString: '',
+      })],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        beforeContent: 'value = 1; value = 1;\n',
+        afterContent: '; value = 1;\n',
+        operation: 'modify',
+      }),
+      diagnostics,
+    })
+
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics).toContain(
+      'snapshot-window-path-ambiguous: src/file.ts had a same-window toolpart chain that could not be fully verified.',
+    )
+  })
+
   test('upgrades a contiguous edit chain from a captured snapshot after anchor', async () => {
     const diagnostics: string[] = []
     const first = change({
