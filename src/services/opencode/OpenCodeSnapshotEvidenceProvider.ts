@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import {
+  formatOpenCodeDiagnosticText,
   type OpenCodeSnapshotEvidenceFile,
   type OpenCodeSnapshotEvidenceProvider,
   type OpenCodeSnapshotEvidenceResult,
@@ -127,7 +128,7 @@ function appendPatchHintDiagnostics(
   }
   for (const relativePath of touchedRelativePaths) {
     if (!patchRelativeFiles.has(relativePath)) {
-      diagnostics.push(`snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path ${relativePath}; using raw snapshot diff as path proof.`)
+      diagnostics.push(`snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path ${formatOpenCodeDiagnosticText(relativePath)}; using raw snapshot diff as path proof.`)
     }
   }
 }
@@ -147,7 +148,7 @@ function appendSessionDirectoryScopeDiagnostics(input: SnapshotSessionEvidenceIn
   for (const relativePath of touchedRelativePaths) {
     if (relativePath !== scopeRelativePath && !relativePath.startsWith(scopePrefix)) {
       diagnostics.push(
-        `snapshot-touched-path-outside-session-directory: ${relativePath} is outside OpenCode session directory scope ${scopeRelativePath}.`,
+        `snapshot-touched-path-outside-session-directory: ${formatOpenCodeDiagnosticText(relativePath)} is outside OpenCode session directory scope ${formatOpenCodeDiagnosticText(scopeRelativePath)}.`,
       )
     }
   }
@@ -250,10 +251,10 @@ export class OpenCodeSnapshotEvidenceProviderService implements OpenCodeSnapshot
           warnings: [
             ...(file.warnings ?? []),
             ...(file.beforeState.unavailableReason
-              ? [`Before snapshot content unavailable for ${file.relativePath}: ${file.beforeState.unavailableReason}.`]
+              ? [`Before snapshot content unavailable for ${formatOpenCodeDiagnosticText(file.relativePath)}: ${file.beforeState.unavailableReason}.`]
               : []),
             ...(file.afterState.unavailableReason
-              ? [`After snapshot content unavailable for ${file.relativePath}: ${file.afterState.unavailableReason}.`]
+              ? [`After snapshot content unavailable for ${formatOpenCodeDiagnosticText(file.relativePath)}: ${file.afterState.unavailableReason}.`]
               : []),
           ],
         })

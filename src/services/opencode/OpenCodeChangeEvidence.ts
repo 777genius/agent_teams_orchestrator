@@ -131,5 +131,11 @@ export function normalizeOpenCodeSnapshotProofUpgradeMode(value: string | undefi
   return 'off'
 }
 
+const UNSAFE_DIAGNOSTIC_TEXT_RE = /[\u0000-\u001f\u007f\u2028\u2029]/
+
+export function formatOpenCodeDiagnosticText(value: string): string {
+  return UNSAFE_DIAGNOSTIC_TEXT_RE.test(value) ? JSON.stringify(value) : value
+}
+
 export const OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC =
   'snapshot-provider-unavailable: OpenCode snapshot evidence provider is unavailable; using chain/metadata fallback.'

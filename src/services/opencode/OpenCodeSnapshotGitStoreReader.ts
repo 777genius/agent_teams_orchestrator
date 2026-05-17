@@ -6,6 +6,7 @@ import { TextDecoder } from 'node:util'
 
 import { isBinaryContent } from '../../constants/files.js'
 import { gitExe } from '../../utils/git.js'
+import { formatOpenCodeDiagnosticText } from './OpenCodeChangeEvidence.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 
 type FileState = {
@@ -194,13 +195,13 @@ function buildTouchedPathSet(paths: string[], diagnostics: string[]): Set<string
   for (const candidate of paths) {
     const normalized = normalizeOpenCodeSnapshotRelativePath(candidate)
     if (!normalized) {
-      diagnostics.push(`snapshot-invalid-touched-path: ${candidate} is not a safe relative path.`)
+      diagnostics.push(`snapshot-invalid-touched-path: ${formatOpenCodeDiagnosticText(candidate)} is not a safe relative path.`)
       continue
     }
     const lower = normalized.toLowerCase()
     const existing = canonicalByLower.get(lower)
     if (existing && existing !== normalized) {
-      diagnostics.push(`snapshot-case-collision: touched paths ${existing} and ${normalized} collide on case-insensitive filesystems.`)
+      diagnostics.push(`snapshot-case-collision: touched paths ${formatOpenCodeDiagnosticText(existing)} and ${formatOpenCodeDiagnosticText(normalized)} collide on case-insensitive filesystems.`)
       return null
     }
     canonicalByLower.set(lower, normalized)
@@ -301,12 +302,12 @@ export function parseOpenCodeSnapshotRawDiffZ(buffer: Buffer, diagnostics: strin
     }
     const normalizedPath = normalizeOpenCodeSnapshotRelativePath(decodedPath)
     if (!normalizedPath) {
-      diagnostics.push(`snapshot-raw-diff-unsafe-path: ${decodedPath} is not a safe relative path.`)
+      diagnostics.push(`snapshot-raw-diff-unsafe-path: ${formatOpenCodeDiagnosticText(decodedPath)} is not a safe relative path.`)
       continue
     }
     const status = match[5]
     if (status.startsWith('R') || status.startsWith('C')) {
-      diagnostics.push(`snapshot-raw-diff-unsupported-relation: ${status} for ${normalizedPath} is not supported.`)
+      diagnostics.push(`snapshot-raw-diff-unsupported-relation: ${status} for ${formatOpenCodeDiagnosticText(normalizedPath)} is not supported.`)
       continue
     }
     entries.push({
@@ -346,7 +347,7 @@ export function parseOpenCodeSnapshotNumstatZ(buffer: Buffer, diagnostics: strin
     const relativePathRaw = decoded.slice(secondTab + 1)
     const relativePath = normalizeOpenCodeSnapshotRelativePath(relativePathRaw)
     if (!relativePath) {
-      diagnostics.push(`snapshot-numstat-unsafe-path: ${relativePathRaw} is not a safe relative path.`)
+      diagnostics.push(`snapshot-numstat-unsafe-path: ${formatOpenCodeDiagnosticText(relativePathRaw)} is not a safe relative path.`)
       continue
     }
     const binary = additionsRaw === '-' || deletionsRaw === '-'
@@ -752,12 +753,12 @@ export class OpenCodeSnapshotGitStoreReader {
     }
     for (const entry of rawEntries) {
       if (!touchedPaths.has(entry.relativePath)) {
-        diagnostics.push(`snapshot-path-not-touched: ${entry.relativePath} was present in snapshot diff but not in toolpart touched paths.`)
+        diagnostics.push(`snapshot-path-not-touched: ${formatOpenCodeDiagnosticText(entry.relativePath)} was present in snapshot diff but not in toolpart touched paths.`)
       }
     }
     for (const touchedPath of touchedPaths) {
       if (!rawMatchedPaths.has(touchedPath)) {
-        diagnostics.push(`snapshot-touched-path-not-in-diff: ${touchedPath} was requested but absent from the scoped snapshot diff.`)
+        diagnostics.push(`snapshot-touched-path-not-in-diff: ${formatOpenCodeDiagnosticText(touchedPath)} was requested but absent from the scoped snapshot diff.`)
       }
     }
 

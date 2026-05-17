@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { normalizeOpenCodeFilePath } from './OpenCodeBridgePath.js'
 import {
   DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE,
+  formatOpenCodeDiagnosticText,
   OPENCODE_SNAPSHOT_PROVIDER_UNAVAILABLE_DIAGNOSTIC,
   type OpenCodeEvidenceProof,
   type OpenCodeSnapshotProofUpgradeMode,
@@ -210,7 +211,7 @@ function pushSnapshotDiagnostic(
   code: SnapshotUpgradeDiagnosticCode,
   detail: string,
 ): void {
-  diagnostics.push(`${code}: ${detail}`)
+  diagnostics.push(`${code}: ${formatOpenCodeDiagnosticText(detail)}`)
 }
 
 function incrementSkipped(stats: SnapshotProofStats, reason: SnapshotUpgradeDiagnosticCode, count = 1): void {
@@ -769,7 +770,7 @@ export class OpenCodeChangeEvidenceEnricher {
         pushSnapshotDiagnostic(params.diagnostics, 'snapshot-upgrade-skipped/path-chain-boundary-mismatch', relativePath)
       }
       if (!verifiedFullPathChain) {
-        params.diagnostics.push(`snapshot-window-path-ambiguous: ${relativePath} had a same-window toolpart chain that could not be fully verified.`)
+        params.diagnostics.push(`snapshot-window-path-ambiguous: ${formatOpenCodeDiagnosticText(relativePath)} had a same-window toolpart chain that could not be fully verified.`)
         continue
       }
       for (const [sourceImportKey, replacement] of localReplacements) {

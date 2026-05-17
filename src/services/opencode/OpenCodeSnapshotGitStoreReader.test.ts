@@ -388,6 +388,23 @@ describe('OpenCode snapshot raw parsers', () => {
     expect(diagnostics).toEqual([])
   })
 
+  test('escapes unsafe path text in diagnostics', () => {
+    const objectA = 'a'.repeat(40)
+    const objectB = 'b'.repeat(40)
+    const unsafePath = 'dir/bad\nname.txt'
+    const raw = Buffer.concat([
+      Buffer.from(`:100644 100644 ${objectA} ${objectB} R100\0`),
+      Buffer.from(`${unsafePath}\0`),
+    ])
+    const diagnostics: string[] = []
+
+    expect(parseOpenCodeSnapshotRawDiffZ(raw, diagnostics)).toEqual([])
+    expect(diagnostics).toContain(
+      `snapshot-raw-diff-unsupported-relation: R100 for ${JSON.stringify(unsafePath)} is not supported.`,
+    )
+    expect(diagnostics.join('\n')).not.toContain(unsafePath)
+  })
+
   test('rejects abbreviated raw object ids even when full-index would be present elsewhere', () => {
     const diagnostics: string[] = []
     const raw = Buffer.from(':100644 100644 abc1234 def5678 M\0file.txt\0')

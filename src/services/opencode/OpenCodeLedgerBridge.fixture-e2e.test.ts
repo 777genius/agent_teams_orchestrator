@@ -1250,8 +1250,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       'snapshot-path-not-touched: 227/formatter-only.js was present in snapshot diff but not in toolpart touched paths.',
     )
     if (supportsNewlineFilenames) {
+      const escapedNewlinePath = JSON.stringify('227/new\nline.js')
       expect(result.diagnostics.join('\n')).toContain(
-        'snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path 227/new\nline.js; using raw snapshot diff as path proof.',
+        `snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path ${escapedNewlinePath}; using raw snapshot diff as path proof.`,
       )
     }
     const diagnosticsText = result.diagnostics.join('\n')
@@ -2213,8 +2214,9 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
     })
     expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+    const escapedNewlinePath = JSON.stringify('227/new\nline.js')
     expect(stdout.result.diagnostics.join('\n')).toContain(
-      'snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path 227/new\nline.js; using raw snapshot diff as path proof.',
+      `snapshot-patch-files-mismatch: OpenCode patch.files did not include touched path ${escapedNewlinePath}; using raw snapshot diff as path proof.`,
     )
 
     const events = await readJsonlEvents(projectDir, 'task-1')
