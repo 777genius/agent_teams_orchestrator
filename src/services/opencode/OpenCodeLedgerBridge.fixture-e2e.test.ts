@@ -415,6 +415,7 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   includeUnattributedSnapshotFile?: boolean
   includeNewlinePathEdit?: boolean
   includeWriteOverwrite?: boolean
+  includeEmptyWriteOverwrite?: boolean
   includeApplyPatchUpdate?: boolean
   includeApplyPatchDelete?: boolean
   includeSamePathEditChain?: boolean
@@ -440,6 +441,10 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   if (input.includeWriteOverwrite) {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
     await writeFile(path.join(input.workspaceRoot, '227', 'rewrite.js'), 'export const rewrite = 1;\n', 'utf8')
+  }
+  if (input.includeEmptyWriteOverwrite) {
+    await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
+    await writeFile(path.join(input.workspaceRoot, '227', 'empty.txt'), 'not empty\n', 'utf8')
   }
   if (input.includeApplyPatchDelete) {
     await mkdir(path.join(input.workspaceRoot, '227'), { recursive: true })
@@ -468,6 +473,9 @@ async function createOpenCodeSnapshotGitStoreFixture(input: {
   }
   if (input.includeWriteOverwrite) {
     await writeFile(path.join(input.workspaceRoot, '227', 'rewrite.js'), 'export const rewrite = 2;\n', 'utf8')
+  }
+  if (input.includeEmptyWriteOverwrite) {
+    await writeFile(path.join(input.workspaceRoot, '227', 'empty.txt'), '', 'utf8')
   }
   if (input.includeApplyPatchDelete) {
     await rm(path.join(input.workspaceRoot, '227', 'delete-me.js'))
@@ -604,6 +612,26 @@ async function insertSnapshotWriteOverwriteToolpart(dbPath: string, workspaceRoo
         content: 'export const rewrite = 2;\n',
         exists: true,
         callID: 'call-bob-write-rewrite',
+      }),
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function insertSnapshotWriteEmptyOverwriteToolpart(dbPath: string, workspaceRoot: string): Promise<void> {
+  const db = new Database(dbPath)
+  try {
+    insertPart(db, {
+      id: 'bob-write-empty-overwrite',
+      messageId: 'bob-assistant-1',
+      sessionId: 'session-bob',
+      time: 1_028,
+      data: writeToolPart({
+        filePath: path.join(workspaceRoot, '227', 'empty.txt'),
+        content: '',
+        exists: true,
+        callID: 'call-bob-write-empty-overwrite',
       }),
     })
   } finally {
@@ -2448,6 +2476,69 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
       contentAvailability: 'full-text',
       latestBeforeHash: (rewriteEvent?.before as { sha256?: string } | undefined)?.sha256,
       latestAfterHash: (rewriteEvent?.after as { sha256?: string } | undefined)?.sha256,
+    })
+  }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
+
+  test('CLI command preserves empty string snapshot content as full-text evidence', async () => {
+    const workspaceRoot = path.join(tempDir, 'workspace-cli-empty-content')
+    const projectDir = path.join(tempDir, 'claude-project-cli-empty-content')
+    const dataDir = envPathsDataDirForHome(homeDir)
+    await mkdir(workspaceRoot, { recursive: true })
+    await mkdir(projectDir, { recursive: true })
+    const dbPath = await createOpenCodeSqliteFixture(dataDir, workspaceRoot)
+    await insertSnapshotWriteEmptyOverwriteToolpart(dbPath, workspaceRoot)
+    await createOpenCodeSnapshotGitStoreFixture({
+      dbPath,
+      workspaceRoot,
+      includeEmptyWriteOverwrite: true,
+    })
+    await createFixtureSessionStore(dataDir, workspaceRoot)
+    const deliveryContext = await createFixtureDeliveryContext()
+
+    const cli = runCliBackfill({ projectDir, workspaceRoot, deliveryContext })
+
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: { outcome: string; importedEvents: number; snapshotShapeFingerprint?: string }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      snapshotShapeFingerprint: 'opencode-snapshot-git-store-v2',
+    })
+    expect(stdout.result.importedEvents).toBeGreaterThanOrEqual(1)
+
+    const emptySha256 = createHash('sha256').update('').digest('hex')
+    const events = await readJsonlEvents(projectDir, 'task-1')
+    const emptyEvent = events.find(event => event.sourcePartId === 'bob-write-empty-overwrite')
+    expect(emptyEvent).toMatchObject({
+      source: 'opencode_toolpart_write',
+      relativePath: '227/empty.txt',
+      operation: 'modify',
+      confidence: 'high',
+      evidenceProof: 'opencode-snapshot',
+      snapshotSource: 'opencode',
+      afterState: {
+        exists: true,
+        sha256: emptySha256,
+        sizeBytes: 0,
+      },
+    })
+    expect(emptyEvent?.snapshotId).toBeTruthy()
+    expect(emptyEvent?.after).toMatchObject({
+      sha256: emptySha256,
+      sizeBytes: 0,
+    })
+    expect((emptyEvent?.after as { blobRef?: string } | undefined)?.blobRef).toBeTruthy()
+    expect((emptyEvent?.before as { sha256?: string } | undefined)?.sha256).toBeTruthy()
+
+    const bundle = await readTaskChangeBundle(projectDir, 'task-1')
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/empty.txt')).toMatchObject({
+      latestOperation: 'modify',
+      finalExists: true,
+      reviewability: 'full-text',
+      contentAvailability: 'full-text',
+      latestAfterHash: emptySha256,
     })
   }, LEDGER_CLI_FIXTURE_E2E_TIMEOUT_MS)
 
