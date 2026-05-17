@@ -316,6 +316,31 @@ function reconstructedChange(overrides: Partial<ReconstructedOpenCodeToolChange>
 }
 
 describe('OpenCodeLedgerBridgeService', () => {
+  test('defaults snapshot proof mode to single-change at bridge backfill boundary', async () => {
+    const previousSnapshotProofMode = process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE
+    delete process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE
+    try {
+      const service = new OpenCodeLedgerBridgeService(
+        { list: async () => [] },
+      )
+
+      const result = await service.backfill({
+        teamName: 'team-a',
+        projectDir,
+        workspaceRoot,
+      })
+
+      expect(result.outcome).toBe('no-history')
+      expect(result.snapshotProofMode).toBe('single-change')
+    } finally {
+      if (previousSnapshotProofMode === undefined) {
+        delete process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE
+      } else {
+        process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE = previousSnapshotProofMode
+      }
+    }
+  })
+
   test('imports reconstructed OpenCode write toolparts into task-change ledger artifacts', async () => {
     const service = new OpenCodeLedgerBridgeService(
       { list: async () => [sessionRecord()] },

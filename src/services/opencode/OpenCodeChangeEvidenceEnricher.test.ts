@@ -140,7 +140,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     expect(normalizeOpenCodeSnapshotProofUpgradeMode('shadow')).toBe('shadow')
     expect(normalizeOpenCodeSnapshotProofUpgradeMode('SINGLE-CHANGE')).toBe('single-change')
     expect(normalizeOpenCodeSnapshotProofUpgradeMode('full')).toBe('full')
-    expect(normalizeOpenCodeSnapshotProofUpgradeMode('')).toBe('full')
+    expect(normalizeOpenCodeSnapshotProofUpgradeMode('')).toBe('single-change')
     expect(normalizeOpenCodeSnapshotProofUpgradeMode('unexpected')).toBe('off')
   })
 
@@ -311,6 +311,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
         afterContent: 'export const value = 3;\n',
         snapshotId: 'snapshot-proof',
       }),
+      snapshotProofMode: 'full',
       diagnostics,
     })
 
@@ -406,6 +407,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       changes: [first, second],
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      snapshotProofMode: 'full',
       diagnostics,
     })
 
@@ -447,6 +449,7 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
       changes: [first, second],
       offline: offlineFixture(),
       snapshotProvider: snapshotProvider('export const value = 3;\n'),
+      snapshotProofMode: 'full',
       diagnostics,
     })
 

@@ -109,7 +109,7 @@ export interface OpenCodeSnapshotEvidenceProvider {
 
 export const DEFAULT_OPENCODE_EVIDENCE_PIPELINE_MODE: OpenCodeEvidencePipelineMode = 'snapshot-auto'
 
-export const DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE: OpenCodeSnapshotProofUpgradeMode = 'full'
+export const DEFAULT_OPENCODE_SNAPSHOT_PROOF_UPGRADE_MODE: OpenCodeSnapshotProofUpgradeMode = 'single-change'
 
 export function normalizeOpenCodeSnapshotProofUpgradeMode(value: string | undefined): OpenCodeSnapshotProofUpgradeMode {
   const normalized = value?.trim().toLowerCase()
