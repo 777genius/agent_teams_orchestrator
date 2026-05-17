@@ -574,6 +574,40 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     )
   })
 
+  test('skips snapshot evidence when strict delivery proof is not allowed', async () => {
+    const diagnostics: string[] = []
+    let providerCalled = false
+    const throwingProvider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        throw new Error('unexpected probe')
+      },
+      async readSessionEvidence() {
+        providerCalled = true
+        throw new Error('unexpected snapshot read')
+      },
+    }
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [change()],
+      offline: offlineFixture(),
+      snapshotProvider: throwingProvider,
+      snapshotProofAllowed: false,
+      diagnostics,
+    })
+
+    expect(providerCalled).toBe(false)
+    expect(result[0]).toMatchObject({
+      beforeContent: null,
+      afterContent: null,
+      evidenceProof: 'metadata-only-fallback',
+    })
+    expect(diagnostics).toContain(
+      'snapshot-upgrade-skipped/strict-delivery-required: OpenCode snapshot proof requires strict delivery attribution.',
+    )
+  })
+
   test('shadow mode computes proof stats but returns original metadata-only changes', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({

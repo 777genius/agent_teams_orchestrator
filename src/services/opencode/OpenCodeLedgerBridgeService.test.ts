@@ -656,6 +656,89 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(event.after).toMatchObject({ sizeBytes: 24 })
   })
 
+  test('does not spend snapshot proof work outside strict delivery attribution', async () => {
+    const afterPath = path.join(workspaceRoot, 'src/existing.ts')
+    await writeFile(afterPath, 'export const value = 2;\n', 'utf8')
+    const editFixture = withSnapshotWindow({
+      ...offlineFixture(),
+      rawParts: [
+        partRow(
+          'user-part-1',
+          'user-1',
+          {
+            text: structuredDeliveryPrompt('user-1'),
+          },
+          900,
+        ),
+        partRow(
+          'tool-part-edit-existing',
+          'assistant-1',
+          {
+            type: 'tool',
+            tool: 'edit',
+            callID: 'call-edit-existing',
+            state: {
+              status: 'completed',
+              input: {
+                filePath: afterPath,
+                oldString: 'value = 1',
+                newString: 'value = 2',
+              },
+              metadata: { exists: true, truncated: false },
+              time: { end: 1000 },
+            },
+          },
+          1000,
+        ),
+      ],
+    })
+    let providerCalled = false
+    const throwingProvider: OpenCodeSnapshotEvidenceProvider = {
+      adapterVersion: 1,
+      async probe() {
+        throw new Error('unexpected probe')
+      },
+      async readSessionEvidence() {
+        providerCalled = true
+        throw new Error('unexpected snapshot read')
+      },
+    }
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => editFixture },
+      new OpenCodeToolpartChangeReconstructor(),
+      new OpenCodeChangeEvidenceEnricher(),
+      throwingProvider,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+    })
+
+    expect(providerCalled).toBe(false)
+    expect(result.outcome).toBe('imported')
+    expect(result.importedEvents).toBe(1)
+    expect(result.snapshotShapeFingerprint).toBeUndefined()
+    expect(result.diagnostics).toContain(
+      'snapshot-upgrade-skipped/strict-delivery-required: OpenCode snapshot proof requires strict delivery attribution.',
+    )
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const event = JSON.parse((await readFile(eventFile, 'utf8')).trim())
+    expect(event).toMatchObject({
+      source: 'opencode_toolpart_edit',
+      operation: 'modify',
+      confidence: 'medium',
+      evidenceProof: 'metadata-only-fallback',
+      before: null,
+      after: null,
+    })
+  })
+
   test('honors shadow snapshot proof mode at bridge backfill boundary', async () => {
     const previousSnapshotProofMode = process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE
     process.env.OPENCODE_SNAPSHOT_PROOF_UPGRADE = 'shadow'

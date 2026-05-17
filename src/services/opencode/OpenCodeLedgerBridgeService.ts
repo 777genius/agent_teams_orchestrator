@@ -721,6 +721,7 @@ export class OpenCodeLedgerBridgeService {
         snapshotProvider: canTrySessionSnapshotEvidence ? this.snapshotEvidenceProvider : undefined,
         evidenceMetadata,
         snapshotProofMode,
+        snapshotProofAllowed: attributionMode === 'strict-delivery',
         diagnostics: result.diagnostics,
       }).catch(error => {
         result.diagnostics.push(`OpenCode evidence enrichment failed; using metadata-only fallback - ${error instanceof Error ? error.message : String(error)}`)

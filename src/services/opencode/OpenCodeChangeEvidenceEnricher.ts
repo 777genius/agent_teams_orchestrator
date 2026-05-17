@@ -24,6 +24,7 @@ type EnrichmentParams = {
     snapshotShapeFingerprint?: string
   }
   snapshotProofMode?: OpenCodeSnapshotProofUpgradeMode
+  snapshotProofAllowed?: boolean
   diagnostics: string[]
 }
 
@@ -34,6 +35,7 @@ type SnapshotUpgradeDiagnosticCode =
   | 'snapshot-upgrade-skipped/single-change-only'
   | 'snapshot-upgrade-skipped/path-chain-boundary-mismatch'
   | 'snapshot-upgrade-skipped/duplicate-file-anchor'
+  | 'snapshot-upgrade-skipped/strict-delivery-required'
 
 type SnapshotProofStats = {
   attemptedChanges: number
@@ -493,6 +495,14 @@ export class OpenCodeChangeEvidenceEnricher {
     }
     const proofCandidates = result.filter(needsSnapshotProof)
     if (proofCandidates.length === 0) {
+      return result
+    }
+    if (params.snapshotProofAllowed === false) {
+      pushSnapshotDiagnostic(
+        params.diagnostics,
+        'snapshot-upgrade-skipped/strict-delivery-required',
+        'OpenCode snapshot proof requires strict delivery attribution.',
+      )
       return result
     }
     const stats = createSnapshotProofStats(proofCandidates)
