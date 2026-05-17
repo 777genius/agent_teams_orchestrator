@@ -13,6 +13,7 @@ import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvide
 import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
+import type { OpenCodeLedgerAttributionMode } from './OpenCodeToolpartChangeReconstructor.js'
 
 let tempDir = ''
 let homeDir = ''
@@ -1039,12 +1040,14 @@ function runCliBackfill(input: {
   projectDir: string
   workspaceRoot: string
   deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
+  attributionMode?: OpenCodeLedgerAttributionMode
   dryRun?: boolean
   homeDir?: string
   snapshotProofMode?: SnapshotProofMode
 }) {
   const cliDev = cliDevCommand()
   const env = childEnvForHome(input.homeDir ?? homeDir)
+  const attributionMode = input.attributionMode ?? 'strict-delivery'
   if (input.snapshotProofMode) {
     env.OPENCODE_SNAPSHOT_PROOF_UPGRADE = input.snapshotProofMode
   }
@@ -1070,7 +1073,7 @@ function runCliBackfill(input: {
       '--delivery-context-hash',
       input.deliveryContext.deliveryContextHash,
       '--attribution-mode',
-      'strict-delivery',
+      attributionMode,
       ...(input.dryRun === true ? ['--dry-run'] : []),
     ],
     {
@@ -2332,6 +2335,62 @@ describe('OpenCode Ledger Bridge real fixture E2E', () => {
     expect(fullFiles.find(file => file.relativePath === '227/chain.ts')).toMatchObject({
       reviewability: 'full-text',
       contentAvailability: 'full-text',
+      eventCount: 2,
+    })
+  }, LEDGER_CLI_MODE_MATRIX_E2E_TIMEOUT_MS)
+
+  test('CLI compatible attribution keeps snapshot-backed candidates metadata-only', async () => {
+    const fixture = await createSnapshotModeMatrixFixture('compatible')
+    const cli = runCliBackfill({
+      projectDir: fixture.projectDir,
+      workspaceRoot: fixture.workspaceRoot,
+      deliveryContext: fixture.deliveryContext,
+      attributionMode: 'compatible',
+      homeDir: fixture.fixtureHomeDir,
+      snapshotProofMode: 'single-change',
+    })
+    expect(cli.status, `stdout:\n${cli.stdout}\nstderr:\n${cli.stderr}`).toBe(0)
+    const stdout = JSON.parse(cli.stdout) as {
+      result: {
+        outcome: string
+        importedEvents: number
+        diagnostics: string[]
+        snapshotProofMode?: SnapshotProofMode
+        snapshotShapeFingerprint?: string
+      }
+    }
+    expect(stdout.result).toMatchObject({
+      outcome: 'imported',
+      importedEvents: 7,
+      snapshotProofMode: 'single-change',
+    })
+    expect(stdout.result.snapshotShapeFingerprint).toBeUndefined()
+    expect(stdout.result.diagnostics).toContain(
+      'snapshot-upgrade-skipped/strict-delivery-required: OpenCode snapshot proof requires strict delivery attribution.',
+    )
+
+    const events = await readJsonlEvents(fixture.projectDir, 'task-1')
+    for (const sourcePartId of ['bob-edit-snapshot-only', 'bob-edit-chain-1', 'bob-edit-chain-2']) {
+      const event = requireEvent(events, sourcePartId)
+      expect(event).toMatchObject({
+        confidence: 'medium',
+        evidenceProof: 'metadata-only-fallback',
+        before: null,
+        after: null,
+      })
+      expect(event.snapshotId).toBeUndefined()
+      expect(event.snapshotSource).toBeUndefined()
+    }
+
+    const bundle = await readTaskChangeBundle(fixture.projectDir, 'task-1')
+    const files = (bundle.files ?? []) as Array<Record<string, unknown>>
+    expect(files.find(file => file.relativePath === '227/snapshot-only.js')).toMatchObject({
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
+    })
+    expect(files.find(file => file.relativePath === '227/chain.ts')).toMatchObject({
+      reviewability: 'metadata-only',
+      contentAvailability: 'hash-only',
       eventCount: 2,
     })
   }, LEDGER_CLI_MODE_MATRIX_E2E_TIMEOUT_MS)
