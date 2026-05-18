@@ -80,7 +80,7 @@ describe('executeCodexNativeTurn', () => {
     ].join('\n')
 
     expect(resolveCodexNativeExecTimeoutPolicy(prompt, {})).toEqual({
-      idleTimeoutMs: 300_000,
+      idleTimeoutMs: 900_000,
       absoluteTimeoutMs: 2_700_000,
     })
     expect(
@@ -203,7 +203,7 @@ describe('executeCodexNativeTurn', () => {
       }),
     )
 
-    expect(observedIdleTimeoutMs).toBe(300_000)
+    expect(observedIdleTimeoutMs).toBe(900_000)
     expect(observedAbsoluteTimeoutMs).toBe(2_700_000)
   })
 
