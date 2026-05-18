@@ -150,7 +150,6 @@ export class PaneBackendExecutor implements TeammateExecutor {
         planModeRequired: config.planModeRequired,
         permissionMode: appState.toolPermissionContext.mode,
         effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
-        strictMcpConfig: Boolean(config.teamName),
         provider: config.provider,
       })
 

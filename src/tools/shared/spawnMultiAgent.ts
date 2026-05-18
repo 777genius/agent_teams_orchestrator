@@ -1639,11 +1639,11 @@ async function handleSpawnSplitPane(
 
   // Build CLI flags to propagate to teammate
   // Pass plan_mode_required to prevent inheriting bypass permissions
+  const inheritedStrictMcpConfig = getStrictMcpConfig()
   let inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
-    strictMcpConfig: Boolean(teamName),
     provider,
   })
 
@@ -1678,7 +1678,7 @@ async function handleSpawnSplitPane(
     model,
     effort,
     prompt,
-    strictMcpConfig: Boolean(teamName),
+    strictMcpConfig: inheritedStrictMcpConfig,
   })
   const startupReadySentinel =
     detectionResult.backend.type === 'tmux'
@@ -1963,11 +1963,11 @@ async function handleSpawnSeparateWindow(
 
   // Build CLI flags to propagate to teammate
   // Pass plan_mode_required to prevent inheriting bypass permissions
+  const inheritedStrictMcpConfig = getStrictMcpConfig()
   let inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
-    strictMcpConfig: Boolean(teamName),
     provider,
   })
 
@@ -2002,7 +2002,7 @@ async function handleSpawnSeparateWindow(
     model,
     effort,
     prompt,
-    strictMcpConfig: Boolean(teamName),
+    strictMcpConfig: inheritedStrictMcpConfig,
   })
   const startupReadySentinel = await createSpawnReadySentinel()
   const launchBoundaryIso = new Date().toISOString()
@@ -2366,12 +2366,12 @@ async function handleSpawnNativeProcess(
     ...(agent_type ? ['--agent-type', agent_type] : []),
   ]
 
+  const inheritedStrictMcpConfig = getStrictMcpConfig()
   let inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
     effortValue:
       typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
-    strictMcpConfig: Boolean(teamName),
     provider,
   })
 
@@ -2398,7 +2398,7 @@ async function handleSpawnNativeProcess(
     model,
     effort,
     prompt,
-    strictMcpConfig: Boolean(teamName),
+    strictMcpConfig: inheritedStrictMcpConfig,
   })
 
   const { command, args: commandArgs } = getTeammateCommandArgv()

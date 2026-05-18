@@ -5,8 +5,10 @@ import { dirname, join } from 'node:path'
 import {
   getFlagSettingsInline,
   getFlagSettingsPath,
+  getStrictMcpConfig,
   setFlagSettingsInline,
   setFlagSettingsPath,
+  setStrictMcpConfig,
 } from '../../bootstrap/state.js'
 
 import {
@@ -54,6 +56,46 @@ describe('buildPaneLauncherCommand', () => {
 })
 
 describe('inherited runtime flags', () => {
+  it('does not force strict MCP config for normal teammate inheritance', () => {
+    const originalStrictMcpConfig = getStrictMcpConfig()
+    setStrictMcpConfig(false)
+
+    try {
+      expect(buildInheritedCliFlags({ provider: 'anthropic' })).not.toContain(
+        '--strict-mcp-config',
+      )
+      expect(
+        buildInheritedCliFlags({
+          provider: 'anthropic',
+          strictMcpConfig: false,
+        }),
+      ).not.toContain('--strict-mcp-config')
+    } finally {
+      setStrictMcpConfig(originalStrictMcpConfig)
+    }
+  })
+
+  it('preserves explicit strict MCP config inheritance', () => {
+    const originalStrictMcpConfig = getStrictMcpConfig()
+
+    try {
+      setStrictMcpConfig(false)
+      expect(
+        buildInheritedCliFlags({
+          provider: 'anthropic',
+          strictMcpConfig: true,
+        }),
+      ).toContain('--strict-mcp-config')
+
+      setStrictMcpConfig(true)
+      expect(buildInheritedCliFlags({ provider: 'anthropic' })).toContain(
+        '--strict-mcp-config',
+      )
+    } finally {
+      setStrictMcpConfig(originalStrictMcpConfig)
+    }
+  })
+
   it('strips model and effort when crossing provider boundaries', () => {
     expect(
       stripProviderBoundaryInheritedRuntimeFlags(

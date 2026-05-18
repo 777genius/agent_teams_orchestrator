@@ -7,13 +7,11 @@ import { openCodeLogProjector } from './OpenCodeLogProjector.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
+import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
-import {
-  buildOpenCodeRuntimePromptMessageId,
-  openCodeTurnSettledObserver,
-} from './OpenCodeTurnSettledObserver.js'
+import { openCodeTurnSettledObserver } from './OpenCodeTurnSettledObserver.js'
 
 import type {
   OpenCodeAuthState,
@@ -43,6 +41,8 @@ type OpenCodeSessionBridgeDeps = {
   turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
   prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
 }
+
+type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
 
 type SessionIdentity = {
   teamId: string
@@ -157,6 +157,9 @@ function buildOpenCodePromptParts(params: {
 function delayMs(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
+
+const OPENCODE_PROMPT_MESSAGE_ID_RECENT_LIMIT = 50
+const OPENCODE_PROMPT_MESSAGE_ID_MAX_ATTEMPTS = 16
 
 export class OpenCodeSessionBridge {
   private readonly retainedSessionHosts = new Map<string, string>()
@@ -607,6 +610,53 @@ export class OpenCodeSessionBridge {
     return messages.find(message => getMessageId(message) === messageID) ?? null
   }
 
+  private async allocateRuntimePromptMessageId(
+    client: OpenCodeClient,
+    sessionId: string,
+  ): Promise<{
+    runtimePromptMessageId: string
+    diagnostics: string[]
+  }> {
+    const diagnostics: string[] = []
+    let lowerBoundMessageIds: Array<string | null> = []
+    try {
+      const messages = await client.getSessionMessages(
+        sessionId,
+        OPENCODE_PROMPT_MESSAGE_ID_RECENT_LIMIT,
+      )
+      lowerBoundMessageIds = messages.map(getMessageId)
+    } catch (error) {
+      diagnostics.push(
+        `OpenCode prompt id lower-bound check skipped - ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+
+    let latestLowerBoundMessageId: string | null = null
+    for (let attempt = 0; attempt < OPENCODE_PROMPT_MESSAGE_ID_MAX_ATTEMPTS; attempt += 1) {
+      const reservation = reserveOpenCodeRuntimePromptMessageId({
+        lowerBoundMessageIds,
+      })
+      latestLowerBoundMessageId = reservation.lowerBoundMessageId
+      if (reservation.waitMs > 0) {
+        await delayMs(reservation.waitMs)
+      }
+      if (
+        !reservation.lowerBoundMessageId ||
+        reservation.runtimePromptMessageId > reservation.lowerBoundMessageId
+      ) {
+        return {
+          runtimePromptMessageId: reservation.runtimePromptMessageId,
+          diagnostics,
+        }
+      }
+      await delayMs(1)
+    }
+
+    throw new Error(
+      `OpenCode prompt id allocation failed to advance past ${latestLowerBoundMessageId ?? 'unknown'} after ${OPENCODE_PROMPT_MESSAGE_ID_MAX_ATTEMPTS} attempts`,
+    )
+  }
+
   async sendMessage(
     record: OpenCodeSessionRecord,
     params: {
@@ -786,15 +836,17 @@ export class OpenCodeSessionBridge {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
     return this.withSessionHost(record, async ({ baseUrl }) => {
+      const client = this.clientFactory.create(baseUrl)
+      const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
         baseUrl,
         sessionId: record.opencodeSessionId,
         projectPath: record.projectPath,
+        runtimePromptMessageId: allocation.runtimePromptMessageId,
         timeoutMs: params.timeoutMs,
         idleTimeoutMs: params.idleTimeoutMs,
       })
-      const client = this.clientFactory.create(baseUrl)
-      const hookDiagnostics: string[] = []
+      const hookDiagnostics: string[] = [...allocation.diagnostics]
       let endpointAccepted = false
       try {
         observation.markPromptSubmitting()
@@ -910,9 +962,10 @@ export class OpenCodeSessionBridge {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
     return this.withSessionHost(record, async ({ baseUrl }) => {
-      const runtimePromptMessageId = buildOpenCodeRuntimePromptMessageId()
       const client = this.clientFactory.create(baseUrl)
-      const hookDiagnostics: string[] = []
+      const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
+      const runtimePromptMessageId = allocation.runtimePromptMessageId
+      const hookDiagnostics: string[] = [...allocation.diagnostics]
       await params.onPromptSubmitting?.({
         sessionId: record.opencodeSessionId,
         runtimePromptMessageId,

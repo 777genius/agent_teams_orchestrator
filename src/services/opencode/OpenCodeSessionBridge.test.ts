@@ -1,5 +1,9 @@
-import { describe, expect, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 
+import {
+  buildOpenCodeRuntimePromptMessageId,
+  resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
+} from './OpenCodeMessageIds.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 
 import type {
@@ -97,6 +101,10 @@ function buildPreviewSummary(
 }
 
 describe('OpenCodeSessionBridge', () => {
+  beforeEach(() => {
+    resetOpenCodeRuntimePromptMessageIdAllocatorForTest()
+  })
+
   test('reuses an existing clean session record', async () => {
     let createSessionCalls = 0
     let prepareProfileCalls = 0
@@ -625,16 +633,19 @@ describe('OpenCodeSessionBridge', () => {
       },
       turnSettledObserver: {
         observe: input => {
+          const runtimePromptMessageId = input.runtimePromptMessageId ?? ''
+          expect(runtimePromptMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
           expect(input).toMatchObject({
             baseUrl: 'http://127.0.0.1:4096',
             sessionId: 'session-1',
             projectPath: '/tmp/project',
+            runtimePromptMessageId,
             timeoutMs: 500,
             idleTimeoutMs: 100,
           })
           return {
-            runtimePromptMessageId: 'msg_prompt_1',
-            turnId: 'msg_prompt_1',
+            runtimePromptMessageId,
+            turnId: runtimePromptMessageId,
             markPromptSubmitting: () => {
               observationMarks.push('submitting')
             },
@@ -647,8 +658,8 @@ describe('OpenCodeSessionBridge', () => {
             waitForSettled: async () => ({
               outcome: 'success',
               sessionId: 'session-1',
-              runtimePromptMessageId: 'msg_prompt_1',
-              turnId: 'msg_prompt_1',
+              runtimePromptMessageId,
+              turnId: runtimePromptMessageId,
               endpoint: '/event',
               streamConnected: true,
               observedEventCount: 2,
@@ -715,12 +726,12 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    expect(result.runtimePromptMessageId).toBe('msg_prompt_1')
+    expect(result.runtimePromptMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     expect(result.turnSettled.outcome).toBe('success')
     expect(result.hookDiagnostics).toEqual([])
     expect(promptBodies).toEqual([
       {
-        messageID: 'msg_prompt_1',
+        messageID: result.runtimePromptMessageId,
         agent: 'teammate',
         noReply: undefined,
         system: undefined,
@@ -733,8 +744,8 @@ describe('OpenCodeSessionBridge', () => {
     ])
     expect(observationMarks).toEqual(['submitting', 'accepted', 'disposed'])
     expect(hookEvents).toEqual([
-      'submitting:session-1:msg_prompt_1',
-      'accepted:session-1:msg_prompt_1',
+      `submitting:session-1:${result.runtimePromptMessageId}`,
+      `accepted:session-1:${result.runtimePromptMessageId}`,
       'turn:session-1:success',
     ])
   })
@@ -748,37 +759,40 @@ describe('OpenCodeSessionBridge', () => {
         releaseHost: async () => {},
       },
       turnSettledObserver: {
-        observe: () => ({
-          runtimePromptMessageId: 'msg_prompt_hook',
-          turnId: 'msg_prompt_hook',
-          markPromptSubmitting: () => {
-            observationMarks.push('submitting')
-          },
-          markPromptAcceptedByEndpoint: () => {
-            observationMarks.push('accepted')
-          },
-          markPromptRejectedByEndpoint: error => {
-            observationMarks.push(`rejected:${String(error)}`)
-          },
-          waitForSettled: async () => ({
-            outcome: 'success',
-            sessionId: 'session-1',
-            runtimePromptMessageId: 'msg_prompt_hook',
-            turnId: 'msg_prompt_hook',
-            endpoint: '/event',
-            streamConnected: true,
-            observedEventCount: 2,
-            matchedEventCount: 2,
-            assistantActivityCount: 1,
-            promptPersisted: true,
-            latestEventType: 'session.status',
-            latestAssistantMessageId: 'msg-assistant-1',
-            diagnostics: [],
-          }),
-          dispose: () => {
-            observationMarks.push('disposed')
-          },
-        }),
+        observe: input => {
+          const runtimePromptMessageId = input.runtimePromptMessageId ?? ''
+          return {
+            runtimePromptMessageId,
+            turnId: runtimePromptMessageId,
+            markPromptSubmitting: () => {
+              observationMarks.push('submitting')
+            },
+            markPromptAcceptedByEndpoint: () => {
+              observationMarks.push('accepted')
+            },
+            markPromptRejectedByEndpoint: error => {
+              observationMarks.push(`rejected:${String(error)}`)
+            },
+            waitForSettled: async () => ({
+              outcome: 'success',
+              sessionId: 'session-1',
+              runtimePromptMessageId,
+              turnId: runtimePromptMessageId,
+              endpoint: '/event',
+              streamConnected: true,
+              observedEventCount: 2,
+              matchedEventCount: 2,
+              assistantActivityCount: 1,
+              promptPersisted: true,
+              latestEventType: 'session.status',
+              latestAssistantMessageId: 'msg-assistant-1',
+              diagnostics: [],
+            }),
+            dispose: () => {
+              observationMarks.push('disposed')
+            },
+          }
+        },
       },
       clientFactory: {
         create: () => ({
@@ -886,7 +900,7 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    expect(result.runtimePromptMessageId).toMatch(/^msg_/)
+    expect(result.runtimePromptMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     expect(result.hookDiagnostics).toEqual([])
     expect(promptBodies).toEqual([
       {
@@ -905,6 +919,234 @@ describe('OpenCodeSessionBridge', () => {
       `submitting:session-1:${result.runtimePromptMessageId}`,
       `accepted:session-1:${result.runtimePromptMessageId}`,
     ])
+  })
+
+  test('allocates prompt_async message ids after latest canonical OpenCode message id', async () => {
+    const latestAssistantMessageId = buildOpenCodeRuntimePromptMessageId({
+      timestampMs: Date.now(),
+      counter: 1,
+      randomSuffix: 'AAAAAAAAAAAAAA',
+    })
+    const promptBodies: Array<Record<string, unknown>> = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [
+            {
+              info: { id: latestAssistantMessageId, role: 'assistant' },
+              parts: [],
+            },
+            {
+              info: { id: 'msg_0d008f4f44e4481a8e3b0bbe848d519c', role: 'user' },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async (_sessionId, body) => {
+            promptBodies.push(body)
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Continue after assistant',
+    })
+
+    expect(result.runtimePromptMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(result.runtimePromptMessageId > latestAssistantMessageId).toBe(true)
+    expect(promptBodies[0]?.messageID).toBe(result.runtimePromptMessageId)
+    expect(result.hookDiagnostics).toEqual([])
+  })
+
+  test('continues prompt_async delivery when prompt id lower-bound fetch fails', async () => {
+    const promptBodies: Array<Record<string, unknown>> = []
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => {
+            throw new Error('temporary message list failure')
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async (_sessionId, body) => {
+            promptBodies.push(body)
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Accept despite list failure',
+    })
+
+    expect(result.runtimePromptMessageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(promptBodies[0]?.messageID).toBe(result.runtimePromptMessageId)
+    expect(result.hookDiagnostics).toEqual([
+      'OpenCode prompt id lower-bound check skipped - temporary message list failure',
+    ])
+  })
+
+  test('fails before prompt_async when no safe prompt message id can be allocated', async () => {
+    const futureAssistantMessageId = buildOpenCodeRuntimePromptMessageId({
+      timestampMs: Date.now() + 60_000,
+      counter: 1,
+      randomSuffix: 'GGGGGGGGGGGGGG',
+    })
+    let promptCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [
+            {
+              info: { id: futureAssistantMessageId, role: 'assistant' },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {
+            promptCalls += 1
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Should not send with unsafe id',
+    })).rejects.toThrow('OpenCode prompt id allocation failed')
+    expect(promptCalls).toBe(0)
+  })
+
+  test('fails before prompt_async when a high legacy msg id would poison OpenCode ordering', async () => {
+    let promptCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [
+            {
+              info: { id: 'msg_fabc1234fabc1234fabc1234fabc1234', role: 'user' },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {
+            promptCalls += 1
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Should not send into poisoned ordering',
+    })).rejects.toThrow('OpenCode prompt id allocation failed')
+    expect(promptCalls).toBe(0)
   })
 
   test('rejects noReply prompt_async before attaching turn-settled observation', async () => {

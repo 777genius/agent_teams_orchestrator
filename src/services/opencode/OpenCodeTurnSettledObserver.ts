@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto'
-
 import {
   getOpenCodeSseMessageId,
   getOpenCodeSseMessageParentId,
@@ -11,8 +9,11 @@ import {
   type OpenCodeSseEndpoint,
   type OpenCodeSseFetch,
 } from './OpenCodeSseEventStream.js'
+import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import type { OpenCodeRuntimeTurnSettledOutcome } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import type { OpenCodeMessage, OpenCodeSseEvent } from './types.js'
+
+export { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 
 const DEFAULT_TURN_SETTLED_TIMEOUT_MS = 15_000
 const DEFAULT_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
@@ -74,10 +75,6 @@ type ObservationState = {
 type TranscriptResponseProof = {
   promptPersisted: boolean
   assistantMessageId: string | null
-}
-
-export function buildOpenCodeRuntimePromptMessageId(): string {
-  return `msg_${randomUUID().replace(/-/g, '')}`
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
