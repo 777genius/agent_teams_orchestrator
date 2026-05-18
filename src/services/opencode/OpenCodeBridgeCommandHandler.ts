@@ -625,7 +625,7 @@ function buildOpenCodeAppManagedBootstrapMessageID(input: {
   contextHash: string
 }): string {
   const digest = hashStable({
-    purpose: 'opencode-app-managed-bootstrap-message-id-v1',
+    purpose: 'opencode-app-managed-bootstrap-message-id-v2',
     teamName: input.teamName,
     memberName: input.memberName,
     runId: input.runId,
@@ -633,7 +633,15 @@ function buildOpenCodeAppManagedBootstrapMessageID(input: {
     runtimeSessionId: input.runtimeSessionId,
     contextHash: input.contextHash,
   })
-  return `msgagtboot${digest.slice(0, 48)}`
+  return `msg_000000000000${digest.slice(0, 14)}`
+}
+
+function getOpenCodeSessionCompatibilityStaleReason(record: OpenCodeSessionRecord): string | null {
+  const bootstrapMessageId = record.appManagedBootstrap?.messageID
+  if (!bootstrapMessageId) return null
+  return bootstrapMessageId.startsWith('msg_')
+    ? null
+    : 'app_managed_bootstrap_message_id_not_opencode_sortable'
 }
 
 function buildOpenCodeAppManagedBootstrapContextText(input: {
@@ -2695,7 +2703,20 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   let deliveryRecord = record
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
-  if (record.staleReason) {
+  const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
+  const staleReason = record.staleReason ?? compatibilityStaleReason
+  if (staleReason) {
+    if (!record.staleReason) {
+      await openCodeSessionStore.markStale(teamId, laneId, memberName, staleReason).catch(error => {
+        mcpDiagnostics.push(
+          teamDiagnostic(
+            'opencode_send_session_compatibility_mark_stale_failed',
+            error instanceof Error ? error.message : String(error),
+            'warning',
+          ),
+        )
+      })
+    }
     deliveryRecord = await openCodeSessionBridge.ensureSession({
       teamId,
       laneId,
@@ -2707,7 +2728,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_stale_record',
-        `Recreated OpenCode session before message delivery because the stored session was stale (${record.staleReason}).`,
+        `Recreated OpenCode session before message delivery because the stored session was stale (${staleReason}).`,
         'warning',
       ),
     )

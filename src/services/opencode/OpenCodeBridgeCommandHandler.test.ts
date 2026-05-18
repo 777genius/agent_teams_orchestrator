@@ -1764,6 +1764,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(upserts).toHaveLength(1)
+    expect(upserts[0]?.appManagedBootstrap?.messageID).toMatch(/^msg_000000000000[0-9a-f]{14}$/)
     expect(upserts[0]).toMatchObject({
       opencodeSessionId: 'session-alice',
       bootstrapMode: 'app_managed_context',
@@ -5931,6 +5932,99 @@ describe('OpenCodeBridgeCommandHandler', () => {
       code: 'opencode_send_session_recreated_after_stale_record',
       message:
         'Recreated OpenCode session before message delivery because the stored session was stale (resolved_behavior_changed:old->new).',
+      severity: 'warning',
+    })
+  })
+
+  test('recreates OpenCode session before sending when app-managed bootstrap id is not sortable', async () => {
+    const originalRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-legacy-bootstrap',
+      lastCanonicalCursor: 'cursor-legacy-bootstrap',
+      bootstrapMode: 'app_managed_context',
+      bootstrapEvidenceSource: 'app_managed_bootstrap',
+      appManagedBootstrap: {
+        schemaVersion: 1,
+        messageID: 'msgagtbootlegacy',
+        contextHash: 'context-hash',
+        briefingHash: 'briefing-hash',
+        injectionVerifiedAt: '2026-04-21T12:00:00.000Z',
+        model: 'openrouter/minimax-m2.5-free',
+        agent: 'teammate-bootstrap',
+      },
+    })
+    const freshRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-fresh-bootstrap',
+      lastCanonicalCursor: 'cursor-fresh-bootstrap',
+      runtimePid: 987,
+    })
+    const staleReasons: string[] = []
+    const mcpCheckedSessionIds: string[] = []
+    const promptSessionIds: string[] = []
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => originalRecord) as typeof openCodeSessionStore.get
+    openCodeSessionStore.markStale = (async (_teamId, _laneId, _memberName, staleReason) => {
+      staleReasons.push(staleReason)
+      return { ...originalRecord, staleReason }
+    }) as typeof openCodeSessionStore.markStale
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      expect(input).toMatchObject({
+        teamId: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: originalRecord.selectedModel,
+        projectPath: originalRecord.projectPath,
+        runId: 'run-sortable-bootstrap-repair',
+      })
+      return freshRecord
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      mcpCheckedSessionIds.push(record.opencodeSessionId)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async record => {
+      promptSessionIds.push(record.opencodeSessionId)
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-sortable-bootstrap-repair',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello bob',
+        messageId: 'message-sortable-bootstrap-repair',
+        settlementMode: 'acceptance',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(staleReasons).toEqual(['app_managed_bootstrap_message_id_not_opencode_sortable'])
+    expect(ensureSessionCalls).toBe(1)
+    expect(mcpCheckedSessionIds).toEqual(['session-bob-fresh-bootstrap'])
+    expect(promptSessionIds).toEqual(['session-bob-fresh-bootstrap'])
+    expect(result.data.sessionId).toBe('session-bob-fresh-bootstrap')
+    expect(result.data.prePromptCursor).toBe('cursor-fresh-bootstrap')
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'opencode_send_session_recreated_after_stale_record',
+      message:
+        'Recreated OpenCode session before message delivery because the stored session was stale (app_managed_bootstrap_message_id_not_opencode_sortable).',
       severity: 'warning',
     })
   })
