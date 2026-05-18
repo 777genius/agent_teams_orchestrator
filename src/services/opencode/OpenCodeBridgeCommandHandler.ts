@@ -72,7 +72,7 @@ const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
 // requirement for OpenCode only. Bump this when changing the injected context
 // or the candidate proof shape so the desktop app can reject stale evidence.
 const OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION = 1
-const OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION = 1
+const OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION = 2
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // This is intentionally longer than the UI wait budget: the app can return
@@ -2660,6 +2660,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
   }
   const projectPath = asString(body.projectPath) ?? envelope.cwd
   const runId = asString(body.runId)
+  const forceSessionRefreshReason = asString(body.forceSessionRefreshReason)?.trim()
   const outcomeBase: SendMessageOutcomeBase = {
     requestId: envelope.requestId,
     body,
@@ -2708,6 +2709,23 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         'opencode_send_session_recreated_after_stale_record',
         `Recreated OpenCode session before message delivery because the stored session was stale (${record.staleReason}).`,
         'warning',
+      ),
+    )
+  } else if (forceSessionRefreshReason) {
+    await openCodeSessionStore.markStale(teamId, laneId, memberName, forceSessionRefreshReason)
+    deliveryRecord = await openCodeSessionBridge.ensureSession({
+      teamId,
+      laneId,
+      memberName,
+      selectedModel: record.selectedModel,
+      projectPath: record.projectPath,
+      runId,
+    })
+    mcpDiagnostics.push(
+      teamDiagnostic(
+        'opencode_send_session_recreated_after_forced_refresh',
+        `Recreated OpenCode session before message delivery because the app requested a session refresh (${forceSessionRefreshReason}).`,
+        'info',
       ),
     )
   }

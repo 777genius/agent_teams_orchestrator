@@ -678,7 +678,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
-    expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(1)
+    expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
@@ -5932,6 +5932,99 @@ describe('OpenCodeBridgeCommandHandler', () => {
       message:
         'Recreated OpenCode session before message delivery because the stored session was stale (resolved_behavior_changed:old->new).',
       severity: 'warning',
+    })
+  })
+
+  test('recreates OpenCode session before sending when the app requests a forced refresh', async () => {
+    const promptCalls: Array<{ sessionId: string; text: string }> = []
+    const staleReasons: string[] = []
+    const originalRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-old-transport',
+      lastCanonicalCursor: 'cursor-old-transport',
+    })
+    const freshRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob-fresh-transport',
+      lastCanonicalCursor: 'cursor-fresh-transport',
+      runtimePid: 765,
+    })
+    let ensureSessionCalls = 0
+    const mcpCheckedSessionIds: string[] = []
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = (async () => originalRecord) as typeof openCodeSessionStore.get
+    openCodeSessionStore.markStale = (async (_teamId, _laneId, _memberName, staleReason) => {
+      staleReasons.push(staleReason)
+      return { ...originalRecord, staleReason }
+    }) as typeof openCodeSessionStore.markStale
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      expect(input).toMatchObject({
+        teamId: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: originalRecord.selectedModel,
+        projectPath: originalRecord.projectPath,
+        runId: 'run-forced-refresh',
+      })
+      return freshRecord
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSessionAppMcpReady = (async record => {
+      mcpCheckedSessionIds.push(record.opencodeSessionId)
+      return {
+        ok: true,
+        runtimePid: record.runtimePid,
+        status: 'present',
+        connected: true,
+        diagnostics: [],
+      }
+    }) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.promptAsync = (async (sessionRecord, input) => {
+      promptCalls.push({
+        sessionId: sessionRecord.opencodeSessionId,
+        text: input.text,
+      })
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        runId: 'run-forced-refresh',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello refreshed bob',
+        forceSessionRefreshReason: 'opencode_app_mcp_transport_changed:old->new',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(staleReasons).toEqual(['opencode_app_mcp_transport_changed:old->new'])
+    expect(ensureSessionCalls).toBe(1)
+    expect(mcpCheckedSessionIds).toEqual(['session-bob-fresh-transport'])
+    expect(promptCalls).toEqual([
+      {
+        sessionId: 'session-bob-fresh-transport',
+        text: expect.stringContaining('hello refreshed bob'),
+      },
+    ])
+    expect(result.data.sessionId).toBe('session-bob-fresh-transport')
+    expect(result.data.prePromptCursor).toBe('cursor-fresh-transport')
+    expect(result.data.diagnostics).toContainEqual({
+      code: 'opencode_send_session_recreated_after_forced_refresh',
+      message:
+        'Recreated OpenCode session before message delivery because the app requested a session refresh (opencode_app_mcp_transport_changed:old->new).',
+      severity: 'info',
     })
   })
 
