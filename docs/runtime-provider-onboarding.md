@@ -131,12 +131,17 @@ Kilo has two different integration surfaces:
 
 Those should not be represented the same way.
 
-Kilo Gateway should start as a nested OpenCode provider, unless the product goal
-is to build a generic OpenAI-compatible top-level API runtime.
+Kilo Gateway is the fastest low-risk API path because it is OpenAI-compatible
+and can be wired through the OpenCode provider path that is already built into
+the orchestrator. It may still appear as a separate nested provider in OpenCode
+provider management.
 
-Kilo CLI can fit as a top-level runtime provider, but only through a real runtime
-adapter. The best top-level shape is `kilo serve` plus `@kilocode/sdk`, not
-desktop-only status and not a plain model catalog.
+Kilo CLI/SDK is the richer and more flexible integration surface. `kilo serve`
+plus `@kilocode/sdk` can use an existing Kilo account/subscription and gives us
+sessions, SSE events, permissions, messages, provider auth, and more runtime
+control. That is the stronger long-term path when the product goal is a real
+top-level Kilo runtime, but it still needs a matching orchestrator runtime
+adapter. Desktop-only status and a plain model catalog are not enough.
 
 ## Recommended Path
 
@@ -144,8 +149,8 @@ desktop-only status and not a plain model catalog.
 
 🎯 8.7   🛡️ 8.3   🧠 4.5 - roughly 120-320 LOC.
 
-This is the best first implementation if the goal is access to Kilo Gateway
-models from our existing team runtime.
+This is the fastest first implementation if the goal is API access to Kilo
+Gateway models from our existing team runtime.
 
 Team launch remains:
 
@@ -585,12 +590,17 @@ Suggested message to the contributor:
 > orchestrator can report status, list models, validate auth, and execute work
 > through the selected runtime.
 >
-> For Kilo there are two separate surfaces. Kilo Gateway is an OpenAI-compatible
-> model gateway, so the best first implementation is to add it as a nested
-> OpenCode provider and keep top-level team launch as `providerId: "opencode"`.
-> Kilo CLI is a real agent runtime and can become a top-level provider later, but
-> that should be implemented with `kilo serve` and `@kilocode/sdk`, including
-> sessions, SSE events, permissions, transcript projection, and cleanup.
+> For Kilo there are two separate surfaces. `kilo serve` plus `@kilocode/sdk` is
+> the richer and more flexible integration surface: it can use an existing Kilo
+> account/subscription and gives us sessions, SSE events, permissions, messages,
+> provider auth, transcript projection, and cleanup. That is the better
+> long-term route for a real top-level Kilo runtime once the orchestrator adapter
+> exists.
+>
+> Kilo Gateway is the faster API path because it is OpenAI-compatible and can be
+> wired through the OpenCode provider support we already have. It can show up as
+> a separate nested OpenCode provider, while team launch stays top-level
+> `providerId: "opencode"`.
 >
 > Please avoid adding `kilocode` as a first-class desktop team provider until the
 > orchestrator has the matching runtime contract. Otherwise the UI can look
@@ -600,10 +610,10 @@ Suggested message to the contributor:
 
 Recommended now:
 
-1. Add Kilo Gateway as a nested OpenCode provider.
+1. For fast API access, add Kilo Gateway as a nested OpenCode provider.
 2. Use the live Kilo model catalog without auth.
 3. Require a real OpenCode model probe before saving/enabling launch.
-4. Do not add top-level `RuntimeProviderId = "kilocode"` until a Kilo CLI runtime
-   adapter exists.
-5. If top-level Kilo is needed, build it on `@kilocode/sdk` + `kilo serve`, not
-   `kilo run --auto` as the main path.
+4. For the fuller Kilo account/subscription experience, plan the top-level
+   runtime around `@kilocode/sdk` + `kilo serve`.
+5. Do not add top-level `RuntimeProviderId = "kilocode"` until that Kilo CLI
+   runtime adapter exists.
