@@ -160,6 +160,18 @@ function delayMs(ms: number): Promise<void> {
 
 const OPENCODE_PROMPT_MESSAGE_ID_RECENT_LIMIT = 50
 const OPENCODE_PROMPT_MESSAGE_ID_MAX_ATTEMPTS = 16
+const OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS = [150, 500]
+
+function isTransientOpenCodeCreateSessionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const normalized = message.toLowerCase()
+  return normalized.includes('socket connection was closed unexpectedly') ||
+    normalized.includes('socket closed') ||
+    normalized.includes('econnreset') ||
+    normalized.includes('connection reset') ||
+    normalized.includes('und_err_socket') ||
+    normalized.includes('fetch failed')
+}
 
 export class OpenCodeSessionBridge {
   private readonly retainedSessionHosts = new Map<string, string>()
@@ -223,9 +235,31 @@ export class OpenCodeSessionBridge {
 
     try {
       const client = this.clientFactory.create(host.baseUrl)
-      const session = await client.createSession({
-        title: params.title?.trim() || `${params.identity.teamId} - ${params.identity.memberName}`,
-      })
+      const sessionTitle = params.title?.trim() || `${params.identity.teamId} - ${params.identity.memberName}`
+      let session: OpenCodeSessionSummary | null = null
+      let lastCreateError: unknown = null
+      for (const [attemptIndex, retryDelayMs] of [0, ...OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS].entries()) {
+        if (retryDelayMs > 0) {
+          await delayMs(retryDelayMs)
+        }
+        try {
+          session = await client.createSession({ title: sessionTitle })
+          break
+        } catch (error) {
+          lastCreateError = error
+          if (
+            attemptIndex >= OPENCODE_CREATE_SESSION_TRANSIENT_RETRY_DELAYS_MS.length ||
+            !isTransientOpenCodeCreateSessionError(error)
+          ) {
+            throw error
+          }
+        }
+      }
+      if (!session) {
+        throw lastCreateError instanceof Error
+          ? lastCreateError
+          : new Error('OpenCode session creation failed')
+      }
       const now = buildNowIso()
       const record: OpenCodeSessionRecord = {
         teamId: params.identity.teamId,

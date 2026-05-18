@@ -257,6 +257,159 @@ describe('OpenCodeSessionBridge', () => {
     expect(createSessionCalls).toBe(0)
   })
 
+  test('retries fresh session creation after a transient OpenCode socket close', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const retainedLeases: unknown[] = []
+    let createSessionCalls = 0
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'created'
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {
+          releaseHostCalls += 1
+        },
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeases.push(input)
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCalls += 1
+            if (createSessionCalls === 1) {
+              throw new Error('The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()')
+            }
+            return { id: 'session-new' }
+          },
+          getSession: async () => ({ id: 'session-new' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: 'team-a',
+      laneId: 'secondary:opencode:tom',
+      memberName: 'tom',
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      runId: 'run-1',
+      fresh: true,
+    })
+
+    expect(createSessionCalls).toBe(2)
+    expect(record.opencodeSessionId).toBe('session-new')
+    expect(upserts).toHaveLength(1)
+    expect(releaseHostCalls).toBe(0)
+    expect(retainedLeases).toEqual([{
+      teamId: 'team-a',
+      laneId: 'secondary:opencode:tom',
+      memberName: 'tom',
+      runId: 'run-1',
+      sessionId: 'session-new',
+    }])
+  })
+
+  test('does not retry fresh session creation after a non-transient OpenCode error', async () => {
+    let createSessionCalls = 0
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => {
+          throw new Error('upsert should not be called')
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {
+          releaseHostCalls += 1
+        },
+        retainHostLease: async () => {
+          throw new Error('retainHostLease should not be called')
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCalls += 1
+            throw new Error('OpenCode request failed (400 Bad Request): invalid session title')
+          },
+          getSession: async () => ({ id: 'session-new' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'tom',
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      fresh: true,
+    })).rejects.toThrow('invalid session title')
+
+    expect(createSessionCalls).toBe(1)
+    expect(releaseHostCalls).toBe(1)
+  })
+
   test('releaseSession drops the persistent host lease even after process restart', async () => {
     const releasedLeases: unknown[] = []
     let releaseHostCalls = 0
