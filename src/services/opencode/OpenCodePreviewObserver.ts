@@ -85,6 +85,10 @@ function buildEmptySummary(sessionId: string): OpenCodeSessionPreviewSummary {
   }
 }
 
+function getOpenCodeSsePartId(properties: Record<string, unknown>): string | null {
+  return asString(properties.partID) ?? asString(properties.partId)
+}
+
 export class OpenCodePreviewObserver {
   constructor(private readonly deps: OpenCodePreviewObserverDeps = {}) {}
 
@@ -170,12 +174,25 @@ export class OpenCodePreviewObserver {
 
       const parts = assistantBuffers.get(messageId)
       if (!parts) {
+        if (state.latestAssistantMessageId === messageId) {
+          state.latestAssistantPreview = null
+        }
         return
       }
 
       const text = Array.from(parts.values()).join('')
       state.latestAssistantMessageId = messageId
       state.latestAssistantPreview = buildPreviewText(text)
+    }
+
+    const storeAssistantPartText = (messageId: string, partId: string, text: string) => {
+      const buffer = assistantBuffers.get(messageId) ?? new Map<string, string>()
+      buffer.set(partId, text)
+      assistantBuffers.set(messageId, buffer)
+      updateAssistantPreview(messageId)
+      if (roleByMessageId.get(messageId) === 'assistant') {
+        state.runtimeState = 'running'
+      }
     }
 
     const handleEvent = (event: OpenCodeSseEvent): void => {
@@ -263,18 +280,35 @@ export class OpenCodePreviewObserver {
           const delta = asString(properties.delta)
           const text = asString(part.text)
           const buffer = assistantBuffers.get(messageId) ?? new Map<string, string>()
-          buffer.set(partId, delta ? `${buffer.get(partId) ?? ''}${delta}` : (text ?? buffer.get(partId) ?? ''))
-          assistantBuffers.set(messageId, buffer)
-          updateAssistantPreview(messageId)
-          if (roleByMessageId.get(messageId) === 'assistant') {
-            state.runtimeState = 'running'
+          storeAssistantPartText(
+            messageId,
+            partId,
+            delta ? `${buffer.get(partId) ?? ''}${delta}` : (text ?? buffer.get(partId) ?? ''),
+          )
+          return
+        }
+
+        case 'message.part.delta': {
+          const messageId = getOpenCodeSseMessageId(properties)
+          const partId = getOpenCodeSsePartId(properties) ?? '__default__'
+          const field = asString(properties.field)
+          const delta = asString(properties.delta)
+          if (!messageId || !delta) {
+            return
           }
+
+          if (field && field !== 'text') {
+            return
+          }
+
+          const buffer = assistantBuffers.get(messageId) ?? new Map<string, string>()
+          storeAssistantPartText(messageId, partId, `${buffer.get(partId) ?? ''}${delta}`)
           return
         }
 
         case 'message.part.removed': {
-          const messageId = asString(properties.messageID)
-          const partId = asString(properties.partID)
+          const messageId = getOpenCodeSseMessageId(properties)
+          const partId = getOpenCodeSsePartId(properties)
           if (!messageId || !partId) {
             return
           }
