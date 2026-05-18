@@ -56,6 +56,136 @@ describe('OpenCodeEventTranslator', () => {
     expect(summary.messages[1]?.reasoningText).toBe('')
   })
 
+  test('treats stale busy status as idle when transcript has a completed assistant response', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1',
+      rawStatus: 'busy',
+      messages: [
+        {
+          info: {
+            id: 'msg-user-busy-stale',
+            role: 'user',
+            sessionID: 'session-1',
+            time: { created: 120 },
+          },
+          parts: [{ type: 'text', text: 'Reply with exactly: pong' }],
+        },
+        {
+          info: {
+            id: 'msg-assistant-busy-stale',
+            parentID: 'msg-user-busy-stale',
+            role: 'assistant',
+            sessionID: 'session-1',
+            time: { created: 121, completed: 125 },
+          },
+          parts: [
+            { type: 'step-start' },
+            { type: 'text', text: 'pong' },
+            { type: 'step-finish' },
+          ],
+        },
+      ],
+    })
+
+    expect(summary.rawStatus).toBe('busy')
+    expect(summary.durableState).toBe('idle')
+    expect(summary.replyPendingSinceMessageId).toBeNull()
+    expect(summary.latestAssistantMessageId).toBe('msg-assistant-busy-stale')
+    expect(summary.diagnostics.join('\n')).toContain('status was busy')
+  })
+
+  test('treats a following assistant response as current even when OpenCode keeps the bootstrap parent id', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1',
+      rawStatus: 'busy',
+      messages: [
+        {
+          info: {
+            id: 'msg-bootstrap',
+            role: 'user',
+            sessionID: 'session-1',
+            time: { created: 100 },
+          },
+          parts: [{ type: 'text', text: 'bootstrap context' }],
+        },
+        {
+          info: {
+            id: 'msg-delivery',
+            role: 'user',
+            sessionID: 'session-1',
+            time: { created: 200 },
+          },
+          parts: [{ type: 'text', text: 'Reply using message_send' }],
+        },
+        {
+          info: {
+            id: 'msg-assistant-bootstrap-parent',
+            parentID: 'msg-bootstrap',
+            role: 'assistant',
+            sessionID: 'session-1',
+            time: { created: 201, completed: 205 },
+            finish: 'tool-calls',
+          },
+          parts: [
+            { type: 'step-start' },
+            {
+              type: 'tool',
+              tool: 'agent-teams_message_send',
+              callID: 'call-message-send',
+              state: {
+                status: 'completed',
+                input: { text: 'visible reply' },
+                output: '{"deliveredToInbox":true}',
+              },
+            },
+            { type: 'step-finish', reason: 'tool-calls' },
+          ],
+        },
+      ],
+    })
+
+    expect(summary.latestUserMessageId).toBe('msg-delivery')
+    expect(summary.latestAssistantMessageId).toBe('msg-assistant-bootstrap-parent')
+    expect(summary.replyPendingSinceMessageId).toBeNull()
+    expect(summary.durableState).toBe('idle')
+    expect(summary.diagnostics.join('\n')).toContain('status was busy')
+  })
+
+  test('keeps busy state when the latest assistant response is not complete', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1',
+      rawStatus: 'busy',
+      messages: [
+        {
+          info: {
+            id: 'msg-user-busy-active',
+            role: 'user',
+            sessionID: 'session-1',
+            time: { created: 130 },
+          },
+          parts: [{ type: 'text', text: 'Reply with exactly: pong' }],
+        },
+        {
+          info: {
+            id: 'msg-assistant-busy-active',
+            parentID: 'msg-user-busy-active',
+            role: 'assistant',
+            sessionID: 'session-1',
+            time: { created: 131 },
+          },
+          parts: [
+            { type: 'step-start' },
+            { type: 'text', text: 'po' },
+          ],
+        },
+      ],
+    })
+
+    expect(summary.rawStatus).toBe('busy')
+    expect(summary.durableState).toBe('running')
+    expect(summary.replyPendingSinceMessageId).toBeNull()
+  })
+
   test('marks reply pending when latest user message has no assistant reply', () => {
     const summary = translator.reconcileSessionMessages({
       sessionId: 'session-1',
@@ -79,6 +209,38 @@ describe('OpenCodeEventTranslator', () => {
     expect(
       summary.diagnostics.some(item => item.includes('has no assistant reply while OpenCode session is idle')),
     ).toBe(true)
+  })
+
+  test('keeps reply pending for a step-start-only assistant shell', () => {
+    const summary = translator.reconcileSessionMessages({
+      sessionId: 'session-1',
+      rawStatus: 'idle',
+      messages: [
+        {
+          info: {
+            id: 'msg-user-step-start-only',
+            role: 'user',
+            sessionID: 'session-1',
+            time: { created: 200 },
+          },
+          parts: [{ type: 'text', text: 'Reply with exactly: pong' }],
+        },
+        {
+          info: {
+            id: 'msg-assistant-step-start-only',
+            parentID: 'msg-user-step-start-only',
+            role: 'assistant',
+            sessionID: 'session-1',
+            time: { created: 201 },
+          },
+          parts: [{ type: 'step-start' }],
+        },
+      ],
+    })
+
+    expect(summary.durableState).toBe('reply_pending')
+    expect(summary.replyPendingSinceMessageId).toBe('msg-user-step-start-only')
+    expect(summary.latestAssistantMessageId).toBe('msg-assistant-step-start-only')
   })
 
   test('preserves OpenCode retry status messages as diagnostics', () => {

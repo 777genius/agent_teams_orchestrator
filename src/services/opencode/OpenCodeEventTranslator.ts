@@ -26,6 +26,77 @@ function getLastMessageId(
   return null
 }
 
+function hasCompletedAssistantTurn(message: OpenCodeCanonicalMessage): boolean {
+  if (message.role !== 'assistant') {
+    return false
+  }
+  if (message.hasError) {
+    return true
+  }
+  if (message.completedAt !== null || message.finishReason !== null) {
+    return true
+  }
+  if (message.partTypes.some(type => type === 'step-finish' || type === 'step_finish')) {
+    return true
+  }
+  return message.toolCalls.some(toolCall => toolCall.status === 'completed' || toolCall.status === 'errored')
+}
+
+function isAssistantResponseEvidencePartType(type: string): boolean {
+  return type !== 'unknown' && type !== 'step-start' && type !== 'step_start'
+}
+
+function hasAssistantTurnEvidence(message: OpenCodeCanonicalMessage): boolean {
+  if (message.role !== 'assistant') {
+    return false
+  }
+  return (
+    hasCompletedAssistantTurn(message) ||
+    message.text.length > 0 ||
+    message.reasoningText.length > 0 ||
+    message.toolCalls.length > 0 ||
+    message.partTypes.some(isAssistantResponseEvidencePartType)
+  )
+}
+
+function hasAssistantResponseAfterUser(
+  messages: OpenCodeCanonicalMessage[],
+  userIndex: number,
+  predicate: (message: OpenCodeCanonicalMessage) => boolean,
+): boolean {
+  if (userIndex < 0) {
+    return false
+  }
+
+  for (const message of messages.slice(userIndex + 1)) {
+    if (message.role === 'user') {
+      break
+    }
+    if (message.role === 'assistant' && predicate(message)) {
+      return true
+    }
+  }
+  return false
+}
+
+function hasCompletedAssistantResponseForLatestUser(
+  messages: OpenCodeCanonicalMessage[],
+  latestUserMessageId: string | null,
+): boolean {
+  if (!latestUserMessageId) {
+    return false
+  }
+
+  const latestUserIndex = messages.findIndex(
+    message => message.role === 'user' && message.id === latestUserMessageId,
+  )
+  if (latestUserIndex < 0) {
+    return false
+  }
+
+  return hasAssistantResponseAfterUser(messages, latestUserIndex, hasCompletedAssistantTurn)
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -101,7 +172,7 @@ export class OpenCodeEventTranslator {
     const respondedParentIds = new Set<string>()
 
     for (const message of canonicalMessages) {
-      if (message.parentId) {
+      if (message.parentId && message.role === 'assistant' && hasAssistantTurnEvidence(message)) {
         respondedParentIds.add(message.parentId)
       }
     }
@@ -112,7 +183,10 @@ export class OpenCodeEventTranslator {
       if (candidate.role !== 'user' || !candidate.id) {
         continue
       }
-      if (!respondedParentIds.has(candidate.id)) {
+      if (
+        !respondedParentIds.has(candidate.id) &&
+        !hasAssistantResponseAfterUser(canonicalMessages, index, hasAssistantTurnEvidence)
+      ) {
         replyPendingSinceMessageId = candidate.id
       }
       break
@@ -124,14 +198,27 @@ export class OpenCodeEventTranslator {
       latestAssistantMessageId
         ? canonicalMessages.find(message => message.id === latestAssistantMessageId) ?? null
         : null
+    const latestUserHasCompletedAssistantResponse = hasCompletedAssistantResponseForLatestUser(
+      canonicalMessages,
+      latestUserMessageId,
+    )
 
     let durableState: OpenCodeSessionReconcileSummary['durableState'] = 'unknown'
     if (normalizedStatus.status === 'retry') {
       durableState = 'retrying'
-    } else if (normalizedStatus.status === 'busy') {
-      durableState = 'running'
     } else if (latestAssistantMessage?.hasError) {
       durableState = 'error'
+    } else if (
+      normalizedStatus.status === 'busy' &&
+      !replyPendingSinceMessageId &&
+      latestUserHasCompletedAssistantResponse
+    ) {
+      durableState = 'idle'
+      diagnostics.push(
+        'OpenCode session status was busy but transcript has a completed assistant response for the latest user message; treating session as idle',
+      )
+    } else if (normalizedStatus.status === 'busy') {
+      durableState = 'running'
     } else if (replyPendingSinceMessageId) {
       durableState = 'reply_pending'
     } else if (normalizedStatus.status === 'idle' || canonicalMessages.length > 0) {

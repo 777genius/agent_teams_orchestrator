@@ -12,10 +12,11 @@ import {
   type OpenCodeSseFetch,
 } from './OpenCodeSseEventStream.js'
 import type { OpenCodeRuntimeTurnSettledOutcome } from './OpenCodeRuntimeTurnSettledEmitter.js'
-import type { OpenCodeSseEvent } from './types.js'
+import type { OpenCodeMessage, OpenCodeSseEvent } from './types.js'
 
 const DEFAULT_TURN_SETTLED_TIMEOUT_MS = 15_000
 const DEFAULT_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
+const DEFAULT_TURN_SETTLED_TRANSCRIPT_LIMIT = 50
 const ENDPOINTS: OpenCodeSseEndpoint[] = ['/event', '/global/event']
 
 type PromptState = 'created' | 'submitting' | 'accepted' | 'rejected'
@@ -70,8 +71,24 @@ type ObservationState = {
   terminal: OpenCodeTurnSettledSummary | null
 }
 
+type TranscriptResponseProof = {
+  promptPersisted: boolean
+  assistantMessageId: string | null
+}
+
 export function buildOpenCodeRuntimePromptMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, '')}`
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  return null
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
 }
 
 function isAssistantActivityPartType(partType: string | null): boolean {
@@ -84,6 +101,99 @@ function isAssistantActivityPartType(partType: string | null): boolean {
     partType === 'step-finish' ||
     partType === 'step_start' ||
     partType === 'step_finish'
+}
+
+function isTranscriptAssistantResponsePartType(partType: string | null): boolean {
+  return partType === 'text' ||
+    partType === 'tool' ||
+    partType === 'tool_use' ||
+    partType === 'tool_result' ||
+    partType === 'reasoning' ||
+    partType === 'step-finish' ||
+    partType === 'step_finish'
+}
+
+function getTranscriptMessageInfo(message: OpenCodeMessage): Record<string, unknown> | null {
+  return asRecord(message.info)
+}
+
+function getTranscriptMessageId(message: OpenCodeMessage): string | null {
+  return asString(getTranscriptMessageInfo(message)?.id)
+}
+
+function getTranscriptMessageParentId(message: OpenCodeMessage): string | null {
+  const info = getTranscriptMessageInfo(message)
+  return (
+    asString(info?.parentID) ??
+    asString(info?.parentId) ??
+    asString(info?.parent)
+  )
+}
+
+function getTranscriptMessageRole(message: OpenCodeMessage): string | null {
+  return asString(getTranscriptMessageInfo(message)?.role)
+}
+
+function hasTranscriptAssistantActivity(message: OpenCodeMessage): boolean {
+  if (!Array.isArray(message.parts)) {
+    return false
+  }
+
+  return message.parts.some((part) => {
+    const record = asRecord(part)
+    const type = asString(record?.type)
+    if (isTranscriptAssistantResponsePartType(type)) {
+      return true
+    }
+    return asString(record?.text) !== null
+  })
+}
+
+function findTranscriptResponseForPrompt(
+  messages: OpenCodeMessage[],
+  runtimePromptMessageId: string,
+): TranscriptResponseProof {
+  const promptIndex = messages.findIndex(message =>
+    getTranscriptMessageRole(message) === 'user' &&
+    getTranscriptMessageId(message) === runtimePromptMessageId
+  )
+  const parentMatchedAssistant = messages.find(message =>
+    getTranscriptMessageRole(message) === 'assistant' &&
+    getTranscriptMessageParentId(message) === runtimePromptMessageId &&
+    hasTranscriptAssistantActivity(message)
+  )
+
+  if (parentMatchedAssistant) {
+    return {
+      promptPersisted: true,
+      assistantMessageId: getTranscriptMessageId(parentMatchedAssistant),
+    }
+  }
+
+  if (promptIndex < 0) {
+    return {
+      promptPersisted: false,
+      assistantMessageId: null,
+    }
+  }
+
+  for (const message of messages.slice(promptIndex + 1)) {
+    const role = getTranscriptMessageRole(message)
+    if (role === 'user') {
+      break
+    }
+    if (role === 'assistant' && hasTranscriptAssistantActivity(message)) {
+      return {
+        promptPersisted: true,
+        assistantMessageId: getTranscriptMessageId(message),
+      }
+    }
+  }
+
+  return {
+    promptPersisted: true,
+    assistantMessageId: null,
+  }
 }
 
 export class OpenCodeTurnSettledObserver {
@@ -123,6 +233,7 @@ export class OpenCodeTurnSettledObserver {
     const idleTimeoutMs = params.idleTimeoutMs ?? DEFAULT_TURN_SETTLED_IDLE_TIMEOUT_MS
     const controller = new AbortController()
     let idleTimer: ReturnType<typeof setTimeout> | null = null
+    let idleTranscriptProbeInFlight = false
     let resolveWait: ((summary: OpenCodeTurnSettledSummary) => void) | null = null
     const waitPromise = new Promise<OpenCodeTurnSettledSummary>(resolve => {
       resolveWait = resolve
@@ -206,6 +317,86 @@ export class OpenCodeTurnSettledObserver {
       )
     }
 
+    const fetchTranscriptResponseProof = async (): Promise<TranscriptResponseProof | null> => {
+      const fetchImpl = this.deps.fetchImpl ?? fetch
+      const path =
+        `/session/${encodeURIComponent(params.sessionId)}/message?limit=${DEFAULT_TURN_SETTLED_TRANSCRIPT_LIMIT}`
+      let response: Response
+      try {
+        response = await fetchImpl(params.baseUrl + path, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: {
+            Accept: 'application/json',
+          },
+        })
+      } catch (error) {
+        if (controller.signal.aborted || state.terminal || state.disposed) {
+          return null
+        }
+        state.diagnostics.push(
+          `OpenCode transcript reconcile failed after idle - ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return null
+      }
+
+      if (!response.ok) {
+        state.diagnostics.push(
+          `OpenCode transcript reconcile returned ${response.status} ${response.statusText}`,
+        )
+        return null
+      }
+
+      let raw: unknown
+      try {
+        raw = await response.json()
+      } catch (error) {
+        state.diagnostics.push(
+          `OpenCode transcript reconcile returned invalid JSON - ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return null
+      }
+
+      if (!Array.isArray(raw)) {
+        state.diagnostics.push('OpenCode transcript reconcile returned a non-array message list')
+        return null
+      }
+
+      return findTranscriptResponseForPrompt(raw as OpenCodeMessage[], runtimePromptMessageId)
+    }
+
+    const reconcileTranscriptAfterIdle = (source: 'session.idle' | 'session.status idle') => {
+      if (state.terminal || state.disposed || idleTranscriptProbeInFlight) {
+        return
+      }
+
+      idleTranscriptProbeInFlight = true
+      void (async () => {
+        try {
+          const proof = await fetchTranscriptResponseProof()
+          if (!proof || state.terminal || state.disposed) {
+            return
+          }
+          if (proof.promptPersisted) {
+            state.promptPersisted = true
+          }
+          if (!proof.assistantMessageId) {
+            state.diagnostics.push(
+              `OpenCode transcript reconcile after ${source} found no assistant response for the current prompt`,
+            )
+            return
+          }
+
+          state.assistantMessageObserved = true
+          state.assistantActivityCount = Math.max(state.assistantActivityCount, 1)
+          state.latestAssistantMessageId = proof.assistantMessageId
+          settle('success', `OpenCode transcript reconcile after ${source} observed assistant activity`)
+        } finally {
+          idleTranscriptProbeInFlight = false
+        }
+      })()
+    }
+
     const handleEvent = (event: OpenCodeSseEvent) => {
       if (state.terminal || state.disposed) {
         return
@@ -260,6 +451,7 @@ export class OpenCodeTurnSettledObserver {
           state.diagnostics.push(
             'OpenCode ignored session.idle without current prompt evidence',
           )
+          reconcileTranscriptAfterIdle('session.idle')
           return
         }
         if (state.assistantActivityCount > 0) {
@@ -269,6 +461,7 @@ export class OpenCodeTurnSettledObserver {
         state.diagnostics.push(
           'OpenCode observed deprecated session.idle without assistant activity; waiting for full turn timeout',
         )
+        reconcileTranscriptAfterIdle('session.idle')
         return
       }
 
@@ -279,6 +472,7 @@ export class OpenCodeTurnSettledObserver {
             state.diagnostics.push(
               'OpenCode ignored session.status idle without current prompt evidence',
             )
+            reconcileTranscriptAfterIdle('session.status idle')
             return
           }
           if (state.assistantActivityCount > 0) {
@@ -288,6 +482,7 @@ export class OpenCodeTurnSettledObserver {
           state.diagnostics.push(
             'OpenCode observed session.status idle without assistant activity; waiting for full turn timeout',
           )
+          reconcileTranscriptAfterIdle('session.status idle')
         }
         return
       }
@@ -316,6 +511,15 @@ export class OpenCodeTurnSettledObserver {
             'OpenCode ignored assistant message shell without current prompt evidence',
           )
         }
+        return
+      }
+
+      if (event.type === 'message.part.delta') {
+        const messageId = getOpenCodeSseMessageId(event.properties)
+        if (messageId === runtimePromptMessageId) {
+          return
+        }
+        recordAssistantActivity(messageId, { source: 'part' })
         return
       }
 

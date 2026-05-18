@@ -123,6 +123,205 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(summary.diagnostics.join('\n')).toContain('before 120ms timeout')
   })
 
+  test('settles on OpenCode 1.15 message.part.delta events', async () => {
+    const observer = new OpenCodeTurnSettledObserver({
+      promptMessageIdFactory: () => 'msg_prompt_delta',
+      fetchImpl: async input => {
+        expect(String(input)).toBe('http://127.0.0.1:4096/event')
+        return buildSseResponse([
+          'data: {"type":"server.connected","properties":{}}\n\n',
+          'data: {"type":"message.part.delta","properties":{"sessionID":"session-1","messageID":"msg-assistant-delta","partID":"part-1","field":"text","delta":"OK"}}\n\n',
+          'data: {"type":"session.status","properties":{"sessionID":"session-1","status":{"session-1":{"type":"idle"}}}}\n\n',
+        ])
+      },
+    })
+
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096',
+      sessionId: 'session-1',
+      timeoutMs: 500,
+      idleTimeoutMs: 100,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+
+    const summary = await observation.waitForSettled()
+
+    expect(summary).toMatchObject({
+      outcome: 'success',
+      runtimePromptMessageId: 'msg_prompt_delta',
+      promptPersisted: false,
+      assistantActivityCount: 1,
+      latestAssistantMessageId: 'msg-assistant-delta',
+      latestEventType: 'session.status',
+      streamConnected: true,
+    })
+  })
+
+  test('uses transcript reconcile after idle when OpenCode omits turn update events', async () => {
+    const stream = buildControlledSseResponse()
+    const urls: string[] = []
+    const observer = new OpenCodeTurnSettledObserver({
+      promptMessageIdFactory: () => 'msg_prompt_reconcile',
+      fetchImpl: async input => {
+        const url = String(input)
+        urls.push(url)
+        if (url.endsWith('/event')) {
+          return stream.response
+        }
+        if (url.endsWith('/session/session-1/message?limit=50')) {
+          return new Response(JSON.stringify([
+            {
+              info: { id: 'msg_prompt_reconcile', role: 'user', sessionID: 'session-1' },
+              parts: [{ type: 'text', text: 'Reply with exactly OK.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-reconcile',
+                role: 'assistant',
+                parentID: 'msg_prompt_reconcile',
+                sessionID: 'session-1',
+              },
+              parts: [
+                { type: 'step-start' },
+                { type: 'text', text: 'OK' },
+                { type: 'step-finish' },
+              ],
+            },
+          ]), {
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+    })
+
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096',
+      sessionId: 'session-1',
+      timeoutMs: 500,
+      idleTimeoutMs: 100,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
+
+    const summary = await observation.waitForSettled()
+
+    expect(urls).toContain('http://127.0.0.1:4096/session/session-1/message?limit=50')
+    expect(summary).toMatchObject({
+      outcome: 'success',
+      runtimePromptMessageId: 'msg_prompt_reconcile',
+      promptPersisted: true,
+      assistantActivityCount: 1,
+      latestAssistantMessageId: 'msg-assistant-reconcile',
+    })
+    expect(summary.diagnostics.join('\n')).toContain('ignored session.status idle')
+    expect(summary.diagnostics.join('\n')).toContain('transcript reconcile after session.status idle observed assistant activity')
+  })
+
+  test('does not use transcript reconcile success for an empty assistant shell', async () => {
+    const stream = buildControlledSseResponse()
+    const observer = new OpenCodeTurnSettledObserver({
+      promptMessageIdFactory: () => 'msg_prompt_empty_reconcile',
+      fetchImpl: async input => {
+        const url = String(input)
+        if (url.endsWith('/event')) {
+          return stream.response
+        }
+        if (url.endsWith('/session/session-1/message?limit=50')) {
+          return new Response(JSON.stringify([
+            {
+              info: { id: 'msg_prompt_empty_reconcile', role: 'user', sessionID: 'session-1' },
+              parts: [{ type: 'text', text: 'Reply with exactly OK.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-empty-reconcile',
+                role: 'assistant',
+                parentID: 'msg_prompt_empty_reconcile',
+                sessionID: 'session-1',
+              },
+              parts: [],
+            },
+          ]), {
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+    })
+
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096',
+      sessionId: 'session-1',
+      timeoutMs: 120,
+      idleTimeoutMs: 100,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
+
+    const summary = await observation.waitForSettled()
+
+    expect(summary.outcome).toBe('idle_without_assistant_activity')
+    expect(summary.promptPersisted).toBe(true)
+    expect(summary.assistantActivityCount).toBe(0)
+    expect(summary.latestAssistantMessageId).toBeNull()
+    expect(summary.diagnostics.join('\n')).toContain('found no assistant response for the current prompt')
+  })
+
+  test('does not use transcript reconcile success for a step-start-only assistant shell', async () => {
+    const stream = buildControlledSseResponse()
+    const observer = new OpenCodeTurnSettledObserver({
+      promptMessageIdFactory: () => 'msg_prompt_started_reconcile',
+      fetchImpl: async input => {
+        const url = String(input)
+        if (url.endsWith('/event')) {
+          return stream.response
+        }
+        if (url.endsWith('/session/session-1/message?limit=50')) {
+          return new Response(JSON.stringify([
+            {
+              info: { id: 'msg_prompt_started_reconcile', role: 'user', sessionID: 'session-1' },
+              parts: [{ type: 'text', text: 'Reply with exactly OK.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-started-reconcile',
+                role: 'assistant',
+                parentID: 'msg_prompt_started_reconcile',
+                sessionID: 'session-1',
+              },
+              parts: [{ type: 'step-start' }],
+            },
+          ]), {
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+    })
+
+    const observation = observer.observe({
+      baseUrl: 'http://127.0.0.1:4096',
+      sessionId: 'session-1',
+      timeoutMs: 120,
+      idleTimeoutMs: 100,
+    })
+    observation.markPromptSubmitting()
+    observation.markPromptAcceptedByEndpoint()
+    stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
+
+    const summary = await observation.waitForSettled()
+
+    expect(summary.outcome).toBe('idle_without_assistant_activity')
+    expect(summary.promptPersisted).toBe(true)
+    expect(summary.assistantActivityCount).toBe(0)
+    expect(summary.latestAssistantMessageId).toBeNull()
+    expect(summary.diagnostics.join('\n')).toContain('found no assistant response for the current prompt')
+  })
+
   test('falls back to global event stream when local endpoint is unavailable', async () => {
     const urls: string[] = []
     const observer = new OpenCodeTurnSettledObserver({
