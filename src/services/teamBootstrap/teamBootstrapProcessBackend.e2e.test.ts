@@ -110,6 +110,12 @@ const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
 const markerPath = process.env.FAKE_TEAMMATE_SPAWN_MARKER
 const mode = process.env.FAKE_TEAMMATE_MODE || 'success'
+const runtimeReadyDelayMs = Number(
+  process.env.FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS || '0',
+)
+const inboxReadyDelayMs = Number(
+  process.env.FAKE_TEAMMATE_INBOX_READY_DELAY_MS || '0',
+)
 
 async function writeEvent(type, detail, extra = {}) {
   if (!eventsPath) return
@@ -252,12 +258,31 @@ try {
     child.unref()
   }
 
+  if (mode === 'delay-runtime-ready' && runtimeReadyDelayMs > 0) {
+    await sleep(runtimeReadyDelayMs)
+  }
+
   await writeEvent('runtime_ready', 'headless flag accepted')
 
   const promptMessage = await waitForBootstrapPrompt()
   const bootstrapMirror = promptMessage.messageId
     ? { bootstrapMirrorId: String(promptMessage.messageId) }
     : {}
+
+  if (mode === 'skip-inbox-poller-ready') {
+    await writeEvent(
+      'bootstrap_prompt_observed',
+      'bootstrap prompt observed before inbox poller readiness',
+      bootstrapMirror,
+    )
+    await sleep(60_000)
+    process.exit(0)
+  }
+
+  if (mode === 'delay-inbox-poller-ready' && inboxReadyDelayMs > 0) {
+    await sleep(inboxReadyDelayMs)
+  }
+
   await writeEvent(
     'inbox_poller_ready',
     'initial poll observed bootstrap prompt',
@@ -349,6 +374,10 @@ beforeEach(() => {
     'FAKE_TEAMMATE_EXPECTED_PROMPT',
     'FAKE_TEAMMATE_MODE',
     'FAKE_TEAMMATE_SPAWN_MARKER',
+    'FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS',
+    'FAKE_TEAMMATE_INBOX_READY_DELAY_MS',
+    'CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS',
+    'CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS',
   ])
   originalCwdState = getCwdState()
   originalOriginalCwd = getOriginalCwd()
@@ -689,6 +718,140 @@ describe('supervised process teammate backend e2e', () => {
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
+  it('accepts slow runtime_ready when the process startup timeout is raised', async () => {
+    process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = '1000'
+    process.env.FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS = '120'
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'delay-runtime-ready',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'runtime_ready',
+      'inbox_poller_ready',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes.indexOf('runtime_ready')).toBeLessThan(
+      eventTypes.indexOf('mailbox_bootstrap_written'),
+    )
+    expect(eventTypes.indexOf('mailbox_bootstrap_written')).toBeLessThan(
+      eventTypes.indexOf('bootstrap_submitted'),
+    )
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('accepts slow inbox_poller_ready after verified mailbox bootstrap write', async () => {
+    process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = '1000'
+    process.env.FAKE_TEAMMATE_INBOX_READY_DELAY_MS = '150'
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'delay-inbox-poller-ready',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'mailbox_bootstrap_written',
+      'inbox_poller_ready',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes.indexOf('mailbox_bootstrap_written')).toBeLessThan(
+      eventTypes.indexOf('inbox_poller_ready'),
+    )
+    expect(eventTypes.indexOf('inbox_poller_ready')).toBeLessThan(
+      eventTypes.indexOf('bootstrap_submitted'),
+    )
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const inboxReady = events.find(event => event.type === 'inbox_poller_ready')
+    expect(inboxReady?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('fails clearly when mailbox bootstrap is written but inbox polling never becomes ready', async () => {
+    process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = '80'
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'skip-inbox-poller-ready',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('did not become inbox_poller_ready')
+    expect(thrown?.message).toContain('timed out waiting for inbox_poller_ready')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      ['runtime_ready', 'mailbox_bootstrap_written', 'failed'],
+      2_000,
+    )
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes).toContain('bootstrap_prompt_observed')
+    expect(eventTypes).not.toContain('inbox_poller_ready')
+    const failed = events.find(event => event.type === 'failed')
+    expect(failed?.detail).toContain('timed out waiting for inbox_poller_ready')
+  })
+
   it('surfaces immediate process crashes with stderr tail and failure event', async () => {
     const fixture = await createFixture({
       trusted: true,
@@ -901,6 +1064,9 @@ async function createFixture(options: {
     | 'hold-child'
     | 'stdin-sensitive'
     | 'member-name-confirmation'
+    | 'delay-runtime-ready'
+    | 'delay-inbox-poller-ready'
+    | 'skip-inbox-poller-ready'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'
