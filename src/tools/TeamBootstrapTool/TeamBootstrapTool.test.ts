@@ -60,11 +60,11 @@ describe('TeamBootstrapTool.validateInput', () => {
     expect(spec.members[0]?.model).toBeUndefined()
   })
 
-  test('accepts ten minute bootstrap timeout in hidden tool schema', () => {
+  test('accepts fifteen minute bootstrap timeout in hidden tool schema', () => {
     const parsed = TeamBootstrapTool.inputSchema.safeParse({
       mode: 'launch',
       team_name: 'atlas-hq',
-      bootstrap_timeout_ms: 600_000,
+      bootstrap_timeout_ms: 900_000,
       members: [{ name: 'alice' }],
     })
 

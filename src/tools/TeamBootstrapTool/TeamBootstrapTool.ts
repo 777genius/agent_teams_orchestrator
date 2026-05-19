@@ -16,7 +16,7 @@ import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstr
 import { TEAM_BOOTSTRAP_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
 
-const MAX_BOOTSTRAP_TIMEOUT_MS = 600_000
+const MAX_BOOTSTRAP_TIMEOUT_MS = 900_000
 const MAX_BOOTSTRAP_MEMBERS = 20
 
 const memberSchema = z.strictObject({

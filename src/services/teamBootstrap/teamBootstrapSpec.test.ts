@@ -743,7 +743,7 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toContain('member_briefing')
   })
 
-  test('readTeamBootstrapSpec accepts app bootstrap timeout up to ten minutes', async () => {
+  test('readTeamBootstrapSpec accepts app bootstrap timeout up to fifteen minutes', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })
 
@@ -765,14 +765,14 @@ describe('team bootstrap spec normalization', () => {
         lead: {},
         members: [{ name: 'alice' }],
         launch: {
-          bootstrapTimeoutMs: 600_000,
+          bootstrapTimeoutMs: 900_000,
         },
       } satisfies TeamBootstrapSpec),
       'utf8',
     )
 
     const request = await readTeamBootstrapSpec(specPath)
-    expect(request.bootstrapTimeoutMs).toBe(600_000)
+    expect(request.bootstrapTimeoutMs).toBe(900_000)
   })
 
   test('readTeamBootstrapSpec accepts hidden tool initiator values', async () => {
