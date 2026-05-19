@@ -52,6 +52,62 @@ describe('bootstrapProofValidation', () => {
     expect(result).toMatchObject({ ok: false, reason: 'missing_team' })
   })
 
+  test('rejects native app-managed proof from a previous bootstrap run', () => {
+    const result = validateBootstrapRuntimeProofEnvelopeDetailed({
+      event: {
+        type: 'bootstrap_confirmed',
+        timestamp: '2026-05-01T10:00:01.000Z',
+        teamName: expected.teamName,
+        source: 'native_app_managed_bootstrap_private_turn',
+        bootstrapProofToken: expected.proofToken,
+        runId: 'previous-bootstrap-run',
+        contextHash: expected.contextHash,
+        briefingHash: expected.briefingHash,
+      },
+      expected,
+    })
+
+    expect(result).toMatchObject({ ok: false, reason: 'run_id_mismatch' })
+  })
+
+  test('rejects native app-managed proof older than the current launch boundary', () => {
+    const result = validateBootstrapRuntimeProofEnvelopeDetailed({
+      event: {
+        type: 'bootstrap_confirmed',
+        timestamp: '2026-05-01T09:59:59.999Z',
+        teamName: expected.teamName,
+        source: 'native_app_managed_bootstrap_private_turn',
+        bootstrapProofToken: expected.proofToken,
+        runId: expected.runId,
+        contextHash: expected.contextHash,
+        briefingHash: expected.briefingHash,
+      },
+      expected,
+    })
+
+    expect(result).toMatchObject({ ok: false, reason: 'stale_timestamp' })
+  })
+
+  test('accepts native app-managed proof metadata from JSON detail', () => {
+    expect(
+      validateBootstrapRuntimeProofEnvelope({
+        event: {
+          type: 'bootstrap_confirmed',
+          timestamp: '2026-05-01T10:00:01.000Z',
+          teamName: expected.teamName,
+          detail: JSON.stringify({
+            source: 'native_app_managed_bootstrap_private_turn',
+            bootstrapProofToken: expected.proofToken,
+            runId: expected.runId,
+            contextHash: expected.contextHash,
+            briefingHash: expected.briefingHash,
+          }),
+        },
+        expected,
+      }),
+    ).toBe(true)
+  })
+
   test('keeps legacy member_briefing proof compatible with missing teamName', () => {
     expect(
       validateBootstrapRuntimeProofEnvelope({

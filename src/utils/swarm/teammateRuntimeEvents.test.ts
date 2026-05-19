@@ -252,6 +252,103 @@ describe('teammateRuntimeEvents helpers', () => {
     }
   })
 
+  it('ignores stale submitted and failed events before the launch start time', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-4',
+      detail: 'old submit from previous launch',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'failed',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      detail: 'old runtime failure from previous launch',
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const sinceMs = Date.now()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await writeTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-4',
+      detail: 'messageId=bootstrap-atlas-4',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-4',
+      sinceMs,
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+    if (result.type === 'timeout') {
+      expect(result.lastStage?.type).toBe('mailbox_bootstrap_written')
+      expect(result.reason).toContain(
+        'last transport stage: mailbox_bootstrap_written: messageId=bootstrap-atlas-4',
+      )
+    }
+  })
+
+  it('ignores same-mirror submit proof from a different bootstrap run', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-atlas-5',
+      detail: 'messageId=bootstrap-atlas-5',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-old',
+      bootstrapMirrorId: 'bootstrap-atlas-5',
+      detail: 'submit proof from previous launch run',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-atlas-5',
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+    if (result.type === 'timeout') {
+      expect(result.lastStage?.type).toBe('mailbox_bootstrap_written')
+      expect(result.reason).toContain(
+        'last transport stage: mailbox_bootstrap_written: messageId=bootstrap-atlas-5',
+      )
+    }
+  })
+
   it('uses same-mirror submit attempt as timeout stage while ignoring wrong-mirror submit success', async () => {
     const eventsPath = await createRuntimeLogPath()
     await writeTeammateRuntimeEvent({
