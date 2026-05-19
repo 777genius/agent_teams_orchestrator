@@ -9,7 +9,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import {
   getCwdState,
@@ -308,6 +308,18 @@ try {
     await sleep(750)
     process.exit(44)
   }
+  if (mode === 'stale-submit-wrong-run-after-inbox-ready') {
+    await writeEvent(
+      'bootstrap_submitted',
+      'stale submit proof from previous launch run',
+      {
+        ...bootstrapMirror,
+        bootstrapRunId: 'previous-bootstrap-run',
+      },
+    )
+    await sleep(60_000)
+    process.exit(0)
+  }
   if (mode === 'submit-rejected-terminal') {
     await writeEvent(
       'bootstrap_submit_rejected',
@@ -572,6 +584,66 @@ describe('supervised process teammate backend e2e', () => {
       await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)
       runtimePids = runtimePids.filter(pid => pid !== alice.runtimePid)
     }
+  })
+
+  it('clears stale runtime events before starting a reused process teammate', async () => {
+    const fixture = await createFixture({ trusted: true })
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await mkdir(dirname(runtimePaths.eventsPath), { recursive: true })
+    await writeFile(
+      runtimePaths.eventsPath,
+      [
+        JSON.stringify({
+          version: 1,
+          type: 'bootstrap_submitted',
+          timestamp: '2026-05-01T10:00:00.000Z',
+          pid: 1111,
+          teamName: fixture.teamName,
+          agentName: 'alice',
+          bootstrapMirrorId: 'stale-bootstrap-message',
+          detail: 'stale submit before current process spawn',
+        }),
+        JSON.stringify({
+          version: 1,
+          type: 'failed',
+          timestamp: '2026-05-01T10:00:01.000Z',
+          pid: 1111,
+          teamName: fixture.teamName,
+          agentName: 'alice',
+          detail: 'stale failure before current process spawn',
+        }),
+      ].join('\n') + '\n',
+    )
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'process_spawned',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    expect(events[0]?.type).toBe('process_spawned')
+    expect(
+      events.some(event => String(event.detail ?? '').includes('stale')),
+    ).toBe(false)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
   it('fails before spawn when workspace trust is missing', async () => {
@@ -965,6 +1037,54 @@ describe('supervised process teammate backend e2e', () => {
     )
   })
 
+  it('does not accept bootstrap_submitted evidence from a previous bootstrap run', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'stale-submit-wrong-run-after-inbox-ready',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+          bootstrapTimeoutMs: 1_600,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('did not submit bootstrap prompt')
+    expect(thrown?.message).toContain('timed out waiting for bootstrap_submitted')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      [
+        'inbox_poller_ready',
+        'bootstrap_submit_attempted',
+        'bootstrap_submitted',
+        'failed',
+      ],
+      3_000,
+    )
+    const staleSubmitted = events.find(
+      event => event.type === 'bootstrap_submitted',
+    )
+    expect(staleSubmitted?.bootstrapRunId).toBe('previous-bootstrap-run')
+    expect(events.find(event => event.type === 'failed')?.detail).toContain(
+      'last transport stage: bootstrap_submit_attempted',
+    )
+  })
+
   it('fails clearly when the runtime exits after submit attempt before durable bootstrap submission', async () => {
     const fixture = await createFixture({
       trusted: true,
@@ -1230,6 +1350,7 @@ async function createFixture(options: {
     | 'exit-after-mailbox-before-inbox-ready'
     | 'skip-bootstrap-submit-after-inbox-ready'
     | 'exit-after-bootstrap-submit-attempt'
+    | 'stale-submit-wrong-run-after-inbox-ready'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'
