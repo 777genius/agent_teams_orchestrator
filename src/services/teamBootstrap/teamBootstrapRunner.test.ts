@@ -344,6 +344,132 @@ describe('team bootstrap readiness contract', () => {
     expect(capturedBootstrapTimeoutMs).toBeLessThanOrEqual(50)
   })
 
+  test('retries a transient pre-runtime-ready process startup failure once', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-retry-'))
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    const teamName = `team-${Date.now()}`
+    const agentId = `alice@${teamName}`
+    const runtimePid = 1234
+    const proofToken = 'proof-token'
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName,
+      agentName: 'alice',
+    })
+    let spawnCalls = 0
+
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath: runtimePaths.eventsPath,
+      pid: runtimePid,
+      teamName,
+      agentName: 'alice',
+      agentId,
+      source: 'member_briefing_tool_success',
+      bootstrapProofToken: proofToken,
+    })
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            {
+              name: 'alice',
+              agentId,
+              bootstrapExpectedAfter: '2026-04-29T00:00:00.000Z',
+              bootstrapProofToken: proofToken,
+              bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+              backendType: 'process',
+              runtimePid,
+            },
+          ],
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async () => {
+        spawnCalls += 1
+        if (spawnCalls === 1) {
+          throw new Error(
+            `Teammate process ${agentId} did not become runtime_ready: teammate process exited before runtime_ready`,
+          )
+        }
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name: 'alice',
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: `process:${runtimePid}`,
+            backend_type: 'process',
+            runtime_pid: runtimePid,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    const result = await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId: 'run-retry-1',
+        requestHash: 'hash-retry-1',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+            provider: 'anthropic',
+          },
+        ],
+        bootstrapTimeoutMs: 30_000,
+        continueOnPartialFailure: false,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    expect(spawnCalls).toBe(2)
+    expect(result.ok).toBe(true)
+  })
+
   test('registered teammate without bootstrap confirmation fails instead of completed', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-ready-'))
     tempDirs.push(tempDir)

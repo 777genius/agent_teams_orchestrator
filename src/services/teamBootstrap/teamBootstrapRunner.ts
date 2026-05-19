@@ -58,6 +58,13 @@ export type TeamBootstrapRunnerDeps = {
   teamCreateCall: TeamCreateCall
 }
 
+type SpawnTeammateInput = Parameters<TeamBootstrapRunnerDeps['spawnTeammate']>[0]
+type SpawnTeammateResult = Awaited<ReturnType<TeamBootstrapRunnerDeps['spawnTeammate']>>
+
+const TRANSIENT_STARTUP_RETRY_LIMIT = 1
+const TRANSIENT_STARTUP_RETRY_DELAY_MS = 2_000
+const TRANSIENT_STARTUP_RETRY_MIN_REMAINING_BUDGET_MS = 15_000
+
 let testDeps: Partial<TeamBootstrapRunnerDeps> | null = null
 
 export function __setTeamBootstrapRunnerDepsForTests(
@@ -77,6 +84,51 @@ function getTeamBootstrapRunnerDeps(): TeamBootstrapRunnerDeps {
       testDeps?.teamCreateCall
       ?? ((input, context) =>
         (TeamCreateTool.call as unknown as TeamCreateCall)(input, context)),
+  }
+}
+
+function isRetryableTransientStartupFailure(error: unknown): boolean {
+  const message = errorMessage(error)
+  return (
+    message.includes('did not become runtime_ready: teammate process exited before runtime_ready') ||
+    message.includes('did not become runtime_ready: timed out waiting for runtime_ready')
+  )
+}
+
+async function spawnTeammateWithTransientStartupRetry(params: {
+  deps: TeamBootstrapRunnerDeps
+  context: ToolUseContext
+  teamName: string
+  memberName: string
+  buildInput: () => SpawnTeammateInput
+  remainingBudgetMs: () => number
+}): Promise<SpawnTeammateResult> {
+  let attempt = 0
+
+  while (true) {
+    try {
+      return await params.deps.spawnTeammate(params.buildInput(), params.context)
+    } catch (error) {
+      const remainingMs = params.remainingBudgetMs()
+      if (
+        attempt >= TRANSIENT_STARTUP_RETRY_LIMIT ||
+        remainingMs <= TRANSIENT_STARTUP_RETRY_MIN_REMAINING_BUDGET_MS ||
+        !isRetryableTransientStartupFailure(error)
+      ) {
+        throw error
+      }
+
+      attempt += 1
+      const delayMs = Math.min(
+        TRANSIENT_STARTUP_RETRY_DELAY_MS,
+        Math.max(1, remainingMs - TRANSIENT_STARTUP_RETRY_MIN_REMAINING_BUDGET_MS),
+      )
+      logForDebugging(
+        `[team-bootstrap] retrying transient startup failure for teammate "${params.memberName}" in team "${params.teamName}" after ${delayMs}ms: ${errorMessage(error)}`,
+        { level: 'warn' },
+      )
+      await sleep(delayMs)
+    }
   }
 }
 
@@ -726,8 +778,13 @@ export async function runTeamBootstrap(params: {
           try {
             assertPrimaryBootstrapProviderSupported(member)
             const model = normalizeBootstrapModelSelection(member.model)
-            const result = await deps.spawnTeammate(
-              {
+            const result = await spawnTeammateWithTransientStartupRetry({
+              deps,
+              context: params.context,
+              teamName: params.request.teamName,
+              memberName: member.displayName,
+              remainingBudgetMs: getRemainingBootstrapBudgetMs,
+              buildInput: () => ({
                 name: member.displayName,
                 prompt: member.prompt,
                 team_name: params.request.teamName,
@@ -758,9 +815,8 @@ export async function runTeamBootstrap(params: {
                 ...(member.planModeRequired
                   ? { plan_mode_required: member.planModeRequired }
                   : {}),
-              },
-              params.context,
-            )
+              }),
+            })
 
             const duplicate = result.data as Partial<DuplicateSkippedOutput>
             if (duplicate.status === 'duplicate_skipped') {
