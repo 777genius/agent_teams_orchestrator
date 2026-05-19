@@ -279,6 +279,11 @@ try {
     process.exit(0)
   }
 
+  if (mode === 'exit-after-mailbox-before-inbox-ready') {
+    console.error('fatal fake exit after mailbox bootstrap write')
+    process.exit(43)
+  }
+
   if (mode === 'delay-inbox-poller-ready' && inboxReadyDelayMs > 0) {
     await sleep(inboxReadyDelayMs)
   }
@@ -297,6 +302,11 @@ try {
   if (mode === 'skip-bootstrap-submit-after-inbox-ready') {
     await sleep(60_000)
     process.exit(0)
+  }
+  if (mode === 'exit-after-bootstrap-submit-attempt') {
+    console.error('fatal fake exit after bootstrap submit attempt')
+    await sleep(750)
+    process.exit(44)
   }
   if (mode === 'submit-rejected-terminal') {
     await writeEvent(
@@ -856,6 +866,50 @@ describe('supervised process teammate backend e2e', () => {
     expect(failed?.detail).toContain('timed out waiting for inbox_poller_ready')
   })
 
+  it('fails clearly when the runtime exits after mailbox bootstrap write before inbox polling readiness', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'exit-after-mailbox-before-inbox-ready',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('did not become inbox_poller_ready')
+    expect(thrown?.message).toContain('teammate process exited before inbox_poller_ready')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await waitForFileText(
+      runtimePaths.stderrPath,
+      'fatal fake exit after mailbox bootstrap write',
+    )
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      ['runtime_ready', 'mailbox_bootstrap_written', 'failed'],
+      2_000,
+    )
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes).not.toContain('inbox_poller_ready')
+    expect(events.find(event => event.type === 'failed')?.detail).toContain(
+      'teammate process exited before inbox_poller_ready',
+    )
+  })
+
   it('fails clearly when inbox polling starts but durable bootstrap submission never appears', async () => {
     const fixture = await createFixture({
       trusted: true,
@@ -908,6 +962,53 @@ describe('supervised process teammate backend e2e', () => {
     expect(attempted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
     expect(events.find(event => event.type === 'failed')?.detail).toContain(
       'last transport stage: bootstrap_submit_attempted',
+    )
+  })
+
+  it('fails clearly when the runtime exits after submit attempt before durable bootstrap submission', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'exit-after-bootstrap-submit-attempt',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+          bootstrapTimeoutMs: 2_000,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('did not submit bootstrap prompt')
+    expect(thrown?.message).toContain('teammate process exited before bootstrap_submitted')
+    expect(thrown?.message).toContain('fatal fake exit after bootstrap submit attempt')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      [
+        'mailbox_bootstrap_written',
+        'inbox_poller_ready',
+        'bootstrap_submit_attempted',
+        'failed',
+      ],
+      3_000,
+    )
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes).not.toContain('bootstrap_submitted')
+    expect(events.find(event => event.type === 'failed')?.detail).toContain(
+      'teammate process exited before bootstrap_submitted',
     )
   })
 
@@ -1126,7 +1227,9 @@ async function createFixture(options: {
     | 'delay-runtime-ready'
     | 'delay-inbox-poller-ready'
     | 'skip-inbox-poller-ready'
+    | 'exit-after-mailbox-before-inbox-ready'
     | 'skip-bootstrap-submit-after-inbox-ready'
+    | 'exit-after-bootstrap-submit-attempt'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'

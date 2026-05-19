@@ -300,6 +300,52 @@ describe('teammateRuntimeEvents helpers', () => {
     }
   })
 
+  it('returns terminal failure with last relevant stage when process exits after submit attempt', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-3',
+      detail: 'messageId=bootstrap-atlas-3',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submit_attempted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-3',
+      detail: 'submitting bootstrap prompt',
+    })
+    let aliveChecks = 0
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 1_000,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-3',
+      isStillAlive: () => {
+        aliveChecks += 1
+        return aliveChecks === 1
+      },
+    })
+
+    expect(result).toMatchObject({
+      type: 'terminal_failure',
+      reason: 'teammate process exited before bootstrap_submitted',
+      event: {
+        type: 'bootstrap_submit_attempted',
+        bootstrapMirrorId: 'bootstrap-atlas-3',
+      },
+    })
+  })
+
   it('does not extend indefinitely for stale retryable submit rejection', async () => {
     const eventsPath = await createRuntimeLogPath()
     await writeTeammateRuntimeEvent({
