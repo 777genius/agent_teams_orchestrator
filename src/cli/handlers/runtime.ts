@@ -39,6 +39,8 @@ import type {
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { readFile, writeFile } from 'node:fs/promises'
 
+const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
+
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 
@@ -628,6 +630,7 @@ export async function runtimeTranscript(opts: {
 export async function runtimeOpenCodeCommand(opts: {
   input: string
   json?: boolean
+  output?: string
 }): Promise<void> {
   let signalCleanupPromise: Promise<void> | null = null
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
@@ -649,19 +652,38 @@ export async function runtimeOpenCodeCommand(opts: {
   process.once('SIGINT', onSigint)
 
   try {
+    logOpenCodeCommandDebug('read-input:start')
     const raw = await readFile(opts.input, 'utf8')
+    logOpenCodeCommandDebug('execute:start')
     const envelope = JSON.parse(raw) as unknown
     const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    logOpenCodeCommandDebug('execute:done')
     if (signalCleanupPromise) {
       await signalCleanupPromise
       return
     }
-    await writeStdoutAndDrain(jsonStringify(result) + '\n')
+    const payload = jsonStringify(result) + '\n'
+    if (opts.output?.trim()) {
+      logOpenCodeCommandDebug('write-output:start')
+      await writeFile(opts.output.trim(), payload, 'utf8')
+      logOpenCodeCommandDebug('write-output:done')
+    } else {
+      logOpenCodeCommandDebug('write-stdout:start')
+      await writeStdoutAndDrain(payload)
+      logOpenCodeCommandDebug('write-stdout:done')
+    }
   } finally {
     process.off('SIGTERM', onSigterm)
     process.off('SIGINT', onSigint)
   }
   process.exit(0)
+}
+
+function logOpenCodeCommandDebug(stage: string): void {
+  if (process.env.CLAUDE_MULTIMODEL_DEBUG_OPENCODE_COMMAND !== '1') {
+    return
+  }
+  process.stderr.write(`[opencode-command] ${stage}\n`)
 }
 
 export async function runtimeOpenCodeLedgerBackfill(opts: {
@@ -707,13 +729,34 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
 
 function writeStdoutAndDrain(payload: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    process.stdout.write(payload, error => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      process.stdout.off('drain', onDrain)
+    }
+    const finish = (error?: Error | null) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
       if (error) {
         reject(error)
         return
       }
       resolve()
+    }
+    const onDrain = () => finish()
+    timer = setTimeout(() => finish(), STDOUT_DRAIN_FALLBACK_TIMEOUT_MS)
+    timer.unref?.()
+    process.stdout.write(payload, error => {
+      finish(error)
     })
+    process.stdout.once('drain', onDrain)
   })
 }
 

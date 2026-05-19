@@ -1333,6 +1333,35 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.evidence.observedMcpTools).not.toContain('message_send')
   })
 
+  test('direct MCP proof keeps readiness bounded when MCP client close hangs', async () => {
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
+    ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: requiredMockMcpTools(),
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () =>
+      new Promise<void>(() => {})
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+
+    const startedAt = Date.now()
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'minimax-m2.5-free',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000)
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('ready')
+    expect(result.data.launchAllowed).toBe(true)
+    expect(result.data.requiredToolsPresent).toBe(true)
+  })
+
   test('direct MCP proof does not accept proxy-prefixed plain message_send as Agent Teams proof', async () => {
     ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {}
     ;(Client.prototype.listTools as unknown as (...args: unknown[]) => Promise<{ tools: Array<{ name: string }> }>) =

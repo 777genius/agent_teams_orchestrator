@@ -1155,6 +1155,7 @@ type AppMcpToolProof = {
 // machines. Keep this below the outer readiness timeout but avoid false launch
 // failures before OpenCode ever gets a chance to attach Agent Teams tools.
 const APP_MCP_PREFLIGHT_TIMEOUT_MS = 45_000
+const APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS = 2_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 1
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_TTL_MS = 10 * 60_000
@@ -1448,7 +1449,7 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
       } catch (error) {
         lastError = error
       } finally {
-        await client.close().catch(() => undefined)
+        await closeMcpClient(client)
       }
     }
 
@@ -1484,7 +1485,7 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
       .map(tool => tool.name)
       .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
   } finally {
-    await client.close().catch(() => undefined)
+    await closeMcpClient(client)
   }
 }
 
@@ -1499,6 +1500,10 @@ function buildMcpPreflightEnv(extra?: Record<string, string>): Record<string, st
     ...env,
     ...(extra ?? {}),
   }
+}
+
+async function closeMcpClient(client: Client): Promise<void> {
+  await withTimeout(client.close(), APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS).catch(() => undefined)
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

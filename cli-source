@@ -85,4 +85,8 @@ EOF
   done
 fi
 
+if [[ "${1-}" == "runtime" && "${2-}" == "opencode-command" ]]; then
+  exec "$BUN_BIN" "$SCRIPT_DIR/src/entrypoints/opencodeCommand.ts" "${@:3}"
+fi
+
 exec "$BUN_BIN" run "$TARGET" "$@"
