@@ -449,6 +449,17 @@ export async function getUnifiedRuntimeStatusPayload(
       availableBackends: codex.availableBackends,
       externalRuntimeDiagnostics: [detectExternalBinary('codex', 'Codex CLI')],
       models: getCodexModels(),
+      runtimeCapabilities: {
+        modelCatalog: {
+          dynamic: true,
+          source: 'runtime',
+        },
+        reasoningEffort: {
+          supported: true,
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          configPassthrough: true,
+        },
+      },
       backend: codex.backend,
     }
   }

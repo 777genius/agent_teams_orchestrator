@@ -110,6 +110,17 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(codex?.capabilities.extensions.mcp.ownership).toBe('shared')
       expect(codex?.capabilities.extensions.plugins.status).toBe('unsupported')
       expect(codex?.capabilities.extensions.plugins.reason).toContain('codex-native')
+      expect(codex?.runtimeCapabilities).toEqual({
+        modelCatalog: {
+          dynamic: true,
+          source: 'runtime',
+        },
+        reasoningEffort: {
+          supported: true,
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          configPassthrough: true,
+        },
+      })
       expect(codex?.backend).toMatchObject({
         kind: 'codex-native',
         label: 'Codex native',

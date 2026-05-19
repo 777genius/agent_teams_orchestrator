@@ -76,6 +76,29 @@ describe('buildCodexNativeExecArgs', () => {
       'Inspect the repo and summarize it.',
     ])
   })
+
+  test('passes Codex xhigh reasoning through model_reasoning_effort config', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        model: 'gpt-5.4',
+        reasoningEffort: 'xhigh',
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-m',
+      'gpt-5.4',
+      '-c',
+      'model_reasoning_effort="xhigh"',
+      'Reply only with OK',
+    ])
+  })
 })
 
 describe('runCodexNativeExec', () => {
