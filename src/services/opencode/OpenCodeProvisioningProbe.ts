@@ -29,6 +29,10 @@ type CacheEntry = {
   snapshot: OpenCodeProvisioningSnapshot
 }
 
+type OpenCodeProvisioningProbeOptions = {
+  disposeHostOnRelease?: boolean
+}
+
 type RetainedProvisioningProbe = {
   snapshot: OpenCodeProvisioningSnapshot
   release: () => Promise<void>
@@ -62,10 +66,14 @@ export class OpenCodeProvisioningProbe {
 
   constructor(private readonly deps: OpenCodeProvisioningProbeDeps = {}) {}
 
-  async probe(projectPath?: string | null): Promise<OpenCodeProvisioningSnapshot> {
+  async probe(
+    projectPath?: string | null,
+    options: OpenCodeProvisioningProbeOptions = {},
+  ): Promise<OpenCodeProvisioningSnapshot> {
     const result = await this.probeWithHost(projectPath, {
       retainHost: false,
       useCache: true,
+      disposeHostOnRelease: options.disposeHostOnRelease,
     })
     return result.snapshot
   }
@@ -79,7 +87,7 @@ export class OpenCodeProvisioningProbe {
 
   private async probeWithHost(
     projectPath: string | null | undefined,
-    options: { retainHost: boolean; useCache: boolean },
+    options: { retainHost: boolean; useCache: boolean; disposeHostOnRelease?: boolean },
   ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await inventoryService.probe(projectPath)
@@ -139,7 +147,9 @@ export class OpenCodeProvisioningProbe {
       }
       released = true
       await hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
-      await hostManager.releaseHost(host.hostKey)
+      if (options.disposeHostOnRelease !== false) {
+        await hostManager.releaseHost(host.hostKey)
+      }
     }
     try {
       host = await hostManager.ensureHost({

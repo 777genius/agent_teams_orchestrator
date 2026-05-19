@@ -50,6 +50,14 @@ type PersistentProbeCachePaths = {
   lockDirPath: string
 }
 
+type ProbeModelParams = {
+  selectedModel: string
+  projectPath?: string | null
+  prompt?: string
+  expectedOutput?: string
+  disposeHostOnRelease?: boolean
+}
+
 function parseProviderScopedModel(selectedModel: string): {
   providerID: string
   modelID: string
@@ -203,12 +211,7 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
   return null
 }
 
-function buildProbeCacheKey(params: {
-  selectedModel: string
-  projectPath?: string | null
-  prompt?: string
-  expectedOutput?: string
-}): string {
+function buildProbeCacheKey(params: ProbeModelParams): string {
   return [
     params.projectPath?.trim() || '<default-project>',
     params.selectedModel.trim(),
@@ -360,12 +363,7 @@ export class OpenCodeExecutionProbe {
     return this.deps.persistentCache ?? (this.deps.clientFactory == null)
   }
 
-  async probeModel(params: {
-    selectedModel: string
-    projectPath?: string | null
-    prompt?: string
-    expectedOutput?: string
-  }): Promise<OpenCodeExecutionProbeResult> {
+  async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const cacheKey = buildProbeCacheKey(params)
     const cached = this.probeCache.get(cacheKey)
     if (cached && cached.expiresAtMs > nowMs()) {
@@ -401,11 +399,7 @@ export class OpenCodeExecutionProbe {
     return cloneProbeResult(await request)
   }
 
-  private async runProbeModel(params: {
-    selectedModel: string
-    projectPath?: string | null
-    prompt?: string
-    expectedOutput?: string
+  private async runProbeModel(params: ProbeModelParams & {
     cacheKey?: string
   }): Promise<OpenCodeExecutionProbeResult> {
     const startedAtMs = nowMs()
@@ -534,7 +528,9 @@ export class OpenCodeExecutionProbe {
       })
     } finally {
       await this.hostManager.releaseHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
-      await this.hostManager.releaseHost(host.hostKey)
+      if (params.disposeHostOnRelease !== false) {
+        await this.hostManager.releaseHost(host.hostKey)
+      }
     }
   }
 
