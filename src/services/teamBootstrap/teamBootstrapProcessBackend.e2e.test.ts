@@ -294,6 +294,10 @@ try {
     'submitting bootstrap prompt',
     bootstrapMirror,
   )
+  if (mode === 'skip-bootstrap-submit-after-inbox-ready') {
+    await sleep(60_000)
+    process.exit(0)
+  }
   if (mode === 'submit-rejected-terminal') {
     await writeEvent(
       'bootstrap_submit_rejected',
@@ -852,6 +856,61 @@ describe('supervised process teammate backend e2e', () => {
     expect(failed?.detail).toContain('timed out waiting for inbox_poller_ready')
   })
 
+  it('fails clearly when inbox polling starts but durable bootstrap submission never appears', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'skip-bootstrap-submit-after-inbox-ready',
+    })
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+          bootstrapTimeoutMs: 1_600,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('did not submit bootstrap prompt')
+    expect(thrown?.message).toContain('timed out waiting for bootstrap_submitted')
+    expect(thrown?.message).toContain('last transport stage: bootstrap_submit_attempted')
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      [
+        'mailbox_bootstrap_written',
+        'inbox_poller_ready',
+        'bootstrap_prompt_observed',
+        'bootstrap_submit_attempted',
+        'failed',
+      ],
+      3_000,
+    )
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes).not.toContain('bootstrap_submitted')
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const attempted = events.find(
+      event => event.type === 'bootstrap_submit_attempted',
+    )
+    expect(attempted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+    expect(events.find(event => event.type === 'failed')?.detail).toContain(
+      'last transport stage: bootstrap_submit_attempted',
+    )
+  })
+
   it('surfaces immediate process crashes with stderr tail and failure event', async () => {
     const fixture = await createFixture({
       trusted: true,
@@ -1067,6 +1126,7 @@ async function createFixture(options: {
     | 'delay-runtime-ready'
     | 'delay-inbox-poller-ready'
     | 'skip-inbox-poller-ready'
+    | 'skip-bootstrap-submit-after-inbox-ready'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'
