@@ -58,6 +58,7 @@ describe('OpenCodeExecutionProbe', () => {
     let sendMessageCount = 0
     const retainedLeaseTeamIds: string[] = []
     const releasedLeaseTeamIds: string[] = []
+    let releaseHostCount = 0
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -74,7 +75,9 @@ describe('OpenCodeExecutionProbe', () => {
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
         },
-        releaseHost: async () => {},
+        releaseHost: async () => {
+          releaseHostCount += 1
+        },
       },
       clientFactory: {
         create: () => ({
@@ -146,6 +149,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(sendMessageCount).toBe(0)
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releaseHostCount).toBe(1)
     expect(ensureHostInput).toEqual({
       projectPath: '/tmp/project',
       profileOptions: {
@@ -158,6 +162,159 @@ describe('OpenCodeExecutionProbe', () => {
         ],
       },
     })
+  })
+
+  test('can release execution probe lease without disposing the live host', async () => {
+    const retainedLeaseTeamIds: string[] = []
+    const releasedLeaseTeamIds: string[] = []
+    let releaseHostCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHost: async () => {
+          releaseHostCount += 1
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                parentID: 'msg-user-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      disposeHostOnRelease: false,
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releaseHostCount).toBe(0)
+  })
+
+  test('still releases execution probe lease without disposing the live host when setup fails', async () => {
+    const retainedLeaseTeamIds: string[] = []
+    const releasedLeaseTeamIds: string[] = []
+    let releaseHostCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        retainHostLease: async (_hostKey, input) => {
+          retainedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeaseTeamIds.push(input.teamId)
+        },
+        releaseHost: async () => {
+          releaseHostCount += 1
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            throw new Error('create session failed')
+          },
+          getSession: async () => {
+            throw new Error('not used')
+          },
+          getSessionStatus: async () => {
+            throw new Error('not used')
+          },
+          getSessionMessages: async () => {
+            throw new Error('not used')
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => {
+            throw new Error('not used')
+          },
+          promptSessionAsync: async () => {
+            throw new Error('not used')
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      disposeHostOnRelease: false,
+    })).rejects.toThrow('create session failed')
+
+    expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
+    expect(releaseHostCount).toBe(0)
   })
 
   test('marks model auth as invalid when OpenCode returns a token refresh failure', async () => {

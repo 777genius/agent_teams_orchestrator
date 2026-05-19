@@ -1922,7 +1922,14 @@ function getSelectedModelProviderConnectionFailure(
 }
 
 async function runReadiness(envelope: BridgeEnvelope) {
-  const snapshot = await openCodeProvisioningProbe.probe(asString(envelope.body.projectPath) ?? envelope.cwd)
+  // Windows packaged bridge processes can lose stdout if they dispose the
+  // just-used OpenCode host before the response is flushed. Release only the
+  // short preflight lease there; cleanupHosts handles stale persistent hosts.
+  const disposeReadinessHostOnRelease = process.platform !== 'win32'
+  const snapshot = await openCodeProvisioningProbe.probe(
+    asString(envelope.body.projectPath) ?? envelope.cwd,
+    { disposeHostOnRelease: disposeReadinessHostOnRelease },
+  )
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   let executionModel: string | null = null
@@ -1995,6 +2002,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
     executionOutcomePromise = openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: snapshot.projectPath,
+      disposeHostOnRelease: disposeReadinessHostOnRelease,
     }).catch(error =>
       buildOpenCodeExecutionOutcome(
         executionModel,

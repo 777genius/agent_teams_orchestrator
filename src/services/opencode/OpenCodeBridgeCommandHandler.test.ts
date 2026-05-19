@@ -1213,8 +1213,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
     let probedModelId: string | null = null
+    let probedDisposeHostOnRelease: boolean | undefined
     openCodeExecutionProbe.probeModel = (async input => {
       probedModelId = input.selectedModel
+      probedDisposeHostOnRelease = input.disposeHostOnRelease
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -1246,6 +1248,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('openrouter/minimax-m2.5-free')
+    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
   })
