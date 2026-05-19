@@ -246,6 +246,7 @@ describe('team bootstrap readiness contract', () => {
       generatedAt: '2026-05-01T19:56:38.000Z',
     }
     let capturedNativeContextHash: string | undefined
+    let capturedBootstrapTimeoutMs: number | undefined
 
     __setTeamBootstrapRunnerDepsForTests({
       readTeamFileAsync: async () =>
@@ -263,6 +264,7 @@ describe('team bootstrap readiness contract', () => {
       spawnTeammate: async input => {
         capturedNativeContextHash =
           input.nativeAppManagedBootstrap?.contextHash
+        capturedBootstrapTimeoutMs = input.bootstrapTimeoutMs
         return {
           data: {
             teammate_id: agentId,
@@ -338,6 +340,8 @@ describe('team bootstrap readiness contract', () => {
     })
 
     expect(capturedNativeContextHash).toBe(nativeAppManagedBootstrap.contextHash)
+    expect(capturedBootstrapTimeoutMs).toBeGreaterThan(0)
+    expect(capturedBootstrapTimeoutMs).toBeLessThanOrEqual(50)
   })
 
   test('registered teammate without bootstrap confirmation fails instead of completed', async () => {

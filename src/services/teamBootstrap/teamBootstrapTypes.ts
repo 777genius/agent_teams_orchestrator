@@ -44,6 +44,9 @@ export type TeamBootstrapSpec = {
     useSplitPane?: boolean
     planModeRequired?: boolean
     description?: string
+    mcpConfigPath?: string
+    mcpSettingSources?: string
+    strictMcpConfig?: boolean
     nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
   }>
   launch?: {
@@ -97,6 +100,9 @@ export type NormalizedBootstrapMember = {
   useSplitPane?: boolean
   planModeRequired?: boolean
   description?: string
+  mcpConfigPath?: string
+  mcpSettingSources?: string
+  strictMcpConfig?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
 }
 

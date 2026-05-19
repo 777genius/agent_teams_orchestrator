@@ -326,6 +326,18 @@ const BOOTSTRAP_TRANSPORT_STAGE_RANK: Partial<
   exited: 910,
 }
 
+const BOOTSTRAP_MIRROR_SCOPED_EVENT_TYPES = new Set<TeammateRuntimeEventType>([
+  'mailbox_bootstrap_written',
+  'bootstrap_prompt_observed',
+  'bootstrap_submit_attempted',
+  'bootstrap_submit_deferred',
+  'bootstrap_submit_rejected',
+  'bootstrap_submit_accepted_without_uuid',
+  'bootstrap_submitted',
+  'bootstrap_context_loaded',
+  'bootstrap_confirmed',
+])
+
 function matchesBootstrapSubmissionIdentity(
   event: TeammateRuntimeEvent,
   expected: {
@@ -361,7 +373,7 @@ function matchesBootstrapSubmissionIdentity(
   }
   if (
     expected.bootstrapMirrorId &&
-    event.bootstrapMirrorId &&
+    BOOTSTRAP_MIRROR_SCOPED_EVENT_TYPES.has(event.type) &&
     event.bootstrapMirrorId !== expected.bootstrapMirrorId
   ) {
     return false

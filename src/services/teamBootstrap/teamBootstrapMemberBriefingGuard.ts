@@ -194,7 +194,7 @@ export function getActiveBootstrapMemberBriefingContext(params: {
   return {
     teamName,
     memberName,
-    bootstrapMirrorId: bootstrapMirror.id,
+    bootstrapMirrorId: bootstrapMirror.messageId ?? bootstrapMirror.id,
     bootstrapMessageId: bootstrapMirror.messageId,
   }
 }

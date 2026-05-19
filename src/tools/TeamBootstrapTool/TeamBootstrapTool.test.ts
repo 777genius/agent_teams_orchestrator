@@ -60,6 +60,17 @@ describe('TeamBootstrapTool.validateInput', () => {
     expect(spec.members[0]?.model).toBeUndefined()
   })
 
+  test('accepts five minute bootstrap timeout in hidden tool schema', () => {
+    const parsed = TeamBootstrapTool.inputSchema.safeParse({
+      mode: 'launch',
+      team_name: 'atlas-hq',
+      bootstrap_timeout_ms: 300_000,
+      members: [{ name: 'alice' }],
+    })
+
+    expect(parsed.success).toBe(true)
+  })
+
   test('rejects OpenCode providers in the hidden primary bootstrap input schema', () => {
     const parsed = TeamBootstrapTool.inputSchema.safeParse({
       mode: 'launch',

@@ -60,7 +60,7 @@ const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_PROCESS_FALLBACK_EXPECTED_PROMPT || ''
 
-async function writeEvent(type, detail) {
+async function writeEvent(type, detail, extra = {}) {
   if (!eventsPath) return
   await mkdir(dirname(eventsPath), { recursive: true })
   await appendFile(
@@ -75,6 +75,7 @@ async function writeEvent(type, detail) {
       agentId,
       cwd: process.cwd(),
       detail,
+      ...extra,
     }) + '\n',
   )
 }
@@ -91,16 +92,16 @@ async function waitForBootstrapPrompt() {
   while (Date.now() < deadline) {
     try {
       const parsed = JSON.parse(await readFile(inboxPath, 'utf8'))
-      if (
-        Array.isArray(parsed) &&
-        parsed.some(
-          message =>
-            message &&
-            message.from === 'team-lead' &&
-            String(message.text || '').includes(expectedPrompt),
-        )
-      ) {
-        return
+      const matched = Array.isArray(parsed)
+        ? parsed.find(
+            message =>
+              message &&
+              message.from === 'team-lead' &&
+              String(message.text || '').includes(expectedPrompt),
+          )
+        : null
+      if (matched) {
+        return matched
       }
     } catch {}
     await sleep(25)
@@ -151,10 +152,14 @@ try {
     process.exit(3)
   }
   await writeEvent('runtime_ready', 'headless runtime accepted')
-  await waitForBootstrapPrompt()
-  await writeEvent('inbox_poller_ready', 'bootstrap prompt observed')
-  await writeEvent('bootstrap_submitted', 'fake runtime submitted bootstrap')
+  const promptMessage = await waitForBootstrapPrompt()
+  const bootstrapMirror = promptMessage.messageId
+    ? { bootstrapMirrorId: String(promptMessage.messageId) }
+    : {}
+  await writeEvent('inbox_poller_ready', 'bootstrap prompt observed', bootstrapMirror)
+  await writeEvent('bootstrap_submitted', 'fake runtime submitted bootstrap', bootstrapMirror)
   await writeLeaderConfirmation()
+  await writeEvent('bootstrap_confirmed', 'leader idle notification written', bootstrapMirror)
   await sleep(5_000)
   process.exit(0)
 } catch (error) {
@@ -324,6 +329,14 @@ describe('spawnTeammate process backend fallback routing', () => {
       expect(eventTypes).toContain('process_spawned')
       expect(eventTypes).toContain('runtime_ready')
       expect(eventTypes).toContain('bootstrap_submitted')
+      const mailboxWritten = events.find(
+        event => event.type === 'mailbox_bootstrap_written',
+      )
+      const submitted = events.find(event => event.type === 'bootstrap_submitted')
+      const confirmed = events.find(event => event.type === 'bootstrap_confirmed')
+      expect(submitted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+      expect(submitted?.bootstrapMirrorId).toBeTruthy()
+      expect(confirmed?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
       expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
         'env=headless',
       )

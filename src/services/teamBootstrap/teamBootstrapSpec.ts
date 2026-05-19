@@ -19,6 +19,8 @@ import { hashNativeBootstrapText } from './nativeAppManagedBootstrapContext.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
 const MAX_BOOTSTRAP_MEMBERS = 16
+const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 120_000
+const MAX_BOOTSTRAP_TIMEOUT_MS = 300_000
 
 const nativeAppManagedBootstrapSchema = z.strictObject({
   schemaVersion: z.literal(1),
@@ -28,6 +30,11 @@ const nativeAppManagedBootstrapSchema = z.strictObject({
   briefingHash: z.string().trim().regex(/^[a-f0-9]{64}$/),
   generatedAt: z.string().trim().min(1),
 })
+
+const bootstrapMcpSettingSourcesSchema = z
+  .string()
+  .trim()
+  .regex(/^(user|project|local)(,(user|project|local))*$/)
 
 const bootstrapMemberSchema = z.strictObject({
   name: z.string().trim().min(1),
@@ -43,6 +50,9 @@ const bootstrapMemberSchema = z.strictObject({
   description: z.string().trim().min(1).optional(),
   useSplitPane: z.boolean().optional(),
   planModeRequired: z.boolean().optional(),
+  mcpConfigPath: z.string().trim().min(1).optional(),
+  mcpSettingSources: bootstrapMcpSettingSourcesSchema.optional(),
+  strictMcpConfig: z.boolean().optional(),
   nativeAppManagedBootstrap: nativeAppManagedBootstrapSchema.optional(),
 })
 
@@ -71,7 +81,12 @@ const bootstrapSpecSchema = z.strictObject({
   members: z.array(bootstrapMemberSchema).max(MAX_BOOTSTRAP_MEMBERS),
   launch: z
     .strictObject({
-      bootstrapTimeoutMs: z.number().int().positive().max(120_000).optional(),
+      bootstrapTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_BOOTSTRAP_TIMEOUT_MS)
+        .optional(),
       continueOnPartialFailure: z.boolean().optional(),
     })
     .optional(),
@@ -177,6 +192,11 @@ function normalizeMember(
       ? { planModeRequired: member.planModeRequired }
       : {}),
     ...(member.description ? { description: member.description } : {}),
+    ...(member.mcpConfigPath ? { mcpConfigPath: member.mcpConfigPath } : {}),
+    ...(member.mcpSettingSources ? { mcpSettingSources: member.mcpSettingSources } : {}),
+    ...(member.strictMcpConfig !== undefined
+      ? { strictMcpConfig: member.strictMcpConfig }
+      : {}),
     ...(member.nativeAppManagedBootstrap
       ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
       : {}),
@@ -218,6 +238,9 @@ export function buildRequestHash(
       useSplitPane: member.useSplitPane ?? false,
       planModeRequired: member.planModeRequired ?? false,
       description: member.description ?? null,
+      mcpConfigPath: member.mcpConfigPath ?? null,
+      mcpSettingSources: member.mcpSettingSources ?? null,
+      strictMcpConfig: member.strictMcpConfig ?? null,
       nativeAppManagedBootstrap: member.nativeAppManagedBootstrap
         ? {
             mode: member.nativeAppManagedBootstrap.mode,
@@ -286,7 +309,7 @@ export async function buildTeamBootstrapRequestFromSpec(
     ...(parsed.team.color ? { color: parsed.team.color } : {}),
     cwd,
     members,
-    bootstrapTimeoutMs: parsed.launch?.bootstrapTimeoutMs ?? 120_000,
+    bootstrapTimeoutMs: parsed.launch?.bootstrapTimeoutMs ?? DEFAULT_BOOTSTRAP_TIMEOUT_MS,
     continueOnPartialFailure:
       parsed.launch?.continueOnPartialFailure !== false,
     permissionSeedTools: normalizePermissionSeedTools(

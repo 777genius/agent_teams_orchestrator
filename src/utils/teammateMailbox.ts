@@ -64,7 +64,16 @@ type RawTeammateMessage = Omit<TeammateMessage, 'messageId'> & {
   messageId?: string
 }
 
+export type VerifiedMailboxWriteReceipt = {
+  messageId: string
+  inboxPath: string
+  attempts: number
+  totalMessages: number
+}
+
 export const MAILBOX_STALE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000
+const VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS = 3
+const VERIFIED_MAILBOX_WRITE_RETRY_DELAYS_MS = [25, 75] as const
 
 export function createCompatibilityInboxMessageId(parts: {
   from: string
@@ -90,6 +99,24 @@ function normalizeTeammateMessage(
     ...message,
     messageId: resolveTeammateMessageId(message),
   }
+}
+
+function isRawMailboxMessage(value: unknown): value is RawTeammateMessage {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as { from?: unknown }).from === 'string' &&
+    typeof (value as { text?: unknown }).text === 'string' &&
+    typeof (value as { timestamp?: unknown }).timestamp === 'string'
+  )
+}
+
+function stringifyUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms))
 }
 
 /**
@@ -136,14 +163,7 @@ export async function readMailbox(
     const parsed = jsonParse(content)
     const messages = Array.isArray(parsed)
       ? parsed
-          .filter(
-            (value): value is RawTeammateMessage =>
-              !!value &&
-              typeof value === 'object' &&
-              typeof value.from === 'string' &&
-              typeof value.text === 'string' &&
-              typeof value.timestamp === 'string',
-          )
+          .filter(isRawMailboxMessage)
           .map(normalizeTeammateMessage)
       : []
     logForDebugging(
@@ -244,6 +264,88 @@ export async function writeToMailbox(
       await release()
     }
   }
+}
+
+async function readMailboxStrictForVerification(
+  recipientName: string,
+  teamName?: string,
+): Promise<TeammateMessage[]> {
+  const inboxPath = getInboxPath(recipientName, teamName)
+  const content = await readFile(inboxPath, 'utf-8')
+  const parsed = jsonParse(content)
+  if (!Array.isArray(parsed)) {
+    throw new Error(`mailbox file is not a JSON array: ${inboxPath}`)
+  }
+  return parsed.filter(isRawMailboxMessage).map(normalizeTeammateMessage)
+}
+
+function hasVerifiedMailboxMessage(
+  messages: readonly TeammateMessage[],
+  message: Pick<TeammateMessage, 'messageId' | 'from' | 'timestamp' | 'text'>,
+): boolean {
+  return messages.some(
+    row =>
+      row.messageId === message.messageId &&
+      row.from === message.from &&
+      row.timestamp === message.timestamp &&
+      row.text === message.text,
+  )
+}
+
+export async function writeToMailboxVerified(
+  recipientName: string,
+  message: Omit<RawTeammateMessage, 'read'>,
+  teamName?: string,
+): Promise<VerifiedMailboxWriteReceipt> {
+  const inboxPath = getInboxPath(recipientName, teamName)
+  const messageId = resolveTeammateMessageId(message)
+  const canonicalMessage = {
+    ...message,
+    messageId,
+  }
+  let lastError: unknown = new Error('message was not observed after write')
+
+  for (let attempt = 0; attempt < VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const messages = await readMailboxStrictForVerification(recipientName, teamName)
+      if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
+        return {
+          messageId,
+          inboxPath,
+          attempts: attempt,
+          totalMessages: messages.length,
+        }
+      }
+      lastError = new Error(`messageId ${messageId} was not found in mailbox`)
+    } catch (error) {
+      lastError = error
+    }
+
+    await writeToMailbox(recipientName, canonicalMessage, teamName)
+    try {
+      const messages = await readMailboxStrictForVerification(recipientName, teamName)
+      if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
+        return {
+          messageId,
+          inboxPath,
+          attempts: attempt + 1,
+          totalMessages: messages.length,
+        }
+      }
+      lastError = new Error(`messageId ${messageId} was not found in mailbox`)
+    } catch (error) {
+      lastError = error
+    }
+
+    const delayMs = VERIFIED_MAILBOX_WRITE_RETRY_DELAYS_MS[attempt]
+    if (delayMs !== undefined) {
+      await sleepMs(delayMs)
+    }
+  }
+
+  throw new Error(
+    `Verified mailbox write failed for ${recipientName}: messageId=${messageId}; path=${inboxPath}; lastError=${stringifyUnknownError(lastError)}`,
+  )
 }
 
 /**

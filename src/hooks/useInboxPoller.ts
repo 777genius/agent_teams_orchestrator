@@ -2894,6 +2894,7 @@ export function useInboxPoller({
             agentId: currentAppState.teamContext?.selfAgentId,
             runId: attempt.nativeAppManaged?.runId ?? sessionId,
             bootstrapRunId: attempt.nativeAppManaged?.runId,
+            bootstrapMirrorId: processingBootstrapMessage.messageId,
             ...(attempt.nativeAppManaged
               ? {
                   source: NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,

@@ -255,13 +255,29 @@ try {
   await writeEvent('runtime_ready', 'headless flag accepted')
 
   const promptMessage = await waitForBootstrapPrompt()
-  await writeEvent('inbox_poller_ready', 'initial poll observed bootstrap prompt')
-  await writeEvent('bootstrap_prompt_observed', 'bootstrap prompt observed')
-  await writeEvent('bootstrap_submit_attempted', 'submitting bootstrap prompt')
+  const bootstrapMirror = promptMessage.messageId
+    ? { bootstrapMirrorId: String(promptMessage.messageId) }
+    : {}
+  await writeEvent(
+    'inbox_poller_ready',
+    'initial poll observed bootstrap prompt',
+    bootstrapMirror,
+  )
+  await writeEvent('bootstrap_prompt_observed', 'bootstrap prompt observed', bootstrapMirror)
+  await writeEvent(
+    'bootstrap_submit_attempted',
+    'submitting bootstrap prompt',
+    bootstrapMirror,
+  )
   if (mode === 'submit-rejected-terminal') {
-    await writeEvent('bootstrap_submit_rejected', 'fatal submit rejection', {
-      retryable: false,
-    })
+    await writeEvent(
+      'bootstrap_submit_rejected',
+      'fatal submit rejection',
+      {
+        ...bootstrapMirror,
+        retryable: false,
+      },
+    )
     await sleep(60_000)
     process.exit(0)
   }
@@ -269,18 +285,20 @@ try {
     await writeEvent(
       'bootstrap_submit_accepted_without_uuid',
       'accepted but missing message id',
-      { retryable: false },
+      { ...bootstrapMirror, retryable: false },
     )
     await sleep(60_000)
     process.exit(0)
   }
   if (mode === 'submit-rejected-then-accepted') {
     await writeEvent('bootstrap_submit_rejected', 'cooldown before retry', {
+      ...bootstrapMirror,
       retryable: true,
       attempt: 1,
     })
     await sleep(50)
     await writeEvent('bootstrap_submit_attempted', 'retrying bootstrap prompt', {
+      ...bootstrapMirror,
       attempt: 2,
     })
   }
@@ -290,9 +308,10 @@ try {
   await writeEvent(
     'bootstrap_submitted',
     'messageId=' + String(promptMessage.messageId || 'missing'),
+    bootstrapMirror,
   )
   await writeLeaderConfirmation()
-  await writeEvent('bootstrap_confirmed', 'leader idle notification written')
+  await writeEvent('bootstrap_confirmed', 'leader idle notification written', bootstrapMirror)
   if (mode === 'hold-child') {
     await writeEvent('heartbeat', 'holding parent open')
     await sleep(60_000)
@@ -476,6 +495,7 @@ describe('supervised process teammate backend e2e', () => {
       'stdout_attached',
       'cli_started',
       'runtime_ready',
+      'mailbox_bootstrap_written',
       'inbox_poller_ready',
       'bootstrap_submitted',
       'bootstrap_confirmed',
@@ -496,6 +516,14 @@ describe('supervised process teammate backend e2e', () => {
     expect(
       events.find(event => event.type === 'runtime_ready')?.pid,
     ).toBe(alice?.runtimePid)
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const submitted = events.find(event => event.type === 'bootstrap_submitted')
+    const confirmed = events.find(event => event.type === 'bootstrap_confirmed')
+    expect(submitted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+    expect(submitted?.bootstrapMirrorId).toBeTruthy()
+    expect(confirmed?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
 
     if (alice?.runtimePid) {
       await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)

@@ -54,7 +54,7 @@ describe('teamBootstrapMemberBriefingGuard', () => {
     ).toEqual({
       teamName: 'vector-room',
       memberName: 'bob',
-      bootstrapMirrorId: 'bootstrap-1',
+      bootstrapMirrorId: 'bootstrap-msg-1',
       bootstrapMessageId: 'bootstrap-msg-1',
     })
   })

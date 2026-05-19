@@ -146,6 +146,7 @@ import {
   readMailbox,
   type TeammateMessage,
   writeToMailbox,
+  writeToMailboxVerified,
 } from '../../utils/teammateMailbox.js'
 import { assertNotWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
@@ -273,6 +274,54 @@ function stripInheritedModelFlag(flags: string): string {
 
 function stripInheritedEffortFlag(flags: string): string {
   return stripInheritedCliFlag(flags, '--effort')
+}
+
+function stripInheritedBooleanCliFlag(flags: string, flagName: string): string {
+  return flags
+    .split(' ')
+    .filter(Boolean)
+    .filter(part => part !== flagName && !part.startsWith(`${flagName}=`))
+    .join(' ')
+}
+
+function appendCliFlag(flags: string, flag: string): string {
+  return flags ? `${flags} ${flag}` : flag
+}
+
+function applyMcpLaunchOverrides(
+  flags: string,
+  input: Pick<
+    SpawnInput,
+    'mcp_config' | 'mcp_setting_sources' | 'strict_mcp_config'
+  >,
+): string {
+  const mcpConfig = input.mcp_config?.trim()
+  const mcpSettingSources = input.mcp_setting_sources?.trim()
+  const hasStrictOverride = input.strict_mcp_config !== undefined
+  if (!mcpConfig && !mcpSettingSources && !hasStrictOverride) {
+    return flags
+  }
+
+  let nextFlags = stripInheritedBooleanCliFlag(
+    stripInheritedCliFlag(
+      stripInheritedCliFlag(flags, '--mcp-config'),
+      '--setting-sources',
+    ),
+    '--strict-mcp-config',
+  )
+  if (mcpSettingSources) {
+    nextFlags = appendCliFlag(
+      nextFlags,
+      `--setting-sources ${quote([mcpSettingSources])}`,
+    )
+  }
+  if (mcpConfig) {
+    nextFlags = appendCliFlag(nextFlags, `--mcp-config ${quote([mcpConfig])}`)
+  }
+  if (input.strict_mcp_config === true) {
+    nextFlags = appendCliFlag(nextFlags, '--strict-mcp-config')
+  }
+  return nextFlags
 }
 
 function summarizePromptSize(prompt: string): string {
@@ -898,8 +947,12 @@ export type SpawnTeammateConfig = {
   agent_type?: string
   isolation?: 'worktree'
   description?: string
+  mcp_config?: string
+  mcp_setting_sources?: string
+  strict_mcp_config?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
   bootstrapRunId?: string
+  bootstrapTimeoutMs?: number
   /** request_id of the API call whose response contained the tool_use that
    *  spawned this teammate. Threaded through to TeammateAgentContext for
    *  lineage tracing on tengu_api_* events. */
@@ -920,8 +973,12 @@ type SpawnInput = {
   agent_type?: string
   isolation?: 'worktree'
   description?: string
+  mcp_config?: string
+  mcp_setting_sources?: string
+  strict_mcp_config?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
   bootstrapRunId?: string
+  bootstrapTimeoutMs?: number
   invokingRequestId?: string
   worktreeInfo?: TeammateWorktreeInfo
 }
@@ -1315,11 +1372,25 @@ export function shouldDetachNativeProcessBackend(
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
-const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 45_000
+const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 90_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
+
+function resolveBoundedTimeoutMs(params: {
+  fallbackMs: number
+  deadlineMs?: number
+}): number {
+  if (
+    typeof params.deadlineMs !== 'number' ||
+    !Number.isFinite(params.deadlineMs)
+  ) {
+    return params.fallbackMs
+  }
+
+  return Math.max(1, Math.min(params.fallbackMs, params.deadlineMs - Date.now()))
+}
 
 async function probeNativeProcessTeammateSpawn(
   child: ChildProcess,
@@ -1650,6 +1721,9 @@ async function handleSpawnSplitPane(
   if (crossesProviderBoundary(input.provider)) {
     inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
+  inheritedFlags = applyMcpLaunchOverrides(inheritedFlags, input)
+  const effectiveStrictMcpConfig =
+    input.strict_mcp_config ?? inheritedStrictMcpConfig
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
   if (model) {
@@ -1678,7 +1752,7 @@ async function handleSpawnSplitPane(
     model,
     effort,
     prompt,
-    strictMcpConfig: inheritedStrictMcpConfig,
+    strictMcpConfig: effectiveStrictMcpConfig,
   })
   const startupReadySentinel =
     detectionResult.backend.type === 'tmux'
@@ -1974,6 +2048,9 @@ async function handleSpawnSeparateWindow(
   if (crossesProviderBoundary(input.provider)) {
     inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
+  inheritedFlags = applyMcpLaunchOverrides(inheritedFlags, input)
+  const effectiveStrictMcpConfig =
+    input.strict_mcp_config ?? inheritedStrictMcpConfig
 
   // If teammate has a custom model, add --model flag (or replace inherited one)
   if (model) {
@@ -2002,7 +2079,7 @@ async function handleSpawnSeparateWindow(
     model,
     effort,
     prompt,
-    strictMcpConfig: inheritedStrictMcpConfig,
+    strictMcpConfig: effectiveStrictMcpConfig,
   })
   const startupReadySentinel = await createSpawnReadySentinel()
   const launchBoundaryIso = new Date().toISOString()
@@ -2378,6 +2455,9 @@ async function handleSpawnNativeProcess(
   if (crossesProviderBoundary(input.provider)) {
     inheritedFlags = stripProviderBoundaryInheritedRuntimeFlags(inheritedFlags)
   }
+  inheritedFlags = applyMcpLaunchOverrides(inheritedFlags, input)
+  const effectiveStrictMcpConfig =
+    input.strict_mcp_config ?? inheritedStrictMcpConfig
   if (model) {
     inheritedFlags = stripInheritedModelFlag(inheritedFlags)
     inheritedFlags = inheritedFlags
@@ -2398,7 +2478,7 @@ async function handleSpawnNativeProcess(
     model,
     effort,
     prompt,
-    strictMcpConfig: inheritedStrictMcpConfig,
+    strictMcpConfig: effectiveStrictMcpConfig,
   })
 
   const { command, args: commandArgs } = getTeammateCommandArgv()
@@ -2406,6 +2486,11 @@ async function handleSpawnNativeProcess(
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
   const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
+  const bootstrapDeadlineMs =
+    typeof input.bootstrapTimeoutMs === 'number' &&
+    Number.isFinite(input.bootstrapTimeoutMs)
+      ? Date.now() + Math.max(1, input.bootstrapTimeoutMs)
+      : undefined
   const persistedEffort = toTeamFileEffort(effort)
   let child: ChildProcess | null = null
   let stdoutLog: WriteStream | undefined
@@ -2565,7 +2650,10 @@ async function handleSpawnNativeProcess(
     const runtimeReady = await waitForTeammateRuntimeEvent({
       eventsPath: runtimePaths.eventsPath,
       type: 'runtime_ready',
-      timeoutMs: PROCESS_RUNTIME_READY_TIMEOUT_MS,
+      timeoutMs: resolveBoundedTimeoutMs({
+        fallbackMs: PROCESS_RUNTIME_READY_TIMEOUT_MS,
+        deadlineMs: bootstrapDeadlineMs,
+      }),
       pid: runtimePid,
       isStillAlive: () => isProcessAlive(runtimePid),
     })
@@ -2644,7 +2732,7 @@ async function handleSpawnNativeProcess(
       )
     }
 
-    await writeToMailbox(
+    const bootstrapMailboxWrite = await writeToMailboxVerified(
       sanitizedName,
       {
         from: TEAM_LEAD_NAME,
@@ -2665,12 +2753,17 @@ async function handleSpawnNativeProcess(
       runId: getSessionId(),
       bootstrapRunId,
       source: 'spawnMultiAgent.process',
+      bootstrapMirrorId: bootstrapMailboxWrite.messageId,
+      detail: `messageId=${bootstrapMailboxWrite.messageId}; readbackAttempts=${bootstrapMailboxWrite.attempts}; totalMessages=${bootstrapMailboxWrite.totalMessages}`,
     })
 
     const inboxPollerReady = await waitForTeammateRuntimeEvent({
       eventsPath: runtimePaths.eventsPath,
       type: 'inbox_poller_ready',
-      timeoutMs: 10_000,
+      timeoutMs: resolveBoundedTimeoutMs({
+        fallbackMs: 10_000,
+        deadlineMs: bootstrapDeadlineMs,
+      }),
       pid: runtimePid,
       isStillAlive: () => isProcessAlive(runtimePid),
     })
@@ -2701,17 +2794,24 @@ async function handleSpawnNativeProcess(
 
     const bootstrapSubmitted = await waitForBootstrapSubmissionOutcome({
       eventsPath: runtimePaths.eventsPath,
-      // Process-backend teammates may need a full model turn after the mailbox
-      // row is written before the child records bootstrap_submitted. Keep this
-      // bounded, but avoid killing slow Anthropic/Codex teammates at 15s.
-      timeoutMs: PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS,
+      // Process-backend teammates may need readiness wait plus a full model turn
+      // after the mailbox row is written before recording bootstrap_submitted.
+      // Keep this bounded, but avoid killing slow Anthropic/Codex teammates early.
+      timeoutMs: resolveBoundedTimeoutMs({
+        fallbackMs: PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS,
+        deadlineMs: bootstrapDeadlineMs,
+      }),
       pid: runtimePid,
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
       bootstrapRunId,
+      bootstrapMirrorId: bootstrapMailboxWrite.messageId,
       sinceMs: Date.parse(launchBoundaryIso),
-      retryableSubmitGraceMs: PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS,
+      retryableSubmitGraceMs:
+        bootstrapDeadlineMs === undefined
+          ? PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS
+          : 0,
       retryableSubmitFreshMs: PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS,
       isStillAlive: () => isProcessAlive(runtimePid),
     })

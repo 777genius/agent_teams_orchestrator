@@ -24,6 +24,7 @@ import {
   readMailbox,
   readUnreadMessages,
   writeToMailbox,
+  writeToMailboxVerified,
 } from './teammateMailbox.js'
 
 const structuredModeSetRequest = JSON.stringify({
@@ -173,6 +174,51 @@ describe('teammateMailbox', () => {
         timestamp: '2026-01-02T00:00:00.000Z',
       }),
     })
+  })
+
+  it('verifies mailbox writes by reading back the canonical row', async () => {
+    const receipt = await writeToMailboxVerified(
+      'atlas',
+      {
+        messageId: 'bootstrap-atlas-1',
+        from: 'team-lead',
+        text: 'bootstrap prompt',
+        timestamp: '2026-01-02T00:00:00.000Z',
+      },
+      'my-team',
+    )
+
+    expect(receipt).toMatchObject({
+      messageId: 'bootstrap-atlas-1',
+      attempts: 1,
+      totalMessages: 1,
+    })
+    const [message] = await readMailbox('atlas', 'my-team')
+    expect(message).toMatchObject({
+      messageId: 'bootstrap-atlas-1',
+      from: 'team-lead',
+      text: 'bootstrap prompt',
+      read: false,
+    })
+  })
+
+  it('treats a matching existing verified row as successful without duplicating it', async () => {
+    const message = {
+      messageId: 'bootstrap-atlas-existing',
+      from: 'team-lead',
+      text: 'bootstrap prompt',
+      timestamp: '2026-01-02T00:00:00.000Z',
+    }
+    await writeToMailbox('atlas', message, 'my-team')
+
+    const receipt = await writeToMailboxVerified('atlas', message, 'my-team')
+
+    expect(receipt).toMatchObject({
+      messageId: 'bootstrap-atlas-existing',
+      attempts: 0,
+      totalMessages: 1,
+    })
+    expect(await readMailbox('atlas', 'my-team')).toHaveLength(1)
   })
 
   it('preserves agent error message kind in the team lead inbox', async () => {

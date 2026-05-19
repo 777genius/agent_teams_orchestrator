@@ -103,6 +103,57 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members).toEqual([])
   })
 
+  test('normalizes per-member MCP launch overrides', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-member-mcp-overrides',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'forge-labs',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'alice',
+          role: 'developer',
+          mcpConfigPath: '/tmp/agent-teams-alice-mcp.json',
+          mcpSettingSources: 'local',
+          strictMcpConfig: false,
+        },
+        {
+          name: 'bob',
+          role: 'reviewer',
+          mcpConfigPath: '/tmp/agent-teams-bob-mcp.json',
+          mcpSettingSources: 'user,project,local',
+          strictMcpConfig: true,
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members).toMatchObject([
+      {
+        normalizedName: 'alice',
+        mcpConfigPath: '/tmp/agent-teams-alice-mcp.json',
+        mcpSettingSources: 'local',
+        strictMcpConfig: false,
+      },
+      {
+        normalizedName: 'bob',
+        mcpConfigPath: '/tmp/agent-teams-bob-mcp.json',
+        mcpSettingSources: 'user,project,local',
+        strictMcpConfig: true,
+      },
+    ])
+  })
+
   test('accepts large startup bootstrap specs up to sixteen teammates', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     const specPath = join(tempRoot, 'bootstrap-sixteen-members.json')
@@ -690,6 +741,38 @@ describe('team bootstrap spec normalization', () => {
     const request = await readTeamBootstrapSpec(specPath)
     expect(request.initiator.source).toBe('claude_team_agent_teams_orchestrator')
     expect(request.members[0]?.prompt).toContain('member_briefing')
+  })
+
+  test('readTeamBootstrapSpec accepts app bootstrap timeout up to five minutes', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const specPath = join(tempRoot, 'bootstrap-timeout-spec.json')
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-timeout-source',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [{ name: 'alice' }],
+        launch: {
+          bootstrapTimeoutMs: 300_000,
+        },
+      } satisfies TeamBootstrapSpec),
+      'utf8',
+    )
+
+    const request = await readTeamBootstrapSpec(specPath)
+    expect(request.bootstrapTimeoutMs).toBe(300_000)
   })
 
   test('readTeamBootstrapSpec accepts hidden tool initiator values', async () => {

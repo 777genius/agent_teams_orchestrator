@@ -193,6 +193,9 @@ describe("team bootstrap launch matrix safe e2e", () => {
         emit: events.emit,
       });
 
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
       expect(result.ok).toBe(true);
       expect(spawnInputs).toMatchObject([
         {
@@ -286,6 +289,56 @@ describe("team bootstrap launch matrix safe e2e", () => {
           expectedMembers: ["alice", "bob", "zoe"],
           registeredMembers: ["alice", "bob", "zoe"],
           failedMembers: [],
+        },
+      ]);
+    },
+    SAFE_E2E_TIMEOUT_MS,
+  );
+
+  test(
+    "passes per-member MCP launch overrides to teammate spawns",
+    async () => {
+      registeredMemberNames = new Set(["alice", "bob"]);
+      const { runTeamBootstrap } = await import("./teamBootstrapRunner.js");
+      const events = createProgressEventSink();
+
+      const result = await runTeamBootstrap({
+        request: request({
+          members: [
+            {
+              ...member("alice", "anthropic", "claude-opus-4-6"),
+              mcpConfigPath: "/tmp/alice-mcp.json",
+              mcpSettingSources: "local",
+              strictMcpConfig: false,
+            },
+            {
+              ...member("bob", "codex", "gpt-5.4-mini"),
+              mcpConfigPath: "/tmp/bob-mcp.json",
+              mcpSettingSources: "user,project,local",
+              strictMcpConfig: true,
+            },
+          ],
+        }),
+        context: attachedContext("atlas-hq"),
+        emit: events.emit,
+      });
+
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+      expect(result.ok).toBe(true);
+      expect(spawnInputs).toMatchObject([
+        {
+          name: "alice",
+          mcp_config: "/tmp/alice-mcp.json",
+          mcp_setting_sources: "local",
+          strict_mcp_config: false,
+        },
+        {
+          name: "bob",
+          mcp_config: "/tmp/bob-mcp.json",
+          mcp_setting_sources: "user,project,local",
+          strict_mcp_config: true,
         },
       ]);
     },

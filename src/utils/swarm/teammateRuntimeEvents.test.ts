@@ -179,6 +179,30 @@ describe('teammateRuntimeEvents helpers', () => {
     expect(result.type).toBe('submitted')
   })
 
+  it('ignores bootstrap_submitted events without the expected mirror id', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapMirrorId: 'bootstrap-atlas-1',
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+  })
+
   it('does not extend indefinitely for stale retryable submit rejection', async () => {
     const eventsPath = await createRuntimeLogPath()
     await writeTeammateRuntimeEvent({

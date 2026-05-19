@@ -16,6 +16,8 @@ import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstr
 import { TEAM_BOOTSTRAP_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
 
+const MAX_BOOTSTRAP_TIMEOUT_MS = 300_000
+
 const memberSchema = z.strictObject({
   name: z.string().trim().min(1),
   role: z.string().trim().min(1).optional(),
@@ -41,7 +43,12 @@ const inputSchema = lazySchema(() =>
       cwd: z.string().trim().min(1).optional(),
       agent_language: z.string().trim().min(1).optional(),
       continue_on_partial_failure: z.boolean().optional(),
-      bootstrap_timeout_ms: z.number().int().positive().max(120_000).optional(),
+      bootstrap_timeout_ms: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_BOOTSTRAP_TIMEOUT_MS)
+        .optional(),
       members: z.array(memberSchema).min(1).max(8),
     })
     .superRefine((input, ctx) => {

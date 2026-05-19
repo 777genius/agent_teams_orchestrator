@@ -505,7 +505,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ]))
-    expectLaunchPromptInputs(promptInputs, [
+    expectLaunchPromptInputsUnordered(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -653,7 +653,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expectLaunchPromptInputs(promptInputs, [
+    expectLaunchPromptInputsUnordered(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -931,7 +931,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/ling-2.6-flash-free',
       },
     ])
-    expectLaunchPromptInputs(promptInputs, [
+    expectLaunchPromptInputsUnordered(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
     ])
@@ -1107,7 +1107,7 @@ describe('mixed Codex and OpenCode launch handoff safe e2e', () => {
         selectedModel: 'openrouter/nemotron-3-super-free',
       },
     ])
-    expectLaunchPromptInputs(promptInputs, [
+    expectLaunchPromptInputsUnordered(promptInputs, [
       { memberName: 'bob', text: 'Bob OpenCode join' },
       { memberName: 'jack', text: 'Jack OpenCode join' },
       { memberName: 'tom', text: 'Tom OpenCode join' },

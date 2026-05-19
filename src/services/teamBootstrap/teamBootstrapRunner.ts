@@ -600,6 +600,13 @@ export async function runTeamBootstrap(params: {
   const stateStore = new TeamBootstrapStateStore(params.request, now)
   const runtimeIdentity = getCurrentTeamBootstrapRuntimeIdentity()
   const timeoutStartedAt = monotonicNow()
+  const getRemainingBootstrapBudgetMs = (): number =>
+    Math.max(
+      1,
+      Math.floor(
+        params.request.bootstrapTimeoutMs - (monotonicNow() - timeoutStartedAt),
+      ),
+    )
   const assertTimeoutBudget = (stage?: string): void => {
     assertBootstrapTimeoutBudget({
       teamName: params.request.teamName,
@@ -733,10 +740,18 @@ export async function runTeamBootstrap(params: {
                 ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
                 ...(member.agentType ? { agent_type: member.agentType } : {}),
                 ...(member.description ? { description: member.description } : {}),
+                ...(member.mcpConfigPath ? { mcp_config: member.mcpConfigPath } : {}),
+                ...(member.mcpSettingSources
+                  ? { mcp_setting_sources: member.mcpSettingSources }
+                  : {}),
+                ...(member.strictMcpConfig !== undefined
+                  ? { strict_mcp_config: member.strictMcpConfig }
+                  : {}),
                 ...(member.nativeAppManagedBootstrap
                   ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
                   : {}),
                 bootstrapRunId: params.request.runId,
+                bootstrapTimeoutMs: getRemainingBootstrapBudgetMs(),
                 ...(member.useSplitPane !== undefined
                   ? { use_splitpane: member.useSplitPane }
                   : {}),
