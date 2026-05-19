@@ -3478,18 +3478,17 @@ export function useInboxPoller({
     const agentName = getAgentNameToPoll(currentAppState)
     if (agentName) {
       hasDoneInitialPollRef.current = true
-      void poll().finally(() => {
-        if (!didWriteInboxPollerReadyRef.current && isTeammate()) {
-          didWriteInboxPollerReadyRef.current = true
-          void writeChildOwnedTeammateRuntimeEvent({
-            type: 'inbox_poller_ready',
-            teamName: currentAppState.teamContext?.teamName,
-            agentName,
-            agentId: currentAppState.teamContext?.selfAgentId,
-            runId: getSessionId(),
-          })
-        }
-      })
+      if (!didWriteInboxPollerReadyRef.current && isTeammate()) {
+        didWriteInboxPollerReadyRef.current = true
+        void writeChildOwnedTeammateRuntimeEvent({
+          type: 'inbox_poller_ready',
+          teamName: currentAppState.teamContext?.teamName,
+          agentName,
+          agentId: currentAppState.teamContext?.selfAgentId,
+          runId: getSessionId(),
+        })
+      }
+      void poll()
     }
     // Note: poll uses store.getState() (not appState) so it won't re-run on appState changes
     // The ref guard is a safety measure to ensure initial poll only happens once

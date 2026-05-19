@@ -19,6 +19,16 @@ augment_launcher_path() {
   fi
 }
 
+normalize_source_node_env() {
+  if [[ "${CLAUDE_TEAM_SOURCE_LAUNCHER_PRESERVE_NODE_ENV:-}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${NODE_ENV:-}" || "${NODE_ENV:-}" == "production" ]]; then
+    export NODE_ENV="development"
+  fi
+}
+
 resolve_bun() {
   if [[ -n "${BUN_INSTALL:-}" && -x "$BUN_INSTALL/bin/bun" ]]; then
     printf '%s\n' "$BUN_INSTALL/bin/bun"
@@ -47,6 +57,7 @@ resolve_bun() {
 }
 
 augment_launcher_path
+normalize_source_node_env
 BUN_BIN="$(resolve_bun)" || exit $?
 
 if [[ "${1-}" == "runtime" && "${2-}" == "status" ]]; then
