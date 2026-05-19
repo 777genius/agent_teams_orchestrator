@@ -5,6 +5,7 @@ dist/
 /cli-dev
 /cli-dev.cmd
 openclaw/
+.serena/
 
 # Competitor directories are local upstream clones used for research only.
 # Do not track new clone contents or local edits there.

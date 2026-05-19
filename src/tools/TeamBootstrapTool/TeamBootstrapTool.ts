@@ -16,7 +16,8 @@ import type { TeamBootstrapSpec } from '../../services/teamBootstrap/teamBootstr
 import { TEAM_BOOTSTRAP_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
 
-const MAX_BOOTSTRAP_TIMEOUT_MS = 300_000
+const MAX_BOOTSTRAP_TIMEOUT_MS = 600_000
+const MAX_BOOTSTRAP_MEMBERS = 20
 
 const memberSchema = z.strictObject({
   name: z.string().trim().min(1),
@@ -49,7 +50,7 @@ const inputSchema = lazySchema(() =>
         .positive()
         .max(MAX_BOOTSTRAP_TIMEOUT_MS)
         .optional(),
-      members: z.array(memberSchema).min(1).max(8),
+      members: z.array(memberSchema).min(1).max(MAX_BOOTSTRAP_MEMBERS),
     })
     .superRefine((input, ctx) => {
       if (isWindowsReservedBasename(input.team_name)) {

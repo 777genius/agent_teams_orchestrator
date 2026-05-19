@@ -154,26 +154,26 @@ describe('team bootstrap spec normalization', () => {
     ])
   })
 
-  test('accepts large startup bootstrap specs up to sixteen teammates', async () => {
+  test('accepts large startup bootstrap specs up to twenty teammates', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
-    const specPath = join(tempRoot, 'bootstrap-sixteen-members.json')
+    const specPath = join(tempRoot, 'bootstrap-twenty-members.json')
     await mkdir(workspaceDir, { recursive: true })
     await writeFile(
       specPath,
       JSON.stringify({
         version: 1,
-        runId: 'run-sixteen-members',
+        runId: 'run-twenty-members',
         mode: 'launch',
         initiator: {
           kind: 'app',
           source: 'claude_team_agent_teams_orchestrator',
         },
         team: {
-          name: 'sixteen-ready-team',
+          name: 'twenty-ready-team',
           cwd: workspaceDir,
         },
         lead: {},
-        members: Array.from({ length: 16 }, (_, index) => ({
+        members: Array.from({ length: 20 }, (_, index) => ({
           name: `member-${index + 1}`,
           role: 'developer',
           workflow: 'Handle assigned work.',
@@ -184,10 +184,10 @@ describe('team bootstrap spec normalization', () => {
 
     const request = await readTeamBootstrapSpec(specPath)
 
-    expect(request.members).toHaveLength(16)
+    expect(request.members).toHaveLength(20)
   })
 
-  test('rejects startup bootstrap specs above sixteen teammates', async () => {
+  test('rejects startup bootstrap specs above twenty teammates', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     const specPath = join(tempRoot, 'bootstrap-too-many-members.json')
     await mkdir(workspaceDir, { recursive: true })
@@ -206,7 +206,7 @@ describe('team bootstrap spec normalization', () => {
           cwd: workspaceDir,
         },
         lead: {},
-        members: Array.from({ length: 17 }, (_, index) => ({
+        members: Array.from({ length: 21 }, (_, index) => ({
           name: `member-${index + 1}`,
           role: 'developer',
           workflow: 'Handle assigned work.',
@@ -216,7 +216,7 @@ describe('team bootstrap spec normalization', () => {
     )
 
     await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow(
-      /expected array to have <=16 items/,
+      /expected array to have <=20 items/,
     )
   })
 
@@ -743,7 +743,7 @@ describe('team bootstrap spec normalization', () => {
     expect(request.members[0]?.prompt).toContain('member_briefing')
   })
 
-  test('readTeamBootstrapSpec accepts app bootstrap timeout up to five minutes', async () => {
+  test('readTeamBootstrapSpec accepts app bootstrap timeout up to ten minutes', async () => {
     const workspaceDir = join(tempRoot, 'workspace')
     await mkdir(workspaceDir, { recursive: true })
 
@@ -765,14 +765,14 @@ describe('team bootstrap spec normalization', () => {
         lead: {},
         members: [{ name: 'alice' }],
         launch: {
-          bootstrapTimeoutMs: 300_000,
+          bootstrapTimeoutMs: 600_000,
         },
       } satisfies TeamBootstrapSpec),
       'utf8',
     )
 
     const request = await readTeamBootstrapSpec(specPath)
-    expect(request.bootstrapTimeoutMs).toBe(300_000)
+    expect(request.bootstrapTimeoutMs).toBe(600_000)
   })
 
   test('readTeamBootstrapSpec accepts hidden tool initiator values', async () => {

@@ -18,9 +18,9 @@ import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { hashNativeBootstrapText } from './nativeAppManagedBootstrapContext.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
-const MAX_BOOTSTRAP_MEMBERS = 16
+const MAX_BOOTSTRAP_MEMBERS = 20
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 120_000
-const MAX_BOOTSTRAP_TIMEOUT_MS = 300_000
+const MAX_BOOTSTRAP_TIMEOUT_MS = 600_000
 
 const nativeAppManagedBootstrapSchema = z.strictObject({
   schemaVersion: z.literal(1),

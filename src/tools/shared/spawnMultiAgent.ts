@@ -1371,12 +1371,32 @@ export function shouldDetachNativeProcessBackend(
 }
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
-const PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
+const PROCESS_RUNTIME_READY_TIMEOUT_ENV = 'CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS'
+const DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
 const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 90_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
+
+function getProcessRuntimeReadyTimeoutMs(): number {
+  const raw = process.env[PROCESS_RUNTIME_READY_TIMEOUT_ENV]?.trim()
+  if (!raw) {
+    return DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS
+  }
+
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(parsed, 300_000)
+    : DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS
+}
+
+export function __getProcessRuntimeReadyTimeoutMsForTests(): number {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__getProcessRuntimeReadyTimeoutMsForTests is only available in tests')
+  }
+  return getProcessRuntimeReadyTimeoutMs()
+}
 
 function resolveBoundedTimeoutMs(params: {
   fallbackMs: number
@@ -2651,7 +2671,7 @@ async function handleSpawnNativeProcess(
       eventsPath: runtimePaths.eventsPath,
       type: 'runtime_ready',
       timeoutMs: resolveBoundedTimeoutMs({
-        fallbackMs: PROCESS_RUNTIME_READY_TIMEOUT_MS,
+        fallbackMs: getProcessRuntimeReadyTimeoutMs(),
         deadlineMs: bootstrapDeadlineMs,
       }),
       pid: runtimePid,

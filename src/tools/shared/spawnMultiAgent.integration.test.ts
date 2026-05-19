@@ -14,6 +14,8 @@ import { getEmptyToolPermissionContext } from '../../Tool.js'
 describe('spawnTeammate partial in-process spawn cleanup', () => {
   const IN_PROCESS_CLEANUP_E2E_TIMEOUT_MS = 60_000
   const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+  const originalRuntimeReadyTimeout =
+    process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS
   let tempConfigDir: string
 
   beforeEach(async () => {
@@ -30,8 +32,33 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
     } else {
       process.env.CLAUDE_CONFIG_DIR = originalConfigDir
     }
+    if (originalRuntimeReadyTimeout === undefined) {
+      delete process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS
+    } else {
+      process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS =
+        originalRuntimeReadyTimeout
+    }
     await rm(tempConfigDir, { recursive: true, force: true })
   })
+
+  it(
+    'uses the process runtime_ready timeout override when provided',
+    async () => {
+      const spawnModulePath = new URL(
+        `./spawnMultiAgent.ts?runtimeReadyTimeoutTest=${Date.now()}`,
+        import.meta.url,
+      ).href
+      const { __getProcessRuntimeReadyTimeoutMsForTests } =
+        await import(spawnModulePath)
+
+      process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = '90000'
+      expect(__getProcessRuntimeReadyTimeoutMsForTests()).toBe(90_000)
+
+      process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = 'not-a-number'
+      expect(__getProcessRuntimeReadyTimeoutMsForTests()).toBe(30_000)
+    },
+    20_000,
+  )
 
   it(
     'cleans up the registered in-process task if durable registration fails after spawn',
