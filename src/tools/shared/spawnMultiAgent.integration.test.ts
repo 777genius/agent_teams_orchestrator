@@ -16,6 +16,8 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
   const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   const originalRuntimeReadyTimeout =
     process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS
+  const originalInboxPollerReadyTimeout =
+    process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS
   let tempConfigDir: string
 
   beforeEach(async () => {
@@ -38,24 +40,38 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
       process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS =
         originalRuntimeReadyTimeout
     }
+    if (originalInboxPollerReadyTimeout === undefined) {
+      delete process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS
+    } else {
+      process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS =
+        originalInboxPollerReadyTimeout
+    }
     await rm(tempConfigDir, { recursive: true, force: true })
   })
 
   it(
-    'uses the process runtime_ready timeout override when provided',
+    'uses process readiness timeout overrides when provided',
     async () => {
       const spawnModulePath = new URL(
         `./spawnMultiAgent.ts?runtimeReadyTimeoutTest=${Date.now()}`,
         import.meta.url,
       ).href
-      const { __getProcessRuntimeReadyTimeoutMsForTests } =
+      const { __getProcessReadinessTimeoutsForTests } =
         await import(spawnModulePath)
 
       process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = '90000'
-      expect(__getProcessRuntimeReadyTimeoutMsForTests()).toBe(90_000)
+      process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = '30000'
+      expect(__getProcessReadinessTimeoutsForTests()).toEqual({
+        runtimeReadyMs: 90_000,
+        inboxPollerReadyMs: 30_000,
+      })
 
       process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = 'not-a-number'
-      expect(__getProcessRuntimeReadyTimeoutMsForTests()).toBe(30_000)
+      process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 'not-a-number'
+      expect(__getProcessReadinessTimeoutsForTests()).toEqual({
+        runtimeReadyMs: 30_000,
+        inboxPollerReadyMs: 10_000,
+      })
     },
     20_000,
   )

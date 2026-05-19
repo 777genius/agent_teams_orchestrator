@@ -1372,30 +1372,56 @@ export function shouldDetachNativeProcessBackend(
 
 const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_ENV = 'CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS'
+const PROCESS_INBOX_POLLER_READY_TIMEOUT_ENV =
+  'CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS'
 const DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
+const DEFAULT_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 10_000
 const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 90_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
-function getProcessRuntimeReadyTimeoutMs(): number {
-  const raw = process.env[PROCESS_RUNTIME_READY_TIMEOUT_ENV]?.trim()
+function getProcessReadinessTimeoutMs(params: {
+  envName: string
+  defaultMs: number
+}): number {
+  const raw = process.env[params.envName]?.trim()
   if (!raw) {
-    return DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS
+    return params.defaultMs
   }
 
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed > 0
     ? Math.min(parsed, 300_000)
-    : DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS
+    : params.defaultMs
 }
 
-export function __getProcessRuntimeReadyTimeoutMsForTests(): number {
+function getProcessRuntimeReadyTimeoutMs(): number {
+  return getProcessReadinessTimeoutMs({
+    envName: PROCESS_RUNTIME_READY_TIMEOUT_ENV,
+    defaultMs: DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS,
+  })
+}
+
+function getProcessInboxPollerReadyTimeoutMs(): number {
+  return getProcessReadinessTimeoutMs({
+    envName: PROCESS_INBOX_POLLER_READY_TIMEOUT_ENV,
+    defaultMs: DEFAULT_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS,
+  })
+}
+
+export function __getProcessReadinessTimeoutsForTests(): {
+  runtimeReadyMs: number
+  inboxPollerReadyMs: number
+} {
   if (process.env.NODE_ENV !== 'test') {
-    throw new Error('__getProcessRuntimeReadyTimeoutMsForTests is only available in tests')
+    throw new Error('__getProcessReadinessTimeoutsForTests is only available in tests')
   }
-  return getProcessRuntimeReadyTimeoutMs()
+  return {
+    runtimeReadyMs: getProcessRuntimeReadyTimeoutMs(),
+    inboxPollerReadyMs: getProcessInboxPollerReadyTimeoutMs(),
+  }
 }
 
 function resolveBoundedTimeoutMs(params: {
@@ -2781,7 +2807,7 @@ async function handleSpawnNativeProcess(
       eventsPath: runtimePaths.eventsPath,
       type: 'inbox_poller_ready',
       timeoutMs: resolveBoundedTimeoutMs({
-        fallbackMs: 10_000,
+        fallbackMs: getProcessInboxPollerReadyTimeoutMs(),
         deadlineMs: bootstrapDeadlineMs,
       }),
       pid: runtimePid,
