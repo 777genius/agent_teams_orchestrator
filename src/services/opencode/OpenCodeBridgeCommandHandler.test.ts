@@ -1168,6 +1168,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   }
 
+  test('deep readiness returns MCP unavailable before probing a configured authless local model when MCP proof fails', async () => {
+    ;(Client.prototype.connect as unknown as (...args: unknown[]) => Promise<void>) = async () => {
+      throw new Error('Connection closed')
+    }
+    ;(Client.prototype.listTools as unknown as () => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: [],
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    let provisioningProbeCalled = false
+    openCodeProvisioningProbe.probe = (async () => {
+      provisioningProbeCalled = true
+      throw new Error('OpenCode host startup should not run when MCP proof already failed')
+    }) as typeof openCodeProvisioningProbe.probe
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run when MCP proof already failed')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        requireExecutionProbe: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('mcp_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.hostHealthy).toBe(false)
+    expect(result.data.requiredToolsPresent).toBe(false)
+    expect(result.data.missing.join('\n')).toContain('Agent Teams MCP tools are not visible')
+    expect(result.data.diagnostics.join('\n')).toContain('Connection closed')
+    expect(result.data.diagnostics.join('\n')).toContain(
+      'Skipped OpenCode host startup and model verification because Agent Teams MCP direct preflight failed',
+    )
+    expect(provisioningProbeCalled).toBe(false)
+    expect(executionProbeCalled).toBe(false)
+  })
+
   test('compatibility mode without execution probe allows built-in free OpenCode models without connected providers', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () =>
@@ -2103,9 +2148,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     if (!result.ok) {
       return
     }
-    expect(upserts).toHaveLength(1)
-    expect(upserts[0]?.appManagedBootstrap?.messageID).toMatch(/^msg_000000000000[0-9a-f]{14}$/)
-    expect(upserts[0]).toMatchObject({
+    expect(upserts.length).toBeGreaterThanOrEqual(1)
+    const finalUpsert = upserts.at(-1)
+    expect(finalUpsert?.appManagedBootstrap?.messageID).toMatch(/^msg_000000000000[0-9a-f]{14}$/)
+    expect(finalUpsert).toMatchObject({
       opencodeSessionId: 'session-alice',
       bootstrapMode: 'app_managed_context',
       bootstrapEvidenceSource: 'app_managed_bootstrap',

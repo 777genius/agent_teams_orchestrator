@@ -737,6 +737,32 @@ export class OpenCodeExecutionProbe {
             message: failureMessage,
           })
 
+          if (
+            summary.durableState === 'idle'
+            && classified.outcome === 'unknown'
+            && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
+          ) {
+            diagnostics.add(
+              'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
+            )
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: 'available',
+              reason: null,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: summary.errorCount,
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+
           return finish({
             providerId: 'opencode',
             modelId: params.selectedModel,

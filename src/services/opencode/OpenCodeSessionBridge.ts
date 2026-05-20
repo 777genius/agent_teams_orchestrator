@@ -30,7 +30,10 @@ import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.j
 
 type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
-    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
+    & Partial<Pick<
+      typeof openCodeHostManager,
+      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
+    >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
@@ -620,6 +623,33 @@ export class OpenCodeSessionBridge {
       throw error
     }
     return created.record
+  }
+
+  async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
+    const [profile, resolvedBehaviorFingerprint] = await Promise.all([
+      this.prepareProfile(record.projectPath),
+      this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null),
+    ])
+    const next: OpenCodeSessionRecord = {
+      ...record,
+      sourceAuthFingerprint: profile.sourceAuthFingerprint,
+      managedAuthFingerprint: profile.managedAuthFingerprint,
+      projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      resolvedBehaviorFingerprint: resolvedBehaviorFingerprint ?? record.resolvedBehaviorFingerprint,
+    }
+    const changed =
+      next.sourceAuthFingerprint !== record.sourceAuthFingerprint
+      || next.managedAuthFingerprint !== record.managedAuthFingerprint
+      || next.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
+      || next.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
+
+    if (!changed) {
+      return record
+    }
+
+    next.updatedAt = buildNowIso()
+    await this.sessionStore.upsert(next)
+    return next
   }
 
   async listMessages(

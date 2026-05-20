@@ -81,6 +81,30 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(true)
   })
 
+  test('requires execution proof for configured authless local providers even when OpenCode reports them connected', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'llama.cpp/qwen-test:0.5b',
+      catalog: catalog({
+        connectedProviders: ['llama.cpp'],
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('configured_authless')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(true)
+  })
+
   test('requires execution proof for loopback OpenAI-compatible providers from the live provider list', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'lmstudio/google/gemma-3n-e4b',

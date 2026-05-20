@@ -622,6 +622,41 @@ describe('OpenCodeSessionBridge', () => {
     expect(upserts[0]?.bootstrapMode).toBe('app_managed_context')
   })
 
+  test('refreshes session environment fingerprints after OpenCode materializes project behavior files', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const refreshedProfile: OpenCodePreparedProfile = {
+      ...profile,
+      projectBehaviorFingerprint: 'behavior-v2',
+      sourceAuthFingerprint: 'source-auth-v2',
+      managedAuthFingerprint: 'managed-auth-v2',
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => refreshedProfile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'updated'
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        refreshResolvedConfigFingerprint: async () => 'resolved-fingerprint-v2',
+      },
+    })
+
+    const refreshed = await bridge.refreshSessionEnvironment(buildRecord())
+
+    expect(refreshed.projectBehaviorFingerprint).toBe('behavior-v2')
+    expect(refreshed.sourceAuthFingerprint).toBe('source-auth-v2')
+    expect(refreshed.managedAuthFingerprint).toBe('managed-auth-v2')
+    expect(refreshed.resolvedBehaviorFingerprint).toBe('resolved-fingerprint-v2')
+    expect(upserts).toHaveLength(1)
+    expect(upserts[0]?.projectBehaviorFingerprint).toBe('behavior-v2')
+  })
+
   test('releases a fresh host lease when session persistence fails', async () => {
     const retainedLeases: unknown[] = []
     const releasedLeases: unknown[] = []

@@ -52,6 +52,11 @@ const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([
   'vllm',
 ])
 
+export function isKnownAuthlessOpenCodeProviderId(providerId: string | null | undefined): boolean {
+  const normalized = normalizeOpenCodeProviderId(providerId)
+  return normalized ? KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(normalized) : false
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -240,6 +245,17 @@ export function evaluateOpenCodeModelAccess(input: {
     }
   }
 
+  if (isAuthlessCapableKnownModel(input.catalog, parsed.providerId, parsed.modelId)) {
+    return {
+      kind: 'configured_authless',
+      providerId: parsed.providerId,
+      modelId: parsed.modelId,
+      launchAllowed: false,
+      requiresExecutionProof: true,
+      reason: `OpenCode provider "${parsed.providerId}" for selected model "${parsed.raw}" requires execution verification before launch`,
+    }
+  }
+
   if (normalizeProviderIdSet(input.catalog.connectedProviders).has(parsed.providerId)) {
     return {
       kind: 'credentialed',
@@ -259,17 +275,6 @@ export function evaluateOpenCodeModelAccess(input: {
       launchAllowed: true,
       requiresExecutionProof: false,
       reason: null,
-    }
-  }
-
-  if (isAuthlessCapableKnownModel(input.catalog, parsed.providerId, parsed.modelId)) {
-    return {
-      kind: 'configured_authless',
-      providerId: parsed.providerId,
-      modelId: parsed.modelId,
-      launchAllowed: false,
-      requiresExecutionProof: true,
-      reason: `OpenCode provider "${parsed.providerId}" for selected model "${parsed.raw}" requires execution verification before launch`,
     }
   }
 

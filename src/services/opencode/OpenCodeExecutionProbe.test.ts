@@ -169,6 +169,77 @@ describe('OpenCodeExecutionProbe', () => {
     })
   })
 
+  test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                parentID: 'msg-user-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PING' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'ollama/qwen2.5-coder:0.5b',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.reason).toBeNull()
+    expect(result.latestAssistantText).toBe('PING')
+    expect(result.diagnostics.join('\n')).toContain(
+      'Model verification completed with non-matching assistant output',
+    )
+  })
+
   test('can release execution probe lease without disposing the live host', async () => {
     const retainedLeaseTeamIds: string[] = []
     const releasedLeaseTeamIds: string[] = []

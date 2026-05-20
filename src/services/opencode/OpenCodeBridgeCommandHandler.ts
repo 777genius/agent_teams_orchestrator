@@ -20,6 +20,7 @@ import {
 import {
   buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
   evaluateOpenCodeModelAccess,
+  isKnownAuthlessOpenCodeProviderId,
 } from './OpenCodeModelAccessPolicy.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
@@ -27,6 +28,7 @@ import {
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
+import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -1395,6 +1397,10 @@ async function proveAppMcpTools(
     }
   }
 
+  return proveAppMcpToolsFromLaunchConfig()
+}
+
+async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
   const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
   const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
@@ -1591,6 +1597,7 @@ function readinessData(
     catalog: getOpenCodeAccessPolicyCatalog(snapshot),
     executionOutcome,
   })
+  const appMcpUnavailable = !appMcpConnected || !requiredToolsPresent
   const hasLaunchProvider =
     connectedProviders.length > 0
     || hasAuthFreeOpenCodeProvider
@@ -1618,6 +1625,18 @@ function readinessData(
     missing.push(
       executionOutcome.reason ?? 'OpenCode provider authentication failed for the selected model',
     )
+  } else if (
+    executionOutcome
+    && executionOutcome.outcome !== 'available'
+    && appMcpUnavailable
+  ) {
+    state = 'mcp_unavailable'
+    launchAllowed = false
+    missing.push(
+      toolProof.missingTools.length > 0
+        ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
+        : 'Agent Teams MCP tools are not visible in OpenCode',
+    )
   } else if (executionOutcome && executionOutcome.outcome !== 'available') {
     state = 'model_unavailable'
     launchAllowed = false
@@ -1630,7 +1649,7 @@ function readinessData(
     state = 'model_unavailable'
     launchAllowed = false
     missing.push('No OpenCode model is available')
-  } else if (!appMcpConnected || !requiredToolsPresent) {
+  } else if (appMcpUnavailable) {
     state = 'mcp_unavailable'
     launchAllowed = false
     missing.push(
@@ -2030,6 +2049,48 @@ function skippedAppMcpToolProof(): AppMcpToolProof {
   }
 }
 
+function shouldFastFailAuthlessModelWhenAppMcpUnavailable(selectedModel: string | null): boolean {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  return parsed ? isKnownAuthlessOpenCodeProviderId(parsed.providerId) : false
+}
+
+function mcpUnavailableReadinessData(input: {
+  selectedModel: string | null
+  toolProof: AppMcpToolProof
+  diagnostics?: string[]
+}) {
+  const missingMessage = input.toolProof.missingTools.length > 0
+    ? `Agent Teams MCP tools are not visible in OpenCode: ${input.toolProof.missingTools.join(', ')}`
+    : 'Agent Teams MCP tools are not visible in OpenCode'
+  const diagnostics = uniqueSortedStrings([
+    ...(input.diagnostics ?? []),
+    ...input.toolProof.diagnostics,
+  ])
+  return {
+    state: 'mcp_unavailable',
+    launchAllowed: false,
+    modelId: input.selectedModel,
+    availableModels: [],
+    opencodeVersion: null,
+    installMethod: 'unknown',
+    binaryPath: 'opencode',
+    hostHealthy: false,
+    appMcpConnected: false,
+    requiredToolsPresent: false,
+    permissionBridgeReady: true,
+    runtimeStoresReady: true,
+    supportLevel: null,
+    missing: [missingMessage],
+    diagnostics,
+    evidence: {
+      capabilitiesReady: true,
+      mcpToolProofRoute: input.toolProof.route,
+      observedMcpTools: input.toolProof.observedTools,
+      runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
+    },
+  }
+}
+
 async function runReadiness(envelope: BridgeEnvelope) {
   // Windows packaged bridge processes can lose stdout if they dispose the
   // just-used OpenCode host before the response is flushed. Release only the
@@ -2039,6 +2100,25 @@ async function runReadiness(envelope: BridgeEnvelope) {
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
+  if (
+    shouldProbeSelectedModel
+    && shouldFastFailAuthlessModelWhenAppMcpUnavailable(selectedModel)
+  ) {
+    const preflightToolProof = await proveAppMcpToolsFromLaunchConfig()
+    if (!preflightToolProof.ok) {
+      return {
+        snapshot: null,
+        data: mcpUnavailableReadinessData({
+          selectedModel,
+          toolProof: preflightToolProof,
+          diagnostics: [
+            'Skipped OpenCode host startup and model verification because Agent Teams MCP direct preflight failed.',
+          ],
+        }),
+      }
+    }
+  }
+
   const modelSnapshot = await openCodeProvisioningProbe.probe(
     projectPath,
     {
@@ -2108,6 +2188,35 @@ async function runReadiness(envelope: BridgeEnvelope) {
   }
 
   if (envelope.body.requireExecutionProbe === true && executionModel) {
+    const selectedModelAccess = evaluateOpenCodeModelAccess({
+      selectedModel: executionModel,
+      catalog: getOpenCodeAccessPolicyCatalog(snapshot),
+    })
+    if (
+      selectedModelAccess.kind === 'configured_authless'
+      && selectedModelAccess.requiresExecutionProof
+      && modelSnapshot.host
+    ) {
+      const preflightToolProof = await proveAppMcpTools(modelSnapshot)
+      if (!preflightToolProof.ok) {
+        const executionOutcome = buildOpenCodeExecutionOutcome(
+          executionModel,
+          'unknown',
+          'Skipped model verification because Agent Teams MCP tools are unavailable',
+        )
+        return {
+          snapshot: modelSnapshot,
+          data: readinessData(
+            modelSnapshot,
+            executionModel,
+            executionOutcome,
+            preflightToolProof,
+            requireSelectedModel,
+          ),
+        }
+      }
+    }
+
     const executionOutcome = await openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: modelSnapshot.projectPath,
@@ -2447,6 +2556,15 @@ async function runLaunchWithProvisioningSnapshot(
         briefingHash,
       })
       memberTiming.injectionMs = elapsedMs(injectionStartedAt)
+      try {
+        record = await openCodeSessionBridge.refreshSessionEnvironment(record)
+      } catch (error) {
+        diagnostics.push(teamDiagnostic(
+          'opencode_launch_session_environment_refresh_failed',
+          `${name}: ${error instanceof Error ? error.message : String(error)}`,
+          'warning',
+        ))
+      }
       const candidateAt = nowIso()
       const appManagedBootstrap = {
         schemaVersion: 1 as const,
