@@ -11,6 +11,8 @@ import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/
 import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
+const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
+
 type ModelProviderTarget = 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all'
 export type InternalModelProvider = Exclude<ModelProviderTarget, 'all'>
 
@@ -135,16 +137,55 @@ export async function modelList(opts: {
   }
 
   if (opts.text) {
+    let textOutput = ''
     for (const [, details] of providerEntries) {
-      process.stdout.write(`${details.displayName}:\n`)
-      process.stdout.write(`  default: ${details.defaultModel}\n`)
+      textOutput += `${details.displayName}:\n`
+      textOutput += `  default: ${details.defaultModel}\n`
       for (const model of details.models) {
-        process.stdout.write(`  - ${model.id} (${model.label})\n`)
+        textOutput += `  - ${model.id} (${model.label})\n`
       }
     }
+    await writeStdoutAndDrain(textOutput)
   } else {
-    process.stdout.write(jsonStringify(output, null, 2) + '\n')
+    await writeStdoutAndDrain(jsonStringify(output, null, 2) + '\n')
   }
 
   process.exit(0)
+}
+
+function writeStdoutAndDrain(payload: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let onDrain: (() => void) | null = null
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      if (onDrain) {
+        process.stdout.off('drain', onDrain)
+        onDrain = null
+      }
+    }
+    const finish = (error?: Error | null) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve()
+    }
+    onDrain = () => finish()
+    timer = setTimeout(() => finish(), STDOUT_DRAIN_FALLBACK_TIMEOUT_MS)
+    timer.unref?.()
+    process.stdout.once('drain', onDrain)
+    process.stdout.write(payload, error => {
+      finish(error)
+    })
+  })
 }

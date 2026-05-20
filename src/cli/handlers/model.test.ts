@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { getProviderModels } from './model.js'
+import { getProviderModels, modelList } from './model.js'
 
 describe('model list handler', () => {
   test('uses the shared Codex runtime model catalog', async () => {
@@ -55,5 +55,69 @@ describe('model list handler', () => {
 
     expect(details.defaultModel).toBe('gpt-5.4')
     expect(details.models.map(model => model.id)).toEqual(['gpt-5.4', 'gpt-5.5'])
+  })
+
+  test('waits for JSON stdout to flush before exiting', async () => {
+    const originalWrite = process.stdout.write
+    const originalExit = process.exit
+    const events: string[] = []
+    try {
+      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        events.push(typeof chunk === 'string' && chunk.includes('"gemini"') ? 'write-json' : 'write')
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        events.push('write-callback')
+        writeCallback?.()
+        return true
+      }) as typeof process.stdout.write
+      process.exit = ((code?: string | number | null | undefined) => {
+        events.push(`exit:${code ?? 0}`)
+        throw new Error('process.exit')
+      }) as typeof process.exit
+
+      await expect(modelList({ json: true, provider: 'gemini' })).rejects.toThrow('process.exit')
+
+      expect(events).toEqual(['write-json', 'write-callback', 'exit:0'])
+    } finally {
+      process.stdout.write = originalWrite
+      process.exit = originalExit
+    }
+  })
+
+  test('waits for text stdout to flush before exiting', async () => {
+    const originalWrite = process.stdout.write
+    const originalExit = process.exit
+    const events: string[] = []
+    try {
+      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        events.push(typeof chunk === 'string' && chunk.includes('Gemini:') ? 'write-text' : 'write')
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        setTimeout(() => {
+          events.push('write-callback')
+          writeCallback?.()
+        }, 5)
+        return false
+      }) as typeof process.stdout.write
+      process.exit = ((code?: string | number | null | undefined) => {
+        events.push(`exit:${code ?? 0}`)
+        throw new Error('process.exit')
+      }) as typeof process.exit
+
+      await expect(modelList({ text: true, provider: 'gemini' })).rejects.toThrow('process.exit')
+
+      expect(events).toEqual(['write-text', 'write-callback', 'exit:0'])
+    } finally {
+      process.stdout.write = originalWrite
+      process.exit = originalExit
+    }
   })
 })
