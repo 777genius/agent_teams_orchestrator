@@ -1,3 +1,9 @@
+import {
+  formatOpenCodeModelRef,
+  normalizeOpenCodeProviderId,
+  parseOpenCodeProviderScopedModelRef,
+} from './OpenCodeModelRef.js'
+
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -18,7 +24,7 @@ function getConfigProviderModelMatches(
   const matches: Array<{ providerId: string; modelId: string }> = []
 
   for (const provider of providers) {
-    const providerId = asString(provider.id)
+    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
     const models = asRecord(provider.models)
     if (!providerId || !models) {
       continue
@@ -47,7 +53,7 @@ function getLiveProviderModelMatches(
   const matches: Array<{ providerId: string; modelId: string }> = []
 
   for (const provider of snapshot.providers?.all ?? []) {
-    const providerId = asString(provider.id)
+    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
     const models = asRecord(provider.models)
     if (!providerId || !models) {
       continue
@@ -101,14 +107,7 @@ function getDefaultProviderMatch(
 function splitProviderScopedModel(
   selectedModel: string,
 ): { providerId: string; modelId: string } | null {
-  const slashIndex = selectedModel.indexOf('/')
-  if (slashIndex <= 0 || slashIndex >= selectedModel.length - 1) {
-    return null
-  }
-  return {
-    providerId: selectedModel.slice(0, slashIndex),
-    modelId: selectedModel.slice(slashIndex + 1),
-  }
+  return parseOpenCodeProviderScopedModelRef(selectedModel)
 }
 
 function hasProviderScopedModel(
@@ -117,13 +116,13 @@ function hasProviderScopedModel(
   modelId: string,
 ): boolean {
   const scopedModel = formatScopedModel(providerId, modelId)
-  if ((snapshot.models ?? []).includes(scopedModel)) {
+  if ((snapshot.models ?? []).some(model => parseOpenCodeProviderScopedModelRef(model)?.raw === scopedModel)) {
     return true
   }
 
   const providers = snapshot.configProviders?.providers ?? []
   for (const provider of providers) {
-    if (asString(provider.id) !== providerId) {
+    if (normalizeOpenCodeProviderId(asString(provider.id)) !== providerId) {
       continue
     }
     const models = asRecord(provider.models)
@@ -133,7 +132,7 @@ function hasProviderScopedModel(
   }
 
   for (const provider of snapshot.providers?.all ?? []) {
-    if (asString(provider.id) !== providerId) {
+    if (normalizeOpenCodeProviderId(asString(provider.id)) !== providerId) {
       continue
     }
     const models = asRecord(provider.models)
@@ -148,32 +147,38 @@ function getKnownProviderIds(snapshot: OpenCodeProvisioningSnapshot): Set<string
   const providerIds = new Set<string>()
 
   for (const provider of snapshot.configProviders?.providers ?? []) {
-    const providerId = asString(provider.id)
+    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
     if (providerId) {
       providerIds.add(providerId)
     }
   }
 
   for (const provider of snapshot.providers?.all ?? []) {
-    const providerId = asString(provider.id)
+    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
     if (providerId) {
       providerIds.add(providerId)
     }
   }
 
   for (const providerId of snapshot.providers?.connected ?? []) {
-    const normalizedProviderId = asString(providerId)
+    const normalizedProviderId = normalizeOpenCodeProviderId(asString(providerId))
     if (normalizedProviderId) {
       providerIds.add(normalizedProviderId)
     }
   }
 
   for (const providerId of Object.keys(asRecord(snapshot.configProviders?.default) ?? {})) {
-    providerIds.add(providerId)
+    const normalizedProviderId = normalizeOpenCodeProviderId(providerId)
+    if (normalizedProviderId) {
+      providerIds.add(normalizedProviderId)
+    }
   }
 
   for (const providerId of Object.keys(asRecord(snapshot.providers?.default) ?? {})) {
-    providerIds.add(providerId)
+    const normalizedProviderId = normalizeOpenCodeProviderId(providerId)
+    if (normalizedProviderId) {
+      providerIds.add(normalizedProviderId)
+    }
   }
 
   for (const model of snapshot.models ?? []) {
@@ -187,7 +192,7 @@ function getKnownProviderIds(snapshot: OpenCodeProvisioningSnapshot): Set<string
 }
 
 function formatScopedModel(providerId: string, modelId: string): string {
-  return `${providerId}/${modelId}`
+  return formatOpenCodeModelRef(providerId, modelId)
 }
 
 export function resolveOpenCodeProviderScopedModel(
@@ -202,7 +207,7 @@ export function resolveOpenCodeProviderScopedModel(
         `OpenCode provider-scoped model "${trimmed}" was not found in the live provider catalog`,
       )
     }
-    return trimmed
+    return scoped.raw
   }
 
   const defaultMatch = getDefaultProviderMatch(snapshot, trimmed)
@@ -218,7 +223,11 @@ export function resolveOpenCodeProviderScopedModel(
     return formatScopedModel(matches[0].providerId, matches[0].modelId)
   }
 
-  const connectedProviders = new Set(snapshot.providers?.connected ?? [])
+  const connectedProviders = new Set(
+    (snapshot.providers?.connected ?? [])
+      .map(providerId => normalizeOpenCodeProviderId(providerId))
+      .filter((providerId): providerId is string => Boolean(providerId)),
+  )
   const connectedMatches = matches.filter(match => connectedProviders.has(match.providerId))
   if (connectedMatches.length === 1 && connectedMatches[0]) {
     return formatScopedModel(connectedMatches[0].providerId, connectedMatches[0].modelId)

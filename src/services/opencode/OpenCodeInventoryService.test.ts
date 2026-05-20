@@ -64,12 +64,22 @@ describe('OpenCodeInventoryService parsers', () => {
   test('parses model and agent output', () => {
     expect(
       parseOpenCodeModelsOutput(
-        'openai/gpt-5.4\nopenrouter/moonshotai/kimi-k2\nopencode/qwen3.6-plus-free\n',
+        [
+          'openai/gpt-5.4',
+          'openrouter/moonshotai/kimi-k2',
+          'opencode/qwen3.6-plus-free',
+          'llama.cpp/qwen3-coder:a3b Local model',
+          'ollama/qwen2.5-coder:0.5b 12 GB',
+          'lmstudio/google/gemma-3n-e4b ready',
+        ].join('\n'),
       ),
     ).toEqual([
       'openai/gpt-5.4',
       'openrouter/moonshotai/kimi-k2',
       'opencode/qwen3.6-plus-free',
+      'llama.cpp/qwen3-coder:a3b',
+      'ollama/qwen2.5-coder:0.5b',
+      'lmstudio/google/gemma-3n-e4b',
     ])
 
     expect(parseOpenCodeAgentListOutput('build (primary)\nexplore (subagent)\n')).toEqual([
@@ -103,12 +113,21 @@ openrouter/openai/gpt-oss-20b:free
     "output": 0
   }
 }
+llama.cpp/qwen3-coder:a3b local
+{
+  "cost": {
+    "input": 0,
+    "output": 0
+  },
+  "limits": { "context": 32768 }
+}
 `)
 
     expect(parsed.models).toEqual([
       'opencode/big-pickle',
       'openai/gpt-5.4',
       'openrouter/openai/gpt-oss-20b:free',
+      'llama.cpp/qwen3-coder:a3b',
     ])
     expect(parsed.modelMetadata[0]?.context).toBe(200000)
     expect(parsed.modelMetadata[0]?.limits).toEqual({ context: 200000 })
@@ -119,6 +138,7 @@ openrouter/openai/gpt-oss-20b:free
     expect(isOpenCodeModelFree('openrouter/openai/gpt-oss-20b:free', parsed.modelMetadata)).toBe(
       true,
     )
+    expect(parsed.modelMetadata.find(item => item.id === 'llama.cpp/qwen3-coder:a3b')?.context).toBe(32768)
     expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
   })
 })

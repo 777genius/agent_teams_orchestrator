@@ -18,6 +18,10 @@ import {
   isOpenCodeModelFree,
   openCodeInventoryService,
 } from '../opencode/OpenCodeInventoryService.js'
+import {
+  buildOpenCodeModelAccessCatalogFromInventorySnapshot,
+  hasOpenCodeConfiguredAuthlessModel,
+} from '../opencode/OpenCodeModelAccessPolicy.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
@@ -511,7 +515,10 @@ async function buildOpenCodeStatus(
     snapshot.models,
     snapshot.modelMetadata,
   )
-  const authenticated = hasConnectedProvider || hasBuiltinFreeModel
+  const hasConfiguredAuthlessModel = hasOpenCodeConfiguredAuthlessModel(
+    buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot),
+  )
+  const authenticated = hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
   const fetchedAt = new Date()
   const defaultModel = runtimeModels.find(model => model === 'opencode/big-pickle')
     ?? runtimeModels[0]
@@ -571,7 +578,9 @@ async function buildOpenCodeStatus(
       ? 'opencode_managed'
       : hasBuiltinFreeModel
         ? 'opencode_builtin_free'
-        : null,
+        : hasConfiguredAuthlessModel
+          ? 'opencode_configured_local'
+          : null,
     verificationState: !snapshot.detected
       ? 'offline'
       : snapshot.probeError && snapshot.models.length === 0 && !authenticated
@@ -629,9 +638,13 @@ async function buildOpenCodeStatus(
       ? {
           kind: 'opencode-cli',
           label: 'OpenCode CLI',
-          authMethodDetail: hasBuiltinFreeModel && !hasConnectedProvider
-            ? 'built-in free models'
-            : snapshot.profile?.authState ?? null,
+          authMethodDetail: hasConnectedProvider
+            ? snapshot.profile?.authState ?? null
+            : hasBuiltinFreeModel
+              ? 'built-in free models'
+              : hasConfiguredAuthlessModel
+                ? 'configured local OpenCode model'
+                : snapshot.profile?.authState ?? null,
         }
       : null,
   }

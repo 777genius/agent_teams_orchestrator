@@ -8,6 +8,7 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
+import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -18,7 +19,7 @@ import type {
 
 const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
-const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 60_000
+const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 120_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
 const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 2 * 60_000
 const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
@@ -419,6 +420,7 @@ export class OpenCodeExecutionProbe {
     const host = await this.hostManager.ensureHost({
       projectPath: params.projectPath,
       profileOptions: {
+        includeAppMcp: false,
         modelOutputLimitOverrides: [
           {
             modelId: params.selectedModel,
@@ -631,7 +633,7 @@ export class OpenCodeExecutionProbe {
         title: `probe:${params.selectedModel}`,
       })
       const probeMessage = {
-        agent: 'teammate',
+        agent: OPEN_CODE_MODEL_PROBE_AGENT_NAME,
         model: parseProviderScopedModel(params.selectedModel),
         parts: [{ type: 'text', text: prompt }],
       }
@@ -660,13 +662,13 @@ export class OpenCodeExecutionProbe {
         })
       }
 
+      const deadlineMs = nowMs() + probeTimeoutMs
       let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
       let latestDurableState: OpenCodeExecutionProbeResult['durableState'] = 'unknown'
       let latestAssistantText: string | null = null
       let latestAssistantPreview: string | null = null
       let latestToolCallCount = 0
       let latestErrorCount = 0
-      const deadlineMs = startedAtMs + probeTimeoutMs
 
       for (;;) {
         const [statusMap, messages] = await Promise.all([

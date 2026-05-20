@@ -14,6 +14,7 @@ export type OpenCodeModelOutputLimitOverride = {
 
 export type OpenCodePrepareProfileOptions = {
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
+  includeAppMcp?: boolean
 }
 
 export type OpenCodePreparedProfile = {
@@ -154,6 +155,8 @@ export type OpenCodeProviderListEntry = {
   id?: string
   source?: string
   name?: string
+  npm?: string
+  options?: Record<string, unknown>
   models?: Record<string, unknown>
 }
 

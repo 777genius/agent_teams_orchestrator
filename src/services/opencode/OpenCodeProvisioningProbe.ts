@@ -31,6 +31,8 @@ type CacheEntry = {
 
 type OpenCodeProvisioningProbeOptions = {
   disposeHostOnRelease?: boolean
+  ensureAppMcp?: boolean
+  bypassCache?: boolean
 }
 
 type RetainedProvisioningProbe = {
@@ -72,8 +74,9 @@ export class OpenCodeProvisioningProbe {
   ): Promise<OpenCodeProvisioningSnapshot> {
     const result = await this.probeWithHost(projectPath, {
       retainHost: false,
-      useCache: true,
+      useCache: options.bypassCache !== true,
       disposeHostOnRelease: options.disposeHostOnRelease,
+      ensureAppMcp: options.ensureAppMcp !== false,
     })
     return result.snapshot
   }
@@ -87,15 +90,24 @@ export class OpenCodeProvisioningProbe {
 
   private async probeWithHost(
     projectPath: string | null | undefined,
-    options: { retainHost: boolean; useCache: boolean; disposeHostOnRelease?: boolean },
+    options: {
+      retainHost: boolean
+      useCache: boolean
+      disposeHostOnRelease?: boolean
+      ensureAppMcp?: boolean
+    },
   ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe(projectPath)
+    const inventory = await inventoryService.probe(projectPath, {
+      bypassCache: !options.useCache,
+      includeAppMcp: options.ensureAppMcp !== false,
+    })
     const cacheKey = [
       inventory.projectPath,
       inventory.profile?.projectBehaviorFingerprint ?? 'none',
       inventory.profile?.managedAuthFingerprint ?? 'none',
       inventory.profile?.managedConfigFingerprint ?? 'none',
+      options.ensureAppMcp === false ? 'without-app-mcp' : 'with-app-mcp',
     ].join('::')
     const cached = options.useCache ? this.cache.get(cacheKey) : undefined
     if (cached && cached.expiresAt > Date.now()) {
@@ -200,11 +212,13 @@ export class OpenCodeProvisioningProbe {
         client.getProviderAuth(),
         client.listAgents(),
       ])
-      const appMcp = await mcpManager.ensureAppMcp({
-        baseUrl: host.baseUrl,
-        attachIfMissing: true,
-      })
-      if (appMcp.summary.status === 'attached') {
+      const appMcp = options.ensureAppMcp === false
+        ? null
+        : await mcpManager.ensureAppMcp({
+          baseUrl: host.baseUrl,
+          attachIfMissing: true,
+        })
+      if (appMcp?.summary.status === 'attached') {
         host.resolvedConfigFingerprint =
           (await hostManager.refreshResolvedConfigFingerprint?.(host.hostKey))
           ?? host.resolvedConfigFingerprint
@@ -259,7 +273,7 @@ export class OpenCodeProvisioningProbe {
           `Managed snapshot mismatch (${String(config.snapshot ?? 'unset')} instead of true)`,
         )
       }
-      if (appMcp.summary.status === 'missing' || appMcp.summary.status === 'attach_failed') {
+      if (appMcp?.summary.status === 'missing' || appMcp?.summary.status === 'attach_failed') {
         diagnostics.push(...appMcp.summary.diagnostics)
       }
 
@@ -279,8 +293,8 @@ export class OpenCodeProvisioningProbe {
         },
         providerAuth,
         agents,
-        mcp: appMcp.mcp,
-        appMcp: appMcp.summary,
+        mcp: appMcp?.mcp ?? null,
+        appMcp: appMcp?.summary ?? null,
         probeError: diagnostics[0] ?? null,
         diagnostics,
       }

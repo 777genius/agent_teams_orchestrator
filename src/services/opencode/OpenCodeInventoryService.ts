@@ -3,6 +3,11 @@ import stripAnsi from 'strip-ansi'
 
 import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getCwd } from '../../utils/cwd.js'
+import {
+  normalizeOpenCodeProviderId,
+  parseFirstOpenCodeModelToken,
+  parseOpenCodeProviderScopedModelRef,
+} from './OpenCodeModelRef.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
@@ -24,6 +29,7 @@ type OpenCodeInventoryProbeMode = 'full' | 'summary'
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
   mode?: OpenCodeInventoryProbeMode
+  includeAppMcp?: boolean
 }
 
 type CacheEntry = {
@@ -32,7 +38,7 @@ type CacheEntry = {
 }
 
 function normalizeProviderId(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, '-')
+  return normalizeOpenCodeProviderId(value.replace(/\s+/g, '-')) ?? value.trim().toLowerCase().replace(/\s+/g, '-')
 }
 
 function getTrimmedNonEmptyLines(output: string): string[] {
@@ -76,7 +82,11 @@ function parseOpenCodeConnectedProviderLine(
 }
 
 export function parseOpenCodeModelsOutput(output: string): string[] {
-  return getTrimmedNonEmptyLines(output).filter(line => /^[a-z0-9-]+\/\S+$/i.test(line))
+  return Array.from(new Set(
+    getTrimmedNonEmptyLines(output)
+      .map(line => parseFirstOpenCodeModelToken(line)?.raw)
+      .filter((model): model is string => Boolean(model)),
+  ))
 }
 
 export function getOpenCodeVerboseModelsArgs(): string[] {
@@ -165,10 +175,11 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? ''
-    if (!/^[a-z0-9-]+\/\S+$/i.test(line)) {
+    const modelRef = parseFirstOpenCodeModelToken(line)
+    if (!modelRef) {
       continue
     }
-    models.push(line)
+    models.push(modelRef.raw)
     const nextLine = lines[index + 1]
     if (!nextLine?.startsWith('{')) {
       continue
@@ -179,11 +190,11 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
       const raw = JSON.parse(block) as Record<string, unknown>
       const limits = raw.limit ?? raw.limits ?? null
       modelMetadata.push({
-        id: line,
+        id: modelRef.raw,
         cost: raw.cost ?? null,
         context: getModelContextLimit(limits),
         limits,
-        free: isFreeCost(raw.cost) && isExplicitFreeOpenCodeModelId(line),
+        free: isFreeCost(raw.cost) && isExplicitFreeOpenCodeModelId(modelRef.raw),
         raw,
       })
       index = blockEnd
@@ -360,7 +371,7 @@ export class OpenCodeInventoryService {
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
-    const cacheKey = `${resolvedProjectPath}\0${mode}`
+    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
@@ -393,7 +404,9 @@ export class OpenCodeInventoryService {
       return missingSnapshot
     }
 
-    const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath)
+    const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath, {
+      includeAppMcp: options.includeAppMcp !== false,
+    })
     const [versionResult, providersResult, modelsResult, agentsResult] = await Promise.all([
       this.execOpenCode(binaryPath, ['--version'], profile),
       this.execOpenCode(binaryPath, ['providers', 'list'], profile),
@@ -469,7 +482,7 @@ export class OpenCodeInventoryService {
     const availableProviders = Array.from(
       new Set([
         ...connectedProviders.map(provider => provider.id),
-        ...models.map(model => model.split('/')[0]?.trim().toLowerCase()).filter(Boolean),
+        ...models.map(model => parseOpenCodeProviderScopedModelRef(model)?.providerId).filter(Boolean),
       ]),
     ).sort()
 

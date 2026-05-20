@@ -15,9 +15,12 @@ import {
 } from './OpenCodeBridgePreconditions.js'
 import {
   hasOpenCodeBuiltinFreeModel,
-  isOpenCodeBuiltinFreeModelId,
   openCodeInventoryService,
 } from './OpenCodeInventoryService.js'
+import {
+  buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
+  evaluateOpenCodeModelAccess,
+} from './OpenCodeModelAccessPolicy.js'
 import {
   OPEN_CODE_APP_MCP_SERVER_NAME,
   type ResolvedAppMcpLaunchConfig,
@@ -1544,20 +1547,19 @@ function readinessData(
   requireSelectedModel: boolean,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
-  const models = Array.from(new Set([
-    ...(snapshot.configProviders?.providers
-      ?.flatMap(provider => Object.keys(asRecord(provider.models) ?? {}).map(model => `${provider.id}/${model}`))
-      .filter((model): model is string => Boolean(model))
-      ?? []),
-    ...(snapshot.models ?? []),
-  ])).sort()
+  const models = getOpenCodeAccessPolicyModels(snapshot)
   const appMcpConnected = snapshot.appMcp?.connected === true || snapshot.appMcp?.status === 'present' || snapshot.appMcp?.status === 'attached'
   const requiredToolsPresent = appMcpConnected && toolProof.ok
-  const hasAuthFreeOpenCodeProvider =
-    isOpenCodeBuiltinFreeModelId(selectedModel, snapshot.modelMetadata)
-    || isOpenCodeBuiltinFreeModelId(executionOutcome?.modelId, snapshot.modelMetadata)
-    || hasOpenCodeBuiltinFreeModel(models, snapshot.modelMetadata)
-  const hasLaunchProvider = connectedProviders.length > 0 || hasAuthFreeOpenCodeProvider
+  const hasAuthFreeOpenCodeProvider = hasOpenCodeBuiltinFreeModel(models, snapshot.modelMetadata)
+  const selectedModelAccess = evaluateOpenCodeModelAccess({
+    selectedModel,
+    catalog: getOpenCodeAccessPolicyCatalog(snapshot),
+    executionOutcome,
+  })
+  const hasLaunchProvider =
+    connectedProviders.length > 0
+    || hasAuthFreeOpenCodeProvider
+    || selectedModelAccess.launchAllowed
   const diagnostics = [
     ...snapshot.diagnostics,
     ...(executionOutcome?.diagnostics ?? []),
@@ -1575,10 +1577,20 @@ function readinessData(
     state = 'unknown_error'
     launchAllowed = false
     missing.push(snapshot.probeError ?? 'OpenCode host is not healthy')
+  } else if (executionOutcome && executionOutcome.outcome === 'not_authenticated') {
+    state = 'not_authenticated'
+    launchAllowed = false
+    missing.push(
+      executionOutcome.reason ?? 'OpenCode provider authentication failed for the selected model',
+    )
+  } else if (executionOutcome && executionOutcome.outcome !== 'available') {
+    state = 'model_unavailable'
+    launchAllowed = false
+    missing.push(executionOutcome.reason ?? 'OpenCode selected model execution is unavailable')
   } else if (!hasLaunchProvider) {
     state = 'not_authenticated'
     launchAllowed = false
-    missing.push('No connected OpenCode providers found')
+    missing.push(selectedModelAccess.reason ?? 'No connected OpenCode providers found')
   } else if (requireSelectedModel && !selectedModel) {
     state = 'model_unavailable'
     launchAllowed = false
@@ -1591,16 +1603,21 @@ function readinessData(
         ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
         : 'Agent Teams MCP tools are not visible in OpenCode',
     )
-  } else if (executionOutcome && executionOutcome.outcome === 'not_authenticated') {
+  } else if (
+    selectedModelAccess.kind === 'configured_authless'
+    && selectedModelAccess.requiresExecutionProof
+  ) {
     state = 'not_authenticated'
     launchAllowed = false
-    missing.push(
-      executionOutcome.reason ?? 'OpenCode provider authentication failed for the selected model',
-    )
-  } else if (executionOutcome && executionOutcome.outcome !== 'available') {
+    missing.push(selectedModelAccess.reason ?? 'OpenCode selected model requires execution verification')
+  } else if (selectedModelAccess.kind === 'unknown_model') {
     state = 'model_unavailable'
     launchAllowed = false
-    missing.push(executionOutcome.reason ?? 'OpenCode selected model execution is unavailable')
+    missing.push(selectedModelAccess.reason ?? 'OpenCode selected model is unavailable')
+  } else if (selectedModelAccess.kind === 'not_authenticated') {
+    state = 'not_authenticated'
+    launchAllowed = false
+    missing.push(selectedModelAccess.reason ?? 'OpenCode selected model provider is not connected')
   }
 
   return {
@@ -1626,6 +1643,27 @@ function readinessData(
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
   }
+}
+
+function getOpenCodeAccessPolicyModels(snapshot: OpenCodeProvisioningSnapshot): string[] {
+  return Array.from(new Set([
+    ...(snapshot.configProviders?.providers
+      ?.flatMap(provider => {
+        const providerId = asString(provider.id)
+        return providerId
+          ? Object.keys(asRecord(provider.models) ?? {}).map(model => `${providerId}/${model}`)
+          : []
+      })
+      ?? []),
+    ...(snapshot.models ?? []),
+  ])).sort()
+}
+
+function getOpenCodeAccessPolicyCatalog(snapshot: OpenCodeProvisioningSnapshot) {
+  return buildOpenCodeModelAccessCatalogFromProvisioningSnapshot({
+    ...snapshot,
+    models: getOpenCodeAccessPolicyModels(snapshot),
+  })
 }
 
 function isAppManagedOpenCodeBootstrap(
@@ -1884,6 +1922,69 @@ function buildOpenCodeExecutionOutcome(
   }
 }
 
+async function assertOpenCodeSelectedModelLaunchAccess(
+  selectedModel: string,
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<void> {
+  const catalog = getOpenCodeAccessPolicyCatalog(snapshot)
+  const access = evaluateOpenCodeModelAccess({
+    selectedModel,
+    catalog,
+  })
+
+  if (access.launchAllowed) {
+    return
+  }
+
+  if (access.kind !== 'configured_authless' || !access.requiresExecutionProof) {
+    throw new Error(access.reason ?? 'OpenCode selected model provider is not connected')
+  }
+
+  const executionOutcome = await openCodeExecutionProbe.probeModel({
+    selectedModel,
+    projectPath: snapshot.projectPath,
+    disposeHostOnRelease: true,
+  }).catch(error =>
+    buildOpenCodeExecutionOutcome(
+      selectedModel,
+      'unknown',
+      error instanceof Error ? error.message : String(error),
+    ),
+  )
+  const verifiedAccess = evaluateOpenCodeModelAccess({
+    selectedModel,
+    catalog,
+    executionOutcome,
+  })
+  if (verifiedAccess.launchAllowed) {
+    return
+  }
+
+  throw new Error(
+    verifiedAccess.reason
+      ?? executionOutcome.reason
+      ?? 'OpenCode selected model execution is unavailable',
+  )
+}
+
+function assertOpenCodeSelectedModelReconcilable(
+  selectedModel: string,
+  snapshot: OpenCodeProvisioningSnapshot,
+): void {
+  const access = evaluateOpenCodeModelAccess({
+    selectedModel,
+    catalog: getOpenCodeAccessPolicyCatalog(snapshot),
+  })
+  if (
+    access.launchAllowed
+    || (access.kind === 'configured_authless' && access.requiresExecutionProof)
+  ) {
+    return
+  }
+
+  throw new Error(access.reason ?? 'OpenCode selected model provider is not connected')
+}
+
 function skippedAppMcpToolProof(): AppMcpToolProof {
   return {
     ok: true,
@@ -1894,66 +1995,36 @@ function skippedAppMcpToolProof(): AppMcpToolProof {
   }
 }
 
-function getProviderIdFromScopedModel(modelId: string): string | null {
-  const slashIndex = modelId.indexOf('/')
-  if (slashIndex <= 0) {
-    return null
-  }
-  return modelId.slice(0, slashIndex)
-}
-
-function getSelectedModelProviderConnectionFailure(
-  selectedModel: string | null,
-  snapshot: OpenCodeProvisioningSnapshot,
-): string | null {
-  if (!selectedModel) {
-    return null
-  }
-  const providerId = getProviderIdFromScopedModel(selectedModel)
-  if (!providerId) {
-    return null
-  }
-  const connectedProviders = new Set(snapshot.providers?.connected ?? [])
-  if (connectedProviders.has(providerId)) {
-    return null
-  }
-  if (
-    providerId === 'opencode'
-    && isOpenCodeBuiltinFreeModelId(selectedModel, snapshot.modelMetadata)
-  ) {
-    return null
-  }
-  return `OpenCode provider "${providerId}" for selected model "${selectedModel}" is not connected`
-}
-
 async function runReadiness(envelope: BridgeEnvelope) {
   // Windows packaged bridge processes can lose stdout if they dispose the
   // just-used OpenCode host before the response is flushed. Release only the
   // short preflight lease there; cleanupHosts handles stale persistent hosts.
   const disposeReadinessHostOnRelease = process.platform !== 'win32'
-  const snapshot = await openCodeProvisioningProbe.probe(
-    asString(envelope.body.projectPath) ?? envelope.cwd,
-    { disposeHostOnRelease: disposeReadinessHostOnRelease },
-  )
+  const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
+  const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
+  const modelSnapshot = await openCodeProvisioningProbe.probe(
+    projectPath,
+    {
+      disposeHostOnRelease: shouldProbeSelectedModel ? true : disposeReadinessHostOnRelease,
+      ensureAppMcp: !shouldProbeSelectedModel,
+      bypassCache: shouldProbeSelectedModel,
+    },
+  )
+  let snapshot = modelSnapshot
   let executionModel: string | null = null
-  let providerConnectionFailureReason: string | null = null
   let executionOutcomePromise: Promise<Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined> =
     Promise.resolve(undefined)
 
   if (selectedModel) {
     try {
       executionModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
-      providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
-        executionModel,
-        snapshot,
-      )
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
       const executionOutcome = buildOpenCodeExecutionOutcome(selectedModel, 'unavailable', reason)
       const fallbackReadiness = readinessData(
-        snapshot,
+        modelSnapshot,
         selectedModel,
         executionOutcome,
         skippedAppMcpToolProof(),
@@ -1967,7 +2038,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
           launchAllowed: false,
           missing: [reason],
           diagnostics: uniqueSortedStrings([
-            ...snapshot.diagnostics,
+            ...modelSnapshot.diagnostics,
             ...executionOutcome.diagnostics,
             reason,
           ]),
@@ -1976,38 +2047,36 @@ async function runReadiness(envelope: BridgeEnvelope) {
     }
   }
 
-  if (providerConnectionFailureReason && executionModel) {
-    const executionOutcome = buildOpenCodeExecutionOutcome(
-      executionModel,
-      'not_authenticated',
-      providerConnectionFailureReason,
-    )
-    const fallbackReadiness = readinessData(
-      snapshot,
-      selectedModel,
-      executionOutcome,
-      skippedAppMcpToolProof(),
-      requireSelectedModel,
-    )
-    return {
-      snapshot,
-      data: {
-        ...fallbackReadiness,
-        state: 'not_authenticated',
-        launchAllowed: false,
-        missing: [providerConnectionFailureReason],
-        diagnostics: uniqueSortedStrings([
-          ...snapshot.diagnostics,
-          ...executionOutcome.diagnostics,
-          providerConnectionFailureReason,
-        ]),
-      },
-    }
-  } else if (envelope.body.requireExecutionProbe === true && executionModel) {
-    executionOutcomePromise = openCodeExecutionProbe.probeModel({
+  if (executionModel && envelope.body.requireExecutionProbe !== true) {
+    const selectedModelAccess = evaluateOpenCodeModelAccess({
       selectedModel: executionModel,
-      projectPath: snapshot.projectPath,
-      disposeHostOnRelease: disposeReadinessHostOnRelease,
+      catalog: getOpenCodeAccessPolicyCatalog(snapshot),
+    })
+    if (
+      !selectedModelAccess.launchAllowed &&
+      (
+        selectedModelAccess.kind === 'not_authenticated' ||
+        selectedModelAccess.kind === 'configured_authless'
+      )
+    ) {
+      return {
+        snapshot,
+        data: readinessData(
+          snapshot,
+          executionModel,
+          undefined,
+          skippedAppMcpToolProof(),
+          requireSelectedModel,
+        ),
+      }
+    }
+  }
+
+  if (envelope.body.requireExecutionProbe === true && executionModel) {
+    const executionOutcome = await openCodeExecutionProbe.probeModel({
+      selectedModel: executionModel,
+      projectPath: modelSnapshot.projectPath,
+      disposeHostOnRelease: true,
     }).catch(error =>
       buildOpenCodeExecutionOutcome(
         executionModel,
@@ -2015,6 +2084,12 @@ async function runReadiness(envelope: BridgeEnvelope) {
         error instanceof Error ? error.message : String(error),
       ),
     )
+    executionOutcomePromise = Promise.resolve(executionOutcome)
+    snapshot = await openCodeProvisioningProbe.probe(projectPath, {
+      disposeHostOnRelease: disposeReadinessHostOnRelease,
+      ensureAppMcp: true,
+      bypassCache: true,
+    })
   }
   const toolProofPromise = proveAppMcpTools(snapshot)
   const [executionOutcome, toolProof] = await Promise.all([
@@ -2212,13 +2287,7 @@ async function runLaunchWithProvisioningSnapshot(
   })
   assertOpenCodeLaunchRuntimeAvailable(snapshot)
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
-  const providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
-    apiSelectedModel,
-    snapshot,
-  )
-  if (providerConnectionFailureReason) {
-    throw new Error(providerConnectionFailureReason)
-  }
+  await assertOpenCodeSelectedModelLaunchAccess(apiSelectedModel, snapshot)
   await assertOpenCodeLaunchMcpReady(snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
   const diagnostics: TeamDiagnostic[] = []
@@ -2482,13 +2551,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
       let expectedSelectedModel: string
       try {
         expectedSelectedModel = resolveOpenCodeProviderScopedModel(expectedModel, snapshot)
-        const providerConnectionFailureReason = getSelectedModelProviderConnectionFailure(
-          expectedSelectedModel,
-          snapshot,
-        )
-        if (providerConnectionFailureReason) {
-          throw new Error(providerConnectionFailureReason)
-        }
+        assertOpenCodeSelectedModelReconcilable(expectedSelectedModel, snapshot)
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
         members[name] = {

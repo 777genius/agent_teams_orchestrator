@@ -5,6 +5,7 @@ import path from 'node:path'
 import type { Dirent } from 'node:fs'
 
 import { getCwd } from '../../utils/cwd.js'
+import { safeParseJSONC } from '../../utils/json.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -32,6 +33,10 @@ import type {
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
 } from './types.js'
+
+export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
+export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
+export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
 
 function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -275,11 +280,11 @@ export function buildManagedConfig(
 ): Record<string, unknown> {
   const config: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
-    default_agent: 'teammate',
+    default_agent: OPEN_CODE_TEAMMATE_AGENT_NAME,
     share: 'disabled',
     snapshot: true,
     agent: {
-      teammate: {
+      [OPEN_CODE_TEAMMATE_AGENT_NAME]: {
         mode: 'primary',
         description: 'Managed teammate agent for claude-multimodel runtime orchestration.',
         permission: {
@@ -302,7 +307,7 @@ export function buildManagedConfig(
           'agent_teams_*': 'allow',
         },
       },
-      'teammate-bootstrap': {
+      [OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME]: {
         mode: 'primary',
         description: 'Silent launch bootstrap agent restricted to Agent Teams MCP attach tools.',
         tools: {
@@ -318,6 +323,16 @@ export function buildManagedConfig(
           'agent_teams_*': 'allow',
           'mcp__agent-teams__*': 'allow',
           'mcp__agent_teams__*': 'allow',
+        },
+      },
+      [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: {
+        mode: 'primary',
+        description: 'Minimal model execution probe agent with tools disabled.',
+        tools: {
+          '*': false,
+        },
+        permission: {
+          '*': 'deny',
         },
       },
     },
@@ -365,6 +380,104 @@ export function buildManagedConfig(
   }
 
   return config
+}
+
+function hasOwnRecordKeys(value: Record<string, unknown>): boolean {
+  return Object.keys(value).length > 0
+}
+
+function deepMergeOpenCodeConfig(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base }
+  for (const [key, value] of Object.entries(override)) {
+    const existing = merged[key]
+    if (
+      value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && existing
+      && typeof existing === 'object'
+      && !Array.isArray(existing)
+    ) {
+      merged[key] = deepMergeOpenCodeConfig(
+        existing as Record<string, unknown>,
+        value as Record<string, unknown>,
+      )
+      continue
+    }
+    merged[key] = value
+  }
+  return merged
+}
+
+function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> {
+  const source = asRecord(value)
+  const safe: Record<string, unknown> = {}
+  const provider = asRecord(source.provider)
+  if (hasOwnRecordKeys(provider)) {
+    safe.provider = provider
+  }
+
+  const model = typeof source.model === 'string' ? source.model.trim() : ''
+  if (model) {
+    safe.model = model
+  }
+
+  const smallModel = typeof source.small_model === 'string' ? source.small_model.trim() : ''
+  if (smallModel) {
+    safe.small_model = smallModel
+  }
+
+  return safe
+}
+
+function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
+  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
+  const candidates = [
+    path.join(xdgConfigHome, 'opencode', 'opencode.json'),
+    path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
+    path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
+    path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
+  ]
+  const explicitConfigPath = env.OPENCODE_CONFIG?.trim()
+  if (explicitConfigPath) {
+    candidates.push(path.resolve(explicitConfigPath))
+  }
+  return Array.from(new Set(candidates.map(candidate => path.resolve(candidate))))
+}
+
+async function readSafeOpenCodeRuntimeConfigFile(
+  filePath: string,
+): Promise<Record<string, unknown>> {
+  try {
+    return pickSafeOpenCodeRuntimeConfig(safeParseJSONC(await readFile(filePath, 'utf8')))
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') {
+      return {}
+    }
+    return {}
+  }
+}
+
+async function readSafeOpenCodeRuntimeConfigImport(
+  env: NodeJS.ProcessEnv,
+): Promise<Record<string, unknown>> {
+  let importedConfig: Record<string, unknown> = {}
+  for (const configPath of getOpenCodeConfigImportPaths(env)) {
+    importedConfig = deepMergeOpenCodeConfig(
+      importedConfig,
+      await readSafeOpenCodeRuntimeConfigFile(configPath),
+    )
+  }
+
+  importedConfig = deepMergeOpenCodeConfig(
+    importedConfig,
+    pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env.OPENCODE_CONFIG_CONTENT)),
+  )
+
+  return importedConfig
 }
 
 function applyManagedPathEnvironmentToMcpConfig(
@@ -534,11 +647,19 @@ export class OpenCodeProfileManager {
     const { projectBehaviorFingerprint, behaviorSources } =
       await collectProjectBehaviorMetadata(resolvedProjectPath)
     const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
-    const managedConfig = buildManagedConfig(await this.resolveManagedAppMcpConfig(), {
-      allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
-      defaultModelId: managedRuntimePreferences.defaultModelId,
-      modelOutputLimitOverrides: options.modelOutputLimitOverrides,
-    })
+    const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
+    const appMcpConfig =
+      options.includeAppMcp === false
+        ? null
+        : await this.resolveManagedAppMcpConfig()
+    const managedConfig = deepMergeOpenCodeConfig(
+      importedRuntimeConfig,
+      buildManagedConfig(appMcpConfig, {
+        allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
+        defaultModelId: managedRuntimePreferences.defaultModelId,
+        modelOutputLimitOverrides: options.modelOutputLimitOverrides,
+      }),
+    )
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
@@ -617,6 +738,21 @@ export class OpenCodeProfileManager {
       }
     })()
 
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: homePath,
+      USERPROFILE: homePath,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      XDG_DATA_HOME: xdgDataHome,
+      XDG_CACHE_HOME: xdgCacheHome,
+      NPM_CONFIG_CACHE: sharedNpmCachePath,
+      [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+      [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+      OPENCODE_DISABLE_CLAUDE_CODE: '1',
+      OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
+    }
+    delete env.OPENCODE_CONFIG
+
     return {
       projectPath: resolvedProjectPath,
       profileRootKey,
@@ -635,19 +771,7 @@ export class OpenCodeProfileManager {
       sourceAuthFingerprint,
       managedAuthFingerprint,
       authState,
-      env: applyOpenCodeAutoUpdatePolicy({
-        ...process.env,
-        HOME: homePath,
-        USERPROFILE: homePath,
-        XDG_CONFIG_HOME: xdgConfigHome,
-        XDG_DATA_HOME: xdgDataHome,
-        XDG_CACHE_HOME: xdgCacheHome,
-        NPM_CONFIG_CACHE: sharedNpmCachePath,
-        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
-        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
-        OPENCODE_DISABLE_CLAUDE_CODE: '1',
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
-      }),
+      env: applyOpenCodeAutoUpdatePolicy(env),
     }
     })
   }

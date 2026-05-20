@@ -96,6 +96,14 @@ describe('OpenCodeProfileManager project behavior contract', () => {
             'mcp__agent_teams__*': 'allow',
           },
         },
+        'teammate-model-probe': {
+          tools: {
+            '*': false,
+          },
+          permission: {
+            '*': 'deny',
+          },
+        },
       },
     })
   })
@@ -123,6 +131,165 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         timeout: 8000,
       },
     })
+  })
+
+  test('can prepare a managed profile without the app MCP overlay for model-only probes', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousMcpCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+    const previousMcpEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+    const appDataHome = path.join(tempDir, 'app-data-no-mcp')
+    const appCacheHome = path.join(tempDir, 'app-cache-no-mcp')
+    const mcpEntryPath = path.join(tempDir, 'agent-teams-mcp.js')
+    await writeFile(mcpEntryPath, 'process.exit(0)\n', 'utf8')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+    process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = mcpEntryPath
+
+    try {
+      const profile = await new OpenCodeProfileManager().prepareProfile(tempDir, {
+        includeAppMcp: false,
+      })
+
+      expect(profile.managedConfig.mcp).toBeUndefined()
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+      if (previousMcpCommand === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = previousMcpCommand
+      }
+      if (previousMcpEntry === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
+      }
+    }
+  })
+
+  test('imports only safe user OpenCode config into managed profile content', async () => {
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    const previousOpenCodeConfig = process.env.OPENCODE_CONFIG
+    const previousOpenCodeConfigContent = process.env.OPENCODE_CONFIG_CONTENT
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-config-import')
+    const appCacheHome = path.join(tempDir, 'app-cache-config-import')
+    const xdgConfigHome = path.join(tempDir, 'real-xdg-config')
+    const customConfigPath = path.join(tempDir, 'custom-opencode.jsonc')
+    await mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+    await writeFile(
+      path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
+      `{
+        // Local Ollama route should be imported.
+        "model": "ollama/qwen2.5-coder:0.5b",
+        "provider": {
+          "ollama": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": { "baseURL": "http://127.0.0.1:11434/v1" },
+            "models": { "qwen2.5-coder:0.5b": {} }
+          }
+        },
+        "mcp": { "unsafe": { "type": "local", "command": ["bad"] } },
+        "permission": { "*": "allow" },
+        "plugin": ["unsafe-plugin"],
+        "agent": { "unsafe": { "mode": "primary" } }
+      }`,
+      'utf8',
+    )
+    await writeFile(
+      customConfigPath,
+      JSON.stringify({
+        small_model: 'llama.cpp/qwen-test:0.5b',
+        provider: {
+          'llama.cpp': {
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:8080/v1' },
+            models: { 'qwen-test:0.5b': {} },
+          },
+        },
+        command: { unsafe: 'nope' },
+      }),
+      'utf8',
+    )
+    process.env.XDG_CONFIG_HOME = xdgConfigHome
+    process.env.OPENCODE_CONFIG = customConfigPath
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      provider: {
+        lmstudio: {
+          npm: '@ai-sdk/openai-compatible',
+          options: { baseURL: 'http://localhost:1234/v1' },
+          models: { 'google/gemma-3n-e4b': {} },
+        },
+      },
+      command: { unsafeInline: 'nope' },
+    })
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+
+    try {
+      const manager = new OpenCodeProfileManager()
+      const profile = await manager.prepareProfile(path.join(tempDir, 'project-config-import'))
+      const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
+      const providers = managedConfig.provider as Record<string, unknown>
+      const agents = managedConfig.agent as Record<string, unknown>
+      const mcp = (managedConfig.mcp ?? {}) as Record<string, unknown>
+
+      expect(profile.env.OPENCODE_CONFIG).toBeUndefined()
+      expect(providers.ollama).toMatchObject({
+        models: { 'qwen2.5-coder:0.5b': {} },
+      })
+      expect(providers['llama.cpp']).toMatchObject({
+        options: { baseURL: 'http://127.0.0.1:8080/v1' },
+      })
+      expect(providers.lmstudio).toMatchObject({
+        models: { 'google/gemma-3n-e4b': {} },
+      })
+      expect(managedConfig.model).toBe('ollama/qwen2.5-coder:0.5b')
+      expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
+      expect(managedConfig).not.toHaveProperty('plugin')
+      expect(managedConfig).not.toHaveProperty('permission')
+      expect(managedConfig).not.toHaveProperty('command')
+      expect(mcp.unsafe).toBeUndefined()
+      expect(agents.teammate).toBeDefined()
+      expect(agents.unsafe).toBeUndefined()
+    } finally {
+      if (previousXdgConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+      }
+      if (previousOpenCodeConfig === undefined) {
+        delete process.env.OPENCODE_CONFIG
+      } else {
+        process.env.OPENCODE_CONFIG = previousOpenCodeConfig
+      }
+      if (previousOpenCodeConfigContent === undefined) {
+        delete process.env.OPENCODE_CONFIG_CONTENT
+      } else {
+        process.env.OPENCODE_CONFIG_CONTENT = previousOpenCodeConfigContent
+      }
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
   })
 
   test('exposes an app-owned global auth path separate from the real OpenCode auth store', () => {

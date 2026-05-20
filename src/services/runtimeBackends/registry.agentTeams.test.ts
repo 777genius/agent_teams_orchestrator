@@ -703,4 +703,41 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     },
     15_000,
   )
+
+  test(
+    'opencode runtime status treats configured local models as launchable routes',
+    async () => {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: async () => ({
+          detected: true,
+          binaryPath: '/opt/homebrew/bin/opencode',
+          version: '1.14.48',
+          projectPath: '/tmp/project',
+          profile: null,
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+          modelMetadata: [],
+          agents: [],
+          authStorePath: null,
+          probeError: null,
+          diagnostics: [],
+        }),
+      })
+      const opencode = payload.providers.opencode
+
+      expect(opencode?.supported).toBe(true)
+      expect(opencode?.authenticated).toBe(true)
+      expect(opencode?.authMethod).toBe('opencode_configured_local')
+      expect(opencode?.statusMessage).toBeNull()
+      expect(opencode?.capabilities.teamLaunch).toBe(true)
+      expect(opencode?.backend?.authMethodDetail).toBe('configured local OpenCode model')
+    },
+    15_000,
+  )
 })

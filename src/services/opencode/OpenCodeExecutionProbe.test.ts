@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
 
 import type {
   OpenCodeHostHandle,
@@ -59,6 +60,7 @@ describe('OpenCodeExecutionProbe', () => {
     const retainedLeaseTeamIds: string[] = []
     const releasedLeaseTeamIds: string[] = []
     let releaseHostCount = 0
+    let promptAgent: string | null = null
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
@@ -128,8 +130,9 @@ describe('OpenCodeExecutionProbe', () => {
             sendMessageCount += 1
             return { info: { id: 'msg-assistant-1' }, parts: [] }
           },
-          promptSessionAsync: async () => {
+          promptSessionAsync: async (_sessionId, message) => {
             promptAsyncCount += 1
+            promptAgent = message.agent ?? null
           },
           abortSession: async () => true,
         }),
@@ -146,6 +149,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
     expect(promptAsyncCount).toBe(1)
+    expect(promptAgent).toBe(OPEN_CODE_MODEL_PROBE_AGENT_NAME)
     expect(sendMessageCount).toBe(0)
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
@@ -153,6 +157,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(ensureHostInput).toEqual({
       projectPath: '/tmp/project',
       profileOptions: {
+        includeAppMcp: false,
         modelOutputLimitOverrides: [
           {
             modelId: 'opencode/big-pickle',
@@ -243,6 +248,90 @@ describe('OpenCodeExecutionProbe', () => {
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releaseHostCount).toBe(0)
+  })
+
+  test('starts the polling timeout after the host has accepted the probe prompt', async () => {
+    let messageReadCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 5,
+      pollIntervalMs: 1,
+      sleep: async () => {},
+      hostManager: {
+        ensureHost: async () => {
+          await new Promise(resolve => setTimeout(resolve, 20))
+          return host
+        },
+        retainHostLease: async () => {},
+        releaseHostLease: async () => {},
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({
+            'session-1': messageReadCount < 1 ? 'busy' : 'idle',
+          }),
+          getSessionMessages: async () => {
+            messageReadCount += 1
+            const messages = [
+              {
+                info: {
+                  id: 'msg-user-1',
+                  role: 'user',
+                  sessionID: 'session-1',
+                  time: { created: 100 },
+                },
+                parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+              },
+            ]
+            if (messageReadCount > 1) {
+              messages.push({
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  parentID: 'msg-user-1',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              })
+            }
+            return messages
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(messageReadCount).toBe(2)
   })
 
   test('still releases execution probe lease without disposing the live host when setup fails', async () => {

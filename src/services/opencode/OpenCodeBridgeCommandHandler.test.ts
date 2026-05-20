@@ -937,6 +937,236 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
+  test('compatibility mode without execution probe requires proof for configured authless local models', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('not_authenticated')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain('requires execution verification')
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('deep readiness verifies configured authless local models with execution probe', async () => {
+    mockRequiredMcpTools()
+    const provisioningOptions: unknown[] = []
+    openCodeProvisioningProbe.probe = async (_projectPath, options) => {
+      provisioningOptions.push(options)
+      return buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    }
+    let probedModelId: string | null = null
+    let probedDisposeHostOnRelease: boolean | undefined
+    openCodeExecutionProbe.probeModel = (async input => {
+      probedModelId = input.selectedModel
+      probedDisposeHostOnRelease = input.disposeHostOnRelease
+      return {
+        providerId: 'opencode' as const,
+        modelId: input.selectedModel,
+        probePrompt: 'Output only the single word PONG.',
+        expectedOutput: 'PONG',
+        outcome: 'available' as const,
+        reason: null,
+        durationMs: 1,
+        rawStatus: 'idle',
+        durableState: 'idle',
+        latestAssistantText: 'PONG',
+        latestAssistantPreview: 'PONG',
+        toolCallCount: 0,
+        errorCount: 0,
+        diagnostics: [],
+      }
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        requireExecutionProbe: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
+    expect(probedDisposeHostOnRelease).toBe(true)
+    expect(provisioningOptions).toEqual([
+      {
+        disposeHostOnRelease: true,
+        ensureAppMcp: false,
+        bypassCache: true,
+      },
+      {
+        disposeHostOnRelease: process.platform !== 'win32',
+        ensureAppMcp: true,
+        bypassCache: true,
+      },
+    ])
+    expect(result.data.state).toBe('ready')
+    expect(result.data.launchAllowed).toBe(true)
+  })
+
+  test('deep readiness reports auth failures from configured authless local model probes', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    openCodeExecutionProbe.probeModel = (async input => ({
+      providerId: 'opencode' as const,
+      modelId: input.selectedModel,
+      probePrompt: 'Output only the single word PONG.',
+      expectedOutput: 'PONG',
+      outcome: 'not_authenticated' as const,
+      reason: 'Local server rejected the probe',
+      durationMs: 1,
+      rawStatus: 'idle',
+      durableState: 'idle',
+      latestAssistantText: null,
+      latestAssistantPreview: null,
+      toolCallCount: 0,
+      errorCount: 1,
+      diagnostics: ['Local server rejected the probe'],
+    })) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        requireExecutionProbe: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('not_authenticated')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toBe('Local server rejected the probe')
+  })
+
+  for (const outcome of ['unavailable', 'unknown'] as const) {
+    test(`deep readiness reports ${outcome} configured authless local model probes as model unavailable`, async () => {
+      mockRequiredMcpTools()
+      openCodeProvisioningProbe.probe = async () =>
+        buildReadinessSnapshot({
+          configProviders: {
+            providers: [
+              {
+                id: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          },
+          providers: {
+            connected: [],
+            default: {},
+          },
+        })
+      openCodeExecutionProbe.probeModel = (async input => ({
+        providerId: 'opencode' as const,
+        modelId: input.selectedModel,
+        probePrompt: 'Output only the single word PONG.',
+        expectedOutput: 'PONG',
+        outcome,
+        reason: `Local model probe ended as ${outcome}`,
+        durationMs: 1,
+        rawStatus: 'idle',
+        durableState: 'idle',
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        toolCallCount: 0,
+        errorCount: 1,
+        diagnostics: [`Local model probe ended as ${outcome}`],
+      })) as typeof openCodeExecutionProbe.probeModel
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.readiness', {
+          projectPath: '/tmp/project',
+          selectedModel: 'llama.cpp/qwen-test:0.5b',
+          requireExecutionProbe: true,
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) {
+        return
+      }
+      expect(result.data.state).toBe('model_unavailable')
+      expect(result.data.launchAllowed).toBe(false)
+      expect(result.data.missing[0]).toBe(`Local model probe ended as ${outcome}`)
+    })
+  }
+
   test('compatibility mode without execution probe allows built-in free OpenCode models without connected providers', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () =>
@@ -3403,6 +3633,80 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
     expect(connectCalls).toBe(0)
     expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('allows launch for configured authless local models after execution proof', async () => {
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    let probedModelId: string | null = null
+    let probedDisposeHostOnRelease: boolean | undefined
+    let ensureSessionCalls = 0
+    openCodeExecutionProbe.probeModel = (async input => {
+      probedModelId = input.selectedModel
+      probedDisposeHostOnRelease = input.disposeHostOnRelease
+      return {
+        providerId: 'opencode' as const,
+        modelId: input.selectedModel,
+        probePrompt: 'Output only the single word PONG.',
+        expectedOutput: 'PONG',
+        outcome: 'available' as const,
+        reason: null,
+        durationMs: 1,
+        rawStatus: 'idle',
+        durableState: 'idle',
+        latestAssistantText: 'PONG',
+        latestAssistantPreview: 'PONG',
+        toolCallCount: 0,
+        errorCount: 0,
+        diagnostics: [],
+      }
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.launchTeam', {
+        runId: 'run-local-authless',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
+    expect(probedDisposeHostOnRelease).toBe(true)
+    expect(ensureSessionCalls).toBe(1)
+    expect(result.data.teamLaunchState).toBe('launching')
   })
 
   test('allows launch for built-in free OpenCode models without connected providers', async () => {

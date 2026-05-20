@@ -34,6 +34,12 @@ function snapshot(overrides: Partial<OpenCodeProvisioningSnapshot> = {}): OpenCo
             'moonshotai/kimi-k2': {},
           },
         },
+        {
+          id: 'llama.cpp',
+          models: {
+            'qwen3-coder:a3b': {},
+          },
+        },
       ],
       default: {
         opencode: 'big-pickle',
@@ -59,6 +65,38 @@ describe('resolveOpenCodeProviderScopedModel', () => {
     expect(resolveOpenCodeProviderScopedModel('openrouter/moonshotai/kimi-k2', snapshot())).toBe(
       'openrouter/moonshotai/kimi-k2',
     )
+  })
+
+  test('validates dotted provider-scoped ids against config providers', () => {
+    expect(resolveOpenCodeProviderScopedModel('llama.cpp/qwen3-coder:a3b', snapshot())).toBe(
+      'llama.cpp/qwen3-coder:a3b',
+    )
+  })
+
+  test('validates local model ids that contain provider-internal slashes', () => {
+    expect(
+      resolveOpenCodeProviderScopedModel(
+        'lmstudio/google/gemma-3n-e4b',
+        snapshot({
+          configProviders: {
+            providers: [
+              {
+                id: 'lmstudio',
+                models: {
+                  'google/gemma-3n-e4b': {},
+                },
+              },
+            ],
+            default: {},
+          },
+          providers: {
+            all: [],
+            default: {},
+            connected: [],
+          },
+        }),
+      ),
+    ).toBe('lmstudio/google/gemma-3n-e4b')
   })
 
   test('validates provider-scoped ids discovered by the OpenCode models inventory', () => {
