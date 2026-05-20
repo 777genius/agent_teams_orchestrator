@@ -81,6 +81,68 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(true)
   })
 
+  test('requires execution proof for loopback OpenAI-compatible providers from the live provider list', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'lmstudio/google/gemma-3n-e4b',
+      catalog: catalog({
+        providers: {
+          connected: [],
+          authenticated: [],
+          all: [
+            {
+              id: 'lmstudio',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://localhost:1234/v1' },
+              models: { 'google/gemma-3n-e4b': {} },
+            },
+          ],
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('configured_authless')
+    expect(access.providerId).toBe('lmstudio')
+    expect(access.modelId).toBe('google/gemma-3n-e4b')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(true)
+  })
+
+  test('does not treat remote OpenAI-compatible providers as authless', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'custom/gpt-remote',
+      catalog: catalog({
+        configProviders: {
+          providers: [
+            {
+              id: 'custom',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'https://api.example.com/v1' },
+              models: { 'gpt-remote': {} },
+            },
+          ],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('not_authenticated')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test('requires execution proof for known local provider models discovered only from inventory', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'llama.cpp/qwen3-coder:a3b',
+      catalog: catalog({
+        models: ['llama.cpp/qwen3-coder:a3b'],
+      }),
+    })
+
+    expect(access.kind).toBe('configured_authless')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(true)
+  })
+
   test('allows configured authless providers after execution proof', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'llama.cpp/qwen-test:0.5b',
