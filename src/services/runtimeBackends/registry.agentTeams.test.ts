@@ -369,7 +369,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
           profile: null,
           connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }],
           availableProviders: ['openrouter'],
-          models: ['opencode/big-pickle'],
+          models: [],
           modelMetadata: [],
           agents: [],
           authStorePath: null,
@@ -382,7 +382,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.supported).toBe(true)
       expect(opencode?.authenticated).toBe(true)
       expect(opencode?.authMethod).toBe('opencode_managed')
-      expect(opencode?.models).toEqual(['opencode/big-pickle'])
+      expect(opencode?.models).toEqual([])
       expect(opencode).not.toHaveProperty('modelCatalog')
       expect(opencode).not.toHaveProperty('capabilitiesInfo')
       expect(opencode?.runtimeCapabilities?.modelCatalog).toEqual({
@@ -410,7 +410,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
           profile: null,
           connectedProviders: [],
           availableProviders: ['opencode'],
-          models: ['opencode/big-pickle'],
+          models: [],
           modelMetadata: [],
           agents: [],
           authStorePath: null,
@@ -423,7 +423,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.supported).toBe(true)
       expect(opencode?.authenticated).toBe(false)
       expect(opencode?.authMethod).toBe(null)
-      expect(opencode?.models).toEqual(['opencode/big-pickle'])
+      expect(opencode?.models).toEqual([])
       expect(opencode?.statusMessage).toBe('No OpenCode providers connected')
       expect(opencode).not.toHaveProperty('modelCatalog')
     },

@@ -503,13 +503,7 @@ async function buildOpenCodeStatus(
           ? { mode: 'summary', bypassCache: true }
           : { mode: 'full' },
       )
-  const runtimeModels =
-    summary && snapshot.detected && snapshot.models.length === 0
-      ? ['opencode/big-pickle']
-      : snapshot.models
-  const displaySnapshot = runtimeModels === snapshot.models
-    ? snapshot
-    : { ...snapshot, models: runtimeModels }
+  const runtimeModels = snapshot.models
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
   const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(
     snapshot.models,
@@ -613,8 +607,8 @@ async function buildOpenCodeStatus(
         },
       }),
     },
-    statusMessage: authenticated ? null : buildOpenCodeStatusMessage(displaySnapshot),
-    detailMessage: buildOpenCodeDetailMessage(displaySnapshot),
+    statusMessage: authenticated ? null : buildOpenCodeStatusMessage(snapshot),
+    detailMessage: buildOpenCodeDetailMessage(snapshot),
     selectedBackendId: null,
     resolvedBackendId: null,
     availableBackends: [],
