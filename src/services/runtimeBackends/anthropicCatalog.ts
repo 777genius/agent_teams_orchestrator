@@ -735,7 +735,21 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
       )
     }
 
-    const auth = getAuthHeaders()
+    let auth: ReturnType<typeof getAuthHeaders>
+    try {
+      auth = getAuthHeaders()
+    } catch (error) {
+      return cacheAnthropicCatalog(
+        createStaticAnthropicRuntimeModelCatalog({
+          fetchedAt,
+          staleAt: fallbackStaleAt,
+          status: 'stale',
+          message: `Using the static Anthropic catalog because no authenticated Anthropic API session is available. ${getErrorMessage(error)}`.trim(),
+          code: 'anthropic-auth-missing',
+        }),
+        ANTHROPIC_FALLBACK_CACHE_TTL_MS,
+      )
+    }
 
     if (auth.error) {
       return cacheAnthropicCatalog(
