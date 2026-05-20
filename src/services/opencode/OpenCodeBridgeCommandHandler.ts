@@ -1260,6 +1260,12 @@ function appMcpPreflightTimeoutMs(launchConfig: ResolvedAppMcpLaunchConfig): num
     : DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS
 }
 
+export function __getAppMcpPreflightTimeoutMsForTests(
+  launchConfig: ResolvedAppMcpLaunchConfig,
+): number {
+  return appMcpPreflightTimeoutMs(launchConfig)
+}
+
 function getAppMcpToolProofPersistedCachePath(): string {
   const override = process.env[APP_MCP_TOOL_PROOF_PERSISTED_CACHE_PATH_ENV]?.trim()
   if (override) {

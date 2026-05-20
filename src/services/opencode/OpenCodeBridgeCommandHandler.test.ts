@@ -5,6 +5,7 @@ import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import {
+  __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
@@ -1590,6 +1591,83 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
     expect(result.data.requiredToolsPresent).toBe(true)
+  })
+
+  test('direct MCP proof keeps default timeout short except for source MCP launch configs', () => {
+    expect(__getAppMcpPreflightTimeoutMsForTests({
+      source: 'env-override',
+      config: {
+        type: 'remote',
+        url: 'http://127.0.0.1:3210/mcp',
+        enabled: true,
+        timeout: 60_000,
+        oauth: false,
+      },
+    })).toBe(45_000)
+
+    expect(__getAppMcpPreflightTimeoutMsForTests({
+      source: 'workspace-dist',
+      config: {
+        type: 'local',
+        command: [process.execPath, '/repo/mcp-server/dist/index.js'],
+        environment: {},
+        enabled: true,
+        timeout: 60_000,
+      },
+    })).toBe(45_000)
+
+    expect(__getAppMcpPreflightTimeoutMsForTests({
+      source: 'env-override',
+      config: {
+        type: 'local',
+        command: ['/repo/node_modules/.bin/tsx', '/repo/mcp-server/src/index.ts'],
+        environment: {},
+        enabled: true,
+        timeout: 60_000,
+      },
+    })).toBe(90_000)
+
+    expect(__getAppMcpPreflightTimeoutMsForTests({
+      source: 'env-override',
+      config: {
+        type: 'local',
+        command: [process.execPath, '/repo/mcp-server/src/index.ts'],
+        environment: {},
+        enabled: true,
+        timeout: 60_000,
+      },
+    })).toBe(90_000)
+  })
+
+  test('direct MCP proof timeout override is bounded', () => {
+    const previous = process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS
+    const launchConfig = {
+      source: 'workspace-dist' as const,
+      config: {
+        type: 'local' as const,
+        command: [process.execPath, '/repo/mcp-server/dist/index.js'],
+        environment: {},
+        enabled: true,
+        timeout: 60_000,
+      },
+    }
+
+    try {
+      process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS = '12'
+      expect(__getAppMcpPreflightTimeoutMsForTests(launchConfig)).toBe(12)
+
+      process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS = '999999'
+      expect(__getAppMcpPreflightTimeoutMsForTests(launchConfig)).toBe(180_000)
+
+      process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS = '0'
+      expect(__getAppMcpPreflightTimeoutMsForTests(launchConfig)).toBe(45_000)
+    } finally {
+      if (previous == null) {
+        delete process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS
+      } else {
+        process.env.AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS = previous
+      }
+    }
   })
 
   test('direct MCP proof does not accept proxy-prefixed plain message_send as Agent Teams proof', async () => {
