@@ -32,6 +32,20 @@ type OpenCodeInventoryProbeOptions = {
   includeAppMcp?: boolean
 }
 
+type OpenCodeCommandResult = {
+  stdout: string
+  stderr: string
+  code: number
+  error?: string
+}
+
+type OpenCodeInventoryCommandResults = {
+  versionResult: OpenCodeCommandResult
+  providersResult: OpenCodeCommandResult
+  modelsResult: OpenCodeCommandResult
+  agentsResult: OpenCodeCommandResult
+}
+
 type CacheEntry = {
   expiresAt: number
   snapshot: OpenCodeInventorySnapshot
@@ -91,6 +105,33 @@ export function parseOpenCodeModelsOutput(output: string): string[] {
 
 export function getOpenCodeVerboseModelsArgs(): string[] {
   return ['models', '--verbose']
+}
+
+const EMPTY_OPEN_CODE_COMMAND_RESULT: OpenCodeCommandResult = {
+  stdout: '',
+  stderr: '',
+  code: 0,
+}
+
+export async function collectOpenCodeInventoryCommandResults(input: {
+  mode: OpenCodeInventoryProbeMode
+  execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
+}): Promise<OpenCodeInventoryCommandResults> {
+  const versionResult = await input.execOpenCode(['--version'])
+  const providersResult = await input.execOpenCode(['providers', 'list'])
+  const modelsResult = input.mode === 'summary'
+    ? EMPTY_OPEN_CODE_COMMAND_RESULT
+    : await input.execOpenCode(getOpenCodeVerboseModelsArgs())
+  const agentsResult = input.mode === 'summary'
+    ? EMPTY_OPEN_CODE_COMMAND_RESULT
+    : await input.execOpenCode(['agent', 'list'])
+
+  return {
+    versionResult,
+    providersResult,
+    modelsResult,
+    agentsResult,
+  }
 }
 
 function collectFiniteNumbers(value: unknown): number[] {
@@ -356,7 +397,7 @@ export class OpenCodeInventoryService {
     binaryPath: string,
     args: string[],
     profile: OpenCodePreparedProfile,
-  ): Promise<{ stdout: string; stderr: string; code: number; error?: string }> {
+  ): Promise<OpenCodeCommandResult> {
     return execFileNoThrowWithCwd(binaryPath, args, {
       cwd: profile.projectPath,
       env: profile.env,
@@ -407,16 +448,15 @@ export class OpenCodeInventoryService {
     const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath, {
       includeAppMcp: options.includeAppMcp !== false,
     })
-    const [versionResult, providersResult, modelsResult, agentsResult] = await Promise.all([
-      this.execOpenCode(binaryPath, ['--version'], profile),
-      this.execOpenCode(binaryPath, ['providers', 'list'], profile),
-      mode === 'summary'
-        ? Promise.resolve({ stdout: '', stderr: '', code: 0 })
-        : this.execOpenCode(binaryPath, getOpenCodeVerboseModelsArgs(), profile),
-      mode === 'summary'
-        ? Promise.resolve({ stdout: '', stderr: '', code: 0 })
-        : this.execOpenCode(binaryPath, ['agent', 'list'], profile),
-    ])
+    const {
+      versionResult,
+      providersResult,
+      modelsResult,
+      agentsResult,
+    } = await collectOpenCodeInventoryCommandResults({
+      mode,
+      execOpenCode: args => this.execOpenCode(binaryPath, args, profile),
+    })
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)

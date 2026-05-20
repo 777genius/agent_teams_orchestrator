@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  collectOpenCodeInventoryCommandResults,
   getOpenCodeVerboseModelsArgs,
   isOpenCodeBuiltinFreeModelId,
   parseOpenCodeAgentListOutput,
@@ -13,6 +14,61 @@ import {
 describe('OpenCodeInventoryService parsers', () => {
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
     expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
+  })
+
+  test('collects inventory commands sequentially to avoid OpenCode profile contention', async () => {
+    const calls: string[] = []
+    let active = 0
+    let maxActive = 0
+
+    const result = await collectOpenCodeInventoryCommandResults({
+      mode: 'full',
+      execOpenCode: async args => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        calls.push(args.join(' '))
+        await Promise.resolve()
+        active -= 1
+        return {
+          stdout: args.join(' '),
+          stderr: '',
+          code: 0,
+        }
+      },
+    })
+
+    expect(maxActive).toBe(1)
+    expect(calls).toEqual([
+      '--version',
+      'providers list',
+      'models --verbose',
+      'agent list',
+    ])
+    expect(result.modelsResult.stdout).toBe('models --verbose')
+    expect(result.agentsResult.stdout).toBe('agent list')
+  })
+
+  test('summary inventory skips model and agent commands', async () => {
+    const calls: string[] = []
+
+    const result = await collectOpenCodeInventoryCommandResults({
+      mode: 'summary',
+      execOpenCode: async args => {
+        calls.push(args.join(' '))
+        return {
+          stdout: args.join(' '),
+          stderr: '',
+          code: 0,
+        }
+      },
+    })
+
+    expect(calls).toEqual([
+      '--version',
+      'providers list',
+    ])
+    expect(result.modelsResult.stdout).toBe('')
+    expect(result.agentsResult.stdout).toBe('')
   })
 
   test('parses provider credentials from boxed CLI output', () => {

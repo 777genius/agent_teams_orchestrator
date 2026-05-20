@@ -1157,7 +1157,8 @@ type AppMcpToolProof = {
 // Cold workspace/source MCP startup can take longer than a model turn on dev
 // machines. Keep this below the outer readiness timeout but avoid false launch
 // failures before OpenCode ever gets a chance to attach Agent Teams tools.
-const APP_MCP_PREFLIGHT_TIMEOUT_MS = 45_000
+const DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS = 90_000
+const APP_MCP_PREFLIGHT_TIMEOUT_ENV = 'AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS'
 const APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS = 2_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
 const APP_MCP_TOOL_PROOF_PERSISTED_CACHE_VERSION = 1
@@ -1230,6 +1231,14 @@ async function fingerprintAppMcpLaunchCommandFiles(
 
 function appMcpToolProofPersistentCacheEnabled(): boolean {
   return !isEnvDefinedFalsy(process.env[APP_MCP_TOOL_PROOF_PERSISTED_CACHE_DISABLED_ENV])
+}
+
+function appMcpPreflightTimeoutMs(): number {
+  const configured = Number(process.env[APP_MCP_PREFLIGHT_TIMEOUT_ENV])
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.min(Math.round(configured), 180_000)
+  }
+  return DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS
 }
 
 function getAppMcpToolProofPersistedCachePath(): string {
@@ -1417,6 +1426,7 @@ async function proveAppMcpTools(
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
 ): Promise<string[]> {
+  const preflightTimeoutMs = appMcpPreflightTimeoutMs()
   const remoteUrl = launchConfig.config.url
   if (launchConfig.config.type === 'remote' || remoteUrl) {
     if (!remoteUrl) {
@@ -1444,8 +1454,8 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
       })
       const transport = createTransport()
       try {
-        await withTimeout(client.connect(transport), APP_MCP_PREFLIGHT_TIMEOUT_MS)
-        const result = await withTimeout(client.listTools(), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+        await withTimeout(client.connect(transport), preflightTimeoutMs)
+        const result = await withTimeout(client.listTools(), preflightTimeoutMs)
         return (result.tools ?? [])
           .map(tool => tool.name)
           .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
@@ -1482,8 +1492,8 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   })
 
   try {
-    await withTimeout(client.connect(transport), APP_MCP_PREFLIGHT_TIMEOUT_MS)
-    const result = await withTimeout(client.listTools(), APP_MCP_PREFLIGHT_TIMEOUT_MS)
+    await withTimeout(client.connect(transport), preflightTimeoutMs)
+    const result = await withTimeout(client.listTools(), preflightTimeoutMs)
     return (result.tools ?? [])
       .map(tool => tool.name)
       .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
