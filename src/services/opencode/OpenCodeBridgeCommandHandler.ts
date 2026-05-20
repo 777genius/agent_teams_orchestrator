@@ -1157,7 +1157,8 @@ type AppMcpToolProof = {
 // Cold workspace/source MCP startup can take longer than a model turn on dev
 // machines. Keep this below the outer readiness timeout but avoid false launch
 // failures before OpenCode ever gets a chance to attach Agent Teams tools.
-const DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS = 90_000
+const DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS = 45_000
+const SOURCE_APP_MCP_PREFLIGHT_TIMEOUT_MS = 90_000
 const APP_MCP_PREFLIGHT_TIMEOUT_ENV = 'AGENT_TEAMS_OPENCODE_MCP_PREFLIGHT_TIMEOUT_MS'
 const APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS = 2_000
 const APP_MCP_TOOL_PROOF_CACHE_TTL_MS = 15_000
@@ -1233,12 +1234,30 @@ function appMcpToolProofPersistentCacheEnabled(): boolean {
   return !isEnvDefinedFalsy(process.env[APP_MCP_TOOL_PROOF_PERSISTED_CACHE_DISABLED_ENV])
 }
 
-function appMcpPreflightTimeoutMs(): number {
+function isSourceAppMcpLaunchConfig(launchConfig: ResolvedAppMcpLaunchConfig): boolean {
+  if (launchConfig.config.type !== 'local') {
+    return false
+  }
+
+  const command = launchConfig.config.command ?? []
+  return command.some(part => {
+    const normalized = part.trim().toLowerCase()
+    return normalized.endsWith('/tsx') ||
+      normalized.endsWith('\\tsx') ||
+      normalized.endsWith('/tsx.cmd') ||
+      normalized.endsWith('\\tsx.cmd') ||
+      normalized.endsWith('.ts')
+  })
+}
+
+function appMcpPreflightTimeoutMs(launchConfig: ResolvedAppMcpLaunchConfig): number {
   const configured = Number(process.env[APP_MCP_PREFLIGHT_TIMEOUT_ENV])
   if (Number.isFinite(configured) && configured > 0) {
     return Math.min(Math.round(configured), 180_000)
   }
-  return DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS
+  return isSourceAppMcpLaunchConfig(launchConfig)
+    ? SOURCE_APP_MCP_PREFLIGHT_TIMEOUT_MS
+    : DEFAULT_APP_MCP_PREFLIGHT_TIMEOUT_MS
 }
 
 function getAppMcpToolProofPersistedCachePath(): string {
@@ -1426,7 +1445,7 @@ async function proveAppMcpTools(
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
 ): Promise<string[]> {
-  const preflightTimeoutMs = appMcpPreflightTimeoutMs()
+  const preflightTimeoutMs = appMcpPreflightTimeoutMs(launchConfig)
   const remoteUrl = launchConfig.config.url
   if (launchConfig.config.type === 'remote' || remoteUrl) {
     if (!remoteUrl) {
