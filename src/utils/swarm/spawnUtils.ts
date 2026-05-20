@@ -29,6 +29,7 @@ import { getAPIProvider } from '../model/providers.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { sleep } from '../sleep.js'
 import { getCodexForcedLoginMethod } from '../../services/runtimeBackends/codexBackendResolver.js'
+import { parseArguments } from '../argumentSubstitution.js'
 import type { TeammateProvider } from './backends/types.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
 import {
@@ -148,7 +149,7 @@ export function buildInheritedCliFlags(options?: {
 }
 
 export function stripInheritedCliFlag(flags: string, flagName: string): string {
-  const parts = flags.split(' ').filter(Boolean)
+  const parts = parseArguments(flags)
   const kept: string[] = []
 
   for (let i = 0; i < parts.length; i++) {
@@ -163,7 +164,7 @@ export function stripInheritedCliFlag(flags: string, flagName: string): string {
     kept.push(part)
   }
 
-  return kept.join(' ')
+  return kept.map(part => quote([part])).join(' ')
 }
 
 export function stripProviderBoundaryInheritedRuntimeFlags(flags: string): string {

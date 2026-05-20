@@ -4,6 +4,7 @@ import * as os from 'os'
 import * as path from 'path'
 
 import {
+  __resolveBootstrapSubmittedElapsedForTests,
   __setTeamBootstrapRunnerDepsForTests,
   assertBootstrapTimeoutBudget,
   assertBootstrapRuntimeWorkspace,
@@ -19,6 +20,8 @@ import {
 
 let tempDirs: string[] = []
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
+const originalSubmittedConfirmationTimeoutMs =
+  process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
 
 afterEach(async () => {
   await Promise.all(
@@ -29,6 +32,12 @@ afterEach(async () => {
     delete process.env.CLAUDE_CONFIG_DIR
   } else {
     process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir
+  }
+  if (originalSubmittedConfirmationTimeoutMs === undefined) {
+    delete process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
+  } else {
+    process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS =
+      originalSubmittedConfirmationTimeoutMs
   }
   __setTeamBootstrapRunnerDepsForTests(null)
 })
@@ -573,6 +582,195 @@ describe('team bootstrap readiness contract', () => {
     expect(failedReason).toContain('did not bootstrap-confirm')
   })
 
+  test('submitted bootstrap prompt times out one member without blocking partial launch', async () => {
+    const tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'bootstrap-submitted-'),
+    )
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS = '80'
+
+    const teamName = `team-${Date.now()}`
+    const runId = 'run-submitted-timeout'
+    const aliceAgentId = `alice@${teamName}`
+    const bobAgentId = `bob@${teamName}`
+    const aliceRuntimePid = 1234
+    const bobRuntimePid = 5678
+    const bootstrapExpectedAfter = new Date(Date.now() - 5_000).toISOString()
+    let completedStatus: string | undefined
+    let completedFailedMembers: Array<{ name: string; reason: string }> = []
+
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath: getTeammateRuntimePaths({
+        teamName,
+        agentName: 'alice',
+      }).eventsPath,
+      pid: aliceRuntimePid,
+      teamName,
+      agentName: 'alice',
+      agentId: aliceAgentId,
+      bootstrapRunId: runId,
+      source: 'member_briefing_tool_success',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath: getTeammateRuntimePaths({
+        teamName,
+        agentName: 'bob',
+      }).eventsPath,
+      pid: bobRuntimePid,
+      teamName,
+      agentName: 'bob',
+      agentId: bobAgentId,
+      bootstrapRunId: runId,
+      bootstrapMessageId: 'bootstrap-bob-1',
+      detail: 'messageId=bootstrap-bob-1',
+      source: 'test',
+    })
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            {
+              name: 'alice',
+              agentId: aliceAgentId,
+              bootstrapExpectedAfter,
+              backendType: 'process',
+              runtimePid: aliceRuntimePid,
+              bootstrapRunId: runId,
+            },
+            {
+              name: 'bob',
+              agentId: bobAgentId,
+              bootstrapExpectedAfter,
+              backendType: 'process',
+              runtimePid: bobRuntimePid,
+              bootstrapRunId: runId,
+            },
+          ],
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async input => {
+        const name = input.name === 'bob' ? 'bob' : 'alice'
+        const agentId = name === 'bob' ? bobAgentId : aliceAgentId
+        const runtimePid = name === 'bob' ? bobRuntimePid : aliceRuntimePid
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name,
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: `process:${runtimePid}`,
+            backend_type: 'process',
+            runtime_pid: runtimePid,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    const result = await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId,
+        requestHash: 'hash-submitted-timeout',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+          },
+          {
+            originalName: 'bob',
+            displayName: 'bob',
+            normalizedName: 'bob',
+            prompt: 'hello',
+          },
+        ],
+        bootstrapTimeoutMs: 5_000,
+        continueOnPartialFailure: true,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async summary => {
+          completedStatus = summary.status
+          completedFailedMembers = summary.failedMembers
+        },
+        failed: async () => {},
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      throw new Error('expected partial bootstrap success')
+    }
+    expect(result.summary.terminalStatus).toBe('partial_success')
+    expect(result.summary.registeredMembers).toEqual(['alice'])
+    expect(result.summary.failedMembers).toHaveLength(1)
+    expect(result.summary.failedMembers[0]).toMatchObject({ name: 'bob' })
+    expect(result.summary.failedMembers[0]?.reason).toContain(
+      'submitted-confirmation timeout (80ms)',
+    )
+    expect(result.summary.failedMembers[0]?.reason).toContain(
+      'Last transport stage: bootstrap_submitted: messageId=bootstrap-bob-1',
+    )
+    expect(completedStatus).toBe('partial_success')
+    expect(completedFailedMembers).toEqual(result.summary.failedMembers)
+
+    const rawState = JSON.parse(
+      await fs.readFile(
+        path.join(tempDir, 'teams', teamName, 'bootstrap-state.json'),
+        'utf8',
+      ),
+    ) as {
+      members: Array<{ name: string; status: string; failureReason?: string }>
+    }
+    expect(rawState.members.find(member => member.name === 'alice')?.status).toBe(
+      'bootstrap_confirmed',
+    )
+    const bobState = rawState.members.find(member => member.name === 'bob')
+    expect(bobState?.status).toBe('failed')
+    expect(bobState?.failureReason).toContain('submitted-confirmation timeout')
+  })
+
   test('process teammate runtime failure fails bootstrap without waiting for timeout', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-ready-'))
     tempDirs.push(tempDir)
@@ -687,6 +885,39 @@ describe('team bootstrap readiness contract', () => {
 
     expect(result.ok).toBe(false)
     expect(failedReason).toContain('API Error: 401')
+  })
+})
+
+describe('team bootstrap submitted-confirmation timing', () => {
+  test('combines submitted event age with monotonic elapsed after observation', () => {
+    expect(
+      __resolveBootstrapSubmittedElapsedForTests({
+        submittedTimestamp: new Date(1_000).toISOString(),
+        observedWallNowMs: 1_100,
+        observedAtMs: 20,
+        observedNowMs: 70,
+      }),
+    ).toBe(150)
+  })
+
+  test('falls back to monotonic observation time for unsafe submitted timestamps', () => {
+    expect(
+      __resolveBootstrapSubmittedElapsedForTests({
+        submittedTimestamp: new Date(10_000).toISOString(),
+        observedWallNowMs: 1_000,
+        observedAtMs: 20,
+        observedNowMs: 70,
+      }),
+    ).toBe(50)
+    expect(
+      __resolveBootstrapSubmittedElapsedForTests({
+        submittedTimestamp: new Date(1_000).toISOString(),
+        observedWallNowMs: 2_000,
+        observedAtMs: 20,
+        observedNowMs: 70,
+        bootstrapExpectedAfter: new Date(1_500).toISOString(),
+      }),
+    ).toBe(50)
   })
 })
 

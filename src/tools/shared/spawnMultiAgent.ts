@@ -277,10 +277,10 @@ function stripInheritedEffortFlag(flags: string): string {
 }
 
 function stripInheritedBooleanCliFlag(flags: string, flagName: string): string {
-  return flags
-    .split(' ')
+  return parseArguments(flags)
     .filter(Boolean)
     .filter(part => part !== flagName && !part.startsWith(`${flagName}=`))
+    .map(part => quote([part]))
     .join(' ')
 }
 

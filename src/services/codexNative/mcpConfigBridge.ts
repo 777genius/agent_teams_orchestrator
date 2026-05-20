@@ -13,6 +13,7 @@ import type {
 } from '../mcp/types.js'
 
 const AUTO_APPROVE_DYNAMIC_MCP_SERVERS = new Set(['agent-teams'])
+const REQUIRED_AGENT_TEAMS_MCP_SERVER = 'agent-teams'
 
 function isSimpleCodexConfigKeySegment(segment: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(segment)
@@ -48,14 +49,21 @@ function buildCodexServerOverride(
 
 function parseDynamicMcpConfigs(
   configEntries: string[],
-): Record<string, ScopedMcpServerConfig> {
+): {
+  allowedServers: Record<string, ScopedMcpServerConfig>
+  fatalErrors: string[]
+  hasNonEmptyEntries: boolean
+} {
   let mergedConfigs: Record<string, ScopedMcpServerConfig> = {}
+  const fatalErrors: string[] = []
+  let hasNonEmptyEntries = false
 
   for (const configItem of configEntries) {
     const trimmed = configItem.trim()
     if (trimmed.length === 0) {
       continue
     }
+    hasNonEmptyEntries = true
 
     const parsedJson = safeParseJSON(trimmed)
     const result = parsedJson
@@ -72,6 +80,13 @@ function parseDynamicMcpConfigs(
         })
 
     if (!result.config) {
+      fatalErrors.push(
+        ...result.errors.map(error => {
+          const location = error.file ? `${error.file}: ` : ''
+          const path = error.path ? `${error.path}: ` : ''
+          return `${location}${path}${error.message}`
+        }),
+      )
       continue
     }
 
@@ -89,7 +104,11 @@ function parseDynamicMcpConfigs(
     }
   }
 
-  return filterMcpServersByPolicy(mergedConfigs).allowed
+  return {
+    allowedServers: filterMcpServersByPolicy(mergedConfigs).allowed,
+    fatalErrors,
+    hasNonEmptyEntries,
+  }
 }
 
 function buildOverridesForServer(
@@ -130,9 +149,25 @@ function buildOverridesForServer(
 
 export function buildCodexNativeMcpConfigOverrides(params?: {
   mcpConfigEntries?: string[]
+  strictMcpConfig?: boolean
 }): string[] {
   const configEntries = params?.mcpConfigEntries ?? getFlagMcpConfig()
-  const allowedServers = parseDynamicMcpConfigs(configEntries)
+  const { allowedServers, fatalErrors, hasNonEmptyEntries } =
+    parseDynamicMcpConfigs(configEntries)
+  if (params?.strictMcpConfig && hasNonEmptyEntries && fatalErrors.length > 0) {
+    throw new Error(
+      `Strict Codex MCP launch could not load dynamic MCP config: ${fatalErrors.join('; ')}`,
+    )
+  }
+  if (
+    params?.strictMcpConfig &&
+    hasNonEmptyEntries &&
+    !allowedServers[REQUIRED_AGENT_TEAMS_MCP_SERVER]
+  ) {
+    throw new Error(
+      'Strict Codex MCP launch did not load the required agent-teams MCP server.',
+    )
+  }
 
   return Object.entries(allowedServers)
     .sort(([left], [right]) => left.localeCompare(right))

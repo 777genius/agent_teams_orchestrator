@@ -1,3 +1,7 @@
+import type {
+  OpenCodeModelRouteMetadata,
+} from '../opencode/OpenCodeModelAccessPolicy.js'
+
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
 export type AnthropicRuntimeBackendId =
@@ -89,6 +93,7 @@ export type RuntimeProviderModelCatalogItem = {
     context?: number | null
     limits?: unknown | null
     free?: boolean
+    opencode?: OpenCodeModelRouteMetadata | null
   } | null
 }
 

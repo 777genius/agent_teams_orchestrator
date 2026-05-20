@@ -15,8 +15,10 @@ import {
   getOriginalCwd,
   resetStateForTests,
   setCwdState,
+  setFlagMcpConfig,
   setIsInteractive,
   setOriginalCwd,
+  setStrictMcpConfig,
 } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
 import { getDefaultAppState } from '../../state/AppStateStore.js'
@@ -55,10 +57,16 @@ const teamName = getArg('--team-name')
 const agentName = getArg('--agent-name')
 const agentId = getArg('--agent-id')
 const teammateRuntime = getArg('--teammate-runtime')
+const hasFlag = flag => args.includes(flag)
 const teammateRuntimeEnv = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME
 const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_PROCESS_FALLBACK_EXPECTED_PROMPT || ''
+const expectedMcpConfig = process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_CONFIG || ''
+const expectedMcpSettingSources =
+  process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_SETTING_SOURCES || ''
+const expectedStrictMcpConfig =
+  process.env.FAKE_PROCESS_FALLBACK_EXPECTED_STRICT_MCP_CONFIG || ''
 
 async function writeEvent(type, detail, extra = {}) {
   if (!eventsPath) return
@@ -141,7 +149,12 @@ async function writeLeaderConfirmation() {
 try {
   await writeEvent(
     'cli_started',
-    'teammateRuntime=' + teammateRuntime + ';env=' + teammateRuntimeEnv,
+    'teammateRuntime=' + teammateRuntime +
+      ';env=' + teammateRuntimeEnv +
+      ';mcpConfig=' + (getArg('--mcp-config') || '') +
+      ';mcpSettingSources=' + (getArg('--setting-sources') || '') +
+      ';strictMcpConfig=' + hasFlag('--strict-mcp-config') +
+      ';args=' + args.join('|'),
   )
   if (teammateRuntime !== 'headless') {
     await writeEvent('failed', 'missing headless runtime flag')
@@ -150,6 +163,35 @@ try {
   if (teammateRuntimeEnv !== 'headless') {
     await writeEvent('failed', 'missing headless runtime env')
     process.exit(3)
+  }
+  if (expectedMcpConfig && getArg('--mcp-config') !== expectedMcpConfig) {
+    console.error('wrong mcp config args=' + args.join('|'))
+    await writeEvent('failed', 'wrong mcp config: ' + (getArg('--mcp-config') || ''))
+    process.exit(4)
+  }
+  if (
+    expectedMcpSettingSources &&
+    getArg('--setting-sources') !== expectedMcpSettingSources
+  ) {
+    await writeEvent(
+      'failed',
+      'wrong mcp setting sources: ' + (getArg('--setting-sources') || ''),
+    )
+    process.exit(5)
+  }
+  if (
+    expectedStrictMcpConfig === 'true' &&
+    !hasFlag('--strict-mcp-config')
+  ) {
+    await writeEvent('failed', 'missing strict mcp config flag')
+    process.exit(6)
+  }
+  if (
+    expectedStrictMcpConfig === 'false' &&
+    hasFlag('--strict-mcp-config')
+  ) {
+    await writeEvent('failed', 'unexpected strict mcp config flag')
+    process.exit(7)
   }
   await writeEvent('runtime_ready', 'headless runtime accepted')
   const promptMessage = await waitForBootstrapPrompt()
@@ -192,6 +234,9 @@ describe('spawnTeammate process backend fallback routing', () => {
       'CLAUDE_CODE_ENTRY_PROVIDER',
       'CLAUDE_CODE_USE_OPENAI',
       'CLAUDE_CODE_USE_GEMINI',
+      'FAKE_PROCESS_FALLBACK_EXPECTED_MCP_CONFIG',
+      'FAKE_PROCESS_FALLBACK_EXPECTED_MCP_SETTING_SOURCES',
+      'FAKE_PROCESS_FALLBACK_EXPECTED_STRICT_MCP_CONFIG',
     ])
     originalCwdState = getCwdState()
     originalOriginalCwd = getOriginalCwd()
@@ -251,6 +296,15 @@ describe('spawnTeammate process backend fallback routing', () => {
       process.env[TEAMMATE_COMMAND_ENV_VAR] =
         `${quoteShellArg(process.execPath)} ${quoteShellArg(scriptPath)}`
       process.env.FAKE_PROCESS_FALLBACK_EXPECTED_PROMPT = PROCESS_FALLBACK_PROMPT
+      const staleMcpConfigPath = join(configDir, 'stale inherited mcp.json')
+      const freshMcpConfigPath = join(configDir, 'fresh member mcp.json')
+      await writeFile(staleMcpConfigPath, '{"mcpServers":{}}')
+      await writeFile(freshMcpConfigPath, '{"mcpServers":{}}')
+      setFlagMcpConfig([staleMcpConfigPath])
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_CONFIG = freshMcpConfigPath
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_SETTING_SOURCES =
+        'user,project,local'
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_STRICT_MCP_CONFIG = 'true'
       process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
       delete process.env.CLAUDE_CODE_USE_OPENAI
       delete process.env.CLAUDE_CODE_USE_GEMINI
@@ -302,6 +356,9 @@ describe('spawnTeammate process backend fallback routing', () => {
             team_name: teamName,
             cwd: projectRealpath,
             provider: 'codex',
+            mcp_config: freshMcpConfigPath,
+            mcp_setting_sources: 'user,project,local',
+            strict_mcp_config: true,
           },
           context,
         )
@@ -340,6 +397,54 @@ describe('spawnTeammate process backend fallback routing', () => {
       expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
         'env=headless',
       )
+      expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
+        `mcpConfig=${freshMcpConfigPath}`,
+      )
+      expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
+        'mcpSettingSources=user,project,local',
+      )
+      expect(events.find(event => event.type === 'cli_started')?.detail).toContain(
+        'strictMcpConfig=true',
+      )
+      expect(events.find(event => event.type === 'cli_started')?.detail).not.toContain(
+        staleMcpConfigPath,
+      )
+
+      const localOnlyMcpConfigPath = join(configDir, 'local only member mcp.json')
+      await writeFile(localOnlyMcpConfigPath, '{"mcpServers":{}}')
+      setStrictMcpConfig(true)
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_CONFIG = localOnlyMcpConfigPath
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_MCP_SETTING_SOURCES = 'local'
+      process.env.FAKE_PROCESS_FALLBACK_EXPECTED_STRICT_MCP_CONFIG = 'false'
+
+      const localOnlyResult = await spawnTeammate(
+        {
+          name: 'localist',
+          prompt: PROCESS_FALLBACK_PROMPT,
+          team_name: teamName,
+          cwd: projectRealpath,
+          provider: 'codex',
+          mcp_config: localOnlyMcpConfigPath,
+          mcp_setting_sources: 'local',
+          strict_mcp_config: false,
+        },
+        context,
+      )
+      if (localOnlyResult.data.runtime_pid) {
+        runtimePids.push(localOnlyResult.data.runtime_pid)
+      }
+      expect(localOnlyResult.data.backend_type).toBe('process')
+
+      const localOnlyEvents = await readTeammateRuntimeEvents(
+        localOnlyResult.data.runtime_events_log!,
+      )
+      const localOnlyCliStarted = localOnlyEvents.find(
+        event => event.type === 'cli_started',
+      )?.detail
+      expect(localOnlyCliStarted).toContain(`mcpConfig=${localOnlyMcpConfigPath}`)
+      expect(localOnlyCliStarted).toContain('mcpSettingSources=local')
+      expect(localOnlyCliStarted).toContain('strictMcpConfig=false')
+      expect(localOnlyCliStarted).not.toContain(staleMcpConfigPath)
     },
     20000,
   )

@@ -227,6 +227,26 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     expect(prompt).not.toContain('relayOfMessageId="mailbox-1"')
   })
 
+  test('uses Codex MCP message and board-tool hints for team-lead mailbox messages', () => {
+    const prompt = getOrdinaryInlineHandoffPrompt({
+      from: 'team-lead',
+      memberName: 'bob',
+      messageId: 'mailbox-2',
+      replyProtocol: 'agent_teams_message_send',
+      text: 'New task assigned. Use task_get and member_work_sync_status.',
+      teamName: 'harbor-labs',
+      timestamp: '2026-04-09T13:38:16.210Z',
+    })
+
+    expect(prompt).toContain('reply via agent-teams_message_send')
+    expect(prompt).toContain('to="team-lead"')
+    expect(prompt).toContain('from="bob"')
+    expect(prompt).toContain('Do not use SendMessage for this Codex-native handoff')
+    expect(prompt).toContain('mcp__agent-teams__task_get')
+    expect(prompt).toContain('mcp__agent-teams__member_work_sync_status')
+    expect(prompt).toContain('Do not run shell searches or list MCP resources')
+  })
+
   test('falls back to SendMessage handoff when Codex MCP context is incomplete', () => {
     const prompt = getOrdinaryInlineHandoffPrompt({
       from: ' user ',

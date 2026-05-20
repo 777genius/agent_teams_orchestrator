@@ -20,6 +20,7 @@ import {
 } from '../opencode/OpenCodeInventoryService.js'
 import {
   buildOpenCodeModelAccessCatalogFromInventorySnapshot,
+  buildOpenCodeModelRouteMetadata,
   hasOpenCodeConfiguredAuthlessModel,
 } from '../opencode/OpenCodeModelAccessPolicy.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
@@ -512,6 +513,7 @@ async function buildOpenCodeStatus(
   const hasConfiguredAuthlessModel = hasOpenCodeConfiguredAuthlessModel(
     buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot),
   )
+  const accessCatalog = buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
   const authenticated = hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
   const fetchedAt = new Date()
   const defaultModel = runtimeModels.find(model => model === 'opencode/big-pickle')
@@ -531,6 +533,10 @@ async function buildOpenCodeStatus(
     defaultLaunchModel: defaultModel,
     models: runtimeModels.map(model => {
       const metadata = metadataByModelId.get(model) ?? null
+      const opencodeMetadata = buildOpenCodeModelRouteMetadata({
+        selectedModel: model,
+        catalog: accessCatalog,
+      })
       return {
         id: model,
         launchModel: model,
@@ -551,8 +557,11 @@ async function buildOpenCodeStatus(
               context: metadata.context,
               limits: metadata.limits,
               free: metadata.free,
+              opencode: opencodeMetadata,
             }
-          : null,
+          : {
+              opencode: opencodeMetadata,
+            },
       }
     }),
     diagnostics: {

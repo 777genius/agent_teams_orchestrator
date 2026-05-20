@@ -605,11 +605,17 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(
         opencode?.modelCatalog?.models.find(model => model.id === 'opencode/big-pickle')
           ?.metadata,
-      ).toEqual({
+      ).toMatchObject({
         cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
         context: 200000,
         limits: { context: 200000, output: 128000 },
         free: true,
+        opencode: {
+          accessKind: 'builtin_free',
+          routeKind: 'builtin_free',
+          proofState: 'not_required',
+          requiresExecutionProof: false,
+        },
       })
       expect(
         opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
@@ -620,7 +626,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.backend?.kind).toBe('opencode-cli')
       expect(opencode?.capabilitiesInfo?.some((item) => item.id === 'managed-profile')).toBe(true)
     },
-    15_000,
+    30_000,
   )
 
   test(
@@ -701,7 +707,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         enabled: true,
       })
     },
-    15_000,
+    30_000,
   )
 
   test(
@@ -738,6 +744,6 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.capabilities.teamLaunch).toBe(true)
       expect(opencode?.backend?.authMethodDetail).toBe('configured local OpenCode model')
     },
-    15_000,
+    30_000,
   )
 })

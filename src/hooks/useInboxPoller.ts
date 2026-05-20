@@ -236,6 +236,12 @@ export type OrdinaryUserDirectReplyProtocol =
   | 'send_message'
   | 'agent_teams_message_send'
 
+const CODEX_AGENT_TEAMS_MCP_TOOL_HINT = [
+  'For Agent Teams task and work-sync tools in this Codex-native handoff, call the exposed MCP tool directly.',
+  'If tool search exposes prefixed names, use mcp__agent-teams__task_get, mcp__agent-teams__task_start, mcp__agent-teams__task_add_comment, mcp__agent-teams__task_complete, mcp__agent-teams__member_work_sync_status, and mcp__agent-teams__member_work_sync_report.',
+  'Do not run shell searches or list MCP resources just to discover these known Agent Teams tools before the first direct tool attempt.',
+].join(' ')
+
 export function resolveOrdinaryUserDirectReplyProtocol(
   entryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER,
 ): OrdinaryUserDirectReplyProtocol {
@@ -344,6 +350,10 @@ export function getBootstrapInlineHandoffPrompt({
   if (!teamName || !memberName) {
     return null
   }
+  const useCodexMcpReply = resolveOrdinaryUserDirectReplyProtocol() === 'agent_teams_message_send'
+  const bootstrapFailureInstruction = useCodexMcpReply
+    ? `If member_briefing is still unavailable after that one retry, send exactly one short message to "team-lead" via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${teamName}", to="team-lead", from="${memberName}", text, and summary, then stop this turn and wait. Do not use SendMessage for this Codex-native bootstrap failure report.`
+    : 'If member_briefing is still unavailable after that one retry, send exactly one short SendMessage to "team-lead" with the exact error text, then stop this turn and wait.'
 
   return [
     `You are bootstrapping into team "${teamName}" as member "${memberName}".`,
@@ -352,7 +362,7 @@ export function getBootstrapInlineHandoffPrompt({
     'Call the MCP tool directly yourself. Do not run a shell command named member_briefing. Do not use Agent, any subagent, or a delegated helper for this bootstrap step.',
     'Do not explore files, inbox paths, or team config before the first member_briefing attempt.',
     'If tool search says agent-teams is still connecting, wait briefly and retry tool search at most once.',
-    'If member_briefing is still unavailable after that one retry, send exactly one short SendMessage to "team-lead" with the exact error text, then stop this turn and wait.',
+    bootstrapFailureInstruction,
     'Do not keep searching for member_briefing, do not check tasks, and do not send repeated status or idle messages after reporting the bootstrap failure.',
     'Bootstrap instructions from team-lead:',
     '<bootstrap_instructions>',
@@ -395,12 +405,20 @@ export function getOrdinaryInlineHandoffPrompt({
   const normalizedTeamName = teamName?.trim()
   const normalizedMemberName = memberName?.trim()
   const normalizedMessageId = messageId?.trim()
+  const normalizedSender = from.trim()
   const canExplainMcpReply =
     replyProtocol === 'agent_teams_message_send' &&
     isUserMessage &&
     Boolean(normalizedTeamName) &&
     Boolean(normalizedMemberName) &&
     Boolean(normalizedMessageId)
+  const canExplainMcpTeamReply =
+    replyProtocol === 'agent_teams_message_send' &&
+    !isUserMessage &&
+    Boolean(normalizedTeamName) &&
+    Boolean(normalizedMemberName) &&
+    Boolean(normalizedSender)
+  const codexMcpToolHints = canExplainMcpReply || canExplainMcpTeamReply
 
   return [
     'Process this queued mailbox message now.',
@@ -410,7 +428,10 @@ export function getOrdinaryInlineHandoffPrompt({
       ? canExplainMcpReply
         ? `If this is a human direct message, reply via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${normalizedTeamName}", to="user", from="${normalizedMemberName}", text, summary, source="runtime_delivery", and relayOfMessageId="${normalizedMessageId}". Do not use SendMessage for this Codex-native handoff. If neither MCP tool name is available before any visible-message tool attempt, write exactly the concise reply text as normal assistant text so the runtime can relay it. This handoff delivery rule supersedes older SendMessage-only wording inside queued_mailbox_message.`
         : 'If this is a human direct message, reply via SendMessage with to="user", summary, and message. If SendMessage is unavailable or fails, write exactly the concise reply text as normal assistant text so the runtime can relay it.'
-      : 'If this message requires a reply, use SendMessage to the sender.',
+      : canExplainMcpTeamReply
+        ? `If this message requires a visible reply, reply via agent-teams_message_send or mcp__agent-teams__message_send with teamName="${normalizedTeamName}", to="${normalizedSender}", from="${normalizedMemberName}", text, summary, and source="runtime_delivery". Do not use SendMessage for this Codex-native handoff.`
+        : 'If this message requires a reply, use SendMessage to the sender.',
+    ...(codexMcpToolHints ? [CODEX_AGENT_TEAMS_MCP_TOOL_HINT] : []),
     '',
     '<queued_mailbox_message>',
     text,

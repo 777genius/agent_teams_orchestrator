@@ -74,6 +74,29 @@ function authStore() {
   }
 }
 
+function executionProbeResult(
+  modelId: string,
+  outcome: 'available' | 'unavailable' | 'not_authenticated' | 'unknown' = 'available',
+  reason: string | null = null,
+) {
+  return {
+    providerId: 'opencode',
+    modelId,
+    probePrompt: 'Output only the single word PONG.',
+    expectedOutput: 'PONG',
+    outcome,
+    reason,
+    durationMs: 10,
+    rawStatus: null,
+    durableState: outcome === 'available' ? 'idle' as const : 'error' as const,
+    latestAssistantText: outcome === 'available' ? 'PONG' : null,
+    latestAssistantPreview: outcome === 'available' ? 'PONG' : null,
+    toolCallCount: 0,
+    errorCount: outcome === 'available' ? 0 : 1,
+    diagnostics: reason ? [reason] : [],
+  }
+}
+
 describe('OpenCodeProviderManagementAdapter', () => {
   test('returns a needs-setup view when OpenCode is missing', async () => {
     let ensureHostCalled = false
@@ -184,6 +207,53 @@ describe('OpenCodeProviderManagementAdapter', () => {
       recommended: true,
     })
     expect(openrouter?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('keeps the current OpenCode default in the configured models panel even before catalog hydration', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: [],
+          models: [],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'openrouter', name: 'OpenRouter' }],
+            default: {
+              openrouter: 'moonshotai/kimi-k2',
+            },
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModel).toBe('openrouter/moonshotai/kimi-k2')
+    expect(result.value.configuredModels).toHaveLength(1)
+    expect(result.value.configuredModels[0]).toMatchObject({
+      modelId: 'openrouter/moonshotai/kimi-k2',
+      providerId: 'openrouter',
+      sourceLabel: 'OpenRouter',
+      default: true,
+      routeKind: 'catalog_provider',
+      accessKind: 'unknown_model',
+    })
   })
 
   test('labels environment-connected providers without claiming app-managed credentials', async () => {
@@ -320,6 +390,67 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
     expect(JSON.stringify(result.value)).not.toContain('sk-test-secret')
     expect(result.value.diagnostics.join('\n')).toContain('Skipped 2 malformed OpenCode provider row(s)')
+  })
+
+  test('directory exposes configured local providers as selectable without manual setup copy', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'llama',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries).toHaveLength(1)
+    expect(result.value.entries[0]).toMatchObject({
+      providerId: 'llama.cpp',
+      setupKind: 'available-readonly',
+      detail: 'Configured local OpenCode model route is available',
+      metadata: {
+        configuredAuthless: true,
+        requiresManualConfig: false,
+      },
+    })
+    expect(result.value.entries[0]?.actions.map(action => action.id)).toEqual([
+      'use',
+      'test',
+      'set-default',
+    ])
+    expect(result.value.entries[0]?.actions.map(action => action.label)).not.toContain(
+      'Manual setup required',
+    )
   })
 
   test('directory exposes connectable providers only when API auth is supported', async () => {
@@ -1597,6 +1728,115 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
   })
 
+  test('marks configured local OpenCode models as authless routes that need proof', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'llama.cpp',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models).toHaveLength(1)
+    expect(result.value.models[0]).toMatchObject({
+      modelId: 'llama.cpp/qwen-test:0.5b',
+      providerId: 'llama.cpp',
+      routeKind: 'configured_local',
+      accessKind: 'configured_authless',
+      proofState: 'needs_probe',
+      requiresExecutionProof: true,
+      availability: 'untested',
+    })
+  })
+
+  test('tests configured authless local models without requiring a connected provider', async () => {
+    let probedModel: string | null = null
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModel = input.selectedModel
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.testModel({
+      runtimeId: 'opencode',
+      providerId: 'llama.cpp',
+      modelId: 'llama.cpp/qwen-test:0.5b',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probedModel).toBe('llama.cpp/qwen-test:0.5b')
+    if (!result.ok) return
+    expect(result.value.availability).toBe('available')
+  })
+
   test('uses live provider defaults when managed config has no default model', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -1741,6 +1981,128 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(
       result.value.providers.find(provider => provider.providerId === 'openrouter')?.defaultModelId,
     ).toBe('openrouter/openai/gpt-oss-20b:free')
+  })
+
+  test('sets configured authless local model as default only after execution proof', async () => {
+    const writes: Array<{ profileRootPath: string; modelId: string }> = []
+    let probedModel: string | null = null
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+          profile: {
+            ...inventory().profile!,
+            managedConfig: options?.bypassCache ? { model: 'llama.cpp/qwen-test:0.5b' } : {},
+          },
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModel = input.selectedModel
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+      managedPreferences: {
+        setDefaultModel: async (profileRootPath, modelId) => {
+          writes.push({ profileRootPath, modelId })
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'llama.cpp',
+      modelId: 'llama.cpp/qwen-test:0.5b',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probedModel).toBe('llama.cpp/qwen-test:0.5b')
+    expect(writes).toEqual([
+      {
+        profileRootPath: '/tmp/profile',
+        modelId: 'llama.cpp/qwen-test:0.5b',
+      },
+    ])
+  })
+
+  test('does not set configured authless local default when execution proof fails', async () => {
+    let wrote = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => executionProbeResult(input.selectedModel, 'unavailable', 'model denied'),
+      },
+      managedPreferences: {
+        setDefaultModel: async () => {
+          wrote = true
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'llama.cpp',
+      modelId: 'llama.cpp/qwen-test:0.5b',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(wrote).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('model-test-failed')
   })
 
   test('invalidates the provider directory cache after changing the default model', async () => {

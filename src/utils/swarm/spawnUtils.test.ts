@@ -10,6 +10,7 @@ import {
   setFlagSettingsPath,
   setStrictMcpConfig,
 } from '../../bootstrap/state.js'
+import { parseArguments } from '../argumentSubstitution.js'
 
 import {
   buildPaneLauncherCommand,
@@ -119,6 +120,20 @@ describe('inherited runtime flags', () => {
         '--effort',
       ),
     ).toBe('--permission-mode auto --strict-mcp-config')
+  })
+
+  it('strips quoted inherited flag values without corrupting later MCP overrides', () => {
+    const stripped = stripInheritedCliFlag(
+      "--mcp-config '/tmp/config dir/stale inherited mcp.json' --setting-sources user\\,project\\,local --strict-mcp-config",
+      '--mcp-config',
+    )
+
+    expect(stripped).not.toContain('stale inherited mcp')
+    expect(parseArguments(stripped)).toEqual([
+      '--setting-sources',
+      'user,project,local',
+      '--strict-mcp-config',
+    ])
   })
 })
 

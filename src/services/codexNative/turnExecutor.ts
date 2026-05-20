@@ -1,7 +1,7 @@
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
 
-import { getSessionId } from '../../bootstrap/state.js'
+import { getSessionId, getStrictMcpConfig } from '../../bootstrap/state.js'
 import type {
   SDKMessage,
   SDKPermissionDenial,
@@ -306,6 +306,9 @@ function shouldUseEphemeralCodexNativeThread(
 function shouldIgnoreCodexNativeUserConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (getStrictMcpConfig()) {
+    return true
+  }
   const value = env[CODEX_NATIVE_IGNORE_USER_CONFIG_ENV]?.trim().toLowerCase()
   return value === '1' || value === 'true' || value === 'yes' || value === 'on'
 }
@@ -563,7 +566,9 @@ export async function* executeCodexNativeTurn(
       apiKey,
       forcedLoginMethod,
       configOverrides: [
-        ...buildCodexNativeMcpConfigOverrides(),
+        ...buildCodexNativeMcpConfigOverrides({
+          strictMcpConfig: getStrictMcpConfig(),
+        }),
         ...buildCodexNativeWorkspaceTrustConfigOverrides(),
       ],
       disabledFeatures: resolveCodexNativeDisabledFeatures({

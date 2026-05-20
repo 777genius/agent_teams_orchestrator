@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
   getFlagSettingsInline,
+  setStrictMcpConfig,
   setFlagSettingsInline,
 } from '../../bootstrap/state.js'
 import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSdkTypes.js'
@@ -68,6 +69,7 @@ async function collectMessagesAndSummary(
 
 afterEach(() => {
   clearDynamicTeamContext()
+  setStrictMcpConfig(false)
 })
 
 describe('executeCodexNativeTurn', () => {
@@ -493,6 +495,60 @@ describe('executeCodexNativeTurn', () => {
         process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
           previousIgnoreUserConfig
       }
+    }
+  })
+
+  test('forces user config isolation when strict MCP config is enabled', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedIgnoreUserConfig: boolean | undefined
+
+    try {
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'false'
+      setStrictMcpConfig(true)
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedIgnoreUserConfig = options.ignoreUserConfig
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedIgnoreUserConfig).toBe(true)
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+      setStrictMcpConfig(false)
     }
   })
 

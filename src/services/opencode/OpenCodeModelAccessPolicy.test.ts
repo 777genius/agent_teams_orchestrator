@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { evaluateOpenCodeModelAccess } from './OpenCodeModelAccessPolicy.js'
+import {
+  buildOpenCodeModelRouteMetadata,
+  evaluateOpenCodeModelAccess,
+} from './OpenCodeModelAccessPolicy.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
 
@@ -82,27 +85,34 @@ describe('OpenCodeModelAccessPolicy', () => {
   })
 
   test('requires execution proof for configured authless local providers even when OpenCode reports them connected', () => {
+    const localCatalog = catalog({
+      connectedProviders: ['llama.cpp'],
+      configProviders: {
+        providers: [
+          {
+            id: 'llama.cpp',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:8080/v1' },
+            models: { 'qwen-test:0.5b': {} },
+          },
+        ],
+        default: {},
+      },
+    })
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'llama.cpp/qwen-test:0.5b',
-      catalog: catalog({
-        connectedProviders: ['llama.cpp'],
-        configProviders: {
-          providers: [
-            {
-              id: 'llama.cpp',
-              npm: '@ai-sdk/openai-compatible',
-              options: { baseURL: 'http://127.0.0.1:8080/v1' },
-              models: { 'qwen-test:0.5b': {} },
-            },
-          ],
-          default: {},
-        },
-      }),
+      catalog: localCatalog,
+    })
+    const route = buildOpenCodeModelRouteMetadata({
+      selectedModel: 'llama.cpp/qwen-test:0.5b',
+      catalog: localCatalog,
     })
 
     expect(access.kind).toBe('configured_authless')
     expect(access.launchAllowed).toBe(false)
     expect(access.requiresExecutionProof).toBe(true)
+    expect(route.routeKind).toBe('configured_local')
+    expect(route.proofState).toBe('needs_probe')
   })
 
   test('requires execution proof for loopback OpenAI-compatible providers from the live provider list', () => {
@@ -192,6 +202,34 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.kind).toBe('verified')
     expect(access.launchAllowed).toBe(true)
     expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test('keeps credentialed providers as connected routes after execution proof', () => {
+    const connectedCatalog = catalog({
+      connectedProviders: ['openrouter'],
+      models: ['openrouter/moonshotai/kimi-k2'],
+    })
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'openrouter/moonshotai/kimi-k2',
+      catalog: connectedCatalog,
+      executionOutcome: {
+        outcome: 'available',
+        reason: null,
+      },
+    })
+    const route = buildOpenCodeModelRouteMetadata({
+      selectedModel: 'openrouter/moonshotai/kimi-k2',
+      catalog: connectedCatalog,
+      executionOutcome: {
+        outcome: 'available',
+        reason: null,
+      },
+    })
+
+    expect(access.kind).toBe('verified')
+    expect(access.launchAllowed).toBe(true)
+    expect(route.routeKind).toBe('connected_provider')
+    expect(route.proofState).toBe('verified')
   })
 
   test('does not treat disconnected remote providers as authless', () => {

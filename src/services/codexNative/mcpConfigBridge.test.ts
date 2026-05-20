@@ -88,6 +88,46 @@ describe('buildCodexNativeMcpConfigOverrides', () => {
       await rm(tempDirectory, { recursive: true, force: true })
     }
   })
+
+  test('fails closed for strict MCP launches when the dynamic config cannot be loaded', async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), 'codex-native-missing-mcp-'))
+    try {
+      const missingConfigPath = join(tempDirectory, 'missing app-only mcp.json')
+
+      expect(() =>
+        buildCodexNativeMcpConfigOverrides({
+          mcpConfigEntries: [missingConfigPath],
+          strictMcpConfig: true,
+        }),
+      ).toThrow('Strict Codex MCP launch could not load dynamic MCP config')
+      expect(
+        buildCodexNativeMcpConfigOverrides({
+          mcpConfigEntries: [missingConfigPath],
+          strictMcpConfig: false,
+        }),
+      ).toEqual([])
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true })
+    }
+  })
+
+  test('fails closed for strict MCP launches when agent-teams is absent', () => {
+    expect(() =>
+      buildCodexNativeMcpConfigOverrides({
+        mcpConfigEntries: [
+          JSON.stringify({
+            mcpServers: {
+              tavily: {
+                command: '/usr/local/bin/node',
+                args: ['/tmp/tavily/index.js'],
+              },
+            },
+          }),
+        ],
+        strictMcpConfig: true,
+      }),
+    ).toThrow('Strict Codex MCP launch did not load the required agent-teams MCP server')
+  })
 })
 
 afterEach(() => {

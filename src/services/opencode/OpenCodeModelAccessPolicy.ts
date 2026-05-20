@@ -14,7 +14,7 @@ import type {
   OpenCodeProvisioningSnapshot,
 } from './types.js'
 
-type OpenCodeModelAccessCatalog = {
+export type OpenCodeModelAccessCatalog = {
   connectedProviders: readonly string[]
   models: readonly string[]
   modelMetadata?: OpenCodeProvisioningSnapshot['modelMetadata']
@@ -37,6 +37,29 @@ export type OpenCodeModelAccessEvaluation = {
   providerId: string | null
   modelId: string | null
   launchAllowed: boolean
+  requiresExecutionProof: boolean
+  reason: string | null
+}
+
+export type OpenCodeModelRouteKind =
+  | 'connected_provider'
+  | 'builtin_free'
+  | 'configured_local'
+  | 'catalog_provider'
+
+export type OpenCodeModelProofState =
+  | 'not_required'
+  | 'needs_probe'
+  | 'verified'
+  | 'failed'
+
+export type OpenCodeModelRouteMetadata = {
+  providerId: string | null
+  modelId: string | null
+  sourceLabel: string | null
+  accessKind: OpenCodeModelAccessKind
+  routeKind: OpenCodeModelRouteKind
+  proofState: OpenCodeModelProofState
   requiresExecutionProof: boolean
   reason: string | null
 }
@@ -175,6 +198,14 @@ function isAuthlessCapableKnownModel(
     )
 }
 
+export function isOpenCodeAuthlessCapableKnownModel(
+  catalog: OpenCodeModelAccessCatalog,
+  providerId: string,
+  modelId: string,
+): boolean {
+  return isAuthlessCapableKnownModel(catalog, providerId, modelId)
+}
+
 function executionFailureKind(
   outcome: OpenCodeExecutionProbeResult['outcome'] | undefined,
 ): OpenCodeModelAccessKind {
@@ -285,6 +316,95 @@ export function evaluateOpenCodeModelAccess(input: {
     launchAllowed: false,
     requiresExecutionProof: false,
     reason: `OpenCode provider "${parsed.providerId}" for selected model "${parsed.raw}" is not connected`,
+  }
+}
+
+function getOpenCodeModelRouteKind(input: {
+  catalog: OpenCodeModelAccessCatalog
+  selectedModel: string
+  providerId: string | null
+  modelId: string | null
+  accessKind: OpenCodeModelAccessKind
+}): OpenCodeModelRouteKind {
+  if (
+    input.accessKind === 'builtin_free'
+    || isOpenCodeBuiltinFreeModelId(input.selectedModel, input.catalog.modelMetadata)
+  ) {
+    return 'builtin_free'
+  }
+
+  if (
+    input.providerId
+    && input.modelId
+    && (
+      input.accessKind === 'configured_authless'
+      || isAuthlessCapableKnownModel(input.catalog, input.providerId, input.modelId)
+    )
+  ) {
+    return 'configured_local'
+  }
+
+  if (
+    input.accessKind === 'credentialed'
+    || (
+      input.providerId
+      && normalizeProviderIdSet(input.catalog.connectedProviders).has(input.providerId)
+    )
+  ) {
+    return 'connected_provider'
+  }
+
+  return 'catalog_provider'
+}
+
+function getOpenCodeModelProofState(input: {
+  accessKind: OpenCodeModelAccessKind
+  requiresExecutionProof: boolean
+  executionOutcome?: Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> | null
+}): OpenCodeModelProofState {
+  if (input.accessKind === 'verified') {
+    return 'verified'
+  }
+  if (input.requiresExecutionProof) {
+    return 'needs_probe'
+  }
+  if (input.executionOutcome && input.executionOutcome.outcome !== 'available') {
+    return 'failed'
+  }
+  return 'not_required'
+}
+
+export function buildOpenCodeModelRouteMetadata(input: {
+  selectedModel: string | null | undefined
+  catalog: OpenCodeModelAccessCatalog
+  executionOutcome?: Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> | null
+  sourceLabel?: string | null
+}): OpenCodeModelRouteMetadata {
+  const selectedModel = input.selectedModel?.trim() ?? ''
+  const access = evaluateOpenCodeModelAccess({
+    selectedModel,
+    catalog: input.catalog,
+    executionOutcome: input.executionOutcome ?? null,
+  })
+  return {
+    providerId: access.providerId,
+    modelId: access.modelId,
+    sourceLabel: input.sourceLabel ?? access.providerId,
+    accessKind: access.kind,
+    routeKind: getOpenCodeModelRouteKind({
+      catalog: input.catalog,
+      selectedModel,
+      providerId: access.providerId,
+      modelId: access.modelId,
+      accessKind: access.kind,
+    }),
+    proofState: getOpenCodeModelProofState({
+      accessKind: access.kind,
+      requiresExecutionProof: access.requiresExecutionProof,
+      executionOutcome: input.executionOutcome ?? null,
+    }),
+    requiresExecutionProof: access.requiresExecutionProof,
+    reason: access.reason,
   }
 }
 

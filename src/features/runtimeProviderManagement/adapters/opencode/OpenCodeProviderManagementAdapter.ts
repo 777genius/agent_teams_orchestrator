@@ -12,6 +12,11 @@ import {
   openCodeInventoryService,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
+import {
+  buildOpenCodeModelRouteMetadata,
+  evaluateOpenCodeModelAccess,
+  type OpenCodeModelAccessCatalog,
+} from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { setOpenCodeManagedDefaultModel } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import type {
@@ -270,6 +275,19 @@ function normalizeProviderScopedModelId(input: {
     return null
   }
   return `${modelProviderId}/${nestedModelId}`
+}
+
+function parseProviderScopedModelId(
+  modelId: string | null | undefined,
+): { providerId: string; modelId: string } | null {
+  const normalizedModelId = modelId?.trim()
+  if (!normalizedModelId?.includes('/')) {
+    return null
+  }
+  const separatorIndex = normalizedModelId.indexOf('/')
+  const providerId = normalizeProviderId(normalizedModelId.slice(0, separatorIndex))
+  const nestedModelId = normalizedModelId.slice(separatorIndex + 1).trim()
+  return providerId && nestedModelId ? { providerId, modelId: normalizedModelId } : null
 }
 
 function providerManagementError(
@@ -860,12 +878,13 @@ function getRuntimeState(input: {
   host: OpenCodeHostHandle | null
   hostStartError: string | null
   connectedProviderCount: number
+  launchableRouteCount: number
   diagnostics: readonly string[]
 }): ProviderRuntimeState {
   if (!input.inventory.detected) return 'needs-setup'
   if (input.hostStartError) return 'degraded'
   if (input.host && input.host.state !== 'healthy') return 'degraded'
-  if (input.connectedProviderCount === 0) return 'needs-auth'
+  if (input.connectedProviderCount === 0 && input.launchableRouteCount === 0) return 'needs-auth'
   if (input.diagnostics.length > 0 && input.inventory.models.length === 0) return 'degraded'
   return 'ready'
 }
@@ -915,8 +934,35 @@ function buildProviderActions(input: {
   authMethods: readonly ProviderAuthMethod[]
   ownership: readonly ProviderOwnership[]
   capabilities: OpenCodeProviderManagementCapabilities
+  configuredAuthless?: boolean
 }): ProviderActionDescriptor[] {
   if (!input.connected) {
+    if (input.configuredAuthless && input.modelCount !== null && input.modelCount > 0) {
+      return [
+        providerAction({
+          id: 'use',
+          label: 'Use',
+          enabled: true,
+          requiresSecret: false,
+          ownershipScope: 'runtime',
+        }),
+        providerAction({
+          id: 'test',
+          label: 'Test',
+          enabled: true,
+          requiresSecret: false,
+          ownershipScope: 'runtime',
+        }),
+        providerAction({
+          id: 'set-default',
+          label: 'Set default',
+          enabled: true,
+          requiresSecret: false,
+          ownershipScope: 'runtime',
+        }),
+      ]
+    }
+
     if (canConnectWithApiKey(input.providerId, input.authMethods)) {
       return [
         providerAction({
@@ -1030,6 +1076,12 @@ function buildProviderConnections(input: {
       : modelCount > 0
         ? 'available'
         : 'not-connected'
+    const configuredAuthless = providerHasConfiguredAuthlessModels({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
 
     connections.push({
       providerId,
@@ -1052,11 +1104,14 @@ function buildProviderConnections(input: {
         authMethods,
         ownership,
         capabilities: input.capabilities,
+        configuredAuthless,
       }),
       detail: connected
         ? getConnectedProviderDetail(ownership)
-        : modelCount > 0
-          ? 'Provider is visible in the OpenCode model catalog'
+        : configuredAuthless && modelCount > 0
+          ? 'Configured local OpenCode model route is available'
+          : modelCount > 0
+            ? 'Provider is visible in the OpenCode model catalog'
           : null,
     })
   }
@@ -1105,6 +1160,36 @@ function getProviderSourceValue(entry: OpenCodeProviderListEntry | undefined): s
   return source ? source.slice(0, 80) : null
 }
 
+function buildProviderManagementAccessCatalog(input: {
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): OpenCodeModelAccessCatalog {
+  return {
+    connectedProviders: Array.from(getConnectedProviderMap(input.inventory, input.providers).keys()),
+    models: input.inventory.models,
+    modelMetadata: input.inventory.modelMetadata,
+    configProviders: input.configProviders,
+    providers: input.providers,
+  }
+}
+
+function providerHasConfiguredAuthlessModels(input: {
+  providerId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): boolean {
+  const accessCatalog = buildProviderManagementAccessCatalog(input)
+  return collectProviderModelIds(input).some(modelId => {
+    const metadata = buildOpenCodeModelRouteMetadata({
+      selectedModel: modelId,
+      catalog: accessCatalog,
+    })
+    return metadata.routeKind === 'configured_local'
+  })
+}
+
 function getProviderSetupKind(input: {
   connected: boolean
   providerId: string
@@ -1134,7 +1219,34 @@ function buildProviderDirectoryActions(input: {
   ownership: readonly ProviderOwnership[]
   capabilities: OpenCodeProviderManagementCapabilities
   setupKind: ProviderDirectoryEntry['setupKind']
+  configuredAuthless: boolean
 }): ProviderActionDescriptor[] {
+  if (input.configuredAuthless && input.modelCount !== null && input.modelCount > 0) {
+    return [
+      providerAction({
+        id: 'use',
+        label: 'Use',
+        enabled: true,
+        requiresSecret: false,
+        ownershipScope: 'runtime',
+      }),
+      providerAction({
+        id: 'test',
+        label: 'Test',
+        enabled: true,
+        requiresSecret: false,
+        ownershipScope: 'runtime',
+      }),
+      providerAction({
+        id: 'set-default',
+        label: 'Set default',
+        enabled: true,
+        requiresSecret: false,
+        ownershipScope: 'runtime',
+      }),
+    ]
+  }
+
   if (input.setupKind === 'available-readonly' || input.setupKind === 'requires-environment') {
     return [
       providerAction({
@@ -1149,6 +1261,28 @@ function buildProviderDirectoryActions(input: {
   }
 
   return buildProviderActions(input)
+}
+
+function getProviderDirectoryDetail(input: {
+  connected: boolean
+  setupKind: ProviderDirectoryEntry['setupKind']
+  modelCount: number | null
+  configuredAuthless: boolean
+  ownership: readonly ProviderOwnership[]
+}): string {
+  if (input.connected) {
+    return getConnectedProviderDetail(input.ownership)
+  }
+  if (input.configuredAuthless && input.modelCount !== null && input.modelCount > 0) {
+    return 'Configured local OpenCode model route is available'
+  }
+  if (input.setupKind === 'connect-api-key') {
+    return 'App-managed API-key setup is available for this provider'
+  }
+  if (input.modelCount !== null && input.modelCount > 0) {
+    return 'Models are visible, but no connected credential was reported'
+  }
+  return 'Inline setup is not supported for this provider yet'
 }
 
 function providerDirectoryEntryMatchesQuery(
@@ -1200,13 +1334,14 @@ function sortProviderDirectoryEntries(
 ): ProviderDirectoryEntry[] {
   const getDirectorySortRank = (entry: ProviderDirectoryEntry): number => {
     if (entry.state === 'connected') return 0
-    if (isRecommendedProvider(entry.providerId)) return 1
-    if (entry.setupKind === 'connect-api-key') return 2
-    if (entry.setupKind === 'available-readonly') return 3
+    if (entry.metadata.configuredAuthless) return 1
+    if (isRecommendedProvider(entry.providerId)) return 2
+    if (entry.setupKind === 'connect-api-key') return 3
+    if (entry.setupKind === 'available-readonly') return 4
     if (entry.setupKind === 'configure-manually' || entry.setupKind === 'requires-environment') {
-      return 4
+      return 5
     }
-    return 5
+    return 6
   }
 
   return [...entries].sort((left, right) => {
@@ -1282,6 +1417,12 @@ function buildProviderDirectory(input: {
       configProviders: input.configProviders,
       providers: input.providers,
     })
+    const configuredAuthless = providerHasConfiguredAuthlessModels({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
     const directoryEntry: ProviderDirectoryEntry = {
       providerId,
       displayName: getProviderDisplayName(providerId, entry),
@@ -1300,13 +1441,13 @@ function buildProviderDirectory(input: {
       sources,
       sourceLabel: getProviderSourceLabel(sources),
       providerSource: getProviderSourceValue(entry),
-      detail: connected
-        ? getConnectedProviderDetail(ownership)
-        : setupKind === 'connect-api-key'
-          ? 'App-managed API-key setup is available for this provider'
-          : modelCount !== null && modelCount > 0
-            ? 'Models are visible, but no connected credential was reported'
-            : 'Inline setup is not supported for this provider yet',
+      detail: getProviderDirectoryDetail({
+        connected,
+        setupKind,
+        modelCount,
+        configuredAuthless,
+        ownership,
+      }),
       actions: buildProviderDirectoryActions({
         providerId,
         connected,
@@ -1315,11 +1456,14 @@ function buildProviderDirectory(input: {
         ownership,
         capabilities,
         setupKind,
+        configuredAuthless,
       }),
       metadata: {
         hasKnownModels: modelCount !== null && modelCount > 0,
-        requiresManualConfig: setupKind === 'configure-manually' || setupKind === 'requires-environment',
+        requiresManualConfig: !configuredAuthless
+          && (setupKind === 'configure-manually' || setupKind === 'requires-environment'),
         supportedInlineAuth: setupKind === 'connect-api-key',
+        configuredAuthless,
       },
     }
 
@@ -1413,6 +1557,16 @@ function buildView(input: {
   const connectedProviderCount = providerConnections.filter(
     provider => provider.state === 'connected',
   ).length
+  const configuredModels = buildConfiguredOpenCodeModels({
+    inventory: input.inventory,
+    configProviders: input.configProviders,
+    providers: input.providers,
+  })
+  const launchableRouteCount = configuredModels.filter(model =>
+    model.routeKind === 'configured_local'
+    || model.routeKind === 'builtin_free'
+    || model.routeKind === 'connected_provider'
+  ).length
 
   return {
     runtimeId: 'opencode',
@@ -1423,6 +1577,7 @@ function buildView(input: {
         host: input.host,
         hostStartError: input.hostStartError ?? null,
         connectedProviderCount,
+        launchableRouteCount,
         diagnostics: input.diagnostics,
       }),
       cliPath: input.inventory.binaryPath,
@@ -1431,6 +1586,7 @@ function buildView(input: {
       localAuth: getLocalAuthState(input.inventory),
     },
     providers: providerConnections,
+    configuredModels,
     defaultModel: getDefaultModel(input.inventory, input.configProviders, input.providers),
     fallbackModel: getFallbackModel(input.inventory),
     diagnostics: input.diagnostics,
@@ -1549,7 +1705,11 @@ function providerModelMatchesQuery(model: RuntimeProviderModel, query: string): 
     model.modelId,
     model.displayName,
     model.sourceLabel,
+    model.routeKind,
+    model.accessKind,
+    model.proofState,
     model.free ? 'free' : '',
+    model.requiresExecutionProof ? 'needs test' : '',
   ].some(value => value.toLowerCase().includes(query))
 }
 
@@ -1560,16 +1720,28 @@ function buildRuntimeProviderModel(input: {
   defaultModelId: string | null
   availability?: ProviderModelAvailability
   inventory: OpenCodeInventorySnapshot
+  accessCatalog: OpenCodeModelAccessCatalog
 }): RuntimeProviderModel {
   const nestedModelId = input.modelId.slice(`${input.providerId}/`.length)
+  const sourceLabel = getProviderDisplayName(input.providerId, input.providerEntry)
+  const routeMetadata = buildOpenCodeModelRouteMetadata({
+    selectedModel: input.modelId,
+    catalog: input.accessCatalog,
+    sourceLabel,
+  })
   return {
     modelId: input.modelId,
     providerId: input.providerId,
     displayName: nestedModelId || input.modelId,
-    sourceLabel: getProviderDisplayName(input.providerId, input.providerEntry),
+    sourceLabel,
     free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
     default: input.defaultModelId === input.modelId,
     availability: input.availability ?? 'untested',
+    accessKind: routeMetadata.accessKind,
+    routeKind: routeMetadata.routeKind,
+    proofState: routeMetadata.proofState,
+    requiresExecutionProof: routeMetadata.requiresExecutionProof,
+    accessReason: routeMetadata.reason,
   }
 }
 
@@ -1591,6 +1763,11 @@ function buildProviderModelsView(input: {
   )
   const query = normalizeQuery(input.query)
   const limit = normalizePositiveLimit(input.limit)
+  const accessCatalog = buildProviderManagementAccessCatalog({
+    inventory: input.inventory,
+    configProviders: input.configProviders,
+    providers: input.providers,
+  })
   const models = collectProviderModelIds({
     providerId: input.providerId,
     inventory: input.inventory,
@@ -1603,6 +1780,7 @@ function buildProviderModelsView(input: {
       providerEntry: entries.get(input.providerId),
       defaultModelId,
       inventory: input.inventory,
+      accessCatalog,
     }))
     .filter(model => providerModelMatchesQuery(model, query))
 
@@ -1615,12 +1793,80 @@ function buildProviderModelsView(input: {
   }
 }
 
-function providerIsConnected(input: {
+function buildConfiguredOpenCodeModels(input: {
   inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
   providers: OpenCodeProviderResponse | null
-  providerId: string
-}): boolean {
-  return getConnectedProviderMap(input.inventory, input.providers).has(input.providerId)
+}): RuntimeProviderModel[] {
+  const entries = getProviderEntries(input.configProviders, input.providers)
+  const accessCatalog = buildProviderManagementAccessCatalog(input)
+  const defaultModel = getDefaultModel(input.inventory, input.configProviders, input.providers)
+  const modelsById = new Map<string, RuntimeProviderModel>()
+
+  for (const providerId of getKnownProviderIds(input)) {
+    const defaultModelId = getDefaultModelForProvider(
+      providerId,
+      input.inventory,
+      input.configProviders,
+      input.providers,
+    )
+    for (const modelId of collectProviderModelIds({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })) {
+      const model = buildRuntimeProviderModel({
+        providerId,
+        modelId,
+        providerEntry: entries.get(providerId),
+        defaultModelId,
+        inventory: input.inventory,
+        accessCatalog,
+      })
+      if (
+        model.routeKind === 'configured_local'
+        || model.routeKind === 'builtin_free'
+        || model.modelId === defaultModel
+      ) {
+        modelsById.set(model.modelId, {
+          ...model,
+          default: model.default || model.modelId === defaultModel,
+        })
+      }
+    }
+  }
+
+  const defaultModelRef = parseProviderScopedModelId(defaultModel)
+  if (defaultModelRef && !modelsById.has(defaultModelRef.modelId)) {
+    modelsById.set(defaultModelRef.modelId, {
+      ...buildRuntimeProviderModel({
+        providerId: defaultModelRef.providerId,
+        modelId: defaultModelRef.modelId,
+        providerEntry: entries.get(defaultModelRef.providerId),
+        defaultModelId: defaultModelRef.modelId,
+        inventory: input.inventory,
+        accessCatalog,
+      }),
+      default: true,
+    })
+  }
+
+  const getRank = (model: RuntimeProviderModel): number => {
+    if (model.routeKind === 'configured_local') return 0
+    if (model.routeKind === 'builtin_free') return 1
+    if (model.default) return 2
+    if (model.routeKind === 'connected_provider') return 3
+    return 4
+  }
+
+  return Array.from(modelsById.values()).sort((left, right) => {
+    const rank = getRank(left) - getRank(right)
+    if (rank !== 0) {
+      return rank
+    }
+    return left.modelId.localeCompare(right.modelId)
+  })
 }
 
 function mapProbeOutcomeToAvailability(
@@ -1648,6 +1894,47 @@ function buildProviderModelTestResult(input: {
       : input.probe.reason ?? 'Model probe failed',
     diagnostics: input.probe.diagnostics,
   }
+}
+
+function getModelAccessError(input: {
+  access: ReturnType<typeof evaluateOpenCodeModelAccess>
+  modelId: string
+  action: 'test' | 'set-default'
+}): ProviderManagementResult<never> | null {
+  if (input.access.kind === 'unknown_model' || input.access.kind === 'no_model') {
+    return providerManagementError(
+      'model-missing',
+      input.access.reason ?? `Model ${input.modelId} was not found in the OpenCode live catalog`,
+    )
+  }
+
+  if (input.access.kind === 'not_authenticated') {
+    return providerManagementError(
+      'auth-required',
+      input.access.reason ?? `Provider for ${input.modelId} is not connected`,
+    )
+  }
+
+  if (input.access.kind === 'execution_failed') {
+    return providerManagementError(
+      'model-test-failed',
+      input.access.reason ?? `Model probe failed for ${input.modelId}`,
+    )
+  }
+
+  if (
+    input.access.kind !== 'credentialed'
+    && input.access.kind !== 'builtin_free'
+    && input.access.kind !== 'configured_authless'
+    && input.access.kind !== 'verified'
+  ) {
+    return providerManagementError(
+      input.action === 'test' ? 'model-test-failed' : 'auth-required',
+      input.access.reason ?? `OpenCode model ${input.modelId} is not launchable`,
+    )
+  }
+
+  return null
 }
 
 export class OpenCodeProviderManagementAdapter implements ProviderManagementQueryPort, ProviderManagementDirectoryQueryPort, ProviderManagementCommandPort {
@@ -2451,13 +2738,6 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
 
-        if (!providerIsConnected({ inventory, providers, providerId })) {
-          return providerManagementError(
-            'auth-required',
-            `Provider ${providerId} must be connected before setting a default model`,
-          )
-        }
-
         const modelsView = buildProviderModelsView({
           providerId,
           inventory,
@@ -2471,12 +2751,38 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
 
-        if (input.probe !== false) {
+        const accessCatalog = buildProviderManagementAccessCatalog({
+          inventory,
+          configProviders,
+          providers,
+        })
+        const access = evaluateOpenCodeModelAccess({
+          selectedModel: modelId,
+          catalog: accessCatalog,
+        })
+        const accessError = getModelAccessError({
+          access,
+          modelId,
+          action: 'set-default',
+        })
+        if (accessError) {
+          return accessError
+        }
+
+        const mustProbe = input.probe !== false
+          || (access.kind === 'configured_authless' && access.requiresExecutionProof)
+        if (mustProbe) {
           const probeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
             projectPath: inventory.projectPath,
           })
           if (probeResult.outcome !== 'available') {
+            if (probeResult.outcome === 'not_authenticated') {
+              return providerManagementError(
+                'auth-required',
+                probeResult.reason ?? `Provider authentication failed for ${modelId}`,
+              )
+            }
             return {
               ok: false,
               error: {
@@ -2553,13 +2859,6 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
 
-        if (!providerIsConnected({ inventory, providers, providerId })) {
-          return providerManagementError(
-            'auth-required',
-            `Provider ${providerId} must be connected before testing a model`,
-          )
-        }
-
         const modelsView = buildProviderModelsView({
           providerId,
           inventory,
@@ -2571,6 +2870,23 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             'model-missing',
             `Model ${modelId} was not found in the OpenCode live catalog`,
           )
+        }
+
+        const access = evaluateOpenCodeModelAccess({
+          selectedModel: modelId,
+          catalog: buildProviderManagementAccessCatalog({
+            inventory,
+            configProviders,
+            providers,
+          }),
+        })
+        const accessError = getModelAccessError({
+          access,
+          modelId,
+          action: 'test',
+        })
+        if (accessError) {
+          return accessError
         }
 
         const probe = await this.getExecutionProbe().probeModel({

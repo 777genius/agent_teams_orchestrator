@@ -64,6 +64,10 @@ type SpawnTeammateResult = Awaited<ReturnType<TeamBootstrapRunnerDeps['spawnTeam
 const TRANSIENT_STARTUP_RETRY_LIMIT = 1
 const TRANSIENT_STARTUP_RETRY_DELAY_MS = 2_000
 const TRANSIENT_STARTUP_RETRY_MIN_REMAINING_BUDGET_MS = 15_000
+const DEFAULT_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS = 180_000
+const BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_ENV =
+  'CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS'
+const BOOTSTRAP_SUBMITTED_EVENT_FUTURE_TOLERANCE_MS = 5_000
 
 let testDeps: Partial<TeamBootstrapRunnerDeps> | null = null
 
@@ -350,6 +354,93 @@ function assertPrimaryBootstrapProviderSupported(member: TeamBootstrapRequest['m
   )
 }
 
+function resolveBootstrapSubmittedConfirmationTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_ENV]
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return DEFAULT_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
+  }
+
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
+  }
+
+  const normalized = Math.floor(parsed)
+  return normalized > 0
+    ? normalized
+    : DEFAULT_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
+}
+
+function formatBootstrapTimeoutMs(timeoutMs: number): string {
+  if (timeoutMs >= 60_000 && timeoutMs % 60_000 === 0) {
+    return `${timeoutMs / 60_000}m`
+  }
+  if (timeoutMs >= 1_000 && timeoutMs % 1_000 === 0) {
+    return `${timeoutMs / 1_000}s`
+  }
+  return `${timeoutMs}ms`
+}
+
+function resolveBootstrapSubmittedElapsedAtObservationMs(params: {
+  submittedTimestamp: string
+  observedWallNowMs: number
+  bootstrapExpectedAfter?: string | null
+}): number {
+  const submittedAtMs = Date.parse(params.submittedTimestamp)
+  if (!Number.isFinite(submittedAtMs)) {
+    return 0
+  }
+
+  if (
+    submittedAtMs >
+    params.observedWallNowMs + BOOTSTRAP_SUBMITTED_EVENT_FUTURE_TOLERANCE_MS
+  ) {
+    return 0
+  }
+
+  if (params.bootstrapExpectedAfter) {
+    const boundaryMs = Date.parse(params.bootstrapExpectedAfter)
+    if (Number.isFinite(boundaryMs) && submittedAtMs < boundaryMs) {
+      return 0
+    }
+  }
+
+  return Math.max(0, params.observedWallNowMs - submittedAtMs)
+}
+
+function resolveBootstrapSubmittedElapsedMs(params: {
+  elapsedAtObservationMs: number
+  observedAtMs: number
+  observedNowMs: number
+}): number {
+  return Math.max(
+    0,
+    params.elapsedAtObservationMs + params.observedNowMs - params.observedAtMs,
+  )
+}
+
+export function __resolveBootstrapSubmittedElapsedForTests(params: {
+  submittedTimestamp: string
+  observedWallNowMs: number
+  observedAtMs: number
+  observedNowMs: number
+  bootstrapExpectedAfter?: string | null
+}): number {
+  const elapsedAtObservationMs =
+    resolveBootstrapSubmittedElapsedAtObservationMs({
+      submittedTimestamp: params.submittedTimestamp,
+      observedWallNowMs: params.observedWallNowMs,
+      bootstrapExpectedAfter: params.bootstrapExpectedAfter,
+    })
+  return resolveBootstrapSubmittedElapsedMs({
+    elapsedAtObservationMs,
+    observedAtMs: params.observedAtMs,
+    observedNowMs: params.observedNowMs,
+  })
+}
+
 function buildSummary(params: {
   request: TeamBootstrapRequest
   reusedExistingTeam: boolean
@@ -501,6 +592,26 @@ async function readLastBootstrapTransportStage(params: {
   return lastStage ? describeBootstrapTransportStage(lastStage) : null
 }
 
+async function readLastBootstrapSubmittedStage(params: {
+  teamName: string
+  memberName: string
+  backendType?: string
+  runtimePid?: number
+  bootstrapRunId?: string | null
+  bootstrapExpectedAfter?: string | null
+}): Promise<{ stage: string; timestamp: string } | null> {
+  const submitted = [
+    ...(await readProcessBootstrapRuntimeEvents(params)),
+  ].reverse().find(event => event.type === 'bootstrap_submitted')
+
+  return submitted
+    ? {
+        stage: describeBootstrapTransportStage(submitted),
+        timestamp: submitted.timestamp,
+      }
+    : null
+}
+
 async function waitForRequiredBootstrapConfirmations(params: {
   request: TeamBootstrapRequest
   stateStore: TeamBootstrapStateStore
@@ -519,6 +630,8 @@ async function waitForRequiredBootstrapConfirmations(params: {
   monotonicNow: () => number
   now: () => number
 }): Promise<string[]> {
+  const submittedConfirmationTimeoutMs =
+    resolveBootstrapSubmittedConfirmationTimeoutMs()
   const pending = new Map<
     string,
     {
@@ -527,6 +640,10 @@ async function waitForRequiredBootstrapConfirmations(params: {
       backendType?: string
       runtimePid?: number
       bootstrapRunId?: string | null
+      bootstrapSubmittedObservedAtMs?: number
+      bootstrapSubmittedElapsedAtObservedMs?: number
+      bootstrapSubmittedEventTimestamp?: string
+      bootstrapSubmittedStage?: string
     }
   >()
   const confirmedMembers = new Set<string>()
@@ -592,7 +709,87 @@ async function waitForRequiredBootstrapConfirmations(params: {
           },
           params.now,
         )
+        continue
       }
+
+      const submittedStage = await readLastBootstrapSubmittedStage({
+        teamName: params.request.teamName,
+        memberName,
+        backendType: pendingMember.backendType,
+        runtimePid: pendingMember.runtimePid,
+        bootstrapRunId: pendingMember.bootstrapRunId,
+        bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
+      })
+      if (!submittedStage) {
+        continue
+      }
+
+      const observedNowMs = params.monotonicNow()
+      if (
+        pendingMember.bootstrapSubmittedEventTimestamp !==
+          submittedStage.timestamp ||
+        pendingMember.bootstrapSubmittedStage !== submittedStage.stage ||
+        pendingMember.bootstrapSubmittedObservedAtMs == null
+      ) {
+        pendingMember.bootstrapSubmittedEventTimestamp =
+          submittedStage.timestamp
+        pendingMember.bootstrapSubmittedObservedAtMs = observedNowMs
+        pendingMember.bootstrapSubmittedElapsedAtObservedMs =
+          resolveBootstrapSubmittedElapsedAtObservationMs({
+            submittedTimestamp: submittedStage.timestamp,
+            observedWallNowMs: params.now(),
+            bootstrapExpectedAfter: pendingMember.bootstrapExpectedAfter,
+          })
+        pendingMember.bootstrapSubmittedStage = submittedStage.stage
+      }
+
+      const submittedElapsedMs = resolveBootstrapSubmittedElapsedMs({
+        elapsedAtObservationMs:
+          pendingMember.bootstrapSubmittedElapsedAtObservedMs ?? 0,
+        observedAtMs: pendingMember.bootstrapSubmittedObservedAtMs,
+        observedNowMs,
+      })
+      if (submittedElapsedMs < submittedConfirmationTimeoutMs) {
+        continue
+      }
+
+      if (
+        await hasBootstrapConfirmation(
+          params.request.teamName,
+          pendingMember.agentId,
+          pendingMember.bootstrapExpectedAfter,
+          memberName,
+        )
+      ) {
+        pending.delete(memberName)
+        confirmedMembers.add(memberName)
+        await params.stateStore.markMemberResult(
+          memberName,
+          {
+            status: 'bootstrap_confirmed',
+            agentId: pendingMember.agentId,
+          },
+          params.now,
+        )
+        continue
+      }
+
+      const reason = [
+        `Bootstrap prompt was submitted, but teammate did not bootstrap-confirm before submitted-confirmation timeout (${formatBootstrapTimeoutMs(submittedConfirmationTimeoutMs)}).`,
+        `Last transport stage: ${pendingMember.bootstrapSubmittedStage ?? submittedStage.stage}`,
+      ].join(' ')
+      pending.delete(memberName)
+      if (!params.failedMembers.some(failed => failed.name === memberName)) {
+        params.failedMembers.push({ name: memberName, reason })
+      }
+      await params.stateStore.markMemberResult(
+        memberName,
+        {
+          status: 'failed',
+          failureReason: reason,
+        },
+        params.now,
+      )
     }
 
     if (pending.size === 0) {

@@ -184,6 +184,7 @@ export type ProviderDirectoryEntry = {
     hasKnownModels: boolean
     requiresManualConfig: boolean
     supportedInlineAuth: boolean
+    configuredAuthless: boolean
   }
 }
 
@@ -206,6 +207,7 @@ export type ProviderManagementView = {
   title: string
   runtime: ProviderManagementRuntimeView
   providers: readonly ProviderConnection[]
+  configuredModels: readonly RuntimeProviderModel[]
   defaultModel: string | null
   fallbackModel: string | null
   diagnostics: readonly string[]
@@ -218,6 +220,28 @@ export type ProviderModelAvailability =
   | 'unknown'
   | 'untested'
 
+export type OpenCodeRuntimeModelAccessKind =
+  | 'no_model'
+  | 'unknown_model'
+  | 'credentialed'
+  | 'builtin_free'
+  | 'configured_authless'
+  | 'verified'
+  | 'not_authenticated'
+  | 'execution_failed'
+
+export type OpenCodeRuntimeModelRouteKind =
+  | 'connected_provider'
+  | 'builtin_free'
+  | 'configured_local'
+  | 'catalog_provider'
+
+export type OpenCodeRuntimeModelProofState =
+  | 'not_required'
+  | 'needs_probe'
+  | 'verified'
+  | 'failed'
+
 export type RuntimeProviderModel = {
   modelId: string
   providerId: string
@@ -226,6 +250,11 @@ export type RuntimeProviderModel = {
   free: boolean
   default: boolean
   availability: ProviderModelAvailability
+  accessKind: OpenCodeRuntimeModelAccessKind
+  routeKind: OpenCodeRuntimeModelRouteKind
+  proofState: OpenCodeRuntimeModelProofState
+  requiresExecutionProof: boolean
+  accessReason: string | null
 }
 
 export type RuntimeProviderModelsView = {
