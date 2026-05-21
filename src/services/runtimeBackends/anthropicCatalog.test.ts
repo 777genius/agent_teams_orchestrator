@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  buildAnthropicCompatibleRuntimeModelCatalogFromApiModels,
   buildAnthropicRuntimeModelCatalogFromApiModels,
   createStaticAnthropicRuntimeModelCatalog,
   getAnthropicRuntimeReasoningEfforts,
@@ -88,7 +89,9 @@ describe('anthropic runtime catalog', () => {
       'max',
     ])
 
-    expect(catalog.models.find((model) => model.launchModel === 'opus[1m]')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'opus[1m]'),
+    ).toMatchObject({
       displayName: 'Opus 4.7 (1M)',
       hidden: true,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
@@ -96,7 +99,9 @@ describe('anthropic runtime catalog', () => {
       supportsFastMode: false,
       source: 'anthropic-models-api',
     })
-    expect(catalog.models.find((model) => model.launchModel === 'claude-opus-4-6')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'claude-opus-4-6'),
+    ).toMatchObject({
       displayName: 'Opus 4.6',
       hidden: false,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
@@ -104,7 +109,9 @@ describe('anthropic runtime catalog', () => {
       supportsFastMode: true,
       source: 'anthropic-models-api',
     })
-    expect(catalog.models.find((model) => model.launchModel === 'sonnet')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'sonnet'),
+    ).toMatchObject({
       displayName: 'Sonnet 4.6',
       hidden: false,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
@@ -112,13 +119,55 @@ describe('anthropic runtime catalog', () => {
       supportsFastMode: false,
       source: 'anthropic-models-api',
     })
-    expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'haiku'),
+    ).toMatchObject({
       displayName: 'Haiku 4.5',
       hidden: false,
       supportedReasoningEfforts: [],
       defaultReasoningEffort: null,
       supportsFastMode: false,
       source: 'anthropic-models-api',
+    })
+  })
+
+  test('normalizes Anthropic-compatible models without requiring Claude model ids', () => {
+    const catalog = buildAnthropicCompatibleRuntimeModelCatalogFromApiModels([
+      {
+        id: 'qwen3.6',
+        object: 'model',
+        display_name: 'Qwen 3.6',
+        max_input_tokens: 128_000,
+      },
+      {
+        id: 'glm-5:cloud',
+        object: 'model',
+        display_name: 'GLM 5 Cloud',
+      },
+    ])
+
+    expect(catalog.source).toBe('anthropic-compatible-api')
+    expect(catalog.status).toBe('ready')
+    expect(catalog.defaultLaunchModel).toBe('qwen3.6')
+    expect(getAnthropicVisibleRuntimeModels(catalog)).toEqual([
+      'qwen3.6',
+      'glm-5:cloud',
+    ])
+    expect(getAnthropicRuntimeReasoningEfforts(catalog)).toEqual([])
+    expect(catalog.models[0]).toMatchObject({
+      id: 'qwen3.6',
+      launchModel: 'qwen3.6',
+      displayName: 'Qwen 3.6',
+      hidden: false,
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      supportsFastMode: false,
+      inputModalities: ['text'],
+      source: 'anthropic-compatible-api',
+      badgeLabel: 'From gateway',
+      metadata: {
+        context: 128_000,
+      },
     })
   })
 
@@ -143,19 +192,27 @@ describe('anthropic runtime catalog', () => {
       'high',
       'max',
     ])
-    expect(catalog.models.find((model) => model.launchModel === 'opus')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'opus'),
+    ).toMatchObject({
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
       source: 'static-fallback',
     })
-    expect(catalog.models.find((model) => model.launchModel === 'claude-sonnet-4-6[1m]')).toMatchObject({
+    expect(
+      catalog.models.find(
+        (model) => model.launchModel === 'claude-sonnet-4-6[1m]',
+      ),
+    ).toMatchObject({
       hidden: true,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
       supportsFastMode: false,
       source: 'static-fallback',
     })
-    expect(catalog.models.find((model) => model.launchModel === 'haiku')).toMatchObject({
+    expect(
+      catalog.models.find((model) => model.launchModel === 'haiku'),
+    ).toMatchObject({
       supportedReasoningEfforts: [],
       defaultReasoningEffort: null,
       source: 'static-fallback',

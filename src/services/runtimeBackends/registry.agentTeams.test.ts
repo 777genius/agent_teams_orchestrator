@@ -55,6 +55,158 @@ describe('runtime backend registry with agent_teams capabilities', () => {
     }
   })
 
+  test('anthropic summary runtime status treats Ollama as Anthropic-compatible bearer auth', async () => {
+    const envKeys = [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_USE_VERTEX',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+    process.env.ANTHROPIC_BASE_URL = 'http://localhost:11434'
+    process.env.ANTHROPIC_AUTH_TOKEN = 'ollama'
+    process.env.ANTHROPIC_API_KEY = ''
+    delete process.env.ANTHROPIC_AWS_WORKSPACE_ID
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+
+    try {
+      let rateLimitRefreshCalls = 0
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'anthropic',
+        {
+          getAnthropicSubscriptionRateLimits: () => {
+            rateLimitRefreshCalls += 1
+            return null
+          },
+        },
+        { detailLevel: 'summary' },
+      )
+      const anthropic = payload.providers.anthropic
+
+      expect(rateLimitRefreshCalls).toBe(0)
+      expect(anthropic?.authenticated).toBe(true)
+      expect(anthropic?.authMethod).toBe('ollama_token')
+      expect(anthropic?.canLoginFromUi).toBe(false)
+      expect(anthropic?.selectedBackendId).toBe('ollama')
+      expect(anthropic?.resolvedBackendId).toBe('ollama')
+      expect(anthropic?.models).toEqual([])
+      expect(anthropic?.runtimeCapabilities?.modelCatalog?.source).toBe(
+        'anthropic-compatible-api',
+      )
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'ollama',
+        label: 'Ollama',
+        endpointLabel: 'http://localhost:11434',
+        authMethodDetail: 'ollama_token',
+      })
+      expect(anthropic?.subscriptionRateLimits).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  test('anthropic summary runtime status treats compatible custom Authorization as auth', async () => {
+    const envKeys = [
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_USE_VERTEX',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+    process.env.ANTHROPIC_BASE_URL = 'http://localhost:9090'
+    process.env.ANTHROPIC_CUSTOM_HEADERS = 'Authorization: Bearer gateway-token'
+    delete process.env.ANTHROPIC_API_KEY
+    delete process.env.ANTHROPIC_AUTH_TOKEN
+    delete process.env.ANTHROPIC_AWS_WORKSPACE_ID
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+
+    try {
+      let rateLimitRefreshCalls = 0
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'anthropic',
+        {
+          getAnthropicSubscriptionRateLimits: () => {
+            rateLimitRefreshCalls += 1
+            return null
+          },
+        },
+        { detailLevel: 'summary' },
+      )
+      const anthropic = payload.providers.anthropic
+
+      expect(rateLimitRefreshCalls).toBe(0)
+      expect(anthropic?.authenticated).toBe(true)
+      expect(anthropic?.authMethod).toBe(
+        'anthropic_compatible_custom_authorization',
+      )
+      expect(anthropic?.canLoginFromUi).toBe(false)
+      expect(anthropic?.selectedBackendId).toBe('anthropic-compatible')
+      expect(anthropic?.resolvedBackendId).toBe('anthropic-compatible')
+      expect(anthropic?.models).toEqual([])
+      expect(anthropic?.runtimeCapabilities?.modelCatalog?.source).toBe(
+        'anthropic-compatible-api',
+      )
+      expect(anthropic?.backend).toMatchObject({
+        kind: 'anthropic-compatible',
+        label: 'Anthropic-compatible API',
+        endpointLabel: 'http://localhost:9090',
+        authMethodDetail: 'anthropic_compatible_custom_authorization',
+      })
+      expect(anthropic?.subscriptionRateLimits).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
   test('anthropic runtime status detects Claude Platform on AWS without prompting login', async () => {
     const envKeys = [
       'ANTHROPIC_AWS_API_KEY',

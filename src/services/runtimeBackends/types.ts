@@ -1,6 +1,4 @@
-import type {
-  OpenCodeModelRouteMetadata,
-} from '../opencode/OpenCodeModelAccessPolicy.js'
+import type { OpenCodeModelRouteMetadata } from '../opencode/OpenCodeModelAccessPolicy.js'
 
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
@@ -9,6 +7,8 @@ export type AnthropicRuntimeBackendId =
   | 'vertex'
   | 'foundry'
   | 'claude-platform-aws'
+  | 'ollama'
+  | 'anthropic-compatible'
 export type GeminiRuntimeBackendId = 'auto' | 'api' | 'cli-sdk'
 export type CodexRuntimeBackendId = 'codex-native'
 export type RuntimeBackendId =
@@ -63,6 +63,7 @@ export type RuntimeReasoningEffort =
 
 export type RuntimeProviderModelCatalogSource =
   | 'anthropic-models-api'
+  | 'anthropic-compatible-api'
   | 'app-server'
   | 'static-fallback'
   | 'runtime'

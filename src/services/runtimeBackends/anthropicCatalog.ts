@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import axios from 'axios'
 
 import {
@@ -16,7 +18,10 @@ import {
   isFastModeEnabled,
   isFastModeSupportedByModel,
 } from '../../utils/fastMode.js'
-import { getAPIProvider } from '../../utils/model/providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+} from '../../utils/model/providers.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import type {
   RuntimeProviderModelCatalog,
@@ -32,14 +37,25 @@ const ANTHROPIC_SUCCESS_CACHE_TTL_MS = 10 * 60 * 1_000
 const ANTHROPIC_FALLBACK_CACHE_TTL_MS = 60 * 1_000
 const ONE_MILLION_INPUT_TOKENS = 1_000_000
 const ANTHROPIC_DEFAULT_LAUNCH_MODEL = 'opus[1m]'
-const ANTHROPIC_STATIC_VISIBLE_MODELS = new Set(['opus', 'claude-opus-4-6', 'sonnet', 'haiku'])
-const ANTHROPIC_EFFORT_ORDER: RuntimeReasoningEffort[] = ['low', 'medium', 'high', 'max']
+const ANTHROPIC_STATIC_VISIBLE_MODELS = new Set([
+  'opus',
+  'claude-opus-4-6',
+  'sonnet',
+  'haiku',
+])
+const ANTHROPIC_EFFORT_ORDER: RuntimeReasoningEffort[] = [
+  'low',
+  'medium',
+  'high',
+  'max',
+]
 
 type AnthropicCatalogFamily = 'opus' | 'sonnet' | 'haiku'
 
 export type AnthropicApiModelInfo = {
   id?: string
   type?: string
+  object?: string
   display_name?: string
   created_at?: string
   max_input_tokens?: number | null
@@ -63,6 +79,7 @@ type AnthropicLaunchDefinition = {
 
 type CachedAnthropicCatalog = {
   catalog: RuntimeProviderModelCatalog
+  cacheKey: string
   expiresAt: number
 }
 
@@ -187,7 +204,9 @@ const ANTHROPIC_LAUNCH_DEFINITIONS: readonly AnthropicLaunchDefinition[] = [
 ] as const
 
 let cachedAnthropicCatalog: CachedAnthropicCatalog | null = null
-let inFlightAnthropicCatalogPromise: Promise<RuntimeProviderModelCatalog> | null = null
+let inFlightAnthropicCatalogPromise: Promise<RuntimeProviderModelCatalog> | null =
+  null
+let inFlightAnthropicCatalogCacheKey: string | null = null
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -199,8 +218,141 @@ function normalizeModelKey(value: string | undefined | null): string {
 
 function getAnthropicApiBaseUrl(): string {
   const configured = process.env.ANTHROPIC_BASE_URL?.trim()
-  const baseUrl = configured && configured.length > 0 ? configured : 'https://api.anthropic.com'
+  const baseUrl =
+    configured && configured.length > 0
+      ? configured
+      : 'https://api.anthropic.com'
   return baseUrl.replace(/\/+$/, '')
+}
+
+function buildAnthropicApiUrl(pathname: string): string {
+  const baseUrl = getAnthropicApiBaseUrl()
+  const normalizedPath = pathname.startsWith('/') ? pathname : `/${pathname}`
+  if (baseUrl.endsWith('/v1/models')) {
+    if (normalizedPath === '/v1/models') {
+      return baseUrl
+    }
+    if (normalizedPath.startsWith('/v1/models/')) {
+      return `${baseUrl}${normalizedPath.slice('/v1/models'.length)}`
+    }
+  }
+  if (baseUrl.endsWith('/v1') && normalizedPath.startsWith('/v1/')) {
+    return `${baseUrl}${normalizedPath.slice('/v1'.length)}`
+  }
+  return `${baseUrl}${normalizedPath}`
+}
+
+export function isAnthropicCompatibleRuntimeBaseUrl(): boolean {
+  const configured = process.env.ANTHROPIC_BASE_URL?.trim()
+  return Boolean(configured) && !isFirstPartyAnthropicBaseUrl()
+}
+
+function isOllamaLikeAnthropicRuntimeBaseUrl(): boolean {
+  const configured = process.env.ANTHROPIC_BASE_URL?.trim()
+  if (process.env.ANTHROPIC_AUTH_TOKEN?.trim().toLowerCase() === 'ollama') {
+    return true
+  }
+  if (!configured) {
+    return false
+  }
+  try {
+    const url = new URL(configured)
+    return url.port === '11434'
+  } catch {
+    return false
+  }
+}
+
+export function getAnthropicCompatibleRuntimeBackendLabel():
+  | 'ollama'
+  | 'anthropic-compatible' {
+  return isOllamaLikeAnthropicRuntimeBaseUrl()
+    ? 'ollama'
+    : 'anthropic-compatible'
+}
+
+function getAnthropicCompatibleAuthHeaders(): Record<string, string> {
+  const authToken = process.env.ANTHROPIC_AUTH_TOKEN?.trim()
+  if (authToken) {
+    return { Authorization: `Bearer ${authToken}` }
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
+  if (apiKey) {
+    return { 'x-api-key': apiKey }
+  }
+
+  return {}
+}
+
+function getAnthropicCustomHeaders(): Record<string, string> {
+  const customHeadersEnv = process.env.ANTHROPIC_CUSTOM_HEADERS
+  if (!customHeadersEnv) {
+    return {}
+  }
+
+  const headers: Record<string, string> = {}
+  for (const headerString of customHeadersEnv.split(/\n|\r\n/)) {
+    const colonIdx = headerString.indexOf(':')
+    if (colonIdx === -1) {
+      continue
+    }
+    const name = headerString.slice(0, colonIdx).trim()
+    if (!name) {
+      continue
+    }
+    headers[name] = headerString.slice(colonIdx + 1).trim()
+  }
+  return headers
+}
+
+export function getAnthropicCustomAuthorizationHeader(): string | null {
+  for (const [name, value] of Object.entries(getAnthropicCustomHeaders())) {
+    if (name.toLowerCase() === 'authorization') {
+      const normalizedValue = value.trim()
+      return normalizedValue.length > 0 ? normalizedValue : null
+    }
+  }
+  return null
+}
+
+function fingerprintCacheInput(value: string | undefined): string {
+  const normalizedValue = value?.trim()
+  if (!normalizedValue) {
+    return ''
+  }
+  return createHash('sha256').update(normalizedValue).digest('hex')
+}
+
+function getAnthropicCatalogCacheKey(): string {
+  return JSON.stringify({
+    apiProvider: getAPIProvider(),
+    baseUrl: getAnthropicApiBaseUrl(),
+    authToken: fingerprintCacheInput(process.env.ANTHROPIC_AUTH_TOKEN),
+    apiKey: fingerprintCacheInput(process.env.ANTHROPIC_API_KEY),
+    customHeaders: fingerprintCacheInput(process.env.ANTHROPIC_CUSTOM_HEADERS),
+    userType: process.env.USER_TYPE?.trim() ?? '',
+  })
+}
+
+function shouldAcceptAnthropicCompatibleModel(
+  model: AnthropicApiModelInfo,
+): boolean {
+  const id = model.id?.trim()
+  if (!id) {
+    return false
+  }
+  const type = model.type?.trim()
+  const object = model.object?.trim()
+  return !type && !object ? true : type === 'model' || object === 'model'
+}
+
+function shouldAcceptFirstPartyAnthropicModel(
+  model: AnthropicApiModelInfo,
+): boolean {
+  return (
+    model.type === 'model' && normalizeModelKey(model.id).startsWith('claude-')
+  )
 }
 
 function readCapabilitySupport(value: unknown): boolean {
@@ -213,25 +365,37 @@ function readCapabilitySupport(value: unknown): boolean {
   return value.supported === true
 }
 
-function cleanAnthropicDisplayName(displayName: string | undefined, fallback: string): string {
+function cleanAnthropicDisplayName(
+  displayName: string | undefined,
+  fallback: string,
+): string {
   const normalized = displayName?.trim().replace(/^Claude\s+/i, '')
   return normalized && normalized.length > 0 ? normalized : fallback
 }
 
-function supportsOneMillionContext(model: AnthropicApiModelInfo | null): boolean {
-  return typeof model?.max_input_tokens === 'number' && model.max_input_tokens >= ONE_MILLION_INPUT_TOKENS
-}
-
-function hasCompleteCapabilityData(model: AnthropicApiModelInfo | null | undefined): boolean {
-  return Boolean(
-    model
-    && isRecord(model.capabilities)
-    && typeof model.max_input_tokens === 'number'
-    && typeof model.max_tokens === 'number',
+function supportsOneMillionContext(
+  model: AnthropicApiModelInfo | null,
+): boolean {
+  return (
+    typeof model?.max_input_tokens === 'number' &&
+    model.max_input_tokens >= ONE_MILLION_INPUT_TOKENS
   )
 }
 
-function normalizeResolvedModelId(model: AnthropicApiModelInfo | null): string | null {
+function hasCompleteCapabilityData(
+  model: AnthropicApiModelInfo | null | undefined,
+): boolean {
+  return Boolean(
+    model &&
+    isRecord(model.capabilities) &&
+    typeof model.max_input_tokens === 'number' &&
+    typeof model.max_tokens === 'number',
+  )
+}
+
+function normalizeResolvedModelId(
+  model: AnthropicApiModelInfo | null,
+): string | null {
   const resolvedId = model?.id?.trim()
   return resolvedId && resolvedId.length > 0 ? resolvedId : null
 }
@@ -240,10 +404,14 @@ function resolveFallbackPreferredModelId(
   definition: AnthropicLaunchDefinition,
 ): string | null {
   const preferredModelId = definition.preferredLiveIds[0]?.trim()
-  return preferredModelId && preferredModelId.length > 0 ? preferredModelId : null
+  return preferredModelId && preferredModelId.length > 0
+    ? preferredModelId
+    : null
 }
 
-function resolveRuntimeBackedAnthropicEfforts(model: AnthropicApiModelInfo | null): RuntimeReasoningEffort[] {
+function resolveRuntimeBackedAnthropicEfforts(
+  model: AnthropicApiModelInfo | null,
+): RuntimeReasoningEffort[] {
   const resolvedModelId = normalizeResolvedModelId(model)
   if (!resolvedModelId || !modelSupportsEffort(resolvedModelId)) {
     return []
@@ -266,7 +434,9 @@ function resolveAnthropicDefaultReasoningEffort(
 
   try {
     const defaultEffort = getDefaultEffortForModel(resolvedModelId)
-    return defaultEffort === undefined ? 'high' : convertEffortValueToLevel(defaultEffort)
+    return defaultEffort === undefined
+      ? 'high'
+      : convertEffortValueToLevel(defaultEffort)
   } catch {
     // Runtime catalog fallback must stay usable even when auth-scoped
     // subscriber metadata is unavailable in the current process.
@@ -274,7 +444,9 @@ function resolveAnthropicDefaultReasoningEffort(
   }
 }
 
-function resolveAnthropicFastModeSupport(model: AnthropicApiModelInfo | null): boolean {
+function resolveAnthropicFastModeSupport(
+  model: AnthropicApiModelInfo | null,
+): boolean {
   const resolvedModelId = normalizeResolvedModelId(model)
   if (!resolvedModelId) {
     return false
@@ -283,7 +455,9 @@ function resolveAnthropicFastModeSupport(model: AnthropicApiModelInfo | null): b
   return isFastModeSupportedByModel(resolvedModelId)
 }
 
-function parseAnthropicInputModalities(model: AnthropicApiModelInfo | null): string[] {
+function parseAnthropicInputModalities(
+  model: AnthropicApiModelInfo | null,
+): string[] {
   const capabilities = model?.capabilities
   if (!isRecord(capabilities)) {
     return ['text']
@@ -310,10 +484,9 @@ function mergeAnthropicModels(
   return {
     ...existing,
     ...nextModel,
-    capabilities:
-      isRecord(nextModel.capabilities)
-        ? nextModel.capabilities
-        : existing.capabilities ?? nextModel.capabilities,
+    capabilities: isRecord(nextModel.capabilities)
+      ? nextModel.capabilities
+      : (existing.capabilities ?? nextModel.capabilities),
   }
 }
 
@@ -321,9 +494,17 @@ function formatAnthropicCatalogItemDisplayName(
   definition: AnthropicLaunchDefinition,
   liveModel: AnthropicApiModelInfo | null,
 ): string {
-  const fallbackDisplayName = definition.fallbackDisplayName.replace(/\s+\(1M\)$/i, '')
-  const liveDisplayName = cleanAnthropicDisplayName(liveModel?.display_name, fallbackDisplayName)
-  return definition.requiresOneMillionContext ? `${liveDisplayName} (1M)` : liveDisplayName
+  const fallbackDisplayName = definition.fallbackDisplayName.replace(
+    /\s+\(1M\)$/i,
+    '',
+  )
+  const liveDisplayName = cleanAnthropicDisplayName(
+    liveModel?.display_name,
+    fallbackDisplayName,
+  )
+  return definition.requiresOneMillionContext
+    ? `${liveDisplayName} (1M)`
+    : liveDisplayName
 }
 
 function createAnthropicCatalogItem(params: {
@@ -333,7 +514,10 @@ function createAnthropicCatalogItem(params: {
   source: 'anthropic-models-api' | 'static-fallback'
   statusMessage?: string | null
 }): RuntimeProviderModelCatalogItem {
-  const displayName = formatAnthropicCatalogItemDisplayName(params.definition, params.liveModel)
+  const displayName = formatAnthropicCatalogItemDisplayName(
+    params.definition,
+    params.liveModel,
+  )
   const supportedReasoningEfforts =
     params.source === 'anthropic-models-api'
       ? resolveRuntimeBackedAnthropicEfforts(params.liveModel)
@@ -402,7 +586,8 @@ function buildAnthropicCatalogDiagnostics(params: {
   }
 
   return {
-    configReadState: params.code === 'anthropic-auth-missing' ? 'skipped' : 'failed',
+    configReadState:
+      params.code === 'anthropic-auth-missing' ? 'skipped' : 'failed',
     appServerState: 'degraded',
     message: params.message ?? null,
     code: params.code ?? null,
@@ -420,17 +605,21 @@ function buildAnthropicCatalogFromDefinitions(params: {
 }): RuntimeProviderModelCatalog {
   const models = dedupeCatalogModels(
     ANTHROPIC_LAUNCH_DEFINITIONS.flatMap((definition) => {
-      const liveModel = definition.preferredLiveIds
-        .map((candidateId) => params.liveModelsById.get(normalizeModelKey(candidateId)) ?? null)
-        .find((candidate) => {
-          if (!candidate) {
-            return false
-          }
-          if (definition.requiresOneMillionContext) {
-            return supportsOneMillionContext(candidate)
-          }
-          return true
-        }) ?? null
+      const liveModel =
+        definition.preferredLiveIds
+          .map(
+            (candidateId) =>
+              params.liveModelsById.get(normalizeModelKey(candidateId)) ?? null,
+          )
+          .find((candidate) => {
+            if (!candidate) {
+              return false
+            }
+            if (definition.requiresOneMillionContext) {
+              return supportsOneMillionContext(candidate)
+            }
+            return true
+          }) ?? null
 
       if (liveModel && !isModelAllowed(definition.launchModel)) {
         return []
@@ -441,7 +630,8 @@ function buildAnthropicCatalogFromDefinitions(params: {
           createAnthropicCatalogItem({
             definition,
             liveModel,
-            isDefault: definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
+            isDefault:
+              definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
             source: 'anthropic-models-api',
           }),
         ]
@@ -466,20 +656,24 @@ function buildAnthropicCatalogFromDefinitions(params: {
   )
 
   const defaultModelId =
-    models.find((model) => model.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL)?.id
-    ?? models.find((model) => model.launchModel === 'opus')?.id
-    ?? models[0]?.id
-    ?? null
+    models.find((model) => model.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL)
+      ?.id ??
+    models.find((model) => model.launchModel === 'opus')?.id ??
+    models[0]?.id ??
+    null
   const defaultLaunchModel =
-    models.find((model) => model.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL)?.launchModel
-    ?? models.find((model) => model.launchModel === 'opus')?.launchModel
-    ?? models[0]?.launchModel
-    ?? null
+    models.find((model) => model.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL)
+      ?.launchModel ??
+    models.find((model) => model.launchModel === 'opus')?.launchModel ??
+    models[0]?.launchModel ??
+    null
 
   return {
     schemaVersion: 1,
     providerId: 'anthropic',
-    source: params.liveSourceEnabled ? 'anthropic-models-api' : 'static-fallback',
+    source: params.liveSourceEnabled
+      ? 'anthropic-models-api'
+      : 'static-fallback',
     status: params.status,
     fetchedAt: params.fetchedAt,
     staleAt: params.staleAt,
@@ -505,33 +699,46 @@ function createLiveModelIndex(
       continue
     }
 
-    indexedModels.set(modelId, mergeAnthropicModels(indexedModels.get(modelId), model))
+    indexedModels.set(
+      modelId,
+      mergeAnthropicModels(indexedModels.get(modelId), model),
+    )
   }
 
   return indexedModels
 }
 
 async function fetchAnthropicModelList(): Promise<AnthropicApiModelInfo[]> {
-  const auth = getAuthHeaders()
-  if (auth.error) {
+  const compatibleEndpoint = isAnthropicCompatibleRuntimeBaseUrl()
+  const auth = compatibleEndpoint ? null : getAuthHeaders()
+  if (auth?.error) {
     throw new Error(auth.error)
   }
 
   const response = await withOAuth401Retry(() =>
-    axios.get<AnthropicApiModelListResponse>(`${getAnthropicApiBaseUrl()}/v1/models`, {
-      headers: {
-        ...auth.headers,
-        'anthropic-version': ANTHROPIC_MODELS_API_VERSION,
-        'user-agent': getUserAgent(),
+    axios.get<AnthropicApiModelListResponse>(
+      buildAnthropicApiUrl('/v1/models'),
+      {
+        headers: {
+          ...getAnthropicCustomHeaders(),
+          ...(compatibleEndpoint
+            ? getAnthropicCompatibleAuthHeaders()
+            : auth?.headers),
+          'anthropic-version': ANTHROPIC_MODELS_API_VERSION,
+          'user-agent': getUserAgent(),
+        },
+        params: {
+          limit: ANTHROPIC_MODELS_API_LIMIT,
+        },
+        timeout: 10_000,
       },
-      params: {
-        limit: ANTHROPIC_MODELS_API_LIMIT,
-      },
-      timeout: 10_000,
-    }),
+    ),
   )
 
-  return response.data.data?.filter((model) => model.type === 'model' && normalizeModelKey(model.id).startsWith('claude-')) ?? []
+  const predicate = compatibleEndpoint
+    ? shouldAcceptAnthropicCompatibleModel
+    : shouldAcceptFirstPartyAnthropicModel
+  return response.data.data?.filter(predicate) ?? []
 }
 
 async function fetchAnthropicModelById(
@@ -543,14 +750,18 @@ async function fetchAnthropicModelById(
   }
 
   const response = await withOAuth401Retry(() =>
-    axios.get<AnthropicApiModelInfo>(`${getAnthropicApiBaseUrl()}/v1/models/${modelId}`, {
-      headers: {
-        ...auth.headers,
-        'anthropic-version': ANTHROPIC_MODELS_API_VERSION,
-        'user-agent': getUserAgent(),
+    axios.get<AnthropicApiModelInfo>(
+      buildAnthropicApiUrl(`/v1/models/${modelId}`),
+      {
+        headers: {
+          ...getAnthropicCustomHeaders(),
+          ...auth.headers,
+          'anthropic-version': ANTHROPIC_MODELS_API_VERSION,
+          'user-agent': getUserAgent(),
+        },
+        timeout: 10_000,
       },
-      timeout: 10_000,
-    }),
+    ),
   )
 
   return response.data
@@ -561,9 +772,9 @@ async function enrichAnthropicCuratedModels(
 ): Promise<Map<string, AnthropicApiModelInfo>> {
   const curatedIds = Array.from(
     new Set(
-      ANTHROPIC_LAUNCH_DEFINITIONS.flatMap((definition) => definition.preferredLiveIds).map(
-        normalizeModelKey,
-      ),
+      ANTHROPIC_LAUNCH_DEFINITIONS.flatMap(
+        (definition) => definition.preferredLiveIds,
+      ).map(normalizeModelKey),
     ),
   )
 
@@ -618,10 +829,12 @@ function getErrorMessage(error: unknown): string {
 
 function cacheAnthropicCatalog(
   catalog: RuntimeProviderModelCatalog,
+  cacheKey: string,
   ttlMs: number,
 ): RuntimeProviderModelCatalog {
   cachedAnthropicCatalog = {
     catalog,
+    cacheKey,
     expiresAt: Date.now() + ttlMs,
   }
   return catalog
@@ -630,8 +843,17 @@ function cacheAnthropicCatalog(
 export function getAnthropicVisibleRuntimeModels(
   catalog: RuntimeProviderModelCatalog,
 ): string[] {
+  if (catalog.source === 'anthropic-compatible-api') {
+    return catalog.models
+      .filter((model) => !model.hidden)
+      .map((model) => model.launchModel)
+  }
+
   return catalog.models
-    .filter((model) => !model.hidden && ANTHROPIC_STATIC_VISIBLE_MODELS.has(model.launchModel))
+    .filter(
+      (model) =>
+        !model.hidden && ANTHROPIC_STATIC_VISIBLE_MODELS.has(model.launchModel),
+    )
     .map((model) => model.launchModel)
 }
 
@@ -639,7 +861,9 @@ export function getAnthropicRuntimeReasoningEfforts(
   catalog: RuntimeProviderModelCatalog,
 ): RuntimeReasoningEffort[] {
   return ANTHROPIC_EFFORT_ORDER.filter((effort) =>
-    catalog.models.some((model) => model.supportedReasoningEfforts.includes(effort)),
+    catalog.models.some((model) =>
+      model.supportedReasoningEfforts.includes(effort),
+    ),
   )
 }
 
@@ -651,9 +875,10 @@ export function getAnthropicRuntimeFastModeCapability(): NonNullable<
     ? getFastModeUnavailableReason()
     : 'Fast mode is not available'
   const available =
-    supported
-    && (runtimeUnavailableReason === null
-      || runtimeUnavailableReason === 'Fast mode is not available in the Agent SDK')
+    supported &&
+    (runtimeUnavailableReason === null ||
+      runtimeUnavailableReason ===
+        'Fast mode is not available in the Agent SDK')
 
   return {
     supported,
@@ -663,15 +888,19 @@ export function getAnthropicRuntimeFastModeCapability(): NonNullable<
   }
 }
 
-export function createStaticAnthropicRuntimeModelCatalog(params: {
-  fetchedAt?: string
-  staleAt?: string
-  status?: RuntimeProviderModelCatalogStatus
-  message?: string | null
-  code?: string | null
-} = {}): RuntimeProviderModelCatalog {
+export function createStaticAnthropicRuntimeModelCatalog(
+  params: {
+    fetchedAt?: string
+    staleAt?: string
+    status?: RuntimeProviderModelCatalogStatus
+    message?: string | null
+    code?: string | null
+  } = {},
+): RuntimeProviderModelCatalog {
   const fetchedAt = params.fetchedAt ?? new Date().toISOString()
-  const staleAt = params.staleAt ?? new Date(Date.now() + ANTHROPIC_FALLBACK_CACHE_TTL_MS).toISOString()
+  const staleAt =
+    params.staleAt ??
+    new Date(Date.now() + ANTHROPIC_FALLBACK_CACHE_TTL_MS).toISOString()
 
   return buildAnthropicCatalogFromDefinitions({
     fetchedAt,
@@ -679,7 +908,8 @@ export function createStaticAnthropicRuntimeModelCatalog(params: {
     liveModelsById: new Map(),
     liveSourceEnabled: false,
     status: params.status ?? 'stale',
-    diagnosticsMessage: params.message ?? 'Using the static Anthropic compatibility catalog.',
+    diagnosticsMessage:
+      params.message ?? 'Using the static Anthropic compatibility catalog.',
     diagnosticsCode: params.code ?? null,
   })
 }
@@ -692,7 +922,9 @@ export function buildAnthropicRuntimeModelCatalogFromApiModels(
   } = {},
 ): RuntimeProviderModelCatalog {
   const fetchedAt = params.fetchedAt ?? new Date().toISOString()
-  const staleAt = params.staleAt ?? new Date(Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS).toISOString()
+  const staleAt =
+    params.staleAt ??
+    new Date(Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS).toISOString()
 
   return buildAnthropicCatalogFromDefinitions({
     fetchedAt,
@@ -703,25 +935,136 @@ export function buildAnthropicRuntimeModelCatalogFromApiModels(
   })
 }
 
+export function buildAnthropicCompatibleRuntimeModelCatalogFromApiModels(
+  models: AnthropicApiModelInfo[],
+  params: {
+    fetchedAt?: string
+    staleAt?: string
+    status?: RuntimeProviderModelCatalogStatus
+    message?: string | null
+    code?: string | null
+  } = {},
+): RuntimeProviderModelCatalog {
+  const fetchedAt = params.fetchedAt ?? new Date().toISOString()
+  const staleAt =
+    params.staleAt ??
+    new Date(Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS).toISOString()
+  const catalogModels = dedupeCatalogModels(
+    models.flatMap((model, index) => {
+      const id = model.id?.trim()
+      if (!id || !isModelAllowed(id)) {
+        return []
+      }
+      const displayName = model.display_name?.trim() || id
+      return [
+        {
+          id,
+          launchModel: id,
+          displayName,
+          hidden: false,
+          supportedReasoningEfforts: [],
+          defaultReasoningEffort: null,
+          supportsFastMode: false,
+          inputModalities: parseAnthropicInputModalities(model),
+          supportsPersonality: false,
+          isDefault: index === 0,
+          upgrade: false,
+          source: 'anthropic-compatible-api',
+          badgeLabel: 'From gateway',
+          statusMessage: null,
+          metadata: {
+            context:
+              typeof model.max_input_tokens === 'number'
+                ? model.max_input_tokens
+                : null,
+          },
+        } satisfies RuntimeProviderModelCatalogItem,
+      ]
+    }),
+  )
+  const defaultModel = catalogModels[0] ?? null
+
+  return {
+    schemaVersion: 1,
+    providerId: 'anthropic',
+    source: 'anthropic-compatible-api',
+    status: params.status ?? 'ready',
+    fetchedAt,
+    staleAt,
+    defaultModelId: defaultModel?.id ?? null,
+    defaultLaunchModel: defaultModel?.launchModel ?? null,
+    models: catalogModels,
+    diagnostics: buildAnthropicCatalogDiagnostics({
+      status: params.status ?? 'ready',
+      message: params.message ?? null,
+      code: params.code ?? null,
+    }),
+  }
+}
+
 export function resetAnthropicRuntimeCatalogCache(): void {
   cachedAnthropicCatalog = null
   inFlightAnthropicCatalogPromise = null
+  inFlightAnthropicCatalogCacheKey = null
 }
 
 export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProviderModelCatalog> {
-  if (cachedAnthropicCatalog && cachedAnthropicCatalog.expiresAt > Date.now()) {
+  const cacheKey = getAnthropicCatalogCacheKey()
+  if (
+    cachedAnthropicCatalog &&
+    cachedAnthropicCatalog.cacheKey === cacheKey &&
+    cachedAnthropicCatalog.expiresAt > Date.now()
+  ) {
     return cachedAnthropicCatalog.catalog
   }
 
-  if (inFlightAnthropicCatalogPromise) {
+  if (
+    inFlightAnthropicCatalogPromise &&
+    inFlightAnthropicCatalogCacheKey === cacheKey
+  ) {
     return inFlightAnthropicCatalogPromise
   }
 
-  inFlightAnthropicCatalogPromise = (async () => {
+  const catalogPromise = (async () => {
     const fetchedAt = new Date().toISOString()
-    const liveStaleAt = new Date(Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS).toISOString()
-    const fallbackStaleAt = new Date(Date.now() + ANTHROPIC_FALLBACK_CACHE_TTL_MS).toISOString()
+    const liveStaleAt = new Date(
+      Date.now() + ANTHROPIC_SUCCESS_CACHE_TTL_MS,
+    ).toISOString()
+    const fallbackStaleAt = new Date(
+      Date.now() + ANTHROPIC_FALLBACK_CACHE_TTL_MS,
+    ).toISOString()
     const apiProvider = getAPIProvider()
+    if (isAnthropicCompatibleRuntimeBaseUrl()) {
+      try {
+        const listedModels = await fetchAnthropicModelList()
+        return cacheAnthropicCatalog(
+          buildAnthropicCompatibleRuntimeModelCatalogFromApiModels(
+            listedModels,
+            {
+              fetchedAt,
+              staleAt: liveStaleAt,
+            },
+          ),
+          cacheKey,
+          ANTHROPIC_SUCCESS_CACHE_TTL_MS,
+        )
+      } catch (error) {
+        return cacheAnthropicCatalog(
+          buildAnthropicCompatibleRuntimeModelCatalogFromApiModels([], {
+            fetchedAt,
+            staleAt: fallbackStaleAt,
+            status: 'degraded',
+            message:
+              `Anthropic-compatible model discovery unavailable. ${getErrorMessage(error)}`.trim(),
+            code:
+              getErrorCode(error) ?? 'anthropic-compatible-models-api-error',
+          }),
+          cacheKey,
+          ANTHROPIC_FALLBACK_CACHE_TTL_MS,
+        )
+      }
+    }
+
     if (apiProvider !== 'firstParty') {
       return cacheAnthropicCatalog(
         createStaticAnthropicRuntimeModelCatalog({
@@ -731,6 +1074,7 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
           message: `Using the static Anthropic catalog because model listing is not available through the ${apiProvider} runtime backend.`,
           code: 'anthropic-external-backend-catalog',
         }),
+        cacheKey,
         ANTHROPIC_FALLBACK_CACHE_TTL_MS,
       )
     }
@@ -744,9 +1088,11 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
           fetchedAt,
           staleAt: fallbackStaleAt,
           status: 'stale',
-          message: `Using the static Anthropic catalog because no authenticated Anthropic API session is available. ${getErrorMessage(error)}`.trim(),
+          message:
+            `Using the static Anthropic catalog because no authenticated Anthropic API session is available. ${getErrorMessage(error)}`.trim(),
           code: 'anthropic-auth-missing',
         }),
+        cacheKey,
         ANTHROPIC_FALLBACK_CACHE_TTL_MS,
       )
     }
@@ -757,16 +1103,20 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
           fetchedAt,
           staleAt: fallbackStaleAt,
           status: 'stale',
-          message: 'Using the static Anthropic catalog because no authenticated Anthropic API session is available.',
+          message:
+            'Using the static Anthropic catalog because no authenticated Anthropic API session is available.',
           code: 'anthropic-auth-missing',
         }),
+        cacheKey,
         ANTHROPIC_FALLBACK_CACHE_TTL_MS,
       )
     }
 
     try {
       const listedModels = await fetchAnthropicModelList()
-      const liveModelsById = await enrichAnthropicCuratedModels(createLiveModelIndex(listedModels))
+      const liveModelsById = await enrichAnthropicCuratedModels(
+        createLiveModelIndex(listedModels),
+      )
       const catalog = buildAnthropicCatalogFromDefinitions({
         fetchedAt,
         staleAt: liveStaleAt,
@@ -774,24 +1124,35 @@ export async function getAnthropicRuntimeModelCatalog(): Promise<RuntimeProvider
         liveSourceEnabled: true,
         status: 'ready',
       })
-      return cacheAnthropicCatalog(catalog, ANTHROPIC_SUCCESS_CACHE_TTL_MS)
+      return cacheAnthropicCatalog(
+        catalog,
+        cacheKey,
+        ANTHROPIC_SUCCESS_CACHE_TTL_MS,
+      )
     } catch (error) {
       return cacheAnthropicCatalog(
         createStaticAnthropicRuntimeModelCatalog({
           fetchedAt,
           staleAt: fallbackStaleAt,
           status: 'degraded',
-          message: `Anthropic Models API unavailable. Using static fallback. ${getErrorMessage(error)}`.trim(),
+          message:
+            `Anthropic Models API unavailable. Using static fallback. ${getErrorMessage(error)}`.trim(),
           code: getErrorCode(error) ?? 'anthropic-models-api-error',
         }),
+        cacheKey,
         ANTHROPIC_FALLBACK_CACHE_TTL_MS,
       )
     }
   })()
+  inFlightAnthropicCatalogPromise = catalogPromise
+  inFlightAnthropicCatalogCacheKey = cacheKey
 
   try {
-    return await inFlightAnthropicCatalogPromise
+    return await catalogPromise
   } finally {
-    inFlightAnthropicCatalogPromise = null
+    if (inFlightAnthropicCatalogPromise === catalogPromise) {
+      inFlightAnthropicCatalogPromise = null
+      inFlightAnthropicCatalogCacheKey = null
+    }
   }
 }

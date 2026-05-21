@@ -1,8 +1,17 @@
-import { getAuthTokenSource, getAnthropicApiKeyWithSource } from '../../utils/auth.js'
+import {
+  getAuthTokenSource,
+  getAnthropicApiKeyWithSource,
+} from '../../utils/auth.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
-import { getGeminiApiVersion, getGeminiBaseUrl } from '../../utils/geminiAuth.js'
-import { getAPIProvider, type APIProvider } from '../../utils/model/providers.js'
+import {
+  getGeminiApiVersion,
+  getGeminiBaseUrl,
+} from '../../utils/geminiAuth.js'
+import {
+  getAPIProvider,
+  type APIProvider,
+} from '../../utils/model/providers.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import { CODEX_MODELS } from '../../utils/model/codex.js'
 import { GEMINI_MODELS } from '../../utils/model/gemini.js'
@@ -26,10 +35,13 @@ import {
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
+  getAnthropicCompatibleRuntimeBackendLabel,
+  getAnthropicCustomAuthorizationHeader,
   getAnthropicRuntimeFastModeCapability,
   getAnthropicRuntimeModelCatalog,
   getAnthropicRuntimeReasoningEfforts,
   getAnthropicVisibleRuntimeModels,
+  isAnthropicCompatibleRuntimeBaseUrl,
 } from './anthropicCatalog.js'
 import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './anthropicSubscriptionRateLimits.js'
 import {
@@ -78,11 +90,17 @@ const CODEX_BACKEND_LABELS: Record<CodexRuntimeBackendId, string> = {
 }
 
 const CODEX_BACKEND_DESCRIPTIONS: Record<CodexRuntimeBackendId, string> = {
-  'codex-native': 'Use the local codex exec JSON seam as the supported Codex runtime path',
+  'codex-native':
+    'Use the local codex exec JSON seam as the supported Codex runtime path',
 }
 
 const ANTHROPIC_SUMMARY_MODELS = ['opus', 'claude-opus-4-6', 'sonnet', 'haiku']
-const ANTHROPIC_SUMMARY_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'] as const
+const ANTHROPIC_SUMMARY_REASONING_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'max',
+] as const
 
 function detectExternalBinary(
   binaryName: 'gemini' | 'codex',
@@ -104,7 +122,9 @@ function detectCodexExternalBinary(): ExternalRuntimeDiagnostic {
     id: 'cli-bin',
     label: 'Codex CLI',
     detected: Boolean(binaryResolution),
-    statusMessage: binaryResolution ? 'Codex CLI detected' : 'Codex CLI not found',
+    statusMessage: binaryResolution
+      ? 'Codex CLI detected'
+      : 'Codex CLI not found',
     detailMessage: binaryResolution?.executablePath ?? null,
   }
 }
@@ -155,7 +175,8 @@ export function normalizeGeminiBackendStorageValue(
 
 export function getGeminiRuntimeBackendPreference(): GeminiRuntimeBackendId {
   return normalizeGeminiBackendPreference(
-    process.env.CLAUDE_CODE_GEMINI_BACKEND ?? getGlobalConfig().geminiBackendPreference,
+    process.env.CLAUDE_CODE_GEMINI_BACKEND ??
+      getGlobalConfig().geminiBackendPreference,
   )
 }
 
@@ -221,7 +242,8 @@ function getClaudePlatformAwsBackendInfo(): AnthropicRuntimeBackendInfo | null {
       projectId: workspaceId,
       authenticated: false,
       authMethodDetail: 'aws_platform_configuration_incomplete',
-      statusMessage: 'Claude Platform on AWS requires AWS_REGION or AWS_DEFAULT_REGION',
+      statusMessage:
+        'Claude Platform on AWS requires AWS_REGION or AWS_DEFAULT_REGION',
       detailMessage:
         'Set AWS_REGION or AWS_DEFAULT_REGION to the region bound to the Claude Platform on AWS workspace.',
     }
@@ -242,19 +264,58 @@ function getClaudePlatformAwsBackendInfo(): AnthropicRuntimeBackendInfo | null {
   }
 }
 
+function getAnthropicCompatibleBackendInfo(): AnthropicRuntimeBackendInfo | null {
+  if (!isAnthropicCompatibleRuntimeBaseUrl()) {
+    return null
+  }
+
+  const backendId = getAnthropicCompatibleRuntimeBackendLabel()
+  const authToken = process.env.ANTHROPIC_AUTH_TOKEN?.trim() ?? ''
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim() ?? ''
+  const customAuthorization = getAnthropicCustomAuthorizationHeader()
+  const hasAuth = Boolean(authToken || apiKey || customAuthorization)
+  const authMethodDetail = authToken
+    ? backendId === 'ollama' && authToken.toLowerCase() === 'ollama'
+      ? 'ollama_token'
+      : 'anthropic_compatible_bearer_token'
+    : apiKey
+      ? 'anthropic_compatible_api_key'
+      : customAuthorization
+        ? 'anthropic_compatible_custom_authorization'
+        : 'anthropic_compatible_no_auth'
+
+  return {
+    id: backendId,
+    label: backendId === 'ollama' ? 'Ollama' : 'Anthropic-compatible API',
+    endpointLabel: process.env.ANTHROPIC_BASE_URL?.trim() ?? null,
+    authenticated: hasAuth,
+    authMethodDetail,
+    statusMessage:
+      backendId === 'ollama'
+        ? 'Configured for Ollama'
+        : 'Configured for Anthropic-compatible API',
+    detailMessage: hasAuth
+      ? 'Requests use the configured ANTHROPIC_BASE_URL and Anthropic-compatible auth environment.'
+      : 'Set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY for this Anthropic-compatible endpoint.',
+  }
+}
+
 function getExternalAnthropicBackendInfo(
   apiProvider: APIProvider,
 ): AnthropicRuntimeBackendInfo | null {
   switch (apiProvider) {
     case 'bedrock': {
-      const usesBearerToken = Boolean(process.env.AWS_BEARER_TOKEN_BEDROCK?.trim())
+      const usesBearerToken = Boolean(
+        process.env.AWS_BEARER_TOKEN_BEDROCK?.trim(),
+      )
       const skipsAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH)
       const authMethodDetail = usesBearerToken
         ? 'bedrock_api_key'
         : skipsAuth
           ? 'bedrock_skip_auth'
           : 'aws_credentials'
-      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null
+      const region =
+        process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null
       return {
         id: 'bedrock',
         label: 'Amazon Bedrock',
@@ -266,10 +327,11 @@ function getExternalAnthropicBackendInfo(
       }
     }
     case 'vertex': {
-      const authMethodDetail =
-        isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
-          ? 'vertex_skip_auth'
-          : 'gcp_credentials'
+      const authMethodDetail = isEnvTruthy(
+        process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH,
+      )
+        ? 'vertex_skip_auth'
+        : 'gcp_credentials'
       const projectId =
         process.env.GOOGLE_CLOUD_PROJECT ||
         process.env.GOOGLE_CLOUD_PROJECT_ID ||
@@ -298,7 +360,8 @@ function getExternalAnthropicBackendInfo(
       return {
         id: 'foundry',
         label: 'Azure AI Foundry',
-        endpointLabel: process.env.ANTHROPIC_FOUNDRY_RESOURCE ?? 'Azure AI Foundry',
+        endpointLabel:
+          process.env.ANTHROPIC_FOUNDRY_RESOURCE ?? 'Azure AI Foundry',
         authMethodDetail,
         statusMessage: 'Configured for Azure AI Foundry',
         detailMessage:
@@ -307,7 +370,8 @@ function getExternalAnthropicBackendInfo(
     }
     default:
       return apiProvider === 'firstParty'
-        ? getClaudePlatformAwsBackendInfo()
+        ? (getAnthropicCompatibleBackendInfo() ??
+            getClaudePlatformAwsBackendInfo())
         : null
   }
 }
@@ -391,6 +455,14 @@ async function buildAnthropicSummaryStatus(
   const anthropicAuth = getAnthropicAuthenticated()
   const fastMode = getAnthropicRuntimeFastModeCapability()
   const backend = externalBackend ?? null
+  const modelCatalogSource =
+    backend?.id === 'ollama' || backend?.id === 'anthropic-compatible'
+      ? 'anthropic-compatible-api'
+      : 'anthropic-models-api'
+  const summaryModels =
+    modelCatalogSource === 'anthropic-compatible-api'
+      ? []
+      : ANTHROPIC_SUMMARY_MODELS.filter(isModelAllowed)
 
   return {
     providerId: 'anthropic',
@@ -415,12 +487,12 @@ async function buildAnthropicSummaryStatus(
     resolvedBackendId: backend?.id ?? null,
     availableBackends: [],
     externalRuntimeDiagnostics: [],
-    models: ANTHROPIC_SUMMARY_MODELS.filter(isModelAllowed),
+    models: summaryModels,
     subscriptionRateLimits: null,
     runtimeCapabilities: {
       modelCatalog: {
         dynamic: true,
-        source: 'anthropic-models-api',
+        source: modelCatalogSource,
       },
       reasoningEffort: {
         supported: true,
@@ -442,31 +514,31 @@ async function buildAnthropicSummaryStatus(
 }
 
 function getGeminiModels(): string[] {
-  return filterDisplayModels(GEMINI_MODELS.map(model => model.id))
+  return filterDisplayModels(GEMINI_MODELS.map((model) => model.id))
 }
 
 function filterDisplayModels(models: string[]): string[] {
-  return models.filter(model => isModelAllowed(model))
+  return models.filter((model) => isModelAllowed(model))
 }
 
 function getCodexSummaryModels(): string[] {
-  return filterDisplayModels(CODEX_MODELS.map(model => model.id))
+  return filterDisplayModels(CODEX_MODELS.map((model) => model.id))
 }
 
 function filterCodexModelCatalog(
   catalog: RuntimeProviderModelCatalog,
 ): RuntimeProviderModelCatalog {
   const models = catalog.models.filter(
-    model => isModelAllowed(model.launchModel) || isModelAllowed(model.id),
+    (model) => isModelAllowed(model.launchModel) || isModelAllowed(model.id),
   )
   const defaultModel =
     models.find(
-      model =>
+      (model) =>
         model.id === catalog.defaultModelId ||
         model.launchModel === catalog.defaultLaunchModel,
     ) ??
-    models.find(model => model.isDefault) ??
-    models.find(model => !model.hidden) ??
+    models.find((model) => model.isDefault) ??
+    models.find((model) => !model.hidden) ??
     models[0] ??
     null
 
@@ -482,11 +554,12 @@ function filterCodexModelCatalog(
     ...catalog,
     defaultModelId: defaultModel?.id ?? null,
     defaultLaunchModel: defaultModel?.launchModel ?? null,
-    models: models.map(model => ({
+    models: models.map((model) => ({
       ...model,
       isDefault:
         defaultModel !== null &&
-        (model.id === defaultModel.id || model.launchModel === defaultModel.launchModel),
+        (model.id === defaultModel.id ||
+          model.launchModel === defaultModel.launchModel),
     })),
   }
 }
@@ -500,9 +573,7 @@ async function buildOpenCodeStatus(
     ? await deps.getOpenCodeInventorySnapshot()
     : await openCodeInventoryService.probe(
         null,
-        summary
-          ? { mode: 'summary', bypassCache: true }
-          : { mode: 'full' },
+        summary ? { mode: 'summary', bypassCache: true } : { mode: 'full' },
       )
   const runtimeModels = snapshot.models
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
@@ -513,14 +584,17 @@ async function buildOpenCodeStatus(
   const hasConfiguredAuthlessModel = hasOpenCodeConfiguredAuthlessModel(
     buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot),
   )
-  const accessCatalog = buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
-  const authenticated = hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
+  const accessCatalog =
+    buildOpenCodeModelAccessCatalogFromInventorySnapshot(snapshot)
+  const authenticated =
+    hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
   const fetchedAt = new Date()
-  const defaultModel = runtimeModels.find(model => model === 'opencode/big-pickle')
-    ?? runtimeModels[0]
-    ?? null
+  const defaultModel =
+    runtimeModels.find((model) => model === 'opencode/big-pickle') ??
+    runtimeModels[0] ??
+    null
   const metadataByModelId = new Map(
-    snapshot.modelMetadata?.map(metadata => [metadata.id, metadata]) ?? [],
+    snapshot.modelMetadata?.map((metadata) => [metadata.id, metadata]) ?? [],
   )
   const modelCatalog: RuntimeProviderModelCatalog = {
     schemaVersion: 1,
@@ -531,7 +605,7 @@ async function buildOpenCodeStatus(
     staleAt: new Date(fetchedAt.getTime() + 10 * 60 * 1000).toISOString(),
     defaultModelId: defaultModel,
     defaultLaunchModel: defaultModel,
-    models: runtimeModels.map(model => {
+    models: runtimeModels.map((model) => {
       const metadata = metadataByModelId.get(model) ?? null
       const opencodeMetadata = buildOpenCodeModelRouteMetadata({
         selectedModel: model,
@@ -549,7 +623,9 @@ async function buildOpenCodeStatus(
         isDefault: model === defaultModel,
         upgrade: false,
         source: 'app-server',
-        badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata) ? 'Free' : null,
+        badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata)
+          ? 'Free'
+          : null,
         statusMessage: null,
         metadata: metadata
           ? {
@@ -597,22 +673,26 @@ async function buildOpenCodeStatus(
         plugins: {
           status: 'read-only',
           ownership: 'provider-scoped',
-          reason: 'OpenCode manages plugin lifecycle. Desktop management wiring is not enabled yet.',
+          reason:
+            'OpenCode manages plugin lifecycle. Desktop management wiring is not enabled yet.',
         },
         mcp: {
           status: 'read-only',
           ownership: 'provider-scoped',
-          reason: 'OpenCode manages MCP lifecycle. Team launch uses app-owned runtime MCP proof.',
+          reason:
+            'OpenCode manages MCP lifecycle. Team launch uses app-owned runtime MCP proof.',
         },
         skills: {
           status: 'read-only',
           ownership: 'provider-scoped',
-          reason: 'OpenCode skill roots are detected by the runtime, but desktop control is not enabled yet.',
+          reason:
+            'OpenCode skill roots are detected by the runtime, but desktop control is not enabled yet.',
         },
         apiKeys: {
           status: 'read-only',
           ownership: 'provider-scoped',
-          reason: 'Provider credentials are managed through OpenCode providers and auth storage.',
+          reason:
+            'Provider credentials are managed through OpenCode providers and auth storage.',
         },
       }),
     },
@@ -626,7 +706,9 @@ async function buildOpenCodeStatus(
         id: 'cli-bin',
         label: 'OpenCode CLI',
         detected: snapshot.detected,
-        statusMessage: snapshot.detected ? 'OpenCode CLI detected' : 'OpenCode CLI not found',
+        statusMessage: snapshot.detected
+          ? 'OpenCode CLI detected'
+          : 'OpenCode CLI not found',
         detailMessage: snapshot.binaryPath,
       },
     ],
@@ -642,12 +724,12 @@ async function buildOpenCodeStatus(
           kind: 'opencode-cli',
           label: 'OpenCode CLI',
           authMethodDetail: hasConnectedProvider
-            ? snapshot.profile?.authState ?? null
+            ? (snapshot.profile?.authState ?? null)
             : hasBuiltinFreeModel
               ? 'built-in free models'
               : hasConfiguredAuthlessModel
                 ? 'configured local OpenCode model'
-                : snapshot.profile?.authState ?? null,
+                : (snapshot.profile?.authState ?? null),
         }
       : null,
   }
@@ -711,12 +793,16 @@ async function buildGeminiStatuses(): Promise<{
       ? 'Auto selected Gemini API'
       : autoResolvedBackendId === 'cli-sdk'
         ? 'Auto selected Gemini CLI SDK'
-        : apiStatus.message ?? cliStatus.message ?? 'No Gemini backend is currently ready.'
+        : (apiStatus.message ??
+          cliStatus.message ??
+          'No Gemini backend is currently ready.')
 
   const autoOption = buildGeminiOptionStatus(
     'auto',
     autoResolvedBackendId !== null,
-    autoResolvedBackendId ? `Resolved to ${GEMINI_BACKEND_LABELS[autoResolvedBackendId]}` : 'Unavailable',
+    autoResolvedBackendId
+      ? `Resolved to ${GEMINI_BACKEND_LABELS[autoResolvedBackendId]}`
+      : 'Unavailable',
     autoStatusDetail,
     true,
   )
@@ -759,10 +845,13 @@ async function buildGeminiStatuses(): Promise<{
         ? {
             kind: 'api',
             label: 'Gemini API',
-            endpointLabel: apiStatus.endpointLabel ?? `${getGeminiBaseUrl()}/${getGeminiApiVersion()}`,
+            endpointLabel:
+              apiStatus.endpointLabel ??
+              `${getGeminiBaseUrl()}/${getGeminiApiVersion()}`,
             projectId: apiStatus.projectId ?? null,
             authMethodDetail:
-              preferredStatus?.authMethod && preferredStatus.authMethod !== 'none'
+              preferredStatus?.authMethod &&
+              preferredStatus.authMethod !== 'none'
                 ? preferredStatus.authMethod
                 : null,
           }
@@ -773,7 +862,8 @@ async function buildGeminiStatuses(): Promise<{
               endpointLabel: cliStatus.endpointLabel,
               projectId: cliStatus.projectId ?? null,
               authMethodDetail:
-                preferredStatus?.authMethod && preferredStatus.authMethod !== 'none'
+                preferredStatus?.authMethod &&
+                preferredStatus.authMethod !== 'none'
                   ? preferredStatus.authMethod
                   : null,
             }
@@ -849,7 +939,8 @@ export async function getUnifiedRuntimeStatusPayload(
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeStatusPayload> {
   const summary = options.detailLevel === 'summary'
-  const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> = {}
+  const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> =
+    {}
 
   if (!providerFilter || providerFilter === 'anthropic') {
     providers.anthropic = summary
@@ -969,7 +1060,8 @@ export async function getUnifiedRuntimeStatusPayload(
           plugins: {
             status: 'unsupported',
             ownership: 'shared',
-            reason: 'Plugin execution is not currently guaranteed for Gemini sessions.',
+            reason:
+              'Plugin execution is not currently guaranteed for Gemini sessions.',
           },
         }),
       },
@@ -978,7 +1070,9 @@ export async function getUnifiedRuntimeStatusPayload(
       selectedBackendId: gemini.selectedBackendId,
       resolvedBackendId: gemini.resolvedBackendId,
       availableBackends: gemini.availableBackends,
-      externalRuntimeDiagnostics: [detectExternalBinary('gemini', 'Gemini CLI')],
+      externalRuntimeDiagnostics: [
+        detectExternalBinary('gemini', 'Gemini CLI'),
+      ],
       models: getGeminiModels(),
       backend: gemini.backend,
     }
