@@ -4380,11 +4380,12 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersTestModel(opts);
   });
-  runtimeProviders.command('set-default').description('Set an app-managed OpenCode default model after a live probe').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--probe', 'Run a blocking model probe before saving').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
+  runtimeProviders.command('set-default').description('Set an app-managed OpenCode default model after a live probe').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').addOption(new Option('--scope <scope>', 'Default scope to update').choices(['project', 'all-projects']).default('project')).option('--probe', 'Run a blocking model probe before saving').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     provider: string;
     model: string;
     projectPath?: string;
+    scope?: 'project' | 'all-projects';
     probe?: boolean;
     compact?: boolean;
     json?: boolean;

@@ -386,6 +386,10 @@ export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSumma
 export class OpenCodeInventoryService {
   private readonly cache = new Map<string, CacheEntry>()
 
+  clearCache(): void {
+    this.cache.clear()
+  }
+
   private getCommandFailureMessage(result: {
     stderr: string
     error?: string

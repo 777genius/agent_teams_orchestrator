@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const OPEN_CODE_MANAGED_PREFERENCES_FILE = 'agent-teams-runtime-preferences.json'
+const OPEN_CODE_GLOBAL_MANAGED_PREFERENCES_FILE = 'global-runtime-preferences.json'
 
 export type OpenCodeManagedRuntimePreferences = {
   schemaVersion: 1
@@ -11,6 +12,10 @@ export type OpenCodeManagedRuntimePreferences = {
 
 export function getOpenCodeManagedPreferencesPath(profileRootPath: string): string {
   return path.join(profileRootPath, OPEN_CODE_MANAGED_PREFERENCES_FILE)
+}
+
+export function getOpenCodeGlobalManagedPreferencesPath(dataRootPath: string): string {
+  return path.join(dataRootPath, 'opencode', OPEN_CODE_GLOBAL_MANAGED_PREFERENCES_FILE)
 }
 
 function emptyPreferences(): OpenCodeManagedRuntimePreferences {
@@ -45,6 +50,22 @@ export async function readOpenCodeManagedRuntimePreferences(
   }
 }
 
+export async function readOpenCodeGlobalManagedRuntimePreferences(
+  dataRootPath: string,
+): Promise<OpenCodeManagedRuntimePreferences> {
+  try {
+    const raw = await readFile(getOpenCodeGlobalManagedPreferencesPath(dataRootPath), 'utf8')
+    const parsed = JSON.parse(raw) as Partial<OpenCodeManagedRuntimePreferences>
+    return {
+      schemaVersion: 1,
+      defaultModelId: normalizeModelId(parsed.defaultModelId),
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null,
+    }
+  } catch {
+    return emptyPreferences()
+  }
+}
+
 export async function writeOpenCodeManagedRuntimePreferences(
   profileRootPath: string,
   preferences: OpenCodeManagedRuntimePreferences,
@@ -66,5 +87,22 @@ export async function setOpenCodeManagedDefaultModel(
     updatedAt: new Date().toISOString(),
   }
   await writeOpenCodeManagedRuntimePreferences(profileRootPath, preferences)
+  return preferences
+}
+
+export async function setOpenCodeManagedGlobalDefaultModel(
+  dataRootPath: string,
+  defaultModelId: string,
+): Promise<OpenCodeManagedRuntimePreferences> {
+  const preferences: OpenCodeManagedRuntimePreferences = {
+    schemaVersion: 1,
+    defaultModelId,
+    updatedAt: new Date().toISOString(),
+  }
+  const preferencesPath = getOpenCodeGlobalManagedPreferencesPath(dataRootPath)
+  await mkdir(path.dirname(preferencesPath), { recursive: true })
+  const tempPath = `${preferencesPath}.${process.pid}.${Date.now()}.tmp`
+  await writeFile(tempPath, `${JSON.stringify(preferences, null, 2)}\n`, 'utf8')
+  await rename(tempPath, preferencesPath)
   return preferences
 }

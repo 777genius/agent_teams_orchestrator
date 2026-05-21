@@ -798,12 +798,12 @@ async function readStdinJsonObject(): Promise<Record<string, unknown> | null> {
     : null
 }
 
-function writeProviderManagementViewResponse(
+async function writeProviderManagementViewResponse(
   runtimeId: RuntimeProviderManagementTarget,
   view: ProviderManagementView | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(view ? { view } : {}),
@@ -811,12 +811,12 @@ function writeProviderManagementViewResponse(
   }, null, 2) + '\n')
 }
 
-function writeProviderManagementDirectoryResponse(
+async function writeProviderManagementDirectoryResponse(
   runtimeId: RuntimeProviderManagementTarget,
   directory: ProviderDirectoryView | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(directory ? { directory } : {}),
@@ -824,12 +824,12 @@ function writeProviderManagementDirectoryResponse(
   }, null, 2) + '\n')
 }
 
-function writeProviderManagementProviderResponse(
+async function writeProviderManagementProviderResponse(
   runtimeId: RuntimeProviderManagementTarget,
   provider: ProviderConnection | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(provider ? { provider } : {}),
@@ -837,12 +837,12 @@ function writeProviderManagementProviderResponse(
   }, null, 2) + '\n')
 }
 
-function writeProviderManagementSetupFormResponse(
+async function writeProviderManagementSetupFormResponse(
   runtimeId: RuntimeProviderManagementTarget,
   setupForm: ProviderSetupForm | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(setupForm ? { setupForm } : {}),
@@ -850,12 +850,12 @@ function writeProviderManagementSetupFormResponse(
   }, null, 2) + '\n')
 }
 
-function writeProviderManagementModelsResponse(
+async function writeProviderManagementModelsResponse(
   runtimeId: RuntimeProviderManagementTarget,
   models: RuntimeProviderModelsView | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(models ? { models } : {}),
@@ -863,12 +863,12 @@ function writeProviderManagementModelsResponse(
   }, null, 2) + '\n')
 }
 
-function writeProviderManagementModelTestResponse(
+async function writeProviderManagementModelTestResponse(
   runtimeId: RuntimeProviderManagementTarget,
   result: ProviderModelTestResult | null,
   error: ProviderManagementError | null,
-): void {
-  process.stdout.write(jsonStringify({
+): Promise<void> {
+  await writeStdoutAndDrain(jsonStringify({
     schemaVersion: 1,
     runtimeId,
     ...(result ? { result } : {}),
@@ -912,7 +912,7 @@ export async function runtimeProvidersView(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementViewResponse(
+    await writeProviderManagementViewResponse(
       runtimeId,
       opts.compact ? compactProviderManagementView(result.value) : result.value,
       null,
@@ -920,7 +920,7 @@ export async function runtimeProvidersView(opts: {
     process.exit(0)
   }
 
-  writeProviderManagementViewResponse(runtimeId, null, result.error)
+  await writeProviderManagementViewResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -946,11 +946,11 @@ export async function runtimeProvidersDirectory(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementDirectoryResponse(runtimeId, result.value, null)
+    await writeProviderManagementDirectoryResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementDirectoryResponse(runtimeId, null, result.error)
+  await writeProviderManagementDirectoryResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -968,11 +968,11 @@ export async function runtimeProvidersSetupForm(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementSetupFormResponse(runtimeId, result.value, null)
+    await writeProviderManagementSetupFormResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementSetupFormResponse(runtimeId, null, result.error)
+  await writeProviderManagementSetupFormResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1024,7 +1024,7 @@ export async function runtimeProvidersConnect(opts: {
   const providerId = opts.provider?.trim()
 
   if (!opts.stdinJson) {
-    writeProviderManagementProviderResponse(
+    await writeProviderManagementProviderResponse(
       runtimeId,
       null,
       authRequiredError('Provider setup payload must be supplied through --stdin-json'),
@@ -1036,7 +1036,7 @@ export async function runtimeProvidersConnect(opts: {
   try {
     payload = await readStdinJsonObject()
   } catch {
-    writeProviderManagementProviderResponse(
+    await writeProviderManagementProviderResponse(
       runtimeId,
       null,
       authRequiredError('Provider setup payload from stdin is not valid JSON'),
@@ -1044,7 +1044,7 @@ export async function runtimeProvidersConnect(opts: {
     process.exit(1)
   }
   if (!payload) {
-    writeProviderManagementProviderResponse(
+    await writeProviderManagementProviderResponse(
       runtimeId,
       null,
       authRequiredError('Provider setup payload from stdin is empty'),
@@ -1061,7 +1061,7 @@ export async function runtimeProvidersConnect(opts: {
       payload,
     })
   } catch (error) {
-    writeProviderManagementProviderResponse(runtimeId, null, {
+    await writeProviderManagementProviderResponse(runtimeId, null, {
       code: 'unsupported-auth-method',
       message: error instanceof Error ? error.message : 'Unsupported provider setup method',
       recoverable: true,
@@ -1072,11 +1072,11 @@ export async function runtimeProvidersConnect(opts: {
   const result = await connectProvider(openCodeProviderManagementAdapter, connectInput)
 
   if (result.ok) {
-    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    await writeProviderManagementProviderResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementProviderResponse(runtimeId, null, result.error)
+  await writeProviderManagementProviderResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1091,7 +1091,7 @@ export async function runtimeProvidersConnectApiKey(opts: {
   const providerId = opts.provider?.trim()
 
   if (!opts.stdinKey) {
-    writeProviderManagementProviderResponse(
+    await writeProviderManagementProviderResponse(
       runtimeId,
       null,
       authRequiredError('API key must be supplied through --stdin-key'),
@@ -1101,7 +1101,7 @@ export async function runtimeProvidersConnectApiKey(opts: {
 
   const apiKey = await readStdinSecret()
   if (!apiKey) {
-    writeProviderManagementProviderResponse(
+    await writeProviderManagementProviderResponse(
       runtimeId,
       null,
       authRequiredError('API key from stdin is empty'),
@@ -1117,11 +1117,11 @@ export async function runtimeProvidersConnectApiKey(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    await writeProviderManagementProviderResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementProviderResponse(runtimeId, null, result.error)
+  await writeProviderManagementProviderResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1139,11 +1139,11 @@ export async function runtimeProvidersForget(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementProviderResponse(runtimeId, result.value, null)
+    await writeProviderManagementProviderResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementProviderResponse(runtimeId, null, result.error)
+  await writeProviderManagementProviderResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1165,11 +1165,11 @@ export async function runtimeProvidersModels(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementModelsResponse(runtimeId, result.value, null)
+    await writeProviderManagementModelsResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementModelsResponse(runtimeId, null, result.error)
+  await writeProviderManagementModelsResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1189,11 +1189,11 @@ export async function runtimeProvidersTestModel(opts: {
   })
 
   if (result.ok) {
-    writeProviderManagementModelTestResponse(runtimeId, result.value, null)
+    await writeProviderManagementModelTestResponse(runtimeId, result.value, null)
     process.exit(0)
   }
 
-  writeProviderManagementModelTestResponse(runtimeId, null, result.error)
+  await writeProviderManagementModelTestResponse(runtimeId, null, result.error)
   process.exit(1)
 }
 
@@ -1202,6 +1202,7 @@ export async function runtimeProvidersSetDefault(opts: {
   provider: string
   model: string
   projectPath?: string
+  scope?: 'project' | 'all-projects'
   probe?: boolean
   compact?: boolean
   json?: boolean
@@ -1212,11 +1213,12 @@ export async function runtimeProvidersSetDefault(opts: {
     providerId: opts.provider?.trim(),
     modelId: opts.model?.trim(),
     projectPath: opts.projectPath?.trim() || null,
+    scope: opts.scope === 'all-projects' ? 'all_projects' : 'project',
     probe: opts.probe === true,
   })
 
   if (result.ok) {
-    writeProviderManagementViewResponse(
+    await writeProviderManagementViewResponse(
       runtimeId,
       opts.compact ? compactProviderManagementView(result.value) : result.value,
       null,
@@ -1224,6 +1226,6 @@ export async function runtimeProvidersSetDefault(opts: {
     process.exit(0)
   }
 
-  writeProviderManagementViewResponse(runtimeId, null, result.error)
+  await writeProviderManagementViewResponse(runtimeId, null, result.error)
   process.exit(1)
 }

@@ -14,6 +14,10 @@ import {
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
 import {
+  setOpenCodeManagedDefaultModel,
+  setOpenCodeManagedGlobalDefaultModel,
+} from './OpenCodeManagedPreferences.js'
+import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
 } from './OpenCodeManagedPaths.js'
@@ -639,6 +643,83 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(buildManagedConfig().model).toBeUndefined()
   })
 
+  test('applies all-projects default to project profiles without overrides', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-all-projects-default')
+    const appCacheHome = path.join(tempDir, 'app-cache-all-projects-default')
+    const projectA = path.join(tempDir, 'project-a')
+    const projectB = path.join(tempDir, 'project-b')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+
+    try {
+      await mkdir(projectA, { recursive: true })
+      await mkdir(projectB, { recursive: true })
+      await setOpenCodeManagedGlobalDefaultModel(
+        appDataHome,
+        'openrouter/openai/gpt-oss-20b:free',
+      )
+
+      const manager = new OpenCodeProfileManager()
+      const profileA = await manager.prepareProfile(projectA, { includeAppMcp: false })
+      const profileB = await manager.prepareProfile(projectB, { includeAppMcp: false })
+
+      expect(profileA.managedConfig.model).toBe('openrouter/openai/gpt-oss-20b:free')
+      expect(profileB.managedConfig.model).toBe('openrouter/openai/gpt-oss-20b:free')
+      expect(profileA.projectDefaultModelId).toBeNull()
+      expect(profileA.allProjectsDefaultModelId).toBe('openrouter/openai/gpt-oss-20b:free')
+      expect(profileA.effectiveManagedDefaultSource).toBe('all_projects')
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
+  test('project default overrides all-projects default', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-project-default-wins')
+    const appCacheHome = path.join(tempDir, 'app-cache-project-default-wins')
+    const projectPath = path.join(tempDir, 'project-default-wins')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+
+    try {
+      await mkdir(projectPath, { recursive: true })
+      await setOpenCodeManagedGlobalDefaultModel(appDataHome, 'openrouter/global-model')
+      const manager = new OpenCodeProfileManager()
+      const initialProfile = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+      await setOpenCodeManagedDefaultModel(initialProfile.profileRootPath, 'openrouter/project-model')
+
+      const profile = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+
+      expect(profile.managedConfig.model).toBe('openrouter/project-model')
+      expect(profile.projectDefaultModelId).toBe('openrouter/project-model')
+      expect(profile.allProjectsDefaultModelId).toBe('openrouter/global-model')
+      expect(profile.effectiveManagedDefaultSource).toBe('project')
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
   test('can cap a provider-scoped model output limit in managed config overrides', () => {
     const managedConfig = buildManagedConfig(null, {
       modelOutputLimitOverrides: [
@@ -650,7 +731,18 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       ],
     })
 
-    expect(managedConfig.provider).toEqual({
+    expect(managedConfig.provider).toMatchObject({
+      atlascloud: {
+        npm: '@ai-sdk/openai-compatible',
+        options: {
+          baseURL: 'https://api.atlascloud.ai/v1',
+        },
+        models: {
+          'zai-org/glm-5.1': {
+            tool_call: true,
+          },
+        },
+      },
       openrouter: {
         models: {
           'anthropic/claude-3.5-haiku': {

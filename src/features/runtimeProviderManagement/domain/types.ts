@@ -208,10 +208,22 @@ export type ProviderManagementView = {
   runtime: ProviderManagementRuntimeView
   providers: readonly ProviderConnection[]
   configuredModels: readonly RuntimeProviderModel[]
+  projectPath?: string | null
+  projectDefaultModel?: string | null
+  allProjectsDefaultModel?: string | null
+  defaultModelSource?: RuntimeProviderDefaultModelSource | null
   defaultModel: string | null
   fallbackModel: string | null
   diagnostics: readonly string[]
 }
+
+export type RuntimeProviderDefaultModelSource =
+  | 'project'
+  | 'all_projects'
+  | 'opencode_config'
+  | 'fallback'
+
+export type RuntimeProviderDefaultScope = 'project' | 'all_projects'
 
 export type ProviderModelAvailability =
   | 'available'
@@ -302,6 +314,7 @@ export type SetDefaultModelInput = {
   providerId: string
   modelId: string
   probe?: boolean
+  scope?: RuntimeProviderDefaultScope
 } & ProjectScopedProviderManagementInput
 
 export type TestProviderModelInput = {

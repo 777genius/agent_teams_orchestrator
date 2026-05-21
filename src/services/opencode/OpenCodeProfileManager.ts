@@ -21,6 +21,7 @@ import {
   readOpenCodeAuthStore,
 } from './OpenCodeAuthStore.js'
 import {
+  readOpenCodeGlobalManagedRuntimePreferences,
   readOpenCodeManagedRuntimePreferences,
 } from './OpenCodeManagedPreferences.js'
 import {
@@ -37,6 +38,79 @@ import type {
 export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
 export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
 export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
+
+const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
+const atlasCloudModel = (
+  name: string,
+  context: number,
+  output: number,
+  options: { reasoning?: boolean } = {},
+) => ({
+  name,
+  ...(options.reasoning ? { reasoning: true } : {}),
+  tool_call: true,
+  limit: {
+    context,
+    output,
+  },
+})
+
+const ATLAS_CLOUD_OPENCODE_MODELS = {
+  // TODO: Replace this curated fallback with cached Atlas /v1/models sync.
+  // Keep this map as the offline fallback so OpenCode startup never depends on network availability.
+  'zai-org/glm-5.1': atlasCloudModel('GLM 5.1', 202_752, 202_752, { reasoning: true }),
+  'zai-org/glm-5-turbo': atlasCloudModel('GLM 5 Turbo', 262_144, 131_072, {
+    reasoning: true,
+  }),
+  'zai-org/glm-5': atlasCloudModel('GLM 5', 202_752, 202_752, { reasoning: true }),
+  'zai-org/glm-4.7': atlasCloudModel('GLM 4.7', 202_752, 202_752, { reasoning: true }),
+  'deepseek-ai/deepseek-v4-pro': atlasCloudModel('DeepSeek V4 Pro', 1_048_576, 393_216),
+  'deepseek-ai/deepseek-v4-flash': atlasCloudModel('DeepSeek V4 Flash', 1_048_576, 393_216),
+  'deepseek-ai/deepseek-v3.2': atlasCloudModel('DeepSeek V3.2', 163_840, 163_840, {
+    reasoning: true,
+  }),
+  'deepseek-ai/DeepSeek-V3.1': atlasCloudModel('DeepSeek V3.1', 131_072, 65_536, {
+    reasoning: true,
+  }),
+  'moonshotai/kimi-k2.6': atlasCloudModel('Kimi K2.6', 262_144, 262_144, {
+    reasoning: true,
+  }),
+  'moonshotai/kimi-k2.5': atlasCloudModel('Kimi K2.5', 262_144, 262_144, {
+    reasoning: true,
+  }),
+  'moonshotai/Kimi-K2-Thinking': atlasCloudModel('Kimi K2 Thinking', 262_144, 262_144, {
+    reasoning: true,
+  }),
+  'moonshotai/Kimi-K2-Instruct': atlasCloudModel('Kimi K2 Instruct', 131_072, 131_072),
+  'minimaxai/minimax-m2.7': atlasCloudModel('MiniMax M2.7', 196_608, 196_608, {
+    reasoning: true,
+  }),
+  'minimaxai/minimax-m2.5': atlasCloudModel('MiniMax M2.5', 196_608, 196_608, {
+    reasoning: true,
+  }),
+  'minimaxai/minimax-m2.1': atlasCloudModel('MiniMax M2.1', 196_608, 196_608, {
+    reasoning: true,
+  }),
+  'Qwen/Qwen3-Coder': atlasCloudModel('Qwen3 Coder', 262_144, 262_144),
+  'qwen/qwen3-coder-next': atlasCloudModel('Qwen3 Coder Next', 262_144, 262_144),
+  'qwen/qwen3.6-plus': atlasCloudModel('Qwen3.6 Plus', 1_000_000, 65_536, {
+    reasoning: true,
+  }),
+  'qwen/qwen3.5-397b-a17b': atlasCloudModel('Qwen3.5 397B A17B', 262_144, 65_536, {
+    reasoning: true,
+  }),
+  'qwen/qwen3-max-2026-01-23': atlasCloudModel('Qwen3 Max 20260123', 252_000, 32_000),
+  'kwaipilot/kat-coder-pro-v2': atlasCloudModel('KAT Coder Pro V2', 262_144, 144_000),
+} as const
+
+const ATLAS_CLOUD_PROVIDER_CONFIG = {
+  npm: '@ai-sdk/openai-compatible',
+  name: 'Atlas Cloud',
+  options: {
+    baseURL: 'https://api.atlascloud.ai/v1',
+  },
+  models: ATLAS_CLOUD_OPENCODE_MODELS,
+} as const
 
 function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -283,6 +357,9 @@ export function buildManagedConfig(
     default_agent: OPEN_CODE_TEAMMATE_AGENT_NAME,
     share: 'disabled',
     snapshot: true,
+    provider: {
+      [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
+    },
     agent: {
       [OPEN_CODE_TEAMMATE_AGENT_NAME]: {
         mode: 'primary',
@@ -647,6 +724,16 @@ export class OpenCodeProfileManager {
     const { projectBehaviorFingerprint, behaviorSources } =
       await collectProjectBehaviorMetadata(resolvedProjectPath)
     const managedRuntimePreferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
+    const globalRuntimePreferences = await readOpenCodeGlobalManagedRuntimePreferences(
+      this.paths.data,
+    )
+    const effectiveManagedDefaultModelId =
+      managedRuntimePreferences.defaultModelId ?? globalRuntimePreferences.defaultModelId
+    const effectiveManagedDefaultSource = managedRuntimePreferences.defaultModelId
+      ? 'project' as const
+      : globalRuntimePreferences.defaultModelId
+        ? 'all_projects' as const
+        : null
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
     const appMcpConfig =
       options.includeAppMcp === false
@@ -656,7 +743,7 @@ export class OpenCodeProfileManager {
       importedRuntimeConfig,
       buildManagedConfig(appMcpConfig, {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
-        defaultModelId: managedRuntimePreferences.defaultModelId,
+        defaultModelId: effectiveManagedDefaultModelId,
         modelOutputLimitOverrides: options.modelOutputLimitOverrides,
       }),
     )
@@ -757,6 +844,10 @@ export class OpenCodeProfileManager {
       projectPath: resolvedProjectPath,
       profileRootKey,
       profileRootPath,
+      projectDefaultModelId: managedRuntimePreferences.defaultModelId,
+      allProjectsDefaultModelId: globalRuntimePreferences.defaultModelId,
+      effectiveManagedDefaultModelId,
+      effectiveManagedDefaultSource,
       projectBehaviorFingerprint,
       behaviorSources,
       managedConfig,

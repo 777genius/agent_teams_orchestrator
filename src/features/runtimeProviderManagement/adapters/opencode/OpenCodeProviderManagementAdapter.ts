@@ -18,7 +18,11 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
-import { setOpenCodeManagedDefaultModel } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
+import {
+  setOpenCodeManagedDefaultModel,
+  setOpenCodeManagedGlobalDefaultModel,
+} from '../../../../services/opencode/OpenCodeManagedPreferences.js'
+import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
 import type {
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
@@ -78,6 +82,7 @@ type OpenCodeInventoryServiceLike = {
     projectPath?: string | null,
     options?: { bypassCache?: boolean },
   ): ReturnType<typeof openCodeInventoryService.probe>
+  clearCache?(): void
 }
 
 type OpenCodeHostManagerLike = Pick<
@@ -132,6 +137,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   }
   managedPreferences?: {
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
+    setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
   }
 }
 
@@ -141,6 +147,7 @@ type SafeValue<T> =
 
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
+  atlascloud: 'Atlas Cloud',
   cerebras: 'Cerebras',
   deepseek: 'DeepSeek',
   'fireworks-ai': 'Fireworks AI',
@@ -161,7 +168,7 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   zenmux: 'ZenMux',
 }
 
-const SEEDED_PROVIDER_IDS = ['openrouter', 'opencode'] as const
+const SEEDED_PROVIDER_IDS = ['openrouter', 'opencode', 'atlascloud'] as const
 const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   ...SEEDED_PROVIDER_IDS,
   'anthropic',
@@ -861,6 +868,17 @@ function getDefaultModel(
 
 function getFallbackModel(inventory: OpenCodeInventorySnapshot): string | null {
   return inventory.models[0] ?? null
+}
+
+function getDefaultModelSource(input: {
+  inventory: OpenCodeInventorySnapshot
+  defaultModel: string | null
+  fallbackModel: string | null
+}): ProviderManagementView['defaultModelSource'] {
+  if (input.defaultModel) {
+    return input.inventory.profile?.effectiveManagedDefaultSource ?? 'opencode_config'
+  }
+  return input.fallbackModel ? 'fallback' : null
 }
 
 function getManagedProfileState(inventory: OpenCodeInventorySnapshot): ManagedProfileState {
@@ -1567,6 +1585,8 @@ function buildView(input: {
     || model.routeKind === 'builtin_free'
     || model.routeKind === 'connected_provider'
   ).length
+  const defaultModel = getDefaultModel(input.inventory, input.configProviders, input.providers)
+  const fallbackModel = getFallbackModel(input.inventory)
 
   return {
     runtimeId: 'opencode',
@@ -1587,8 +1607,16 @@ function buildView(input: {
     },
     providers: providerConnections,
     configuredModels,
-    defaultModel: getDefaultModel(input.inventory, input.configProviders, input.providers),
-    fallbackModel: getFallbackModel(input.inventory),
+    projectPath: input.inventory.projectPath,
+    projectDefaultModel: input.inventory.profile?.projectDefaultModelId ?? null,
+    allProjectsDefaultModel: input.inventory.profile?.allProjectsDefaultModelId ?? null,
+    defaultModelSource: getDefaultModelSource({
+      inventory: input.inventory,
+      defaultModel,
+      fallbackModel,
+    }),
+    defaultModel,
+    fallbackModel,
     diagnostics: input.diagnostics,
   }
 }
@@ -2023,6 +2051,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
   private getManagedPreferences() {
     return this.deps.managedPreferences ?? {
       setDefaultModel: setOpenCodeManagedDefaultModel,
+      setAllProjectsDefaultModel: (modelId: string) =>
+        setOpenCodeManagedGlobalDefaultModel(resolveClaudeMultimodelPaths().data, modelId),
     }
   }
 
@@ -2726,6 +2756,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         `Model id must be scoped to provider ${providerId}`,
       )
     }
+    const scope = input.scope === 'all_projects' ? 'all_projects' : 'project'
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
@@ -2794,37 +2825,39 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           }
         }
 
-        const profileRootPath = inventory.profile?.profileRootPath
-        if (!profileRootPath) {
+        const profile = inventory.profile
+        if (!profile) {
           return providerManagementError(
             'runtime-unhealthy',
-            'OpenCode managed profile root is unavailable',
+            'OpenCode managed profile is unavailable',
           )
         }
-        await this.getManagedPreferences().setDefaultModel(profileRootPath, modelId)
+        const managedPreferences = this.getManagedPreferences()
+        if (scope === 'all_projects') {
+          if (!managedPreferences.setAllProjectsDefaultModel) {
+            return providerManagementError(
+              'runtime-unhealthy',
+              'OpenCode all-projects managed preferences are unavailable',
+            )
+          }
+          await managedPreferences.setAllProjectsDefaultModel(modelId)
+        } else {
+          await managedPreferences.setDefaultModel(profile.profileRootPath, modelId)
+        }
         this.invalidateDirectoryCache()
+        inventoryService.clearCache?.()
 
         const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
           bypassCache: true,
         })
-        const refreshedView = await readLiveView({
-          inventory: refreshedInventory,
-          host,
-          client,
-          diagnostics: refreshedInventory.diagnostics,
-        })
-
         return {
           ok: true,
-          value: {
-            ...refreshedView,
-            defaultModel: modelId,
-            providers: refreshedView.providers.map(provider =>
-              provider.providerId === providerId
-                ? { ...provider, defaultModelId: modelId }
-                : provider
-            ),
-          },
+          value: await readLiveView({
+            inventory: refreshedInventory,
+            host,
+            client,
+            diagnostics: refreshedInventory.diagnostics,
+          }),
         }
       },
       { failureCode: 'model-test-failed' },

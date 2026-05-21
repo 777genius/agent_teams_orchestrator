@@ -16,6 +16,10 @@ function inventory(
       projectPath: '/tmp/project',
       profileRootKey: 'profile-key',
       profileRootPath: '/tmp/profile',
+      projectDefaultModelId: null,
+      allProjectsDefaultModelId: null,
+      effectiveManagedDefaultModelId: null,
+      effectiveManagedDefaultSource: null,
       projectBehaviorFingerprint: 'behavior',
       behaviorSources: ['AGENTS.md'],
       managedConfig: {},
@@ -132,6 +136,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.providers.map(provider => provider.providerId)).toEqual([
       'openrouter',
       'opencode',
+      'atlascloud',
     ])
   })
 
@@ -185,6 +190,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'openrouter',
       'opencode',
       'openai',
+      'atlascloud',
     ])
 
     const openai = result.value.providers.find(provider => provider.providerId === 'openai')
@@ -495,6 +501,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.entries.map(entry => entry.providerId)).toEqual([
       'opencode',
       'openrouter',
+      'atlascloud',
       'cloudflare-workers-ai',
     ])
     expect(result.value.entries.find(entry =>
@@ -545,6 +552,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.value.entries.map(entry => entry.providerId)).toEqual([
+      'atlascloud',
       'cloudflare-ai-gateway',
       'clarifai',
     ])
@@ -1983,6 +1991,179 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toBe('openrouter/openai/gpt-oss-20b:free')
   })
 
+  test('sets all-projects default without writing project preferences', async () => {
+    const projectWrites: Array<{ profileRootPath: string; modelId: string }> = []
+    const allProjectWrites: string[] = []
+    let allProjectsDefaultModel: string | null = null
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/qwen/qwen3-coder'],
+          profile: {
+            ...inventory().profile!,
+            allProjectsDefaultModelId: allProjectsDefaultModel,
+            effectiveManagedDefaultModelId: allProjectsDefaultModel,
+            effectiveManagedDefaultSource: allProjectsDefaultModel ? 'all_projects' : null,
+            managedConfig:
+              options?.bypassCache && allProjectsDefaultModel
+                ? { model: allProjectsDefaultModel }
+                : {},
+          },
+        }),
+        clearCache: () => {},
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: { 'qwen/qwen3-coder': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+      managedPreferences: {
+        setDefaultModel: async (profileRootPath, modelId) => {
+          projectWrites.push({ profileRootPath, modelId })
+        },
+        setAllProjectsDefaultModel: async (modelId) => {
+          allProjectWrites.push(modelId)
+          allProjectsDefaultModel = modelId
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      modelId: 'openrouter/qwen/qwen3-coder',
+      scope: 'all_projects',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(projectWrites).toEqual([])
+    expect(allProjectWrites).toEqual(['openrouter/qwen/qwen3-coder'])
+    expect(result.value.defaultModel).toBe('openrouter/qwen/qwen3-coder')
+    expect(result.value.allProjectsDefaultModel).toBe('openrouter/qwen/qwen3-coder')
+    expect(result.value.projectDefaultModel).toBeNull()
+    expect(result.value.defaultModelSource).toBe('all_projects')
+  })
+
+  test('keeps project default effective after setting all-projects default', async () => {
+    const projectWrites: Array<{ profileRootPath: string; modelId: string }> = []
+    const allProjectWrites: string[] = []
+    let allProjectsDefaultModel: string | null = null
+    const projectDefaultModel = 'openrouter/project-model'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/qwen/qwen3-coder', projectDefaultModel],
+          profile: {
+            ...inventory().profile!,
+            projectDefaultModelId: projectDefaultModel,
+            allProjectsDefaultModelId: allProjectsDefaultModel,
+            effectiveManagedDefaultModelId: projectDefaultModel,
+            effectiveManagedDefaultSource: 'project',
+            managedConfig: {
+              model: projectDefaultModel,
+              ...(options?.bypassCache && allProjectsDefaultModel
+                ? { allProjectsProbeObserved: true }
+                : {}),
+            },
+          },
+        }),
+        clearCache: () => {},
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'qwen/qwen3-coder': {},
+                  'project-model': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+      managedPreferences: {
+        setDefaultModel: async (profileRootPath, modelId) => {
+          projectWrites.push({ profileRootPath, modelId })
+        },
+        setAllProjectsDefaultModel: async (modelId) => {
+          allProjectWrites.push(modelId)
+          allProjectsDefaultModel = modelId
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      modelId: 'openrouter/qwen/qwen3-coder',
+      scope: 'all_projects',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(projectWrites).toEqual([])
+    expect(allProjectWrites).toEqual(['openrouter/qwen/qwen3-coder'])
+    expect(result.value.defaultModel).toBe(projectDefaultModel)
+    expect(result.value.projectDefaultModel).toBe(projectDefaultModel)
+    expect(result.value.allProjectsDefaultModel).toBe('openrouter/qwen/qwen3-coder')
+    expect(result.value.defaultModelSource).toBe('project')
+  })
+
   test('sets configured authless local model as default only after execution proof', async () => {
     const writes: Array<{ profileRootPath: string; modelId: string }> = []
     let probedModel: string | null = null
@@ -2048,6 +2229,79 @@ describe('OpenCodeProviderManagementAdapter', () => {
         modelId: 'llama.cpp/qwen-test:0.5b',
       },
     ])
+  })
+
+  test('sets configured authless all-projects default only after execution proof', async () => {
+    const allProjectWrites: string[] = []
+    let probedModel: string | null = null
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory({
+          connectedProviders: [],
+          availableProviders: ['llama.cpp'],
+          models: ['llama.cpp/qwen-test:0.5b'],
+          profile: {
+            ...inventory().profile!,
+            allProjectsDefaultModelId: options?.bypassCache
+              ? 'llama.cpp/qwen-test:0.5b'
+              : null,
+            effectiveManagedDefaultModelId: options?.bypassCache
+              ? 'llama.cpp/qwen-test:0.5b'
+              : null,
+            effectiveManagedDefaultSource: options?.bypassCache ? 'all_projects' : null,
+            managedConfig: options?.bypassCache ? { model: 'llama.cpp/qwen-test:0.5b' } : {},
+          },
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'llama.cpp',
+                name: 'llama.cpp',
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: 'http://127.0.0.1:8080/v1' },
+                models: { 'qwen-test:0.5b': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModel = input.selectedModel
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+      managedPreferences: {
+        setDefaultModel: async () => {
+          throw new Error('project preferences should not be written')
+        },
+        setAllProjectsDefaultModel: async (modelId) => {
+          allProjectWrites.push(modelId)
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'llama.cpp',
+      modelId: 'llama.cpp/qwen-test:0.5b',
+      scope: 'all_projects',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probedModel).toBe('llama.cpp/qwen-test:0.5b')
+    expect(allProjectWrites).toEqual(['llama.cpp/qwen-test:0.5b'])
   })
 
   test('does not set configured authless local default when execution proof fails', async () => {
