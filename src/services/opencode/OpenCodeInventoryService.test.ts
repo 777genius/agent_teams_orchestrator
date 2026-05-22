@@ -447,6 +447,13 @@ opencode/big-pickle
 openai/gpt-5.4
 {
   "cost": {
+    "input": 0.25,
+    "output": 1
+  }
+}
+openrouter/anthropic/claude-haiku-4.5
+{
+  "cost": {
     "input": 0,
     "output": 0
   }
@@ -471,6 +478,7 @@ llama.cpp/qwen3-coder:a3b local
     expect(parsed.models).toEqual([
       'opencode/big-pickle',
       'openai/gpt-5.4',
+      'openrouter/anthropic/claude-haiku-4.5',
       'openrouter/openai/gpt-oss-20b:free',
       'llama.cpp/qwen3-coder:a3b',
     ])
@@ -480,6 +488,9 @@ llama.cpp/qwen3-coder:a3b local
     expect(isOpenCodeBuiltinFreeModelId(' openai/gpt-5.4 ', parsed.modelMetadata)).toBe(false)
     expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
     expect(isOpenCodeModelFree('openai/gpt-5.4', parsed.modelMetadata)).toBe(false)
+    expect(
+      isOpenCodeModelFree('openrouter/anthropic/claude-haiku-4.5', parsed.modelMetadata),
+    ).toBe(true)
     expect(isOpenCodeModelFree('openrouter/openai/gpt-oss-20b:free', parsed.modelMetadata)).toBe(
       true,
     )

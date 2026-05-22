@@ -1893,6 +1893,7 @@ async function recreateSessionAfterBootstrapMcpFailure(params: {
     selectedModel: params.record.selectedModel,
     projectPath: params.record.projectPath,
     runId: params.runId,
+    toolApprovalMode: params.record.toolApprovalMode,
   })
   params.diagnostics.push(
     teamDiagnostic(
@@ -2996,6 +2997,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       selectedModel: record.selectedModel,
       projectPath: record.projectPath,
       runId,
+      toolApprovalMode: record.toolApprovalMode,
     })
     mcpDiagnostics.push(
       teamDiagnostic(
@@ -3013,6 +3015,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       selectedModel: record.selectedModel,
       projectPath: record.projectPath,
       runId,
+      toolApprovalMode: record.toolApprovalMode,
     })
     mcpDiagnostics.push(
       teamDiagnostic(
@@ -3081,6 +3084,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       selectedModel: record.selectedModel,
       projectPath: record.projectPath,
       runId: asString(body.runId),
+      toolApprovalMode: record.toolApprovalMode,
     })
     mcpDiagnostics.push(
       teamDiagnostic(
@@ -3486,17 +3490,18 @@ async function runObserveMessageDelivery(envelope: BridgeEnvelope): Promise<{
     )
   }
 
+  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
+  if (!record) {
+    throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
+  }
   const snapshot = await openCodeProvisioningProbe.probe(
-    asString(body.projectPath) ?? envelope.cwd,
+    asString(body.projectPath) ?? record.projectPath,
+    { toolApprovalMode: record.toolApprovalMode },
   )
   validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
   })
-  const record = await openCodeSessionStore.get(teamId, laneId, memberName)
-  if (!record) {
-    throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
-  }
 
   let runtimePid =
     typeof record.runtimePid === 'number' && record.runtimePid > 0 ? record.runtimePid : undefined
@@ -3787,7 +3792,9 @@ async function runTranscript(envelope: BridgeEnvelope) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${memberName}`)
   }
   const result = await openCodeSessionBridge.projectLogMessages(record, { limit: 100 })
-  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath)
+  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath, {
+    toolApprovalMode: record.toolApprovalMode,
+  })
   return {
     snapshot,
     data: {

@@ -18,6 +18,7 @@ import type {
   OpenCodeAppMcpStatus,
   OpenCodeLogProjection,
   OpenCodeMessage,
+  OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionRecord,
   OpenCodeSessionPreviewSummary,
@@ -45,7 +46,7 @@ type OpenCodeSessionBridgeDeps = {
   turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
   prepareProfile?: (
     projectPath?: string | null,
-    options?: { toolApprovalMode?: OpenCodeToolApprovalMode },
+    options?: OpenCodePrepareProfileOptions,
   ) => Promise<OpenCodePreparedProfile>
 }
 
@@ -55,6 +56,11 @@ type SessionIdentity = {
   teamId: string
   laneId: string
   memberName: string
+}
+
+type PreparedSessionProfile = {
+  profile: OpenCodePreparedProfile
+  toolApprovalMode: OpenCodeToolApprovalMode
 }
 
 export type OpenCodePromptPart =
@@ -145,6 +151,32 @@ function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function extractManagedConfigFingerprintFromHostKey(hostKey: string | null | undefined): string | null {
+  const parts = hostKey?.split('::') ?? []
+  if (parts.length < 4) {
+    return null
+  }
+  const lastPart = parts[parts.length - 1]
+  const fingerprint = lastPart?.startsWith('process:')
+    ? parts[parts.length - 2]
+    : lastPart
+  const trimmed = fingerprint?.trim()
+  return trimmed ? trimmed : null
+}
+
+function getRecordManagedConfigFingerprint(record: OpenCodeSessionRecord): string | null {
+  return record.managedConfigFingerprint ?? extractManagedConfigFingerprintFromHostKey(record.hostKey)
+}
+
+function inferToolApprovalModeFromPreparedProfile(
+  profile: OpenCodePreparedProfile,
+): OpenCodeToolApprovalMode {
+  const agentConfig = asRecord(profile.managedConfig.agent)
+  const teammateConfig = asRecord(agentConfig?.teammate)
+  const permissionConfig = asRecord(teammateConfig?.permission)
+  return permissionConfig?.['*'] === 'ask' ? 'manual' : 'auto'
+}
+
 function buildOpenCodePromptParts(params: {
   text: string
   parts?: OpenCodePromptPart[]
@@ -223,12 +255,89 @@ export class OpenCodeSessionBridge {
 
   private async prepareProfile(
     projectPath?: string | null,
-    options?: { toolApprovalMode?: OpenCodeToolApprovalMode },
+    options?: OpenCodePrepareProfileOptions,
   ) {
     const prepareProfile =
       this.deps.prepareProfile
       ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
     return prepareProfile(projectPath, options)
+  }
+
+  private sessionProfileMatchesStoredConfig(
+    record: OpenCodeSessionRecord,
+    profile: OpenCodePreparedProfile,
+  ): boolean {
+    const managedConfigFingerprint = getRecordManagedConfigFingerprint(record)
+    return !managedConfigFingerprint || managedConfigFingerprint === profile.managedConfigFingerprint
+  }
+
+  private async prepareProfileForSessionRecord(
+    record: OpenCodeSessionRecord,
+    projectPath: string | null | undefined = record.projectPath,
+  ): Promise<PreparedSessionProfile> {
+    if (record.toolApprovalMode) {
+      return {
+        profile: await this.prepareProfile(projectPath, { toolApprovalMode: record.toolApprovalMode }),
+        toolApprovalMode: record.toolApprovalMode,
+      }
+    }
+
+    const autoProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'auto' })
+    if (this.sessionProfileMatchesStoredConfig(record, autoProfile)) {
+      return { profile: autoProfile, toolApprovalMode: 'auto' }
+    }
+
+    const manualProfile = await this.prepareProfile(projectPath, { toolApprovalMode: 'manual' })
+    if (this.sessionProfileMatchesStoredConfig(record, manualProfile)) {
+      return { profile: manualProfile, toolApprovalMode: 'manual' }
+    }
+
+    return { profile: autoProfile, toolApprovalMode: 'auto' }
+  }
+
+  private buildSessionProfileStaleReason(
+    record: OpenCodeSessionRecord,
+    profile: OpenCodePreparedProfile,
+  ): string | null {
+    const managedConfigFingerprint = getRecordManagedConfigFingerprint(record)
+    return record.staleReason
+      ?? (profile.projectPath !== record.projectPath
+        ? 'project_path_changed'
+        : profile.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
+          ? 'project_behavior_changed'
+          : managedConfigFingerprint && managedConfigFingerprint !== profile.managedConfigFingerprint
+            ? `managed_config_changed:${managedConfigFingerprint}->${profile.managedConfigFingerprint}`
+            : profile.managedAuthFingerprint !== record.managedAuthFingerprint
+              ? 'managed_auth_changed'
+              : null)
+  }
+
+  private withSessionProfileMetadata(
+    record: OpenCodeSessionRecord,
+    sessionProfile: PreparedSessionProfile,
+  ): OpenCodeSessionRecord {
+    const storedManagedConfigFingerprint = getRecordManagedConfigFingerprint(record)
+    const shouldPersistInferredMetadata =
+      record.toolApprovalMode !== undefined
+      || storedManagedConfigFingerprint !== null
+      || sessionProfile.toolApprovalMode !== 'auto'
+    if (!shouldPersistInferredMetadata) {
+      return record
+    }
+
+    if (
+      record.toolApprovalMode === sessionProfile.toolApprovalMode
+      && record.managedConfigFingerprint === sessionProfile.profile.managedConfigFingerprint
+    ) {
+      return record
+    }
+
+    return {
+      ...record,
+      toolApprovalMode: sessionProfile.toolApprovalMode,
+      managedConfigFingerprint: sessionProfile.profile.managedConfigFingerprint,
+      updatedAt: buildNowIso(),
+    }
   }
 
   private async createFreshSessionRecord(params: {
@@ -237,6 +346,7 @@ export class OpenCodeSessionBridge {
     selectedModel: string
     title?: string | null
     runId?: string | null
+    toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<{ record: OpenCodeSessionRecord; retainedHostKey: string }> {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
@@ -280,6 +390,7 @@ export class OpenCodeSessionBridge {
         projectPath: host.projectPath,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
+        toolApprovalMode: params.toolApprovalMode ?? 'auto',
         runtimePid: host.pid > 0 ? host.pid : undefined,
         resolvedBehaviorFingerprint: host.resolvedConfigFingerprint,
         opencodeSessionId: session.id,
@@ -289,6 +400,8 @@ export class OpenCodeSessionBridge {
         sourceAuthFingerprint: host.profile.sourceAuthFingerprint,
         managedAuthFingerprint: host.profile.managedAuthFingerprint,
         projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+        managedConfigFingerprint: host.profile.managedConfigFingerprint,
+        opencodeVersion: host.version ?? undefined,
         bootstrapMode: 'app_managed_context',
         staleReason: null,
         createdAt: now,
@@ -335,10 +448,16 @@ export class OpenCodeSessionBridge {
       return null
     }
 
+    const sessionProfile = profile
+      ? {
+        profile,
+        toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
+      }
+      : await this.prepareProfileForSessionRecord(record)
     const host = await this.hostManager.ensureHost({
       projectPath: record.projectPath,
       hostKey: record.hostKey,
-      preparedProfile: profile,
+      preparedProfile: sessionProfile.profile,
     })
     await this.hostManager.retainHostLease?.(record.hostKey, {
       teamId: record.teamId,
@@ -408,10 +527,18 @@ export class OpenCodeSessionBridge {
       resolvedConfigFingerprint: string | null
       runtimePid: number | null
     }) => Promise<T>,
+    profile?: OpenCodePreparedProfile,
   ): Promise<T> {
+    const sessionProfile = profile
+      ? {
+        profile,
+        toolApprovalMode: record.toolApprovalMode ?? inferToolApprovalModeFromPreparedProfile(profile),
+      }
+      : await this.prepareProfileForSessionRecord(record)
     const host = await this.hostManager.ensureHost({
       projectPath: record.projectPath,
       hostKey: record.hostKey,
+      preparedProfile: sessionProfile.profile,
     })
     await this.hostManager.retainHostLease?.(record.hostKey, {
       teamId: record.teamId,
@@ -565,22 +692,48 @@ export class OpenCodeSessionBridge {
     fresh?: boolean
     toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<OpenCodeSessionRecord> {
-    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath, {
-      toolApprovalMode: params.toolApprovalMode,
-    })
     const laneId = params.laneId?.trim() || 'primary'
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
+    const requestedProfile: PreparedSessionProfile = params.preparedProfile
+      ? {
+        profile: params.preparedProfile,
+        toolApprovalMode: params.toolApprovalMode
+          ?? existing?.toolApprovalMode
+          ?? inferToolApprovalModeFromPreparedProfile(params.preparedProfile),
+      }
+      : params.toolApprovalMode
+        ? {
+          profile: await this.prepareProfile(params.projectPath, {
+            toolApprovalMode: params.toolApprovalMode,
+          }),
+          toolApprovalMode: params.toolApprovalMode,
+        }
+        : existing
+          ? await this.prepareProfileForSessionRecord(existing, params.projectPath)
+          : {
+            profile: await this.prepareProfile(params.projectPath, { toolApprovalMode: 'auto' }),
+            toolApprovalMode: 'auto',
+          }
+    const profile = requestedProfile.profile
+    const existingManagedConfigFingerprint = existing
+      ? getRecordManagedConfigFingerprint(existing)
+      : null
     if (
       existing &&
       existing.selectedModel === params.selectedModel &&
       existing.projectPath === profile.projectPath &&
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
+      (!existingManagedConfigFingerprint || existingManagedConfigFingerprint === profile.managedConfigFingerprint) &&
       params.fresh !== true &&
       !existing.staleReason
     ) {
       const host = await this.retainSessionHost(existing, params.runId, profile)
-      return host?.pid && host.pid > 0 ? { ...existing, runtimePid: host.pid } : existing
+      const cleanRecord = this.withSessionProfileMetadata(existing, requestedProfile)
+      if (cleanRecord !== existing) {
+        await this.sessionStore.upsert(cleanRecord)
+      }
+      return host?.pid && host.pid > 0 ? { ...cleanRecord, runtimePid: host.pid } : cleanRecord
     }
 
     if (existing) {
@@ -593,9 +746,11 @@ export class OpenCodeSessionBridge {
             ? 'project_path_changed'
             : existing.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
               ? 'project_behavior_changed'
-              : existing.managedAuthFingerprint !== profile.managedAuthFingerprint
-                ? 'managed_auth_changed'
-                : existing.staleReason ?? 'session_refresh_required'
+              : existingManagedConfigFingerprint && existingManagedConfigFingerprint !== profile.managedConfigFingerprint
+                ? `managed_config_changed:${existingManagedConfigFingerprint}->${profile.managedConfigFingerprint}`
+                : existing.managedAuthFingerprint !== profile.managedAuthFingerprint
+                  ? 'managed_auth_changed'
+                  : existing.staleReason ?? 'session_refresh_required'
 
       await this.sessionStore.markStale(
         params.teamId,
@@ -616,6 +771,7 @@ export class OpenCodeSessionBridge {
       selectedModel: params.selectedModel,
       title: params.title,
       runId: params.runId ?? null,
+      toolApprovalMode: requestedProfile.toolApprovalMode,
     })
     try {
       await this.sessionStore.upsert(created.record)
@@ -636,21 +792,26 @@ export class OpenCodeSessionBridge {
   }
 
   async refreshSessionEnvironment(record: OpenCodeSessionRecord): Promise<OpenCodeSessionRecord> {
-    const [profile, resolvedBehaviorFingerprint] = await Promise.all([
-      this.prepareProfile(record.projectPath),
+    const [sessionProfile, resolvedBehaviorFingerprint] = await Promise.all([
+      this.prepareProfileForSessionRecord(record),
       this.hostManager.refreshResolvedConfigFingerprint?.(record.hostKey) ?? Promise.resolve(null),
     ])
+    const profile = sessionProfile.profile
     const next: OpenCodeSessionRecord = {
       ...record,
+      toolApprovalMode: sessionProfile.toolApprovalMode,
       sourceAuthFingerprint: profile.sourceAuthFingerprint,
       managedAuthFingerprint: profile.managedAuthFingerprint,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      managedConfigFingerprint: profile.managedConfigFingerprint,
       resolvedBehaviorFingerprint: resolvedBehaviorFingerprint ?? record.resolvedBehaviorFingerprint,
     }
     const changed =
-      next.sourceAuthFingerprint !== record.sourceAuthFingerprint
+      next.toolApprovalMode !== record.toolApprovalMode
+      || next.sourceAuthFingerprint !== record.sourceAuthFingerprint
       || next.managedAuthFingerprint !== record.managedAuthFingerprint
       || next.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
+      || next.managedConfigFingerprint !== record.managedConfigFingerprint
       || next.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
 
     if (!changed) {
@@ -1083,16 +1244,10 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
-    const profile = await this.prepareProfile(record.projectPath)
-    const staleReason =
-      record.staleReason
-      ?? (profile.projectPath !== record.projectPath
-        ? 'project_path_changed'
-        : profile.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
-          ? 'project_behavior_changed'
-          : profile.managedAuthFingerprint !== record.managedAuthFingerprint
-            ? 'managed_auth_changed'
-            : null)
+    const sessionProfile = await this.prepareProfileForSessionRecord(record)
+    const profile = sessionProfile.profile
+    const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
+    const staleReason = this.buildSessionProfileStaleReason(record, profile)
 
     const preflightDiagnostics: string[] = []
     if (profile.authState === 'stale') {
@@ -1108,15 +1263,15 @@ export class OpenCodeSessionBridge {
       })
     }
 
-    return this.withSessionHost(record, async ({ baseUrl, resolvedConfigFingerprint, runtimePid }) => {
+    return this.withSessionHost(activeRecord, async ({ baseUrl, resolvedConfigFingerprint, runtimePid }) => {
       if (
-        record.resolvedBehaviorFingerprint
+        activeRecord.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
-        && record.resolvedBehaviorFingerprint !== resolvedConfigFingerprint
+        && activeRecord.resolvedBehaviorFingerprint !== resolvedConfigFingerprint
       ) {
         return this.buildStaleReconcileResult({
-          record,
-          staleReason: `resolved_behavior_changed:${record.resolvedBehaviorFingerprint}->${resolvedConfigFingerprint}`,
+          record: activeRecord,
+          staleReason: `resolved_behavior_changed:${activeRecord.resolvedBehaviorFingerprint}->${resolvedConfigFingerprint}`,
           profileAuthState: profile.authState,
           diagnostics: preflightDiagnostics,
         })
@@ -1132,15 +1287,15 @@ export class OpenCodeSessionBridge {
         }),
       ])
       const messageDiagnostics: string[] = []
-      const targetSessionId = options.sessionId?.trim() || record.opencodeSessionId
+      const targetSessionId = options.sessionId?.trim() || activeRecord.opencodeSessionId
       let messages = await client.getSessionMessages(targetSessionId, options.limit)
       if (
         typeof options.limit === 'number'
-        && record.lastCanonicalCursor
-        && !messages.some(message => getMessageId(message) === record.lastCanonicalCursor)
+        && activeRecord.lastCanonicalCursor
+        && !messages.some(message => getMessageId(message) === activeRecord.lastCanonicalCursor)
       ) {
         messageDiagnostics.push(
-          `Stored cursor ${record.lastCanonicalCursor} was missing from the latest ${options.limit} messages, rebuilding full OpenCode session history`,
+          `Stored cursor ${activeRecord.lastCanonicalCursor} was missing from the latest ${options.limit} messages, rebuilding full OpenCode session history`,
         )
         messages = await client.getSessionMessages(targetSessionId)
       }
@@ -1173,13 +1328,13 @@ export class OpenCodeSessionBridge {
         summary.diagnostics.push(...preflightDiagnostics)
       }
 
-      const nextRecord = this.buildUpdatedRecord(record, {
+      const nextRecord = this.buildUpdatedRecord(activeRecord, {
         lastCanonicalCursor: summary.lastCanonicalCursor,
         lastKnownRawStatus: summary.rawStatus,
         lastKnownDurableState: summary.durableState,
-        resolvedBehaviorFingerprint: resolvedConfigFingerprint ?? record.resolvedBehaviorFingerprint,
+        resolvedBehaviorFingerprint: resolvedConfigFingerprint ?? activeRecord.resolvedBehaviorFingerprint,
       })
-      const isCurrentSession = targetSessionId === record.opencodeSessionId
+      const isCurrentSession = targetSessionId === activeRecord.opencodeSessionId
 
       if (
         isCurrentSession &&
@@ -1188,17 +1343,19 @@ export class OpenCodeSessionBridge {
           || nextRecord.lastKnownRawStatus !== record.lastKnownRawStatus
           || nextRecord.lastKnownDurableState !== record.lastKnownDurableState
           || nextRecord.resolvedBehaviorFingerprint !== record.resolvedBehaviorFingerprint
+          || nextRecord.managedConfigFingerprint !== record.managedConfigFingerprint
+          || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
         await this.sessionStore.upsert(nextRecord)
       }
 
-      const reconciledRecord = isCurrentSession ? nextRecord : record
+      const reconciledRecord = isCurrentSession ? nextRecord : activeRecord
       return {
         record: runtimePid ? { ...reconciledRecord, runtimePid } : reconciledRecord,
         summary,
       }
-    })
+    }, profile)
   }
 
   async observePreview(
@@ -1212,16 +1369,10 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionPreviewSummary
   }> {
-    const profile = await this.prepareProfile(record.projectPath)
-    const staleReason =
-      record.staleReason
-      ?? (profile.projectPath !== record.projectPath
-        ? 'project_path_changed'
-        : profile.projectBehaviorFingerprint !== record.projectBehaviorFingerprint
-          ? 'project_behavior_changed'
-          : profile.managedAuthFingerprint !== record.managedAuthFingerprint
-            ? 'managed_auth_changed'
-            : null)
+    const sessionProfile = await this.prepareProfileForSessionRecord(record)
+    const profile = sessionProfile.profile
+    const activeRecord = this.withSessionProfileMetadata(record, sessionProfile)
+    const staleReason = this.buildSessionProfileStaleReason(record, profile)
 
     const preflightDiagnostics: string[] = []
     if (profile.authState === 'stale') {
@@ -1237,15 +1388,15 @@ export class OpenCodeSessionBridge {
       })
     }
 
-    return this.withSessionHost(record, async ({ baseUrl, resolvedConfigFingerprint }) => {
+    return this.withSessionHost(activeRecord, async ({ baseUrl, resolvedConfigFingerprint }) => {
       if (
-        record.resolvedBehaviorFingerprint
+        activeRecord.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
-        && record.resolvedBehaviorFingerprint !== resolvedConfigFingerprint
+        && activeRecord.resolvedBehaviorFingerprint !== resolvedConfigFingerprint
       ) {
         return this.buildStalePreviewResult({
-          record,
-          staleReason: `resolved_behavior_changed:${record.resolvedBehaviorFingerprint}->${resolvedConfigFingerprint}`,
+          record: activeRecord,
+          staleReason: `resolved_behavior_changed:${activeRecord.resolvedBehaviorFingerprint}->${resolvedConfigFingerprint}`,
           profileAuthState: profile.authState,
           diagnostics: preflightDiagnostics,
         })
@@ -1253,7 +1404,7 @@ export class OpenCodeSessionBridge {
 
       const summary = await this.previewObserver.observeSession({
         baseUrl,
-        sessionId: record.opencodeSessionId,
+        sessionId: activeRecord.opencodeSessionId,
         timeoutMs: options.timeoutMs,
         idleTimeoutMs: options.idleTimeoutMs,
         signal: options.signal,
@@ -1264,10 +1415,10 @@ export class OpenCodeSessionBridge {
       }
 
       return {
-        record,
+        record: activeRecord,
         summary,
       }
-    })
+    }, profile)
   }
 
   async projectLogMessages(

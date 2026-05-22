@@ -2396,6 +2396,75 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('marks provider-scoped zero-cost OpenRouter models as free', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [
+            {
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            },
+          ],
+          availableProviders: ['openrouter'],
+          models: ['openrouter/anthropic/claude-haiku-4.5'],
+          modelMetadata: [
+            {
+              id: 'openrouter/anthropic/claude-haiku-4.5',
+              cost: { input: 0, output: 0 },
+              context: null,
+              limits: null,
+              free: true,
+              raw: { cost: { input: 0, output: 0 } },
+            },
+          ],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: { 'anthropic/claude-haiku-4.5': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      query: 'haiku',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models[0]).toMatchObject({
+      modelId: 'openrouter/anthropic/claude-haiku-4.5',
+      providerId: 'openrouter',
+      sourceLabel: 'OpenRouter',
+      free: true,
+    })
+  })
+
   test('loads provider-scoped models reported only by the live provider catalog', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {

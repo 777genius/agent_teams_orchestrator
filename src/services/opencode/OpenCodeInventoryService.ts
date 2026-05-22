@@ -402,16 +402,6 @@ function isFreeCost(cost: unknown): boolean {
   return numbers.length > 0 && numbers.every(value => value === 0)
 }
 
-function isExplicitFreeOpenCodeModelId(modelId: string): boolean {
-  const normalized = modelId.trim().toLowerCase()
-  return (
-    normalized.startsWith('opencode/')
-    || normalized.includes(':free')
-    || normalized.endsWith('-free')
-    || normalized.endsWith('/free')
-  )
-}
-
 export function isOpenCodeBuiltinProviderModelId(modelId: string | null | undefined): boolean {
   return modelId?.trim().toLowerCase().startsWith('opencode/') === true
 }
@@ -485,7 +475,7 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
         cost: raw.cost ?? null,
         context: getModelContextLimit(limits),
         limits,
-        free: isFreeCost(raw.cost) && isExplicitFreeOpenCodeModelId(modelRef.raw),
+        free: isFreeCost(raw.cost),
         raw,
       })
       index = blockEnd

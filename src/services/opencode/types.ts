@@ -575,6 +575,7 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null
   opencodeSessionId: string

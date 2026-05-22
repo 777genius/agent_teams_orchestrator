@@ -6341,6 +6341,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       lastCanonicalCursor: 'cursor-broken',
       bootstrapMode: 'model_tool_checkin',
       bootstrapEvidenceSource: 'runtime_bootstrap_checkin',
+      toolApprovalMode: 'manual',
     })
     const freshRecord = buildRecord({
       laneId: 'secondary:opencode:bob',
@@ -6368,6 +6369,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: originalRecord.selectedModel,
         projectPath: originalRecord.projectPath,
         runId: 'run-bootstrap-repair',
+        toolApprovalMode: 'manual',
       })
       return freshRecord
     }) as typeof openCodeSessionBridge.ensureSession
@@ -6449,6 +6451,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       opencodeSessionId: 'session-bob-stale',
       lastCanonicalCursor: 'cursor-stale',
       staleReason: 'resolved_behavior_changed:old->new',
+      toolApprovalMode: 'manual',
     })
     const freshRecord = buildRecord({
       laneId: 'secondary:opencode:bob',
@@ -6470,6 +6473,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: staleRecord.selectedModel,
         projectPath: staleRecord.projectPath,
         runId: 'run-stale-send',
+        toolApprovalMode: 'manual',
       })
       return freshRecord
     }) as typeof openCodeSessionBridge.ensureSession
@@ -6531,6 +6535,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       lastCanonicalCursor: 'cursor-legacy-bootstrap',
       bootstrapMode: 'app_managed_context',
       bootstrapEvidenceSource: 'app_managed_bootstrap',
+      toolApprovalMode: 'manual',
       appManagedBootstrap: {
         schemaVersion: 1,
         messageID: 'msgagtbootlegacy',
@@ -6567,6 +6572,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: originalRecord.selectedModel,
         projectPath: originalRecord.projectPath,
         runId: 'run-sortable-bootstrap-repair',
+        toolApprovalMode: 'manual',
       })
       return freshRecord
     }) as typeof openCodeSessionBridge.ensureSession
@@ -6624,6 +6630,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       memberName: 'bob',
       opencodeSessionId: 'session-bob-old-transport',
       lastCanonicalCursor: 'cursor-old-transport',
+      toolApprovalMode: 'manual',
     })
     const freshRecord = buildRecord({
       laneId: 'secondary:opencode:bob',
@@ -6649,6 +6656,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         selectedModel: originalRecord.selectedModel,
         projectPath: originalRecord.projectPath,
         runId: 'run-forced-refresh',
+        toolApprovalMode: 'manual',
       })
       return freshRecord
     }) as typeof openCodeSessionBridge.ensureSession
@@ -6717,6 +6725,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       memberName: 'bob',
       opencodeSessionId: 'session-bob-old',
       lastCanonicalCursor: 'cursor-old',
+      toolApprovalMode: 'manual',
     })
     const recreatedRecord = buildRecord({
       laneId: 'secondary:opencode:bob',
@@ -6732,7 +6741,17 @@ describe('OpenCodeBridgeCommandHandler', () => {
       staleReasons.push(staleReason)
       return { ...originalRecord, staleReason }
     }) as typeof openCodeSessionStore.markStale
-    openCodeSessionBridge.ensureSession = (async () => recreatedRecord) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.ensureSession = (async input => {
+      expect(input).toMatchObject({
+        teamId: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        selectedModel: originalRecord.selectedModel,
+        projectPath: originalRecord.projectPath,
+        toolApprovalMode: 'manual',
+      })
+      return recreatedRecord
+    }) as typeof openCodeSessionBridge.ensureSession
     openCodeSessionBridge.ensureSessionAppMcpReady = (async () => {
       mcpChecks += 1
       return mcpChecks === 1
@@ -7582,6 +7601,72 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.error.message).toContain('laneId is required')
   })
 
+  test('observes message delivery with the stored manual tool approval mode', async () => {
+    const manualRecord = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+      toolApprovalMode: 'manual',
+    })
+    const probeOptions: Array<{ toolApprovalMode?: string } | undefined> = []
+    const reconciledSessions: Array<string | null | undefined> = []
+    openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
+      probeOptions.push(options)
+      return snapshot
+    }) as typeof openCodeProvisioningProbe.probe
+    openCodeSessionStore.get = (async () => manualRecord) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.reconcileSession = (async (record, options) => {
+      reconciledSessions.push(options?.sessionId)
+      return {
+        record,
+        summary: buildReconcileSummary({
+          sessionId: 'session-bob',
+          messageCount: 2,
+          latestAssistantMessageId: 'msg-assistant-delivery',
+          latestAssistantText: 'delivery observed',
+          latestAssistantPreview: 'delivery observed',
+          messages: [
+            buildCanonicalMessage({
+              id: 'msg-runtime-prompt',
+              role: 'user',
+              text: 'deliver message msg-inbound-1',
+            }),
+            buildCanonicalMessage({
+              id: 'msg-assistant-delivery',
+              parentId: 'msg-runtime-prompt',
+              role: 'assistant',
+              text: 'delivery observed',
+              previewText: 'delivery observed',
+            }),
+          ],
+        }),
+      }
+    }) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.observeMessageDelivery', {
+        runId: 'run-observe',
+        laneId: 'secondary:opencode:bob',
+        teamId: 'team-a',
+        teamName: 'team-a',
+        memberName: 'bob',
+        messageId: 'msg-inbound-1',
+        sessionId: 'session-bob',
+        runtimePromptMessageId: 'msg-runtime-prompt',
+        prePromptCursor: 'cursor-before',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(probeOptions).toEqual([{ toolApprovalMode: 'manual' }])
+    expect(reconciledSessions).toEqual(['session-bob'])
+    expect(result.data.responseObservation.state).toBe('responded_plain_text')
+    expect(result.data.responseObservation.deliveredUserMessageId).toBe('msg-runtime-prompt')
+  })
+
   test('rejects ambiguous transcript reads without laneId when multiple lanes exist', async () => {
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
@@ -7608,9 +7693,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
       laneId: 'secondary:opencode:alice:alt',
       memberName: 'alice',
       opencodeSessionId: 'session-alt',
+      toolApprovalMode: 'manual',
     })
     const projectedRecords: OpenCodeSessionRecord[] = []
-    openCodeProvisioningProbe.probe = async () => snapshot
+    const probeOptions: Array<{ toolApprovalMode?: string } | undefined> = []
+    openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
+      probeOptions.push(options)
+      return snapshot
+    }) as typeof openCodeProvisioningProbe.probe
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
       selectedRecord,
@@ -7651,6 +7741,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(projectedRecords.map(record => record.opencodeSessionId)).toEqual(['session-alt'])
+    expect(probeOptions).toEqual([{ toolApprovalMode: 'manual' }])
     expect(result.data.sessionId).toBe('session-alt')
   })
 

@@ -257,6 +257,263 @@ describe('OpenCodeSessionBridge', () => {
     expect(createSessionCalls).toBe(0)
   })
 
+  test('persists manual tool approval mode in fresh session records', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'created'
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async input => {
+          expect(input?.preparedProfile).toBe(profile)
+          return host
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-manual' }),
+          getSession: async () => ({ id: 'session-manual' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: 'team-a',
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      fresh: true,
+      toolApprovalMode: 'manual',
+    })
+
+    expect(record.toolApprovalMode).toBe('manual')
+    expect(record.managedConfigFingerprint).toBe('managed-config-v1')
+    expect(upserts[0]?.toolApprovalMode).toBe('manual')
+    expect(upserts[0]?.managedConfigFingerprint).toBe('managed-config-v1')
+  })
+
+  test('infers manual tool approval mode from caller-provided prepared profile', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const manualProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfig: {
+        agent: {
+          teammate: {
+            permission: {
+              '*': 'ask',
+            },
+          },
+        },
+      },
+      managedConfigFingerprint: 'manual-config-v1',
+    }
+    const manualHost: OpenCodeHostHandle = {
+      ...host,
+      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      profile: manualProfile,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        throw new Error('preparedProfile should be used directly')
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'created'
+        },
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async input => {
+          expect(input?.preparedProfile).toBe(manualProfile)
+          return manualHost
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-manual-profile' }),
+          getSession: async () => ({ id: 'session-manual-profile' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: 'team-a',
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      preparedProfile: manualProfile,
+      fresh: true,
+    })
+
+    expect(record.toolApprovalMode).toBe('manual')
+    expect(record.managedConfigFingerprint).toBe('manual-config-v1')
+    expect(upserts[0]?.toolApprovalMode).toBe('manual')
+  })
+
+  test('reuses legacy manual session records by inferring approval mode from host config fingerprint', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const staleReasons: string[] = []
+    const prepareProfileModes: Array<string | undefined> = []
+    const ensuredProfileFingerprints: string[] = []
+    let createSessionCalls = 0
+    const manualProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'manual-config-v1',
+    }
+    const autoProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'auto-config-v1',
+    }
+    const manualHost: OpenCodeHostHandle = {
+      ...host,
+      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      profile: manualProfile,
+    }
+    const legacyRecord = buildRecord({
+      hostKey: manualHost.hostKey,
+      managedConfigFingerprint: undefined,
+      toolApprovalMode: undefined,
+    })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        prepareProfileModes.push(options?.toolApprovalMode)
+        return options?.toolApprovalMode === 'manual' ? manualProfile : autoProfile
+      },
+      sessionStore: {
+        get: async () => legacyRecord,
+        upsert: async record => {
+          upserts.push(record)
+          return 'updated'
+        },
+        markStale: async (_teamId, _laneId, _memberName, staleReason) => {
+          staleReasons.push(staleReason)
+          return { ...legacyRecord, staleReason }
+        },
+      },
+      hostManager: {
+        ensureHost: async input => {
+          ensuredProfileFingerprints.push(input?.preparedProfile?.managedConfigFingerprint ?? 'missing')
+          return manualHost
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCalls += 1
+            return { id: 'session-new' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const record = await bridge.ensureSession({
+      teamId: 'team-a',
+      laneId: 'primary',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      runId: 'run-1',
+    })
+
+    expect(prepareProfileModes).toEqual(['auto', 'manual'])
+    expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
+    expect(createSessionCalls).toBe(0)
+    expect(staleReasons).toEqual([])
+    expect(record.toolApprovalMode).toBe('manual')
+    expect(record.managedConfigFingerprint).toBe('manual-config-v1')
+    expect(upserts[0]?.toolApprovalMode).toBe('manual')
+    expect(upserts[0]?.managedConfigFingerprint).toBe('manual-config-v1')
+  })
+
   test('retries fresh session creation after a transient OpenCode socket close', async () => {
     const upserts: OpenCodeSessionRecord[] = []
     const retainedLeases: unknown[] = []
@@ -441,9 +698,10 @@ describe('OpenCodeSessionBridge', () => {
     const ensureCalls: Array<{ baseUrl: string; attachIfMissing?: boolean }> = []
     let releaseHostCalls = 0
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async input => {
-          expect(input).toEqual({ projectPath: '/tmp/project', hostKey: 'host-key' })
+          expect(input).toEqual({ projectPath: '/tmp/project', hostKey: 'host-key', preparedProfile: profile })
           return host
         },
         releaseHost: async () => {
@@ -487,6 +745,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('ensureSessionAppMcpReady returns blocking state when app MCP cannot attach', async () => {
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -523,6 +782,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('ensureSessionAppMcpReady converts MCP probe exceptions into blocking state', async () => {
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -546,6 +806,82 @@ describe('OpenCodeSessionBridge', () => {
       connected: null,
       diagnostics: ['OpenCode app MCP readiness check failed: mcp endpoint unavailable'],
     })
+  })
+
+  test('answers permissions on the stored manual session profile', async () => {
+    const answerCalls: unknown[] = []
+    const ensuredProfileFingerprints: string[] = []
+    const manualProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'manual-config-v1',
+    }
+    const manualHost: OpenCodeHostHandle = {
+      ...host,
+      profile: manualProfile,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        expect(options?.toolApprovalMode).toBe('manual')
+        return manualProfile
+      },
+      hostManager: {
+        ensureHost: async input => {
+          ensuredProfileFingerprints.push(input?.preparedProfile?.managedConfigFingerprint ?? 'missing')
+          return manualHost
+        },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          answerPermission: async input => {
+            answerCalls.push(input)
+            return { ok: true }
+          },
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await bridge.answerPermission(buildRecord({
+      toolApprovalMode: 'manual',
+      managedConfigFingerprint: 'manual-config-v1',
+    }), {
+      requestId: 'perm-1',
+      decision: 'allow',
+    })
+
+    expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
+    expect(answerCalls).toEqual([{
+      requestId: 'perm-1',
+      sessionId: 'session-1',
+      decision: 'allow',
+    }])
   })
 
   test('marks stale and creates a new session when the model changes', async () => {
@@ -1444,6 +1780,102 @@ describe('OpenCodeSessionBridge', () => {
     expect(upserts).toHaveLength(1)
   })
 
+  test('infers manual tool approval mode for legacy records from stored host config fingerprint', async () => {
+    const upserts: OpenCodeSessionRecord[] = []
+    const prepareProfileModes: Array<string | undefined> = []
+    const ensuredProfileFingerprints: string[] = []
+    const manualProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'manual-config-v1',
+    }
+    const autoProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'auto-config-v1',
+    }
+    const manualHost: OpenCodeHostHandle = {
+      ...host,
+      hostKey: '/tmp/project::profile-root::behavior-v1::manual-config-v1',
+      profile: manualProfile,
+      resolvedConfigFingerprint: null,
+    }
+    const legacyRecord = buildRecord({
+      hostKey: manualHost.hostKey,
+      resolvedBehaviorFingerprint: null,
+      managedConfigFingerprint: undefined,
+      toolApprovalMode: undefined,
+    })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        prepareProfileModes.push(options?.toolApprovalMode)
+        return options?.toolApprovalMode === 'manual' ? manualProfile : autoProfile
+      },
+      hostManager: {
+        ensureHost: async input => {
+          ensuredProfileFingerprints.push(input?.preparedProfile?.managedConfigFingerprint ?? 'missing')
+          return manualHost
+        },
+        releaseHost: async () => {},
+      },
+      sessionStore: {
+        get: async () => null,
+        upsert: async record => {
+          upserts.push(record)
+          return 'updated'
+        },
+        markStale: async () => null,
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-1',
+                role: 'user',
+                sessionID: 'session-1',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'hello' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await bridge.reconcileSession(legacyRecord)
+
+    expect(prepareProfileModes).toEqual(['auto', 'manual'])
+    expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
+    expect(result.record.toolApprovalMode).toBe('manual')
+    expect(result.record.managedConfigFingerprint).toBe('manual-config-v1')
+    expect(upserts[0]?.toolApprovalMode).toBe('manual')
+    expect(upserts[0]?.managedConfigFingerprint).toBe('manual-config-v1')
+  })
+
   test('skips durable reconcile when stored project behavior has drifted', async () => {
     const staleMarks: Array<{ laneId: string; staleReason: string }> = []
     const bridge = new OpenCodeSessionBridge({
@@ -2151,6 +2583,49 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.profileAuthState).toBe('ok')
     expect(result.summary.latestAssistantPreview).toBe('pong')
     expect(upserts).toEqual([])
+  })
+
+  test('observes preview on the stored manual session profile', async () => {
+    const prepareProfileModes: Array<string | undefined> = []
+    const ensuredProfileFingerprints: string[] = []
+    const observedSessions: string[] = []
+    const manualProfile: OpenCodePreparedProfile = {
+      ...profile,
+      managedConfigFingerprint: 'manual-config-v1',
+    }
+    const manualHost: OpenCodeHostHandle = {
+      ...host,
+      profile: manualProfile,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async (_projectPath, options) => {
+        prepareProfileModes.push(options?.toolApprovalMode)
+        return manualProfile
+      },
+      hostManager: {
+        ensureHost: async input => {
+          ensuredProfileFingerprints.push(input?.preparedProfile?.managedConfigFingerprint ?? 'missing')
+          return manualHost
+        },
+        releaseHost: async () => {},
+      },
+      previewObserver: {
+        observeSession: async input => {
+          observedSessions.push(input.sessionId)
+          return buildPreviewSummary()
+        },
+      },
+    })
+
+    const result = await bridge.observePreview(buildRecord({
+      toolApprovalMode: 'manual',
+      managedConfigFingerprint: 'manual-config-v1',
+    }))
+
+    expect(prepareProfileModes).toEqual(['manual'])
+    expect(ensuredProfileFingerprints).toEqual(['manual-config-v1'])
+    expect(observedSessions).toEqual(['session-1'])
+    expect(result.summary.previewOutcome).toBe('observed')
   })
 
   test('skips preview observation when the stored session is stale', async () => {
