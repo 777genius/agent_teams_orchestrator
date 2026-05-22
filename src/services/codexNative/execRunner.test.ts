@@ -81,6 +81,29 @@ describe('buildCodexNativeExecArgs', () => {
     ])
   })
 
+  test('passes approval policy as a Codex config override', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Inspect the repo and summarize it.',
+        cwd: '/tmp/demo',
+        approvalPolicy: 'never',
+        sandboxMode: 'danger-full-access',
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-c',
+      'approval_policy="never"',
+      '--sandbox',
+      'danger-full-access',
+      '-',
+    ])
+  })
+
   test('passes Codex xhigh reasoning through model_reasoning_effort config', () => {
     expect(
       buildCodexNativeExecArgs({

@@ -28,6 +28,12 @@ import {
   getCodexNativeApiKey,
 } from '../runtimeBackends/codexBackendResolver.js'
 import { runCodexNativeExec } from './execRunner.js'
+import {
+  type CodexAppServerApprovalRequestHandler,
+  buildCodexAutoExecPolicy,
+  buildCodexManualAppServerThreadPolicy,
+} from './appServerApproval.js'
+import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -75,10 +81,12 @@ type ExecuteCodexNativeTurnParams = {
   startTime: number
   abortSignal?: AbortSignal
   setSDKStatus?: (status: SDKStatus) => void
+  requestApproval?: CodexAppServerApprovalRequestHandler
 }
 
 type ExecuteCodexNativeTurnDeps = {
   runExec?: typeof runCodexNativeExec
+  runAppServer?: typeof runCodexNativeAppServer
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
   runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
@@ -262,21 +270,46 @@ function toCodexNativePromptText(
   }
 }
 
-function mapPermissionModeToSandboxMode(
+export type CodexNativeApprovalLaunchPolicy =
+  | {
+      transport: 'exec-json'
+      approvalPolicy: 'never'
+      sandboxMode: 'danger-full-access'
+    }
+  | {
+      transport: 'app-server'
+      approvalPolicy: 'on-request'
+      approvalsReviewer: 'user'
+      sandbox: 'read-only'
+    }
+
+export function resolveCodexNativeApprovalLaunchPolicy(
   permissionMode: PermissionMode,
-): 'read-only' | 'workspace-write' | 'danger-full-access' {
+): CodexNativeApprovalLaunchPolicy {
   switch (permissionMode) {
-    case 'acceptEdits':
-      return 'workspace-write'
     case 'bypassPermissions':
-    case 'dontAsk':
-      return 'danger-full-access'
+    case 'dontAsk': {
+      const policy = buildCodexAutoExecPolicy()
+      return {
+        transport: 'exec-json',
+        approvalPolicy: policy.approvalPolicy,
+        sandboxMode: policy.sandboxMode,
+      }
+    }
+    case 'acceptEdits':
     case 'default':
     case 'plan':
     case 'auto':
     case 'bubble':
-    default:
-      return 'read-only'
+    default: {
+      const policy = buildCodexManualAppServerThreadPolicy()
+      return {
+        transport: 'app-server',
+        approvalPolicy: policy.approvalPolicy,
+        approvalsReviewer: policy.approvalsReviewer,
+        sandbox: policy.sandbox,
+      }
+    }
   }
 }
 
@@ -459,6 +492,7 @@ export async function* executeCodexNativeTurn(
   deps: ExecuteCodexNativeTurnDeps = {},
 ): AsyncGenerator<SDKMessage, CodexNativeExecutionSummary, unknown> {
   const runExec = deps.runExec ?? runCodexNativeExec
+  const runAppServer = deps.runAppServer ?? runCodexNativeAppServer
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
@@ -551,7 +585,10 @@ export async function* executeCodexNativeTurn(
     const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
     const apiKey =
       forcedLoginMethod === 'chatgpt' ? undefined : (getCodexNativeApiKey() ?? undefined)
-    const iterator = runExec({
+    const launchPolicy = resolveCodexNativeApprovalLaunchPolicy(
+      params.permissionMode,
+    )
+    const commonOptions = {
       prompt: resolvedPrompt.text,
       imagePaths: resolvedPrompt.imagePaths,
       cwd: params.cwd,
@@ -560,8 +597,6 @@ export async function* executeCodexNativeTurn(
         params.model,
         params.effortValue,
       ),
-      sandboxMode: mapPermissionModeToSandboxMode(params.permissionMode),
-      additionalWritableDirectories: params.additionalWritableDirectories,
       ephemeral: shouldUseEphemeralCodexNativeThread(),
       apiKey,
       forcedLoginMethod,
@@ -575,11 +610,27 @@ export async function* executeCodexNativeTurn(
         apiKey,
         forcedLoginMethod,
       }),
-      ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
       abortSignal: params.abortSignal,
       idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
       absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,
-    })
+    }
+    const iterator =
+      launchPolicy.transport === 'app-server'
+        ? runAppServer({
+            ...commonOptions,
+            requestApproval:
+              params.requestApproval ??
+              (async () => {
+                throw new Error('update Codex CLI or enable auto-approve')
+              }),
+          })
+        : runExec({
+            ...commonOptions,
+            approvalPolicy: launchPolicy.approvalPolicy,
+            sandboxMode: launchPolicy.sandboxMode,
+            additionalWritableDirectories: params.additionalWritableDirectories,
+            ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
+          })
 
     while (true) {
       const next = await iterator.next()

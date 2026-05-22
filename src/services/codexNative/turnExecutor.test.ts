@@ -11,6 +11,7 @@ import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import type { CodexNativeTurnSettledEvent } from './runtimeTurnSettledEmitter.js'
 import {
   executeCodexNativeTurn,
+  resolveCodexNativeApprovalLaunchPolicy,
   resolveCodexNativeExecTimeoutPolicy,
   resolveCodexNativeExecTimeoutMs,
 } from './turnExecutor.js'
@@ -21,7 +22,7 @@ function baseParams(overrides: Partial<Parameters<typeof executeCodexNativeTurn>
     cwd: '/tmp/demo',
     model: 'gpt-5.3-codex',
     effortValue: undefined,
-    permissionMode: 'default' as const,
+    permissionMode: 'bypassPermissions' as const,
     additionalWritableDirectories: [],
     persistSession: false,
     replayedUserMessages: [] as SDKUserMessageReplay[],
@@ -250,6 +251,125 @@ describe('executeCodexNativeTurn', () => {
 
     expect(observedIdleTimeoutMs).toBe(900_000)
     expect(observedAbsoluteTimeoutMs).toBe(3_600_000)
+  })
+
+  test('maps bypass permissions to Codex native never-approval mode', async () => {
+    let observedApprovalPolicy: 'never' | 'on-request' | null | undefined
+
+    await collectMessages(
+      executeCodexNativeTurn(baseParams({ permissionMode: 'bypassPermissions' }), {
+        runExec: async function* (options) {
+          observedApprovalPolicy = options.approvalPolicy
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'assistant_text',
+              itemId: 'item_0',
+              text: 'OK',
+            },
+          }
+          yield {
+            type: 'normalized_event',
+            event: {
+              type: 'turn_completed',
+            },
+          }
+          return {
+            identity: {
+              executablePath: '/usr/local/bin/codex',
+              executableSource: 'system-path',
+              version: 'codex-cli 0.117.0',
+            },
+            threadId: 'thread-1',
+            credentialSource: 'none',
+            completionPolicy: 'ephemeral',
+            finalHistoryCompleteness: 'live-only',
+            finalUsageAuthority: 'live-turn-completed',
+          }
+        },
+      }),
+    )
+
+    expect(observedApprovalPolicy).toBe('never')
+  })
+
+  test('resolves manual Codex approval policy to the app-server protocol', () => {
+    expect(resolveCodexNativeApprovalLaunchPolicy('default')).toEqual({
+      transport: 'app-server',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandbox: 'read-only',
+    })
+    expect(resolveCodexNativeApprovalLaunchPolicy('bypassPermissions')).toEqual({
+      transport: 'exec-json',
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+    })
+  })
+
+  test('routes manual Codex turns through the app-server approval transport', async () => {
+    let observedTransport: 'app-server' | null = null
+    let observedApprovalProvider: string | null = null
+
+    const messages = await collectMessages(
+      executeCodexNativeTurn(
+        baseParams({
+          permissionMode: 'default',
+          requestApproval: async approval => {
+            observedApprovalProvider = approval.providerId
+            return { allow: true }
+          },
+        }),
+        {
+          runAppServer: async function* (options) {
+            observedTransport = 'app-server'
+            await options.requestApproval({
+              providerId: 'codex',
+              requestId: 'rpc-1',
+              providerRequestId: 'codex:item/commandExecution/requestApproval:item-1',
+              method: 'item/commandExecution/requestApproval',
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              itemId: 'item-1',
+              toolName: 'Bash',
+              toolInput: { provider: 'codex', command: 'echo ok' },
+              reason: 'approval smoke',
+              raw: {},
+            })
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.125.0',
+              },
+              threadId: 'thread-1',
+              credentialSource: 'none',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'explicit-hydration-required',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        },
+      ),
+    )
+
+    expect(observedTransport).toBe('app-server')
+    expect(observedApprovalProvider).toBe('codex')
+    expect(messages.some(message => message.type === 'assistant')).toBe(true)
   })
 
   test('disables unsupported Codex plugins only for API-key native execution', async () => {

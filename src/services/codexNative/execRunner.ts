@@ -20,6 +20,7 @@ export type CodexNativeExecRunnerOptions = {
   cwd: string
   model?: string | null
   reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null
+  approvalPolicy?: 'never' | 'on-request' | null
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access' | null
   additionalWritableDirectories?: string[]
   ephemeral?: boolean
@@ -142,6 +143,10 @@ export function buildCodexNativeExecArgs(
 
   if (options.reasoningEffort) {
     args.push('-c', `model_reasoning_effort="${options.reasoningEffort}"`)
+  }
+
+  if (options.approvalPolicy) {
+    args.push('-c', `approval_policy="${options.approvalPolicy}"`)
   }
 
   if (options.forcedLoginMethod) {

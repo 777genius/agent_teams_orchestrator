@@ -35,6 +35,7 @@ import { hasAutoMemPathOverride } from './memdir/paths.js'
 import { query } from './query.js'
 import { categorizeRetryableAPIError } from './services/api/errors.js'
 import type { MCPServerConnection } from './services/mcp/types.js'
+import { createCodexAppServerApprovalPromptHandler } from './services/codexNative/approvalPromptBridge.js'
 import { executeCodexNativeTurn } from './services/codexNative/turnExecutor.js'
 import { resolveCodexRuntimeSelection } from './services/runtimeBackends/codexBackendResolver.js'
 import type { AppState } from './state/AppState.js'
@@ -700,6 +701,10 @@ export class QueryEngine {
         startTime,
         abortSignal: this.abortController.signal,
         setSDKStatus,
+        requestApproval: createCodexAppServerApprovalPromptHandler({
+          canUseTool: wrappedCanUseTool,
+          toolUseContext: processUserInputContext,
+        }),
       })
       this.totalUsage = nativeSummary.totalUsage
       return
