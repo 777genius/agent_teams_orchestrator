@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { type ChildProcess } from 'node:child_process'
+import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import net from 'node:net'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -19,6 +19,7 @@ import type {
 } from './types.js'
 
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = 60_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500
@@ -28,6 +29,9 @@ const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
+
+export type OpenCodeHostLifetime = 'persistent' | 'process'
+
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
   retries: {
     retries: 30,
@@ -50,6 +54,7 @@ type ManagedHostEntry = {
   child: ChildProcess | null
   refCount: number
   ownedByProcess: boolean
+  lifetime: OpenCodeHostLifetime
 }
 
 type FetchJsonResult = {
@@ -258,6 +263,16 @@ function buildLeaseKey(input: OpenCodeHostLeaseInput): string {
   return `${teamId}::${laneId}::${memberName}`
 }
 
+function normalizeOpenCodeHostHealthTimeoutMs(timeoutMs?: number | null): number {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
+    return OPEN_CODE_HOST_HEALTH_TIMEOUT_MS
+  }
+  return Math.min(
+    Math.max(Math.trunc(timeoutMs), 1),
+    OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS,
+  )
+}
+
 export function createOpenCodePreflightHostLeaseInput(scope: string): OpenCodeHostLeaseInput {
   const normalizedScope =
     scope.trim().replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96)
@@ -286,6 +301,21 @@ function unrefChildProcessHandle(child: ChildProcess): void {
   unrefHandle(child.stdout as UnrefableHandle)
   unrefHandle(child.stderr as UnrefableHandle)
   unrefHandle(child.stdin as UnrefableHandle)
+}
+
+export function buildOpenCodeHostSpawnOptions(
+  profile: OpenCodePreparedProfile,
+  platform: NodeJS.Platform = process.platform,
+  options: { lifetime?: OpenCodeHostLifetime } = {},
+): SpawnOptions {
+  const lifetime = options.lifetime ?? 'persistent'
+  return {
+    cwd: profile.projectPath,
+    env: profile.env,
+    detached: lifetime === 'persistent' || platform !== 'win32',
+    stdio: 'ignore',
+    windowsHide: true,
+  }
 }
 
 function normalizePersistentHostLeases(
@@ -333,6 +363,7 @@ export class OpenCodeHostManager {
   private readonly hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
+  private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
 
@@ -588,6 +619,9 @@ export class OpenCodeHostManager {
         if (!entry) {
           return
         }
+        if (entry.lifetime !== 'persistent') {
+          return
+        }
         record = this.buildPersistentHostRecord(entry.handle)
         registry.hosts[hostKey] = record
       }
@@ -718,15 +752,20 @@ export class OpenCodeHostManager {
       child: null,
       refCount: this.pendingRefCounts.get(hostKey) ?? 1,
       ownedByProcess: false,
+      lifetime: 'persistent',
     })
     await this.upsertPersistentHost(handle).catch(() => undefined)
     return handle
   }
 
-  private async waitForHealthyHost(baseUrl: string): Promise<{ version: string | null }> {
+  private async waitForHealthyHost(
+    baseUrl: string,
+    getHealthTimeoutMs: () => number = () => OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
+  ): Promise<{ version: string | null }> {
     const startedAt = this.nowMs()
+    let healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(getHealthTimeoutMs())
 
-    while (this.nowMs() - startedAt < OPEN_CODE_HOST_HEALTH_TIMEOUT_MS) {
+    while (this.nowMs() - startedAt < healthTimeoutMs) {
       try {
         const result = await this.fetchJsonWithTimeout(
           `${baseUrl}/global/health`,
@@ -743,10 +782,11 @@ export class OpenCodeHostManager {
       }
 
       await this.sleepMs(OPEN_CODE_HOST_HEALTH_POLL_MS)
+      healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(getHealthTimeoutMs())
     }
 
     throw new Error(
-      `OpenCode host did not become healthy within ${OPEN_CODE_HOST_HEALTH_TIMEOUT_MS}ms`,
+      `OpenCode host did not become healthy within ${healthTimeoutMs}ms`,
     )
   }
 
@@ -807,6 +847,7 @@ export class OpenCodeHostManager {
   private spawnHost(
     profile: OpenCodePreparedProfile,
     port: number,
+    lifetime: OpenCodeHostLifetime,
   ): ChildProcess {
     if (this.deps.spawnHostProcess) {
       return this.deps.spawnHostProcess(profile, port)
@@ -815,13 +856,7 @@ export class OpenCodeHostManager {
     return spawnPortableCli(
       resolveOpenCodeBinaryPath() ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
-      {
-        cwd: profile.projectPath,
-        env: profile.env,
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      },
+      buildOpenCodeHostSpawnOptions(profile, process.platform, { lifetime }),
     )
   }
 
@@ -886,10 +921,11 @@ export class OpenCodeHostManager {
   private async createHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    lifetime: OpenCodeHostLifetime,
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
-    const child = this.spawnHost(profile, port)
+    const child = this.spawnHost(profile, port, lifetime)
 
     const diagnostics: string[] = []
     const captureOutput = (source: 'stdout' | 'stderr') => (chunk: Buffer | string) => {
@@ -926,17 +962,23 @@ export class OpenCodeHostManager {
       child,
       refCount: this.pendingRefCounts.get(hostKey) ?? 1,
       ownedByProcess: true,
+      lifetime,
     }
     this.hosts.set(hostKey, entry)
     this.bindHostLifecycle(hostKey, entry)
     unrefChildProcessHandle(child)
 
     try {
-      const health = await this.waitForHealthyHost(baseUrl)
+      const health = await this.waitForHealthyHost(
+        baseUrl,
+        () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
+      )
       handle.version = health.version
       handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(baseUrl)
       handle.state = 'healthy'
-      await this.upsertPersistentHost(handle)
+      if (lifetime === 'persistent') {
+        await this.upsertPersistentHost(handle)
+      }
       return handle
     } catch (error) {
       handle.state = 'degraded'
@@ -952,11 +994,21 @@ export class OpenCodeHostManager {
     hostKey?: string | null
     profileOptions?: OpenCodePrepareProfileOptions
     preparedProfile?: OpenCodePreparedProfile
+    healthTimeoutMs?: number | null
+    hostLifetime?: OpenCodeHostLifetime
   } = {}): Promise<OpenCodeHostHandle> {
     const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath, params.profileOptions)
+    const hostLifetime = params.hostLifetime ?? 'persistent'
+    const baseHostKey =
+      `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
     const hostKey =
       params.hostKey?.trim()
-      || `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
+      || (
+        hostLifetime === 'process'
+          ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
+          : baseHostKey
+      )
+    const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const existing = this.hosts.get(hostKey)
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
@@ -971,18 +1023,26 @@ export class OpenCodeHostManager {
       } else {
         this.pendingRefCounts.set(hostKey, (this.pendingRefCounts.get(hostKey) ?? 0) + 1)
       }
+      this.pendingHostHealthTimeoutMs.set(
+        hostKey,
+        Math.max(this.pendingHostHealthTimeoutMs.get(hostKey) ?? 0, healthTimeoutMs),
+      )
       return pending
     }
 
     this.pendingRefCounts.set(hostKey, 1)
+    this.pendingHostHealthTimeoutMs.set(hostKey, healthTimeoutMs)
     const createPromise = (async () => {
       return this.withPersistentHostStartupLock(hostKey, async () => {
-        const adopted = await this.adoptPersistentHost(hostKey, profile)
-        return adopted ?? this.createHost(hostKey, profile)
+        const adopted = hostLifetime === 'persistent'
+          ? await this.adoptPersistentHost(hostKey, profile)
+          : null
+        return adopted ?? this.createHost(hostKey, profile, hostLifetime)
       })
     })().finally(() => {
       this.pendingHosts.delete(hostKey)
       this.pendingRefCounts.delete(hostKey)
+      this.pendingHostHealthTimeoutMs.delete(hostKey)
     })
     this.pendingHosts.set(hostKey, createPromise)
     return createPromise

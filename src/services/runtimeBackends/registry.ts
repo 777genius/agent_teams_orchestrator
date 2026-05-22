@@ -23,9 +23,13 @@ import {
   buildOpenCodeStatusMessage,
 } from '../opencode/OpenCodeDiagnostics.js'
 import {
+  OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
+  createOpenCodeInventoryProbeProgressTracker,
   hasOpenCodeBuiltinFreeModel,
   isOpenCodeModelFree,
   openCodeInventoryService,
+  withOpenCodeInventoryProbeTimeout,
 } from '../opencode/OpenCodeInventoryService.js'
 import {
   buildOpenCodeModelAccessCatalogFromInventorySnapshot,
@@ -417,6 +421,7 @@ type RuntimeStatusRegistryDeps = {
     | null
     | Promise<RuntimeProviderSubscriptionRateLimitSnapshot | null>
   getOpenCodeInventorySnapshot?: () => Promise<OpenCodeInventorySnapshot>
+  openCodeInventoryTimeoutMs?: number
 }
 
 async function buildAnthropicStatus(
@@ -569,12 +574,37 @@ async function buildOpenCodeStatus(
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
 ): Promise<RuntimeProviderStatus> {
   const summary = options.detailLevel === 'summary'
-  const snapshot = deps.getOpenCodeInventorySnapshot
-    ? await deps.getOpenCodeInventorySnapshot()
-    : await openCodeInventoryService.probe(
-        null,
-        summary ? { mode: 'summary', bypassCache: true } : { mode: 'full' },
-      )
+  const timeoutMs =
+    deps.openCodeInventoryTimeoutMs ??
+    (summary ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+  const abortController = new AbortController()
+  const progress = createOpenCodeInventoryProbeProgressTracker()
+  const snapshot = await withOpenCodeInventoryProbeTimeout(
+    deps.getOpenCodeInventorySnapshot
+      ? deps.getOpenCodeInventorySnapshot()
+      : openCodeInventoryService.probe(
+          null,
+          summary
+            ? {
+                mode: 'summary',
+                bypassCache: true,
+                includeAppMcp: false,
+                abortSignal: abortController.signal,
+                progress,
+              }
+            : {
+                mode: 'full',
+                includeAppMcp: false,
+                abortSignal: abortController.signal,
+                progress,
+              },
+        ),
+    {
+      timeoutMs,
+      progress,
+      onTimeout: () => abortController.abort(),
+    },
+  )
   const runtimeModels = snapshot.models
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
   const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(

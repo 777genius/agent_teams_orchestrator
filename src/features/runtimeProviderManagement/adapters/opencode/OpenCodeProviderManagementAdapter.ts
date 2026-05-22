@@ -8,8 +8,12 @@ import {
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
+  OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+  createOpenCodeInventoryProbeProgressTracker,
+  isOpenCodeInventoryTimeoutSnapshot,
   isOpenCodeModelFree,
   openCodeInventoryService,
+  withOpenCodeInventoryProbeTimeout,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
 import {
@@ -80,7 +84,7 @@ import type {
 type OpenCodeInventoryServiceLike = {
   probe(
     projectPath?: string | null,
-    options?: { bypassCache?: boolean },
+    options?: Parameters<typeof openCodeInventoryService.probe>[1],
   ): ReturnType<typeof openCodeInventoryService.probe>
   clearCache?(): void
 }
@@ -139,6 +143,7 @@ type OpenCodeProviderManagementAdapterDeps = {
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
     setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
   }
+  inventoryTimeoutMs?: number
 }
 
 type SafeValue<T> =
@@ -190,6 +195,7 @@ const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -330,6 +336,23 @@ function redactDiagnostics(messages: readonly string[]): string[] {
   return messages.map(redactDiagnostic).filter(Boolean)
 }
 
+function appendViewDiagnostics(
+  view: ProviderManagementView,
+  diagnostics: readonly string[],
+): ProviderManagementView {
+  const appendedDiagnostics = redactDiagnostics(diagnostics)
+  if (appendedDiagnostics.length === 0) {
+    return view
+  }
+  return {
+    ...view,
+    diagnostics: [
+      ...view.diagnostics,
+      ...appendedDiagnostics,
+    ],
+  }
+}
+
 function getProviderDisplayName(providerId: string, entry?: OpenCodeProviderListEntry): string {
   const name = asString(entry?.name)
   return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? providerId
@@ -344,6 +367,10 @@ async function safeRead<T>(read: () => Promise<T>): Promise<SafeValue<T>> {
       message: error instanceof Error ? error.message : String(error),
     }
   }
+}
+
+function safeReadDiagnostics<T>(result: SafeValue<T>): string[] {
+  return 'message' in result ? [result.message] : []
 }
 
 function getConnectedProviderMap(
@@ -367,6 +394,129 @@ function getConnectedProviderMap(
   }
 
   return connected
+}
+
+function addManagedProviderToInventory(
+  inventory: OpenCodeInventorySnapshot,
+  providerId: string,
+): OpenCodeInventorySnapshot {
+  const normalizedProviderId = normalizeProviderId(providerId)
+  if (!normalizedProviderId) {
+    return inventory
+  }
+  const connectedProviders = inventory.connectedProviders
+    .filter(provider => normalizeProviderId(provider.id) !== normalizedProviderId)
+  connectedProviders.push({
+    id: normalizedProviderId,
+    authHint: 'api',
+    source: 'credentials',
+    credentialScopes: ['managed'],
+  })
+  const availableProviders = Array.from(new Set([
+    ...inventory.availableProviders,
+    normalizedProviderId,
+  ])).sort()
+  return {
+    ...inventory,
+    connectedProviders,
+    availableProviders,
+  }
+}
+
+function removeManagedProviderFromInventory(
+  inventory: OpenCodeInventorySnapshot,
+  providerId: string,
+): OpenCodeInventorySnapshot {
+  const normalizedProviderId = normalizeProviderId(providerId)
+  if (!normalizedProviderId) {
+    return inventory
+  }
+  const availableProviders = Array.from(new Set([
+    ...inventory.availableProviders,
+    normalizedProviderId,
+  ])).sort()
+  return {
+    ...inventory,
+    connectedProviders: inventory.connectedProviders.flatMap(provider => {
+      if (normalizeProviderId(provider.id) !== normalizedProviderId) {
+        return [provider]
+      }
+      if (provider.source !== 'credentials') {
+        return [provider]
+      }
+      const remainingScopes = provider.credentialScopes
+        ?.filter(scope => scope === 'local') ?? []
+      return remainingScopes.length > 0
+        ? [{
+            ...provider,
+            credentialScopes: remainingScopes,
+          }]
+        : []
+    }),
+    availableProviders,
+  }
+}
+
+function applyManagedDefaultToInventory(
+  inventory: OpenCodeInventorySnapshot,
+  input: {
+    modelId: string
+    scope: 'project' | 'all_projects'
+  },
+): OpenCodeInventorySnapshot {
+  const profile = inventory.profile
+  if (!profile) {
+    return inventory
+  }
+  const projectDefaultModelId = input.scope === 'project'
+    ? input.modelId
+    : profile.projectDefaultModelId
+  const allProjectsDefaultModelId = input.scope === 'all_projects'
+    ? input.modelId
+    : profile.allProjectsDefaultModelId
+  const effectiveManagedDefaultModelId =
+    projectDefaultModelId ?? allProjectsDefaultModelId ?? null
+  const effectiveManagedDefaultSource =
+    projectDefaultModelId
+      ? 'project' as const
+      : allProjectsDefaultModelId
+        ? 'all_projects' as const
+        : null
+  return {
+    ...inventory,
+    profile: {
+      ...profile,
+      projectDefaultModelId,
+      allProjectsDefaultModelId,
+      effectiveManagedDefaultModelId,
+      effectiveManagedDefaultSource,
+      managedConfig: {
+        ...profile.managedConfig,
+        ...(effectiveManagedDefaultModelId ? { model: effectiveManagedDefaultModelId } : {}),
+      },
+    },
+  }
+}
+
+function useActionRefreshInventory(
+  previousInventory: OpenCodeInventorySnapshot,
+  refreshedInventory: OpenCodeInventorySnapshot,
+  fallback?: (inventory: OpenCodeInventorySnapshot) => OpenCodeInventorySnapshot,
+): {
+  inventory: OpenCodeInventorySnapshot
+  postViewDiagnostics: string[]
+} {
+  if (!isOpenCodeInventoryTimeoutSnapshot(refreshedInventory)) {
+    return {
+      inventory: refreshedInventory,
+      postViewDiagnostics: [],
+    }
+  }
+  const fallbackInventory = fallback?.(previousInventory) ?? previousInventory
+  return {
+    inventory: fallbackInventory,
+    postViewDiagnostics: refreshedInventory.diagnostics,
+  }
 }
 
 function getModelCounts(
@@ -804,6 +954,26 @@ function getOwnership(input: {
   return []
 }
 
+function hasExplicitConnectionEvidence(
+  connectedProvider: OpenCodeConnectedProvider | null | undefined,
+): boolean {
+  return connectedProvider?.source === 'environment' || connectedProvider?.source === 'credentials'
+}
+
+function shouldDisplayProviderAsConnected(input: {
+  connected: boolean
+  connectedProvider: OpenCodeConnectedProvider | null | undefined
+  configuredAuthless: boolean
+}): boolean {
+  if (!input.connected) {
+    return false
+  }
+  if (!input.configuredAuthless) {
+    return true
+  }
+  return hasExplicitConnectionEvidence(input.connectedProvider)
+}
+
 function getConnectedProviderDetail(ownership: readonly ProviderOwnership[]): string {
   if (ownership.includes('env')) {
     return 'Connected via OpenCode environment credential'
@@ -902,6 +1072,7 @@ function getRuntimeState(input: {
   if (!input.inventory.detected) return 'needs-setup'
   if (input.hostStartError) return 'degraded'
   if (input.host && input.host.state !== 'healthy') return 'degraded'
+  if (input.inventory.probeError && input.inventory.models.length === 0) return 'degraded'
   if (input.connectedProviderCount === 0 && input.launchableRouteCount === 0) return 'needs-auth'
   if (input.diagnostics.length > 0 && input.inventory.models.length === 0) return 'degraded'
   return 'ready'
@@ -1081,25 +1252,30 @@ function buildProviderConnections(input: {
   const connections: ProviderConnection[] = []
   for (const providerId of providerIds) {
     const connectedProvider = connectedProviders.get(providerId)
-    const connected = connectedProviders.has(providerId)
     const modelCount = modelCounts.get(providerId) ?? 0
     const authMethods = normalizeAuthMethods(input.providerAuth?.[providerId])
-    const ownership = getOwnership({
-      connected,
-      connectedProvider,
-      inventory: input.inventory,
-    })
-    const state: ProviderConnection['state'] = connected
-      ? 'connected'
-      : modelCount > 0
-        ? 'available'
-        : 'not-connected'
+    const connected = connectedProviders.has(providerId)
     const configuredAuthless = providerHasConfiguredAuthlessModels({
       providerId,
       inventory: input.inventory,
       configProviders: input.configProviders,
       providers: input.providers,
     })
+    const displayConnected = shouldDisplayProviderAsConnected({
+      connected,
+      connectedProvider,
+      configuredAuthless,
+    })
+    const ownership = getOwnership({
+      connected: displayConnected,
+      connectedProvider,
+      inventory: input.inventory,
+    })
+    const state: ProviderConnection['state'] = displayConnected
+      ? 'connected'
+      : modelCount > 0
+        ? 'available'
+        : 'not-connected'
 
     connections.push({
       providerId,
@@ -1117,14 +1293,14 @@ function buildProviderConnections(input: {
       authMethods,
       actions: buildProviderActions({
         providerId,
-        connected,
+        connected: displayConnected,
         modelCount,
         authMethods,
         ownership,
         capabilities: input.capabilities,
         configuredAuthless,
       }),
-      detail: connected
+      detail: displayConnected
         ? getConnectedProviderDetail(ownership)
         : configuredAuthless && modelCount > 0
           ? 'Configured local OpenCode model route is available'
@@ -1404,21 +1580,32 @@ function buildProviderDirectory(input: {
   for (const providerId of providerIds) {
     const entry = entries.get(providerId)
     const connectedProvider = connectedProviders.get(providerId)
-    const connected = connectedProviders.has(providerId)
     const modelCount = modelCounts.has(providerId) ? modelCounts.get(providerId)! : null
     const authMethods = normalizeAuthMethods(input.providerAuth?.[providerId])
-    const ownership = getOwnership({
+    const connected = connectedProviders.has(providerId)
+    const configuredAuthless = providerHasConfiguredAuthlessModels({
+      providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
+    const displayConnected = shouldDisplayProviderAsConnected({
       connected,
+      connectedProvider,
+      configuredAuthless,
+    })
+    const ownership = getOwnership({
+      connected: displayConnected,
       connectedProvider,
       inventory: input.inventory,
     })
     const setupKind = getProviderSetupKind({
-      connected,
+      connected: displayConnected,
       providerId,
       modelCount,
       authMethods,
     })
-    const state: ProviderConnection['state'] = connected
+    const state: ProviderConnection['state'] = displayConnected
       ? 'connected'
       : modelCount !== null && modelCount > 0
         ? 'available'
@@ -1430,12 +1617,6 @@ function buildProviderDirectory(input: {
       providers: input.providers,
     })
     const modelIds = collectProviderModelIds({
-      providerId,
-      inventory: input.inventory,
-      configProviders: input.configProviders,
-      providers: input.providers,
-    })
-    const configuredAuthless = providerHasConfiguredAuthlessModels({
       providerId,
       inventory: input.inventory,
       configProviders: input.configProviders,
@@ -1460,7 +1641,7 @@ function buildProviderDirectory(input: {
       sourceLabel: getProviderSourceLabel(sources),
       providerSource: getProviderSourceValue(entry),
       detail: getProviderDirectoryDetail({
-        connected,
+        connected: displayConnected,
         setupKind,
         modelCount,
         configuredAuthless,
@@ -1468,7 +1649,7 @@ function buildProviderDirectory(input: {
       }),
       actions: buildProviderDirectoryActions({
         providerId,
-        connected,
+        connected: displayConnected,
         modelCount,
         authMethods,
         ownership,
@@ -1645,10 +1826,10 @@ async function readLiveView(input: {
 
   const diagnostics = [
     ...(input.diagnostics ?? []),
-    ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
-    ...(providersResult.ok ? [] : [providersResult.message]),
-    ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
-    ...(serverDocResult.ok ? [] : [serverDocResult.message]),
+    ...safeReadDiagnostics(configProvidersResult),
+    ...safeReadDiagnostics(providersResult),
+    ...safeReadDiagnostics(providerAuthResult),
+    ...safeReadDiagnostics(serverDocResult),
   ]
 
   return buildView({
@@ -2015,6 +2196,29 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     this.directoryCache.clear()
   }
 
+  private async probeInventory(
+    inventoryService: OpenCodeInventoryServiceLike,
+    projectPath?: string | null,
+    options?: Parameters<typeof openCodeInventoryService.probe>[1],
+  ): Promise<OpenCodeInventorySnapshot> {
+    const abortController = new AbortController()
+    const progress = createOpenCodeInventoryProbeProgressTracker()
+    return withOpenCodeInventoryProbeTimeout(
+      inventoryService.probe(projectPath, {
+        ...options,
+        includeAppMcp: false,
+        abortSignal: abortController.signal,
+        progress,
+      }),
+      {
+        projectPath,
+        timeoutMs: this.deps.inventoryTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+        progress,
+        onTimeout: () => abortController.abort(),
+      },
+    )
+  }
+
   private getAuthStore() {
     const configured = this.deps.authStore
     return {
@@ -2105,12 +2309,18 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe(projectPath)
+    const inventory = await this.probeInventory(inventoryService, projectPath)
 
     if (!inventory.detected) {
       return providerManagementError(
         'runtime-missing',
         'OpenCode CLI not detected on PATH',
+      )
+    }
+    if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        inventory.probeError ?? 'OpenCode inventory probe timed out',
       )
     }
 
@@ -2119,7 +2329,10 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     let host: OpenCodeHostHandle | null = null
 
     try {
-      host = await hostManager.ensureHost({ projectPath: inventory.projectPath })
+      host = await hostManager.ensureHost({
+        projectPath: inventory.projectPath,
+        hostLifetime: 'process',
+      })
       const client = clientFactory.create(host.baseUrl)
       return await run({ inventory, inventoryService, host, client })
     } catch (error) {
@@ -2151,9 +2364,22 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe(request.projectPath)
+    const inventory = await this.probeInventory(inventoryService, request.projectPath)
 
     if (!inventory.detected) {
+      return {
+        ok: true,
+        value: buildView({
+          inventory,
+          host: null,
+          configProviders: null,
+          providers: null,
+          providerAuth: null,
+          diagnostics: inventory.diagnostics,
+        }),
+      }
+    }
+    if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
       return {
         ok: true,
         value: buildView({
@@ -2172,7 +2398,15 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     let host: OpenCodeHostHandle | null = null
 
     try {
-      host = await hostManager.ensureHost({ projectPath: inventory.projectPath })
+      host = await hostManager.ensureHost({
+        projectPath: inventory.projectPath,
+        preparedProfile: inventory.profile ?? undefined,
+        profileOptions: {
+          includeAppMcp: false,
+        },
+        hostLifetime: 'process',
+        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+      })
       const client = clientFactory.create(host.baseUrl)
 
       return {
@@ -2217,9 +2451,25 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await inventoryService.probe(input.projectPath)
+    const inventory = await this.probeInventory(inventoryService, input.projectPath)
 
     if (!inventory.detected) {
+      return {
+        ok: true,
+        value: buildProviderDirectory({
+          inventory,
+          configProviders: null,
+          providers: null,
+          providerAuth: null,
+          diagnostics: inventory.diagnostics,
+          query: input.query,
+          filter: input.filter,
+          limit: input.limit,
+          cursor: input.cursor,
+        }),
+      }
+    }
+    if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
       return {
         ok: true,
         value: buildProviderDirectory({
@@ -2241,7 +2491,15 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     let host: OpenCodeHostHandle | null = null
 
     try {
-      host = await hostManager.ensureHost({ projectPath: inventory.projectPath })
+      host = await hostManager.ensureHost({
+        projectPath: inventory.projectPath,
+        preparedProfile: inventory.profile ?? undefined,
+        profileOptions: {
+          includeAppMcp: false,
+        },
+        hostLifetime: 'process',
+        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+      })
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
@@ -2281,10 +2539,10 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       ])
       const diagnostics = [
         ...inventory.diagnostics,
-        ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
-        ...(providersResult.ok ? [] : [providersResult.message]),
-        ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
-        ...(serverDocResult.ok ? [] : [serverDocResult.message]),
+        ...safeReadDiagnostics(configProvidersResult),
+        ...safeReadDiagnostics(providersResult),
+        ...safeReadDiagnostics(providerAuthResult),
+        ...safeReadDiagnostics(serverDocResult),
       ]
       const directorySource = {
         inventory,
@@ -2404,8 +2662,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         ])
         const diagnostics = [
           ...inventory.diagnostics,
-          ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
-          ...(providersResult.ok ? [] : [providersResult.message]),
+          ...safeReadDiagnostics(configProvidersResult),
+          ...safeReadDiagnostics(providersResult),
         ]
         const modelsView = buildProviderModelsView({
           providerId,
@@ -2572,10 +2830,10 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           client,
           diagnostics: [
             ...inventory.diagnostics,
-            ...(configProvidersResult.ok ? [] : [configProvidersResult.message]),
-            ...(providersResult.ok ? [] : [providersResult.message]),
-            ...(providerAuthResult.ok ? [] : [providerAuthResult.message]),
-            ...(serverDocResult.ok ? [] : [serverDocResult.message]),
+            ...safeReadDiagnostics(configProvidersResult),
+            ...safeReadDiagnostics(providersResult),
+            ...safeReadDiagnostics(providerAuthResult),
+            ...safeReadDiagnostics(serverDocResult),
           ],
         })
         const providerEvidence = findProviderConnection(providerEvidenceView, providerId)
@@ -2624,16 +2882,25 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
         this.invalidateDirectoryCache()
-        const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
+        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
           bypassCache: true,
         })
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
+        )
         const view = await readLiveView({
-          inventory: refreshedInventory,
+          inventory: refresh.inventory,
           host,
           client,
-          diagnostics: refreshedInventory.diagnostics,
+          diagnostics: refresh.inventory.diagnostics,
         })
-        const provider = findProviderConnection(view, providerId)
+        const viewWithRefreshDiagnostics = appendViewDiagnostics(
+          view,
+          refresh.postViewDiagnostics,
+        )
+        const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           await this.rollbackProviderAuth({
             client,
@@ -2707,16 +2974,36 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           await authStore.removeCredential({ authPath, providerId })
         }
         this.invalidateDirectoryCache()
-        const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
+        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
           bypassCache: true,
         })
-        const view = await readLiveView({
-          inventory: refreshedInventory,
-          host,
-          client,
-          diagnostics: refreshedInventory.diagnostics,
-        })
-        const provider = findProviderConnection(view, providerId)
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => removeManagedProviderFromInventory(fallbackInventory, providerId),
+        )
+        const viewWithRefreshDiagnostics = refresh.postViewDiagnostics.length > 0
+          ? buildView({
+              inventory: refresh.inventory,
+              host,
+              configProviders: null,
+              providers: null,
+              providerAuth: null,
+              diagnostics: [
+                ...refresh.inventory.diagnostics,
+                ...redactDiagnostics(refresh.postViewDiagnostics),
+              ],
+            })
+          : appendViewDiagnostics(
+              await readLiveView({
+                inventory: refresh.inventory,
+                host,
+                client,
+                diagnostics: refresh.inventory.diagnostics,
+              }),
+              refresh.postViewDiagnostics,
+            )
+        const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           return providerManagementError(
             'provider-missing',
@@ -2847,17 +3134,26 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         this.invalidateDirectoryCache()
         inventoryService.clearCache?.()
 
-        const refreshedInventory = await inventoryService.probe(inventory.projectPath, {
+        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
           bypassCache: true,
+        })
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => applyManagedDefaultToInventory(fallbackInventory, {
+            modelId,
+            scope,
+          }),
+        )
+        const view = await readLiveView({
+          inventory: refresh.inventory,
+          host,
+          client,
+          diagnostics: refresh.inventory.diagnostics,
         })
         return {
           ok: true,
-          value: await readLiveView({
-            inventory: refreshedInventory,
-            host,
-            client,
-            diagnostics: refreshedInventory.diagnostics,
-          }),
+          value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
         }
       },
       { failureCode: 'model-test-failed' },

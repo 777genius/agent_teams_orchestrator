@@ -2,7 +2,15 @@ import { describe, expect, test } from 'bun:test'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
 
-import type { OpenCodeHostHandle, OpenCodeInventorySnapshot } from '../../../../services/opencode/types.js'
+import type {
+  OpenCodeExecutionProbeResult,
+  OpenCodeHostHandle,
+  OpenCodeInventorySnapshot,
+} from '../../../../services/opencode/types.js'
+import type {
+  ProviderManagementError,
+  ProviderManagementResult,
+} from '../../domain/types.js'
 
 function inventory(
   overrides: Partial<OpenCodeInventorySnapshot> = {},
@@ -78,11 +86,19 @@ function authStore() {
   }
 }
 
+function expectFailure<T>(result: ProviderManagementResult<T>): ProviderManagementError {
+  expect(result.ok).toBe(false)
+  if ('error' in result) {
+    return result.error
+  }
+  throw new Error('Expected provider management failure')
+}
+
 function executionProbeResult(
   modelId: string,
   outcome: 'available' | 'unavailable' | 'not_authenticated' | 'unknown' = 'available',
   reason: string | null = null,
-) {
+): OpenCodeExecutionProbeResult {
   return {
     providerId: 'opencode',
     modelId,
@@ -138,6 +154,219 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'opencode',
       'atlascloud',
     ])
+  })
+
+  test('returns degraded provider management data when OpenCode inventory probing stalls', async () => {
+    const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+    let ensureHostCalled = false
+    const probeOptions: Array<{ includeAppMcp?: boolean; abortSignal?: AbortSignal }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryTimeoutMs: 1,
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          probeOptions.push(options ?? {})
+          return new Promise(() => {})
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalled = true
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+    })
+
+    try {
+      const viewResult = await adapter.loadView({
+        runtimeId: 'opencode',
+        projectPath: '/tmp/project',
+      })
+      const directoryResult = await adapter.loadDirectory({
+        runtimeId: 'opencode',
+        projectPath: '/tmp/project',
+        query: null,
+        filter: 'all',
+        limit: 50,
+        cursor: null,
+        refresh: false,
+      })
+
+      expect(ensureHostCalled).toBe(false)
+      expect(probeOptions).toHaveLength(2)
+      expect(probeOptions.every(options => options.includeAppMcp === false)).toBe(true)
+      expect(probeOptions.every(options => options.abortSignal?.aborted === true)).toBe(true)
+      expect(viewResult.ok).toBe(true)
+      expect(directoryResult.ok).toBe(true)
+      if (!viewResult.ok || !directoryResult.ok) return
+      expect(viewResult.value.runtime.state).toBe('degraded')
+      expect(viewResult.value.diagnostics).toContain('OpenCode inventory probe timed out after 1ms')
+      expect(directoryResult.value.diagnostics).toContain('OpenCode inventory probe timed out after 1ms')
+    } finally {
+      if (originalBinaryPath === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      } else {
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = originalBinaryPath
+      }
+    }
+  })
+
+  test('does not run provider writes when OpenCode inventory probing stalls', async () => {
+    const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+    let ensureHostCalled = false
+    let setProviderAuthCalled = false
+    let authWriteCalled = false
+    const probeOptions: Array<{ includeAppMcp?: boolean; abortSignal?: AbortSignal }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryTimeoutMs: 1,
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          probeOptions.push(options ?? {})
+          return new Promise(() => {})
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalled = true
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async () => {
+            setProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async () => {
+          authWriteCalled = true
+        },
+        removeCredential: async () => {},
+      },
+    })
+
+    try {
+      const result = await adapter.connectProvider({
+        runtimeId: 'opencode',
+        providerId: 'openrouter',
+        method: 'api',
+        apiKey: 'sk-test-secret',
+        metadata: {},
+      })
+
+      const failure = expectFailure(result)
+      expect(failure.code).toBe('runtime-unhealthy')
+      expect(failure.message).toBe('OpenCode inventory probe timed out after 1ms')
+      expect(ensureHostCalled).toBe(false)
+      expect(setProviderAuthCalled).toBe(false)
+      expect(authWriteCalled).toBe(false)
+      expect(probeOptions).toHaveLength(1)
+      expect(probeOptions[0]?.includeAppMcp).toBe(false)
+      expect(probeOptions[0]?.abortSignal?.aborted).toBe(true)
+    } finally {
+      if (originalBinaryPath === undefined) {
+        delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      } else {
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = originalBinaryPath
+      }
+    }
+  })
+
+  test('uses a bounded host startup budget only for read-only provider management views', async () => {
+    const ensureHostCalls: Array<{
+      projectPath?: string | null
+      healthTimeoutMs?: number | null
+      hostLifetime?: string
+      preparedProfile?: unknown
+      profileOptions?: { includeAppMcp?: boolean }
+    }> = []
+    const releasedHosts: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory(),
+      },
+      hostManager: {
+        ensureHost: async (params) => {
+          ensureHostCalls.push(params ?? {})
+          return host()
+        },
+        releaseHost: async (hostKey) => {
+          releasedHosts.push(hostKey)
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'openai', name: 'OpenAI', models: { 'gpt-5.4-mini': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openai', name: 'OpenAI', models: { 'gpt-5.4-mini': {} } }],
+            connected: ['openai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openai: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const viewResult = await adapter.loadView('opencode')
+    const directoryResult = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: null,
+      filter: 'all',
+      limit: 50,
+      cursor: null,
+      refresh: true,
+    })
+    const modelsResult = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'openai',
+      query: null,
+      limit: 50,
+    })
+
+    expect(viewResult.ok).toBe(true)
+    expect(directoryResult.ok).toBe(true)
+    expect(modelsResult.ok).toBe(true)
+    expect(ensureHostCalls.map(call => ({
+      projectPath: call.projectPath,
+      hostLifetime: call.hostLifetime,
+      healthTimeoutMs: call.healthTimeoutMs,
+      preparedProfile: Boolean(call.preparedProfile),
+      includeAppMcp: call.profileOptions?.includeAppMcp,
+    }))).toEqual([
+      {
+        projectPath: '/tmp/project',
+        hostLifetime: 'process',
+        healthTimeoutMs: 10_000,
+        preparedProfile: true,
+        includeAppMcp: false,
+      },
+      {
+        projectPath: '/tmp/project',
+        hostLifetime: 'process',
+        healthTimeoutMs: 10_000,
+        preparedProfile: true,
+        includeAppMcp: false,
+      },
+      {
+        projectPath: '/tmp/project',
+        hostLifetime: 'process',
+        healthTimeoutMs: undefined,
+        preparedProfile: false,
+        includeAppMcp: undefined,
+      },
+    ])
+    expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
   })
 
   test('normalizes OpenCode provider catalog into the feature view model', async () => {
@@ -731,9 +960,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('unsupported-auth-method')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('unsupported-auth-method')
     expect(setProviderAuthCalled).toBe(false)
     expect(authWrites).toEqual([])
   })
@@ -987,10 +1215,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       metadata: {},
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('auth-failed')
-    expect(result.error.message).not.toContain('sk-test-secret')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
+    expect(failure.message).not.toContain('sk-test-secret')
     expect(deleteCalled).toBe(true)
     expect(removedAuthPaths).toEqual([
       '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
@@ -1171,6 +1398,79 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('keeps a successful connect when post-write inventory refresh times out', async () => {
+    const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
+    const removedCredentials: Array<{ authPath: string; providerId: string }> = []
+    let probeCallCount = 0
+    let authApplied = false
+    const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCallCount += 1
+          if (probeCallCount > 1) {
+            return inventory({
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              profile: null,
+              probeError: timeoutMessage,
+              diagnostics: [timeoutMessage],
+            })
+          }
+          return inventory({
+            connectedProviders: [],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/moonshotai/kimi-k2:free'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: authApplied ? ['openrouter'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          setProviderAuth: async () => {
+            authApplied = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async input => {
+          authWrites.push(input)
+        },
+        removeCredential: async input => {
+          removedCredentials.push(input)
+        },
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      apiKey: 'sk-test-secret',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(authWrites).toHaveLength(2)
+    expect(removedCredentials).toEqual([])
+    expect(result.value).toMatchObject({
+      providerId: 'openrouter',
+      state: 'connected',
+      ownership: ['managed'],
+    })
+  })
+
   test('refuses API-key connect when the app-owned global auth path is unavailable', async () => {
     let setProviderAuthCalled = false
     const authWrites: Array<{ authPath: string; providerId: string; apiKey: string }> = []
@@ -1216,10 +1516,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('runtime-unhealthy')
-    expect(result.error.message).toContain('global auth store path')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('runtime-unhealthy')
+    expect(failure.message).toContain('global auth store path')
     expect(setProviderAuthCalled).toBe(false)
     expect(authWrites).toEqual([])
   })
@@ -1259,11 +1558,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('auth-failed')
-    expect(result.error.message).toContain('[redacted]')
-    expect(result.error.message).not.toContain('sk-test-secret')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
+    expect(failure.message).toContain('[redacted]')
+    expect(failure.message).not.toContain('sk-test-secret')
   })
 
   test('treats false OpenCode auth writes as connect failures', async () => {
@@ -1299,10 +1597,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('auth-failed')
-    expect(result.error.message).not.toContain('sk-test-secret')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
+    expect(failure.message).not.toContain('sk-test-secret')
   })
 
   test('rejects seeded curated providers absent from the live catalog before OpenCode auth writes', async () => {
@@ -1344,9 +1641,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('provider-missing')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('provider-missing')
     expect(setProviderAuthCalled).toBe(false)
     expect(authWrites).toEqual([])
   })
@@ -1397,10 +1693,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('auth-failed')
-    expect(result.error.message).not.toContain('sk-test-secret')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
+    expect(failure.message).not.toContain('sk-test-secret')
     expect(deleteCalled).toBe(true)
     expect(authWrites).toEqual([])
   })
@@ -1455,9 +1750,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: 'sk-test-secret',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('auth-failed')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
     expect(deleteCalled).toBe(true)
     expect(authWrites).toEqual([])
   })
@@ -1491,9 +1785,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       providerId: 'openai',
     })
 
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('unsupported-action')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('unsupported-action')
     expect(deleteCalled).toBe(false)
   })
 
@@ -1560,6 +1853,163 @@ describe('OpenCodeProviderManagementAdapter', () => {
       '/tmp/profile/data/opencode/auth.json',
       '/tmp/other-profile/data/opencode/auth.json',
     ])
+  })
+
+  test('keeps a successful forget when post-delete inventory refresh times out', async () => {
+    const removedAuthPaths: string[] = []
+    let probeCallCount = 0
+    let deleteCalled = false
+    const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCallCount += 1
+          if (probeCallCount > 1) {
+            return inventory({
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              profile: null,
+              probeError: timeoutMessage,
+              diagnostics: [timeoutMessage],
+            })
+          }
+          return inventory({
+            connectedProviders: [{
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed'],
+            }],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/moonshotai/kimi-k2:free'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          deleteProviderAuth: async () => {
+            deleteCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiKey: async () => {},
+        removeCredential: async input => {
+          removedAuthPaths.push(input.authPath)
+        },
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+      },
+    })
+
+    const result = await adapter.forgetManagedCredential({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(deleteCalled).toBe(true)
+    expect(removedAuthPaths).toEqual([
+      '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+      '/tmp/profile/data/opencode/auth.json',
+    ])
+    expect(result.value).toMatchObject({
+      providerId: 'openrouter',
+      state: 'available',
+      ownership: [],
+    })
+  })
+
+  test('preserves local OpenCode auth when managed forget refresh times out', async () => {
+    const removedAuthPaths: string[] = []
+    let probeCallCount = 0
+    const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCallCount += 1
+          if (probeCallCount > 1) {
+            return inventory({
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              profile: null,
+              probeError: timeoutMessage,
+              diagnostics: [timeoutMessage],
+            })
+          }
+          return inventory({
+            connectedProviders: [{
+              id: 'openrouter',
+              authHint: 'api',
+              source: 'credentials',
+              credentialScopes: ['managed', 'local'],
+            }],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/moonshotai/kimi-k2:free'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          deleteProviderAuth: async () => true,
+        }),
+      },
+      authStore: {
+        upsertApiKey: async () => {},
+        removeCredential: async input => {
+          removedAuthPaths.push(input.authPath)
+        },
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+      },
+    })
+
+    const result = await adapter.forgetManagedCredential({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(removedAuthPaths).toEqual([
+      '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+      '/tmp/profile/data/opencode/auth.json',
+    ])
+    expect(result.value).toMatchObject({
+      providerId: 'openrouter',
+      state: 'connected',
+      ownership: ['local'],
+    })
   })
 
   test('marks the runtime degraded when the managed host cannot start', async () => {
@@ -1765,7 +2215,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           }),
           getProviders: async () => ({
             all: [],
-            connected: [],
+            connected: ['ollama'],
             default: {},
           }),
           getProviderAuth: async () => ({}),
@@ -1790,6 +2240,140 @@ describe('OpenCodeProviderManagementAdapter', () => {
       proofState: 'needs_probe',
       requiresExecutionProof: true,
       availability: 'untested',
+    })
+  })
+
+  test('surfaces configured Ollama Cloud models as launchable authless routes', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: [],
+          models: [],
+          profile: {
+            ...inventory().profile!,
+            managedConfig: {
+              model: 'ollama/kimi-k2.6:cloud',
+              provider: {
+                ollama: {
+                  models: {
+                    'kimi-k2.6:cloud': {
+                      limit: {
+                        context: 262_144,
+                        output: 262_144,
+                      },
+                      attachment: true,
+                      modalities: {
+                        input: ['text', 'image'],
+                        output: ['text'],
+                      },
+                      name: 'kimi-k2.6:cloud',
+                    },
+                  },
+                },
+              },
+            },
+          },
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'ollama',
+                name: 'Ollama',
+                models: {
+                  'kimi-k2.6:cloud': {
+                    limit: {
+                      context: 262_144,
+                      output: 262_144,
+                    },
+                    attachment: true,
+                    modalities: {
+                      input: ['text', 'image'],
+                      output: ['text'],
+                    },
+                    name: 'kimi-k2.6:cloud',
+                  },
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const viewResult = await adapter.loadView('opencode')
+    const directoryResult = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'ollama',
+      limit: 10,
+    })
+    const modelsResult = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'ollama',
+      query: 'kimi',
+      limit: 10,
+    })
+
+    expect(viewResult.ok).toBe(true)
+    expect(directoryResult.ok).toBe(true)
+    expect(modelsResult.ok).toBe(true)
+    if (!viewResult.ok || !directoryResult.ok || !modelsResult.ok) return
+
+    expect(viewResult.value.defaultModel).toBe('ollama/kimi-k2.6:cloud')
+    expect(viewResult.value.configuredModels.map(model => model.modelId)).toContain(
+      'ollama/kimi-k2.6:cloud',
+    )
+    expect(viewResult.value.providers.find(provider => provider.providerId === 'ollama')).toMatchObject({
+      state: 'available',
+      ownership: [],
+      detail: 'Configured local OpenCode model route is available',
+    })
+    expect(
+      viewResult.value.providers
+        .find(provider => provider.providerId === 'ollama')
+        ?.actions.map(action => action.id),
+    ).toEqual(['use', 'test', 'set-default'])
+    expect(directoryResult.value.entries[0]).toMatchObject({
+      providerId: 'ollama',
+      displayName: 'Ollama',
+      state: 'available',
+      ownership: [],
+      setupKind: 'available-readonly',
+      detail: 'Configured local OpenCode model route is available',
+      metadata: {
+        configuredAuthless: true,
+      },
+    })
+    expect(directoryResult.value.entries[0]?.actions.map(action => action.id)).toEqual([
+      'use',
+      'test',
+      'set-default',
+    ])
+    expect(modelsResult.value.models).toHaveLength(1)
+    expect(modelsResult.value.models[0]).toMatchObject({
+      modelId: 'ollama/kimi-k2.6:cloud',
+      providerId: 'ollama',
+      displayName: 'kimi-k2.6:cloud',
+      sourceLabel: 'Ollama',
+      default: true,
+      routeKind: 'configured_local',
+      accessKind: 'configured_authless',
+      proofState: 'needs_probe',
+      requiresExecutionProof: true,
     })
   })
 
@@ -1989,6 +2573,100 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(
       result.value.providers.find(provider => provider.providerId === 'openrouter')?.defaultModelId,
     ).toBe('openrouter/openai/gpt-oss-20b:free')
+  })
+
+  test('keeps a successful default update when post-write inventory refresh times out', async () => {
+    const writes: Array<{ profileRootPath: string; modelId: string }> = []
+    let probeCallCount = 0
+    const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCallCount += 1
+          if (probeCallCount > 1) {
+            return inventory({
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              profile: null,
+              probeError: timeoutMessage,
+              diagnostics: [timeoutMessage],
+            })
+          }
+          return inventory({
+            connectedProviders: [
+              {
+                id: 'openrouter',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/old-model', 'openrouter/new-model'],
+            profile: {
+              ...inventory().profile!,
+              projectDefaultModelId: 'openrouter/old-model',
+              effectiveManagedDefaultModelId: 'openrouter/old-model',
+              effectiveManagedDefaultSource: 'project',
+              managedConfig: { model: 'openrouter/old-model' },
+            },
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'old-model': {},
+                  'new-model': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'openrouter', name: 'OpenRouter' }],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+      managedPreferences: {
+        setDefaultModel: async (profileRootPath, modelId) => {
+          writes.push({ profileRootPath, modelId })
+        },
+      },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      modelId: 'openrouter/new-model',
+      probe: false,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(writes).toEqual([
+      {
+        profileRootPath: '/tmp/profile',
+        modelId: 'openrouter/new-model',
+      },
+    ])
+    expect(result.value.runtime.state).toBe('ready')
+    expect(result.value.projectDefaultModel).toBe('openrouter/new-model')
+    expect(result.value.defaultModel).toBe('openrouter/new-model')
+    expect(result.value.diagnostics).toContain(timeoutMessage)
   })
 
   test('sets all-projects default without writing project preferences', async () => {
@@ -2353,10 +3031,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       probe: false,
     })
 
-    expect(result.ok).toBe(false)
     expect(wrote).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('model-test-failed')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('model-test-failed')
   })
 
   test('invalidates the provider directory cache after changing the default model', async () => {
@@ -2588,9 +3265,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       probe: true,
     })
 
-    expect(result.ok).toBe(false)
     expect(wrote).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('model-test-failed')
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('model-test-failed')
   })
 })

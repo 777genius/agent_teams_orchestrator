@@ -1,8 +1,9 @@
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
 
-import { execFileNoThrowWithCwd } from '../../utils/execFileNoThrow.js'
 import { getCwd } from '../../utils/cwd.js'
+import { killProcessTree } from '../../utils/processKill.js'
+import { spawnPortableCli } from '../../utils/portableCli.js'
 import {
   normalizeOpenCodeProviderId,
   parseFirstOpenCodeModelToken,
@@ -19,10 +20,14 @@ import type {
   OpenCodeInventorySnapshot,
   OpenCodeModelMetadata,
   OpenCodePreparedProfile,
+  OpenCodeToolApprovalMode,
 } from './types.js'
 
 const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
+export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
+export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = 12_000
 const OPEN_CODE_CACHE_TTL_MS = 10_000
+const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
 
 type OpenCodeInventoryProbeMode = 'full' | 'summary'
 
@@ -30,13 +35,69 @@ type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
   mode?: OpenCodeInventoryProbeMode
   includeAppMcp?: boolean
+  toolApprovalMode?: OpenCodeToolApprovalMode
+  abortSignal?: AbortSignal
+  progress?: OpenCodeInventoryProbeProgressTracker
 }
 
-type OpenCodeCommandResult = {
+export type OpenCodeCommandResult = {
   stdout: string
   stderr: string
   code: number
   error?: string
+}
+
+export type OpenCodeInventoryProbeProgressSnapshot = {
+  elapsedMs: number
+  currentStep: string | null
+  currentStepElapsedMs: number | null
+  completedSteps: Array<{
+    label: string
+    durationMs: number
+  }>
+}
+
+export type OpenCodeInventoryProbeProgressTracker = {
+  enterStep(label: string): () => void
+  snapshot(): OpenCodeInventoryProbeProgressSnapshot
+}
+
+export function createOpenCodeInventoryProbeProgressTracker(
+  now: () => number = () => Date.now(),
+): OpenCodeInventoryProbeProgressTracker {
+  const startedAtMs = now()
+  const completedSteps: OpenCodeInventoryProbeProgressSnapshot['completedSteps'] = []
+  let currentStep: { label: string; startedAtMs: number } | null = null
+
+  return {
+    enterStep(label: string): () => void {
+      const step = { label, startedAtMs: now() }
+      currentStep = step
+      let active = true
+      return () => {
+        if (!active || currentStep !== step) {
+          return
+        }
+        active = false
+        completedSteps.push({
+          label,
+          durationMs: Math.max(0, now() - step.startedAtMs),
+        })
+        currentStep = null
+      }
+    },
+    snapshot(): OpenCodeInventoryProbeProgressSnapshot {
+      const elapsedMs = Math.max(0, now() - startedAtMs)
+      return {
+        elapsedMs,
+        currentStep: currentStep?.label ?? null,
+        currentStepElapsedMs: currentStep
+          ? Math.max(0, now() - currentStep.startedAtMs)
+          : null,
+        completedSteps: completedSteps.slice(-6),
+      }
+    },
+  }
 }
 
 type OpenCodeInventoryCommandResults = {
@@ -113,6 +174,106 @@ const EMPTY_OPEN_CODE_COMMAND_RESULT: OpenCodeCommandResult = {
   code: 0,
 }
 
+function stripOneFinalNewline(value: string): string {
+  return value.replace(/\r?\n$/, '')
+}
+
+export function execOpenCodePortableCommand(input: {
+  binaryPath: string
+  args: string[]
+  profile: OpenCodePreparedProfile
+  abortSignal?: AbortSignal
+  timeoutMs?: number
+}): Promise<OpenCodeCommandResult> {
+  return new Promise(resolve => {
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let settled = false
+    let child: ReturnType<typeof spawnPortableCli> | null = null
+    const timeoutMs = input.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS
+
+    const finish = (result: OpenCodeCommandResult): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timeout)
+      input.abortSignal?.removeEventListener('abort', abort)
+      resolve({
+        ...result,
+        stdout: stripOneFinalNewline(result.stdout),
+        stderr: stripOneFinalNewline(result.stderr),
+      })
+    }
+
+    const snapshotOutput = (): Pick<OpenCodeCommandResult, 'stdout' | 'stderr'> => ({
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+    })
+
+    const abort = (): void => {
+      if (child) {
+        killProcessTree(child.pid, 'SIGKILL')
+      }
+      finish({
+        ...snapshotOutput(),
+        code: 1,
+        error: 'OpenCode command aborted',
+      })
+    }
+
+    const timeout = setTimeout(() => {
+      if (child) {
+        killProcessTree(child.pid, 'SIGKILL')
+      }
+      finish({
+        ...snapshotOutput(),
+        code: 1,
+        error: `OpenCode command timed out after ${timeoutMs}ms`,
+      })
+    }, timeoutMs)
+
+    if (input.abortSignal?.aborted) {
+      abort()
+      return
+    }
+    input.abortSignal?.addEventListener('abort', abort, { once: true })
+
+    try {
+      child = spawnPortableCli(input.binaryPath, input.args, {
+        cwd: input.profile.projectPath,
+        env: input.profile.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+    } catch (error) {
+      finish({
+        ...snapshotOutput(),
+        code: 1,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
+    }
+
+    child.stdout?.on('data', chunk => stdout.push(Buffer.from(chunk)))
+    child.stderr?.on('data', chunk => stderr.push(Buffer.from(chunk)))
+    child.once('error', error => {
+      finish({
+        ...snapshotOutput(),
+        code: 1,
+        error: error.message,
+      })
+    })
+    child.once('close', (code, signal) => {
+      finish({
+        ...snapshotOutput(),
+        code: code ?? 1,
+        ...(signal ? { error: signal } : {}),
+      })
+    })
+  })
+}
+
 export async function collectOpenCodeInventoryCommandResults(input: {
   mode: OpenCodeInventoryProbeMode
   execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
@@ -131,6 +292,95 @@ export async function collectOpenCodeInventoryCommandResults(input: {
     providersResult,
     modelsResult,
     agentsResult,
+  }
+}
+
+export function isOpenCodeInventoryTimeoutMessage(message: string | null | undefined): boolean {
+  return message?.startsWith(OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX) === true
+}
+
+export function isOpenCodeInventoryTimeoutSnapshot(
+  snapshot: OpenCodeInventorySnapshot,
+): boolean {
+  return isOpenCodeInventoryTimeoutMessage(snapshot.probeError)
+}
+
+export function buildOpenCodeInventoryTimeoutSnapshot(input: {
+  projectPath?: string | null
+  timeoutMs: number
+  progress?: OpenCodeInventoryProbeProgressSnapshot | null
+}): OpenCodeInventorySnapshot {
+  const resolvedProjectPath = path.resolve(input.projectPath?.trim() || getCwd())
+  const binaryPath = resolveOpenCodeBinaryPath()
+  const currentStep = input.progress?.currentStep?.trim() || null
+  const message = currentStep
+    ? `${OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX} after ${input.timeoutMs}ms during ${currentStep}`
+    : `${OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX} after ${input.timeoutMs}ms`
+  const diagnostics = [message]
+  if (input.progress) {
+    diagnostics.push(
+      currentStep && input.progress.currentStepElapsedMs !== null
+        ? `Current OpenCode inventory step: ${currentStep} has been running for ${input.progress.currentStepElapsedMs}ms.`
+        : 'No OpenCode inventory step was active when the timeout fired.',
+    )
+    diagnostics.push(
+      input.progress.completedSteps.length > 0
+        ? `Completed OpenCode inventory steps before timeout: ${input.progress.completedSteps
+            .map(step => `${step.label} (${step.durationMs}ms)`)
+            .join(', ')}.`
+        : 'No OpenCode inventory step completed before timeout.',
+    )
+  }
+  diagnostics.push(
+    'Agent Teams runtime stayed alive, but OpenCode did not finish inventory probing before the UI timeout budget.',
+  )
+  diagnostics.push(
+    'Common causes: slow or hung OpenCode CLI startup, provider catalog/model listing, project OpenCode plugins, corrupted OpenCode cache/profile, or Windows security software delaying child processes.',
+  )
+
+  return {
+    detected: Boolean(binaryPath),
+    binaryPath,
+    version: null,
+    projectPath: resolvedProjectPath,
+    profile: null,
+    connectedProviders: [],
+    availableProviders: [],
+    models: [],
+    modelMetadata: [],
+    agents: [],
+    authStorePath: null,
+    probeError: message,
+    diagnostics,
+  }
+}
+
+export async function withOpenCodeInventoryProbeTimeout(
+  probe: Promise<OpenCodeInventorySnapshot>,
+  input: {
+    projectPath?: string | null
+    timeoutMs: number
+    progress?: OpenCodeInventoryProbeProgressTracker | null
+    onTimeout?: () => void
+  },
+): Promise<OpenCodeInventorySnapshot> {
+  let timeout: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      probe,
+      new Promise<OpenCodeInventorySnapshot>(resolve => {
+        timeout = setTimeout(() => {
+          input.onTimeout?.()
+          resolve(buildOpenCodeInventoryTimeoutSnapshot({
+            projectPath: input.projectPath,
+            timeoutMs: input.timeoutMs,
+            progress: input.progress?.snapshot() ?? null,
+          }))
+        }, input.timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
   }
 }
 
@@ -401,13 +651,23 @@ export class OpenCodeInventoryService {
     binaryPath: string,
     args: string[],
     profile: OpenCodePreparedProfile,
+    options: {
+      abortSignal?: AbortSignal
+      progress?: OpenCodeInventoryProbeProgressTracker
+    } = {},
   ): Promise<OpenCodeCommandResult> {
-    return execFileNoThrowWithCwd(binaryPath, args, {
-      cwd: profile.projectPath,
-      env: profile.env,
-      timeout: OPEN_CODE_PROBE_TIMEOUT_MS,
-      preserveOutputOnError: true,
-    })
+    const leaveStep = options.progress?.enterStep(`opencode ${args.join(' ')}`)
+    try {
+      return await execOpenCodePortableCommand({
+        binaryPath,
+        args,
+        profile,
+        abortSignal: options.abortSignal,
+        timeoutMs: OPEN_CODE_PROBE_TIMEOUT_MS,
+      })
+    } finally {
+      leaveStep?.()
+    }
   }
 
   async probe(
@@ -416,7 +676,8 @@ export class OpenCodeInventoryService {
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
-    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}`
+    const toolApprovalMode = options.toolApprovalMode ?? 'auto'
+    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
@@ -449,8 +710,12 @@ export class OpenCodeInventoryService {
       return missingSnapshot
     }
 
+    const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
     const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath, {
       includeAppMcp: options.includeAppMcp !== false,
+      toolApprovalMode,
+    }).finally(() => {
+      leaveProfileStep?.()
     })
     const {
       versionResult,
@@ -459,7 +724,10 @@ export class OpenCodeInventoryService {
       agentsResult,
     } = await collectOpenCodeInventoryCommandResults({
       mode,
-      execOpenCode: args => this.execOpenCode(binaryPath, args, profile),
+      execOpenCode: args => this.execOpenCode(binaryPath, args, profile, {
+        abortSignal: options.abortSignal,
+        progress: options.progress,
+      }),
     })
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
@@ -514,7 +782,10 @@ export class OpenCodeInventoryService {
     let modelMetadata = verboseModels.modelMetadata
     let finalModelsResult = modelsResult
     if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, ['models'], profile)
+      const fallbackModelsResult = await this.execOpenCode(binaryPath, ['models'], profile, {
+        abortSignal: options.abortSignal,
+        progress: options.progress,
+      })
       finalModelsResult = fallbackModelsResult
       models = fallbackModelsResult.code === 0
         ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
@@ -569,7 +840,7 @@ export class OpenCodeInventoryService {
       diagnostics,
     }
 
-    if (cacheEnabled) {
+    if (cacheEnabled && !options.abortSignal?.aborted) {
       this.cache.set(cacheKey, {
         expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS,
         snapshot,

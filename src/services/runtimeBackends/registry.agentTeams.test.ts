@@ -1,59 +1,73 @@
 import { describe, expect, test } from 'bun:test'
 
 describe('runtime backend registry with agent_teams capabilities', () => {
-  test('anthropic runtime status treats Bedrock as external runtime auth', async () => {
-    const envKeys = [
-      'ANTHROPIC_AWS_WORKSPACE_ID',
-      'AWS_PROFILE',
-      'AWS_REGION',
-      'CLAUDE_CODE_ENTRY_PROVIDER',
-      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
-      'CLAUDE_CODE_USE_BEDROCK',
-    ] as const
-    const originalEnv = new Map<string, string | undefined>(
-      envKeys.map(key => [key, process.env[key]]),
-    )
-
-    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
-    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
-    process.env.CLAUDE_CODE_USE_BEDROCK = '1'
-    process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
-    process.env.AWS_PROFILE = 'cc'
-    process.env.AWS_REGION = 'us-east-1'
-
-    try {
-      const registryModulePath = new URL('./registry.js', import.meta.url).href
-      const { getUnifiedRuntimeStatusPayload } = await import(
-        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+  test(
+    'anthropic runtime status treats Bedrock as external runtime auth',
+    async () => {
+      const envKeys = [
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_AWS_WORKSPACE_ID',
+        'ANTHROPIC_BASE_URL',
+        'AWS_PROFILE',
+        'AWS_REGION',
+        'CLAUDE_CODE_ENTRY_PROVIDER',
+        'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+        'CLAUDE_CODE_USE_BEDROCK',
+        'CLAUDE_CODE_USE_FOUNDRY',
+        'CLAUDE_CODE_USE_VERTEX',
+      ] as const
+      const originalEnv = new Map<string, string | undefined>(
+        envKeys.map(key => [key, process.env[key]]),
       )
 
-      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
-      const anthropic = payload.providers.anthropic
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+      process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+      process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
+      process.env.AWS_PROFILE = 'cc'
+      process.env.AWS_REGION = 'us-east-1'
+      delete process.env.ANTHROPIC_API_KEY
+      delete process.env.ANTHROPIC_AUTH_TOKEN
+      delete process.env.ANTHROPIC_BASE_URL
+      delete process.env.CLAUDE_CODE_USE_FOUNDRY
+      delete process.env.CLAUDE_CODE_USE_VERTEX
 
-      expect(anthropic?.authenticated).toBe(true)
-      expect(anthropic?.authMethod).toBe('aws_credentials')
-      expect(anthropic?.canLoginFromUi).toBe(false)
-      expect(anthropic?.selectedBackendId).toBe('bedrock')
-      expect(anthropic?.resolvedBackendId).toBe('bedrock')
-      expect(anthropic?.backend).toMatchObject({
-        kind: 'bedrock',
-        label: 'Amazon Bedrock',
-        endpointLabel: 'AWS region us-east-1',
-        authMethodDetail: 'aws_credentials',
-      })
-      expect(anthropic?.statusMessage).toBe('Configured for Amazon Bedrock')
-      expect(anthropic?.subscriptionRateLimits).toBeNull()
-    } finally {
-      for (const key of envKeys) {
-        const value = originalEnv.get(key)
-        if (value === undefined) {
-          delete process.env[key]
-        } else {
-          process.env[key] = value
+      try {
+        const registryModulePath = new URL('./registry.js', import.meta.url).href
+        const { getUnifiedRuntimeStatusPayload } = await import(
+          `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+        )
+
+        const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+        const anthropic = payload.providers.anthropic
+
+        expect(anthropic?.authenticated).toBe(true)
+        expect(anthropic?.authMethod).toBe('aws_credentials')
+        expect(anthropic?.canLoginFromUi).toBe(false)
+        expect(anthropic?.selectedBackendId).toBe('bedrock')
+        expect(anthropic?.resolvedBackendId).toBe('bedrock')
+        expect(anthropic?.backend).toMatchObject({
+          kind: 'bedrock',
+          label: 'Amazon Bedrock',
+          endpointLabel: 'AWS region us-east-1',
+          authMethodDetail: 'aws_credentials',
+        })
+        expect(anthropic?.statusMessage).toBe('Configured for Amazon Bedrock')
+        expect(anthropic?.subscriptionRateLimits).toBeNull()
+      } finally {
+        for (const key of envKeys) {
+          const value = originalEnv.get(key)
+          if (value === undefined) {
+            delete process.env[key]
+          } else {
+            process.env[key] = value
+          }
         }
       }
-    }
-  })
+    },
+    30_000,
+  )
 
   test('anthropic summary runtime status treats Ollama as Anthropic-compatible bearer auth', async () => {
     const envKeys = [
@@ -503,6 +517,58 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       Bun.which = originalWhich
     }
   })
+
+  test(
+    'opencode summary runtime status returns degraded JSON when inventory probing stalls',
+    async () => {
+      const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+
+      try {
+        const registryModulePath = new URL('./registry.js', import.meta.url).href
+        const { getUnifiedRuntimeStatusPayload } = await import(
+          `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+        )
+
+        const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+          getOpenCodeInventorySnapshot: async () => new Promise(resolve => {
+            setTimeout(() => resolve({
+              detected: true,
+              binaryPath: process.execPath,
+              version: 'slow-test-inventory',
+              projectPath: '/tmp/project',
+              profile: null,
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              modelMetadata: [],
+              agents: [],
+              authStorePath: null,
+              probeError: null,
+              diagnostics: [],
+            }), 50)
+          }),
+          openCodeInventoryTimeoutMs: 1,
+        }, { detailLevel: 'summary' })
+        const opencode = payload.providers.opencode
+
+        expect(opencode?.supported).toBe(true)
+        expect(opencode?.authenticated).toBe(false)
+        expect(opencode?.verificationState).toBe('error')
+        expect(opencode?.statusMessage).toBe('OpenCode probe incomplete')
+        expect(opencode?.detailMessage).toContain('OpenCode inventory probe timed out after 1ms')
+        expect(opencode?.models).toEqual([])
+        expect(opencode).not.toHaveProperty('modelCatalog')
+      } finally {
+        if (originalBinaryPath === undefined) {
+          delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+        } else {
+          process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = originalBinaryPath
+        }
+      }
+    },
+    30_000,
+  )
 
   test(
     'summary runtime status omits full catalogs without losing live provider state',

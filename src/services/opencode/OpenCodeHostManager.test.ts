@@ -10,6 +10,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
+  buildOpenCodeHostSpawnOptions,
 } from './OpenCodeHostManager.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
@@ -94,6 +95,106 @@ function createDeferred<T = void>(): {
 }
 
 describe('OpenCodeHostManager', () => {
+  test('keeps persistent OpenCode hosts detached on Windows so launch hosts survive bridge exit', () => {
+    const profile = {
+      ...baseProfile,
+      env: {
+        OPENCODE_SERVER_PASSWORD: 'secret',
+      },
+    }
+
+    expect(buildOpenCodeHostSpawnOptions(profile, 'win32')).toEqual({
+      cwd: profile.projectPath,
+      env: profile.env,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+  })
+
+  test('keeps process-scoped OpenCode hosts attached on Windows to avoid console popup detachment', () => {
+    expect(buildOpenCodeHostSpawnOptions(baseProfile, 'win32', { lifetime: 'process' })).toMatchObject({
+      detached: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+  })
+
+  test('keeps OpenCode host detached on POSIX platforms', () => {
+    expect(buildOpenCodeHostSpawnOptions(baseProfile, 'darwin')).toMatchObject({
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+  })
+
+  test('does not persist process-scoped hosts into the cross-process registry', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const spawned = createMockChildProcess(43138)
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43138,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 200,
+            data: { healthy: true, version: '1.4.0' },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43138 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        return {
+          status: 200,
+          data: { ok: true },
+        }
+      },
+      persistentRegistryPath: registryPath,
+    })
+
+    let hostKey: string | null = null
+
+    try {
+      const handle = await manager.ensureHost({ hostLifetime: 'process' })
+      hostKey = handle.hostKey
+      expect(handle.hostKey).toContain('::process:')
+      await manager.retainHostLease(handle.hostKey, {
+        teamId: 'team-1',
+        memberName: 'alice',
+      })
+      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+    } finally {
+      if (hostKey) {
+        await manager.releaseHost(hostKey).catch(() => undefined)
+      }
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('reuses the same host promise for concurrent ensureHost calls', async () => {
     const spawned = createMockChildProcess()
     let spawnCount = 0
@@ -610,6 +711,119 @@ describe('OpenCodeHostManager', () => {
       { pid: 43134, signal: 'SIGTERM' },
       { pid: 43134, signal: 'SIGKILL' },
     ])
+  })
+
+  test('uses a caller-provided host health timeout during startup verification', async () => {
+    const spawned = createMockChildProcess(43136)
+    const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
+    let nowMs = 0
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43136,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: 503,
+            data: { healthy: false },
+          }
+        }
+        return {
+          status: 200,
+          data: {},
+        }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid,
+      killProcess: (pid, signal) => {
+        killedSignals.push({ pid, signal })
+      },
+      now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
+      sleepMs: async (ms) => {
+        nowMs += ms
+      },
+      persistentRegistryPath: null,
+    })
+
+    await expect(manager.ensureHost({ hostKey: 'host-key', healthTimeoutMs: 5_000 })).rejects.toThrow(
+      'OpenCode host did not become healthy within 5000ms',
+    )
+
+    expect(manager.getHost('host-key')).toBeNull()
+    expect(killedSignals).toEqual([
+      { pid: 43136, signal: 'SIGTERM' },
+      { pid: 43136, signal: 'SIGKILL' },
+    ])
+  })
+
+  test('lets a later pending caller extend a short host health timeout', async () => {
+    const spawned = createMockChildProcess(43137)
+    const firstSleepStarted = createDeferred()
+    const allowSleep = createDeferred()
+    let nowMs = 0
+    let sleepCalls = 0
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43137,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return {
+            status: nowMs >= 5_250 ? 200 : 503,
+            data: nowMs >= 5_250
+              ? { healthy: true, version: '1.4.0' }
+              : { healthy: false },
+          }
+        }
+        if (url.endsWith('/config')) {
+          return {
+            status: 200,
+            data: { server: { port: 43137 }, default_agent: 'teammate' },
+          }
+        }
+        if (url.endsWith('/config/providers')) {
+          return {
+            status: 200,
+            data: { providers: [], default: {} },
+          }
+        }
+        if (url.endsWith('/agent')) {
+          return {
+            status: 200,
+            data: [{ name: 'teammate', mode: 'primary' }],
+          }
+        }
+        if (url.endsWith('/mcp')) {
+          return {
+            status: 200,
+            data: {},
+          }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
+      sleepMs: async (ms) => {
+        sleepCalls += 1
+        if (sleepCalls === 1) {
+          firstSleepStarted.resolve()
+          await allowSleep.promise
+        }
+        nowMs += ms
+      },
+      persistentRegistryPath: null,
+    })
+
+    const first = manager.ensureHost({ hostKey: 'host-key', healthTimeoutMs: 5_000 })
+    await firstSleepStarted.promise
+    const second = manager.ensureHost({ hostKey: 'host-key' })
+    allowSleep.resolve()
+
+    const [firstHandle, secondHandle] = await Promise.all([first, second])
+
+    expect(firstHandle).toBe(secondHandle)
+    expect(firstHandle.state).toBe('healthy')
+    expect(nowMs).toBeGreaterThan(5_000)
   })
 
   test('force-kills a healthy spawned host when persistent registry write fails', async () => {
