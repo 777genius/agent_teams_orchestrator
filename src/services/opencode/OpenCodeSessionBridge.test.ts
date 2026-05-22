@@ -1611,6 +1611,8 @@ describe('OpenCodeSessionBridge', () => {
               requestID: 'perm-1',
               sessionID: 'session-1',
               tool: 'bash',
+              title: 'Run git status',
+              kind: 'tool',
             },
           ],
           sendSessionMessage: async () => ({ info: {}, parts: [] }),
@@ -1624,6 +1626,15 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(result.summary.durableState).toBe('blocked')
     expect(result.summary.pendingPermissionRequestIds).toEqual(['perm-1'])
+    expect(result.summary.pendingPermissions).toMatchObject([
+      {
+        requestId: 'perm-1',
+        sessionId: 'session-1',
+        tool: 'bash',
+        title: 'Run git status',
+        kind: 'tool',
+      },
+    ])
     expect(
       result.summary.diagnostics.some(item => item.includes('pending permission request')),
     ).toBe(true)

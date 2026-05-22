@@ -80,8 +80,19 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         teammate: {
           permission: {
             '*': 'deny',
+            read: 'allow',
+            glob: 'allow',
+            grep: 'allow',
+            list: 'allow',
+            lsp: 'allow',
+            todoread: 'allow',
+            todowrite: 'allow',
+            edit: 'allow',
+            bash: 'allow',
             'agent-teams_*': 'allow',
             'agent_teams_*': 'allow',
+            'mcp__agent-teams__*': 'allow',
+            'mcp__agent_teams__*': 'allow',
           },
         },
         'teammate-bootstrap': {
@@ -106,6 +117,29 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           },
           permission: {
             '*': 'deny',
+          },
+        },
+      },
+    })
+  })
+
+  test('can build a manual approval teammate profile while keeping app MCP allowed', () => {
+    const managedConfig = buildManagedConfig(null, { toolApprovalMode: 'manual' })
+
+    expect(managedConfig).toMatchObject({
+      agent: {
+        teammate: {
+          permission: {
+            '*': 'ask',
+            task: {
+              '*': 'deny',
+            },
+            external_directory: 'deny',
+            doom_loop: 'deny',
+            'agent-teams_*': 'allow',
+            'agent_teams_*': 'allow',
+            'mcp__agent-teams__*': 'allow',
+            'mcp__agent_teams__*': 'allow',
           },
         },
       },
@@ -267,6 +301,114 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(mcp.unsafe).toBeUndefined()
       expect(agents.teammate).toBeDefined()
       expect(agents.unsafe).toBeUndefined()
+    } finally {
+      if (previousXdgConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME
+      } else {
+        process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+      }
+      if (previousOpenCodeConfig === undefined) {
+        delete process.env.OPENCODE_CONFIG
+      } else {
+        process.env.OPENCODE_CONFIG = previousOpenCodeConfig
+      }
+      if (previousOpenCodeConfigContent === undefined) {
+        delete process.env.OPENCODE_CONFIG_CONTENT
+      } else {
+        process.env.OPENCODE_CONFIG_CONTENT = previousOpenCodeConfigContent
+      }
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
+  test('imports Ollama Cloud model routes from user opencode.json', async () => {
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    const previousOpenCodeConfig = process.env.OPENCODE_CONFIG
+    const previousOpenCodeConfigContent = process.env.OPENCODE_CONFIG_CONTENT
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-ollama-cloud-import')
+    const appCacheHome = path.join(tempDir, 'app-cache-ollama-cloud-import')
+    const xdgConfigHome = path.join(tempDir, 'xdg-config-ollama-cloud')
+    await mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+    await writeFile(
+      path.join(xdgConfigHome, 'opencode', 'opencode.json'),
+      JSON.stringify({
+        model: 'ollama/kimi-k2.6:cloud',
+        provider: {
+          ollama: {
+            models: {
+              'kimi-k2.6:cloud': {
+                limit: {
+                  context: 262_144,
+                  output: 262_144,
+                },
+                attachment: true,
+                modalities: {
+                  input: ['text', 'image'],
+                  output: ['text'],
+                },
+                name: 'kimi-k2.6:cloud',
+              },
+              'deepseek-v4-flash:cloud': {
+                limit: {
+                  context: 1_000_000,
+                  output: 1_000_000,
+                },
+                name: 'deepseek-v4-flash:cloud',
+              },
+            },
+          },
+        },
+      }),
+      'utf8',
+    )
+    process.env.XDG_CONFIG_HOME = xdgConfigHome
+    delete process.env.OPENCODE_CONFIG
+    delete process.env.OPENCODE_CONFIG_CONTENT
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+
+    try {
+      const profile = await new OpenCodeProfileManager().prepareProfile(
+        path.join(tempDir, 'project-ollama-cloud-import'),
+      )
+      const managedConfig = JSON.parse(profile.env.OPENCODE_CONFIG_CONTENT ?? '{}') as Record<string, unknown>
+      const providers = managedConfig.provider as Record<string, unknown>
+
+      expect(managedConfig.model).toBe('ollama/kimi-k2.6:cloud')
+      expect(providers.ollama).toMatchObject({
+        models: {
+          'kimi-k2.6:cloud': {
+            limit: {
+              context: 262_144,
+              output: 262_144,
+            },
+            attachment: true,
+            modalities: {
+              input: ['text', 'image'],
+              output: ['text'],
+            },
+            name: 'kimi-k2.6:cloud',
+          },
+          'deepseek-v4-flash:cloud': {
+            limit: {
+              context: 1_000_000,
+              output: 1_000_000,
+            },
+            name: 'deepseek-v4-flash:cloud',
+          },
+        },
+      })
     } finally {
       if (previousXdgConfigHome === undefined) {
         delete process.env.XDG_CONFIG_HOME

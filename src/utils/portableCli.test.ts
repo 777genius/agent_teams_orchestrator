@@ -11,6 +11,7 @@ import {
 } from './portableCli.js'
 
 const originalPlatform = process.platform
+const originalBunWhich = Bun.which
 
 function setPlatform(value: NodeJS.Platform): void {
   Object.defineProperty(process, 'platform', {
@@ -21,6 +22,7 @@ function setPlatform(value: NodeJS.Platform): void {
 
 afterEach(() => {
   setPlatform(originalPlatform)
+  Bun.which = originalBunWhich
 })
 
 describe('portableCli Windows launcher resolution', () => {
@@ -90,6 +92,77 @@ describe('portableCli Windows launcher resolution', () => {
       expect(resolveDirectWindowsLauncher(shimPath)).toEqual({
         command: 'node',
         argsPrefix: [scriptPath],
+      })
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('resolves npm native exe cmd shims to the underlying executable', async () => {
+    setPlatform('win32')
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'portable-cli-test-'))
+    try {
+      const exeDir = path.join(tempDir, 'node_modules', 'opencode-ai', 'bin')
+      const exePath = path.join(exeDir, 'opencode.exe')
+      const shimPath = path.join(tempDir, 'opencode.cmd')
+      await mkdir(exeDir, { recursive: true })
+      await writeFile(exePath, '', 'utf8')
+      await writeFile(
+        shimPath,
+        [
+          '@ECHO off',
+          'GOTO start',
+          ':find_dp0',
+          'SET dp0=%~dp0',
+          'EXIT /b',
+          ':start',
+          'SETLOCAL',
+          'CALL :find_dp0',
+          'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+
+      expect(resolveDirectWindowsLauncher(shimPath)).toEqual({
+        command: exePath,
+        argsPrefix: [],
+      })
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('resolves extensionless PATH commands to native npm cmd shims', async () => {
+    setPlatform('win32')
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'portable-cli-test-'))
+    try {
+      const exeDir = path.join(tempDir, 'node_modules', 'opencode-ai', 'bin')
+      const exePath = path.join(exeDir, 'opencode.exe')
+      const shimPath = path.join(tempDir, 'opencode.cmd')
+      await mkdir(exeDir, { recursive: true })
+      await writeFile(exePath, '', 'utf8')
+      await writeFile(
+        shimPath,
+        [
+          '@ECHO off',
+          'GOTO start',
+          ':find_dp0',
+          'SET dp0=%~dp0',
+          'EXIT /b',
+          ':start',
+          'SETLOCAL',
+          'CALL :find_dp0',
+          'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+      Bun.which = command => (command === 'opencode' ? shimPath : originalBunWhich(command))
+
+      expect(resolveDirectWindowsLauncher('opencode')).toEqual({
+        command: exePath,
+        argsPrefix: [],
       })
     } finally {
       await rm(tempDir, { recursive: true, force: true })

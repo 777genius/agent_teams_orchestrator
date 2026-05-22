@@ -79,6 +79,24 @@ function resolveNpmNodeShim(
   }
 }
 
+function resolveNpmNativeShim(
+  content: string,
+  launcherDir: string,
+): DirectWindowsLauncher | null {
+  const nativeTarget =
+    /(?:^|[&|])\s*"([^"]+\.(?:exe|com))"\s+%\*/im.exec(content)?.[1]
+  if (!nativeTarget) {
+    return null
+  }
+
+  const target = resolveCmdPathTemplate(nativeTarget, launcherDir)
+  if (!existsSync(target)) {
+    return null
+  }
+
+  return { command: target, argsPrefix: [] }
+}
+
 function resolveCompanionWindowsExecutable(binaryPath: string): string {
   if (process.platform !== 'win32' || path.extname(binaryPath)) {
     return binaryPath
@@ -116,6 +134,7 @@ export function resolveDirectWindowsLauncher(
     return (
       resolveGeneratedBunLauncher(content, launcherDir)
       ?? resolveNpmNodeShim(content, launcherDir)
+      ?? resolveNpmNativeShim(content, launcherDir)
     )
   } catch {
     return null

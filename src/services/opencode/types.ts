@@ -12,9 +12,12 @@ export type OpenCodeModelOutputLimitOverride = {
   contextTokens?: number
 }
 
+export type OpenCodeToolApprovalMode = 'auto' | 'manual'
+
 export type OpenCodePrepareProfileOptions = {
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
   includeAppMcp?: boolean
+  toolApprovalMode?: OpenCodeToolApprovalMode
 }
 
 export type OpenCodePreparedProfile = {
@@ -288,6 +291,15 @@ export type OpenCodePendingPermission = {
   [key: string]: unknown
 }
 
+export type OpenCodeNormalizedPermission = {
+  requestId: string
+  sessionId: string | null
+  tool: string | null
+  title: string | null
+  kind: string | null
+  raw: OpenCodePendingPermission
+}
+
 export type OpenCodeSseEvent = {
   type: string
   properties: Record<string, unknown>
@@ -523,6 +535,7 @@ export type OpenCodeSessionReconcileSummary = {
   staleReason: string | null
   profileAuthState: OpenCodeAuthState | null
   pendingPermissionRequestIds: string[]
+  pendingPermissions?: OpenCodeNormalizedPermission[]
   messageCount: number
   toolCallCount: number
   errorCount: number

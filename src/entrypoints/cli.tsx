@@ -40,6 +40,40 @@ if (feature('ABLATION_BASELINE') && process.env.CLAUDE_CODE_ABLATION_BASELINE) {
  * All imports are dynamic to minimize module evaluation for fast paths.
  * Fast-path for --version has zero imports beyond this file.
  */
+function readOption(args: string[], name: string): string | undefined {
+  const inlinePrefix = `${name}=`;
+  const inlineValue = args.find(arg => arg.startsWith(inlinePrefix));
+  if (inlineValue) {
+    return inlineValue.slice(inlinePrefix.length) || undefined;
+  }
+
+  const index = args.indexOf(name);
+  if (index < 0) {
+    return undefined;
+  }
+  const value = args[index + 1];
+  return value && !value.startsWith('--') ? value : undefined;
+}
+
+function parseOpenCodeCommandOptions(args: string[]): {
+  input: string;
+  json?: boolean;
+  output?: string;
+} {
+  const input = readOption(args, '--input');
+  if (!input) {
+    process.stderr.write('Missing required option --input <path>\n');
+    // eslint-disable-next-line custom-rules/no-process-exit
+    process.exit(1);
+  }
+
+  return {
+    input,
+    output: readOption(args, '--output'),
+    json: args.includes('--json'),
+  };
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -56,6 +90,20 @@ async function main(): Promise<void> {
     profileCheckpoint
   } = await import('../utils/startupProfiler.js');
   profileCheckpoint('cli_entry');
+
+  if (
+    args[0] === 'runtime'
+    && args[1] === 'opencode-command'
+    && !args.includes('--help')
+    && !args.includes('-h')
+  ) {
+    profileCheckpoint('cli_opencode_command_path');
+    const {
+      runtimeOpenCodeCommand
+    } = await import('../cli/handlers/runtimeOpenCodeCommand.js');
+    await runtimeOpenCodeCommand(parseOpenCodeCommandOptions(args.slice(2)));
+    return;
+  }
 
   // Fast-path for --dump-system-prompt: output the rendered system prompt and exit.
   // Used by prompt sensitivity evals to extract the system prompt at a specific commit.

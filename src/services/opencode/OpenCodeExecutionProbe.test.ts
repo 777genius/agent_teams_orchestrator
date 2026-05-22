@@ -64,6 +64,7 @@ describe('OpenCodeExecutionProbe', () => {
     let ensureHostInput: {
       projectPath?: string | null
       profileOptions?: OpenCodePrepareProfileOptions
+      hostLifetime?: string
     } | null = null
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -166,6 +167,7 @@ describe('OpenCodeExecutionProbe', () => {
           },
         ],
       },
+      hostLifetime: 'process',
     })
   })
 

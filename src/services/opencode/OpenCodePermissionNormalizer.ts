@@ -1,4 +1,7 @@
-import type { OpenCodePendingPermission } from './types.js'
+import type {
+  OpenCodeNormalizedPermission,
+  OpenCodePendingPermission,
+} from './types.js'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -18,18 +21,9 @@ function firstString(...values: unknown[]): string | null {
   return null
 }
 
-export type NormalizedOpenCodePermission = {
-  requestId: string
-  sessionId: string | null
-  tool: string | null
-  title: string | null
-  kind: string | null
-  raw: OpenCodePendingPermission
-}
-
 export function normalizeOpenCodePermission(
   permission: OpenCodePendingPermission,
-): NormalizedOpenCodePermission | null {
+): OpenCodeNormalizedPermission | null {
   const record = asRecord(permission)
   if (!record) {
     return null
@@ -71,8 +65,8 @@ export function normalizeOpenCodePermission(
 
 export function normalizeOpenCodePermissions(
   permissions: OpenCodePendingPermission[],
-): NormalizedOpenCodePermission[] {
+): OpenCodeNormalizedPermission[] {
   return permissions
     .map(permission => normalizeOpenCodePermission(permission))
-    .filter((permission): permission is NormalizedOpenCodePermission => permission !== null)
+    .filter((permission): permission is OpenCodeNormalizedPermission => permission !== null)
 }

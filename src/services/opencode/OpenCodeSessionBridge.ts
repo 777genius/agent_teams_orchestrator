@@ -25,6 +25,7 @@ import type {
   OpenCodeSessionStatus,
   OpenCodeSessionStatusInput,
   OpenCodeSessionSummary,
+  OpenCodeToolApprovalMode,
 } from './types.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 
@@ -42,7 +43,10 @@ type OpenCodeSessionBridgeDeps = {
   offlineReader?: Pick<typeof openCodeOfflineSessionReader, 'readSession'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
   turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
-  prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
+  prepareProfile?: (
+    projectPath?: string | null,
+    options?: { toolApprovalMode?: OpenCodeToolApprovalMode },
+  ) => Promise<OpenCodePreparedProfile>
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -217,11 +221,14 @@ export class OpenCodeSessionBridge {
     return this.deps.offlineReader ?? openCodeOfflineSessionReader
   }
 
-  private async prepareProfile(projectPath?: string | null) {
+  private async prepareProfile(
+    projectPath?: string | null,
+    options?: { toolApprovalMode?: OpenCodeToolApprovalMode },
+  ) {
     const prepareProfile =
       this.deps.prepareProfile
       ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
-    return prepareProfile(projectPath)
+    return prepareProfile(projectPath, options)
   }
 
   private async createFreshSessionRecord(params: {
@@ -556,8 +563,11 @@ export class OpenCodeSessionBridge {
     preparedProfile?: OpenCodePreparedProfile | null
     runId?: string | null
     fresh?: boolean
+    toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<OpenCodeSessionRecord> {
-    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath)
+    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath, {
+      toolApprovalMode: params.toolApprovalMode,
+    })
     const laneId = params.laneId?.trim() || 'primary'
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
     if (
@@ -1141,9 +1151,11 @@ export class OpenCodeSessionBridge {
         messages,
       })
       summary.profileAuthState = profile.authState
-      const pendingPermissionRequestIds = normalizeOpenCodePermissions(pendingPermissions)
+      const normalizedPendingPermissions = normalizeOpenCodePermissions(pendingPermissions)
         .filter(permission => permission.sessionId === targetSessionId)
+      const pendingPermissionRequestIds = normalizedPendingPermissions
         .map(permission => permission.requestId)
+      summary.pendingPermissions = normalizedPendingPermissions
       summary.pendingPermissionRequestIds = pendingPermissionRequestIds
       if (pendingPermissionRequestIds.length > 0) {
         summary.durableState = 'blocked'

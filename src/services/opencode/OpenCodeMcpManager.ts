@@ -26,6 +26,7 @@ const OPEN_CODE_APP_MCP_VERIFY_POLL_MS = 250
 const OPEN_CODE_MCP_ENTRY_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY'
 const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
 const OPEN_CODE_MCP_ARGS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON'
+const OPEN_CODE_MCP_ENV_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON'
 const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
@@ -121,6 +122,49 @@ function parseMcpRemoteUrl(value: string | null): string | null {
   } catch {
     return null
   }
+}
+
+function parseMcpEnvironmentJson(value: string | null): Record<string, string> {
+  if (!value) {
+    return {}
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (error) {
+    throw new Error(
+      `${OPEN_CODE_MCP_ENV_JSON_ENV} must be a JSON object with string values: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+
+  const record = asRecord(parsed)
+  if (!record) {
+    throw new Error(`${OPEN_CODE_MCP_ENV_JSON_ENV} must be a JSON object with string values`)
+  }
+
+  const result: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(record)) {
+    if (typeof raw !== 'string') {
+      throw new Error(`${OPEN_CODE_MCP_ENV_JSON_ENV} value for ${key} must be a string`)
+    }
+    result[key] = raw
+  }
+  return result
+}
+
+function getMcpEnvironmentJsonKeys(env: NodeJS.ProcessEnv): string[] {
+  return Object.keys(parseMcpEnvironmentJson(asString(env[OPEN_CODE_MCP_ENV_JSON_ENV])))
+}
+
+function hasOpenCodeLocalMcpLaunchOverride(env: NodeJS.ProcessEnv): boolean {
+  return [
+    OPEN_CODE_MCP_COMMAND_ENV,
+    OPEN_CODE_MCP_ENTRY_ENV,
+    OPEN_CODE_MCP_ARGS_JSON_ENV,
+  ].some(key => asString(env[key]) !== null)
 }
 
 function asStringRecord(value: unknown): Record<string, string> | null {
@@ -282,13 +326,19 @@ function buildForwardedEnvironment(env: NodeJS.ProcessEnv): Record<string, strin
   return forwarded
 }
 
+function buildLocalMcpEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  return {
+    ...buildForwardedEnvironment(env),
+    ...parseMcpEnvironmentJson(asString(env[OPEN_CODE_MCP_ENV_JSON_ENV])),
+  }
+}
+
 export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   env?: NodeJS.ProcessEnv
   pathExists?: (targetPath: string) => Promise<boolean>
 } = {}): Promise<ResolvedAppMcpLaunchConfig> {
   const env = deps.env ?? process.env
   const pathExists = deps.pathExists ?? defaultPathExists
-  const forwardedEnvironment = buildForwardedEnvironment(env)
   const remoteUrlOverrideRaw = asString(env[OPEN_CODE_MCP_URL_ENV])
   const remoteUrlOverride = parseMcpRemoteUrl(remoteUrlOverrideRaw)
   const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
@@ -313,6 +363,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   }
 
   if (argsOverride) {
+    const localEnvironment = buildLocalMcpEnvironment(env)
     return {
       source: 'env-override',
       config: {
@@ -321,7 +372,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
           commandOverride ?? resolveNodeCommand(),
           ...argsOverride.map(arg => arg.startsWith('-') || path.isAbsolute(arg) ? arg : path.resolve(arg)),
         ],
-        environment: forwardedEnvironment,
+        environment: localEnvironment,
         enabled: true,
         timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
       },
@@ -330,18 +381,20 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
 
   if (entryOverride) {
     const absoluteEntry = path.resolve(entryOverride)
+    const localEnvironment = buildLocalMcpEnvironment(env)
     return {
       source: 'env-override',
       config: {
         type: 'local',
         command: [commandOverride ?? resolveNodeCommand(), absoluteEntry],
-        environment: forwardedEnvironment,
+        environment: localEnvironment,
         enabled: true,
         timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
       },
     }
   }
 
+  const forwardedEnvironment = buildForwardedEnvironment(env)
   for (const claudeTeamRoot of getCandidateClaudeTeamRoots()) {
     const builtEntry = path.join(claudeTeamRoot, 'mcp-server', 'dist', 'index.js')
     if (await pathExists(builtEntry)) {
@@ -489,14 +542,22 @@ function getEntryUrl(entry: OpenCodeMcpStatusEntry | null): string | null {
 function appMcpConfigMatchesRequiredRuntime(
   entry: OpenCodeMcpStatusEntry | null,
   desiredConfig: OpenCodeMcpServerConfig,
+  options: { requiredEnvironmentKeys?: readonly string[] } = {},
 ): { ok: boolean; reason: string | null } {
   const desiredEnvironment = desiredConfig.environment ?? {}
   const desiredIdentityKeys = OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.filter(key =>
     typeof desiredEnvironment[key] === 'string' && desiredEnvironment[key].length > 0,
   )
+  const desiredIdentityKeySet = new Set<string>(desiredIdentityKeys)
+  const requiredEnvironmentKeys = Array.from(new Set([
+    ...desiredIdentityKeys,
+    ...(options.requiredEnvironmentKeys ?? []).filter(
+      key => typeof desiredEnvironment[key] === 'string',
+    ),
+  ]))
   const entryEnvironment = getEntryEnvironment(entry)
 
-  for (const key of desiredIdentityKeys) {
+  for (const key of requiredEnvironmentKeys) {
     if (!entryEnvironment) {
       return {
         ok: false,
@@ -506,7 +567,9 @@ function appMcpConfigMatchesRequiredRuntime(
     if (entryEnvironment[key] !== desiredEnvironment[key]) {
       return {
         ok: false,
-        reason: `existing app MCP ${key} does not match current runtime root`,
+        reason: desiredIdentityKeySet.has(key)
+          ? `existing app MCP ${key} does not match current runtime root`
+          : `existing app MCP ${key} does not match current MCP child environment`,
       }
     }
   }
@@ -647,6 +710,7 @@ export class OpenCodeMcpManager {
         params.attachIfMissing === true
         && (
           asString(currentEnv[OPEN_CODE_MCP_URL_ENV]) !== null
+          || hasOpenCodeLocalMcpLaunchOverride(currentEnv)
           || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
             const value = currentEnv[key]
             return typeof value === 'string' && value.length > 0
@@ -654,9 +718,14 @@ export class OpenCodeMcpManager {
         )
       if (shouldVerifyExistingConfig) {
         launchConfig = await this.resolveLaunchConfig()
+        const requiredEnvironmentKeys =
+          launchConfig.source === 'env-override' && launchConfig.config.type === 'local'
+            ? getMcpEnvironmentJsonKeys(currentEnv)
+            : []
         let compatibility = appMcpConfigMatchesRequiredRuntime(
           existingMatch.entry,
           launchConfig.config,
+          { requiredEnvironmentKeys },
         )
         if (!compatibility.ok && typeof client.getConfig === 'function') {
           try {
@@ -665,6 +734,7 @@ export class OpenCodeMcpManager {
               const configCompatibility = appMcpConfigMatchesRequiredRuntime(
                 configEntry,
                 launchConfig.config,
+                { requiredEnvironmentKeys },
               )
               if (configCompatibility.ok) {
                 compatibility = configCompatibility

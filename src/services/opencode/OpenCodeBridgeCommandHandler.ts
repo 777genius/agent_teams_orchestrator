@@ -67,8 +67,10 @@ import type {
   OpenCodeMessage,
   OpenCodePendingPermission,
   OpenCodeProvisioningSnapshot,
+  OpenCodeNormalizedPermission,
   OpenCodeSessionRecord,
   OpenCodeSessionReconcileSummary,
+  OpenCodeToolApprovalMode,
 } from './types.js'
 
 const BRIDGE_SCHEMA_VERSION = 1
@@ -89,6 +91,11 @@ const OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_ENV =
   'AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS'
 const OPEN_CODE_TEAMMATE_AGENT = 'teammate'
 const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT = 'teammate-bootstrap'
+const ELECTRON_RUN_AS_NODE_ENV = 'ELECTRON_RUN_AS_NODE'
+
+function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
+  return body.skipPermissions === false ? 'manual' : 'auto'
+}
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',
   'opencode.commandStatus',
@@ -142,6 +149,7 @@ type LaunchMemberDraft = {
   sessionId: string
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
   pendingPermissionRequestIds?: string[]
+  pendingPermissions?: OpenCodeNormalizedPermission[]
   runtimePid?: number
   bootstrapEvidenceSource?: 'runtime_bootstrap_checkin' | 'app_managed_bootstrap'
   bootstrapMode?: 'model_tool_checkin' | 'app_managed_context'
@@ -1520,6 +1528,13 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
     command: binary,
     args,
     env: buildMcpPreflightEnv(launchConfig.config.environment),
+    stderr: 'pipe',
+  })
+  let stderr = ''
+  const stderrStream = transport.stderr as NodeJS.ReadableStream | null
+  stderrStream?.setEncoding('utf8')
+  stderrStream?.on('data', chunk => {
+    stderr += String(chunk)
   })
 
   try {
@@ -1528,6 +1543,13 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
     return (result.tools ?? [])
       .map(tool => tool.name)
       .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+  } catch (error) {
+    const detail = stderr.trim()
+    if (detail) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new Error(`${message}\nAgent Teams MCP stderr:\n${detail.slice(0, 4000)}`)
+    }
+    throw error
   } finally {
     await closeMcpClient(client)
   }
@@ -1540,6 +1562,7 @@ function buildMcpPreflightEnv(extra?: Record<string, string>): Record<string, st
       env[key] = value
     }
   }
+  delete env[ELECTRON_RUN_AS_NODE_ENV]
   return {
     ...env,
     ...(extra ?? {}),
@@ -1927,6 +1950,9 @@ function buildTeamLaunchData(params: {
             : {}),
           ...(member.pendingPermissionRequestIds?.length
             ? { pendingPermissionRequestIds: [...new Set(member.pendingPermissionRequestIds)] }
+            : {}),
+          ...(member.pendingPermissions?.length
+            ? { pendingPermissions: member.pendingPermissions }
             : {}),
           ...(member.diagnostics.length ? { diagnostics: [...member.diagnostics] } : {}),
           model: params.selectedModel,
@@ -2393,10 +2419,12 @@ async function runLaunch(envelope: BridgeEnvelope) {
     throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
   }
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
+  const toolApprovalMode = resolveLaunchToolApprovalMode(body)
 
   const probeStartedAt = Date.now()
   const retainedProbe = await openCodeProvisioningProbe.probeRetainingHost(
     asString(body.projectPath) ?? envelope.cwd,
+    { toolApprovalMode },
   )
   const provisioningProbeMs = elapsedMs(probeStartedAt)
   try {
@@ -2424,17 +2452,27 @@ async function runLaunchWithProvisioningSnapshot(
     throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
   }
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
+  const toolApprovalMode = resolveLaunchToolApprovalMode(body)
+  const diagnostics: TeamDiagnostic[] = []
 
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
     runtime: createRuntimePreconditionSnapshot(snapshot),
+    allowCapabilitySnapshotRecovery: true,
   })
+  if (commandEvidence.capabilitySnapshotRecovery) {
+    const recovery = commandEvidence.capabilitySnapshotRecovery
+    diagnostics.push(teamDiagnostic(
+      'opencode_capability_snapshot_recovery',
+      `Accepted fresh OpenCode capability snapshot after app recovery attempt ${recovery.recoveryAttemptId}: expected ${recovery.expectedCapabilitySnapshotId}, actual ${recovery.actualCapabilitySnapshotId ?? 'null'}.`,
+      'warning',
+    ))
+  }
   assertOpenCodeLaunchRuntimeAvailable(snapshot)
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
   await assertOpenCodeSelectedModelLaunchAccess(apiSelectedModel, snapshot)
   await assertOpenCodeLaunchMcpReady(snapshot)
   const members: Record<string, LaunchMemberDraft> = {}
-  const diagnostics: TeamDiagnostic[] = []
   const memberTimings = new Map<string, {
     ensureSessionMs?: number
     injectionMs?: number
@@ -2461,6 +2499,7 @@ async function runLaunchWithProvisioningSnapshot(
         preparedProfile: snapshot.profile,
         runId,
         fresh: true,
+        toolApprovalMode,
       })
       memberTiming.ensureSessionMs = elapsedMs(ensureStartedAt)
       let mcpReady = await waitForLaunchSessionAppMcpReady(record)
@@ -2501,6 +2540,7 @@ async function runLaunchWithProvisioningSnapshot(
           preparedProfile: snapshot.profile,
           runId,
           fresh: true,
+          toolApprovalMode,
         })
         diagnostics.push(teamDiagnostic(
           'opencode_launch_session_recreated_after_mcp_attach',
@@ -2752,6 +2792,9 @@ async function runReconcile(envelope: BridgeEnvelope) {
         bootstrapMode: resolvedOpenCodeBootstrapMode(record),
         ...(reconciled.summary.pendingPermissionRequestIds.length > 0
           ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
+          : {}),
+        ...(reconciled.summary.pendingPermissions?.length
+          ? { pendingPermissions: reconciled.summary.pendingPermissions }
           : {}),
         ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
           ? { runtimePid: reconciled.record.runtimePid }
@@ -3613,6 +3656,9 @@ async function runAnswerPermission(envelope: BridgeEnvelope) {
         ...(reconciled.summary.pendingPermissionRequestIds.length > 0
           ? { pendingPermissionRequestIds: [...new Set(reconciled.summary.pendingPermissionRequestIds)] }
           : {}),
+        ...(reconciled.summary.pendingPermissions?.length
+          ? { pendingPermissions: reconciled.summary.pendingPermissions }
+          : {}),
         ...(typeof reconciled.record?.runtimePid === 'number' && reconciled.record.runtimePid > 0
           ? { runtimePid: reconciled.record.runtimePid }
           : typeof laneRecord.runtimePid === 'number' && laneRecord.runtimePid > 0
@@ -3678,15 +3724,23 @@ async function runListPermissions(envelope: BridgeEnvelope) {
     }
     if (records.length > 0) {
       const requestIds = new Set<string>()
+      const permissionByRequestId = new Map<string, OpenCodePendingPermission>()
       for (const record of records) {
         const reconciled = await openCodeSessionBridge.reconcileSession(record, { limit: 1 })
+        for (const permission of reconciled.summary.pendingPermissions ?? []) {
+          const requestID = permission.requestId.trim()
+          if (requestID) {
+            requestIds.add(requestID)
+            permissionByRequestId.set(requestID, permission.raw)
+          }
+        }
         for (const requestID of reconciled.summary.pendingPermissionRequestIds) {
           if (requestID.trim()) {
             requestIds.add(requestID.trim())
           }
         }
       }
-      permissions = [...requestIds].map(requestID => ({ requestID }))
+      permissions = [...requestIds].map(requestID => permissionByRequestId.get(requestID) ?? { requestID })
     }
   }
   return {

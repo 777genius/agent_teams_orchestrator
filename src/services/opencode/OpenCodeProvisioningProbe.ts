@@ -9,6 +9,7 @@ import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import type {
   OpenCodeAgentResponse,
   OpenCodeProvisioningSnapshot,
+  OpenCodeToolApprovalMode,
 } from './types.js'
 
 type OpenCodeProvisioningProbeDeps = {
@@ -33,6 +34,7 @@ type OpenCodeProvisioningProbeOptions = {
   disposeHostOnRelease?: boolean
   ensureAppMcp?: boolean
   bypassCache?: boolean
+  toolApprovalMode?: OpenCodeToolApprovalMode
 }
 
 type RetainedProvisioningProbe = {
@@ -77,14 +79,19 @@ export class OpenCodeProvisioningProbe {
       useCache: options.bypassCache !== true,
       disposeHostOnRelease: options.disposeHostOnRelease,
       ensureAppMcp: options.ensureAppMcp !== false,
+      toolApprovalMode: options.toolApprovalMode,
     })
     return result.snapshot
   }
 
-  async probeRetainingHost(projectPath?: string | null): Promise<RetainedProvisioningProbe> {
+  async probeRetainingHost(
+    projectPath?: string | null,
+    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode'> = {},
+  ): Promise<RetainedProvisioningProbe> {
     return this.probeWithHost(projectPath, {
       retainHost: true,
       useCache: false,
+      toolApprovalMode: options.toolApprovalMode,
     })
   }
 
@@ -95,12 +102,14 @@ export class OpenCodeProvisioningProbe {
       useCache: boolean
       disposeHostOnRelease?: boolean
       ensureAppMcp?: boolean
+      toolApprovalMode?: OpenCodeToolApprovalMode
     },
   ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await inventoryService.probe(projectPath, {
       bypassCache: !options.useCache,
       includeAppMcp: options.ensureAppMcp !== false,
+      toolApprovalMode: options.toolApprovalMode,
     })
     const cacheKey = [
       inventory.projectPath,
@@ -108,6 +117,7 @@ export class OpenCodeProvisioningProbe {
       inventory.profile?.managedAuthFingerprint ?? 'none',
       inventory.profile?.managedConfigFingerprint ?? 'none',
       options.ensureAppMcp === false ? 'without-app-mcp' : 'with-app-mcp',
+      options.toolApprovalMode ?? 'auto',
     ].join('::')
     const cached = options.useCache ? this.cache.get(cacheKey) : undefined
     if (cached && cached.expiresAt > Date.now()) {
@@ -167,6 +177,9 @@ export class OpenCodeProvisioningProbe {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
+        hostLifetime: options.retainHost || options.disposeHostOnRelease === false
+          ? 'persistent'
+          : 'process',
       })
       await hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
     } catch (error) {

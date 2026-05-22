@@ -1,6 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises'
 
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
@@ -42,7 +42,7 @@ export async function runtimeOpenCodeCommand(opts: {
     }
     const payload = jsonStringify(result) + '\n'
     if (opts.output?.trim()) {
-      await writeFile(opts.output.trim(), payload, 'utf8')
+      await writeOutputFileAtomically(opts.output.trim(), payload)
     } else {
       await writeStdoutAndDrain(payload)
     }
@@ -51,6 +51,17 @@ export async function runtimeOpenCodeCommand(opts: {
     process.off('SIGINT', onSigint)
   }
   process.exit(0)
+}
+
+async function writeOutputFileAtomically(outputPath: string, payload: string): Promise<void> {
+  const tempPath = `${outputPath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await writeFile(tempPath, payload, 'utf8')
+    await rename(tempPath, outputPath)
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined)
+    throw error
+  }
 }
 
 function writeStdoutAndDrain(payload: string): Promise<void> {

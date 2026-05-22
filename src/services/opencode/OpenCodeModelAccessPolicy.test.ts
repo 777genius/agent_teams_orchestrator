@@ -84,6 +84,55 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(true)
   })
 
+  test('requires execution proof for configured Ollama Cloud routes', () => {
+    const cloudCatalog = catalog({
+      configProviders: {
+        providers: [
+          {
+            id: 'ollama',
+            name: 'Ollama',
+            models: {
+              'kimi-k2.6:cloud': {
+                limit: {
+                  context: 262_144,
+                  output: 262_144,
+                },
+                attachment: true,
+                modalities: {
+                  input: ['text', 'image'],
+                  output: ['text'],
+                },
+                name: 'kimi-k2.6:cloud',
+              },
+            },
+          },
+        ],
+        default: {},
+      },
+    })
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'ollama/kimi-k2.6:cloud',
+      catalog: cloudCatalog,
+    })
+    const route = buildOpenCodeModelRouteMetadata({
+      selectedModel: 'ollama/kimi-k2.6:cloud',
+      catalog: cloudCatalog,
+    })
+
+    expect(access).toMatchObject({
+      kind: 'configured_authless',
+      providerId: 'ollama',
+      modelId: 'kimi-k2.6:cloud',
+      launchAllowed: false,
+      requiresExecutionProof: true,
+    })
+    expect(route).toMatchObject({
+      routeKind: 'configured_local',
+      proofState: 'needs_probe',
+      requiresExecutionProof: true,
+    })
+  })
+
   test('requires execution proof for configured authless local providers even when OpenCode reports them connected', () => {
     const localCatalog = catalog({
       connectedProviders: ['llama.cpp'],

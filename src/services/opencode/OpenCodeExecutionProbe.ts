@@ -429,6 +429,7 @@ export class OpenCodeExecutionProbe {
           },
         ],
       },
+      hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
     })
     const preflightLease = createOpenCodePreflightHostLeaseInput(
       `model-probe-${params.selectedModel}`,
@@ -685,7 +686,7 @@ export class OpenCodeExecutionProbe {
         for (const diagnostic of summary.diagnostics) {
           diagnostics.add(diagnostic)
         }
-        latestRawStatus = rawStatus
+        latestRawStatus = summary.rawStatus
         latestDurableState = summary.durableState
         latestAssistantText = summary.latestAssistantText
         latestAssistantPreview = summary.latestAssistantPreview
@@ -704,7 +705,7 @@ export class OpenCodeExecutionProbe {
             outcome: 'available',
             reason: null,
             durationMs: buildDurationMs(startedAtMs),
-            rawStatus,
+            rawStatus: summary.rawStatus,
             durableState: summary.durableState,
             latestAssistantText: summary.latestAssistantText,
             latestAssistantPreview: summary.latestAssistantPreview,
@@ -753,7 +754,7 @@ export class OpenCodeExecutionProbe {
               outcome: 'available',
               reason: null,
               durationMs: buildDurationMs(startedAtMs),
-              rawStatus,
+              rawStatus: summary.rawStatus,
               durableState: summary.durableState,
               latestAssistantText: summary.latestAssistantText,
               latestAssistantPreview: summary.latestAssistantPreview,
@@ -771,7 +772,7 @@ export class OpenCodeExecutionProbe {
             outcome: classified.outcome,
             reason: classified.reason,
             durationMs: buildDurationMs(startedAtMs),
-            rawStatus,
+            rawStatus: summary.rawStatus,
             durableState: summary.durableState,
             latestAssistantText: summary.latestAssistantText,
             latestAssistantPreview: summary.latestAssistantPreview,

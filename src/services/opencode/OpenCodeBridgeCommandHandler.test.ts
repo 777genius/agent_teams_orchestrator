@@ -1213,6 +1213,84 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
+  test('direct MCP proof includes child stderr when local MCP launch closes', async () => {
+    ;(Client.prototype.connect as unknown as (transport: unknown) => Promise<void>) =
+      async transport => {
+        const stderr = (transport as {
+          stderr?: { emit?: (event: 'data', chunk: string) => boolean }
+        }).stderr
+        stderr?.emit?.('data', 'node: bad option: --appimage-extract-and-run\n')
+        throw new Error('Connection closed')
+      }
+    ;(Client.prototype.listTools as unknown as () => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: [],
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'llama.cpp/qwen-test:0.5b',
+        requireExecutionProbe: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.state).toBe('mcp_unavailable')
+    expect(result.data.diagnostics.join('\n')).toContain('Connection closed')
+    expect(result.data.diagnostics.join('\n')).toContain('Agent Teams MCP stderr:')
+    expect(result.data.diagnostics.join('\n')).toContain('node: bad option')
+  })
+
+  test('direct MCP proof does not forward inherited Electron Node env without MCP config env', async () => {
+    const previousElectronRunAsNode = process.env.ELECTRON_RUN_AS_NODE
+    const previousMcpEnvJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON
+    let capturedEnv: Record<string, string> | undefined
+    ;(Client.prototype.connect as unknown as (transport: unknown) => Promise<void>) =
+      async transport => {
+        capturedEnv = (transport as {
+          _serverParams?: { env?: Record<string, string> }
+        })._serverParams?.env
+      }
+    ;(Client.prototype.listTools as unknown as () => Promise<{ tools: Array<{ name: string }> }>) =
+      async () => ({
+        tools: requiredMockMcpTools(),
+      })
+    ;(Client.prototype.close as unknown as () => Promise<void>) = async () => {}
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+
+    try {
+      process.env.ELECTRON_RUN_AS_NODE = 'inherited-global-value'
+      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.readiness', {
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          requireExecutionProbe: false,
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      expect(capturedEnv?.ELECTRON_RUN_AS_NODE).toBeUndefined()
+    } finally {
+      if (previousElectronRunAsNode == null) {
+        delete process.env.ELECTRON_RUN_AS_NODE
+      } else {
+        process.env.ELECTRON_RUN_AS_NODE = previousElectronRunAsNode
+      }
+      if (previousMcpEnvJson == null) {
+        delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON
+      } else {
+        process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = previousMcpEnvJson
+      }
+    }
+  })
+
   test('compatibility mode without execution probe allows built-in free OpenCode models without connected providers', async () => {
     mockRequiredMcpTools()
     openCodeProvisioningProbe.probe = async () =>
@@ -4005,6 +4083,55 @@ describe('OpenCodeBridgeCommandHandler', () => {
       'OpenCode bridge capability snapshot precondition mismatch',
     )
     expect(ensureSessionCalls).toBe(0)
+  })
+
+  test('accepts a fresh launch snapshot after an explicit capability recovery attempt', async () => {
+    let ensureSessionCalls = 0
+    openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    const originalRefreshSessionEnvironment = openCodeSessionBridge.refreshSessionEnvironment
+    openCodeSessionBridge.refreshSessionEnvironment = (async record =>
+      record) as typeof openCodeSessionBridge.refreshSessionEnvironment
+
+    let result: Awaited<ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>>
+    try {
+      result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.launchTeam', {
+          runId: 'run-recovered-capability',
+          laneId: 'secondary:opencode:bob',
+          teamId: 'team-a',
+          teamName: 'team-a',
+          projectPath: '/tmp/project',
+          selectedModel: 'minimax-m2.5-free',
+          expectedCapabilitySnapshotId: 'opencode:stale-snapshot',
+          capabilitySnapshotRecoveryAttemptId: 'recovery-1',
+          members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+        }),
+      )
+    } finally {
+      openCodeSessionBridge.refreshSessionEnvironment = originalRefreshSessionEnvironment
+    }
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.members.bob?.launchState).toBe('created')
+    expect(result.data.diagnostics).toContainEqual(
+      expect.objectContaining({
+        code: 'opencode_capability_snapshot_recovery',
+        severity: 'warning',
+      }),
+    )
+    expect(ensureSessionCalls).toBe(1)
   })
 
   test('rejects launch before creating sessions when the runtime manifest precondition is stale', async () => {
@@ -7127,6 +7254,22 @@ describe('OpenCodeBridgeCommandHandler', () => {
             messageCount: 0,
             durableState: 'blocked',
             pendingPermissionRequestIds: ['perm-bob'],
+            pendingPermissions: [
+              {
+                requestId: 'perm-bob',
+                sessionId: 'session-bob',
+                tool: 'bash',
+                title: 'Run npm test',
+                kind: 'tool',
+                raw: {
+                  requestID: 'perm-bob',
+                  sessionID: 'session-bob',
+                  tool: 'bash',
+                  title: 'Run npm test',
+                  kind: 'tool',
+                },
+              },
+            ],
             messages: [],
           }),
     })) as typeof openCodeSessionBridge.reconcileSession
@@ -7151,6 +7294,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.members.alice?.launchState).toBe('confirmed_alive')
     expect(result.data.members.bob?.launchState).toBe('permission_blocked')
     expect(result.data.members.bob?.pendingPermissionRequestIds).toEqual(['perm-bob'])
+    expect(result.data.members.bob?.pendingPermissions).toMatchObject([
+      {
+        requestId: 'perm-bob',
+        sessionId: 'session-bob',
+        tool: 'bash',
+        title: 'Run npm test',
+      },
+    ])
   })
 
   test('keeps OpenCode permission peers visible when one post-answer reconcile throws', async () => {
@@ -7331,10 +7482,42 @@ describe('OpenCodeBridgeCommandHandler', () => {
           ? buildReconcileSummary({
             sessionId: record.opencodeSessionId,
             pendingPermissionRequestIds: ['perm-1'],
+            pendingPermissions: [
+              {
+                requestId: 'perm-1',
+                sessionId: 'session-alice',
+                tool: 'bash',
+                title: 'Run git status',
+                kind: 'tool',
+                raw: {
+                  requestID: 'perm-1',
+                  sessionID: 'session-alice',
+                  tool: 'bash',
+                  title: 'Run git status',
+                  kind: 'tool',
+                },
+              },
+            ],
           })
           : buildReconcileSummary({
             sessionId: record.opencodeSessionId,
             pendingPermissionRequestIds: ['perm-2', 'perm-1'],
+            pendingPermissions: [
+              {
+                requestId: 'perm-2',
+                sessionId: 'session-bob',
+                tool: 'write',
+                title: 'Write src/file.ts',
+                kind: 'tool',
+                raw: {
+                  requestID: 'perm-2',
+                  sessionID: 'session-bob',
+                  tool: 'write',
+                  title: 'Write src/file.ts',
+                  kind: 'tool',
+                },
+              },
+            ],
           }),
     })) as typeof openCodeSessionBridge.reconcileSession
 
@@ -7353,6 +7536,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.permissions.map(permission => permission.requestId)).toEqual([
       'perm-1',
       'perm-2',
+    ])
+    expect(result.data.permissions).toMatchObject([
+      {
+        requestId: 'perm-1',
+        sessionId: 'session-alice',
+        tool: 'bash',
+        title: 'Run git status',
+      },
+      {
+        requestId: 'perm-2',
+        sessionId: 'session-bob',
+        tool: 'write',
+        title: 'Write src/file.ts',
+      },
     ])
   })
 

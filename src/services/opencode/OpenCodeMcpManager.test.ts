@@ -152,6 +152,75 @@ describe('OpenCodeMcpManager', () => {
     )
   })
 
+  test('reattaches an existing app MCP server when MCP child env changed', async () => {
+    let addCalls = 0
+    let currentMcp: Record<
+      string,
+      {
+        connected: boolean
+        command?: string[]
+        environment?: Record<string, string>
+      }
+    > = {
+      'agent-teams': {
+        connected: true,
+        command: ['/opt/Agent Teams AI/agent-teams-ai', '/tmp/agent-teams-mcp.js'],
+        environment: {},
+      },
+    }
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => currentMcp,
+          addMcp: async (_name, config) => {
+            addCalls += 1
+            currentMcp = {
+              'agent-teams': {
+                connected: true,
+                command: config.command ?? [],
+                environment: config.environment ?? {},
+              },
+            }
+            return currentMcp
+          },
+        }),
+      },
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/Agent Teams AI/agent-teams-ai',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp.js',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify([
+          '/tmp/agent-teams-mcp.js',
+        ]),
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({
+          ELECTRON_RUN_AS_NODE: '1',
+        }),
+      },
+      resolveLaunchConfig: async () => ({
+        source: 'env-override',
+        config: {
+          type: 'local',
+          command: ['/opt/Agent Teams AI/agent-teams-ai', '/tmp/agent-teams-mcp.js'],
+          environment: {
+            ELECTRON_RUN_AS_NODE: '1',
+          },
+          enabled: true,
+          timeout: 8000,
+        },
+      }),
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(addCalls).toBe(1)
+    expect(result.summary.status).toBe('attached')
+    expect(result.summary.diagnostics[0]).toContain('current MCP child environment')
+    expect(currentMcp['agent-teams'].environment.ELECTRON_RUN_AS_NODE).toBe('1')
+  })
+
   test('uses resolved config to verify an existing app MCP server when /mcp omits environment', async () => {
     let addCalls = 0
 
@@ -407,6 +476,7 @@ describe('OpenCodeMcpManager', () => {
         OPENCODE_CONFIG_CONTENT: '{"mcp":{}}',
         OPENCODE_SERVER_PASSWORD: 'secret',
         SAFE_ENV: 'forward-me',
+        ELECTRON_RUN_AS_NODE: '1',
         PATH: '/usr/local/bin:/usr/bin',
         CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:43123',
         AGENT_TEAMS_MCP_CLAUDE_DIR: '/Users/test/.claude',
@@ -431,6 +501,7 @@ describe('OpenCodeMcpManager', () => {
       },
     })
     expect(result.config.environment?.SAFE_ENV).toBeUndefined()
+    expect(result.config.environment?.ELECTRON_RUN_AS_NODE).toBeUndefined()
     expect(result.config.environment?.OPENCODE_CONFIG_CONTENT).toBeUndefined()
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
@@ -622,6 +693,59 @@ describe('OpenCodeMcpManager', () => {
       '/tmp/tsx-cli.mjs',
       '/tmp/agent-teams-mcp/src/index.ts',
     ])
+  })
+
+  test('applies MCP env JSON only to local MCP launch config', async () => {
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/Agent Teams AI/agent-teams-ai',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp/index.js',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify([
+          '/tmp/agent-teams-mcp/index.js',
+        ]),
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({
+          ELECTRON_RUN_AS_NODE: '1',
+        }),
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config.command).toEqual([
+      '/opt/Agent Teams AI/agent-teams-ai',
+      '/tmp/agent-teams-mcp/index.js',
+    ])
+    expect(result.config.environment?.ELECTRON_RUN_AS_NODE).toBe('1')
+  })
+
+  test('rejects invalid MCP env JSON for local MCP launch config', async () => {
+    await expect(
+      resolveOpenCodeAppMcpLaunchConfig({
+        env: {
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/Agent Teams AI/agent-teams-ai',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp/index.js',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: '{',
+        },
+        pathExists: async () => false,
+      }),
+    ).rejects.toThrow('CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON must be a JSON object')
+  })
+
+  test('rejects non-string MCP env JSON values for local MCP launch config', async () => {
+    await expect(
+      resolveOpenCodeAppMcpLaunchConfig({
+        env: {
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/opt/Agent Teams AI/agent-teams-ai',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp/index.js',
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({
+            ELECTRON_RUN_AS_NODE: true,
+          }),
+        },
+        pathExists: async () => false,
+      }),
+    ).rejects.toThrow(
+      'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON value for ELECTRON_RUN_AS_NODE must be a string',
+    )
   })
 
   test('resolves workspace source MCP launch through node and the tsx CLI entrypoint', async () => {

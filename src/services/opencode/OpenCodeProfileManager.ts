@@ -33,6 +33,7 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeToolApprovalMode,
 } from './types.js'
 
 export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
@@ -124,6 +125,47 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
+}
+
+function buildOpenCodeTeammatePermission(
+  toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
+): Record<string, unknown> {
+  if (toolApprovalMode === 'manual') {
+    return {
+      '*': 'ask',
+      task: {
+        '*': 'deny',
+      },
+      external_directory: 'deny',
+      doom_loop: 'deny',
+      'agent-teams_*': 'allow',
+      'agent_teams_*': 'allow',
+      'mcp__agent-teams__*': 'allow',
+      'mcp__agent_teams__*': 'allow',
+    }
+  }
+
+  return {
+    '*': 'deny',
+    read: 'allow',
+    glob: 'allow',
+    grep: 'allow',
+    list: 'allow',
+    lsp: 'allow',
+    todoread: 'allow',
+    todowrite: 'allow',
+    edit: 'allow',
+    bash: 'allow',
+    task: {
+      '*': 'deny',
+    },
+    external_directory: 'deny',
+    doom_loop: 'deny',
+    'agent-teams_*': 'allow',
+    'agent_teams_*': 'allow',
+    'mcp__agent-teams__*': 'allow',
+    'mcp__agent_teams__*': 'allow',
+  }
 }
 
 function parseProviderScopedModelId(value: string): {
@@ -350,6 +392,7 @@ export function buildManagedConfig(
     allowAutoUpdate?: boolean
     defaultModelId?: string | null
     modelOutputLimitOverrides?: OpenCodePrepareProfileOptions['modelOutputLimitOverrides']
+    toolApprovalMode?: OpenCodeToolApprovalMode
   } = {},
 ): Record<string, unknown> {
   const config: Record<string, unknown> = {
@@ -364,25 +407,7 @@ export function buildManagedConfig(
       [OPEN_CODE_TEAMMATE_AGENT_NAME]: {
         mode: 'primary',
         description: 'Managed teammate agent for claude-multimodel runtime orchestration.',
-        permission: {
-          '*': 'deny',
-          read: 'allow',
-          glob: 'allow',
-          grep: 'allow',
-          list: 'allow',
-          lsp: 'allow',
-          todoread: 'allow',
-          todowrite: 'allow',
-          edit: 'allow',
-          bash: 'allow',
-          task: {
-            '*': 'deny',
-          },
-          external_directory: 'deny',
-          doom_loop: 'deny',
-          'agent-teams_*': 'allow',
-          'agent_teams_*': 'allow',
-        },
+        permission: buildOpenCodeTeammatePermission(options.toolApprovalMode),
       },
       [OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME]: {
         mode: 'primary',
@@ -745,6 +770,7 @@ export class OpenCodeProfileManager {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
         defaultModelId: effectiveManagedDefaultModelId,
         modelOutputLimitOverrides: options.modelOutputLimitOverrides,
+        toolApprovalMode: options.toolApprovalMode,
       }),
     )
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {

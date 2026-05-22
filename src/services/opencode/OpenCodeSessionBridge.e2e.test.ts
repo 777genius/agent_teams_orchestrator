@@ -88,6 +88,15 @@ const liveTest =
   process.env.OPENCODE_E2E === '1'
     ? test
     : test.skip
+const permissionLiveTest =
+  process.env.OPENCODE_E2E === '1' &&
+  process.env.OPENCODE_PERMISSION_LIVE_E2E === '1'
+    ? test
+    : test.skip
+
+async function delayMs(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms))
+}
 
 describe('OpenCodeSessionBridge live e2e', () => {
   liveTest('reconciles a simple assistant reply against a real OpenCode host', async () => {
@@ -241,6 +250,97 @@ describe('OpenCodeSessionBridge live e2e', () => {
       })
     }
   }, 120_000)
+
+  permissionLiveTest('surfaces and answers a real manual permission request', async () => {
+    const selectedModel = await getLiveModel()
+    const identity = buildUniqueIdentity('opencode-live-permission')
+    const projectPath = await createTempProject('opencode-session-bridge-live-permission')
+    let record: Awaited<ReturnType<typeof openCodeSessionBridge.ensureSession>> | undefined
+
+    try {
+      record = await withTimeout(
+        openCodeSessionBridge.ensureSession({
+          ...identity,
+          selectedModel,
+          projectPath,
+          toolApprovalMode: 'manual',
+          fresh: true,
+        }),
+        30_000,
+        'ensureSession(permission)',
+      )
+
+      await withTimeout(
+        openCodeSessionBridge.promptAsync(record, {
+          text: [
+            'Run exactly this shell command and then reply with the output:',
+            'printf opencode-approval-smoke',
+          ].join('\n'),
+        }),
+        20_000,
+        'promptAsync(permission)',
+      )
+
+      const blocked = await withTimeout(
+        (async () => {
+          for (let attempt = 0; attempt < 60; attempt += 1) {
+            const reconciled = await openCodeSessionBridge.reconcileSession(record!)
+            const requestId = reconciled.summary.pendingPermissionRequestIds[0]
+            if (requestId) {
+              return { reconciled, requestId }
+            }
+            await delayMs(1_000)
+          }
+          throw new Error('OpenCode manual permission did not surface')
+        })(),
+        75_000,
+        'waitForPermission',
+      )
+
+      expect(blocked.reconciled.summary.durableState).toBe('blocked')
+      expect(blocked.reconciled.summary.pendingPermissions?.[0]).toMatchObject({
+        sessionId: record.opencodeSessionId,
+      })
+
+      await withTimeout(
+        openCodeSessionBridge.answerPermission(record, {
+          requestId: blocked.requestId,
+          decision: 'allow',
+        }),
+        20_000,
+        'answerPermission',
+      )
+
+      const completed = await withTimeout(
+        (async () => {
+          for (let attempt = 0; attempt < 90; attempt += 1) {
+            const reconciled = await openCodeSessionBridge.reconcileSession(record!)
+            const output = JSON.stringify(reconciled.summary)
+            if (
+              reconciled.summary.pendingPermissionRequestIds.length === 0 &&
+              output.includes('opencode-approval-smoke')
+            ) {
+              return reconciled
+            }
+            await delayMs(1_000)
+          }
+          throw new Error('OpenCode did not resume after manual permission allow')
+        })(),
+        110_000,
+        'waitForPermissionResume',
+      )
+
+      expect(completed.summary.pendingPermissionRequestIds).toEqual([])
+      expect(JSON.stringify(completed.summary)).toContain('opencode-approval-smoke')
+    } finally {
+      await cleanupLiveSession({
+        projectPath,
+        record,
+        identity,
+        reason: 'opencode-permission-live-e2e-cleanup',
+      })
+    }
+  }, 180_000)
 })
 
 async function removeTempDirWithRetries(dirPath: string): Promise<void> {

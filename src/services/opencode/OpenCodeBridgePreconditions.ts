@@ -19,11 +19,17 @@ export type OpenCodeBridgeCommandEvidence = {
   idempotencyKey?: string
   manifestHighWatermark: number | null
   runtimeStoreManifestHighWatermark: number | null
+  capabilitySnapshotRecovery?: {
+    expectedCapabilitySnapshotId: string
+    actualCapabilitySnapshotId: string | null
+    recoveryAttemptId: string
+  }
 }
 
 type ValidationInput = {
   body: Record<string, unknown>
   runtime: OpenCodeBridgePreconditionRuntime
+  allowCapabilitySnapshotRecovery?: boolean
 }
 
 export function validateOpenCodeBridgeStateChangingPreconditions(
@@ -55,11 +61,26 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
   )
   const expectedCapabilitySnapshotId =
     preconditions?.expectedCapabilitySnapshotId ?? bodyCapabilitySnapshotId ?? null
+  const recoveryAttemptId = asOptionalString(
+    input.body.capabilitySnapshotRecoveryAttemptId,
+    'capabilitySnapshotRecoveryAttemptId',
+  )
+  let capabilitySnapshotRecovery: OpenCodeBridgeCommandEvidence['capabilitySnapshotRecovery']
   if (
     expectedCapabilitySnapshotId &&
     input.runtime.capabilitySnapshotId !== expectedCapabilitySnapshotId
   ) {
-    throw new Error('OpenCode bridge capability snapshot precondition mismatch')
+    if (input.allowCapabilitySnapshotRecovery === true && recoveryAttemptId) {
+      capabilitySnapshotRecovery = {
+        expectedCapabilitySnapshotId,
+        actualCapabilitySnapshotId: input.runtime.capabilitySnapshotId,
+        recoveryAttemptId,
+      }
+    } else {
+      throw new Error(
+        `OpenCode bridge capability snapshot precondition mismatch (expected ${expectedCapabilitySnapshotId}, actual ${input.runtime.capabilitySnapshotId ?? 'null'})`,
+      )
+    }
   }
 
   const bodyManifestHighWatermark = asOptionalNullableNumber(
@@ -80,6 +101,7 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
     ...(preconditions ? { idempotencyKey: preconditions.idempotencyKey } : {}),
     manifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
     runtimeStoreManifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
+    ...(capabilitySnapshotRecovery ? { capabilitySnapshotRecovery } : {}),
   }
 }
 

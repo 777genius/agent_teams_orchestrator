@@ -401,6 +401,7 @@ describe('OpenCodeProvisioningProbe', () => {
       expect.objectContaining({
         projectPath: '/tmp/project',
         preparedProfile: profile,
+        hostLifetime: 'persistent',
       }),
     ])
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])

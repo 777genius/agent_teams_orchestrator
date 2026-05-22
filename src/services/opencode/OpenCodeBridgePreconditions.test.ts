@@ -46,6 +46,31 @@ describe('OpenCodeBridgePreconditions', () => {
     ).toThrow('capability snapshot precondition mismatch')
   })
 
+  test('allows a fresh capability snapshot when launch is an explicit recovery attempt', () => {
+    const result = validateOpenCodeBridgeStateChangingPreconditions({
+      body: {
+        runId: 'run-1',
+        expectedCapabilitySnapshotId: 'cap-old',
+        capabilitySnapshotRecoveryAttemptId: 'recovery-1',
+      },
+      runtime: {
+        capabilitySnapshotId: 'cap-new',
+        runtimeStoreManifestHighWatermark: 0,
+      },
+      allowCapabilitySnapshotRecovery: true,
+    })
+
+    expect(result).toEqual({
+      manifestHighWatermark: 0,
+      runtimeStoreManifestHighWatermark: 0,
+      capabilitySnapshotRecovery: {
+        expectedCapabilitySnapshotId: 'cap-old',
+        actualCapabilitySnapshotId: 'cap-new',
+        recoveryAttemptId: 'recovery-1',
+      },
+    })
+  })
+
   test('accepts matching laneId preconditions for state-changing commands', () => {
     expect(() =>
       validateOpenCodeBridgeStateChangingPreconditions({
