@@ -8,6 +8,9 @@ import {
   createOpenCodeInventoryProbeProgressTracker,
   execOpenCodePortableCommand,
   getOpenCodeVerboseModelsArgs,
+  OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
+  OPEN_CODE_PROBE_TIMEOUT_MS,
   isOpenCodeBuiltinFreeModelId,
   isOpenCodeInventoryTimeoutSnapshot,
   parseOpenCodeAgentListOutput,
@@ -55,6 +58,15 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
+    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
+      OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
+    )
+    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      OPEN_CODE_PROBE_TIMEOUT_MS * 5,
+    )
+  })
+
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
     expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
   })
@@ -254,11 +266,11 @@ describe('OpenCodeInventoryService parsers', () => {
           projectPath: tempDir,
           env: process.env,
         } as OpenCodePreparedProfile,
-        timeoutMs: 500,
+        timeoutMs: 2_000,
       })
 
       expect(result.code).toBe(1)
-      expect(result.error).toBe('OpenCode command timed out after 500ms')
+      expect(result.error).toBe('OpenCode command timed out after 2000ms')
       expect(result.stdout).toBe('started')
       expect(result.stderr).toBe('warming up')
     } finally {

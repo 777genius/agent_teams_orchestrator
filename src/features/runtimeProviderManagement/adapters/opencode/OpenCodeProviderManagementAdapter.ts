@@ -137,6 +137,7 @@ type OpenCodeProviderManagementAdapterDeps = {
       projectPath?: string | null
       prompt?: string
       expectedOutput?: string
+      bypassCache?: boolean
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
@@ -174,6 +175,15 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
 }
 
 const SEEDED_PROVIDER_IDS = ['openrouter', 'opencode', 'atlascloud'] as const
+const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>(['atlascloud'])
+const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>(['atlascloud'])
+const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
+  atlascloud: [
+    'atlascloud/deepseek-ai/deepseek-v3.2',
+    'atlascloud/deepseek-ai/deepseek-v4-flash',
+    'atlascloud/zai-org/glm-5.1',
+  ],
+}
 const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   ...SEEDED_PROVIDER_IDS,
   'anthropic',
@@ -388,6 +398,13 @@ function getConnectedProviderMap(
 
   for (const providerId of providers?.connected ?? []) {
     const normalizedProviderId = normalizeProviderId(providerId)
+    if (
+      normalizedProviderId &&
+      PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE.has(normalizedProviderId) &&
+      !connected.has(normalizedProviderId)
+    ) {
+      continue
+    }
     if (normalizedProviderId && !connected.has(normalizedProviderId)) {
       connected.set(normalizedProviderId, null)
     }
@@ -952,6 +969,14 @@ function getOwnership(input: {
   }
 
   return []
+}
+
+function requiresExplicitCredentialEvidence(providerId: string): boolean {
+  return PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE.has(providerId)
+}
+
+function requiresConnectExecutionProof(providerId: string): boolean {
+  return PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF.has(providerId)
 }
 
 function hasExplicitConnectionEvidence(
@@ -1889,6 +1914,36 @@ function collectProviderModelIds(input: {
   return Array.from(modelIds).sort((left, right) => left.localeCompare(right))
 }
 
+function getProviderCredentialValidationModelId(input: {
+  providerId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): string | null {
+  const modelIds = collectProviderModelIds(input)
+  if (modelIds.length === 0) {
+    return null
+  }
+
+  const defaultModelId = getDefaultModelForProvider(
+    input.providerId,
+    input.inventory,
+    input.configProviders,
+    input.providers,
+  )
+  if (defaultModelId && modelIds.includes(defaultModelId)) {
+    return defaultModelId
+  }
+
+  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]
+    ?.find(modelId => modelIds.includes(modelId))
+  if (preferredModelId) {
+    return preferredModelId
+  }
+
+  return modelIds[0] ?? null
+}
+
 function buildProviderDirectoryModelSearchIndex(input: {
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
@@ -2824,45 +2879,47 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
 
-        const providerEvidenceView = await readLiveView({
-          inventory,
-          host,
-          client,
-          diagnostics: [
-            ...inventory.diagnostics,
-            ...safeReadDiagnostics(configProvidersResult),
-            ...safeReadDiagnostics(providersResult),
-            ...safeReadDiagnostics(providerAuthResult),
-            ...safeReadDiagnostics(serverDocResult),
-          ],
-        })
-        const providerEvidence = findProviderConnection(providerEvidenceView, providerId)
-        if (!providerEvidence) {
-          await this.rollbackProviderAuth({
+        if (!requiresExplicitCredentialEvidence(providerId)) {
+          const providerEvidenceView = await readLiveView({
+            inventory,
+            host,
             client,
-            providerId,
-            authPaths: [globalAuthPath, managedAuthPath],
-            canDeleteProviderAuth,
+            diagnostics: [
+              ...inventory.diagnostics,
+              ...safeReadDiagnostics(configProvidersResult),
+              ...safeReadDiagnostics(providersResult),
+              ...safeReadDiagnostics(providerAuthResult),
+              ...safeReadDiagnostics(serverDocResult),
+            ],
           })
-          return providerManagementError(
-            'provider-missing',
-            `OpenCode did not return provider ${providerId} after connecting`,
-          )
-        }
-        if (
-          providerEvidence.state !== 'connected' ||
-          !providerEvidence.ownership.includes('managed')
-        ) {
-          await this.rollbackProviderAuth({
-            client,
-            providerId,
-            authPaths: [globalAuthPath, managedAuthPath],
-            canDeleteProviderAuth,
-          })
-          return providerManagementError(
-            'auth-failed',
-            `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
-          )
+          const providerEvidence = findProviderConnection(providerEvidenceView, providerId)
+          if (!providerEvidence) {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: [globalAuthPath, managedAuthPath],
+              canDeleteProviderAuth,
+            })
+            return providerManagementError(
+              'provider-missing',
+              `OpenCode did not return provider ${providerId} after connecting`,
+            )
+          }
+          if (
+            providerEvidence.state !== 'connected' ||
+            !providerEvidence.ownership.includes('managed')
+          ) {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: [globalAuthPath, managedAuthPath],
+              canDeleteProviderAuth,
+            })
+            return providerManagementError(
+              'auth-failed',
+              `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
+            )
+          }
         }
 
         const authStore = this.getAuthStore()
@@ -2924,6 +2981,56 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             'auth-failed',
             `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
           )
+        }
+        if (requiresConnectExecutionProof(providerId)) {
+          const validationModelId = getProviderCredentialValidationModelId({
+            providerId,
+            inventory: refresh.inventory,
+            configProviders,
+            providers,
+          })
+          if (!validationModelId) {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: [globalAuthPath, managedAuthPath],
+              canDeleteProviderAuth,
+            })
+            return providerManagementError(
+              'model-missing',
+              `OpenCode did not expose a probeable model for provider ${providerId}`,
+            )
+          }
+
+          const probeResult = await this.getExecutionProbe().probeModel({
+            selectedModel: validationModelId,
+            projectPath: refresh.inventory.projectPath,
+            bypassCache: true,
+          })
+          if (probeResult.outcome !== 'available') {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: [globalAuthPath, managedAuthPath],
+              canDeleteProviderAuth,
+            })
+            const probeReason = redactSecret(
+              probeResult.reason ?? `Model probe failed for ${validationModelId}`,
+              apiKey,
+            )
+            if (probeResult.outcome === 'not_authenticated') {
+              return providerManagementError(
+                'auth-failed',
+                probeResult.reason
+                  ? probeReason
+                  : `Provider authentication failed for ${validationModelId}`,
+              )
+            }
+            return providerManagementError(
+              'model-test-failed',
+              probeReason,
+            )
+          }
         }
         return { ok: true, value: provider }
       },

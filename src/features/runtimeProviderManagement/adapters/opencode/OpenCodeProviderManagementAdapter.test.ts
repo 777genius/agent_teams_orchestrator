@@ -444,6 +444,58 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(openrouter?.actions.map(action => action.id)).toEqual(['connect'])
   })
 
+  test('does not mark Atlas Cloud connected from config-only OpenCode provider state', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          connectedProviders: [],
+          availableProviders: ['atlascloud'],
+          models: ['atlascloud/deepseek-ai/deepseek-v3.2'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'atlascloud',
+                name: 'Atlas Cloud',
+                models: {
+                  'deepseek-ai/DeepSeek-V3.1': {},
+                  'deepseek-ai/deepseek-v3.2': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'atlascloud', name: 'Atlas Cloud' }],
+            connected: ['atlascloud'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ atlascloud: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const atlasCloud = result.value.providers.find(provider => provider.providerId === 'atlascloud')
+    expect(atlasCloud).toMatchObject({
+      state: 'available',
+      ownership: [],
+      modelCount: 2,
+      detail: 'Provider is visible in the OpenCode model catalog',
+    })
+    expect(atlasCloud?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
   test('keeps the current OpenCode default in the configured models panel even before catalog hydration', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -1309,6 +1361,219 @@ describe('OpenCodeProviderManagementAdapter', () => {
       state: 'connected',
       ownership: ['managed'],
     })
+  })
+
+  test('connects Atlas Cloud only after storing the user-provided API key', async () => {
+    const authWrites: Array<{ authPath: string; providerId: string; key: string }> = []
+    const modelProbes: Array<{ selectedModel: string; bypassCache: boolean | undefined }> = []
+    let authApplied = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory(options?.bypassCache
+          ? {
+              connectedProviders: [
+                {
+                  id: 'atlascloud',
+                  authHint: 'api',
+                  source: 'credentials',
+                  credentialScopes: ['managed'],
+                },
+              ],
+              availableProviders: ['atlascloud'],
+              models: ['atlascloud/deepseek-ai/deepseek-v3.2'],
+            }
+          : {
+              connectedProviders: [],
+              availableProviders: ['atlascloud'],
+              models: ['atlascloud/deepseek-ai/deepseek-v3.2'],
+            }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'atlascloud',
+                name: 'Atlas Cloud',
+                models: {
+                  'deepseek-ai/DeepSeek-V3.1': {},
+                  'deepseek-ai/deepseek-v3.2': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'atlascloud', name: 'Atlas Cloud' }],
+            connected: authApplied ? ['atlascloud'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ atlascloud: [{ type: 'api' }] }),
+          setProviderAuth: async () => {
+            authApplied = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async input => {
+          authWrites.push({
+            authPath: input.authPath,
+            providerId: input.providerId,
+            key: input.auth.key,
+          })
+        },
+        removeCredential: async () => {},
+      },
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push({
+            selectedModel: input.selectedModel,
+            bypassCache: input.bypassCache,
+          })
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'atlascloud',
+      apiKey: 'atlas-user-token',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(authWrites).toEqual([
+      {
+        authPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        providerId: 'atlascloud',
+        key: 'atlas-user-token',
+      },
+      {
+        authPath: '/tmp/profile/data/opencode/auth.json',
+        providerId: 'atlascloud',
+        key: 'atlas-user-token',
+      },
+    ])
+    expect(modelProbes).toEqual([{
+      selectedModel: 'atlascloud/deepseek-ai/deepseek-v3.2',
+      bypassCache: true,
+    }])
+    expect(result.value).toMatchObject({
+      providerId: 'atlascloud',
+      state: 'connected',
+      ownership: ['managed'],
+    })
+  })
+
+  test('rejects Atlas Cloud connect when the user-provided API key fails model execution proof', async () => {
+    const authWrites: Array<{ authPath: string; providerId: string; key: string }> = []
+    const removedCredentials: Array<{ authPath: string; providerId: string }> = []
+    let deleteProviderAuthCalled = false
+    let authApplied = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory(options?.bypassCache
+          ? {
+              connectedProviders: [
+                {
+                  id: 'atlascloud',
+                  authHint: 'api',
+                  source: 'credentials',
+                  credentialScopes: ['managed'],
+                },
+              ],
+              availableProviders: ['atlascloud'],
+              models: ['atlascloud/deepseek-ai/deepseek-v3.2'],
+            }
+          : {
+              connectedProviders: [],
+              availableProviders: ['atlascloud'],
+              models: ['atlascloud/deepseek-ai/deepseek-v3.2'],
+            }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'atlascloud',
+                name: 'Atlas Cloud',
+                models: { 'deepseek-ai/deepseek-v3.2': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'atlascloud', name: 'Atlas Cloud' }],
+            connected: authApplied ? ['atlascloud'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ atlascloud: [{ type: 'api' }] }),
+          getServerDoc: async () => ({ paths: { '/auth/{providerID}': { delete: {} } } }),
+          setProviderAuth: async () => {
+            authApplied = true
+            return true
+          },
+          deleteProviderAuth: async () => {
+            deleteProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async input => {
+          authWrites.push({
+            authPath: input.authPath,
+            providerId: input.providerId,
+            key: input.auth.key,
+          })
+        },
+        removeCredential: async input => {
+          removedCredentials.push(input)
+        },
+      },
+      executionProbe: {
+        probeModel: async input =>
+          executionProbeResult(
+            input.selectedModel,
+            'not_authenticated',
+            'Unauthorized bad-atlas-token',
+          ),
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'atlascloud',
+      apiKey: 'bad-atlas-token',
+    })
+
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-failed')
+    expect(failure.message).toContain('Unauthorized')
+    expect(failure.message).not.toContain('bad-atlas-token')
+    expect(authWrites).toHaveLength(2)
+    expect(deleteProviderAuthCalled).toBe(true)
+    expect(removedCredentials).toEqual([
+      {
+        authPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        providerId: 'atlascloud',
+      },
+      {
+        authPath: '/tmp/profile/data/opencode/auth.json',
+        providerId: 'atlascloud',
+      },
+    ])
   })
 
   test('persists accepted OpenCode auth writes into the managed auth store after live provider evidence', async () => {

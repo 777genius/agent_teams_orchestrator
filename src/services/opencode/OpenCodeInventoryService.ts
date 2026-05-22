@@ -23,9 +23,9 @@ import type {
   OpenCodeToolApprovalMode,
 } from './types.js'
 
-const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
+export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
-export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = 12_000
+export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
 

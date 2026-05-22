@@ -680,6 +680,73 @@ describe('OpenCodeExecutionProbe', () => {
     expect(createSessionCount).toBe(1)
   })
 
+  test('bypasses in-memory probe cache when requested', async () => {
+    let createSessionCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => {
+            throw new Error('not used')
+          },
+          getConfigProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviders: async () => {
+            throw new Error('not used')
+          },
+          getProviderAuth: async () => {
+            throw new Error('not used')
+          },
+          listAgents: async () => {
+            throw new Error('not used')
+          },
+          getMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            createSessionCount += 1
+            return { id: `session-${createSessionCount}` }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ [`session-${createSessionCount}`]: 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: `msg-assistant-${createSessionCount}`,
+                role: 'assistant',
+                parentID: `msg-user-${createSessionCount}`,
+                sessionID: `session-${createSessionCount}`,
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const input = {
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    }
+    const first = await probe.probeModel(input)
+    const second = await probe.probeModel({ ...input, bypassCache: true })
+    const third = await probe.probeModel(input)
+
+    expect(first.outcome).toBe('available')
+    expect(second.outcome).toBe('available')
+    expect(third.outcome).toBe('available')
+    expect(createSessionCount).toBe(2)
+  })
+
   test('deduplicates concurrent probes across probe instances with the persistent cache', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-probe-cache-'))
     try {

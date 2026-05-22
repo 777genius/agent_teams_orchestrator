@@ -56,6 +56,7 @@ type ProbeModelParams = {
   projectPath?: string | null
   prompt?: string
   expectedOutput?: string
+  bypassCache?: boolean
   disposeHostOnRelease?: boolean
 }
 
@@ -366,37 +367,43 @@ export class OpenCodeExecutionProbe {
 
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const cacheKey = buildProbeCacheKey(params)
-    const cached = this.probeCache.get(cacheKey)
-    if (cached && cached.expiresAtMs > nowMs()) {
-      return cloneProbeResult(cached.result)
-    }
-    if (cached) {
-      this.probeCache.delete(cacheKey)
-    }
+    if (!params.bypassCache) {
+      const cached = this.probeCache.get(cacheKey)
+      if (cached && cached.expiresAtMs > nowMs()) {
+        return cloneProbeResult(cached.result)
+      }
+      if (cached) {
+        this.probeCache.delete(cacheKey)
+      }
 
-    const inFlight = this.inFlightProbes.get(cacheKey)
-    if (inFlight) {
-      return cloneProbeResult(await inFlight)
+      const inFlight = this.inFlightProbes.get(cacheKey)
+      if (inFlight) {
+        return cloneProbeResult(await inFlight)
+      }
     }
 
     const request = this.runProbeModel({ ...params, cacheKey })
       .then(result => {
-        const ttlMs = getProbeResultCacheTtlMs(result)
-        if (ttlMs > 0) {
-          this.probeCache.set(cacheKey, {
-            expiresAtMs: nowMs() + ttlMs,
-            result: cloneProbeResult(result),
-          })
+        if (!params.bypassCache) {
+          const ttlMs = getProbeResultCacheTtlMs(result)
+          if (ttlMs > 0) {
+            this.probeCache.set(cacheKey, {
+              expiresAtMs: nowMs() + ttlMs,
+              result: cloneProbeResult(result),
+            })
+          }
         }
         return result
       })
       .finally(() => {
-        if (this.inFlightProbes.get(cacheKey) === request) {
+        if (!params.bypassCache && this.inFlightProbes.get(cacheKey) === request) {
           this.inFlightProbes.delete(cacheKey)
         }
       })
 
-    this.inFlightProbes.set(cacheKey, request)
+    if (!params.bypassCache) {
+      this.inFlightProbes.set(cacheKey, request)
+    }
     return cloneProbeResult(await request)
   }
 
@@ -437,7 +444,7 @@ export class OpenCodeExecutionProbe {
     await this.hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
 
     try {
-      const cachePaths = this.persistentCacheEnabled
+      const cachePaths = this.persistentCacheEnabled && !params.bypassCache
         ? getPersistentProbeCachePaths({
           cacheKey: params.cacheKey ?? buildProbeCacheKey(params),
           host,
