@@ -69,8 +69,8 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
       process.env.CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS = 'not-a-number'
       process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 'not-a-number'
       expect(__getProcessReadinessTimeoutsForTests()).toEqual({
-        runtimeReadyMs: 30_000,
-        inboxPollerReadyMs: 10_000,
+        runtimeReadyMs: 90_000,
+        inboxPollerReadyMs: 30_000,
       })
     },
     20_000,

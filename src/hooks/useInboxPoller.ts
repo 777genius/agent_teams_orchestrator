@@ -33,6 +33,7 @@ import {
 import { applyPermissionUpdate } from '../utils/permissions/PermissionUpdate.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import { isToolSearchEnabledOptimistic } from '../utils/toolSearch.js'
+import { getCwd } from '../utils/cwd.js'
 import { isInsideTmux } from '../utils/swarm/backends/detection.js'
 import {
   ensureBackendsRegistered,
@@ -54,7 +55,9 @@ import {
 } from '../utils/swarm/teamHelpers.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import {
+  getAgentId,
   getAgentName,
+  getTeamName,
   getTeammateColor,
   isPlanModeRequired,
   isTeamLead,
@@ -3501,13 +3504,27 @@ export function useInboxPoller({
       hasDoneInitialPollRef.current = true
       if (!didWriteInboxPollerReadyRef.current && isTeammate()) {
         didWriteInboxPollerReadyRef.current = true
-        void writeChildOwnedTeammateRuntimeEvent({
-          type: 'inbox_poller_ready',
-          teamName: currentAppState.teamContext?.teamName,
-          agentName,
-          agentId: currentAppState.teamContext?.selfAgentId,
-          runId: getSessionId(),
-        })
+        const teamName = getTeamName(currentAppState.teamContext)
+        const agentId = getAgentId() ?? currentAppState.teamContext?.selfAgentId
+        const runId = getSessionId()
+        void (async () => {
+          await writeChildOwnedTeammateRuntimeEvent({
+            type: 'runtime_ready',
+            teamName,
+            agentName,
+            agentId,
+            runId,
+            cwd: getCwd(),
+            detail: 'inbox poller mounted',
+          })
+          await writeChildOwnedTeammateRuntimeEvent({
+            type: 'inbox_poller_ready',
+            teamName,
+            agentName,
+            agentId,
+            runId,
+          })
+        })()
       }
       void poll()
     }

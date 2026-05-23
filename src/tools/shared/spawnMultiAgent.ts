@@ -1374,8 +1374,8 @@ const PROCESS_SPAWN_SMOKE_DELAY_MS = 800
 const PROCESS_RUNTIME_READY_TIMEOUT_ENV = 'CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS'
 const PROCESS_INBOX_POLLER_READY_TIMEOUT_ENV =
   'CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS'
-const DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS = 30_000
-const DEFAULT_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 10_000
+const DEFAULT_PROCESS_RUNTIME_READY_TIMEOUT_MS = 90_000
+const DEFAULT_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 30_000
 const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 90_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
@@ -2821,6 +2821,15 @@ async function handleSpawnNativeProcess(
         expectedAgentId: teammateId,
         teamName,
       })
+      const stderrTail = await readProcessLogTail(runtimePaths.stderrPath)
+      const stdoutTail = await readProcessLogTail(runtimePaths.stdoutPath)
+      const detail = [
+        inboxPollerReady.reason,
+        stderrTail ? `Last stderr:\n${stderrTail}` : '',
+        stdoutTail ? `Last stdout:\n${stdoutTail}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
       await writeParentOwnedTeammateRuntimeEvent({
         type: 'failed',
         eventsPath: runtimePaths.eventsPath,
@@ -2831,10 +2840,10 @@ async function handleSpawnNativeProcess(
         runId: getSessionId(),
         bootstrapRunId,
         source: 'spawnMultiAgent.process',
-        detail: inboxPollerReady.reason,
+        detail,
       })
       throw new Error(
-        `Teammate process ${teammateId} did not become inbox_poller_ready: ${inboxPollerReady.reason}`,
+        `Teammate process ${teammateId} did not become inbox_poller_ready: ${detail}`,
       )
     }
 

@@ -171,10 +171,6 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
-import {
-  TEAMMATE_STARTUP_READY_SENTINEL_ENV,
-  writeStartupReadySentinel,
-} from './utils/swarm/startupReadySentinel.js';
 import { writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
@@ -1258,18 +1254,6 @@ async function run(): Promise<CommanderCommand> {
         });
         if (isHeadlessTeammateRuntime) {
           const sessionId = getSessionId();
-          const startupReadySentinelPath =
-            process.env[TEAMMATE_STARTUP_READY_SENTINEL_ENV];
-
-          if (startupReadySentinelPath) {
-            void writeStartupReadySentinel({
-              filePath: startupReadySentinelPath,
-              teamName: teammateOpts.teamName,
-              agentName: teammateOpts.agentName,
-              sessionId,
-            });
-          }
-
           void writeTeammateRuntimeEvent({
             type: 'cli_started',
             teamName: teammateOpts.teamName,
@@ -1285,15 +1269,6 @@ async function run(): Promise<CommanderCommand> {
               `stdoutIsTTY=${process.stdout.isTTY ? 'true' : 'false'}`,
               `stdinIsTTY=${process.stdin.isTTY ? 'true' : 'false'}`,
             ].join('; ')
-          });
-          void writeTeammateRuntimeEvent({
-            type: 'runtime_ready',
-            teamName: teammateOpts.teamName,
-            agentName: teammateOpts.agentName,
-            agentId: teammateOpts.agentId,
-            runId: sessionId,
-            cwd: getCwd(),
-            detail: 'headless teammate startup accepted',
           });
         }
       }

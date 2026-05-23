@@ -262,7 +262,15 @@ try {
     await sleep(runtimeReadyDelayMs)
   }
 
-  await writeEvent('runtime_ready', 'headless flag accepted')
+  await writeEvent('runtime_ready', 'inbox poller mounted')
+  let wroteInboxPollerReadyBeforePrompt = false
+  if (mode === 'ready-before-mailbox-bootstrap') {
+    wroteInboxPollerReadyBeforePrompt = true
+    await writeEvent(
+      'inbox_poller_ready',
+      'inbox poller mounted before bootstrap prompt',
+    )
+  }
 
   const promptMessage = await waitForBootstrapPrompt()
   const bootstrapMirror = promptMessage.messageId
@@ -288,11 +296,13 @@ try {
     await sleep(inboxReadyDelayMs)
   }
 
-  await writeEvent(
-    'inbox_poller_ready',
-    'initial poll observed bootstrap prompt',
-    bootstrapMirror,
-  )
+  if (!wroteInboxPollerReadyBeforePrompt) {
+    await writeEvent(
+      'inbox_poller_ready',
+      'initial poll observed bootstrap prompt',
+      bootstrapMirror,
+    )
+  }
   await writeEvent('bootstrap_prompt_observed', 'bootstrap prompt observed', bootstrapMirror)
   await writeEvent(
     'bootstrap_submit_attempted',
@@ -897,6 +907,56 @@ describe('supervised process teammate backend e2e', () => {
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
+  it('accepts inbox_poller_ready that mounted before verified mailbox bootstrap write', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'ready-before-mailbox-bootstrap',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'runtime_ready',
+      'inbox_poller_ready',
+      'mailbox_bootstrap_written',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes.indexOf('runtime_ready')).toBeLessThan(
+      eventTypes.indexOf('inbox_poller_ready'),
+    )
+    expect(eventTypes.indexOf('inbox_poller_ready')).toBeLessThan(
+      eventTypes.indexOf('mailbox_bootstrap_written'),
+    )
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const submitted = events.find(event => event.type === 'bootstrap_submitted')
+    const inboxReady = events.find(event => event.type === 'inbox_poller_ready')
+    expect(inboxReady?.bootstrapMirrorId).toBeUndefined()
+    expect(submitted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
   it('fails clearly when mailbox bootstrap is written but inbox polling never becomes ready', async () => {
     process.env.CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = '80'
     const fixture = await createFixture({
@@ -921,6 +981,10 @@ describe('supervised process teammate backend e2e', () => {
 
     expect(thrown?.message).toContain('did not become inbox_poller_ready')
     expect(thrown?.message).toContain('timed out waiting for inbox_poller_ready')
+    expect(thrown?.message).toContain('Last stderr:')
+    expect(thrown?.message).toContain('fake stderr: alice@')
+    expect(thrown?.message).toContain('Last stdout:')
+    expect(thrown?.message).toContain('fake stdout: alice@')
 
     const runtimePaths = getTeammateRuntimePaths({
       teamName: fixture.teamName,
@@ -936,6 +1000,8 @@ describe('supervised process teammate backend e2e', () => {
     expect(eventTypes).not.toContain('inbox_poller_ready')
     const failed = events.find(event => event.type === 'failed')
     expect(failed?.detail).toContain('timed out waiting for inbox_poller_ready')
+    expect(failed?.detail).toContain('Last stderr:')
+    expect(failed?.detail).toContain('Last stdout:')
   })
 
   it('fails clearly when the runtime exits after mailbox bootstrap write before inbox polling readiness', async () => {
@@ -1345,6 +1411,7 @@ async function createFixture(options: {
     | 'stdin-sensitive'
     | 'member-name-confirmation'
     | 'delay-runtime-ready'
+    | 'ready-before-mailbox-bootstrap'
     | 'delay-inbox-poller-ready'
     | 'skip-inbox-poller-ready'
     | 'exit-after-mailbox-before-inbox-ready'
