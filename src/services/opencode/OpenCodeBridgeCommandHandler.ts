@@ -3926,7 +3926,9 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       const snapshot = lightweightLaunchHandshake
         ? null
-        : await openCodeProvisioningProbe.probe(envelope.cwd)
+        : await openCodeProvisioningProbe.probe(envelope.cwd, {
+          disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
+        })
       const identity = createBridgeServerIdentity(snapshot, {
         runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
           ? asNullableNumber(envelope.body.expectedManifestHighWatermark)

@@ -732,8 +732,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   test('keeps full handshake when launch commands require a capability snapshot', async () => {
     let probeCalled = false
-    openCodeProvisioningProbe.probe = (async () => {
+    let probeOptions: unknown = null
+    openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
       probeCalled = true
+      probeOptions = options
       return snapshot
     }) as typeof openCodeProvisioningProbe.probe
 
@@ -748,6 +750,9 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(probeCalled).toBe(true)
+    expect(probeOptions).toEqual({
+      disposeHostOnRelease: process.platform !== 'win32',
+    })
     if (result.ok) {
       expect(result.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
       expect(result.data.server.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
