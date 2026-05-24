@@ -1041,10 +1041,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(true)
+    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
     expect(provisioningOptions).toEqual([
       {
-        disposeHostOnRelease: true,
+        disposeHostOnRelease: process.platform !== 'win32',
         ensureAppMcp: false,
         bypassCache: true,
       },
@@ -3906,7 +3906,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
-    expect(probedDisposeHostOnRelease).toBe(true)
+    expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
     expect(ensureSessionCalls).toBe(1)
     expect(result.data.teamLaunchState).toBe('launching')
   })
