@@ -2701,6 +2701,10 @@ async function handleSpawnNativeProcess(
         deadlineMs: bootstrapDeadlineMs,
       }),
       pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      sinceMs: Date.parse(launchBoundaryIso),
       isStillAlive: () => isProcessAlive(runtimePid),
     })
     if (!runtimeReady.ok) {
@@ -2811,6 +2815,10 @@ async function handleSpawnNativeProcess(
         deadlineMs: bootstrapDeadlineMs,
       }),
       pid: runtimePid,
+      teamName,
+      agentName: sanitizedName,
+      agentId: teammateId,
+      sinceMs: Date.parse(launchBoundaryIso),
       isStillAlive: () => isProcessAlive(runtimePid),
     })
     if (!inboxPollerReady.ok) {
