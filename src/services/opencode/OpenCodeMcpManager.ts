@@ -1,5 +1,6 @@
 import path from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
+import os from 'node:os'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
@@ -28,6 +29,8 @@ const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
 const OPEN_CODE_MCP_ARGS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON'
 const OPEN_CODE_MCP_ENV_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON'
 const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
+const AGENT_TEAMS_MCP_CLAUDE_DIR_ENV = 'AGENT_TEAMS_MCP_CLAUDE_DIR'
+const CLAUDE_TEAM_CONTROL_URL_ENV = 'CLAUDE_TEAM_CONTROL_URL'
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
   'HOME',
@@ -39,14 +42,14 @@ const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'TMP',
   'LANG',
   'LC_ALL',
-  'CLAUDE_TEAM_CONTROL_URL',
-  'AGENT_TEAMS_MCP_CLAUDE_DIR',
+  CLAUDE_TEAM_CONTROL_URL_ENV,
+  AGENT_TEAMS_MCP_CLAUDE_DIR_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
 ] as const
 const OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS = [
-  'CLAUDE_TEAM_CONTROL_URL',
-  'AGENT_TEAMS_MCP_CLAUDE_DIR',
+  CLAUDE_TEAM_CONTROL_URL_ENV,
+  AGENT_TEAMS_MCP_CLAUDE_DIR_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
 ] as const
@@ -249,6 +252,32 @@ function getOpenCodeBridgeRepoRoot(): string {
   return path.resolve(import.meta.dir, '../../..')
 }
 
+function getRuntimeUserHome(env: NodeJS.ProcessEnv): string | null {
+  const explicitHome = asString(env.USERPROFILE) ?? asString(env.HOME)
+  if (explicitHome) {
+    return path.resolve(explicitHome)
+  }
+
+  const homeDrive = asString(env.HOMEDRIVE)
+  const homePath = asString(env.HOMEPATH)
+  if (homeDrive && homePath) {
+    return path.resolve(`${homeDrive}${homePath}`)
+  }
+
+  const fallbackHome = os.homedir()
+  return fallbackHome ? path.resolve(fallbackHome) : null
+}
+
+function resolveAgentTeamsMcpClaudeDir(env: NodeJS.ProcessEnv): string | null {
+  const explicitClaudeDir = asString(env[AGENT_TEAMS_MCP_CLAUDE_DIR_ENV])
+  if (explicitClaudeDir) {
+    return path.resolve(explicitClaudeDir)
+  }
+
+  const home = getRuntimeUserHome(env)
+  return home ? path.join(home, '.claude') : null
+}
+
 export function getCandidateClaudeTeamRootsForBridgeRoot(bridgeRepoRoot: string): string[] {
   const bridgeRepoName = path.basename(bridgeRepoRoot)
   const pairedWorktreeSuffix = bridgeRepoName.startsWith('agent_teams_orchestrator')
@@ -322,6 +351,10 @@ function buildForwardedEnvironment(env: NodeJS.ProcessEnv): Record<string, strin
       continue
     }
     forwarded[key] = value
+  }
+  const agentTeamsClaudeDir = resolveAgentTeamsMcpClaudeDir(env)
+  if (agentTeamsClaudeDir && !forwarded[AGENT_TEAMS_MCP_CLAUDE_DIR_ENV]) {
+    forwarded[AGENT_TEAMS_MCP_CLAUDE_DIR_ENV] = agentTeamsClaudeDir
   }
   return forwarded
 }
@@ -539,6 +572,35 @@ function getEntryUrl(entry: OpenCodeMcpStatusEntry | null): string | null {
   return null
 }
 
+function shouldVerifyExistingAppMcpConfig(
+  entry: OpenCodeMcpStatusEntry | null,
+  client: OpenCodeMcpClient,
+  env: NodeJS.ProcessEnv,
+  attachIfMissing?: boolean,
+): boolean {
+  if (attachIfMissing !== true) {
+    return false
+  }
+
+  if (
+    asString(env[OPEN_CODE_MCP_URL_ENV]) !== null
+    || hasOpenCodeLocalMcpLaunchOverride(env)
+    || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
+      const value = env[key]
+      return typeof value === 'string' && value.length > 0
+    })
+  ) {
+    return true
+  }
+
+  return (
+    typeof client.getConfig === 'function'
+    && getEntryCommand(entry) === null
+    && getEntryEnvironment(entry) === null
+    && getEntryUrl(entry) === null
+  )
+}
+
 function appMcpConfigMatchesRequiredRuntime(
   entry: OpenCodeMcpStatusEntry | null,
   desiredConfig: OpenCodeMcpServerConfig,
@@ -706,16 +768,12 @@ export class OpenCodeMcpManager {
       const connected = inferMcpConnected(existingMatch.entry)
       let launchConfig: ResolvedAppMcpLaunchConfig | null = null
       const currentEnv = this.deps.env ?? process.env
-      const shouldVerifyExistingConfig =
-        params.attachIfMissing === true
-        && (
-          asString(currentEnv[OPEN_CODE_MCP_URL_ENV]) !== null
-          || hasOpenCodeLocalMcpLaunchOverride(currentEnv)
-          || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
-            const value = currentEnv[key]
-            return typeof value === 'string' && value.length > 0
-          })
-        )
+      const shouldVerifyExistingConfig = shouldVerifyExistingAppMcpConfig(
+        existingMatch.entry,
+        client,
+        currentEnv,
+        params.attachIfMissing,
+      )
       if (shouldVerifyExistingConfig) {
         launchConfig = await this.resolveLaunchConfig()
         const requiredEnvironmentKeys =

@@ -674,6 +674,7 @@ describe('OpenCodeHostManager', () => {
     const spawned = createMockChildProcess(43134)
     const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
     let nowMs = 0
+    let healthCalls = 0
 
     const manager = new OpenCodeHostManager({
       prepareProfile: async () => baseProfile,
@@ -681,6 +682,11 @@ describe('OpenCodeHostManager', () => {
       spawnHostProcess: () => spawned.child,
       fetchJson: async (url) => {
         if (url.endsWith('/global/health')) {
+          if (healthCalls === 0) {
+            ;(spawned.child.stdout as PassThrough).write('server booting\n')
+            ;(spawned.child.stderr as PassThrough).write('waiting for config\n')
+          }
+          healthCalls += 1
           return {
             status: 503,
             data: { healthy: false },
@@ -702,9 +708,15 @@ describe('OpenCodeHostManager', () => {
       persistentRegistryPath: null,
     })
 
-    await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
-      'OpenCode host did not become healthy',
-    )
+    let thrown: unknown = null
+    await manager.ensureHost({ hostKey: 'host-key' }).catch(error => {
+      thrown = error
+    })
+
+    const message = thrown instanceof Error ? thrown.message : String(thrown)
+    expect(message).toContain('OpenCode host did not become healthy')
+    expect(message).toContain('stdout: server booting')
+    expect(message).toContain('stderr: waiting for config')
 
     expect(manager.getHost('host-key')).toBeNull()
     expect(killedSignals).toEqual([

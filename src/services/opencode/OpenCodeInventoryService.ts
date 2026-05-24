@@ -2,7 +2,7 @@ import path from 'node:path'
 import stripAnsi from 'strip-ansi'
 
 import { getCwd } from '../../utils/cwd.js'
-import { killProcessTree } from '../../utils/processKill.js'
+import { killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import {
   normalizeOpenCodeProviderId,
@@ -189,6 +189,7 @@ export function execOpenCodePortableCommand(input: {
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let settled = false
+    let stopping = false
     let child: ReturnType<typeof spawnPortableCli> | null = null
     const timeoutMs = input.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS
 
@@ -206,31 +207,44 @@ export function execOpenCodePortableCommand(input: {
       })
     }
 
+    const stopChildAndFinish = (error: string): void => {
+      if (settled || stopping) {
+        return
+      }
+      stopping = true
+      clearTimeout(timeout)
+      input.abortSignal?.removeEventListener('abort', abort)
+
+      const pid = child?.pid
+      if (!pid) {
+        finish({
+          ...snapshotOutput(),
+          code: 1,
+          error,
+        })
+        return
+      }
+
+      void killProcessTreeAndWait(pid, 'SIGKILL').finally(() => {
+        finish({
+          ...snapshotOutput(),
+          code: 1,
+          error,
+        })
+      })
+    }
+
     const snapshotOutput = (): Pick<OpenCodeCommandResult, 'stdout' | 'stderr'> => ({
       stdout: Buffer.concat(stdout).toString('utf8'),
       stderr: Buffer.concat(stderr).toString('utf8'),
     })
 
     const abort = (): void => {
-      if (child) {
-        killProcessTree(child.pid, 'SIGKILL')
-      }
-      finish({
-        ...snapshotOutput(),
-        code: 1,
-        error: 'OpenCode command aborted',
-      })
+      stopChildAndFinish('OpenCode command aborted')
     }
 
     const timeout = setTimeout(() => {
-      if (child) {
-        killProcessTree(child.pid, 'SIGKILL')
-      }
-      finish({
-        ...snapshotOutput(),
-        code: 1,
-        error: `OpenCode command timed out after ${timeoutMs}ms`,
-      })
+      stopChildAndFinish(`OpenCode command timed out after ${timeoutMs}ms`)
     }, timeoutMs)
 
     if (input.abortSignal?.aborted) {
@@ -258,6 +272,9 @@ export function execOpenCodePortableCommand(input: {
     child.stdout?.on('data', chunk => stdout.push(Buffer.from(chunk)))
     child.stderr?.on('data', chunk => stderr.push(Buffer.from(chunk)))
     child.once('error', error => {
+      if (stopping) {
+        return
+      }
       finish({
         ...snapshotOutput(),
         code: 1,
@@ -265,6 +282,9 @@ export function execOpenCodePortableCommand(input: {
       })
     })
     child.once('close', (code, signal) => {
+      if (stopping) {
+        return
+      }
       finish({
         ...snapshotOutput(),
         code: code ?? 1,

@@ -6,6 +6,7 @@ import { TextDecoder } from 'node:util'
 
 import { isBinaryContent } from '../../constants/files.js'
 import { gitExe } from '../../utils/git.js'
+import { killProcessTree } from '../../utils/processKill.js'
 import { formatOpenCodeDiagnosticText } from './OpenCodeChangeEvidence.js'
 import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 
@@ -417,7 +418,9 @@ async function runGit(args: string[], input: {
     let stdoutBytes = 0
     let stderrBytes = 0
     let settled = false
+    let stopping = false
     let timer: ReturnType<typeof setTimeout>
+    let stopFallbackTimer: ReturnType<typeof setTimeout> | null = null
 
     const settle = (code: number) => {
       if (settled) {
@@ -425,6 +428,10 @@ async function runGit(args: string[], input: {
       }
       settled = true
       clearTimeout(timer)
+      if (stopFallbackTimer) {
+        clearTimeout(stopFallbackTimer)
+        stopFallbackTimer = null
+      }
       resolve({
         code,
         stdout: Buffer.concat(stdoutChunks),
@@ -433,10 +440,19 @@ async function runGit(args: string[], input: {
       })
     }
 
+    const stopAndSettle = (code: number) => {
+      if (settled || stopping) {
+        return
+      }
+      stopping = true
+      clearTimeout(timer)
+      killProcessTree(child.pid, 'SIGTERM')
+      stopFallbackTimer = setTimeout(() => settle(code), 2_500)
+    }
+
     timer = setTimeout(() => {
       diagnostics.push(`snapshot-git-timeout: git ${gitArgs.join(' ')} timed out after ${input.timeoutMs}ms.`)
-      child.kill('SIGTERM')
-      settle(1)
+      stopAndSettle(1)
     }, input.timeoutMs)
     timer.unref()
 
@@ -447,16 +463,14 @@ async function runGit(args: string[], input: {
       const remaining = input.maxBytes - stdoutBytes
       if (remaining <= 0) {
         diagnostics.push(`snapshot-git-output-cap: git ${gitArgs.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
-        child.kill('SIGTERM')
-        settle(1)
+        stopAndSettle(1)
         return
       }
       if (chunk.length > remaining) {
         stdoutChunks.push(chunk.subarray(0, remaining))
         stdoutBytes += remaining
         diagnostics.push(`snapshot-git-output-cap: git ${gitArgs.join(' ')} exceeded ${input.maxBytes} stdout bytes.`)
-        child.kill('SIGTERM')
-        settle(1)
+        stopAndSettle(1)
         return
       }
       stdoutChunks.push(chunk)
@@ -473,10 +487,19 @@ async function runGit(args: string[], input: {
     })
 
     child.on('error', error => {
+      if (stopping) {
+        return
+      }
       diagnostics.push(`snapshot-git-spawn-failed: ${error instanceof Error ? error.message : String(error)}`)
       settle(1)
     })
-    child.on('close', code => settle(code ?? 1))
+    child.on('close', code => {
+      if (stopping) {
+        settle(1)
+        return
+      }
+      settle(code ?? 1)
+    })
 
     if (typeof input.stdin === 'string') {
       child.stdin.end(input.stdin)
@@ -516,7 +539,7 @@ function shortenGitPathArgs(args: string[], cwd: string): string[] {
     }
     const relative = path.relative(cwd, value)
     if (relative && relative.length < value.length) {
-      result[index + 1] = relative
+      result[index + 1] = relative.replace(/\\/g, '/')
     }
   }
   return result

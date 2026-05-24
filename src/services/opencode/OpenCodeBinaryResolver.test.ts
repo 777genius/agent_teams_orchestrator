@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
@@ -9,12 +9,14 @@ describe('OpenCodeBinaryResolver', () => {
   let tempRoot: string
   let originalAppManagedPath: string | undefined
   let originalOpenCodePath: string | undefined
+  let originalAppData: string | undefined
   let originalWhich: typeof Bun.which
 
   beforeEach(async () => {
     tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-bin-resolver-'))
     originalAppManagedPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     originalOpenCodePath = process.env.OPENCODE_BIN_PATH
+    originalAppData = process.env.APPDATA
     originalWhich = Bun.which
   })
 
@@ -28,6 +30,11 @@ describe('OpenCodeBinaryResolver', () => {
       delete process.env.OPENCODE_BIN_PATH
     } else {
       process.env.OPENCODE_BIN_PATH = originalOpenCodePath
+    }
+    if (originalAppData === undefined) {
+      delete process.env.APPDATA
+    } else {
+      process.env.APPDATA = originalAppData
     }
     Bun.which = originalWhich
     await rm(tempRoot, { recursive: true, force: true })
@@ -61,5 +68,28 @@ describe('OpenCodeBinaryResolver', () => {
     process.env.OPENCODE_BIN_PATH = path.join(tempRoot, 'also-missing-opencode')
 
     expect(resolveOpenCodeBinaryPath()).toBe(path.join(tempRoot, 'path-opencode'))
+  })
+
+  test('falls back to the app-managed UI runtime cache when env and PATH are unavailable', async () => {
+    const appData = path.join(tempRoot, 'appdata')
+    const binaryPath = path.join(
+      appData,
+      'claude-agent-teams-ui',
+      'data',
+      'runtimes',
+      'opencode',
+      'versions',
+      '1.14.48',
+      'opencode-windows-x64',
+      'opencode.exe',
+    )
+    await mkdir(path.dirname(binaryPath), { recursive: true })
+    await writeFile(binaryPath, 'app-managed-runtime')
+    delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    delete process.env.OPENCODE_BIN_PATH
+    process.env.APPDATA = appData
+    Bun.which = (() => null) as typeof Bun.which
+
+    expect(resolveOpenCodeBinaryPath()).toBe(binaryPath)
   })
 })

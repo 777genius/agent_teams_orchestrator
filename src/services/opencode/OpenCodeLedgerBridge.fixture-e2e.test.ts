@@ -94,6 +94,16 @@ function hashFast(value: string): string {
   return createHash('sha1').update(value).digest('hex')
 }
 
+function shortSnapshotModeSuffix(suffix: string): string {
+  return ({
+    off: 'o',
+    shadow: 's',
+    'single-change': 'c',
+    full: 'f',
+    compatible: 'm',
+  } satisfies Record<string, string>)[suffix] ?? hashFast(suffix).slice(0, 1)
+}
+
 function shortenGitPathArgs(args: string[], cwd: string): string[] {
   const result = [...args]
   for (let index = 0; index < result.length - 1; index += 1) {
@@ -106,7 +116,7 @@ function shortenGitPathArgs(args: string[], cwd: string): string[] {
     }
     const relative = path.relative(cwd, value)
     if (relative && relative.length < value.length) {
-      result[index + 1] = relative
+      result[index + 1] = relative.replace(/\\/g, '/')
     }
   }
   return result
@@ -1191,9 +1201,10 @@ async function createSnapshotModeMatrixFixture(suffix: string): Promise<{
   projectDir: string
   deliveryContext: { deliveryContextPath: string; deliveryContextHash: string }
 }> {
-  const fixtureHomeDir = path.join(tempDir, `home-mode-${suffix}`)
-  const workspaceRoot = path.join(tempDir, `workspace-mode-${suffix}`)
-  const projectDir = path.join(tempDir, `claude-project-mode-${suffix}`)
+  const shortSuffix = shortSnapshotModeSuffix(suffix)
+  const fixtureHomeDir = path.join(tempDir, `h${shortSuffix}`)
+  const workspaceRoot = path.join(tempDir, `w${shortSuffix}`)
+  const projectDir = path.join(tempDir, `p${shortSuffix}`)
   const dataDir = envPathsDataDirForHome(fixtureHomeDir)
   await mkdir(fixtureHomeDir, { recursive: true })
   await mkdir(workspaceRoot, { recursive: true })

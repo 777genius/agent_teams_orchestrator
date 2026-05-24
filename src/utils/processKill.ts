@@ -86,7 +86,6 @@ function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
       }
       finish()
     }, timeoutMs)
-    timeout.unref?.()
 
     try {
       const { command, args } = buildWindowsTaskkillInvocation(pid)
@@ -97,7 +96,6 @@ function runWindowsTaskkill(pid: number, timeoutMs: number): Promise<void> {
       })
       child.once('error', finish)
       child.once('close', finish)
-      child.unref()
     } catch {
       finish()
     }
