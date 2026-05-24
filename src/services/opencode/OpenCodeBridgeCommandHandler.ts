@@ -2003,6 +2003,13 @@ function buildOpenCodeExecutionOutcome(
   }
 }
 
+function shouldDisposeBridgeProbeHostOnRelease(): boolean {
+  // Windows packaged bridge processes can lose stdout if they dispose the
+  // just-used OpenCode host before the response is flushed. Release only the
+  // short preflight lease there; cleanupHosts handles stale persistent hosts.
+  return process.platform !== 'win32'
+}
+
 async function assertOpenCodeSelectedModelLaunchAccess(
   selectedModel: string,
   snapshot: OpenCodeProvisioningSnapshot,
@@ -2024,7 +2031,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
   const executionOutcome = await openCodeExecutionProbe.probeModel({
     selectedModel,
     projectPath: snapshot.projectPath,
-    disposeHostOnRelease: true,
+    disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
   }).catch(error =>
     buildOpenCodeExecutionOutcome(
       selectedModel,
@@ -2119,10 +2126,7 @@ function mcpUnavailableReadinessData(input: {
 }
 
 async function runReadiness(envelope: BridgeEnvelope) {
-  // Windows packaged bridge processes can lose stdout if they dispose the
-  // just-used OpenCode host before the response is flushed. Release only the
-  // short preflight lease there; cleanupHosts handles stale persistent hosts.
-  const disposeReadinessHostOnRelease = process.platform !== 'win32'
+  const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
@@ -2149,7 +2153,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
   const modelSnapshot = await openCodeProvisioningProbe.probe(
     projectPath,
     {
-      disposeHostOnRelease: shouldProbeSelectedModel ? true : disposeReadinessHostOnRelease,
+      disposeHostOnRelease: disposeReadinessHostOnRelease,
       ensureAppMcp: !shouldProbeSelectedModel,
       bypassCache: shouldProbeSelectedModel,
     },
@@ -2247,7 +2251,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
     const executionOutcome = await openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: modelSnapshot.projectPath,
-      disposeHostOnRelease: true,
+      disposeHostOnRelease: disposeReadinessHostOnRelease,
     }).catch(error =>
       buildOpenCodeExecutionOutcome(
         executionModel,
@@ -3922,7 +3926,9 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
       const snapshot = lightweightLaunchHandshake
         ? null
-        : await openCodeProvisioningProbe.probe(envelope.cwd)
+        : await openCodeProvisioningProbe.probe(envelope.cwd, {
+          disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
+        })
       const identity = createBridgeServerIdentity(snapshot, {
         runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
           ? asNullableNumber(envelope.body.expectedManifestHighWatermark)
