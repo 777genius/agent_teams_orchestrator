@@ -326,6 +326,41 @@ describe('teammateRuntimeEvents helpers', () => {
     expect(result.type).toBe('submitted')
   })
 
+  it('accepts identity-matched bootstrap submission when a Windows wrapper pid differs', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    const sinceMs = Date.now()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 3333,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      agentId: 'atlas@signal-ops',
+      bootstrapRunId: 'run-atlas-1',
+      bootstrapMirrorId: 'bootstrap-atlas-1',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 2222,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      agentId: 'atlas@signal-ops',
+      bootstrapRunId: 'run-atlas-1',
+      bootstrapMirrorId: 'bootstrap-atlas-1',
+      sinceMs,
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('submitted')
+    if (result.type === 'submitted') {
+      expect(result.event.pid).toBe(3333)
+    }
+  })
+
   it('ignores bootstrap_submitted events without the expected mirror id', async () => {
     const eventsPath = await createRuntimeLogPath()
     await writeTeammateRuntimeEvent({

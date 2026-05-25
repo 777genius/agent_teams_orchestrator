@@ -467,7 +467,21 @@ function matchesBootstrapSubmissionIdentity(
     sinceMs?: number
   },
 ): boolean {
-  if (typeof expected.pid === 'number' && event.pid !== expected.pid) return false
+  const pidMatches = typeof expected.pid !== 'number' || event.pid === expected.pid
+  if (!pidMatches) {
+    if (
+      !matchesStrictRuntimeIdentity(event, {
+        teamName: expected.teamName,
+        agentName: expected.agentName,
+        agentId: expected.agentId,
+        sinceMs: expected.sinceMs,
+      })
+    ) {
+      return false
+    }
+  } else if (!isRuntimeEventFreshEnough(event, expected.sinceMs)) {
+    return false
+  }
   if (expected.teamName && event.teamName && event.teamName !== expected.teamName) {
     return false
   }
@@ -494,10 +508,6 @@ function matchesBootstrapSubmissionIdentity(
     event.bootstrapMirrorId !== expected.bootstrapMirrorId
   ) {
     return false
-  }
-  if (typeof expected.sinceMs === 'number' && Number.isFinite(expected.sinceMs)) {
-    const eventMs = Date.parse(event.timestamp)
-    if (!Number.isFinite(eventMs) || eventMs < expected.sinceMs) return false
   }
   return true
 }
