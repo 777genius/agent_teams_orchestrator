@@ -249,6 +249,44 @@ try {
     throw new Error('runtime opencode-command stdout did not return a successful handshake envelope');
   }
 
+  const readinessInputPath = path.join(tempRoot, 'opencode-readiness.json');
+  writeFileSync(
+    readinessInputPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      requestId: 'runtime-opencode-readiness-smoke',
+      command: 'opencode.readiness',
+      cwd: projectPath,
+      startedAt: new Date().toISOString(),
+      timeoutMs: 45_000,
+      body: {
+        projectPath,
+        selectedModel: 'opencode/big-pickle',
+        requireExecutionProbe: false,
+      },
+    }, null, 2),
+    'utf8',
+  );
+
+  const readinessStdoutResult = runRuntime([
+    'runtime',
+    'opencode-command',
+    '--json',
+    '--input',
+    readinessInputPath,
+  ]);
+  assertExitZero(readinessStdoutResult, 'runtime opencode-command readiness stdout');
+  const readinessStdoutPayload = assertJsonObject(
+    readinessStdoutResult.stdout,
+    'runtime opencode-command readiness stdout',
+  );
+  if (
+    readinessStdoutPayload.command !== 'opencode.readiness' ||
+    typeof readinessStdoutPayload.ok !== 'boolean'
+  ) {
+    throw new Error('runtime opencode-command readiness stdout did not return a bridge envelope');
+  }
+
   process.stdout.write('Windows runtime OpenCode provider JSON smoke passed\n');
 } finally {
   try {
