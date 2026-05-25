@@ -7,6 +7,28 @@ import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager
 import { jsonStringify } from '../../utils/slowOperations.js'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
+export const OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS = 1_000
+
+type RuntimeCommandTimer = ReturnType<typeof setInterval>
+type RuntimeCommandSetInterval = (callback: () => void, ms: number) => RuntimeCommandTimer
+type RuntimeCommandClearInterval = (timer: RuntimeCommandTimer) => void
+
+export function startRuntimeCommandKeepAlive(deps: {
+  setInterval?: RuntimeCommandSetInterval
+  clearInterval?: RuntimeCommandClearInterval
+} = {}): () => void {
+  const setIntervalFn = deps.setInterval ?? setInterval
+  const clearIntervalFn = deps.clearInterval ?? clearInterval
+  const timer = setIntervalFn(() => undefined, OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS)
+  let cleared = false
+  return () => {
+    if (cleared) {
+      return
+    }
+    cleared = true
+    clearIntervalFn(timer)
+  }
+}
 
 export async function runtimeOpenCodeCommand(opts: {
   input: string
@@ -31,6 +53,7 @@ export async function runtimeOpenCodeCommand(opts: {
   const onSigint = () => cleanupUnregisteredHostsAndExit(130)
   process.once('SIGTERM', onSigterm)
   process.once('SIGINT', onSigint)
+  const stopKeepAlive = startRuntimeCommandKeepAlive()
 
   try {
     const raw = await readFile(opts.input, 'utf8')
@@ -47,6 +70,7 @@ export async function runtimeOpenCodeCommand(opts: {
       await writeStdoutAndDrain(payload)
     }
   } finally {
+    stopKeepAlive()
     process.off('SIGTERM', onSigterm)
     process.off('SIGINT', onSigint)
   }

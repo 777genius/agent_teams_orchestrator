@@ -479,7 +479,10 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
 }
 
 async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<OpenCodeProvisioningSnapshot> {
-  const inventory = await openCodeInventoryService.probe(projectPath)
+  const inventory = await openCodeInventoryService.probe(projectPath, {
+    mode: 'summary',
+    includeAppMcp: false,
+  })
   return {
     detected: inventory.detected,
     hostHealthy: false,
@@ -498,7 +501,45 @@ async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<
     probeError: inventory.probeError,
     diagnostics: [
       ...inventory.diagnostics,
-      'OpenCode command status used read-only inventory snapshot; host state was not probed.',
+      'OpenCode command status used read-only summary inventory snapshot; host state was not probed.',
+    ],
+  }
+}
+
+function buildSendMessageStoredSessionSnapshot(
+  projectPath: string,
+  record: OpenCodeSessionRecord,
+): OpenCodeProvisioningSnapshot {
+  return {
+    detected: true,
+    hostHealthy: false,
+    projectPath: record.projectPath || projectPath,
+    models: record.selectedModel ? [record.selectedModel] : [],
+    modelMetadata: [],
+    profile: null,
+    host: null,
+    config: null,
+    configProviders: null,
+    providers: null,
+    providerAuth: null,
+    agents: [],
+    mcp: null,
+    appMcp: null,
+    probeError: null,
+    diagnostics: [
+      'OpenCode sendMessage used stored session state; provisioning preflight was not probed.',
+    ],
+  }
+}
+
+function buildTranscriptStoredSessionSnapshot(
+  projectPath: string,
+  record: OpenCodeSessionRecord,
+): OpenCodeProvisioningSnapshot {
+  return {
+    ...buildSendMessageStoredSessionSnapshot(projectPath, record),
+    diagnostics: [
+      'OpenCode transcript used stored session state; provisioning preflight was not probed.',
     ],
   }
 }
@@ -2960,10 +3001,9 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     status: 'received',
   })
 
-  const snapshot = await openCodeProvisioningProbe.probe(projectPath)
   const commandEvidence = validateOpenCodeBridgeStateChangingPreconditions({
     body,
-    runtime: createRuntimePreconditionSnapshot(snapshot),
+    runtime: createRuntimePreconditionSnapshot(null),
   })
   await markSendMessageOutcome(outcomeBase, {
     status: 'preconditions_checked',
@@ -2978,6 +3018,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
   }
   let deliveryRecord = record
+  let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   let mcpRuntimePid: number | undefined
   const mcpDiagnostics: TeamDiagnostic[] = []
   const compatibilityStaleReason = getOpenCodeSessionCompatibilityStaleReason(record)
@@ -3003,6 +3044,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId,
       toolApprovalMode: record.toolApprovalMode,
     })
+    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_stale_record',
@@ -3021,6 +3063,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId,
       toolApprovalMode: record.toolApprovalMode,
     })
+    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_forced_refresh',
@@ -3034,6 +3077,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
     runId,
     diagnostics: mcpDiagnostics,
   })
+  snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   await markSendMessageOutcome(outcomeBase, {
     status: 'session_resolved',
     sessionId: deliveryRecord.opencodeSessionId,
@@ -3090,6 +3134,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       runId: asString(body.runId),
       toolApprovalMode: record.toolApprovalMode,
     })
+    snapshot = buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
     mcpDiagnostics.push(
       teamDiagnostic(
         'opencode_send_session_recreated_after_mcp_failure',
@@ -3199,6 +3244,40 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         noReply: true,
       })
       promptEndpointAccepted = true
+      const runtimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
+      const finalData: SendMessageCommandData = {
+        accepted: true,
+        ...(runId ? { runId } : {}),
+        sessionId: deliveryRecord.opencodeSessionId,
+        memberName,
+        ...(runtimePid ? { runtimePid } : {}),
+        prePromptCursor,
+        diagnostics: [
+          ...mcpDiagnostics,
+          teamDiagnostic(
+            'opencode_send_no_reply_accepted',
+            'OpenCode prompt_async accepted with noReply; no assistant turn will be observed.',
+            'info',
+          ),
+        ],
+        ...(commandEvidence.idempotencyKey ? { idempotencyKey: commandEvidence.idempotencyKey } : {}),
+        manifestHighWatermark: commandEvidence.manifestHighWatermark,
+        runtimeStoreManifestHighWatermark: commandEvidence.runtimeStoreManifestHighWatermark,
+      }
+      await markSendMessageOutcome(outcomeBase, {
+        status: 'reconciled',
+        sessionId: deliveryRecord.opencodeSessionId,
+        runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+        prePromptCursor,
+        acceptedAt: nowIso(),
+        completedAt: nowIso(),
+        sendMessageData: finalData,
+        diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
+      }).catch(() => undefined)
+      return {
+        snapshot,
+        data: finalData,
+      }
     } else if (settlementMode === 'acceptance') {
       const prompted = await openCodeSessionBridge.promptAsyncUntilAccepted(deliveryRecord, {
         text: deliveryText,
@@ -3796,9 +3875,7 @@ async function runTranscript(envelope: BridgeEnvelope) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${memberName}`)
   }
   const result = await openCodeSessionBridge.projectLogMessages(record, { limit: 100 })
-  const snapshot = await openCodeProvisioningProbe.probe(record.projectPath, {
-    toolApprovalMode: record.toolApprovalMode,
-  })
+  const snapshot = buildTranscriptStoredSessionSnapshot(envelope.cwd, result.record)
   return {
     snapshot,
     data: {

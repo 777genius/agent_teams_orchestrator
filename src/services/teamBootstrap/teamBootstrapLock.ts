@@ -11,8 +11,15 @@ const BOOTSTRAP_LOCK_STALE_MS = 5 * 60_000
 const BOOTSTRAP_LOCK_RECLAIM_GUARD_STALE_MS = 30_000
 const BOOTSTRAP_LOCK_RETRY_BASE_MS = 25
 const BOOTSTRAP_LOCK_SLOW_WAIT_MS = 100
+const BOOTSTRAP_LOCK_RENAME_RETRY_DELAYS_MS = [25, 75, 150] as const
 const MAX_BOOTSTRAP_LOCK_METADATA_BYTES = 64 * 1024
 const MAX_BOOTSTRAP_RECLAIM_GUARD_METADATA_BYTES = 16 * 1024
+const TRANSIENT_BOOTSTRAP_LOCK_FS_ERROR_CODES = new Set([
+  'EBUSY',
+  'EMFILE',
+  'ENFILE',
+  'EPERM',
+])
 
 type BootstrapLockMetadata = {
   pid: number
@@ -151,6 +158,32 @@ function buildReclaimedLockDir(lockDir: string): string {
   return `${lockDir}.reclaimed.${process.pid}.${Date.now()}.${randomUUID()}`
 }
 
+function isTransientBootstrapLockFsError(error: unknown): boolean {
+  const code = getErrnoCode(error)
+  return !!code && TRANSIENT_BOOTSTRAP_LOCK_FS_ERROR_CODES.has(code)
+}
+
+async function renameBootstrapLockDirWithRetry(
+  fromPath: string,
+  toPath: string,
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(fromPath, toPath)
+      return
+    } catch (error) {
+      const retryDelayMs = BOOTSTRAP_LOCK_RENAME_RETRY_DELAYS_MS[attempt]
+      if (
+        retryDelayMs === undefined ||
+        !isTransientBootstrapLockFsError(error)
+      ) {
+        throw error
+      }
+      await sleep(retryDelayMs)
+    }
+  }
+}
+
 async function isBootstrapLockReclaimGuardActive(
   teamName: string,
 ): Promise<boolean> {
@@ -273,13 +306,13 @@ async function reclaimStaleBootstrapLock(params: {
     }
 
     const reclaimedLockDir = buildReclaimedLockDir(params.lockDir)
-    await rename(params.lockDir, reclaimedLockDir)
+    await renameBootstrapLockDirWithRetry(params.lockDir, reclaimedLockDir)
     if (metadata) {
       const reclaimedMetadata = await readLockMetadataFile(
         join(reclaimedLockDir, 'metadata.json'),
       )
       if (!lockMetadataMatches(metadata, reclaimedMetadata)) {
-        await rename(reclaimedLockDir, params.lockDir)
+        await renameBootstrapLockDirWithRetry(reclaimedLockDir, params.lockDir)
         return false
       }
     }

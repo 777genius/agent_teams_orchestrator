@@ -277,6 +277,80 @@ describe('OpenCodeMcpManager', () => {
     expect(addCalls).toBe(0)
   })
 
+  test('reattaches an existing app MCP server when resolved config lacks the forced Claude root', async () => {
+    let addCalls = 0
+    const userHome = path.join(path.parse(process.cwd()).root, 'opencode-test-home')
+    const expectedClaudeDir = path.join(userHome, '.claude')
+    let currentConfig: {
+      type: 'local'
+      command: string[]
+      environment?: Record<string, string>
+      enabled?: boolean
+      timeout?: number
+    } = {
+      type: 'local',
+      command: ['node', '/tmp/agent-teams-mcp.js'],
+      environment: {},
+    }
+
+    const manager = new OpenCodeMcpManager({
+      clientFactory: {
+        create: () => ({
+          getMcp: async () => ({
+            'agent-teams': {
+              status: 'connected',
+            },
+          }),
+          getConfig: async () => ({
+            mcp: {
+              'agent-teams': currentConfig,
+            },
+          }),
+          addMcp: async (_name, config) => {
+            addCalls += 1
+            currentConfig = {
+              type: 'local',
+              command: config.command ?? [],
+              environment: config.environment ?? {},
+              enabled: config.enabled,
+              timeout: config.timeout,
+            }
+            return {
+              'agent-teams': {
+                status: 'connected',
+              },
+            }
+          },
+        }),
+      },
+      env: {
+        HOME: userHome,
+      },
+      resolveLaunchConfig: async () => ({
+        source: 'workspace-dist',
+        config: {
+          type: 'local',
+          command: ['node', '/tmp/agent-teams-mcp.js'],
+          environment: {
+            AGENT_TEAMS_MCP_CLAUDE_DIR: expectedClaudeDir,
+          },
+          enabled: true,
+          timeout: 30000,
+        },
+      }),
+    })
+
+    const result = await manager.ensureAppMcp({
+      baseUrl: 'http://127.0.0.1:4096',
+      attachIfMissing: true,
+    })
+
+    expect(addCalls).toBe(1)
+    expect(result.summary.status).toBe('attached')
+    expect(result.summary.diagnostics[0]).toContain('AGENT_TEAMS_MCP_CLAUDE_DIR')
+    expect(currentConfig.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR).toBe(expectedClaudeDir)
+  })
+
   test('attaches the app MCP server when missing', async () => {
     let addCalls = 0
     let attached = false
@@ -504,6 +578,23 @@ describe('OpenCodeMcpManager', () => {
     expect(result.config.environment?.ELECTRON_RUN_AS_NODE).toBeUndefined()
     expect(result.config.environment?.OPENCODE_CONFIG_CONTENT).toBeUndefined()
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+  })
+
+  test('adds the real user Claude root to local MCP launch config when env omits it', async () => {
+    const userHome = path.join(path.parse(process.cwd()).root, 'opencode-test-home')
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/usr/local/bin/node',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/agent-teams-mcp.js',
+        HOME: userHome,
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR).toBe(
+      path.join(userHome, '.claude'),
+    )
   })
 
   test('prefers env override remote MCP URL over local command overrides', async () => {

@@ -113,7 +113,7 @@ describe('OpenCodeInventoryService parsers', () => {
     )
 
     expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(true)
-    expect(result.projectPath).toBe('/tmp/project')
+    expect(result.projectPath).toBe(path.resolve('/tmp/project'))
     expect(result.probeError).toBe('OpenCode inventory probe timed out after 1ms')
     expect(result.models).toEqual([])
     expect(result.diagnostics).toContain(

@@ -1,4 +1,4 @@
-import { appendFile, lstat, mkdir, open, readFile } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { errorMessage } from '../errors.js'
@@ -76,7 +76,7 @@ export function getTeammateRuntimePaths(params: {
 export async function ensureTeammateRuntimePaths(
   paths: TeammateRuntimePaths,
 ): Promise<void> {
-  await mkdir(paths.dir, { recursive: true })
+  await fs.mkdir(paths.dir, { recursive: true })
 }
 
 export type TeammateRuntimeEventWriteParams = {
@@ -98,6 +98,7 @@ export type TeammateRuntimeEventWriteParams = {
   retryable?: boolean
   attempt?: number
   detail?: string
+  writeAttemptTimeoutMs?: number
 }
 
 export type ParentOwnedTeammateRuntimeEventWriteParams =
@@ -115,6 +116,119 @@ const MAX_RUNTIME_EVENT_DETAIL_CHARS = 500
 const MAX_RUNTIME_EVENT_LINE_CHARS = 16 * 1024
 const MAX_RECENT_RUNTIME_EVENT_BYTES = 256 * 1024
 const MAX_RECENT_RUNTIME_EVENT_LINES = 256
+const DEFAULT_RUNTIME_EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 2_000
+const RUNTIME_EVENT_WRITE_RETRY_DELAYS_MS = [20, 50, 100] as const
+const TRANSIENT_RUNTIME_EVENT_WRITE_ERROR_CODES = new Set([
+  'EBUSY',
+  'EMFILE',
+  'ENFILE',
+  'ETIMEDOUT',
+  'EPERM',
+])
+
+class RuntimeEventWriteTimeoutError extends Error {
+  code = 'ETIMEDOUT'
+
+  constructor(timeoutMs: number) {
+    super(`runtime event write timed out after ${timeoutMs}ms`)
+    this.name = 'RuntimeEventWriteTimeoutError'
+  }
+}
+
+function isTransientRuntimeEventWriteError(error: unknown): boolean {
+  const code = getRuntimeEventWriteErrorCode(error)
+  return (
+    typeof code === 'string' &&
+    TRANSIENT_RUNTIME_EVENT_WRITE_ERROR_CODES.has(code)
+  )
+}
+
+function getRuntimeEventWriteErrorCode(error: unknown): string | undefined {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined
+  return typeof code === 'string' ? code : undefined
+}
+
+function writeRuntimeEventFailureToCapturedStderr(params: {
+  eventType: TeammateRuntimeEventType
+  eventsPath: string
+  error: unknown
+}): void {
+  if (process.env[TEAMMATE_RUNTIME_EVENTS_ENV] !== params.eventsPath) {
+    return
+  }
+  const code = getRuntimeEventWriteErrorCode(params.error) ?? 'unknown'
+  try {
+    process.stderr.write(
+      `[TeammateRuntime] event write failed for ${params.eventType}: ${code}\n`,
+    )
+  } catch {
+    // Best-effort diagnostic only.
+  }
+}
+
+async function withRuntimeEventWriteTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new RuntimeEventWriteTimeoutError(timeoutMs))
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function resolveRuntimeEventWriteAttemptTimeoutMs(
+  timeoutMs: number | undefined,
+): number {
+  return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)
+    ? Math.max(1, timeoutMs)
+    : DEFAULT_RUNTIME_EVENT_WRITE_ATTEMPT_TIMEOUT_MS
+}
+
+async function appendRuntimeEventLine(
+  eventsPath: string,
+  line: string,
+  options: { writeAttemptTimeoutMs?: number } = {},
+): Promise<void> {
+  const writeAttemptTimeoutMs = resolveRuntimeEventWriteAttemptTimeoutMs(
+    options.writeAttemptTimeoutMs,
+  )
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await withRuntimeEventWriteTimeout(
+        (async () => {
+          await fs.mkdir(dirname(eventsPath), { recursive: true })
+          await fs.appendFile(eventsPath, line, {
+            encoding: 'utf8',
+            mode: 0o600,
+          })
+        })(),
+        writeAttemptTimeoutMs,
+      )
+      return
+    } catch (error) {
+      const retryDelayMs = RUNTIME_EVENT_WRITE_RETRY_DELAYS_MS[attempt]
+      if (
+        retryDelayMs === undefined ||
+        !isTransientRuntimeEventWriteError(error)
+      ) {
+        throw error
+      }
+      await sleep(retryDelayMs)
+    }
+  }
+}
 
 function sanitizeRuntimeEventDetail(detail: string): string {
   return detail
@@ -166,16 +280,19 @@ export async function writeTeammateRuntimeEvent(
   }
 
   try {
-    await mkdir(dirname(eventsPath), { recursive: true })
-    await appendFile(eventsPath, `${JSON.stringify(event)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
+    await appendRuntimeEventLine(eventsPath, `${JSON.stringify(event)}\n`, {
+      writeAttemptTimeoutMs: params.writeAttemptTimeoutMs,
     })
   } catch (error) {
     logForDebugging(
       `[TeammateRuntime] event write failed for ${params.type}: ${errorMessage(error)}`,
       { level: 'warn' },
     )
+    writeRuntimeEventFailureToCapturedStderr({
+      eventType: params.type,
+      eventsPath,
+      error,
+    })
   }
 }
 
@@ -233,7 +350,7 @@ export async function readTeammateRuntimeEvents(
 ): Promise<TeammateRuntimeEvent[]> {
   let raw: string
   try {
-    raw = await readFile(eventsPath, 'utf8')
+    raw = await fs.readFile(eventsPath, 'utf8')
   } catch {
     return []
   }
@@ -255,13 +372,13 @@ export async function readRecentTeammateRuntimeEvents(
   // scan an unbounded log.
   const maxBytes = Math.max(1, options.maxBytes ?? MAX_RECENT_RUNTIME_EVENT_BYTES)
   const maxLines = Math.max(1, options.maxLines ?? MAX_RECENT_RUNTIME_EVENT_LINES)
-  let handle: Awaited<ReturnType<typeof open>> | null = null
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null
   try {
-    const stat = await lstat(eventsPath)
+    const stat = await fs.lstat(eventsPath)
     if (!stat.isFile()) {
       return []
     }
-    handle = await open(eventsPath, 'r')
+    handle = await fs.open(eventsPath, 'r')
     const fileStat = await handle.stat()
     if (!fileStat.isFile()) {
       return []
@@ -385,6 +502,38 @@ function matchesBootstrapSubmissionIdentity(
   return true
 }
 
+function isRuntimeEventFreshEnough(
+  event: TeammateRuntimeEvent,
+  sinceMs?: number,
+): boolean {
+  if (typeof sinceMs !== 'number' || !Number.isFinite(sinceMs)) {
+    return true
+  }
+  const eventMs = Date.parse(event.timestamp)
+  return Number.isFinite(eventMs) && eventMs >= sinceMs
+}
+
+function matchesStrictRuntimeIdentity(
+  event: TeammateRuntimeEvent,
+  expected: {
+    teamName?: string
+    agentName?: string
+    agentId?: string
+    sinceMs?: number
+  },
+): boolean {
+  if (!isRuntimeEventFreshEnough(event, expected.sinceMs)) {
+    return false
+  }
+  if (!expected.teamName || event.teamName !== expected.teamName) {
+    return false
+  }
+  if (expected.agentId && event.agentId === expected.agentId) {
+    return true
+  }
+  return !!expected.agentName && event.agentName === expected.agentName
+}
+
 function selectLastRelevantBootstrapTransportEvent(
   events: TeammateRuntimeEvent[],
 ): TeammateRuntimeEvent | undefined {
@@ -399,6 +548,10 @@ function selectLastRelevantBootstrapTransportEvent(
     }
   }
   return selected
+}
+
+function formatRuntimeEventStage(event: TeammateRuntimeEvent): string {
+  return event.detail ? `${event.type}: ${event.detail}` : event.type
 }
 
 function isFreshRetryableBootstrapSubmitRejection(
@@ -508,12 +661,17 @@ export async function waitForTeammateRuntimeEvent(params: {
   type: TeammateRuntimeEventType
   timeoutMs: number
   pid?: number
+  teamName?: string
+  agentName?: string
+  agentId?: string
+  sinceMs?: number
   pollIntervalMs?: number
   isStillAlive?: () => boolean
 }): Promise<{ ok: true; event: TeammateRuntimeEvent } | { ok: false; reason: string }> {
   const startedAt = Date.now()
   const pollIntervalMs = params.pollIntervalMs ?? 250
   let lastReadError: string | undefined
+  let lastStage: TeammateRuntimeEvent | undefined
 
   while (Date.now() - startedAt < params.timeoutMs) {
     if (params.isStillAlive && !params.isStillAlive()) {
@@ -525,17 +683,44 @@ export async function waitForTeammateRuntimeEvent(params: {
 
     try {
       const events = await readRecentTeammateRuntimeEvents(params.eventsPath)
-      const matchesPid = (event: TeammateRuntimeEvent): boolean =>
-        typeof params.pid !== 'number' || event.pid === params.pid
+      const matchesExpectedRuntime = (event: TeammateRuntimeEvent): boolean => {
+        if (
+          typeof params.pid === 'number' &&
+          event.pid === params.pid &&
+          isRuntimeEventFreshEnough(event, params.sinceMs)
+        ) {
+          return true
+        }
+        if (
+          typeof params.pid !== 'number' &&
+          !params.teamName &&
+          !params.agentName &&
+          !params.agentId
+        ) {
+          return true
+        }
+        if (!params.teamName || (!params.agentName && !params.agentId)) {
+          return false
+        }
+        return matchesStrictRuntimeIdentity(event, {
+          teamName: params.teamName,
+          agentName: params.agentName,
+          agentId: params.agentId,
+          sinceMs: params.sinceMs,
+        })
+      }
+      const matchedEvents = events.filter(matchesExpectedRuntime)
       const match = events.find(
-        event => event.type === params.type && matchesPid(event),
+        event => event.type === params.type && matchesExpectedRuntime(event),
       )
       if (match) {
         return { ok: true, event: match }
       }
-      const failure = [...events]
+      lastStage =
+        selectLastRelevantBootstrapTransportEvent(matchedEvents) ?? lastStage
+      const failure = [...matchedEvents]
         .reverse()
-        .find(event => event.type === 'failed' && matchesPid(event))
+        .find(event => event.type === 'failed')
       if (failure) {
         return {
           ok: false,
@@ -551,8 +736,14 @@ export async function waitForTeammateRuntimeEvent(params: {
 
   return {
     ok: false,
-    reason: lastReadError
-      ? `timed out waiting for ${params.type}; last runtime log error: ${lastReadError}`
-      : `timed out waiting for ${params.type}`,
+    reason: [
+      `timed out waiting for ${params.type}`,
+      lastStage
+        ? `last runtime stage: ${formatRuntimeEventStage(lastStage)}`
+        : '',
+      lastReadError ? `last runtime log error: ${lastReadError}` : '',
+    ]
+      .filter(Boolean)
+      .join('; '),
   }
 }

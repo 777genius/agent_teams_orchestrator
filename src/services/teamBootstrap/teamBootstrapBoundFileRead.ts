@@ -81,7 +81,7 @@ export async function readBoundRegularUtf8File(params: {
     if (opened.size > params.maxBytes) {
       throw new Error(params.messages.oversized)
     }
-    return handle.readFile({ encoding: 'utf8' })
+    return await handle.readFile({ encoding: 'utf8' })
   } catch (error) {
     if (error instanceof Error) {
       throw error

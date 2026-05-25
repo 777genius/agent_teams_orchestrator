@@ -18,7 +18,7 @@ import type {
   OpenCodePreparedProfile,
 } from './types.js'
 
-const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 15_000
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 30_000
 const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = 60_000
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
@@ -982,10 +982,14 @@ export class OpenCodeHostManager {
       return handle
     } catch (error) {
       handle.state = 'degraded'
-      diagnostics.push(error instanceof Error ? error.message : String(error))
+      const message = error instanceof Error ? error.message : String(error)
+      diagnostics.push(message)
       this.hosts.delete(hostKey)
       await this.forceKillSpawnedHostProcess(child)
-      throw error
+      const diagnosticSuffix = diagnostics.length > 0
+        ? ` Diagnostics: ${diagnostics.join(' | ')}`
+        : ''
+      throw new Error(`${message}${diagnosticSuffix}`)
     }
   }
 
@@ -1117,6 +1121,9 @@ export class OpenCodeHostManager {
     }
 
     if (entry) {
+      entry.child?.stdout?.destroy()
+      entry.child?.stderr?.destroy()
+      entry.child?.stdin?.destroy()
       entry.handle.state = 'disposed'
     }
     this.hosts.delete(record.hostKey)

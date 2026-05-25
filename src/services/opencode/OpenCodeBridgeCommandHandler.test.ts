@@ -12,6 +12,7 @@ import {
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
@@ -382,6 +383,7 @@ function mockRequiredMcpTools(): void {
 
 const originalProbe = openCodeProvisioningProbe.probe
 const originalProbeRetainingHost = openCodeProvisioningProbe.probeRetainingHost
+const originalInventoryProbe = openCodeInventoryService.probe
 const originalProbeModel = openCodeExecutionProbe.probeModel
 const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistentHosts
 const originalEnsureSession = openCodeSessionBridge.ensureSession
@@ -617,6 +619,7 @@ afterEach(async () => {
   __resetAppMcpToolProofCacheForTests()
   openCodeProvisioningProbe.probe = originalProbe
   openCodeProvisioningProbe.probeRetainingHost = originalProbeRetainingHost
+  openCodeInventoryService.probe = originalInventoryProbe
   openCodeExecutionProbe.probeModel = originalProbeModel
   openCodeHostManager.reconcilePersistentHosts = originalReconcilePersistentHosts
   openCodeSessionBridge.ensureSession = originalEnsureSession
@@ -809,6 +812,47 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.cleaned).toBe(1)
       expect(result.runtime.capabilitySnapshotId).toBeNull()
     }
+  })
+
+  test('checks command status with read-only summary inventory', async () => {
+    const probeCalls: Array<{ projectPath?: string | null; options?: Record<string, unknown> }> = []
+    openCodeInventoryService.probe = (async (projectPath, options) => {
+      probeCalls.push({ projectPath, options: options as Record<string, unknown> })
+      return {
+        detected: true,
+        binaryPath: 'opencode',
+        version: '1.0.0',
+        projectPath: projectPath ?? '/tmp/project',
+        profile: null,
+        connectedProviders: [],
+        availableProviders: [],
+        models: [],
+        modelMetadata: [],
+        agents: [],
+        authStorePath: null,
+        probeError: null,
+        diagnostics: [],
+      }
+    }) as typeof openCodeInventoryService.probe
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.commandStatus', {
+        projectPath: '/tmp/project',
+        originalRequestId: 'missing-request',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
+    expect(result.data.status).toBe('unknown')
+    expect(probeCalls).toEqual([
+      {
+        projectPath: '/tmp/project',
+        options: { mode: 'summary', includeAppMcp: false },
+      },
+    ])
   })
 
   test('compatibility mode without execution probe still rejects unknown raw model ids', async () => {
@@ -5868,6 +5912,44 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.runtimePid).toBe(789)
   })
 
+  test('sends a message without provisioning a readiness host first', async () => {
+    let probeCalls = 0
+    const promptCalls: string[] = []
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+      runtimePid: 456,
+    })
+    openCodeProvisioningProbe.probe = (async () => {
+      probeCalls += 1
+      throw new Error('sendMessage must not run readiness provisioning before delivery')
+    }) as typeof openCodeProvisioningProbe.probe
+    openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async (_sessionRecord, input) => {
+      promptCalls.push(input.text)
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'hello bob',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeCalls).toBe(0)
+    expect(promptCalls).toEqual(['hello bob'])
+  })
+
   test('reobserves message_send tool errors before returning plain-text fallback proof', async () => {
     const previousFallbackGrace =
       process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS
@@ -6165,6 +6247,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   test('keeps noReply OpenCode delivery out of turn-settled observer path', async () => {
     const promptCalls: Array<{ noReply?: boolean }> = []
+    let reconcileCalls = 0
     const record = buildRecord({
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
@@ -6180,7 +6263,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
     openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
       record: sessionRecord,
-      summary: buildReconcileSummary(),
+      summary: (reconcileCalls += 1, buildReconcileSummary()),
     })) as typeof openCodeSessionBridge.reconcileSession
 
     const result = await executeOpenCodeBridgeCommandEnvelope(
@@ -6196,7 +6279,22 @@ describe('OpenCodeBridgeCommandHandler', () => {
     )
 
     expect(result.ok).toBe(true)
+    if (!result.ok) {
+      return
+    }
     expect(promptCalls).toEqual([{ noReply: true }])
+    expect(reconcileCalls).toBe(0)
+    expect(result.data).toMatchObject({
+      accepted: true,
+      sessionId: 'session-bob',
+      memberName: 'bob',
+      prePromptCursor: record.lastCanonicalCursor,
+    })
+    expect(result.data.runtimePromptMessageId).toBeUndefined()
+    expect(result.data.responseObservation).toBeUndefined()
+    expect(result.data.diagnostics.map(diagnostic => diagnostic.code)).toContain(
+      'opencode_send_no_reply_accepted',
+    )
   })
 
   test('reattaches app MCP before sending a message to an OpenCode lane session', async () => {
@@ -7701,10 +7799,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
       toolApprovalMode: 'manual',
     })
     const projectedRecords: OpenCodeSessionRecord[] = []
-    const probeOptions: Array<{ toolApprovalMode?: string } | undefined> = []
-    openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
-      probeOptions.push(options)
-      return snapshot
+    openCodeProvisioningProbe.probe = (async () => {
+      throw new Error('transcript should not probe provisioning')
     }) as typeof openCodeProvisioningProbe.probe
     openCodeSessionStore.list = (async () => [
       buildRecord({ laneId: 'secondary:opencode:alice', memberName: 'alice' }),
@@ -7746,7 +7842,6 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(projectedRecords.map(record => record.opencodeSessionId)).toEqual(['session-alt'])
-    expect(probeOptions).toEqual([{ toolApprovalMode: 'manual' }])
     expect(result.data.sessionId).toBe('session-alt')
   })
 
