@@ -6172,7 +6172,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
-  test('returns after prompt acceptance in acceptance settlement mode without reconciling inline', async () => {
+  test('keeps acceptance settlement mode alive through turn-settled guard without reconciling inline', async () => {
     const record = buildRecord({
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
@@ -6181,11 +6181,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
     let reconcileCalls = 0
     let postAcceptanceReconcileCalls = 0
     let promptAccepted = false
+    let turnObserved = false
     try {
       openCodeProvisioningProbe.probe = async () => snapshot
       openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
       openCodeSessionBridge.promptAsync = (async () => undefined) as typeof openCodeSessionBridge.promptAsync
-      openCodeSessionBridge.promptAsyncUntilAccepted = (async (_record, input) => {
+      openCodeSessionBridge.promptAsyncWithTurnSettled = (async (_record, input) => {
         const runtimePromptMessageId = 'msg_test_acceptance'
         await input.onPromptSubmitting?.({
           sessionId: record.opencodeSessionId,
@@ -6197,8 +6198,29 @@ describe('OpenCodeBridgeCommandHandler', () => {
           runtimePromptMessageId,
         })
         promptAccepted = true
-        return { runtimePromptMessageId, hookDiagnostics: [] }
-      }) as typeof openCodeSessionBridge.promptAsyncUntilAccepted
+        const turnSettled: OpenCodeTurnSettledSummary = {
+          outcome: 'success',
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId,
+          turnId: runtimePromptMessageId,
+          endpoint: '/event',
+          streamConnected: true,
+          observedEventCount: 2,
+          matchedEventCount: 2,
+          assistantActivityCount: 1,
+          promptPersisted: true,
+          latestEventType: 'session.status',
+          latestAssistantMessageId: 'msg-assistant-acceptance',
+          diagnostics: [],
+        }
+        await input.onTurnObserved?.({
+          sessionId: record.opencodeSessionId,
+          runtimePromptMessageId,
+          turnSettled,
+        })
+        turnObserved = true
+        return { runtimePromptMessageId, turnSettled, hookDiagnostics: [] }
+      }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
       openCodeSessionBridge.reconcileSession = (async () => {
         reconcileCalls += 1
         if (promptAccepted) {
@@ -6237,11 +6259,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.responseObservation).toBeUndefined()
       expect(reconcileCalls).toBe(0)
       expect(postAcceptanceReconcileCalls).toBe(0)
+      expect(turnObserved).toBe(true)
       const diagnosticCodes = result.data.diagnostics.map(diagnostic => diagnostic.code)
       expect(diagnosticCodes).toContain('opencode_send_settlement_acceptance')
     } finally {
       openCodeSessionBridge.reconcileSession = originalReconcileSession
-      openCodeSessionBridge.promptAsyncUntilAccepted = originalPromptAsyncUntilAccepted
+      openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
     }
   })
 
