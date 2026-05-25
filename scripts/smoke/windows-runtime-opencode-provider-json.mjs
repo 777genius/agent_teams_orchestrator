@@ -233,6 +233,22 @@ try {
     throw new Error('runtime opencode-command did not return a successful handshake envelope');
   }
 
+  const bridgeStdoutResult = runRuntime([
+    'runtime',
+    'opencode-command',
+    '--json',
+    '--input',
+    bridgeInputPath,
+  ]);
+  assertExitZero(bridgeStdoutResult, 'runtime opencode-command stdout');
+  const bridgeStdoutPayload = assertJsonObject(
+    bridgeStdoutResult.stdout,
+    'runtime opencode-command stdout',
+  );
+  if (bridgeStdoutPayload.ok !== true || bridgeStdoutPayload.command !== 'opencode.handshake') {
+    throw new Error('runtime opencode-command stdout did not return a successful handshake envelope');
+  }
+
   process.stdout.write('Windows runtime OpenCode provider JSON smoke passed\n');
 } finally {
   try {
