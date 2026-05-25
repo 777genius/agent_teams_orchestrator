@@ -1,6 +1,6 @@
 import { feature } from 'bun:bundle'
 import { randomBytes } from 'crypto'
-import { unwatchFile, watchFile } from 'fs'
+import { realpathSync, unwatchFile, watchFile } from 'fs'
 import memoize from 'lodash-es/memoize.js'
 import pickBy from 'lodash-es/pickBy.js'
 import { basename, dirname, join, resolve } from 'path'
@@ -810,20 +810,49 @@ function computeTrustDialogAccepted(): boolean {
 
 /**
  * Check trust for an arbitrary directory (not the session cwd).
- * Walks up from `dir`, returning true if any ancestor has trust persisted.
+ * Walks up from `dir`, its realpath, and its validated canonical git root.
  * Unlike checkHasTrustDialogAccepted, this does NOT consult session trust or
- * the memoized project path — use when the target dir differs from cwd (e.g.
- * /assistant installing into a user-typed path).
+ * the memoized project path, but it must still mirror Claude's persisted
+ * project key semantics for valid git worktrees.
  */
-export function isPathTrusted(dir: string): boolean {
-  const config = getGlobalConfig()
+function isConfigPathTrusted(
+  projects: GlobalConfig['projects'],
+  dir: string,
+): boolean {
   let currentPath = normalizePathForConfigKey(resolve(dir))
   while (true) {
-    if (config.projects?.[currentPath]?.hasTrustDialogAccepted) return true
+    if (projects?.[currentPath]?.hasTrustDialogAccepted) return true
     const parentPath = normalizePathForConfigKey(resolve(currentPath, '..'))
     if (parentPath === currentPath) return false
     currentPath = parentPath
   }
+}
+
+function getTrustLookupRoots(dir: string): string[] {
+  const roots = new Set<string>()
+  const add = (value: string | null | undefined): void => {
+    if (value) roots.add(normalizePathForConfigKey(resolve(value)))
+  }
+
+  add(dir)
+  try {
+    add(realpathSync(dir))
+  } catch {
+    // Missing or inaccessible paths are handled by the direct path lookup.
+  }
+
+  const paths = [...roots]
+  for (const path of paths) {
+    add(findCanonicalGitRoot(path))
+  }
+  return [...roots]
+}
+
+export function isPathTrusted(dir: string): boolean {
+  const config = getGlobalConfig()
+  return getTrustLookupRoots(dir).some(root =>
+    isConfigPathTrusted(config.projects, root),
+  )
 }
 
 // We have to put this test code here because Jest doesn't support mocking ES modules :O

@@ -655,6 +655,14 @@ export async function waitForBootstrapSubmissionOutcome(params: {
     await sleep(Math.min(pollIntervalMs, Math.max(1, activeDeadlineMs - nowMs)))
   }
 
+  if (params.isStillAlive && !params.isStillAlive()) {
+    return {
+      type: 'terminal_failure',
+      reason: 'teammate process exited before bootstrap_submitted',
+      event: lastStage,
+    }
+  }
+
   return {
     type: 'timeout',
     lastStage,

@@ -7,7 +7,7 @@ import React from 'react'
 import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, type WriteStream } from 'node:fs'
-import { access, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   getChromeFlagOverride,
@@ -2455,7 +2455,10 @@ async function handleSpawnNativeProcess(
   })
 
   try {
-    await access(workingDir)
+    const workingDirStat = await stat(workingDir)
+    if (!workingDirStat.isDirectory()) {
+      throw new Error('path exists but is not a directory')
+    }
   } catch (error) {
     throw new Error(
       `Teammate "${sanitizedName}" cannot start because cwd "${workingDir}" is unavailable: ${errorMessage(error)}`,

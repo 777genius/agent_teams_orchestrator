@@ -23,6 +23,28 @@ describe('buildCodexNativeWorkspaceTrustConfigOverrides', () => {
     ])
   })
 
+  test('keeps generated worktree and canonical repo-root trust overrides together', () => {
+    expect(
+      buildCodexNativeWorkspaceTrustConfigOverrides({
+        settingsInline: {
+          codex: {
+            agent_teams_workspace_trust: {
+              config_overrides: [
+                'projects."/tmp/generated-worktrees/alice".trust_level="trusted"',
+                'projects."/private/tmp/generated-worktrees/alice".trust_level="trusted"',
+                'projects."/Users/belief/project".trust_level="trusted"',
+              ],
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      'projects."/tmp/generated-worktrees/alice".trust_level="trusted"',
+      'projects."/private/tmp/generated-worktrees/alice".trust_level="trusted"',
+      'projects."/Users/belief/project".trust_level="trusted"',
+    ])
+  })
+
   test('dedupes repeated workspace trust overrides without dropping valid escaped paths', () => {
     expect(
       buildCodexNativeWorkspaceTrustConfigOverrides({

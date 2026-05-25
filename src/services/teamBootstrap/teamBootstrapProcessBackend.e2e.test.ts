@@ -28,7 +28,9 @@ import {
   getGlobalConfig,
   saveGlobalConfig,
   type GlobalConfig,
+  type ProjectConfig,
 } from '../../utils/config.js'
+import { findCanonicalGitRoot, findGitRoot } from '../../utils/git.js'
 import { normalizePathForConfigKey } from '../../utils/path.js'
 import { isProcessAlive, killProcessTree } from '../../utils/processKill.js'
 import { TEAMMATE_COMMAND_ENV_VAR, TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
@@ -55,6 +57,21 @@ const WINDOWS_TEMP_RM_DELAY_MS = 100
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function trustedProjectConfig(existing?: ProjectConfig): ProjectConfig {
+  return {
+    allowedTools: [],
+    mcpContextUris: [],
+    mcpServers: {},
+    enabledMcpjsonServers: [],
+    disabledMcpjsonServers: [],
+    projectOnboardingSeenCount: 0,
+    hasClaudeMdExternalIncludesApproved: false,
+    hasClaudeMdExternalIncludesWarningShown: false,
+    ...(existing ?? {}),
+    hasTrustDialogAccepted: true,
+  }
 }
 
 async function waitForRuntimePidsToExit(pids: number[]): Promise<void> {
@@ -437,6 +454,8 @@ afterEach(async () => {
   restoreEnv(envSnapshot)
   setCwdState(originalCwdState)
   setOriginalCwd(originalOriginalCwd)
+  findGitRoot.cache.clear()
+  findCanonicalGitRoot.cache.clear()
   saveGlobalConfig(current => ({
     ...current,
     projects: originalGlobalConfig.projects,
@@ -516,7 +535,7 @@ describe('supervised process teammate backend e2e', () => {
     })
 
     if (!bootstrapResult.ok) {
-      throw new Error(bootstrapResult.error)
+      throw new Error('error' in bootstrapResult ? bootstrapResult.error : 'bootstrap failed')
     }
     expect(bootstrapResult.ok).toBe(true)
     expect(bootstrapResult.summary.terminalStatus).toBe('completed')
@@ -676,6 +695,81 @@ describe('supervised process teammate backend e2e', () => {
 
     expect(thrown?.message).toContain('workspace trust is not accepted')
     expect(await pathExists(fixture.markerPath)).toBe(false)
+  })
+
+  it('fails before trust checks when cwd is not a directory', async () => {
+    const fixture = await createFixture({ trusted: true })
+    const fileCwd = join(fixture.projectRealpath, 'not-a-directory.txt')
+    await writeFile(fileCwd, 'not a cwd', 'utf8')
+
+    let thrown: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fileCwd,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown?.message).toContain('is not a directory')
+    expect(thrown?.message).not.toContain('workspace trust is not accepted')
+    expect(await pathExists(fixture.markerPath)).toBe(false)
+  })
+
+  it('launches from a git worktree when trust is stored under the canonical repo root', async () => {
+    const fixture = await createFixture({ trusted: false })
+    const worktreeDir = join(dirname(fixture.projectRealpath), 'worktrees', 'alice')
+    const worktreeGitDir = join(fixture.projectRealpath, '.git', 'worktrees', 'alice')
+
+    await mkdir(join(fixture.projectRealpath, '.git'), { recursive: true })
+    await mkdir(worktreeDir, { recursive: true })
+    await mkdir(worktreeGitDir, { recursive: true })
+    await writeFile(join(worktreeDir, '.git'), `gitdir: ${worktreeGitDir}\n`, 'utf8')
+    await writeFile(join(worktreeGitDir, 'commondir'), '../..\n', 'utf8')
+    await writeFile(join(worktreeGitDir, 'gitdir'), `${join(worktreeDir, '.git')}\n`, 'utf8')
+    const worktreeRealpath = await realpath(worktreeDir)
+    expect(findCanonicalGitRoot(worktreeRealpath)).toBe(fixture.projectRealpath)
+
+    const canonicalProjectKey = normalizePathForConfigKey(fixture.projectRealpath)
+    saveGlobalConfig(current => ({
+      ...current,
+      projects: {
+        [canonicalProjectKey]: trustedProjectConfig(
+          current.projects?.[canonicalProjectKey],
+        ),
+      },
+    }))
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: worktreeRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await waitForEvents(runtimePaths.eventsPath, [
+      'process_spawned',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    expect(await pathExists(fixture.markerPath)).toBe(true)
   })
 
   it('keeps retryable bootstrap submit rejection pending until a later submit succeeds', async () => {
@@ -1456,10 +1550,7 @@ async function createFixture(options: {
     projects: options.trusted
       ? {
           ...(current.projects ?? {}),
-          [projectKey]: {
-            ...(current.projects?.[projectKey] ?? {}),
-            hasTrustDialogAccepted: true,
-          },
+          [projectKey]: trustedProjectConfig(current.projects?.[projectKey]),
         }
       : {},
   }))
