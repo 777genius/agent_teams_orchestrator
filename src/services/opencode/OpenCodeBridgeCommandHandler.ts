@@ -3279,11 +3279,13 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         data: finalData,
       }
     } else if (settlementMode === 'acceptance') {
-      const prompted = await openCodeSessionBridge.promptAsyncUntilAccepted(deliveryRecord, {
+      const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
         text: deliveryText,
         parts: fileParts,
         agent: deliveryAgent,
         noReply: false,
+        timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
+        idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',
@@ -3309,8 +3311,19 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
             ],
           })
         },
+        onTurnObserved: async ({ sessionId, runtimePromptMessageId }) => {
+          await markSendMessageOutcome(outcomeBase, {
+            status: 'turn_observed',
+            sessionId,
+            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
+            prePromptCursor,
+            runtimePromptMessageId,
+            turnObservedAt: nowIso(),
+          })
+        },
       })
       runtimePromptMessageId = prompted.runtimePromptMessageId
+      turnSettled = prompted.turnSettled
       if (prompted.hookDiagnostics.length > 0) {
         mcpDiagnostics.push(
           ...prompted.hookDiagnostics.map(message =>
@@ -3397,7 +3410,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         ...mcpDiagnostics,
         teamDiagnostic(
           'opencode_send_settlement_acceptance',
-          'OpenCode prompt_async accepted; response observation will continue through durable app-side ledger reconciliation.',
+          'OpenCode prompt_async accepted after a turn-settled guard; response observation remains delegated to durable app-side ledger reconciliation.',
           'info',
         ),
       ],
@@ -3415,6 +3428,12 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       sendMessageData: finalData,
       diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
     }).catch(() => undefined)
+    await openCodeTurnSettledEmissionCoordinator.emitDelivery({
+      record: deliveryRecord,
+      runtimePromptMessageId,
+      turnSettled,
+      reconcileSummary: null,
+    })
     return {
       snapshot,
       data: finalData,
