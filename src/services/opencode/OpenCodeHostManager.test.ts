@@ -11,6 +11,7 @@ import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
   buildOpenCodeHostSpawnOptions,
+  shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
 
 import type { OpenCodePreparedProfile } from './types.js'
@@ -126,6 +127,12 @@ describe('OpenCodeHostManager', () => {
       stdio: 'ignore',
       windowsHide: true,
     })
+  })
+
+  test('keeps Windows process-scoped hosts referenced until explicit release', () => {
+    expect(shouldUnrefOpenCodeHostProcess('process', 'win32')).toBe(false)
+    expect(shouldUnrefOpenCodeHostProcess('persistent', 'win32')).toBe(true)
+    expect(shouldUnrefOpenCodeHostProcess('process', 'darwin')).toBe(true)
   })
 
   test('does not persist process-scoped hosts into the cross-process registry', async () => {

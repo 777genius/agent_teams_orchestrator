@@ -142,13 +142,14 @@ jobs:
             fi
           done
           [[ -n "$src" ]] || { echo "Compiled runtime binary not found"; exit 1; }
+          runtime_commit="$(git rev-parse HEAD)"
 
           rm -rf release
           mkdir -p release/runtime
           cp "$src" "release/runtime/${{ matrix.binary_name }}"
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
-          printf '%s\n' "${{ github.sha }}" > release/runtime/COMMIT_SHA
+          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package runtime archive (Windows)
@@ -166,12 +167,13 @@ jobs:
           if (-not $source) {
             throw "Compiled runtime binary not found"
           }
+          $runtimeCommit = git rev-parse HEAD
 
           Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
-          Set-Content -Path release/runtime/COMMIT_SHA -Value "${{ github.sha }}"
+          Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name
