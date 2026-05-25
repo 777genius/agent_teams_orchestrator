@@ -122,7 +122,9 @@ jobs:
       - name: Verify compiled runtime (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\dist\cli.exe --version
+        run: |
+          .\dist\cli.exe --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
 
       - name: Package runtime archive
         if: runner.os != 'Windows'
