@@ -1,5 +1,16 @@
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readlink, readdir, readFile, rm, stat, symlink } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  readlink,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { Dirent } from 'node:fs'
@@ -214,7 +225,25 @@ function getErrnoCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code
 }
 
-async function isDirectorySymlinkTo(linkPath: string, targetPath: string): Promise<boolean> {
+function isAccessDeniedLinkError(error: unknown): boolean {
+  const code = getErrnoCode(error)
+  return code === 'EPERM' || code === 'EACCES'
+}
+
+function normalizePathForCompare(value: string): string {
+  const resolved = path.resolve(value)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+async function removePathIfPresent(filePath: string): Promise<void> {
+  await rm(filePath, { recursive: true, force: true }).catch(error => {
+    if (getErrnoCode(error) !== 'ENOENT') {
+      throw error
+    }
+  })
+}
+
+async function isDirectoryLinkTo(linkPath: string, targetPath: string): Promise<boolean> {
   let existing: Awaited<ReturnType<typeof lstat>>
   try {
     existing = await lstat(linkPath)
@@ -224,13 +253,30 @@ async function isDirectorySymlinkTo(linkPath: string, targetPath: string): Promi
     }
     throw error
   }
+  if (!existing.isSymbolicLink() && !existing.isDirectory()) {
+    return false
+  }
+
+  try {
+    const [linkRealPath, targetRealPath] = await Promise.all([
+      realpath(linkPath),
+      realpath(targetPath),
+    ])
+    if (normalizePathForCompare(linkRealPath) === normalizePathForCompare(targetRealPath)) {
+      return true
+    }
+  } catch {
+    // readlink below still handles symlinks whose target currently cannot be realpathed.
+  }
+
   if (!existing.isSymbolicLink()) {
     return false
   }
 
   try {
     const currentTarget = await readlink(linkPath)
-    return path.resolve(path.dirname(linkPath), currentTarget) === path.resolve(targetPath)
+    return normalizePathForCompare(path.resolve(path.dirname(linkPath), currentTarget))
+      === normalizePathForCompare(targetPath)
   } catch (error) {
     if (getErrnoCode(error) === 'EINVAL' || getErrnoCode(error) === 'ENOENT') {
       return false
@@ -239,46 +285,168 @@ async function isDirectorySymlinkTo(linkPath: string, targetPath: string): Promi
   }
 }
 
-async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
+export type OpenCodeProfileNodeModulesMode =
+  | 'shared-symlink'
+  | 'shared-junction'
+  | 'profile-directory'
+
+type DirectorySymlinkType = 'dir' | 'junction'
+
+type SymlinkDirectory = (
+  target: string,
+  path: string,
+  type?: DirectorySymlinkType,
+) => Promise<void>
+
+export type EnsureOpenCodeProfileNodeModulesOptions = {
+  platform?: NodeJS.Platform
+  symlink?: SymlinkDirectory
+}
+
+async function tryCreateSharedDirectoryLink(
+  linkPath: string,
+  targetPath: string,
+  options: Required<EnsureOpenCodeProfileNodeModulesOptions>,
+): Promise<
+  | { ok: true, mode: OpenCodeProfileNodeModulesMode }
+  | { ok: false, error: unknown }
+> {
+  const attempts: DirectorySymlinkType[] = options.platform === 'win32'
+    ? ['dir', 'junction']
+    : ['dir']
+
+  let lastError: unknown = null
+  for (const linkType of attempts) {
+    try {
+      await options.symlink(path.resolve(targetPath), linkPath, linkType)
+      return {
+        ok: true,
+        mode: linkType === 'junction' ? 'shared-junction' : 'shared-symlink',
+      }
+    } catch (error) {
+      if (getErrnoCode(error) === 'EEXIST' && await isDirectoryLinkTo(linkPath, targetPath)) {
+        return {
+          ok: true,
+          mode: linkType === 'junction' ? 'shared-junction' : 'shared-symlink',
+        }
+      }
+      lastError = error
+      if (
+        linkType === 'dir'
+        && options.platform === 'win32'
+        && isAccessDeniedLinkError(error)
+      ) {
+        continue
+      }
+      break
+    }
+  }
+
+  return { ok: false, error: lastError }
+}
+
+async function restoreOrCreateProfileDirectory(input: {
+  linkPath: string
+  backupPath: string | null
+  backupWasDirectory: boolean
+}): Promise<void> {
+  await removePathIfPresent(input.linkPath)
+  if (input.backupPath && input.backupWasDirectory) {
+    try {
+      await rename(input.backupPath, input.linkPath)
+      return
+    } catch (error) {
+      if (getErrnoCode(error) !== 'ENOENT') {
+        throw error
+      }
+    }
+  }
+  if (input.backupPath) {
+    await removePathIfPresent(input.backupPath)
+  }
+  await mkdir(input.linkPath, { recursive: true })
+}
+
+export async function ensureOpenCodeProfileNodeModulesPath(
+  linkPath: string,
+  targetPath: string,
+  rawOptions: EnsureOpenCodeProfileNodeModulesOptions = {},
+): Promise<OpenCodeProfileNodeModulesMode> {
+  const options: Required<EnsureOpenCodeProfileNodeModulesOptions> = {
+    platform: rawOptions.platform ?? process.platform,
+    symlink: rawOptions.symlink ?? symlink,
+  }
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (await isDirectorySymlinkTo(linkPath, targetPath)) {
-      return
+    if (await isDirectoryLinkTo(linkPath, targetPath)) {
+      return options.platform === 'win32' ? 'shared-junction' : 'shared-symlink'
     }
 
-    await rm(linkPath, { recursive: true, force: true }).catch(error => {
+    let existing: Awaited<ReturnType<typeof lstat>> | null = null
+    try {
+      existing = await lstat(linkPath)
+    } catch (error) {
       if (getErrnoCode(error) !== 'ENOENT') {
         throw error
       }
-    })
+    }
 
+    if (!existing) {
+      const created = await tryCreateSharedDirectoryLink(linkPath, targetPath, options)
+      if (created.ok) {
+        return created.mode
+      }
+      if (isAccessDeniedLinkError(created.error)) {
+        await mkdir(linkPath, { recursive: true })
+        return 'profile-directory'
+      }
+      throw created.error
+    }
+
+    const backupPath = `${linkPath}.replaced-${process.pid}-${Date.now()}-${attempt}`
+    const backupWasDirectory = existing.isDirectory() && !existing.isSymbolicLink()
     try {
-      await symlink(targetPath, linkPath, 'dir')
-      return
+      await rename(linkPath, backupPath)
     } catch (error) {
-      if (getErrnoCode(error) !== 'EEXIST') {
-        throw error
+      if (getErrnoCode(error) === 'ENOENT') {
+        continue
       }
-      if (await isDirectorySymlinkTo(linkPath, targetPath)) {
-        return
+      if (isAccessDeniedLinkError(error) && backupWasDirectory) {
+        return 'profile-directory'
       }
+      throw error
     }
+
+    const created = await tryCreateSharedDirectoryLink(linkPath, targetPath, options)
+    if (created.ok) {
+      await removePathIfPresent(backupPath)
+      return created.mode
+    }
+
+    if (isAccessDeniedLinkError(created.error)) {
+      await restoreOrCreateProfileDirectory({ linkPath, backupPath, backupWasDirectory })
+      return 'profile-directory'
+    }
+
+    await restoreOrCreateProfileDirectory({ linkPath, backupPath, backupWasDirectory })
+    throw created.error
   }
 
-  if (await isDirectorySymlinkTo(linkPath, targetPath)) {
-    return
+  if (await isDirectoryLinkTo(linkPath, targetPath)) {
+    return options.platform === 'win32' ? 'shared-junction' : 'shared-symlink'
   }
-  await rm(linkPath, { recursive: true, force: true })
-  try {
-    await symlink(targetPath, linkPath, 'dir')
-  } catch (error) {
-    if (getErrnoCode(error) === 'EEXIST' && await isDirectorySymlinkTo(linkPath, targetPath)) {
-      return
-    }
-    throw error
+  await removePathIfPresent(linkPath)
+  const created = await tryCreateSharedDirectoryLink(linkPath, targetPath, options)
+  if (created.ok) {
+    return created.mode
   }
+  if (isAccessDeniedLinkError(created.error)) {
+    await mkdir(linkPath, { recursive: true })
+    return 'profile-directory'
+  }
+  throw created.error
 }
 
 async function runAfterSettled(previous: Promise<void> | undefined): Promise<void> {
@@ -804,7 +972,10 @@ export class OpenCodeProfileManager {
       mkdir(xdgCacheHome, { recursive: true }),
       mkdir(sharedNpmCachePath, { recursive: true }),
     ])
-    await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
+    await ensureOpenCodeProfileNodeModulesPath(
+      profileOpenCodeNodeModulesPath,
+      sharedOpenCodeNodeModulesPath,
+    )
 
     const globalAuthExists = await fileExists(globalAuthPath)
     const globalAuthFingerprint = globalAuthExists

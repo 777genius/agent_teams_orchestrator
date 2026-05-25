@@ -1,4 +1,12 @@
-import { lstat, mkdtemp, mkdir, readlink, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -8,6 +16,7 @@ import {
   buildManagedConfig,
   buildManagedConfigFingerprint,
   collectProjectBehaviorMetadata,
+  ensureOpenCodeProfileNodeModulesPath,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
 } from './OpenCodeProfileManager.js'
@@ -24,6 +33,42 @@ import {
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
+}
+
+function normalizeComparablePath(value: string): string {
+  const normalized = normalizePath(path.resolve(value))
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+async function expectDirectoryLinkToTarget(linkPath: string, targetPath: string): Promise<void> {
+  const [linkRealPath, targetRealPath] = await Promise.all([
+    realpath(linkPath),
+    realpath(targetPath),
+  ])
+  expect(normalizeComparablePath(linkRealPath)).toBe(normalizeComparablePath(targetRealPath))
+}
+
+function createFsError(code: string, message: string): Error {
+  const error = new Error(message) as NodeJS.ErrnoException
+  error.code = code
+  return error
+}
+
+function createAccessDeniedError(
+  code: 'EPERM' | 'EACCES' = 'EPERM',
+  message = `${code}: operation not permitted, symlink`,
+): Error {
+  return createFsError(code, message)
+}
+
+async function createDirectoryLink(linkPath: string, targetPath: string): Promise<void> {
+  await mkdir(path.dirname(linkPath), { recursive: true })
+  await mkdir(targetPath, { recursive: true })
+  await symlink(
+    targetPath,
+    linkPath,
+    process.platform === 'win32' ? 'junction' : 'dir',
+  )
 }
 
 describe('OpenCodeProfileManager project behavior contract', () => {
@@ -478,8 +523,6 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       const profile = await manager.prepareProfile(path.join(tempDir, 'project'))
       const profileNodeModulesPath = path.join(profile.xdgConfigHome, 'opencode', 'node_modules')
       const sharedNodeModulesPath = path.join(profile.xdgCacheHome, 'config-node_modules')
-      const nodeModulesStat = await lstat(profileNodeModulesPath)
-      const nodeModulesTarget = await readlink(profileNodeModulesPath)
       const appMcpConfig = (
         profile.managedConfig.mcp as Record<string, { environment?: Record<string, string> }>
       )?.['agent-teams']
@@ -491,8 +534,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(profile.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(appCacheHome)
       expect(appMcpConfig?.environment?.[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
       expect(appMcpConfig?.environment?.[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(appCacheHome)
-      expect(nodeModulesStat.isSymbolicLink()).toBe(true)
-      expect(path.resolve(path.dirname(profileNodeModulesPath), nodeModulesTarget)).toBe(sharedNodeModulesPath)
+      await expectDirectoryLinkToTarget(profileNodeModulesPath, sharedNodeModulesPath)
     } finally {
       if (previousDataHome === undefined) {
         delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
@@ -587,12 +629,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       await writeFile(path.join(profileNodeModulesPath, 'stale.txt'), 'stale directory\n', 'utf8')
 
       const repairedProfile = await manager.prepareProfile(projectPath)
-      const repairedStat = await lstat(profileNodeModulesPath)
-      const repairedTarget = await readlink(profileNodeModulesPath)
 
       expect(repairedProfile.profileRootKey).toBe(firstProfile.profileRootKey)
-      expect(repairedStat.isSymbolicLink()).toBe(true)
-      expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
+      await expectDirectoryLinkToTarget(
+        profileNodeModulesPath,
         path.join(repairedProfile.xdgCacheHome, 'config-node_modules'),
       )
     } finally {
@@ -632,14 +672,12 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       const profiles = await Promise.all(
         Array.from({ length: 8 }, () => manager.prepareProfile(projectPath)),
       )
-      const repairedStat = await lstat(profileNodeModulesPath)
-      const repairedTarget = await readlink(profileNodeModulesPath)
 
       expect(new Set(profiles.map(profile => profile.profileRootKey))).toEqual(
         new Set([firstProfile.profileRootKey]),
       )
-      expect(repairedStat.isSymbolicLink()).toBe(true)
-      expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
+      await expectDirectoryLinkToTarget(
+        profileNodeModulesPath,
         path.join(firstProfile.xdgCacheHome, 'config-node_modules'),
       )
     } finally {
@@ -654,6 +692,142 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
       }
     }
+  })
+
+  test('falls back to a Windows junction when directory symlink creation is denied', async () => {
+    const linkPath = path.join(tempDir, 'profile', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache', 'config-node_modules')
+    const attempts: Array<string | undefined> = []
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: 'win32',
+      symlink: async (_target, nextLinkPath, type) => {
+        attempts.push(type)
+        if (type === 'dir') {
+          throw createAccessDeniedError()
+        }
+        await mkdir(nextLinkPath, { recursive: true })
+      },
+    })
+
+    expect(mode).toBe('shared-junction')
+    expect(attempts).toEqual(['dir', 'junction'])
+  })
+
+  test('falls back to profile-local node_modules on non-Windows access-denied symlinks', async () => {
+    const linkPath = path.join(tempDir, 'profile-posix-local', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-posix-local', 'config-node_modules')
+    const attempts: Array<string | undefined> = []
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: 'linux',
+      symlink: async (_target, _nextLinkPath, type) => {
+        attempts.push(type)
+        throw createAccessDeniedError('EACCES')
+      },
+    })
+
+    expect(mode).toBe('profile-directory')
+    expect(normalizeComparablePath(await realpath(linkPath))).toBe(normalizeComparablePath(linkPath))
+    expect(attempts).toEqual(['dir'])
+  })
+
+  test('falls back to profile-local node_modules when Windows directory links are denied', async () => {
+    const linkPath = path.join(tempDir, 'profile-local', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-local', 'config-node_modules')
+    const attempts: Array<string | undefined> = []
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: 'win32',
+      symlink: async (_target, _nextLinkPath, type) => {
+        attempts.push(type)
+        throw createAccessDeniedError()
+      },
+    })
+
+    const fallbackContent = await realpath(linkPath)
+    expect(mode).toBe('profile-directory')
+    expect(normalizeComparablePath(fallbackContent)).toBe(normalizeComparablePath(linkPath))
+    expect(attempts).toEqual(['dir', 'junction'])
+  })
+
+  test('preserves an existing profile-local node_modules directory when Windows links are denied', async () => {
+    const linkPath = path.join(tempDir, 'profile-preserve', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-preserve', 'config-node_modules')
+    await mkdir(linkPath, { recursive: true })
+    await writeFile(path.join(linkPath, 'existing.txt'), 'keep local install\n', 'utf8')
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: 'win32',
+      symlink: async () => {
+        throw createAccessDeniedError()
+      },
+    })
+
+    expect(mode).toBe('profile-directory')
+    expect(await readFile(path.join(linkPath, 'existing.txt'), 'utf8')).toBe(
+      'keep local install\n',
+    )
+  })
+
+  test('restores an existing profile-local node_modules directory when link creation fails unexpectedly', async () => {
+    const linkPath = path.join(tempDir, 'profile-restore', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-restore', 'config-node_modules')
+    await mkdir(linkPath, { recursive: true })
+    await writeFile(path.join(linkPath, 'existing.txt'), 'restore after failed link\n', 'utf8')
+
+    await expect(ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: 'win32',
+      symlink: async () => {
+        throw createFsError('EINVAL', 'EINVAL: invalid directory link')
+      },
+    })).rejects.toThrow('invalid directory link')
+
+    expect(await readFile(path.join(linkPath, 'existing.txt'), 'utf8')).toBe(
+      'restore after failed link\n',
+    )
+  })
+
+  test('does not recreate an already-correct shared node_modules link', async () => {
+    const linkPath = path.join(tempDir, 'profile-existing-link', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-existing-link', 'config-node_modules')
+    await createDirectoryLink(linkPath, targetPath)
+    let symlinkCalls = 0
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: process.platform,
+      symlink: async () => {
+        symlinkCalls += 1
+        throw new Error('should not create a new link')
+      },
+    })
+
+    expect(['shared-symlink', 'shared-junction']).toContain(mode)
+    expect(symlinkCalls).toBe(0)
+    await expectDirectoryLinkToTarget(linkPath, targetPath)
+  })
+
+  test('accepts a correct shared node_modules link created during an EEXIST race', async () => {
+    const linkPath = path.join(tempDir, 'profile-eexist-race', 'config', 'opencode', 'node_modules')
+    const targetPath = path.join(tempDir, 'cache-eexist-race', 'config-node_modules')
+    let symlinkCalls = 0
+
+    const mode = await ensureOpenCodeProfileNodeModulesPath(linkPath, targetPath, {
+      platform: process.platform,
+      symlink: async (target, nextLinkPath) => {
+        symlinkCalls += 1
+        await symlink(
+          target,
+          nextLinkPath,
+          process.platform === 'win32' ? 'junction' : 'dir',
+        )
+        throw createFsError('EEXIST', 'EEXIST: file already exists, symlink')
+      },
+    })
+
+    expect(['shared-symlink', 'shared-junction']).toContain(mode)
+    expect(symlinkCalls).toBe(1)
+    await expectDirectoryLinkToTarget(linkPath, targetPath)
   })
 
   test('syncs app-global OpenCode auth before real local auth so fresh login wins conflicts', () => {
