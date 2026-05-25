@@ -347,8 +347,14 @@ echo Runtime bundle not found after waiting: %TARGET% 1>&2
 exit /b 127
 
 :run_target
+call :augment_launcher_path
 bun "%TARGET%" %*
 exit /b %ERRORLEVEL%
+
+:augment_launcher_path
+if defined BUN_INSTALL if exist "%BUN_INSTALL%\\bin\\bun.exe" set "PATH=%BUN_INSTALL%\\bin;%PATH%"
+if exist "%USERPROFILE%\\.bun\\bin\\bun.exe" set "PATH=%USERPROFILE%\\.bun\\bin;%PATH%"
+exit /b 0
 `
     writeFileSync(`${launcherPath}.cmd`, cmdLauncher)
   }
