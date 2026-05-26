@@ -7,6 +7,7 @@ import {
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
 import { generateAwaySummary } from '../services/awaySummary.js'
 import type { Message } from '../types/message.js'
+import { isHumanTurn } from '../utils/messagePredicates.js'
 import { createAwaySummaryMessage } from '../utils/messages.js'
 
 const BLUR_DELAY_MS = 5 * 60_000
@@ -16,7 +17,7 @@ type SetMessages = (updater: (prev: Message[]) => Message[]) => void
 function hasSummarySinceLastUserTurn(messages: readonly Message[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!
-    if (m.type === 'user' && !m.isMeta && !m.isCompactSummary) return false
+    if (isHumanTurn(m) && !m.isCompactSummary) return false
     if (m.type === 'system' && m.subtype === 'away_summary') return true
   }
   return false

@@ -3,6 +3,7 @@ import { useMemo, useRef } from 'react'
 import type { FileEditOutput } from '../tools/FileEditTool/types.js'
 import type { Output as FileWriteOutput } from '../tools/FileWriteTool/FileWriteTool.js'
 import type { Message } from '../types/message.js'
+import { isHumanTurn } from '../utils/messagePredicates.js'
 
 export type TurnFileDiff = {
   filePath: string
@@ -121,13 +122,7 @@ export function useTurnDiffs(messages: Message[]): TurnDiff[] {
       const message = messages[i]
       if (!message || message.type !== 'user') continue
 
-      // Check if this is a user prompt (not a tool result)
-      const isToolResult =
-        message.toolUseResult ||
-        (Array.isArray(message.message.content) &&
-          message.message.content[0]?.type === 'tool_result')
-
-      if (!isToolResult && !message.isMeta) {
+      if (isHumanTurn(message)) {
         // Start a new turn on user prompt
         if (c.currentTurn && c.currentTurn.files.size > 0) {
           computeTurnStats(c.currentTurn)

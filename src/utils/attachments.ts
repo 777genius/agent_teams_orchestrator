@@ -561,6 +561,7 @@ export type Attachment =
       commandMode?: string
       /** Provenance carried from QueuedCommand so mid-turn drains preserve it */
       origin?: MessageOrigin
+      protocolKind?: string
       /** Carried from QueuedCommand.isMeta — distinguishes human-typed from system-injected */
       isMeta?: boolean
     }
@@ -1088,6 +1089,7 @@ export async function getQueuedCommandAttachments(
         imagePasteIds: getImagePasteIds(_.pastedContents),
         commandMode: _.mode,
         origin: _.origin,
+        protocolKind: _.protocolKind,
         isMeta: _.isMeta,
       }
     }),
@@ -2381,7 +2383,7 @@ export function startRelevantMemoryPrefetch(
     return undefined
   }
 
-  const lastUserMessage = messages.findLast(m => m.type === 'user' && !m.isMeta)
+  const lastUserMessage = messages.findLast(isHumanTurn)
   if (!lastUserMessage) {
     return undefined
   }
