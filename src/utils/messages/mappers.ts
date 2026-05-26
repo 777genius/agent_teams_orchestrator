@@ -46,6 +46,12 @@ export function toInternalMessages(
             uuid: message.uuid ?? randomUUID(),
             timestamp: message.timestamp ?? new Date().toISOString(),
             isMeta: message.isSynthetic,
+            isSynthetic: message.isSynthetic,
+            isReplay: message.isReplay,
+            ...(message.origin ? { origin: message.origin } : {}),
+            ...(message.protocolKind
+              ? { protocolKind: message.protocolKind }
+              : {}),
           } as Message,
         ]
       case 'system':
@@ -135,7 +141,14 @@ export function toSDKMessages(messages: Message[]): SDKMessage[] {
             parent_tool_use_id: null,
             uuid: message.uuid,
             timestamp: message.timestamp,
-            isSynthetic: message.isMeta || message.isVisibleInTranscriptOnly,
+            isSynthetic:
+              message.isSynthetic ||
+              message.isMeta ||
+              message.isVisibleInTranscriptOnly,
+            ...(message.origin ? { origin: message.origin } : {}),
+            ...(message.protocolKind
+              ? { protocolKind: message.protocolKind }
+              : {}),
             // Structured tool output (not the string content sent to the
             // model — the full Output object). Rides the protobuf catchall
             // so web viewers can read things like BriefTool's file_uuid

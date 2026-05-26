@@ -21,6 +21,7 @@ import { logForDebugging } from './debug.js'
 import { safeParseJSON } from './json.js'
 import { lazySchema } from './lazySchema.js'
 import { extractTextContent } from './messages.js'
+import { classifyUserTurnProvenance } from './replayProvenance.js'
 import { asSystemPrompt } from './systemPromptType.js'
 
 const MAX_CONVERSATION_TEXT = 1000
@@ -34,8 +35,10 @@ export function extractConversationText(messages: Message[]): string {
   const parts: string[] = []
   for (const msg of messages) {
     if (msg.type !== 'user' && msg.type !== 'assistant') continue
-    if ('isMeta' in msg && msg.isMeta) continue
-    if ('origin' in msg && msg.origin && msg.origin.kind !== 'human') continue
+    if (msg.type === 'user' && classifyUserTurnProvenance(msg) !== 'human') {
+      continue
+    }
+    if (msg.type === 'assistant' && 'isMeta' in msg && msg.isMeta) continue
     const content = msg.message.content
     if (typeof content === 'string') {
       parts.push(content)

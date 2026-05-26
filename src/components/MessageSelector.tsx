@@ -23,9 +23,10 @@ import * as path from 'path';
 import { useTerminalSize } from 'src/hooks/useTerminalSize.js';
 import type { FileEditOutput } from 'src/tools/FileEditTool/types.js';
 import type { Output as FileWriteToolOutput } from 'src/tools/FileWriteTool/FileWriteTool.js';
-import { BASH_STDERR_TAG, BASH_STDOUT_TAG, COMMAND_MESSAGE_TAG, LOCAL_COMMAND_STDERR_TAG, LOCAL_COMMAND_STDOUT_TAG, TASK_NOTIFICATION_TAG, TEAMMATE_MESSAGE_TAG, TICK_TAG } from '../constants/xml.js';
+import { BASH_STDERR_TAG, BASH_STDOUT_TAG, COMMAND_MESSAGE_TAG, LOCAL_COMMAND_STDERR_TAG, LOCAL_COMMAND_STDOUT_TAG } from '../constants/xml.js';
 import { count } from '../utils/array.js';
 import { formatRelativeTimeAgo, truncate } from '../utils/format.js';
+import { isHumanTurn } from '../utils/messagePredicates.js';
 import type { Theme } from '../utils/theme.js';
 import { Divider } from './design-system/Divider.js';
 type RestoreOption = 'both' | 'conversation' | 'code' | 'summarize' | 'summarize_up_to' | 'nevermind';
@@ -765,9 +766,7 @@ function computeDiffStatsBetweenMessages(messages: Message[], fromMessageId: UUI
   };
 }
 export function selectableUserMessagesFilter(message: Message): message is UserMessage {
-  if (message.type !== 'user') {
-    return false;
-  }
+  if (!isHumanTurn(message)) return false;
   if (Array.isArray(message.message.content) && message.message.content[0]?.type === 'tool_result') {
     return false;
   }
@@ -784,8 +783,8 @@ export function selectableUserMessagesFilter(message: Message): message is UserM
   const lastBlock = typeof content === 'string' ? null : content[content.length - 1];
   const messageText = typeof content === 'string' ? content.trim() : lastBlock && isTextBlock(lastBlock) ? lastBlock.text.trim() : '';
 
-  // Filter out non-user-authored messages (command outputs, task notifications, ticks).
-  if (messageText.indexOf(`<${LOCAL_COMMAND_STDOUT_TAG}>`) !== -1 || messageText.indexOf(`<${LOCAL_COMMAND_STDERR_TAG}>`) !== -1 || messageText.indexOf(`<${BASH_STDOUT_TAG}>`) !== -1 || messageText.indexOf(`<${BASH_STDERR_TAG}>`) !== -1 || messageText.indexOf(`<${TASK_NOTIFICATION_TAG}>`) !== -1 || messageText.indexOf(`<${TICK_TAG}>`) !== -1 || messageText.indexOf(`<${TEAMMATE_MESSAGE_TAG}`) !== -1) {
+  // Keep legacy command output filtering for mixed display-tag content.
+  if (messageText.indexOf(`<${LOCAL_COMMAND_STDOUT_TAG}>`) !== -1 || messageText.indexOf(`<${LOCAL_COMMAND_STDERR_TAG}>`) !== -1 || messageText.indexOf(`<${BASH_STDOUT_TAG}>`) !== -1 || messageText.indexOf(`<${BASH_STDERR_TAG}>`) !== -1) {
     return false;
   }
   return true;
@@ -807,7 +806,7 @@ export function messagesAfterAreOnlySynthetic(messages: Message[], fromIndex: nu
     if (msg.type === 'progress') continue;
     if (msg.type === 'system') continue;
     if (msg.type === 'attachment') continue;
-    if (msg.type === 'user' && msg.isMeta) continue;
+    if (msg.type === 'user' && !isHumanTurn(msg)) continue;
 
     // Assistant with actual content = meaningful
     if (msg.type === 'assistant') {
@@ -819,7 +818,7 @@ export function messagesAfterAreOnlySynthetic(messages: Message[], fromIndex: nu
       continue;
     }
 
-    // User messages that aren't synthetic or meta = meaningful
+    // Human-authored user messages are meaningful.
     if (msg.type === 'user') {
       return false;
     }

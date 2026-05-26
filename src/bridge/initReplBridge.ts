@@ -42,6 +42,7 @@ import {
   isSyntheticMessage,
 } from '../utils/messages.js'
 import type { PermissionMode } from '../utils/permissions/PermissionMode.js'
+import { classifyUserTurnProvenance } from '../utils/replayProvenance.js'
 import { getCurrentSessionTitle } from '../utils/sessionStorage.js'
 import {
   extractConversationText,
@@ -281,10 +282,8 @@ export async function initReplBridge(
         const msg = initialMessages[i]!
         if (
           msg.type !== 'user' ||
-          msg.isMeta ||
-          msg.toolUseResult ||
           msg.isCompactSummary ||
-          (msg.origin && msg.origin.kind !== 'human') ||
+          classifyUserTurnProvenance(msg) !== 'human' ||
           isSyntheticMessage(msg)
         )
           continue

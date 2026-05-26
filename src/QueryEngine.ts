@@ -109,6 +109,12 @@ import {
   isResultSuccessful,
   normalizeMessage,
 } from './utils/queryHelpers.js'
+import {
+  classifyUserTurnProvenance,
+  isSyntheticQueuedCommandReplay,
+  protocolKindForOrigin,
+  protocolKindFromUserContent,
+} from './utils/replayProvenance.js'
 
 // Dead code elimination: conditional import for coordinator mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -675,6 +681,11 @@ export class QueryEngine {
             uuid: message.uuid,
             timestamp: message.timestamp,
             isReplay: true,
+            ...(classifyUserTurnProvenance(message) !== 'human'
+              ? { isSynthetic: true }
+              : {}),
+            ...(message.origin ? { origin: message.origin } : {}),
+            ...(message.protocolKind ? { protocolKind: message.protocolKind } : {}),
           } satisfies SDKUserMessageReplay,
         ]
       })
@@ -794,6 +805,13 @@ export class QueryEngine {
                 uuid: msgToAck.uuid,
                 timestamp: msgToAck.timestamp,
                 isReplay: true,
+                ...(classifyUserTurnProvenance(msgToAck) !== 'human'
+                  ? { isSynthetic: true }
+                  : {}),
+                ...(msgToAck.origin ? { origin: msgToAck.origin } : {}),
+                ...(msgToAck.protocolKind
+                  ? { protocolKind: msgToAck.protocolKind }
+                  : {}),
               } as SDKUserMessageReplay
             }
           }
@@ -927,6 +945,20 @@ export class QueryEngine {
             replayUserMessages &&
             message.attachment.type === 'queued_command'
           ) {
+            const commandProtocolKind =
+              message.attachment.protocolKind ??
+              protocolKindFromUserContent(message.attachment.prompt)
+            const origin =
+              message.attachment.origin ??
+              (message.attachment.commandMode === 'task-notification'
+                ? ({ kind: 'task-notification' } as const)
+                : message.attachment.isMeta && commandProtocolKind === undefined
+                  ? ({ kind: 'coordinator' } as const)
+                  : undefined)
+            const isSyntheticQueuedCommand = isSyntheticQueuedCommandReplay(
+              { ...message.attachment, origin, protocolKind: commandProtocolKind },
+            )
+            const protocolKind = commandProtocolKind ?? protocolKindForOrigin(origin)
             yield {
               type: 'user',
               message: {
@@ -938,6 +970,9 @@ export class QueryEngine {
               uuid: message.attachment.source_uuid || message.uuid,
               timestamp: message.timestamp,
               isReplay: true,
+              ...(isSyntheticQueuedCommand ? { isSynthetic: true } : {}),
+              ...(origin ? { origin } : {}),
+              ...(protocolKind ? { protocolKind } : {}),
             } as SDKUserMessageReplay
           }
           break

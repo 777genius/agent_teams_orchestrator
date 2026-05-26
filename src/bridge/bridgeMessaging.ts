@@ -25,6 +25,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { stripDisplayTagsAllowEmpty } from '../utils/displayTags.js'
 import { errorMessage } from '../utils/errors.js'
 import type { PermissionMode } from '../utils/permissions/PermissionMode.js'
+import { classifyUserTurnProvenance } from '../utils/replayProvenance.js'
 import { jsonParse } from '../utils/slowOperations.js'
 import type { ReplBridgeTransport } from './replBridgeTransport.js'
 
@@ -101,9 +102,9 @@ export function isEligibleBridgeMessage(m: Message): boolean {
  * implausible (an interrupt implies a prior prompt already flowed through).
  */
 export function extractTitleText(m: Message): string | undefined {
-  if (m.type !== 'user' || m.isMeta || m.toolUseResult || m.isCompactSummary)
+  if (m.type !== 'user' || m.isCompactSummary)
     return undefined
-  if (m.origin && m.origin.kind !== 'human') return undefined
+  if (classifyUserTurnProvenance(m) !== 'human') return undefined
   const content = m.message.content
   let raw: string | undefined
   if (typeof content === 'string') {

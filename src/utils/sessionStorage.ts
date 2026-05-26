@@ -82,6 +82,7 @@ import { parseJSONL } from './json.js'
 import { logError } from './log.js'
 import { extractTag, isCompactBoundaryMessage } from './messages.js'
 import { sanitizePath } from './path.js'
+import { classifyUserTurnProvenance } from './replayProvenance.js'
 import {
   extractJsonStringField,
   extractLastJsonStringField,
@@ -1753,7 +1754,8 @@ export function getFirstMeaningfulUserMessageTextContent<T extends Message>(
   transcript: T[],
 ): string | undefined {
   for (const msg of transcript) {
-    if (msg.type !== 'user' || msg.isMeta) continue
+    if (msg.type !== 'user') continue
+    if (classifyUserTurnProvenance(msg) !== 'human') continue
     // Skip compact summary messages - they should not be treated as the first prompt
     if ('isCompactSummary' in msg && msg.isCompactSummary) continue
 
@@ -4766,8 +4768,7 @@ async function readLiteMetadata(
   const firstPrompt =
     extractLastJsonStringField(tail, 'lastPrompt') ||
     extractFirstPromptFromChunk(head) ||
-    extractJsonStringFieldPrefix(head, 'content', 200) ||
-    extractJsonStringFieldPrefix(head, 'text', 200) ||
+    extractFirstPromptPrefixFromChunk(head) ||
     ''
 
   // Extract tail metadata via string search (last occurrence wins).
@@ -4834,13 +4835,12 @@ function extractFirstPromptFromChunk(chunk: string): string {
     if (!line.includes('"type":"user"') && !line.includes('"type": "user"')) {
       continue
     }
-    if (line.includes('"tool_result"')) continue
-    if (line.includes('"isMeta":true') || line.includes('"isMeta": true'))
-      continue
+    if (isSkippableFirstPromptLine(line)) continue
 
     try {
       const entry = jsonParse(line) as Record<string, unknown>
       if (entry.type !== 'user') continue
+      if (classifyUserTurnProvenance(entry) !== 'human') continue
 
       const message = entry.message as Record<string, unknown> | undefined
       if (!message) continue
@@ -4917,6 +4917,60 @@ function extractFirstPromptFromChunk(chunk: string): string {
   if ((feature('PROACTIVE') || feature('KAIROS')) && hasTickMessages)
     return 'Proactive session'
   return ''
+}
+
+function extractFirstPromptPrefixFromChunk(chunk: string): string {
+  let start = 0
+  while (start < chunk.length) {
+    const newlineIdx = chunk.indexOf('\n', start)
+    const line =
+      newlineIdx >= 0 ? chunk.slice(start, newlineIdx) : chunk.slice(start)
+    start = newlineIdx >= 0 ? newlineIdx + 1 : chunk.length
+
+    if (!line.includes('"type":"user"') && !line.includes('"type": "user"')) {
+      continue
+    }
+    if (isSkippableFirstPromptLine(line)) continue
+
+    const contentPrefix =
+      extractJsonStringFieldPrefix(line, 'content', 200) ||
+      extractJsonStringFieldPrefix(line, 'text', 200)
+    if (contentPrefix) return contentPrefix
+  }
+  return ''
+}
+
+function isSkippableFirstPromptLine(line: string): boolean {
+  if (line.includes('"tool_result"')) return true
+  if (line.includes('"isMeta":true') || line.includes('"isMeta": true'))
+    return true
+  if (
+    line.includes('"isSynthetic":true') ||
+    line.includes('"isSynthetic": true')
+  )
+    return true
+  if (
+    line.includes('"isCompactSummary":true') ||
+    line.includes('"isCompactSummary": true')
+  )
+    return true
+  if (line.includes('"protocolKind":')) return true
+  if (
+    line.includes('"kind":"coordinator"') ||
+    line.includes('"kind": "coordinator"') ||
+    line.includes('"kind":"task-notification"') ||
+    line.includes('"kind": "task-notification"') ||
+    line.includes('"kind":"channel"') ||
+    line.includes('"kind": "channel"') ||
+    line.includes('"kind":"cross-session"') ||
+    line.includes('"kind": "cross-session"') ||
+    line.includes('"kind":"tick"') ||
+    line.includes('"kind": "tick"') ||
+    line.includes('"kind":"teammate"') ||
+    line.includes('"kind": "teammate"')
+  )
+    return true
+  return false
 }
 
 /**
