@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
+import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 
@@ -301,6 +302,37 @@ describe('OpenCodeSessionBridge live e2e', () => {
       expect(blocked.reconciled.summary.pendingPermissions?.[0]).toMatchObject({
         sessionId: record.opencodeSessionId,
       })
+      const listedPermissions = await withTimeout(
+        executeOpenCodeBridgeCommandEnvelope({
+          schemaVersion: 1,
+          requestId: `list-permissions-${identity.teamId}`,
+          command: 'opencode.listRuntimePermissions',
+          cwd: projectPath,
+          startedAt: new Date().toISOString(),
+          timeoutMs: 30_000,
+          body: {
+            teamId: identity.teamId,
+            teamName: identity.teamId,
+            laneId: record.laneId ?? 'primary',
+            memberName: identity.memberName,
+            sessionId: record.opencodeSessionId,
+            projectPath,
+          },
+        }),
+        30_000,
+        'listRuntimePermissions(permission)',
+      )
+      expect(listedPermissions.ok).toBe(true)
+      if (listedPermissions.ok) {
+        expect(listedPermissions.data.permissions).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              requestId: blocked.requestId,
+              sessionId: record.opencodeSessionId,
+            }),
+          ]),
+        )
+      }
 
       await withTimeout(
         openCodeSessionBridge.answerPermission(record, {

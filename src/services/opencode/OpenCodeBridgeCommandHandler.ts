@@ -3816,11 +3816,19 @@ async function runListPermissions(envelope: BridgeEnvelope) {
     const body = envelope.body
     const teamId = asString(body.teamId) ?? asString(body.teamName)
     const laneId = asString(body.laneId)
+    const memberName = asString(body.memberName)
+    const sessionId = asString(body.sessionId)
     let records = await openCodeSessionStore.list()
     if (teamId) {
       records = records.filter(record => record.teamId === teamId)
       if (laneId) {
         records = records.filter(record => record.laneId === laneId)
+      }
+      if (memberName) {
+        records = records.filter(record => record.memberName === memberName)
+      }
+      if (sessionId) {
+        records = records.filter(record => record.opencodeSessionId === sessionId)
       }
     }
     if (!laneId && teamId) {
@@ -3838,12 +3846,22 @@ async function runListPermissions(envelope: BridgeEnvelope) {
           const requestID = permission.requestId.trim()
           if (requestID) {
             requestIds.add(requestID)
-            permissionByRequestId.set(requestID, permission.raw)
+            permissionByRequestId.set(requestID, {
+              ...permission.raw,
+              sessionID: permission.sessionId ?? record.opencodeSessionId,
+            })
           }
         }
         for (const requestID of reconciled.summary.pendingPermissionRequestIds) {
           if (requestID.trim()) {
-            requestIds.add(requestID.trim())
+            const trimmedRequestID = requestID.trim()
+            requestIds.add(trimmedRequestID)
+            if (!permissionByRequestId.has(trimmedRequestID)) {
+              permissionByRequestId.set(trimmedRequestID, {
+                requestID: trimmedRequestID,
+                sessionID: record.opencodeSessionId,
+              })
+            }
           }
         }
       }
