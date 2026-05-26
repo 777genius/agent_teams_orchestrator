@@ -114,6 +114,7 @@ import {
   isSyntheticQueuedCommandReplay,
   protocolKindForOrigin,
   protocolKindFromUserContent,
+  shouldInferProtocolKindFromLegacyContent,
 } from './utils/replayProvenance.js'
 
 // Dead code elimination: conditional import for coordinator mode
@@ -947,7 +948,9 @@ export class QueryEngine {
           ) {
             const commandProtocolKind =
               message.attachment.protocolKind ??
-              protocolKindFromUserContent(message.attachment.prompt)
+              (shouldInferProtocolKindFromLegacyContent(message.attachment)
+                ? protocolKindFromUserContent(message.attachment.prompt)
+                : undefined)
             const origin =
               message.attachment.origin ??
               (message.attachment.commandMode === 'task-notification'

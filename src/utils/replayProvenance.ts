@@ -118,11 +118,13 @@ export function classifyUserTurnProvenance(
     return 'task-notification'
   }
 
-  const legacyProtocolKind = classifyLegacyProtocolText(
-    getTextContent(getMessageContent(message)),
-  )
-  if (legacyProtocolKind) {
-    return legacyProtocolKind
+  if (shouldUseLegacyProtocolFallback(message)) {
+    const legacyProtocolKind = classifyLegacyProtocolText(
+      getTextContent(getMessageContent(message)),
+    )
+    if (legacyProtocolKind) {
+      return legacyProtocolKind
+    }
   }
 
   if (message.isSynthetic === true) {
@@ -191,6 +193,27 @@ export function protocolKindFromUserContent(
   return protocolKindFromLegacyUserText(getTextContent(content))
 }
 
+export function shouldInferProtocolKindFromLegacyContent(
+  message: Pick<
+    UserTurnProvenanceInput,
+    | 'commandMode'
+    | 'isMeta'
+    | 'isReplay'
+    | 'isSynthetic'
+    | 'mode'
+    | 'origin'
+  >,
+): boolean {
+  return (
+    message.isReplay === true ||
+    message.isSynthetic === true ||
+    message.isMeta === true ||
+    message.commandMode === 'task-notification' ||
+    message.mode === 'task-notification' ||
+    hasNonHumanOrigin(message.origin)
+  )
+}
+
 export function protocolKindFromLegacyUserText(
   text: string | undefined,
 ): string | undefined {
@@ -257,6 +280,12 @@ function normalizeOriginKind(
     default:
       return 'coordinator'
   }
+}
+
+function shouldUseLegacyProtocolFallback(
+  message: UserTurnProvenanceInput,
+): boolean {
+  return shouldInferProtocolKindFromLegacyContent(message)
 }
 
 function classifyLegacyProtocolText(

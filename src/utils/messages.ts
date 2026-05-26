@@ -93,6 +93,7 @@ import { getPewterLedgerVariant } from './planModeV2.js'
 import {
   protocolKindForOrigin,
   protocolKindFromUserContent,
+  shouldInferProtocolKindFromLegacyContent,
 } from './replayProvenance.js'
 import { jsonStringify } from './slowOperations.js'
 
@@ -3909,7 +3910,9 @@ Read the team config to discover your teammates' names. Check the task list peri
       const detectedProtocolKind =
         attachment.protocolKind ??
         protocolKindForOrigin(attachment.origin) ??
-        protocolKindFromUserContent(attachment.prompt)
+        (shouldInferProtocolKindFromLegacyContent(attachment)
+          ? protocolKindFromUserContent(attachment.prompt)
+          : undefined)
       const origin: MessageOrigin | undefined =
         attachment.origin ??
         (attachment.commandMode === 'task-notification'

@@ -6,6 +6,7 @@ import {
   isSyntheticQueuedCommandReplay,
   isSyntheticSDKUserReplay,
   protocolKindFromUserContent,
+  shouldInferProtocolKindFromLegacyContent,
 } from './replayProvenance.js'
 
 describe('replayProvenance', () => {
@@ -54,6 +55,31 @@ describe('replayProvenance', () => {
     })
   })
 
+  describe('shouldInferProtocolKindFromLegacyContent', () => {
+    test('limits legacy XML inference to replay or non-human command contexts', () => {
+      expect(shouldInferProtocolKindFromLegacyContent({ commandMode: 'prompt' })).toBe(
+        false,
+      )
+      expect(
+        shouldInferProtocolKindFromLegacyContent({
+          commandMode: 'prompt',
+          isMeta: true,
+        }),
+      ).toBe(true)
+      expect(
+        shouldInferProtocolKindFromLegacyContent({
+          commandMode: 'task-notification',
+        }),
+      ).toBe(true)
+      expect(
+        shouldInferProtocolKindFromLegacyContent({
+          commandMode: 'prompt',
+          origin: { kind: 'coordinator' },
+        }),
+      ).toBe(true)
+    })
+  })
+
   describe('classifyUserTurnProvenance', () => {
     test('treats replay alone as human-compatible', () => {
       expect(
@@ -79,12 +105,25 @@ describe('replayProvenance', () => {
       expect(
         classifyUserTurnProvenance({
           type: 'user',
+          isReplay: true,
           message: {
             content:
               'Human: <teammate-message teammate_id="alice">looks good</teammate-message>',
           },
         }),
       ).toBe('teammate-protocol')
+    })
+
+    test('does not treat live human text that starts with protocol XML as synthetic', () => {
+      expect(
+        classifyUserTurnProvenance({
+          type: 'user',
+          message: {
+            content:
+              '<teammate-message teammate_id="alice">please inspect this literal</teammate-message>',
+          },
+        }),
+      ).toBe('human')
     })
 
     test('extracts protocol kind from raw protocol content for new emissions', () => {

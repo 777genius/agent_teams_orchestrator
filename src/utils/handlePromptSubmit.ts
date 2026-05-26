@@ -33,6 +33,7 @@ import { queryCheckpoint, startQueryProfile } from './queryProfiler.js'
 import {
   protocolKindForOrigin,
   protocolKindFromUserContent,
+  shouldInferProtocolKindFromLegacyContent,
 } from './replayProvenance.js'
 import { runWithWorkload } from './workloadContext.js'
 
@@ -505,7 +506,10 @@ async function executeUserInput(params: ExecuteUserInputParams): Promise<void> {
         // does NOT mirror its isMeta:true so idle-dequeued notifications stay
         // visible in the transcript via UserAgentNotificationMessage.
         const commandProtocolKind =
-          cmd.protocolKind ?? protocolKindFromUserContent(cmd.value)
+          cmd.protocolKind ??
+          (shouldInferProtocolKindFromLegacyContent(cmd)
+            ? protocolKindFromUserContent(cmd.value)
+            : undefined)
         const origin =
           cmd.origin ??
           (cmd.mode === 'task-notification'

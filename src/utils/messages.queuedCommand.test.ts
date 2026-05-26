@@ -60,7 +60,7 @@ describe('normalizeAttachmentForAPI queued_command provenance', () => {
     expect(message?.isSynthetic).toBe(true)
   })
 
-  test('marks raw teammate protocol queued commands without wrapping them as user-authored', () => {
+  test('keeps ordinary queued prompts user-authored even when they start with protocol XML', () => {
     const prompt =
       '<teammate-message teammate_id="alice">Looks good</teammate-message>'
     const [message] = normalizeAttachmentForAPI(
@@ -68,6 +68,24 @@ describe('normalizeAttachmentForAPI queued_command provenance', () => {
         prompt,
         isMeta: undefined,
       } as Partial<Attachment>),
+    )
+
+    expect(message?.origin).toBeUndefined()
+    expect(message?.protocolKind).toBeUndefined()
+    expect(message?.isMeta).toBeUndefined()
+    expect(message?.isSynthetic).toBeUndefined()
+    expect(String(message?.message.content)).toContain(
+      'The user sent a new message while you were working:',
+    )
+  })
+
+  test('marks meta raw teammate protocol queued commands without wrapping them as user-authored', () => {
+    const prompt =
+      '<teammate-message teammate_id="alice">Looks good</teammate-message>'
+    const [message] = normalizeAttachmentForAPI(
+      queuedCommandAttachment({
+        prompt,
+      }),
     )
 
     expect(message?.protocolKind).toBe('teammate-message')
