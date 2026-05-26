@@ -39,21 +39,33 @@ jobs:
       target_repo: ${{ steps.meta.outputs.target_repo }}
       target_tag: ${{ steps.meta.outputs.target_tag }}
       runtime_version: ${{ steps.meta.outputs.runtime_version }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      source_commit: ${{ steps.meta.outputs.source_commit }}
 
     steps:
+      - name: Checkout source ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref || github.ref }}
+
       - name: Resolve publish metadata
         id: meta
         shell: bash
         env:
+          INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref }}
           INPUT_TARGET_RELEASE_REPO: ${{ github.event.inputs.target_release_repo }}
           INPUT_TARGET_RELEASE_TAG: ${{ github.event.inputs.target_release_tag }}
           INPUT_RUNTIME_VERSION: ${{ github.event.inputs.runtime_version }}
         run: |
           set -euo pipefail
+          source_ref="${INPUT_SOURCE_REF:-${GITHUB_REF_NAME}}"
+          source_commit="$(git rev-parse HEAD)"
           target_repo="${INPUT_TARGET_RELEASE_REPO:-${DEFAULT_TARGET_RELEASE_REPO}}"
           target_tag="${INPUT_TARGET_RELEASE_TAG:-${GITHUB_REF_NAME}}"
           runtime_version="${INPUT_RUNTIME_VERSION:-${GITHUB_REF_NAME}}"
           runtime_version="${runtime_version#v}"
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
           echo "target_repo=$target_repo" >> "$GITHUB_OUTPUT"
           echo "target_tag=$target_tag" >> "$GITHUB_OUTPUT"
           echo "runtime_version=$runtime_version" >> "$GITHUB_OUTPUT"
@@ -101,7 +113,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.source_ref || github.ref }}
+          ref: ${{ needs.prepare-release.outputs.source_commit }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -116,13 +128,30 @@ jobs:
 
       - name: Verify compiled runtime
         if: runner.os != 'Windows'
+        env:
+          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
-        run: ./dist/cli --version
+        run: |
+          set -euo pipefail
+          actual_version="$(./dist/cli --version | awk '{print $1}')"
+          if [[ "$actual_version" != "$EXPECTED_RUNTIME_VERSION" ]]; then
+            echo "Compiled runtime version mismatch: expected $EXPECTED_RUNTIME_VERSION, got $actual_version" >&2
+            exit 1
+          fi
+          ./dist/cli --version
 
       - name: Verify compiled runtime (Windows)
         if: runner.os == 'Windows'
+        env:
+          EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: pwsh
-        run: .\dist\cli.exe --version
+        run: |
+          $actualVersion = (& .\dist\cli.exe --version).Split(" ")[0]
+          if ($actualVersion -ne $env:EXPECTED_RUNTIME_VERSION) {
+            throw "Compiled runtime version mismatch: expected $env:EXPECTED_RUNTIME_VERSION, got $actualVersion"
+          }
+          .\dist\cli.exe --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
 
       - name: Package runtime archive
         if: runner.os != 'Windows'
@@ -140,13 +169,14 @@ jobs:
             fi
           done
           [[ -n "$src" ]] || { echo "Compiled runtime binary not found"; exit 1; }
+          runtime_commit="$(git rev-parse HEAD)"
 
           rm -rf release
           mkdir -p release/runtime
           cp "$src" "release/runtime/${{ matrix.binary_name }}"
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
-          printf '%s\n' "${{ github.sha }}" > release/runtime/COMMIT_SHA
+          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package runtime archive (Windows)
@@ -164,12 +194,13 @@ jobs:
           if (-not $source) {
             throw "Compiled runtime binary not found"
           }
+          $runtimeCommit = git rev-parse HEAD
 
           Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
-          Set-Content -Path release/runtime/COMMIT_SHA -Value "${{ github.sha }}"
+          Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name
@@ -217,6 +248,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare-release.outputs.source_commit }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -243,6 +276,8 @@ jobs:
         env:
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          RUNTIME_SOURCE_REF: ${{ needs.prepare-release.outputs.source_ref }}
+          RUNTIME_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
         shell: bash
         run: |
           set -euo pipefail

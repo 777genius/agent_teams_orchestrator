@@ -303,6 +303,13 @@ function unrefChildProcessHandle(child: ChildProcess): void {
   unrefHandle(child.stdin as UnrefableHandle)
 }
 
+export function shouldUnrefOpenCodeHostProcess(
+  lifetime: OpenCodeHostLifetime,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return lifetime === 'persistent' || platform !== 'win32'
+}
+
 export function buildOpenCodeHostSpawnOptions(
   profile: OpenCodePreparedProfile,
   platform: NodeJS.Platform = process.platform,
@@ -966,7 +973,9 @@ export class OpenCodeHostManager {
     }
     this.hosts.set(hostKey, entry)
     this.bindHostLifecycle(hostKey, entry)
-    unrefChildProcessHandle(child)
+    if (shouldUnrefOpenCodeHostProcess(lifetime)) {
+      unrefChildProcessHandle(child)
+    }
 
     try {
       const health = await this.waitForHealthyHost(

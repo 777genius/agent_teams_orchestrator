@@ -56,7 +56,8 @@ const manifest = {
   targetReleaseTag,
   generatedAt: new Date().toISOString(),
   sourceRepository: process.env.GITHUB_REPOSITORY,
-  sourceCommit: process.env.GITHUB_SHA,
+  sourceRef: process.env.RUNTIME_SOURCE_REF ?? process.env.GITHUB_REF_NAME,
+  sourceCommit: process.env.RUNTIME_SOURCE_COMMIT ?? process.env.GITHUB_SHA,
   assets: {} as Record<string, { file: string; archiveKind: string; binaryName: string; sha256: string }>,
 };
 
