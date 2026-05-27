@@ -15,12 +15,6 @@ async function expectRuntimeCommandExit(
   run: () => Promise<void>,
   expectedCode: number,
 ): Promise<void> {
-  if (process.platform === 'win32') {
-    await run()
-    expect(process.exitCode).toBe(expectedCode)
-    return
-  }
-
   await expect(run()).rejects.toThrow(`process.exit:${expectedCode}`)
 }
 
@@ -113,9 +107,7 @@ describe('runtime provider stdout contract', () => {
       expect(stdout.join('')).not.toContain('noisy stdout')
       expect(stderr.join('')).toContain('noisy stdout before result')
       expect(stderr.join('')).toContain('noisy stdout while response is being selected')
-      if (process.platform !== 'win32') {
-        expect(stderr.join('')).toContain('noisy stdout during exit')
-      }
+      expect(stderr.join('')).toContain('noisy stdout during exit')
     } finally {
       openCodeProviderManagementAdapter.loadView = originalLoadView
       process.stdout.write = originalStdoutWrite
@@ -188,9 +180,7 @@ describe('runtime provider stdout contract', () => {
       expect(payload.error?.message).not.toContain('live-token-123456789')
       expect(stdout.join('')).not.toContain('noisy stdout')
       expect(stderr.join('')).toContain('noisy stdout before throw')
-      if (process.platform !== 'win32') {
-        expect(stderr.join('')).toContain('noisy stdout during exit')
-      }
+      expect(stderr.join('')).toContain('noisy stdout during exit')
     } finally {
       openCodeProviderManagementAdapter.loadView = originalLoadView
       process.stdout.write = originalStdoutWrite
@@ -258,9 +248,6 @@ describe('runtime provider stdout contract', () => {
         }) as typeof process.exit
 
         await scenario.run()
-        if (process.platform === 'win32') {
-          expect(process.exitCode).toBe(1)
-        }
 
         expect(stdout).toHaveLength(1)
         const payload = JSON.parse(stdout.join('')) as {
@@ -270,9 +257,7 @@ describe('runtime provider stdout contract', () => {
         expect(payload.error?.recoverable).toBe(true)
         expect(payload.error?.message).toBe(scenario.message)
         expect(stdout.join('')).not.toContain('noisy stdout')
-        if (process.platform !== 'win32') {
-          expect(stderr.join('')).toContain('noisy stdout during validation exit:1')
-        }
+        expect(stderr.join('')).toContain('noisy stdout during validation exit:1')
       } finally {
         process.stdout.write = originalStdoutWrite
         process.stderr.write = originalStderrWrite

@@ -47,16 +47,7 @@ type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 type RuntimeStdoutWrite = typeof process.stdout.write
 
-function shouldDeferRuntimeStdoutExit(): boolean {
-  return process.platform === 'win32'
-}
-
 function exitRuntimeCommand(exitCode: number): void {
-  if (shouldDeferRuntimeStdoutExit()) {
-    process.exitCode = exitCode
-    return
-  }
-
   process.exit(exitCode)
 }
 
