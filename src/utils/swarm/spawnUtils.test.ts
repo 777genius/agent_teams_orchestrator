@@ -632,6 +632,55 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
+  it('passes sanitized inline settings for app-managed Desktop runtime settings paths', () => {
+    const originalAppManagedRuntimePath =
+      process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+    const settingsPath =
+      '/tmp/agent-teams-runtime-settings/mixed/run/runtime-settings-anthropic.json'
+
+    process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH = settingsPath
+    setFlagSettingsPath(settingsPath)
+    setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      codex: {
+        forced_login_method: 'chatgpt',
+        agent_teams_workspace_trust: {
+          config_overrides: [
+            'projects."/tmp/project".trust_level="trusted"',
+          ],
+        },
+      },
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'codex' })
+
+      expect(flags).toContain('--settings')
+      expect(flags).toContain('forced_login_method')
+      expect(flags).toContain('chatgpt')
+      expect(flags).toContain('agent_teams_workspace_trust')
+      expect(flags).not.toContain(settingsPath)
+      expect(flags).not.toContain('apiKeyHelper')
+      expect(flags).not.toContain('awsCredentialExport')
+      expect(flags).not.toContain('awsAuthRefresh')
+      expect(flags).not.toContain('gcpAuthRefresh')
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
+      if (originalAppManagedRuntimePath === undefined) {
+        delete process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH =
+          originalAppManagedRuntimePath
+      }
+    }
+  })
+
   it('keeps custom path-based inherited settings authoritative for Codex teammates', () => {
     const originalFlagSettingsPath = getFlagSettingsPath()
     const originalFlagSettingsInline = getFlagSettingsInline()
@@ -886,6 +935,8 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const originalCodexApiKey = process.env.CODEX_API_KEY
     const originalCodexHome = process.env.CODEX_HOME
     const originalCodexCliPath = process.env.CODEX_CLI_PATH
+    const originalRuntimeSettingsPath =
+      process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH
     const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
     const originalSettingsInline = getFlagSettingsInline()
 
@@ -893,6 +944,8 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     process.env.CODEX_API_KEY = 'sk-codex-teammate'
     process.env.CODEX_HOME = '/tmp/codex-connected-home'
     process.env.CODEX_CLI_PATH = '/tmp/codex-bin'
+    process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH =
+      '/tmp/runtime-settings-anthropic.json'
     process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
     setFlagSettingsInline({
       codex: {
@@ -909,6 +962,9 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       expect(env).toContain("CODEX_API_KEY=''")
       expect(env).toContain('CODEX_HOME=/tmp/codex-connected-home')
       expect(env).toContain('CODEX_CLI_PATH=/tmp/codex-bin')
+      expect(env).toContain(
+        'CLAUDE_TEAM_RUNTIME_SETTINGS_PATH=/tmp/runtime-settings-anthropic.json',
+      )
       expect(env).not.toContain('OPENAI_API_KEY=sk-openai-teammate')
       expect(env).not.toContain('CODEX_API_KEY=sk-codex-teammate')
     } finally {
@@ -934,6 +990,13 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         delete process.env.CODEX_CLI_PATH
       } else {
         process.env.CODEX_CLI_PATH = originalCodexCliPath
+      }
+
+      if (originalRuntimeSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH =
+          originalRuntimeSettingsPath
       }
 
       if (originalEntryProvider === undefined) {

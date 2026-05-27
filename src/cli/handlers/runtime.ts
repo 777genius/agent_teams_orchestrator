@@ -41,6 +41,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { readFile, writeFile } from 'node:fs/promises'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
+const STDOUT_EXIT_SETTLE_TIMEOUT_MS = 50
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
@@ -65,6 +66,7 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
       result = recoverOperationError(error)
     }
     const exitCode = await writeResponse(result, originalWrite)
+    await new Promise(resolve => setTimeout(resolve, STDOUT_EXIT_SETTLE_TIMEOUT_MS))
     process.exit(exitCode)
   } finally {
     process.stdout.write = originalWrite

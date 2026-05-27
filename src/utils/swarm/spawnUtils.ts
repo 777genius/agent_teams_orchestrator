@@ -107,12 +107,22 @@ export function buildInheritedCliFlags(options?: {
     buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
   const suppressAppManagedAnthropicPath =
     provider !== 'anthropic' && isAppManagedAnthropicSettingsPath(settingsPath)
-  if (settingsPath && !appManagedAnthropicSettingsFlag && !suppressAppManagedAnthropicPath) {
+  const suppressAppManagedTeamRuntimePath =
+    provider !== 'anthropic' && isAppManagedTeamRuntimeSettingsPath(settingsPath)
+  if (
+    settingsPath &&
+    !appManagedAnthropicSettingsFlag &&
+    !suppressAppManagedAnthropicPath &&
+    !suppressAppManagedTeamRuntimePath
+  ) {
     flags.push(`--settings ${quote([settingsPath])}`)
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
-  } else if (inheritedSettingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+  } else if (
+    inheritedSettingsInline &&
+    (!settingsPath || suppressAppManagedAnthropicPath || suppressAppManagedTeamRuntimePath)
+  ) {
     flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
   }
 
@@ -200,6 +210,7 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD',
   'CODEX_CLI_PATH',
   'CODEX_HOME',
+  'CLAUDE_TEAM_RUNTIME_SETTINGS_PATH',
   'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE',
   'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
   // Custom API endpoint
@@ -251,6 +262,8 @@ const APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV = 'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE'
 const APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER = 'api_key_helper'
 const APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV =
   'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH'
+const APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV =
+  'CLAUDE_TEAM_RUNTIME_SETTINGS_PATH'
 const APP_MANAGED_ANTHROPIC_COMPETING_AUTH_ENV_VARS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
@@ -372,6 +385,13 @@ function isAppManagedAnthropicSettingsPath(settingsPath?: string | null): boolea
     return false
   }
   return settingsPath === helperSettingsPath || dirname(settingsPath) === dirname(helperSettingsPath)
+}
+
+export function isAppManagedTeamRuntimeSettingsPath(
+  settingsPath?: string | null,
+): boolean {
+  const appManagedPath = process.env[APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV]?.trim()
+  return Boolean(settingsPath && appManagedPath && settingsPath === appManagedPath)
 }
 
 type JsonObject = Record<string, unknown>

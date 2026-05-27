@@ -82,6 +82,7 @@ import {
   buildInheritedEnvObject,
   buildInheritedEnvVars,
   buildProviderScopedInheritedSettingsInline,
+  isAppManagedTeamRuntimeSettingsPath,
   probeTmuxTeammateSpawn,
   stripInheritedCliFlag,
   stripProviderBoundaryInheritedRuntimeFlags,
@@ -1558,12 +1559,22 @@ function buildInheritedCliFlags(options?: {
     !!helperSettingsPath &&
     (settingsPath === helperSettingsPath ||
       settingsPath.startsWith(`${dirname(helperSettingsPath)}/`))
-  if (settingsPath && !appManagedAnthropicSettingsFlag && !suppressAppManagedAnthropicPath) {
+  const suppressAppManagedTeamRuntimePath =
+    provider !== 'anthropic' && isAppManagedTeamRuntimeSettingsPath(settingsPath)
+  if (
+    settingsPath &&
+    !appManagedAnthropicSettingsFlag &&
+    !suppressAppManagedAnthropicPath &&
+    !suppressAppManagedTeamRuntimePath
+  ) {
     flags.push(`--settings ${quote([settingsPath])}`)
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
-  } else if (inheritedSettingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+  } else if (
+    inheritedSettingsInline &&
+    (!settingsPath || suppressAppManagedAnthropicPath || suppressAppManagedTeamRuntimePath)
+  ) {
     flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
   }
 
