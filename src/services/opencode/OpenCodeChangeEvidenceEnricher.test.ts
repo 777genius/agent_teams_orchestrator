@@ -191,6 +191,45 @@ describe('OpenCodeChangeEvidenceEnricher', () => {
     })
   })
 
+  test('records snapshot shape metadata when full-text toolpart proof needs no upgrade', async () => {
+    const diagnostics: string[] = []
+    const evidenceMetadata: { snapshotShapeFingerprint?: string } = {}
+    const result = await new OpenCodeChangeEvidenceEnricher().enrich({
+      workspaceRoot,
+      sessionRecord: sessionRecord(),
+      changes: [
+        change({
+          sourceTool: 'write',
+          sourcePartId: 'part-write',
+          sourceImportKey: 'opencode\0session-1\0part-write\0/repo/src/file.ts',
+          beforeContent: null,
+          afterContent: 'export const value = 2;\n',
+          beforeState: { exists: false, sizeBytes: 0 },
+          afterState: { exists: true, sizeBytes: 24 },
+          operation: 'create',
+          warnings: [],
+        }),
+      ],
+      offline: offlineFixture(),
+      snapshotProvider: snapshotProvider({
+        relativePath: 'src/file.ts',
+        operation: 'create',
+        afterContent: 'export const value = 2;\n',
+      }),
+      evidenceMetadata,
+      snapshotProofAllowed: true,
+      diagnostics,
+    })
+
+    expect(diagnostics).toEqual([])
+    expect(evidenceMetadata.snapshotShapeFingerprint).toBe('shape-v1')
+    expect(result[0]).toMatchObject({
+      operation: 'create',
+      confidence: 'medium',
+      evidenceProof: 'toolpart-chain',
+    })
+  })
+
   test('upgrades write overwrites when session snapshot proves full before and after text', async () => {
     const diagnostics: string[] = []
     const result = await new OpenCodeChangeEvidenceEnricher().enrich({

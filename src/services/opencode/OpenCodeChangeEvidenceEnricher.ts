@@ -521,6 +521,28 @@ export class OpenCodeChangeEvidenceEnricher {
     }
     const proofCandidates = result.filter(needsSnapshotProof)
     if (proofCandidates.length === 0) {
+      if (
+        params.snapshotProofAllowed === true &&
+        params.snapshotProvider &&
+        params.evidenceMetadata &&
+        result.some(change => changeRelativePathKey(params.workspaceRoot, change))
+      ) {
+        const probeResult = await params.snapshotProvider.probe({
+          workspaceRoot: params.workspaceRoot,
+          profileRootKey: params.sessionRecord.profileRootKey,
+        }).catch(error => {
+          params.diagnostics.push(`OpenCode snapshot evidence probe failed - ${error instanceof Error ? error.message : String(error)}`)
+          return null
+        })
+        if (probeResult?.supported) {
+          params.evidenceMetadata.snapshotShapeFingerprint = probeResult.shapeFingerprint
+          if (probeResult.diagnostics?.length) {
+            params.diagnostics.push(...probeResult.diagnostics)
+          }
+        } else if (probeResult?.diagnostics?.length) {
+          params.diagnostics.push(...probeResult.diagnostics)
+        }
+      }
       return result
     }
     if (params.snapshotProofAllowed === false) {
