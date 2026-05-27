@@ -11,6 +11,19 @@ import {
   runtimeProvidersView,
 } from './runtime.js'
 
+async function expectRuntimeCommandExit(
+  run: () => Promise<void>,
+  expectedCode: number,
+): Promise<void> {
+  if (process.platform === 'win32') {
+    await run()
+    expect(process.exitCode).toBe(expectedCode)
+    return
+  }
+
+  await expect(run()).rejects.toThrow(`process.exit:${expectedCode}`)
+}
+
 function minimalProviderView(): ProviderManagementView {
   return {
     runtimeId: 'opencode',
@@ -36,10 +49,12 @@ describe('runtime provider stdout contract', () => {
     const originalStdoutWrite = process.stdout.write
     const originalStderrWrite = process.stderr.write
     const originalExit = process.exit
+    const originalExitCode = process.exitCode
     const stdout: string[] = []
     const stderr: string[] = []
 
     try {
+      process.exitCode = undefined
       process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
         stdout.push(String(chunk))
         const writeCallback =
@@ -83,8 +98,9 @@ describe('runtime provider stdout contract', () => {
         return result
       }
 
-      await expect(runtimeProvidersView({ runtime: 'opencode', json: true })).rejects.toThrow(
-        'process.exit:0',
+      await expectRuntimeCommandExit(
+        () => runtimeProvidersView({ runtime: 'opencode', json: true }),
+        0,
       )
 
       expect(stdout).toHaveLength(1)
@@ -97,12 +113,15 @@ describe('runtime provider stdout contract', () => {
       expect(stdout.join('')).not.toContain('noisy stdout')
       expect(stderr.join('')).toContain('noisy stdout before result')
       expect(stderr.join('')).toContain('noisy stdout while response is being selected')
-      expect(stderr.join('')).toContain('noisy stdout during exit')
+      if (process.platform !== 'win32') {
+        expect(stderr.join('')).toContain('noisy stdout during exit')
+      }
     } finally {
       openCodeProviderManagementAdapter.loadView = originalLoadView
       process.stdout.write = originalStdoutWrite
       process.stderr.write = originalStderrWrite
       process.exit = originalExit
+      process.exitCode = originalExitCode
     }
   })
 
@@ -111,10 +130,12 @@ describe('runtime provider stdout contract', () => {
     const originalStdoutWrite = process.stdout.write
     const originalStderrWrite = process.stderr.write
     const originalExit = process.exit
+    const originalExitCode = process.exitCode
     const stdout: string[] = []
     const stderr: string[] = []
 
     try {
+      process.exitCode = undefined
       process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
         stdout.push(String(chunk))
         const writeCallback =
@@ -149,8 +170,9 @@ describe('runtime provider stdout contract', () => {
         )
       }
 
-      await expect(runtimeProvidersView({ runtime: 'opencode', json: true })).rejects.toThrow(
-        'process.exit:1',
+      await expectRuntimeCommandExit(
+        () => runtimeProvidersView({ runtime: 'opencode', json: true }),
+        1,
       )
 
       expect(stdout).toHaveLength(1)
@@ -166,12 +188,15 @@ describe('runtime provider stdout contract', () => {
       expect(payload.error?.message).not.toContain('live-token-123456789')
       expect(stdout.join('')).not.toContain('noisy stdout')
       expect(stderr.join('')).toContain('noisy stdout before throw')
-      expect(stderr.join('')).toContain('noisy stdout during exit')
+      if (process.platform !== 'win32') {
+        expect(stderr.join('')).toContain('noisy stdout during exit')
+      }
     } finally {
       openCodeProviderManagementAdapter.loadView = originalLoadView
       process.stdout.write = originalStdoutWrite
       process.stderr.write = originalStderrWrite
       process.exit = originalExit
+      process.exitCode = originalExitCode
     }
   })
 
@@ -199,10 +224,12 @@ describe('runtime provider stdout contract', () => {
       const originalStdoutWrite = process.stdout.write
       const originalStderrWrite = process.stderr.write
       const originalExit = process.exit
+      const originalExitCode = process.exitCode
       const stdout: string[] = []
       const stderr: string[] = []
 
       try {
+        process.exitCode = undefined
         process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
           stdout.push(String(chunk))
           const writeCallback =
@@ -231,6 +258,9 @@ describe('runtime provider stdout contract', () => {
         }) as typeof process.exit
 
         await scenario.run()
+        if (process.platform === 'win32') {
+          expect(process.exitCode).toBe(1)
+        }
 
         expect(stdout).toHaveLength(1)
         const payload = JSON.parse(stdout.join('')) as {
@@ -240,11 +270,14 @@ describe('runtime provider stdout contract', () => {
         expect(payload.error?.recoverable).toBe(true)
         expect(payload.error?.message).toBe(scenario.message)
         expect(stdout.join('')).not.toContain('noisy stdout')
-        expect(stderr.join('')).toContain('noisy stdout during validation exit:1')
+        if (process.platform !== 'win32') {
+          expect(stderr.join('')).toContain('noisy stdout during validation exit:1')
+        }
       } finally {
         process.stdout.write = originalStdoutWrite
         process.stderr.write = originalStderrWrite
         process.exit = originalExit
+        process.exitCode = originalExitCode
       }
     })
   }
