@@ -38,6 +38,7 @@ import type {
   RuntimeProviderStatus,
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { writeSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
@@ -46,6 +47,21 @@ const STDOUT_EXIT_SETTLE_TIMEOUT_MS = 50
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 type RuntimeStdoutWrite = typeof process.stdout.write
+
+const writeRawStdout: RuntimeStdoutWrite = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+  const writeCallback =
+    typeof encodingOrCallback === 'function'
+      ? encodingOrCallback
+      : typeof callback === 'function'
+        ? callback
+        : null
+  const output = Buffer.isBuffer(chunk) || typeof chunk === 'string'
+    ? chunk
+    : String(chunk)
+  writeSync(1, output)
+  writeCallback?.()
+  return true
+}) as RuntimeStdoutWrite
 
 async function withRuntimeJsonStdoutGuardedResponse<T>(
   operation: () => Promise<T>,
@@ -65,7 +81,8 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
       }
       result = recoverOperationError(error)
     }
-    const exitCode = await writeResponse(result, originalWrite)
+    const responseWrite = process.platform === 'win32' ? writeRawStdout : originalWrite
+    const exitCode = await writeResponse(result, responseWrite)
     await new Promise(resolve => setTimeout(resolve, STDOUT_EXIT_SETTLE_TIMEOUT_MS))
     process.exit(exitCode)
   } finally {
