@@ -518,8 +518,9 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
     const originalFlagSettingsPath = getFlagSettingsPath()
     const originalFlagSettingsInline = getFlagSettingsInline()
-    const helperDir = '/tmp/team-runtime-auth/mixed/runs/run-1'
-    const inheritedAnthropicSettingsPath = `${helperDir}/runtime-settings-anthropic.json`
+    const helperDir = '/var/folders/team-runtime-auth/mixed/runs/run-1'
+    const inheritedAnthropicSettingsPath =
+      `/private${helperDir}/runtime-settings-anthropic.json`
 
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
@@ -638,10 +639,10 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const originalFlagSettingsPath = getFlagSettingsPath()
     const originalFlagSettingsInline = getFlagSettingsInline()
     const settingsPath =
-      '/tmp/agent-teams-runtime-settings/mixed/run/runtime-settings-anthropic.json'
+      '/var/folders/agent-teams-runtime-settings/mixed/run/runtime-settings-anthropic.json'
 
     process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH = settingsPath
-    setFlagSettingsPath(settingsPath)
+    setFlagSettingsPath(`/private${settingsPath}`)
     setFlagSettingsInline({
       apiKeyHelper: "'/tmp/helper.sh'",
       awsCredentialExport: '/tmp/aws.sh',
@@ -665,6 +666,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       expect(flags).toContain('chatgpt')
       expect(flags).toContain('agent_teams_workspace_trust')
       expect(flags).not.toContain(settingsPath)
+      expect(flags).not.toContain(`/private${settingsPath}`)
       expect(flags).not.toContain('apiKeyHelper')
       expect(flags).not.toContain('awsCredentialExport')
       expect(flags).not.toContain('awsAuthRefresh')

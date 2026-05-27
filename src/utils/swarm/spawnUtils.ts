@@ -374,24 +374,44 @@ export function buildAppManagedAnthropicApiKeyHelperSettingsFlag(
   return `--settings ${quote([mergedPath ?? settingsPath])}`
 }
 
-function isAppManagedAnthropicSettingsPath(settingsPath?: string | null): boolean {
-  const helperSettingsPath = process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV]?.trim()
+function normalizeComparableSettingsPath(pathValue?: string | null): string | null {
+  const trimmed = pathValue?.trim()
+  if (!trimmed) {
+    return null
+  }
+  if (process.platform === 'darwin' && trimmed.startsWith('/private/var/')) {
+    return trimmed.slice('/private'.length)
+  }
+  return trimmed
+}
+
+export function isAppManagedAnthropicSettingsPath(settingsPath?: string | null): boolean {
+  const comparableSettingsPath = normalizeComparableSettingsPath(settingsPath)
+  const helperSettingsPath = normalizeComparableSettingsPath(
+    process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV],
+  )
   if (
-    !settingsPath ||
+    !comparableSettingsPath ||
     !helperSettingsPath ||
     process.env[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] !==
       APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER
   ) {
     return false
   }
-  return settingsPath === helperSettingsPath || dirname(settingsPath) === dirname(helperSettingsPath)
+  return (
+    comparableSettingsPath === helperSettingsPath ||
+    dirname(comparableSettingsPath) === dirname(helperSettingsPath)
+  )
 }
 
 export function isAppManagedTeamRuntimeSettingsPath(
   settingsPath?: string | null,
 ): boolean {
-  const appManagedPath = process.env[APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV]?.trim()
-  return Boolean(settingsPath && appManagedPath && settingsPath === appManagedPath)
+  const comparableSettingsPath = normalizeComparableSettingsPath(settingsPath)
+  const appManagedPath = normalizeComparableSettingsPath(
+    process.env[APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV],
+  )
+  return Boolean(comparableSettingsPath && appManagedPath && comparableSettingsPath === appManagedPath)
 }
 
 type JsonObject = Record<string, unknown>

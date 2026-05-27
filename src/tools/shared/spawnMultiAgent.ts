@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, type WriteStream } from 'node:fs'
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -81,6 +81,7 @@ import {
   buildAppManagedAnthropicApiKeyHelperSettingsFlag,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
+  isAppManagedAnthropicSettingsPath,
   buildProviderScopedInheritedSettingsInline,
   isAppManagedTeamRuntimeSettingsPath,
   probeTmuxTeammateSpawn,
@@ -1550,15 +1551,8 @@ function buildInheritedCliFlags(options?: {
   )
   const appManagedAnthropicSettingsFlag =
     buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
-  const helperSettingsPath =
-    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH?.trim()
   const suppressAppManagedAnthropicPath =
-    provider !== 'anthropic' &&
-    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE === 'api_key_helper' &&
-    !!settingsPath &&
-    !!helperSettingsPath &&
-    (settingsPath === helperSettingsPath ||
-      settingsPath.startsWith(`${dirname(helperSettingsPath)}/`))
+    provider !== 'anthropic' && isAppManagedAnthropicSettingsPath(settingsPath)
   const suppressAppManagedTeamRuntimePath =
     provider !== 'anthropic' && isAppManagedTeamRuntimeSettingsPath(settingsPath)
   if (

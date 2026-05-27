@@ -48,6 +48,20 @@ type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
 type RuntimeStdoutWrite = typeof process.stdout.write
 
+function shouldDeferRuntimeStdoutExit(): boolean {
+  return process.platform === 'win32'
+    && Boolean((process.versions as typeof process.versions & { bun?: string }).bun)
+}
+
+function exitRuntimeCommand(exitCode: number): void {
+  if (shouldDeferRuntimeStdoutExit()) {
+    process.exitCode = exitCode
+    return
+  }
+
+  process.exit(exitCode)
+}
+
 const writeRawStdout: RuntimeStdoutWrite = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
   const writeCallback =
     typeof encodingOrCallback === 'function'
@@ -84,7 +98,7 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
     const responseWrite = process.platform === 'win32' ? writeRawStdout : originalWrite
     const exitCode = await writeResponse(result, responseWrite)
     await new Promise(resolve => setTimeout(resolve, STDOUT_EXIT_SETTLE_TIMEOUT_MS))
-    process.exit(exitCode)
+    exitRuntimeCommand(exitCode)
   } finally {
     process.stdout.write = originalWrite
   }
@@ -770,7 +784,7 @@ export async function runtimeOpenCodeCommand(opts: {
     process.off('SIGTERM', onSigterm)
     process.off('SIGINT', onSigint)
   }
-  process.exit(0)
+  exitRuntimeCommand(0)
 }
 
 function logOpenCodeCommandDebug(stage: string): void {
