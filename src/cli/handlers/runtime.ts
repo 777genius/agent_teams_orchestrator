@@ -38,7 +38,6 @@ import type {
   RuntimeProviderStatus,
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
-import { writeSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
@@ -50,7 +49,6 @@ type RuntimeStdoutWrite = typeof process.stdout.write
 
 function shouldDeferRuntimeStdoutExit(): boolean {
   return process.platform === 'win32'
-    && Boolean((process.versions as typeof process.versions & { bun?: string }).bun)
 }
 
 function exitRuntimeCommand(exitCode: number): void {
@@ -62,27 +60,20 @@ function exitRuntimeCommand(exitCode: number): void {
   process.exit(exitCode)
 }
 
-const writeRawStdout: RuntimeStdoutWrite = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
-  const writeCallback =
-    typeof encodingOrCallback === 'function'
-      ? encodingOrCallback
-      : typeof callback === 'function'
-        ? callback
-        : null
-  const output = Buffer.isBuffer(chunk) || typeof chunk === 'string'
-    ? chunk
-    : String(chunk)
-  writeSync(1, output)
-  writeCallback?.()
-  return true
-}) as RuntimeStdoutWrite
-
 async function withRuntimeJsonStdoutGuardedResponse<T>(
   operation: () => Promise<T>,
   writeResponse: (result: T, stdoutWrite: RuntimeStdoutWrite) => Promise<number>,
   recoverOperationError?: (error: unknown) => T,
 ): Promise<void> {
   const originalWrite = process.stdout.write
+  let stdoutRestored = false
+  const restoreStdout = () => {
+    if (stdoutRestored) {
+      return
+    }
+    process.stdout.write = originalWrite
+    stdoutRestored = true
+  }
   process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) =>
     process.stderr.write(...args)) as typeof process.stdout.write
   try {
@@ -95,12 +86,14 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
       }
       result = recoverOperationError(error)
     }
-    const responseWrite = process.platform === 'win32' ? writeRawStdout : originalWrite
-    const exitCode = await writeResponse(result, responseWrite)
+    if (process.platform === 'win32') {
+      restoreStdout()
+    }
+    const exitCode = await writeResponse(result, originalWrite)
     await new Promise(resolve => setTimeout(resolve, STDOUT_EXIT_SETTLE_TIMEOUT_MS))
     exitRuntimeCommand(exitCode)
   } finally {
-    process.stdout.write = originalWrite
+    restoreStdout()
   }
 }
 
