@@ -86,9 +86,6 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
       }
       result = recoverOperationError(error)
     }
-    if (process.platform === 'win32') {
-      restoreStdout()
-    }
     const exitCode = await writeResponse(result, originalWrite)
     await new Promise(resolve => setTimeout(resolve, STDOUT_EXIT_SETTLE_TIMEOUT_MS))
     exitRuntimeCommand(exitCode)

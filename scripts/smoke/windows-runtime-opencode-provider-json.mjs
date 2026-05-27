@@ -12,10 +12,18 @@ const fakeOpenCodeCmd = path.join(tempRoot, 'opencode.cmd');
 const projectPath = path.join(tempRoot, 'project with spaces');
 const dataPath = path.join(tempRoot, 'data');
 const cachePath = path.join(tempRoot, 'cache');
+const userProfilePath = path.join(tempRoot, 'home');
+const appDataPath = path.join(tempRoot, 'AppData', 'Roaming');
+const localAppDataPath = path.join(tempRoot, 'AppData', 'Local');
+const claudeConfigPath = path.join(tempRoot, 'claude-config');
 
 mkdirSync(projectPath, { recursive: true });
 mkdirSync(dataPath, { recursive: true });
 mkdirSync(cachePath, { recursive: true });
+mkdirSync(userProfilePath, { recursive: true });
+mkdirSync(appDataPath, { recursive: true });
+mkdirSync(localAppDataPath, { recursive: true });
+mkdirSync(claudeConfigPath, { recursive: true });
 
 writeFileSync(
   fakeOpenCodeScript,
@@ -102,10 +110,21 @@ writeFileSync(
 
 const smokeEnv = {
   ...process.env,
+  CI: 'true',
+  USERPROFILE: userProfilePath,
+  HOME: userProfilePath,
+  APPDATA: appDataPath,
+  LOCALAPPDATA: localAppDataPath,
+  XDG_CONFIG_HOME: path.join(userProfilePath, '.config'),
+  CLAUDE_CONFIG_DIR: claudeConfigPath,
   CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH: fakeOpenCodeCmd,
   CLAUDE_MULTIMODEL_DATA_HOME: dataPath,
   CLAUDE_MULTIMODEL_CACHE_HOME: cachePath,
 };
+delete smokeEnv.ANTHROPIC_API_KEY;
+delete smokeEnv.CLAUDE_CODE_OAUTH_TOKEN;
+delete smokeEnv.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR;
+delete smokeEnv.CLAUDE_CODE_SESSION_ACCESS_TOKEN;
 
 function runRuntime(args, options = {}) {
   const result = spawnSync(runtimeBinary, args, {
@@ -123,10 +142,17 @@ function runRuntime(args, options = {}) {
   return result;
 }
 
-function assertJsonObject(raw, label) {
+function describeRuntimeResult(result) {
+  if (!result) {
+    return '';
+  }
+  return ` status=${result.status} signal=${result.signal ?? 'null'} stdout=${JSON.stringify((result.stdout ?? '').slice(0, 1000))} stderr=${JSON.stringify((result.stderr ?? '').slice(0, 1000))}`;
+}
+
+function assertJsonObject(raw, label, result) {
   const trimmed = raw.trim();
   if (!trimmed) {
-    throw new Error(`${label} returned empty stdout`);
+    throw new Error(`${label} returned empty stdout.${describeRuntimeResult(result)}`);
   }
   const parsed = JSON.parse(trimmed);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -156,7 +182,7 @@ try {
     projectPath,
   ]);
   assertExitZero(providersResult, 'runtime providers view');
-  const providersPayload = assertJsonObject(providersResult.stdout, 'runtime providers view');
+  const providersPayload = assertJsonObject(providersResult.stdout, 'runtime providers view', providersResult);
   if (providersPayload.runtimeId !== 'opencode') {
     throw new Error('runtime providers view returned the wrong runtimeId');
   }
@@ -244,6 +270,7 @@ try {
   const bridgeStdoutPayload = assertJsonObject(
     bridgeStdoutResult.stdout,
     'runtime opencode-command stdout',
+    bridgeStdoutResult,
   );
   if (bridgeStdoutPayload.ok !== true || bridgeStdoutPayload.command !== 'opencode.handshake') {
     throw new Error('runtime opencode-command stdout did not return a successful handshake envelope');
@@ -279,6 +306,7 @@ try {
   const readinessStdoutPayload = assertJsonObject(
     readinessStdoutResult.stdout,
     'runtime opencode-command readiness stdout',
+    readinessStdoutResult,
   );
   if (
     readinessStdoutPayload.command !== 'opencode.readiness' ||

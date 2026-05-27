@@ -55,6 +55,23 @@ function readOption(args: string[], name: string): string | undefined {
   return value && !value.startsWith('--') ? value : undefined;
 }
 
+function hasOption(args: string[], name: string): boolean {
+  return args.includes(name) || args.some(arg => arg.startsWith(`${name}=`));
+}
+
+function hasHelpOption(args: string[]): boolean {
+  return args.includes('--help') || args.includes('-h');
+}
+
+function readNumberOption(args: string[], name: string): number | undefined {
+  const value = readOption(args, name);
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function parseOpenCodeCommandOptions(args: string[]): {
   input: string;
   json?: boolean;
@@ -72,6 +89,109 @@ function parseOpenCodeCommandOptions(args: string[]): {
     output: readOption(args, '--output'),
     json: args.includes('--json'),
   };
+}
+
+async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
+  if (
+    args[0] !== 'runtime'
+    || args[1] !== 'providers'
+    || hasHelpOption(args)
+  ) {
+    return false;
+  }
+
+  const command = args[2];
+  const providerArgs = args.slice(3);
+  const common = {
+    runtime: readOption(providerArgs, '--runtime'),
+    projectPath: readOption(providerArgs, '--project-path'),
+    json: hasOption(providerArgs, '--json'),
+  };
+  const provider = readOption(providerArgs, '--provider') ?? '';
+  const model = readOption(providerArgs, '--model') ?? '';
+  const {
+    runtimeProvidersConnect,
+    runtimeProvidersConnectApiKey,
+    runtimeProvidersDirectory,
+    runtimeProvidersForget,
+    runtimeProvidersModels,
+    runtimeProvidersSetDefault,
+    runtimeProvidersSetupForm,
+    runtimeProvidersTestModel,
+    runtimeProvidersView,
+  } = await import('../cli/handlers/runtime.js');
+
+  switch (command) {
+    case 'view':
+      await runtimeProvidersView({
+        ...common,
+        compact: hasOption(providerArgs, '--compact'),
+      });
+      return true;
+    case 'directory':
+      await runtimeProvidersDirectory({
+        ...common,
+        query: readOption(providerArgs, '--query'),
+        filter: readOption(providerArgs, '--filter'),
+        limit: readNumberOption(providerArgs, '--limit'),
+        cursor: readOption(providerArgs, '--cursor'),
+        refresh: hasOption(providerArgs, '--refresh'),
+      });
+      return true;
+    case 'setup-form':
+      await runtimeProvidersSetupForm({
+        ...common,
+        provider,
+      });
+      return true;
+    case 'connect':
+      await runtimeProvidersConnect({
+        ...common,
+        provider,
+        stdinJson: hasOption(providerArgs, '--stdin-json'),
+      });
+      return true;
+    case 'connect-api-key':
+      await runtimeProvidersConnectApiKey({
+        ...common,
+        provider,
+        stdinKey: hasOption(providerArgs, '--stdin-key'),
+      });
+      return true;
+    case 'forget':
+      await runtimeProvidersForget({
+        ...common,
+        provider,
+      });
+      return true;
+    case 'models':
+      await runtimeProvidersModels({
+        ...common,
+        provider,
+        query: readOption(providerArgs, '--query'),
+        limit: readNumberOption(providerArgs, '--limit'),
+      });
+      return true;
+    case 'test-model':
+      await runtimeProvidersTestModel({
+        ...common,
+        provider,
+        model,
+      });
+      return true;
+    case 'set-default':
+      await runtimeProvidersSetDefault({
+        ...common,
+        provider,
+        model,
+        scope: readOption(providerArgs, '--scope') as 'project' | 'all-projects' | undefined,
+        probe: hasOption(providerArgs, '--probe'),
+        compact: hasOption(providerArgs, '--compact'),
+      });
+      return true;
+    default:
+      return false;
+  }
 }
 
 async function main(): Promise<void> {
@@ -102,6 +222,11 @@ async function main(): Promise<void> {
       runtimeOpenCodeCommand
     } = await import('../cli/handlers/runtimeOpenCodeCommand.js');
     await runtimeOpenCodeCommand(parseOpenCodeCommandOptions(args.slice(2)));
+    return;
+  }
+
+  if (await runRuntimeProvidersFastPath(args)) {
+    profileCheckpoint('cli_runtime_providers_fast_path');
     return;
   }
 
