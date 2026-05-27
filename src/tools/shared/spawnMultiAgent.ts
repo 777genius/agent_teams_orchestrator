@@ -81,6 +81,7 @@ import {
   buildAppManagedAnthropicApiKeyHelperSettingsFlag,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
+  buildProviderScopedInheritedSettingsInline,
   probeTmuxTeammateSpawn,
   stripInheritedCliFlag,
   stripProviderBoundaryInheritedRuntimeFlags,
@@ -1542,6 +1543,10 @@ function buildInheritedCliFlags(options?: {
   // Propagate --settings if set via CLI
   const settingsPath = getFlagSettingsPath()
   const settingsInline = getFlagSettingsInline()
+  const inheritedSettingsInline = buildProviderScopedInheritedSettingsInline(
+    provider,
+    settingsInline,
+  )
   const appManagedAnthropicSettingsFlag =
     buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
   const helperSettingsPath =
@@ -1558,8 +1563,8 @@ function buildInheritedCliFlags(options?: {
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
-  } else if (settingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
-    flags.push(`--settings ${quote([JSON.stringify(settingsInline)])}`)
+  } else if (inheritedSettingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+    flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()

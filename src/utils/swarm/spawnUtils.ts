@@ -99,6 +99,10 @@ export function buildInheritedCliFlags(options?: {
   // Propagate --settings if set via CLI
   const settingsPath = getFlagSettingsPath()
   const settingsInline = getFlagSettingsInline()
+  const inheritedSettingsInline = buildProviderScopedInheritedSettingsInline(
+    provider,
+    settingsInline,
+  )
   const appManagedAnthropicSettingsFlag =
     buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
   const suppressAppManagedAnthropicPath =
@@ -108,8 +112,8 @@ export function buildInheritedCliFlags(options?: {
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
-  } else if (settingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
-    flags.push(`--settings ${quote([JSON.stringify(settingsInline)])}`)
+  } else if (inheritedSettingsInline && (!settingsPath || suppressAppManagedAnthropicPath)) {
+    flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()
@@ -194,6 +198,7 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_CODE_GEMINI_BACKEND',
   'CLAUDE_CODE_CODEX_BACKEND',
   'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD',
+  'CODEX_CLI_PATH',
   'CODEX_HOME',
   'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE',
   'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
@@ -270,6 +275,34 @@ function getExplicitEntryProvider(provider: TeammateProvider): string {
 const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
   PROVIDER_SELECTION_ENV_VARS,
 )
+
+export function buildProviderScopedInheritedSettingsInline(
+  provider: TeammateProvider | 'opencode' | undefined,
+  settings: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!settings) {
+    return null
+  }
+  if (!provider || provider === 'anthropic') {
+    return settings
+  }
+
+  const next = JSON.parse(JSON.stringify(settings)) as Record<string, unknown>
+  delete next.apiKeyHelper
+
+  if (provider === 'codex' || provider === 'opencode') {
+    delete next.awsCredentialExport
+    delete next.awsAuthRefresh
+    delete next.gcpAuthRefresh
+  }
+
+  if (provider === 'gemini') {
+    delete next.awsCredentialExport
+    delete next.awsAuthRefresh
+  }
+
+  return Object.keys(next).length > 0 ? next : null
+}
 
 function getCurrentTeammateProviderForEnvForwarding(): TeammateProvider {
   const provider = getAPIProvider()

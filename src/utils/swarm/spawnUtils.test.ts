@@ -18,6 +18,7 @@ import {
   buildInheritedCliFlags,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
+  buildProviderScopedInheritedSettingsInline,
   shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
   stripInheritedCliFlag,
@@ -111,6 +112,70 @@ describe('inherited runtime flags', () => {
         '--model=gpt-5.4 --effort=high --strict-mcp-config',
       ),
     ).toBe('--strict-mcp-config')
+  })
+
+  it('scopes inherited settings for Codex teammates without Anthropic helper settings', () => {
+    const settings = buildProviderScopedInheritedSettingsInline('codex', {
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      codex: {
+        forced_login_method: 'chatgpt',
+        agent_teams_workspace_trust: {
+          config_overrides: ['projects."/tmp/project".trust_level="trusted"'],
+        },
+      },
+    })
+
+    expect(settings).toEqual({
+      codex: {
+        forced_login_method: 'chatgpt',
+        agent_teams_workspace_trust: {
+          config_overrides: ['projects."/tmp/project".trust_level="trusted"'],
+        },
+      },
+    })
+  })
+
+  it('scopes inherited settings for Gemini teammates while keeping GCP refresh settings', () => {
+    const settings = buildProviderScopedInheritedSettingsInline('gemini', {
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      gemini: { example: true },
+    })
+
+    expect(settings).toEqual({
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      gemini: { example: true },
+    })
+  })
+
+  it('drops empty inherited helper-only settings for Codex teammates', () => {
+    expect(
+      buildProviderScopedInheritedSettingsInline('codex', {
+        apiKeyHelper: "'/tmp/helper.sh'",
+        awsCredentialExport: '/tmp/aws.sh',
+        awsAuthRefresh: '/tmp/aws-refresh.sh',
+        gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      }),
+    ).toBeNull()
+  })
+
+  it('scopes inherited settings for OpenCode teammates without Anthropic helper settings', () => {
+    expect(
+      buildProviderScopedInheritedSettingsInline('opencode', {
+        apiKeyHelper: "'/tmp/helper.sh'",
+        awsCredentialExport: '/tmp/aws.sh',
+        awsAuthRefresh: '/tmp/aws-refresh.sh',
+        gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+        opencode: { example: true },
+      }),
+    ).toEqual({
+      opencode: { example: true },
+    })
   })
 
   it('keeps unrelated flags when stripping one inherited flag', () => {
@@ -462,6 +527,10 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       `${helperDir}/settings.json`
     setFlagSettingsPath(inheritedAnthropicSettingsPath)
     setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
       codex: {
         forced_login_method: 'chatgpt',
         agent_teams_workspace_trust: {
@@ -481,6 +550,10 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       expect(flags).toContain('agent_teams_workspace_trust')
       expect(flags).toContain('projects')
       expect(flags).not.toContain(inheritedAnthropicSettingsPath)
+      expect(flags).not.toContain('apiKeyHelper')
+      expect(flags).not.toContain('awsCredentialExport')
+      expect(flags).not.toContain('awsAuthRefresh')
+      expect(flags).not.toContain('gcpAuthRefresh')
     } finally {
       setFlagSettingsPath(originalFlagSettingsPath)
       setFlagSettingsInline(originalFlagSettingsInline)
@@ -501,6 +574,172 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
           originalSettingsPath
       }
+    }
+  })
+
+  it('omits inherited settings for Codex teammates when sanitized helper-only settings are empty', () => {
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalAuthMode = process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+    const originalSettingsPath =
+      process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+    const helperDir = '/tmp/team-runtime-auth/helper-only/runs/run-1'
+    const inheritedAnthropicSettingsPath = `${helperDir}/runtime-settings-anthropic.json`
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      `${helperDir}/settings.json`
+    setFlagSettingsPath(inheritedAnthropicSettingsPath)
+    setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'codex' })
+
+      expect(flags).not.toContain('--settings')
+      expect(flags).not.toContain(inheritedAnthropicSettingsPath)
+      expect(flags).not.toContain('apiKeyHelper')
+      expect(flags).not.toContain('awsCredentialExport')
+      expect(flags).not.toContain('awsAuthRefresh')
+      expect(flags).not.toContain('gcpAuthRefresh')
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+      if (originalAuthMode === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = originalAuthMode
+      }
+      if (originalSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+          originalSettingsPath
+      }
+    }
+  })
+
+  it('keeps custom path-based inherited settings authoritative for Codex teammates', () => {
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+
+    setFlagSettingsPath('/tmp/user-custom-settings.json')
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+      },
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'codex' })
+
+      expect(flags).toContain('--settings /tmp/user-custom-settings.json')
+      expect(flags).not.toContain('forced_login_method')
+      expect(flags).not.toContain('chatgpt')
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
+    }
+  })
+
+  it('passes sanitized inline Gemini settings while keeping GCP refresh settings', () => {
+    const originalManagedByHost =
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    const originalAuthMode = process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+    const originalSettingsPath =
+      process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+    const helperDir = '/tmp/team-runtime-auth/gemini/runs/run-1'
+    const inheritedAnthropicSettingsPath = `${helperDir}/runtime-settings-anthropic.json`
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
+    process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+      `${helperDir}/settings.json`
+    setFlagSettingsPath(inheritedAnthropicSettingsPath)
+    setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      awsAuthRefresh: '/tmp/aws-refresh.sh',
+      gcpAuthRefresh: '/tmp/gcp-refresh.sh',
+      gemini: {
+        runtime: 'vertex',
+      },
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'gemini' })
+
+      expect(flags).toContain('--settings')
+      expect(flags).toContain('gcpAuthRefresh')
+      expect(flags).toContain('/tmp/gcp-refresh.sh')
+      expect(flags).toContain('gemini')
+      expect(flags).toContain('vertex')
+      expect(flags).not.toContain(inheritedAnthropicSettingsPath)
+      expect(flags).not.toContain('apiKeyHelper')
+      expect(flags).not.toContain('awsCredentialExport')
+      expect(flags).not.toContain('awsAuthRefresh')
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
+      if (originalManagedByHost === undefined) {
+        delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+      } else {
+        process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST =
+          originalManagedByHost
+      }
+      if (originalAuthMode === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = originalAuthMode
+      }
+      if (originalSettingsPath === undefined) {
+        delete process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH
+      } else {
+        process.env.CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH =
+          originalSettingsPath
+      }
+    }
+  })
+
+  it('keeps Anthropic inherited inline settings unscoped for Anthropic teammates', () => {
+    const originalFlagSettingsPath = getFlagSettingsPath()
+    const originalFlagSettingsInline = getFlagSettingsInline()
+
+    setFlagSettingsPath(null)
+    setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      awsCredentialExport: '/tmp/aws.sh',
+      anthropic: {
+        safe: true,
+      },
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({ provider: 'anthropic' })
+
+      expect(flags).toContain('--settings')
+      expect(flags).toContain('apiKeyHelper')
+      expect(flags).toContain('awsCredentialExport')
+      expect(flags).toContain('anthropic')
+      expect(flags).toContain('safe')
+    } finally {
+      setFlagSettingsPath(originalFlagSettingsPath)
+      setFlagSettingsInline(originalFlagSettingsInline)
     }
   })
 
@@ -646,12 +885,14 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const originalApiKey = process.env.OPENAI_API_KEY
     const originalCodexApiKey = process.env.CODEX_API_KEY
     const originalCodexHome = process.env.CODEX_HOME
+    const originalCodexCliPath = process.env.CODEX_CLI_PATH
     const originalEntryProvider = process.env.CLAUDE_CODE_ENTRY_PROVIDER
     const originalSettingsInline = getFlagSettingsInline()
 
     process.env.OPENAI_API_KEY = 'sk-openai-teammate'
     process.env.CODEX_API_KEY = 'sk-codex-teammate'
     process.env.CODEX_HOME = '/tmp/codex-connected-home'
+    process.env.CODEX_CLI_PATH = '/tmp/codex-bin'
     process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
     setFlagSettingsInline({
       codex: {
@@ -667,6 +908,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       expect(env).toContain("OPENAI_API_KEY=''")
       expect(env).toContain("CODEX_API_KEY=''")
       expect(env).toContain('CODEX_HOME=/tmp/codex-connected-home')
+      expect(env).toContain('CODEX_CLI_PATH=/tmp/codex-bin')
       expect(env).not.toContain('OPENAI_API_KEY=sk-openai-teammate')
       expect(env).not.toContain('CODEX_API_KEY=sk-codex-teammate')
     } finally {
@@ -686,6 +928,12 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
         delete process.env.CODEX_HOME
       } else {
         process.env.CODEX_HOME = originalCodexHome
+      }
+
+      if (originalCodexCliPath === undefined) {
+        delete process.env.CODEX_CLI_PATH
+      } else {
+        process.env.CODEX_CLI_PATH = originalCodexCliPath
       }
 
       if (originalEntryProvider === undefined) {
