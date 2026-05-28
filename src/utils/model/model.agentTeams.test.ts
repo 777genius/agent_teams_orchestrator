@@ -82,7 +82,7 @@ describe('model access fallback with agent_teams capabilities', () => {
     process.env.CLAUDE_CODE_USE_BEDROCK = '1';
 
     expect(getAPIProvider()).toBe('bedrock');
-    expect(getDefaultOpusModel()).toContain('opus-4-6');
+    expect(getDefaultOpusModel()).toContain('opus-4-7');
   });
 
   it('keeps Claude Platform on AWS as launch metadata without adding a new API provider', () => {
@@ -165,7 +165,7 @@ describe('model access fallback with agent_teams capabilities', () => {
   });
 });
 
-describe('Opus 4.7 defaults', () => {
+describe('Opus 4.8 defaults', () => {
   it('recognizes GPT-5.5 without making it the static Codex default', () => {
     expect(isCodexModel('gpt-5.5')).toBe(true);
     expect(CODEX_MODELS.map((model) => model.id)).toContain('gpt-5.5');
@@ -174,23 +174,23 @@ describe('Opus 4.7 defaults', () => {
     expect(getMarketingNameForModel('gpt-5.5')).toBe('GPT-5.5');
   });
 
-  it('resolves the first-party Opus alias to Opus 4.7', () => {
-    expect(getDefaultOpusModel()).toBe('claude-opus-4-7');
-    expect(parseUserSpecifiedModel('opus')).toBe('claude-opus-4-7');
-    expect(parseUserSpecifiedModel('opus[1m]')).toBe('claude-opus-4-7[1m]');
+  it('resolves the first-party Opus alias to Opus 4.8', () => {
+    expect(getDefaultOpusModel()).toBe('claude-opus-4-8');
+    expect(parseUserSpecifiedModel('opus')).toBe('claude-opus-4-8');
+    expect(parseUserSpecifiedModel('opus[1m]')).toBe('claude-opus-4-8[1m]');
   });
 
-  it('keeps third-party Opus defaults pinned to 4.6', () => {
+  it('keeps third-party Opus defaults pinned to 4.7', () => {
     process.env.CLAUDE_CODE_USE_BEDROCK = '1';
 
-    expect(getDefaultOpusModel()).toContain('opus-4-6');
+    expect(getDefaultOpusModel()).toContain('opus-4-7');
   });
 
-  it('treats Opus 4.7 as the public first-party Opus model for labels and core capabilities', () => {
-    expect(getPublicModelDisplayName('claude-opus-4-7')).toBe('Opus 4.7');
-    expect(getPublicModelDisplayName('claude-opus-4-7[1m]')).toBe('Opus 4.7 (1M context)');
-    expect(getMarketingNameForModel('claude-opus-4-7[1m]')).toBe(
-      'Opus 4.7 (with 1M context)'
+  it('treats Opus 4.8 as the public first-party Opus model for labels and core capabilities', () => {
+    expect(getPublicModelDisplayName('claude-opus-4-8')).toBe('Opus 4.8');
+    expect(getPublicModelDisplayName('claude-opus-4-8[1m]')).toBe('Opus 4.8 (1M context)');
+    expect(getMarketingNameForModel('claude-opus-4-8[1m]')).toBe(
+      'Opus 4.8 (with 1M context)'
     );
   });
 
@@ -206,11 +206,12 @@ describe('Opus 4.7 defaults', () => {
     expect(typeof parseUserSpecifiedModel('')).toBe('string');
   });
 
-  it('keeps fast mode pinned to explicit Opus 4.6 while opus resolves to 4.7', () => {
+  it('pins fast mode to explicit Opus 4.8 while opus resolves to 4.8', () => {
     process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
 
-    expect(getFastModeModel()).toBe('claude-opus-4-6');
-    expect(isFastModeSupportedByModel('opus')).toBe(false);
-    expect(isFastModeSupportedByModel('claude-opus-4-6')).toBe(true);
+    expect(getFastModeModel()).toBe('claude-opus-4-8');
+    expect(isFastModeSupportedByModel('opus')).toBe(true);
+    expect(isFastModeSupportedByModel('claude-opus-4-8')).toBe(true);
+    expect(isFastModeSupportedByModel('claude-opus-4-6')).toBe(false);
   });
 });

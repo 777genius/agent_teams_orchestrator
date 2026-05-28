@@ -145,9 +145,9 @@ function getOpus41Option(): ModelOption {
 
 function getOpus46Option(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
-  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
+  const opusLabel = is3P ? 'Opus 4.7' : 'Opus 4.8'
   return {
-    value: is3P ? getModelStrings().opus46 : 'opus',
+    value: is3P ? getModelStrings().opus47 : 'opus',
     label: 'Opus',
     description: `${opusLabel} · Most capable for complex work`,
     descriptionForModel: `${opusLabel} - most capable for complex work`,
@@ -167,9 +167,9 @@ export function getSonnet46_1MOption(): ModelOption {
 
 export function getOpus46_1MOption(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
-  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
+  const opusLabel = is3P ? 'Opus 4.7' : 'Opus 4.8'
   return {
-    value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
+    value: is3P ? getModelStrings().opus47 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
     description: `${opusLabel} for long sessions`,
     descriptionForModel:
@@ -234,7 +234,7 @@ function getCodexModelOptions(): ModelOption[] {
 }
 
 function getMaxOpusOption(_fastMode = false): ModelOption {
-  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.6' : 'Opus 4.7'
+  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.7' : 'Opus 4.8'
   return {
     value: 'opus',
     label: 'Opus',
@@ -254,7 +254,7 @@ export function getMaxSonnet46_1MOption(): ModelOption {
 
 export function getMaxOpus46_1MOption(_fastMode = false): ModelOption {
   const billingInfo = isClaudeAISubscriber() ? ' · Billed as extra usage' : ''
-  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.6' : 'Opus 4.7'
+  const opusLabel = getAPIProvider() !== 'firstParty' ? 'Opus 4.7' : 'Opus 4.8'
   return {
     value: 'opus[1m]',
     label: 'Opus (1M context)',
@@ -264,9 +264,9 @@ export function getMaxOpus46_1MOption(_fastMode = false): ModelOption {
 
 function getMergedOpus1MOption(_fastMode = false): ModelOption {
   const is3P = getAPIProvider() !== 'firstParty'
-  const opusLabel = is3P ? 'Opus 4.6' : 'Opus 4.7'
+  const opusLabel = is3P ? 'Opus 4.7' : 'Opus 4.8'
   return {
-    value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
+    value: is3P ? getModelStrings().opus47 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
     description: `${opusLabel} with 1M context · Most capable for complex work`,
     descriptionForModel:
@@ -290,7 +290,7 @@ function getOpusPlanOption(): ModelOption {
   return {
     value: 'opusplan',
     label: 'Opus Plan Mode',
-    description: 'Use Opus 4.7 in plan mode, Sonnet 4.6 otherwise',
+    description: 'Use Opus 4.8 in plan mode, Sonnet 4.6 otherwise',
   }
 }
 

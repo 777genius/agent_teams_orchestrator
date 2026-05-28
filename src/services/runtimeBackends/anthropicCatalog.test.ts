@@ -106,7 +106,7 @@ describe('anthropic runtime catalog', () => {
       hidden: false,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
-      supportsFastMode: true,
+      supportsFastMode: false,
       source: 'anthropic-models-api',
     })
     expect(
