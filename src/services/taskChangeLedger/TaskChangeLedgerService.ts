@@ -160,6 +160,9 @@ type TaskChangeEventV1 = {
   snapshotId?: string
   snapshotSource?: 'opencode'
   supersedesEventId?: string
+  suppressed?: true
+  suppressionReason?: string
+  suppressedAt?: string
   importedAt?: string
   importBatchId?: string
   importSchemaVersion?: 1
@@ -1528,28 +1531,42 @@ function projectTaskChangeEventsForSummary(events: TaskChangeEventV1[]): {
 } {
   const rawCountByGroupKey = new Map<string, number>()
   const selectedBySourceKey = new Map<string, { event: TaskChangeEventV1; index: number; rank: number }>()
+  const rawCountBySourceKey = new Map<string, number>()
   const passthrough: Array<{ event: TaskChangeEventV1; index: number }> = []
 
   events.forEach((event, index) => {
-    const groupKey = buildSummaryGroupKey(event)
-    rawCountByGroupKey.set(groupKey, (rawCountByGroupKey.get(groupKey) ?? 0) + 1)
-
     const sourceImportKey = sourceImportKeyForEvent(event)
     if (!sourceImportKey) {
-      passthrough.push({ event, index })
+      if (event.suppressed !== true) {
+        const groupKey = buildSummaryGroupKey(event)
+        rawCountByGroupKey.set(groupKey, (rawCountByGroupKey.get(groupKey) ?? 0) + 1)
+        passthrough.push({ event, index })
+      }
       return
     }
-    const rank = evidenceRankForEvent(event)
+    rawCountBySourceKey.set(sourceImportKey, (rawCountBySourceKey.get(sourceImportKey) ?? 0) + 1)
+    const rank = projectionRankForEvent(event)
     const existing = selectedBySourceKey.get(sourceImportKey)
     if (!existing || rank >= existing.rank) {
       selectedBySourceKey.set(sourceImportKey, { event, index, rank })
     }
   })
 
+  const projectedSourceItems = [...selectedBySourceKey.entries()]
+    .filter(([, item]) => item.event.suppressed !== true)
+    .map(([sourceImportKey, item]) => {
+      const groupKey = buildSummaryGroupKey(item.event)
+      rawCountByGroupKey.set(
+        groupKey,
+        (rawCountByGroupKey.get(groupKey) ?? 0) + (rawCountBySourceKey.get(sourceImportKey) ?? 1),
+      )
+      return item
+    })
+
   return {
     events: [
       ...passthrough,
-      ...[...selectedBySourceKey.values()].map(item => ({ event: item.event, index: item.index })),
+      ...projectedSourceItems.map(item => ({ event: item.event, index: item.index })),
     ]
       .sort((left, right) => left.index - right.index)
       .map(item => item.event),
@@ -2229,6 +2246,13 @@ function buildImportedUpgradeEventId(input: {
   return `opencode-import-upgrade-${sha256(JSON.stringify(input)).slice(0, 32)}`
 }
 
+function buildImportedSuppressionEventId(input: {
+  sourceImportKey: string
+  eventId: string
+}): string {
+  return `opencode-import-suppressed-${sha256(JSON.stringify(input)).slice(0, 32)}`
+}
+
 type ExistingSourceImportProjection = {
   sourceImportKey: string
   eventId: string
@@ -2251,6 +2275,12 @@ function isOpenCodeLedgerEvent(event: TaskChangeEventV1): boolean {
     event.source === 'opencode_toolpart_edit' ||
     event.source === 'opencode_toolpart_apply_patch'
   )
+}
+
+function projectionRankForEvent(event: TaskChangeEventV1): number {
+  return event.suppressed === true
+    ? Number.MAX_SAFE_INTEGER
+    : evidenceRankForEvent(event)
 }
 
 function sourceImportKeyForEvent(event: TaskChangeEventV1): string | null {
@@ -2277,7 +2307,7 @@ function projectionFromEvent(
     sourceImportKey,
     eventId: event.eventId,
     ...(event.evidenceProof ? { evidenceProof: event.evidenceProof } : {}),
-    evidenceRank: evidenceRankForEvent(event),
+    evidenceRank: projectionRankForEvent(event),
     eventCount,
     taskId: event.taskId,
     relativePath: event.relativePath,
@@ -2585,6 +2615,104 @@ export async function importTaskChangeLedgerEvents(params: {
     importedEventCount,
     skippedDuplicateCount,
     skippedUnsafeCount,
+    diagnostics,
+  }
+}
+
+export async function suppressOpenCodeTaskChangeLedgerEvents(params: {
+  projectDir?: string
+  taskId: string
+  sourceImportKeys: string[]
+  reason: string
+}): Promise<{
+  suppressedEventCount: number
+  suppressedSourceImportKeys: string[]
+  diagnostics: string[]
+}> {
+  const projectDir = params.projectDir && isAbsolute(params.projectDir)
+    ? params.projectDir
+    : getLedgerProjectDir()
+  const diagnostics: string[] = []
+  const sourceImportKeys = new Set(
+    params.sourceImportKeys.filter(key => typeof key === 'string' && key.length > 0),
+  )
+  if (sourceImportKeys.size === 0) {
+    return {
+      suppressedEventCount: 0,
+      suppressedSourceImportKeys: [],
+      diagnostics,
+    }
+  }
+
+  let suppressedEventCount = 0
+  const suppressedSourceImportKeys: string[] = []
+
+  await enqueueTaskWrite(params.taskId, async () => {
+    await runTaskLedgerWrite({
+      scope: {
+        taskId: params.taskId,
+        task: { ref: params.taskId, refKind: 'canonical' },
+        phase: 'work',
+        executionSeq: 0,
+      },
+      sessionId: 'opencode-ledger-suppression',
+      toolUseId: 'opencode-snapshot-only-suppression',
+      projectDir,
+      write: async () => {
+        const existing = await readTaskEvents(params.taskId, projectDir)
+        const alreadySuppressed = new Set<string>()
+        const candidates = new Map<string, TaskChangeEventV1>()
+        for (const event of existing.entries) {
+          const sourceImportKey = sourceImportKeyForEvent(event)
+          if (!sourceImportKey || !sourceImportKeys.has(sourceImportKey)) {
+            continue
+          }
+          if (event.suppressed === true) {
+            alreadySuppressed.add(sourceImportKey)
+            continue
+          }
+          candidates.set(sourceImportKey, event)
+        }
+
+        const suppressedAt = new Date().toISOString()
+        for (const [sourceImportKey, event] of candidates) {
+          if (alreadySuppressed.has(sourceImportKey)) {
+            continue
+          }
+          await appendEvent(
+            {
+              ...event,
+              eventId: buildImportedSuppressionEventId({
+                sourceImportKey,
+                eventId: event.eventId,
+              }),
+              timestamp: suppressedAt,
+              before: null,
+              after: null,
+              linesAdded: 0,
+              linesRemoved: 0,
+              suppressed: true,
+              suppressionReason: params.reason,
+              suppressedAt,
+              supersedesEventId: event.eventId,
+            },
+            projectDir,
+          )
+          suppressedEventCount += 1
+          suppressedSourceImportKeys.push(sourceImportKey)
+        }
+      },
+    })
+  })
+
+  if (suppressedEventCount > 0) {
+    diagnostics.push(
+      `OpenCode ledger suppressed ${suppressedEventCount} stale snapshot-only imported change(s).`,
+    )
+  }
+  return {
+    suppressedEventCount,
+    suppressedSourceImportKeys,
     diagnostics,
   }
 }

@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import {
   importTaskChangeLedgerEvents,
+  suppressOpenCodeTaskChangeLedgerEvents,
   type ImportedOpenCodeFileChange,
 } from '../taskChangeLedger/TaskChangeLedgerService.js'
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
@@ -27,6 +28,7 @@ import {
   type OpenCodeLedgerAttributionMode,
   type OpenCodeTaskRef,
   type ReconstructedOpenCodeToolChange,
+  type SkippedOpenCodeSnapshotOnlyChange,
 } from './OpenCodeToolpartChangeReconstructor.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
@@ -90,6 +92,8 @@ const MAX_METADATA_TEXT_BLOB_BYTES = 1024 * 1024
 const DELIVERY_CONTEXT_FILE_NAME = 'delivery-context.json'
 const DELIVERY_CONTEXT_TEMP_PREFIX = 'claude-team-opencode-ledger-context-'
 export const OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION = 1
+const SNAPSHOT_ONLY_AUTHORSHIP_SUPPRESSION_REASON =
+  'snapshot-only evidence does not prove file authorship in shared workspaces'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -210,16 +214,39 @@ function groupByTask(changes: ReconstructedOpenCodeToolChange[]): Map<string, Re
   return grouped
 }
 
+function groupSkippedSnapshotOnlyChangesByTask(
+  changes: SkippedOpenCodeSnapshotOnlyChange[],
+): Map<string, SkippedOpenCodeSnapshotOnlyChange[]> {
+  const grouped = new Map<string, SkippedOpenCodeSnapshotOnlyChange[]>()
+  for (const change of changes) {
+    const bucket = grouped.get(change.taskId) ?? []
+    bucket.push(change)
+    grouped.set(change.taskId, bucket)
+  }
+  return grouped
+}
+
+function toOpenCodeLedgerSource(sourceTool: ReconstructedOpenCodeToolChange['sourceTool']): ImportedOpenCodeFileChange['source'] {
+  switch (sourceTool) {
+    case 'write':
+      return 'opencode_toolpart_write'
+    case 'edit':
+      return 'opencode_toolpart_edit'
+    case 'apply_patch':
+      return 'opencode_toolpart_apply_patch'
+    case 'snapshot_patch':
+      throw new Error('Snapshot-only OpenCode patch changes cannot be imported as authored ledger events.')
+  }
+  const exhaustive: never = sourceTool
+  return exhaustive
+}
+
 function toLedgerChange(change: ReconstructedOpenCodeToolChange): ImportedOpenCodeFileChange {
   return {
     filePath: change.filePath,
     beforeContent: change.beforeContent,
     afterContent: change.afterContent,
-    source: change.sourceTool === 'write'
-      ? 'opencode_toolpart_write'
-      : change.sourceTool === 'edit'
-        ? 'opencode_toolpart_edit'
-        : 'opencode_toolpart_apply_patch',
+    source: toOpenCodeLedgerSource(change.sourceTool),
     confidence: change.confidence,
     operation: change.operation,
     beforeState: change.beforeState,
@@ -529,6 +556,20 @@ function validateCandidateBatch(
   })
 }
 
+function filterAuthorProvenChanges(
+  changes: ReconstructedOpenCodeToolChange[],
+  diagnostics: string[],
+): ReconstructedOpenCodeToolChange[] {
+  const filtered = changes.filter(change => change.sourceTool !== 'snapshot_patch')
+  const skipped = changes.length - filtered.length
+  if (skipped > 0) {
+    diagnostics.push(
+      `OpenCode ledger backfill skipped ${skipped} snapshot-only change(s) because snapshot proof does not prove file authorship in shared workspaces.`,
+    )
+  }
+  return filtered
+}
+
 export class OpenCodeLedgerBridgeService {
   constructor(
     private readonly sessionStore: SessionStorePort = openCodeSessionStore,
@@ -709,12 +750,22 @@ export class OpenCodeLedgerBridgeService {
       })
       result.diagnostics.push(...reconstructed.diagnostics)
       result.notices.push(...reconstructed.notices)
+      await this.suppressStaleSnapshotOnlyImports({
+        params,
+        result,
+        skippedSnapshotOnlyChanges: reconstructed.skippedSnapshotOnlyChanges ?? [],
+      })
+      const authorReconstructedChanges = filterAuthorProvenChanges(reconstructed.changes, result.diagnostics)
+      result.skippedEvents += reconstructed.changes.length - authorReconstructedChanges.length
+      if (authorReconstructedChanges.length === 0) {
+        continue
+      }
       const evidenceMetadata: { snapshotShapeFingerprint?: string } = {}
       const canTrySessionSnapshotEvidence =
         attributionMode === 'strict-delivery' &&
-        reconstructed.changes.length > 0
+        authorReconstructedChanges.length > 0
       const enrichedChanges = await this.evidenceEnricher.enrich({
-        changes: reconstructed.changes,
+        changes: authorReconstructedChanges,
         workspaceRoot,
         sessionRecord: record,
         offline,
@@ -725,7 +776,7 @@ export class OpenCodeLedgerBridgeService {
         diagnostics: result.diagnostics,
       }).catch(error => {
         result.diagnostics.push(`OpenCode evidence enrichment failed; using metadata-only fallback - ${error instanceof Error ? error.message : String(error)}`)
-        return reconstructed.changes
+        return authorReconstructedChanges
       })
       result.snapshotShapeFingerprint ??= evidenceMetadata.snapshotShapeFingerprint
       const materializedChanges = await materializeMetadataOnlyChanges(
@@ -735,8 +786,13 @@ export class OpenCodeLedgerBridgeService {
       if (materializedChanges.length === 0) {
         continue
       }
+      const authorProvenChanges = filterAuthorProvenChanges(materializedChanges, result.diagnostics)
+      result.skippedEvents += materializedChanges.length - authorProvenChanges.length
+      if (authorProvenChanges.length === 0) {
+        continue
+      }
 
-      for (const [taskId, changes] of groupByTask(materializedChanges)) {
+      for (const [taskId, changes] of groupByTask(authorProvenChanges)) {
         if (params.taskId && taskId !== params.taskId) {
           continue
         }
@@ -787,6 +843,29 @@ export class OpenCodeLedgerBridgeService {
       result.retryAfterReason = this.resolveRetryAfterReason(result.diagnostics)
     }
     return result
+  }
+
+  private async suppressStaleSnapshotOnlyImports(input: {
+    params: BackfillParams
+    result: OpenCodeLedgerBridgeBackfillResult
+    skippedSnapshotOnlyChanges: SkippedOpenCodeSnapshotOnlyChange[]
+  }): Promise<void> {
+    if (input.params.dryRun === true || input.skippedSnapshotOnlyChanges.length === 0) {
+      return
+    }
+    for (const [taskId, skippedChanges] of groupSkippedSnapshotOnlyChangesByTask(input.skippedSnapshotOnlyChanges)) {
+      if (input.params.taskId && taskId !== input.params.taskId) {
+        continue
+      }
+      const suppression = await suppressOpenCodeTaskChangeLedgerEvents({
+        projectDir: input.params.projectDir,
+        taskId,
+        sourceImportKeys: [...new Set(skippedChanges.map(change => change.sourceImportKey))],
+        reason: SNAPSHOT_ONLY_AUTHORSHIP_SUPPRESSION_REASON,
+      })
+      input.result.skippedEvents += suppression.suppressedEventCount
+      input.result.diagnostics.push(...suppression.diagnostics)
+    }
   }
 
   private resolveOutcome(result: OpenCodeLedgerBridgeBackfillResult): OpenCodeLedgerBackfillOutcome {

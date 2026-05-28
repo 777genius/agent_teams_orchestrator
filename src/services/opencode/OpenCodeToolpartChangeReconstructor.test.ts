@@ -11,6 +11,10 @@ import type {
 const workspaceRoot = path.resolve('/repo')
 const defaultTaskRefs = [{ taskId: 'task-1', displayId: 'abc12345', teamName: 'team-a' }]
 
+function sourceImportKey(partId: string, relativePath: string): string {
+  return ['opencode', 'session-1', partId, path.join(workspaceRoot, relativePath)].join('\0')
+}
+
 function structuredDeliveryPrompt(input: {
   inboundMessageId: string
   taskRefs?: Array<{ taskId: string; displayId: string; teamName: string }>
@@ -874,7 +878,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     })
   })
 
-  test('strict delivery mode imports OpenCode snapshot patch files without matching file toolparts', () => {
+  test('strict delivery mode skips OpenCode snapshot patch files without matching file toolparts', () => {
     const result = reconstruct([
       partRow(
         'part-snapshot-patch-1',
@@ -891,21 +895,23 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       ),
     ])
 
-    expect(result.diagnostics).toEqual([])
     expect(result.notices).toEqual([])
-    expect(result.changes).toHaveLength(2)
-    expect(result.changes.map(change => change.relativePath)).toEqual(['docs/a.md', 'docs/b.md'])
-    expect(result.changes[0]).toMatchObject({
-      sourceTool: 'snapshot_patch',
-      sourcePartId: 'part-snapshot-patch-1',
-      sourceMessageId: 'assistant-1',
-      parentUserMessageId: 'user-1',
-      attributionMethod: 'delivery-ledger-taskrefs',
-      evidenceProof: 'metadata-only-fallback',
-    })
+    expect(result.changes).toEqual([])
+    expect(result.skippedSnapshotOnlyChanges.map(change => [
+      change.taskId,
+      change.relativePath,
+      change.sourceImportKey,
+    ])).toEqual([
+      ['task-1', 'docs/a.md', sourceImportKey('part-snapshot-patch-1', 'docs/a.md')],
+      ['task-1', 'docs/b.md', sourceImportKey('part-snapshot-patch-1', 'docs/b.md')],
+    ])
+    expect(result.diagnostics).toEqual([
+      'OpenCode snapshot patch part part-snapshot-patch-1 observed docs/a.md but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.',
+      'OpenCode snapshot patch part part-snapshot-patch-1 observed docs/b.md but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.',
+    ])
   })
 
-  test('strict delivery mode does not duplicate snapshot patch paths already covered by file toolparts', () => {
+  test('strict delivery mode only keeps file toolpart paths when snapshot patch also lists unrelated files', () => {
     const result = reconstruct([
       toolPart({
         id: 'part-edit-1',
@@ -929,11 +935,58 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
       ),
     ])
 
-    expect(result.diagnostics).toEqual([])
     expect(result.notices).toEqual([])
     expect(result.changes.map(change => [change.sourceTool, change.relativePath])).toEqual([
       ['edit', 'docs/a.md'],
-      ['snapshot_patch', 'docs/b.md'],
+    ])
+    expect(result.skippedSnapshotOnlyChanges.map(change => [change.taskId, change.relativePath])).toEqual([
+      ['task-1', 'docs/b.md'],
+    ])
+    expect(result.diagnostics).toEqual([
+      'OpenCode snapshot patch part part-snapshot-patch-1 observed docs/b.md but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.',
+    ])
+  })
+
+  test('strict delivery mode prevents shared-workspace snapshot patches from attributing teammate files', () => {
+    const result = reconstruct([
+      toolPart({
+        id: 'part-write-style',
+        tool: 'write',
+        filePath: path.join(workspaceRoot, '3232323/style.css'),
+        content: '.calculator { color: white; }\n',
+        exists: false,
+      }),
+      partRow(
+        'part-snapshot-patch-style',
+        'assistant-1',
+        {
+          type: 'patch',
+          hash: 'snapshot-before-1',
+          files: [
+            path.join(workspaceRoot, '3232323/index.html'),
+            path.join(workspaceRoot, '3232323/style.css'),
+            path.join(workspaceRoot, '3232323/calc.js'),
+          ],
+        },
+        1200,
+      ),
+    ])
+
+    expect(result.notices).toEqual([])
+    expect(result.changes.map(change => [change.sourceTool, change.relativePath])).toEqual([
+      ['write', '3232323/style.css'],
+    ])
+    expect(result.skippedSnapshotOnlyChanges.map(change => [
+      change.taskId,
+      change.relativePath,
+      change.sourceImportKey,
+    ])).toEqual([
+      ['task-1', '3232323/index.html', sourceImportKey('part-snapshot-patch-style', '3232323/index.html')],
+      ['task-1', '3232323/calc.js', sourceImportKey('part-snapshot-patch-style', '3232323/calc.js')],
+    ])
+    expect(result.diagnostics).toEqual([
+      'OpenCode snapshot patch part part-snapshot-patch-style observed 3232323/index.html but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.',
+      'OpenCode snapshot patch part part-snapshot-patch-style observed 3232323/calc.js but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.',
     ])
   })
 
@@ -965,6 +1018,7 @@ describe('OpenCodeToolpartChangeReconstructor', () => {
     expect(result.changes.map(change => [change.sourceTool, change.relativePath])).toEqual([
       ['edit', 'docs/new\nline.md'],
     ])
+    expect(result.skippedSnapshotOnlyChanges).toEqual([])
     expect(result.diagnostics.join('\n')).toContain(
       'OpenCode snapshot patch part part-snapshot-patch-1 skipped split newline path fragment docs/new.',
     )

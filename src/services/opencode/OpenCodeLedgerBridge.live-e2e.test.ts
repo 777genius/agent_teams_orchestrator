@@ -12,7 +12,7 @@ import { buildManagedConfig } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeSnapshotEvidenceProviderService } from './OpenCodeSnapshotEvidenceProvider.js'
 import { OpenCodeSnapshotGitStoreReader } from './OpenCodeSnapshotGitStoreReader.js'
-import { spawnSyncPortableCli } from '../../utils/portableCli.js'
+import { spawnPortableCli, spawnSyncPortableCli } from '../../utils/portableCli.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
 
@@ -40,6 +40,8 @@ const LIVE_CLI_FILE = 'live-cli-runtime.ts'
 const LIVE_CLI_CREATE_FILE = 'live-cli-created.ts'
 const LIVE_CLI_MIXED_MODIFY_FILE = 'live-cli-mixed-modify.ts'
 const LIVE_CLI_MIXED_CREATE_FILE = 'live-cli-mixed-create.ts'
+const SHARED_ALPHA_FILE = 'live-shared-alpha.ts'
+const SHARED_BETA_FILE = 'live-shared-beta.ts'
 
 let tempDir = ''
 
@@ -61,7 +63,7 @@ afterEach(async () => {
   if (tempDir) {
     await rm(tempDir, { recursive: true, force: true })
   }
-})
+}, 60_000)
 
 function childEnv(options: { snapshot?: boolean } = {}): NodeJS.ProcessEnv {
   const home = liveHome()
@@ -120,6 +122,44 @@ function runOpenCode(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000
     encoding: 'utf8',
     timeout: timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
+  })
+}
+
+function runOpenCodeAsync(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 180_000): Promise<{
+  status: number | null
+  signal: NodeJS.Signals | null
+  stdout: string
+  stderr: string
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawnPortableCli('opencode', args, {
+      cwd: tempDir,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', chunk => {
+      stdout += chunk
+    })
+    child.stderr?.on('data', chunk => {
+      stderr += chunk
+    })
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM')
+      setTimeout(() => child.kill('SIGKILL'), 2_000).unref()
+    }, timeoutMs)
+    timeout.unref()
+    child.on('error', error => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.on('close', (status, signal) => {
+      clearTimeout(timeout)
+      resolve({ status, signal, stdout, stderr })
+    })
   })
 }
 
@@ -230,6 +270,42 @@ function findLiveToolpartForFiles(dbPath: string, workspaceRoot: string, relativ
   throw new Error(`No live OpenCode write/edit/apply_patch toolpart found for ${relativePaths.join(', ')}.`)
 }
 
+function normalizePatchFilePath(workspaceRoot: string, value: string): string {
+  const normalized = value.replace(/\\/g, '/')
+  return path.resolve(path.isAbsolute(normalized) ? normalized : path.join(workspaceRoot, normalized))
+}
+
+function readPatchFileGroupsForMessage(
+  dbPath: string,
+  input: {
+    sessionId: string
+    assistantMessageId: string
+    workspaceRoot: string
+  },
+): string[][] {
+  const db = new Database(dbPath, { readonly: true })
+  try {
+    const rows = db.query(
+      'select data from part where session_id = ? and message_id = ? order by time_created asc, id asc',
+    ).all(input.sessionId, input.assistantMessageId) as Array<{ data: string }>
+    const groups: string[][] = []
+    for (const row of rows) {
+      const data = parseRecord(row.data)
+      if (data?.type !== 'patch' || !Array.isArray(data.files)) {
+        continue
+      }
+      groups.push(
+        data.files
+          .filter((file): file is string => typeof file === 'string')
+          .map(file => normalizePatchFilePath(input.workspaceRoot, file)),
+      )
+    }
+    return groups
+  } finally {
+    db.close()
+  }
+}
+
 function sessionRecord(input: {
   sessionId: string
   workspaceRoot: string
@@ -260,14 +336,18 @@ function sessionRecord(input: {
 async function writeDeliveryContext(input: {
   sessionId: string
   parentUserMessageId: string
+  taskId?: string
+  taskDisplayId?: string
 }): Promise<{ deliveryContextPath: string; deliveryContextHash: string }> {
   const contextDir = await mkdtemp(path.join(tempDir, 'claude-team-opencode-ledger-context-'))
   await chmod(contextDir, 0o700).catch(() => undefined)
   const filePath = path.join(contextDir, 'delivery-context.json')
+  const taskId = input.taskId ?? TASK_ID
+  const taskDisplayId = input.taskDisplayId ?? TASK_DISPLAY_ID
   const rawContext = `${JSON.stringify({
     schemaVersion: 1,
     teamName: TEAM_NAME,
-    taskId: TASK_ID,
+    taskId,
     records: [
       {
         memberName: MEMBER_NAME,
@@ -279,7 +359,7 @@ async function writeDeliveryContext(input: {
         prePromptCursor: null,
         postPromptCursor: null,
         taskRefs: [
-          { taskId: TASK_ID, displayId: TASK_DISPLAY_ID, teamName: TEAM_NAME },
+          { taskId, displayId: taskDisplayId, teamName: TEAM_NAME },
         ],
       },
     ],
@@ -371,18 +451,18 @@ function runCliBackfill(input: {
   )
 }
 
-async function readBundle(projectDir: string): Promise<Record<string, unknown>> {
+async function readBundle(projectDir: string, taskId = TASK_ID): Promise<Record<string, unknown>> {
   return JSON.parse(
     await readFile(
-      path.join(projectDir, '.board-task-changes', 'bundles', `${encodeURIComponent(TASK_ID)}.json`),
+      path.join(projectDir, '.board-task-changes', 'bundles', `${encodeURIComponent(taskId)}.json`),
       'utf8',
     ),
   ) as Record<string, unknown>
 }
 
-async function readEvents(projectDir: string): Promise<Array<Record<string, unknown>>> {
+async function readEvents(projectDir: string, taskId = TASK_ID): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(
-    path.join(projectDir, '.board-task-changes', 'events', `${encodeURIComponent(TASK_ID)}.jsonl`),
+    path.join(projectDir, '.board-task-changes', 'events', `${encodeURIComponent(taskId)}.jsonl`),
     'utf8',
   )
   return raw.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
@@ -724,6 +804,228 @@ describe('OpenCode Ledger Bridge live e2e', () => {
     expect(duplicateResult.importedEvents).toBe(0)
     expect((await readEvents(projectDir)).length).toBe(eventCountAfterFirstImport)
   }, 240_000)
+
+  liveSnapshotBridgeTest('does not attribute ambient shared-workspace snapshot patch files to a later OpenCode task', async () => {
+    const env = childEnv({ snapshot: true })
+    const version = runOpenCode(['--version'], env, 15_000)
+    expect(version.status, `stdout:\n${version.stdout}\nstderr:\n${version.stderr}`).toBe(0)
+
+    const dbPathResult = runOpenCode(['db', 'path'], env, 30_000)
+    expect(dbPathResult.status, `stdout:\n${dbPathResult.stdout}\nstderr:\n${dbPathResult.stderr}`).toBe(0)
+    const dbPath = parseDbPath(dbPathResult.stdout)
+
+    type ReproducedSharedSnapshot = {
+      workspaceRoot: string
+      alphaProjectDir: string
+      betaProjectDir: string
+      alphaTaskId: string
+      betaTaskId: string
+      alphaTaskDisplayId: string
+      betaTaskDisplayId: string
+      alphaPath: string
+      betaPath: string
+      alphaToolpart: ReturnType<typeof findLiveToolpartForFiles>
+      betaToolpart: ReturnType<typeof findLiveToolpartForFiles>
+      patchFileGroups: string[][]
+    }
+    let reproduced: ReproducedSharedSnapshot | null = null
+    const reproductionDiagnostics: string[] = []
+
+    for (let attempt = 1; attempt <= 4 && !reproduced; attempt += 1) {
+      const workspaceRootPath = path.join(tempDir, `workspace-shared-snapshot-attribution-${attempt}`)
+      const alphaProjectDir = path.join(tempDir, `claude-project-shared-snapshot-alpha-${attempt}`)
+      const betaProjectDir = path.join(tempDir, `claude-project-shared-snapshot-beta-${attempt}`)
+      const alphaTaskId = `live-task-shared-alpha-${attempt}`
+      const betaTaskId = `live-task-shared-beta-${attempt}`
+      const alphaTaskDisplayId = `livealpha${attempt}`
+      const betaTaskDisplayId = `livebeta${attempt}`
+      await mkdir(workspaceRootPath, { recursive: true })
+      await mkdir(alphaProjectDir, { recursive: true })
+      await mkdir(betaProjectDir, { recursive: true })
+      const workspaceRoot = await realpath(workspaceRootPath)
+      runGit(['init'], workspaceRoot)
+      runGit(['config', 'user.email', 'opencode-ledger-live@example.local'], workspaceRoot)
+      runGit(['config', 'user.name', 'OpenCode Ledger Live'], workspaceRoot)
+      const alphaPath = path.join(workspaceRoot, SHARED_ALPHA_FILE)
+      const betaPath = path.join(workspaceRoot, SHARED_BETA_FILE)
+      await writeFile(alphaPath, 'export const sharedAlpha = 1;\n', 'utf8')
+      await writeFile(betaPath, 'export const sharedBeta = 1;\n', 'utf8')
+      runGit(['add', SHARED_ALPHA_FILE, SHARED_BETA_FILE], workspaceRoot)
+      runGit(['commit', '-m', 'seed live shared snapshot workspace'], workspaceRoot)
+
+      const alphaPrompt = [
+        `You are running a live Agent Teams shared-workspace alpha smoke test attempt ${attempt}.`,
+        `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+        `Overwrite this exact absolute file path: ${alphaPath}`,
+        `The write tool content must be exactly: export const sharedAlpha = 2;`,
+        `Do not create, delete, inspect, or modify any other files.`,
+        `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+      ].join('\n')
+
+      const betaPrompt = [
+        `You are running a live Agent Teams shared-workspace beta smoke test attempt ${attempt}.`,
+        `Use the file write tool exactly once, not shell, bash, glob, or read.`,
+        `Overwrite this exact absolute file path: ${betaPath}`,
+        `The write tool content must be exactly: export const sharedBeta = 2;`,
+        `Do not create, delete, inspect, or modify any other files.`,
+        `This run is correlated by the delivery ledger; do not add legacy taskRefs text markers.`,
+      ].join('\n')
+
+      const [alphaRun, betaRun] = await Promise.all([
+        runOpenCodeAsync([
+          'run',
+          '--pure',
+          '--dir',
+          workspaceRoot,
+          '--model',
+          LIVE_MODEL,
+          '--dangerously-skip-permissions',
+          '--format',
+          'json',
+          alphaPrompt,
+        ], env, 300_000),
+        runOpenCodeAsync([
+          'run',
+          '--pure',
+          '--dir',
+          workspaceRoot,
+          '--model',
+          LIVE_MODEL,
+          '--dangerously-skip-permissions',
+          '--format',
+          'json',
+          betaPrompt,
+        ], env, 300_000),
+      ])
+      expect(alphaRun.status, `stdout:\n${alphaRun.stdout}\nstderr:\n${alphaRun.stderr}`).toBe(0)
+      expect(betaRun.status, `stdout:\n${betaRun.stdout}\nstderr:\n${betaRun.stderr}`).toBe(0)
+      expect((await readFile(alphaPath, 'utf8')).trim()).toBe('export const sharedAlpha = 2;')
+      expect((await readFile(betaPath, 'utf8')).trim()).toBe('export const sharedBeta = 2;')
+
+      const alphaToolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [SHARED_ALPHA_FILE])
+      const betaToolpart = findLiveToolpartForFiles(dbPath, workspaceRoot, [SHARED_BETA_FILE])
+      const patchFileGroups = readPatchFileGroupsForMessage(dbPath, {
+        sessionId: betaToolpart.sessionId,
+        assistantMessageId: betaToolpart.assistantMessageId,
+        workspaceRoot,
+      })
+      const reproducedAmbientPatch =
+        patchFileGroups.some(group => group.includes(alphaPath) && group.includes(betaPath))
+      if (!reproducedAmbientPatch) {
+        reproductionDiagnostics.push(`attempt ${attempt}: ${JSON.stringify(patchFileGroups)}`)
+        continue
+      }
+      reproduced = {
+        workspaceRoot,
+        alphaProjectDir,
+        betaProjectDir,
+        alphaTaskId,
+        betaTaskId,
+        alphaTaskDisplayId,
+        betaTaskDisplayId,
+        alphaPath,
+        betaPath,
+        alphaToolpart,
+        betaToolpart,
+        patchFileGroups,
+      }
+    }
+
+    expect(
+      reproduced,
+      `Expected beta OpenCode snapshot patch files to include both ambient ${SHARED_ALPHA_FILE} and authored ${SHARED_BETA_FILE}; attempts: ${reproductionDiagnostics.join(' | ')}`,
+    ).not.toBeNull()
+    const {
+      workspaceRoot,
+      alphaProjectDir,
+      betaProjectDir,
+      alphaTaskId,
+      betaTaskId,
+      alphaTaskDisplayId,
+      betaTaskDisplayId,
+      alphaToolpart,
+      betaToolpart,
+    } = reproduced!
+
+    const alphaDeliveryContext = await writeDeliveryContext({
+      sessionId: alphaToolpart.sessionId,
+      parentUserMessageId: alphaToolpart.parentUserMessageId,
+      taskId: alphaTaskId,
+      taskDisplayId: alphaTaskDisplayId,
+    })
+    const alphaService = liveSnapshotBridgeService({
+      dbPath,
+      sessionId: alphaToolpart.sessionId,
+      workspaceRoot,
+    })
+    const alphaResult = await alphaService.backfill({
+      teamName: TEAM_NAME,
+      taskId: alphaTaskId,
+      taskDisplayId: alphaTaskDisplayId,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir: alphaProjectDir,
+      workspaceRoot,
+      ...alphaDeliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(alphaResult.outcome).toBe('imported')
+    expect(alphaResult.importedEvents).toBeGreaterThanOrEqual(1)
+    const alphaBundle = await readBundle(alphaProjectDir, alphaTaskId)
+    expect(alphaBundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: alphaTaskId,
+      totalFiles: 1,
+    })
+    const alphaFiles = alphaBundle.files as Array<Record<string, unknown>>
+    expect(alphaFiles.map(file => file.relativePath)).toEqual([SHARED_ALPHA_FILE])
+    const alphaEvents = await readEvents(alphaProjectDir, alphaTaskId)
+    expect(alphaEvents.some(event => event.relativePath === SHARED_ALPHA_FILE)).toBe(true)
+    expect(alphaEvents.some(event => event.relativePath === SHARED_BETA_FILE)).toBe(false)
+
+    const betaDeliveryContext = await writeDeliveryContext({
+      sessionId: betaToolpart.sessionId,
+      parentUserMessageId: betaToolpart.parentUserMessageId,
+      taskId: betaTaskId,
+      taskDisplayId: betaTaskDisplayId,
+    })
+    const betaService = liveSnapshotBridgeService({
+      dbPath,
+      sessionId: betaToolpart.sessionId,
+      workspaceRoot,
+    })
+    const betaResult = await betaService.backfill({
+      teamName: TEAM_NAME,
+      taskId: betaTaskId,
+      taskDisplayId: betaTaskDisplayId,
+      memberName: MEMBER_NAME,
+      laneId: LANE_ID,
+      projectDir: betaProjectDir,
+      workspaceRoot,
+      ...betaDeliveryContext,
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(betaResult.outcome).toBe('imported')
+    expect(betaResult.importedEvents).toBeGreaterThanOrEqual(1)
+    expect(betaResult.diagnostics.join('\n')).toContain(
+      `observed ${SHARED_ALPHA_FILE} but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.`,
+    )
+
+    const betaBundle = await readBundle(betaProjectDir, betaTaskId)
+    expect(betaBundle).toMatchObject({
+      source: 'task-change-ledger',
+      taskId: betaTaskId,
+      totalFiles: 1,
+    })
+    const betaFiles = betaBundle.files as Array<Record<string, unknown>>
+    expect(betaFiles.map(file => file.relativePath)).toEqual([SHARED_BETA_FILE])
+
+    const betaEvents = await readEvents(betaProjectDir, betaTaskId)
+    expect(betaEvents.some(event => event.relativePath === SHARED_ALPHA_FILE)).toBe(false)
+    expect(betaEvents.some(event => event.relativePath === SHARED_BETA_FILE)).toBe(true)
+  }, 420_000)
 
   liveSnapshotBridgeTest('public CLI imports real OpenCode snapshot changes from managed profile artifacts', async () => {
     const env = childEnv({ snapshot: true })

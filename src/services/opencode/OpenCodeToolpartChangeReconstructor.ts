@@ -89,6 +89,14 @@ export type ReconstructedOpenCodeToolChange = {
   timestamp: string
 }
 
+export type SkippedOpenCodeSnapshotOnlyChange = {
+  taskId: string
+  sourceImportKey: string
+  relativePath: string
+  sourcePartId: string
+  sourceMessageId: string
+}
+
 type Toolpart = {
   partId: string
   messageId: string
@@ -363,6 +371,10 @@ function buildSourceImportKey(params: {
   return ['opencode', params.sessionId, params.partId, params.normalizedPath.comparisonKey].join('\0')
 }
 
+function snapshotPatchSkippedDiagnostic(partId: string, relativePath: string): string {
+  return `OpenCode snapshot patch part ${partId} observed ${relativePath} but skipped it because snapshot-only evidence does not prove file authorship in shared workspaces.`
+}
+
 function compareSourcePartSortKey(
   left: SourcePartSortKey | undefined,
   right: SourcePartSortKey | undefined,
@@ -392,6 +404,7 @@ export class OpenCodeToolpartChangeReconstructor {
     laneId?: string | null
   }): {
     changes: ReconstructedOpenCodeToolChange[]
+    skippedSnapshotOnlyChanges: SkippedOpenCodeSnapshotOnlyChange[]
     notices: Array<{ severity: 'warning'; message: string; code: string }>
     diagnostics: string[]
   } {
@@ -433,6 +446,7 @@ export class OpenCodeToolpartChangeReconstructor {
     )
     const fileStates = new Map<string, ReconstructedFileState>()
     const changes: ReconstructedOpenCodeToolChange[] = []
+    const skippedSnapshotOnlyChanges: SkippedOpenCodeSnapshotOnlyChange[] = []
     changes.push(...this.reconstructSnapshotPatchChanges({
       rows: parsedParts,
       messagesById,
@@ -440,6 +454,7 @@ export class OpenCodeToolpartChangeReconstructor {
       toolparts,
       params,
       diagnostics,
+      skippedSnapshotOnlyChanges,
     }))
 
     for (const toolpart of toolparts.sort((left, right) => {
@@ -825,6 +840,7 @@ export class OpenCodeToolpartChangeReconstructor {
           ) || left.index - right.index
         )
         .map(({ change }) => change),
+      skippedSnapshotOnlyChanges,
       notices,
       diagnostics,
     }
@@ -846,6 +862,7 @@ export class OpenCodeToolpartChangeReconstructor {
       laneId?: string | null
     }
     diagnostics: string[]
+    skippedSnapshotOnlyChanges: SkippedOpenCodeSnapshotOnlyChange[]
   }): ReconstructedOpenCodeToolChange[] {
     const touchedByToolpart = this.buildToolpartTouchedPathIndex(input.toolparts, input.params.projectPath)
     const changes: ReconstructedOpenCodeToolChange[] = []
@@ -901,46 +918,19 @@ export class OpenCodeToolpartChangeReconstructor {
           )
           continue
         }
-        changes.push({
-          taskId: taskContext.taskRef.taskId,
-          taskRef: taskContext.taskRef.taskId,
-          taskRefKind: 'canonical',
-          teamName: taskContext.taskRef.teamName,
-          memberName: input.params.memberName,
+        const sourceImportKey = buildSourceImportKey({
           sessionId: input.params.sessionId,
-          ...(parentUserMessageId ? { parentUserMessageId } : {}),
-          assistantMessageId: row.message_id,
-          toolUseId: row.id,
+          partId: row.id,
+          normalizedPath,
+        })
+        input.skippedSnapshotOnlyChanges.push({
+          taskId: taskContext.taskRef.taskId,
+          sourceImportKey,
+          relativePath: normalizedPath.relativePath,
           sourcePartId: row.id,
           sourceMessageId: row.message_id,
-          sourceTool: 'snapshot_patch',
-          sourceImportKey: buildSourceImportKey({
-            sessionId: input.params.sessionId,
-            partId: row.id,
-            normalizedPath,
-          }),
-          filePath: normalizedPath.absolutePath,
-          relativePath: normalizedPath.relativePath,
-          beforeContent: null,
-          afterContent: null,
-          operation: 'modify',
-          confidence: 'medium',
-          attributionMethod: taskContext.method,
-          beforeState: {
-            exists: true,
-            unavailableReason: 'opencode-snapshot-patch-before-content-unavailable',
-          },
-          afterState: {
-            exists: true,
-            unavailableReason: 'opencode-snapshot-patch-after-content-unavailable',
-          },
-          evidenceProof: 'metadata-only-fallback',
-          timestamp: toIsoTimestamp(row.time_created, row.time_created),
-          warnings: [
-            'OpenCode snapshot patch was captured without a matching file toolpart; full review depends on snapshot evidence.',
-            ...(taskContext.warning ? [taskContext.warning] : []),
-          ],
         })
+        input.diagnostics.push(snapshotPatchSkippedDiagnostic(row.id, normalizedPath.relativePath))
       }
     }
 

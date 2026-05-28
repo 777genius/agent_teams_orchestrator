@@ -8,6 +8,7 @@ import { OpenCodeChangeEvidenceEnricher } from './OpenCodeChangeEvidenceEnricher
 import { OpenCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { OPENCODE_UNSUPPORTED_HISTORY_SHAPE_CODE } from './OpenCodeOfflineSessionReader.js'
 import { OpenCodeToolpartChangeReconstructor } from './OpenCodeToolpartChangeReconstructor.js'
+import { importTaskChangeLedgerEvents } from '../taskChangeLedger/TaskChangeLedgerService.js'
 
 import type { OpenCodeSnapshotBoundary, OpenCodeSnapshotEvidenceFile, OpenCodeSnapshotEvidenceProvider } from './OpenCodeChangeEvidence.js'
 import type { ReconstructedOpenCodeToolChange } from './OpenCodeToolpartChangeReconstructor.js'
@@ -1400,6 +1401,245 @@ describe('OpenCodeLedgerBridgeService', () => {
     expect(result.importedEvents).toBe(0)
     expect(result.skippedEvents).toBe(2)
     expect(result.diagnostics).toContain('OpenCode evidence skipped 1 sourceImportKey collision(s).')
+  })
+
+  test('skips snapshot-only reconstructed changes before importing ledger events', async () => {
+    const changes = [
+      reconstructedChange({
+        toolUseId: 'part-snapshot-patch-1',
+        sourcePartId: 'part-snapshot-patch-1',
+        sourceTool: 'snapshot_patch',
+        sourceImportKey: 'opencode\0session-1\0part-snapshot-patch-1\0src/ambient.ts',
+        filePath: path.join(workspaceRoot, 'src/ambient.ts'),
+        relativePath: 'src/ambient.ts',
+        beforeContent: null,
+        afterContent: 'export const ambient = 1;\n',
+        beforeState: { exists: false, sizeBytes: 0 },
+        afterState: { exists: true, sizeBytes: 26 },
+        operation: 'create',
+        confidence: 'high',
+        evidenceProof: 'opencode-snapshot',
+      }),
+    ]
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      {
+        reconstruct: () => ({
+          changes,
+          notices: [],
+          diagnostics: [],
+        }),
+      } as unknown as OpenCodeToolpartChangeReconstructor,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.skippedEvents).toBe(1)
+    expect(result.diagnostics).toContain(
+      'OpenCode ledger backfill skipped 1 snapshot-only change(s) because snapshot proof does not prove file authorship in shared workspaces.',
+    )
+  })
+
+  test('suppresses stale imported snapshot-only ledger events from earlier bridge versions', async () => {
+    const sourceImportKey = [
+      'opencode',
+      'session-1',
+      'part-snapshot-patch-1',
+      path.join(workspaceRoot, 'src/ambient.ts'),
+    ].join('\0')
+    const staleImport = await importTaskChangeLedgerEvents({
+      projectDir,
+      scope: {
+        taskId: 'task-1',
+        task: { ref: 'task-1', refKind: 'canonical' },
+        phase: 'work',
+        executionSeq: 0,
+      },
+      sessionId: 'session-1',
+      memberName: 'bob',
+      workspaceRoot,
+      toolStatus: 'succeeded',
+      changes: [
+        {
+          filePath: path.join(workspaceRoot, 'src/ambient.ts'),
+          beforeContent: null,
+          afterContent: 'export const ambient = 1;\n',
+          source: 'opencode_toolpart_apply_patch',
+          confidence: 'high',
+          operation: 'create',
+          beforeState: { exists: false, sizeBytes: 0 },
+          afterState: { exists: true, sizeBytes: 26 },
+          toolUseId: 'part-snapshot-patch-1',
+          timestamp: '2026-03-01T10:00:00.000Z',
+          sourceImportKey,
+          sourceRuntime: 'opencode',
+          sourceSessionId: 'session-1',
+          sourcePartId: 'part-snapshot-patch-1',
+          sourceMessageId: 'assistant-1',
+          parentUserMessageId: 'user-1',
+          attributionMethod: 'delivery-ledger-taskrefs',
+          evidenceProof: 'opencode-snapshot',
+        },
+      ],
+    })
+    expect(staleImport.importedEventCount).toBe(1)
+    const bundlePath = path.join(projectDir, '.board-task-changes', 'bundles', 'task-1.json')
+    const beforeBundle = JSON.parse(await readFile(bundlePath, 'utf8')) as {
+      totalFiles: number
+      files: Array<{ relativePath: string }>
+    }
+    expect(beforeBundle.totalFiles).toBe(1)
+    expect(beforeBundle.files.map(file => file.relativePath)).toEqual(['src/ambient.ts'])
+
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      {
+        reconstruct: () => ({
+          changes: [],
+          skippedSnapshotOnlyChanges: [
+            {
+              taskId: 'task-1',
+              sourceImportKey,
+              relativePath: 'src/ambient.ts',
+              sourcePartId: 'part-snapshot-patch-1',
+              sourceMessageId: 'assistant-1',
+            },
+          ],
+          notices: [],
+          diagnostics: [],
+        }),
+      } as unknown as OpenCodeToolpartChangeReconstructor,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('no-attribution')
+    expect(result.candidateEvents).toBe(0)
+    expect(result.importedEvents).toBe(0)
+    expect(result.skippedEvents).toBe(1)
+    expect(result.diagnostics).toContain(
+      'OpenCode ledger suppressed 1 stale snapshot-only imported change(s).',
+    )
+    const afterBundle = JSON.parse(await readFile(bundlePath, 'utf8')) as {
+      totalFiles: number
+      files: Array<{ relativePath: string }>
+    }
+    expect(afterBundle.totalFiles).toBe(0)
+    expect(afterBundle.files).toEqual([])
+    const eventFile = path.join(projectDir, '.board-task-changes', 'events', 'task-1.jsonl')
+    const events = (await readFile(eventFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as { eventId: string; suppressed?: true; supersedesEventId?: string })
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({
+      suppressed: true,
+      supersedesEventId: events[0]?.eventId,
+    })
+
+    const secondResult = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+    expect(secondResult.outcome).toBe('no-attribution')
+    expect(secondResult.skippedEvents).toBe(0)
+    const eventsAfterSecondRun = (await readFile(eventFile, 'utf8')).trim().split('\n')
+    expect(eventsAfterSecondRun).toHaveLength(2)
+  })
+
+  test('does not reintroduce snapshot-only changes when evidence enrichment falls back', async () => {
+    const changes = [
+      reconstructedChange(),
+      reconstructedChange({
+        toolUseId: 'part-snapshot-patch-1',
+        sourcePartId: 'part-snapshot-patch-1',
+        sourceTool: 'snapshot_patch',
+        sourceImportKey: 'opencode\0session-1\0part-snapshot-patch-1\0src/ambient.ts',
+        filePath: path.join(workspaceRoot, 'src/ambient.ts'),
+        relativePath: 'src/ambient.ts',
+        beforeContent: null,
+        afterContent: null,
+        beforeState: {
+          exists: true,
+          unavailableReason: 'opencode-snapshot-patch-before-content-unavailable',
+        },
+        afterState: {
+          exists: true,
+          unavailableReason: 'opencode-snapshot-patch-after-content-unavailable',
+        },
+        operation: 'modify',
+        confidence: 'medium',
+        evidenceProof: 'metadata-only-fallback',
+      }),
+    ]
+    const service = new OpenCodeLedgerBridgeService(
+      { list: async () => [sessionRecord()] },
+      { readSession: async () => offlineFixture() },
+      {
+        reconstruct: () => ({
+          changes,
+          notices: [],
+          diagnostics: [],
+        }),
+      } as unknown as OpenCodeToolpartChangeReconstructor,
+      {
+        enrich: async () => {
+          throw new Error('snapshot probe boom')
+        },
+      } as unknown as OpenCodeChangeEvidenceEnricher,
+    )
+
+    const result = await service.backfill({
+      teamName: 'team-a',
+      taskId: 'task-1',
+      taskDisplayId: 'abc12345',
+      projectDir,
+      workspaceRoot,
+      ...(await writeDeliveryContext()),
+      attributionMode: 'strict-delivery',
+    })
+
+    expect(result.outcome).toBe('imported')
+    expect(result.candidateEvents).toBe(1)
+    expect(result.importedEvents).toBe(1)
+    expect(result.skippedEvents).toBe(1)
+    expect(result.diagnostics).toContain(
+      'OpenCode evidence enrichment failed; using metadata-only fallback - snapshot probe boom',
+    )
+    expect(result.diagnostics.join('\n')).not.toContain(
+      'OpenCode metadata-only final disk state materialized for src/ambient.ts.',
+    )
+    const bundle = JSON.parse(
+      await readFile(path.join(projectDir, '.board-task-changes', 'bundles', 'task-1.json'), 'utf8'),
+    ) as { totalFiles: number; files: Array<{ relativePath: string }> }
+    expect(bundle.totalFiles).toBe(1)
+    expect(bundle.files.map(file => file.relativePath)).toEqual(['src/opencode.ts'])
   })
 
   test('downgrades apply_patch delete evidence when final disk state still exists', async () => {

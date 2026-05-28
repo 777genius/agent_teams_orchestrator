@@ -27,6 +27,7 @@ import {
   finishTaskChangeShellSnapshot,
   importTaskChangeLedgerEvents,
   maybeBeginTaskChangeShellSnapshot,
+  suppressOpenCodeTaskChangeLedgerEvents,
   type ImportedOpenCodeFileChange,
 } from './TaskChangeLedgerService.js'
 import {
@@ -447,6 +448,68 @@ describe('TaskChangeLedgerService integration', () => {
       journalEventCount: 2,
       eventCount: 1,
     })
+  })
+
+  test('suppresses stale OpenCode imports idempotently without hiding legitimate same-file imports', async () => {
+    const taskId = 'task-opencode-suppression-idempotent'
+    const staleSourceImportKey = 'opencode\0session-opencode\0part-snapshot\0src/opencode.ts'
+    const legitimateSourceImportKey = 'opencode\0session-opencode\0part-write\0src/opencode.ts'
+    const stale = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        sourceImportKey: staleSourceImportKey,
+        sourcePartId: 'part-snapshot',
+        sourceMessageId: 'assistant-snapshot',
+        toolUseId: 'part-snapshot',
+        evidenceProof: 'opencode-snapshot',
+      }),
+    ])
+    expect(stale.importedEventCount).toBe(1)
+    const legitimate = await importOpenCodeChanges(taskId, [
+      openCodeChange({
+        sourceImportKey: legitimateSourceImportKey,
+        sourcePartId: 'part-write',
+        sourceMessageId: 'assistant-write',
+        toolUseId: 'part-write',
+        beforeContent: 'export const value = 1;\n',
+        afterContent: 'export const value = 3;\n',
+        beforeState: { exists: true, sha256: sha256('export const value = 1;\n'), sizeBytes: 24 },
+        afterState: { exists: true, sha256: sha256('export const value = 3;\n'), sizeBytes: 24 },
+        confidence: 'exact',
+        evidenceProof: 'toolpart-chain',
+      }),
+    ])
+    expect(legitimate.importedEventCount).toBe(1)
+
+    const firstSuppression = await suppressOpenCodeTaskChangeLedgerEvents({
+      taskId,
+      sourceImportKeys: [staleSourceImportKey],
+      reason: 'snapshot-only evidence does not prove file authorship in shared workspaces',
+    })
+    expect(firstSuppression.suppressedEventCount).toBe(1)
+    const secondSuppression = await suppressOpenCodeTaskChangeLedgerEvents({
+      taskId,
+      sourceImportKeys: [staleSourceImportKey],
+      reason: 'snapshot-only evidence does not prove file authorship in shared workspaces',
+    })
+    expect(secondSuppression.suppressedEventCount).toBe(0)
+
+    const events = await readJsonl<Record<string, unknown>>(eventsPath(taskId))
+    expect(events).toHaveLength(3)
+    expect(events.filter(event => event.suppressed === true)).toHaveLength(1)
+
+    const bundle = await readJson<Record<string, unknown>>(bundlePath(taskId))
+    const files = bundle.files as Array<Record<string, unknown>>
+    expect(bundle.eventCount).toBe(3)
+    expect(bundle.projectedEventCount).toBe(1)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatchObject({
+      relativePath: 'src/opencode.ts',
+      eventCount: 1,
+      reviewability: 'full-text',
+      linesAdded: 1,
+      linesRemoved: 1,
+    })
+    expect(files[0]?.journalEventCount).toBeUndefined()
   })
 
   test('does not append weaker or operation-mismatched OpenCode evidence after an upgrade', async () => {
