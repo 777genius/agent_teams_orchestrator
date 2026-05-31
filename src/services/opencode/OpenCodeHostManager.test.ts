@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -29,6 +29,7 @@ const baseProfile: OpenCodePreparedProfile = {
   },
   managedConfigFingerprint: 'managed-config-v1',
   homePath: '/tmp/profile-root/home',
+  tmpPath: '/tmp/profile-root/tmp',
   xdgConfigHome: '/tmp/profile-root/config',
   xdgDataHome: '/tmp/profile-root/data',
   xdgCacheHome: '/tmp/profile-root/cache',
@@ -93,6 +94,15 @@ function createDeferred<T = void>(): {
     reject = promiseReject
   })
   return { promise, resolve, reject }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 describe('OpenCodeHostManager', () => {
@@ -198,6 +208,132 @@ describe('OpenCodeHostManager', () => {
       if (hostKey) {
         await manager.releaseHost(hostKey).catch(() => undefined)
       }
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('cleans OpenTUI temp dylibs after disposing an owned host', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-temp-'))
+    const tmpPath = path.join(tempDir, 'tmp')
+    await mkdir(tmpPath, { recursive: true })
+    const profile: OpenCodePreparedProfile = {
+      ...baseProfile,
+      profileRootPath: tempDir,
+      tmpPath,
+    }
+    const dylibPath = path.join(tmpPath, '.bbb6fbfdecfffefd-00000000.dylib')
+    const keepPath = path.join(tmpPath, 'keep.txt')
+    const spawned = createMockChildProcess(43139)
+    let processAlive = true
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => profile,
+      allocateLoopbackPort: async () => 43139,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/config')) {
+          return { status: 200, data: { server: { port: 43139 }, default_agent: 'teammate' } }
+        }
+        if (url.endsWith('/config/providers')) {
+          return { status: 200, data: { providers: [], default: {} } }
+        }
+        if (url.endsWith('/agent')) {
+          return { status: 200, data: [{ name: 'teammate', mode: 'primary' }] }
+        }
+        if (url.endsWith('/mcp')) {
+          return { status: 200, data: {} }
+        }
+        return { status: 200, data: { ok: true } }
+      },
+      isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      sleepMs: async () => {},
+      killProcess: (_pid, signal) => {
+        spawned.killedSignals.push(signal)
+        processAlive = false
+      },
+      persistentRegistryPath: null,
+    })
+
+    try {
+      await manager.ensureHost({ hostKey: 'host-key' })
+      await writeFile(dylibPath, 'temp dylib', 'utf8')
+      await writeFile(keepPath, 'keep', 'utf8')
+
+      await manager.disposeHost('host-key')
+
+      expect(await pathExists(dylibPath)).toBe(false)
+      expect(await pathExists(keepPath)).toBe(true)
+      expect(spawned.killedSignals).toEqual(['SIGTERM'])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps OpenTUI temp dylibs while another host sharing the profile is alive', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-shared-temp-'))
+    const tmpPath = path.join(tempDir, 'tmp')
+    await mkdir(tmpPath, { recursive: true })
+    const profile: OpenCodePreparedProfile = {
+      ...baseProfile,
+      profileRootPath: tempDir,
+      tmpPath,
+    }
+    const dylibPath = path.join(tmpPath, '.bbb6fbfdecfffefd-00000000.dylib')
+    const spawnedHosts = [
+      createMockChildProcess(43139),
+      createMockChildProcess(43140),
+    ]
+    const alivePids = new Set<number>([43139, 43140])
+    let spawnIndex = 0
+    let nextPort = 43139
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => profile,
+      allocateLoopbackPort: async () => nextPort++,
+      spawnHostProcess: () => spawnedHosts[spawnIndex++].child,
+      fetchJson: async (url) => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/config')) {
+          return { status: 200, data: { default_agent: 'teammate' } }
+        }
+        if (url.endsWith('/config/providers')) {
+          return { status: 200, data: { providers: [], default: {} } }
+        }
+        if (url.endsWith('/agent')) {
+          return { status: 200, data: [{ name: 'teammate', mode: 'primary' }] }
+        }
+        if (url.endsWith('/mcp')) {
+          return { status: 200, data: {} }
+        }
+        return { status: 200, data: { ok: true } }
+      },
+      isProcessAlive: pid => alivePids.has(pid),
+      sleepMs: async () => {},
+      killProcess: (pid, signal) => {
+        spawnedHosts.find(spawned => spawned.child.pid === pid)?.killedSignals.push(signal)
+        alivePids.delete(pid)
+      },
+      persistentRegistryPath: null,
+    })
+
+    try {
+      await manager.ensureHost({ hostKey: 'host-a' })
+      await writeFile(dylibPath, 'temp dylib', 'utf8')
+
+      await manager.ensureHost({ hostKey: 'host-b' })
+      expect(await pathExists(dylibPath)).toBe(true)
+
+      await manager.disposeHost('host-a')
+      expect(await pathExists(dylibPath)).toBe(true)
+
+      await manager.disposeHost('host-b')
+      expect(await pathExists(dylibPath)).toBe(false)
+    } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
   })

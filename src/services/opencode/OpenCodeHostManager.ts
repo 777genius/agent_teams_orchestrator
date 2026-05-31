@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import net from 'node:net'
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
@@ -29,6 +29,7 @@ const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
+const OPENTUI_TEMP_DYLIB_RE = /^\.bbb[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
 
@@ -239,6 +240,26 @@ async function fetchJson(
 function defaultPersistentRegistryPath(): string {
   const paths = resolveClaudeMultimodelPaths()
   return path.join(paths.data, 'opencode', 'host-registry.json')
+}
+
+function getOpenCodeProfileTmpPath(profileRootKey: string): string {
+  const paths = resolveClaudeMultimodelPaths()
+  return path.join(paths.data, 'opencode', 'profiles', profileRootKey, 'tmp')
+}
+
+async function cleanupOpenTuiTempDylibs(tempPath: string): Promise<void> {
+  let entries: Awaited<ReturnType<typeof readdir>>
+  try {
+    entries = await readdir(tempPath, { withFileTypes: true })
+  } catch {
+    return
+  }
+
+  await Promise.all(
+    entries
+      .filter(entry => entry.isFile() && OPENTUI_TEMP_DYLIB_RE.test(entry.name))
+      .map(entry => rm(path.join(tempPath, entry.name), { force: true }).catch(() => undefined)),
+  )
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -465,6 +486,35 @@ export class OpenCodeHostManager {
 
   private async readPersistentRegistry(): Promise<PersistentHostRegistryShape> {
     return this.readPersistentRegistryUnlocked()
+  }
+
+  private hasTrackedAliveHostUsingTempPath(tempPath: string, ignoredPid?: number): boolean {
+    for (const entry of this.hosts.values()) {
+      const pid = entry.handle.pid
+      if (entry.handle.profile.tmpPath !== tempPath) {
+        continue
+      }
+      if (typeof ignoredPid === 'number' && pid === ignoredPid) {
+        continue
+      }
+      if (pid > 0 && this.isProcessAlive(pid)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private async cleanupOpenTuiTempArtifactsIfUnused(
+    tempPath: string,
+    pid?: number,
+  ): Promise<void> {
+    if (typeof pid === 'number' && pid > 0 && this.isProcessAlive(pid)) {
+      return
+    }
+    if (this.hasTrackedAliveHostUsingTempPath(tempPath, pid)) {
+      return
+    }
+    await cleanupOpenTuiTempDylibs(tempPath).catch(() => undefined)
   }
 
   private async readPersistentRegistryUnlocked(): Promise<PersistentHostRegistryShape> {
@@ -897,6 +947,10 @@ export class OpenCodeHostManager {
       this.hosts.delete(hostKey)
       this.pendingHosts.delete(hostKey)
       void this.removePersistentHost(hostKey).catch(() => undefined)
+      void this.cleanupOpenTuiTempArtifactsIfUnused(
+        entry.handle.profile.tmpPath,
+        entry.handle.pid,
+      ).catch(() => undefined)
     })
   }
 
@@ -932,6 +986,7 @@ export class OpenCodeHostManager {
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
+    await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
     const child = this.spawnHost(profile, port, lifetime)
 
     const diagnostics: string[] = []
@@ -995,6 +1050,7 @@ export class OpenCodeHostManager {
       diagnostics.push(message)
       this.hosts.delete(hostKey)
       await this.forceKillSpawnedHostProcess(child)
+      await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
       const diagnosticSuffix = diagnostics.length > 0
         ? ` Diagnostics: ${diagnostics.join(' | ')}`
         : ''
@@ -1137,6 +1193,10 @@ export class OpenCodeHostManager {
     }
     this.hosts.delete(record.hostKey)
     this.pendingHosts.delete(record.hostKey)
+    await this.cleanupOpenTuiTempArtifactsIfUnused(
+      entry?.handle.profile.tmpPath ?? getOpenCodeProfileTmpPath(record.profileRootKey),
+      pid,
+    )
   }
 
   async disposeHost(hostKey: string): Promise<boolean> {

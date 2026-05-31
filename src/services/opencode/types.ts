@@ -33,6 +33,7 @@ export type OpenCodePreparedProfile = {
   managedConfig: Record<string, unknown>
   managedConfigFingerprint: string
   homePath: string
+  tmpPath: string
   xdgConfigHome: string
   xdgDataHome: string
   xdgCacheHome: string

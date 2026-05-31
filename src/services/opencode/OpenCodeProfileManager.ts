@@ -779,6 +779,7 @@ export class OpenCodeProfileManager {
     })
     const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
     const homePath = path.join(profileRootPath, 'home')
+    const tmpPath = path.join(profileRootPath, 'tmp')
     const xdgConfigHome = path.join(profileRootPath, 'config')
     const xdgDataHome = path.join(profileRootPath, 'data')
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
@@ -799,6 +800,7 @@ export class OpenCodeProfileManager {
 
     await Promise.all([
       mkdir(homePath, { recursive: true }),
+      mkdir(tmpPath, { recursive: true }),
       mkdir(xdgConfigHome, { recursive: true }),
       mkdir(path.join(xdgDataHome, 'opencode'), { recursive: true }),
       mkdir(xdgCacheHome, { recursive: true }),
@@ -855,6 +857,9 @@ export class OpenCodeProfileManager {
       ...process.env,
       HOME: homePath,
       USERPROFILE: homePath,
+      TMPDIR: tmpPath,
+      TMP: tmpPath,
+      TEMP: tmpPath,
       XDG_CONFIG_HOME: xdgConfigHome,
       XDG_DATA_HOME: xdgDataHome,
       XDG_CACHE_HOME: xdgCacheHome,
@@ -879,6 +884,7 @@ export class OpenCodeProfileManager {
       managedConfig,
       managedConfigFingerprint,
       homePath,
+      tmpPath,
       xdgConfigHome,
       xdgDataHome,
       xdgCacheHome,

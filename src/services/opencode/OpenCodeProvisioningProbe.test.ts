@@ -27,6 +27,7 @@ const profile: OpenCodePreparedProfile = {
   },
   managedConfigFingerprint: 'managed-config-v1',
   homePath: '/tmp/profile-root/home',
+  tmpPath: '/tmp/profile-root/tmp',
   xdgConfigHome: '/tmp/profile-root/config',
   xdgDataHome: '/tmp/profile-root/data',
   xdgCacheHome: '/tmp/profile-root/cache',

@@ -478,6 +478,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       const profile = await manager.prepareProfile(path.join(tempDir, 'project'))
       const profileNodeModulesPath = path.join(profile.xdgConfigHome, 'opencode', 'node_modules')
       const sharedNodeModulesPath = path.join(profile.xdgCacheHome, 'config-node_modules')
+      const tmpStat = await lstat(profile.tmpPath)
       const nodeModulesStat = await lstat(profileNodeModulesPath)
       const nodeModulesTarget = await readlink(profileNodeModulesPath)
       const appMcpConfig = (
@@ -485,6 +486,11 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       )?.['agent-teams']
 
       expect(profile.profileRootPath.startsWith(path.join(appDataHome, 'opencode', 'profiles'))).toBe(true)
+      expect(profile.tmpPath).toBe(path.join(profile.profileRootPath, 'tmp'))
+      expect(profile.env.TMPDIR).toBe(profile.tmpPath)
+      expect(profile.env.TMP).toBe(profile.tmpPath)
+      expect(profile.env.TEMP).toBe(profile.tmpPath)
+      expect(tmpStat.isDirectory()).toBe(true)
       expect(profile.xdgCacheHome).toBe(path.join(appCacheHome, 'opencode', 'shared-cache'))
       expect(profile.env.NPM_CONFIG_CACHE).toBe(path.join(profile.xdgCacheHome, 'npm'))
       expect(profile.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
