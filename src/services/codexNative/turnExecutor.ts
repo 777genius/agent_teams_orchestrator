@@ -34,6 +34,7 @@ import {
   buildCodexManualAppServerThreadPolicy,
 } from './appServerApproval.js'
 import { runCodexNativeAppServer } from './appServerRunner.js'
+import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -601,6 +602,7 @@ export async function* executeCodexNativeTurn(
       apiKey,
       forcedLoginMethod,
       configOverrides: [
+        ...buildCodexNativeCustomProviderConfigOverrides(),
         ...buildCodexNativeMcpConfigOverrides({
           strictMcpConfig: getStrictMcpConfig(),
         }),

@@ -566,6 +566,139 @@ describe('executeCodexNativeTurn', () => {
     }
   })
 
+  test('passes validated custom provider settings to native exec config overrides', async () => {
+    const previousSettings = getFlagSettingsInline()
+    let observedConfigOverrides: string[] | undefined
+
+    try {
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'api',
+          agent_teams_custom_provider: {
+            config_overrides: [
+              'model_provider="agent_teams_custom"',
+              'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+              'model_providers.agent_teams_custom.base_url="https://gateway.example.com/v1"',
+              'model_providers.agent_teams_custom.wire_api="responses"',
+              'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+              'forced_login_method="chatgpt"',
+            ],
+          },
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedConfigOverrides = options.configOverrides
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedConfigOverrides).toEqual([
+        'model_provider="agent_teams_custom"',
+        'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+        'model_providers.agent_teams_custom.base_url="https://gateway.example.com/v1"',
+        'model_providers.agent_teams_custom.wire_api="responses"',
+        'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+      ])
+    } finally {
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
+  test('passes validated custom provider settings to native app-server config overrides', async () => {
+    const previousSettings = getFlagSettingsInline()
+    let observedConfigOverrides: string[] | undefined
+
+    try {
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'api',
+          agent_teams_custom_provider: {
+            config_overrides: [
+              'model_provider="agent_teams_custom"',
+              'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+              'model_providers.agent_teams_custom.base_url="http://127.0.0.1:8080/v1"',
+              'model_providers.agent_teams_custom.wire_api="responses"',
+              'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+            ],
+          },
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams({ permissionMode: 'default' }), {
+          runAppServer: async function* (options) {
+            observedConfigOverrides = options.configOverrides
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: 'thread-1',
+              credentialSource: 'explicit-api-key',
+              completionPolicy: 'persistent',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedConfigOverrides).toEqual([
+        'model_provider="agent_teams_custom"',
+        'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+        'model_providers.agent_teams_custom.base_url="http://127.0.0.1:8080/v1"',
+        'model_providers.agent_teams_custom.wire_api="responses"',
+        'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+      ])
+    } finally {
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
   test('passes explicit user config isolation to native exec', async () => {
     const previousIgnoreUserConfig =
       process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
