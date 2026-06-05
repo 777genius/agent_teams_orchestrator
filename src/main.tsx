@@ -171,7 +171,7 @@ import { setCwd } from 'src/utils/Shell.js';
 import { type ProcessedResume, processResumedConversation } from 'src/utils/sessionRestore.js';
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
-import { writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
+import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV, writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
@@ -1170,6 +1170,8 @@ async function run(): Promise<CommanderCommand> {
     const isHeadlessTeammateRuntime = (options as {
       teammateRuntime?: string;
     }).teammateRuntime === 'headless';
+    const teammateBootstrapRunId =
+      process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim() || undefined;
     const init = options.init ?? false;
     const initOnly = options.initOnly ?? false;
     const maintenance = options.maintenance ?? false;
@@ -1260,7 +1262,9 @@ async function run(): Promise<CommanderCommand> {
             agentName: teammateOpts.agentName,
             agentId: teammateOpts.agentId,
             runId: sessionId,
+            bootstrapRunId: teammateBootstrapRunId,
             cwd: getCwd(),
+            source: 'main.startup',
             detail: [
               `teammateRuntime=${isHeadlessTeammateRuntime ? 'headless' : 'default'}`,
               `env=${process.env[TEAMMATE_RUNTIME_ENV] ?? 'unset'}`,
@@ -1279,6 +1283,23 @@ async function run(): Promise<CommanderCommand> {
         getTeammateModeSnapshot().setCliTeammateModeOverride?.(teammateOpts.teammateMode);
       }
     }
+    const writeHeadlessTeammateStartupCheckpoint = (detail: string): void => {
+      if (!isHeadlessTeammateRuntime || !storedTeammateOpts?.agentId || !storedTeammateOpts.agentName || !storedTeammateOpts.teamName) {
+        return;
+      }
+      void writeTeammateRuntimeEvent({
+        type: 'startup_checkpoint',
+        teamName: storedTeammateOpts.teamName,
+        agentName: storedTeammateOpts.agentName,
+        agentId: storedTeammateOpts.agentId,
+        runId: getSessionId(),
+        bootstrapRunId: teammateBootstrapRunId,
+        cwd: getCwd(),
+        source: 'main.startup',
+        detail,
+        writeAttemptTimeoutMs: 500
+      });
+    };
 
     // Extract remote sdk options
     const sdkUrl = (options as {
@@ -2001,6 +2022,7 @@ async function run(): Promise<CommanderCommand> {
     commandsPromise?.catch(() => {});
     agentDefsPromise?.catch(() => {});
     await setupPromise;
+    writeHeadlessTeammateStartupCheckpoint('setup_completed');
     logForDebugging(`[STARTUP] setup() completed in ${Date.now() - setupStart}ms`);
     profileCheckpoint('action_after_setup');
 
@@ -2096,6 +2118,7 @@ async function run(): Promise<CommanderCommand> {
     // Join the promises kicked before setup() (or start fresh if
     // worktreeEnabled gated the early kick). Both memoized by cwd.
     const [commands, agentDefinitionsResult] = await Promise.all([commandsPromise ?? getCommands(currentCwd), agentDefsPromise ?? getAgentDefinitionsWithOverrides(currentCwd)]);
+    writeHeadlessTeammateStartupCheckpoint('commands_agents_loaded');
     logForDebugging(`[STARTUP] Commands and agents loaded in ${Date.now() - commandsStart}ms`);
     profileCheckpoint('action_commands_loaded');
 
@@ -2296,6 +2319,7 @@ async function run(): Promise<CommanderCommand> {
         createRoot
       } = await import('./ink.js');
       root = await createRoot(isHeadlessTeammateRuntime ? getHeadlessTeammateRenderOptions(ctx.renderOptions) : ctx.renderOptions);
+      writeHeadlessTeammateStartupCheckpoint('ink_root_created');
 
       // Log startup time now, before any blocking dialog renders. Logging
       // from REPL's first render (the old location) included however long
@@ -2455,6 +2479,7 @@ async function run(): Promise<CommanderCommand> {
     const {
       servers: existingMcpConfigs
     } = await mcpConfigPromise;
+    writeHeadlessTeammateStartupCheckpoint('mcp_configs_loaded');
     logForDebugging(`[STARTUP] MCP configs resolved in ${mcpConfigResolvedMs}ms (awaited at +${Date.now() - mcpConfigStart}ms)`);
     // CLI flag (--mcp-config) should override file-based configs, matching settings precedence
     const allMcpConfigs = {
@@ -3098,6 +3123,7 @@ async function run(): Promise<CommanderCommand> {
       // teammates reading their own identity, not the assistant-mode leader.
       teamContext: feature('KAIROS') ? assistantTeamContext ?? computeInitialTeamContext?.() : computeInitialTeamContext?.()
     };
+    writeHeadlessTeammateStartupCheckpoint('initial_state_created');
 
     // Add CLI initial prompt to history
     if (inputPrompt) {

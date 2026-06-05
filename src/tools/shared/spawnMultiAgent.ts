@@ -106,6 +106,7 @@ import {
   getTeammateRuntimePaths,
   readTeammateRuntimeEvents,
   TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV,
+  TEAMMATE_BOOTSTRAP_RUN_ID_ENV,
   TEAMMATE_RUNTIME_EVENTS_ENV,
   waitForBootstrapSubmissionOutcome,
   waitForTeammateRuntimeEvent,
@@ -1414,6 +1415,14 @@ function getProcessInboxPollerReadyTimeoutMs(): number {
   })
 }
 
+async function shouldResetNativeProcessRuntimeEvents(params: {
+  eventsPath: string
+  bootstrapRunId: string
+}): Promise<boolean> {
+  const events = await readTeammateRuntimeEvents(params.eventsPath)
+  return !events.some(event => event.bootstrapRunId === params.bootstrapRunId)
+}
+
 export function __getProcessReadinessTimeoutsForTests(): {
   runtimeReadyMs: number
   inboxPollerReadyMs: number
@@ -1843,6 +1852,7 @@ async function handleSpawnSplitPane(
         ...nativeAppManagedBootstrapEnv,
         [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
         [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
+        [TEAMMATE_BOOTSTRAP_RUN_ID_ENV]: bootstrapRunId,
         ...(startupReadySentinel
           ? {
               [TEAMMATE_STARTUP_READY_SENTINEL_ENV]:
@@ -2164,6 +2174,7 @@ async function handleSpawnSeparateWindow(
         ...nativeAppManagedBootstrapEnv,
         [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
         [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
+        [TEAMMATE_BOOTSTRAP_RUN_ID_ENV]: bootstrapRunId,
         [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
       },
     })
@@ -2463,6 +2474,7 @@ async function handleSpawnNativeProcess(
     teamName,
     agentName: sanitizedName,
   })
+  const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
 
   try {
     const workingDirStat = await stat(workingDir)
@@ -2480,10 +2492,17 @@ async function handleSpawnNativeProcess(
     )
   }
   await ensureTeammateRuntimePaths(runtimePaths)
-  await writeFile(runtimePaths.eventsPath, '', {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
+  if (
+    await shouldResetNativeProcessRuntimeEvents({
+      eventsPath: runtimePaths.eventsPath,
+      bootstrapRunId,
+    })
+  ) {
+    await writeFile(runtimePaths.eventsPath, '', {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+  }
 
   const teammateArgs = [
     '--teammate-runtime',
@@ -2544,7 +2563,6 @@ async function handleSpawnNativeProcess(
   const argv = [...commandArgs, ...teammateArgs, ...parseArguments(inheritedFlags)]
   const launchBoundaryIso = new Date().toISOString()
   const bootstrapProofToken = randomUUID()
-  const bootstrapRunId = input.bootstrapRunId ?? getSessionId()
   const bootstrapDeadlineMs =
     typeof input.bootstrapTimeoutMs === 'number' &&
     Number.isFinite(input.bootstrapTimeoutMs)
@@ -2603,6 +2621,7 @@ async function handleSpawnNativeProcess(
               startupReadySentinel.filePath,
             [TEAMMATE_RUNTIME_EVENTS_ENV]: runtimePaths.eventsPath,
             [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
+            [TEAMMATE_BOOTSTRAP_RUN_ID_ENV]: bootstrapRunId,
           },
         }),
       },
@@ -2717,6 +2736,7 @@ async function handleSpawnNativeProcess(
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
+      bootstrapRunId,
       sinceMs: Date.parse(launchBoundaryIso),
       isStillAlive: () => isProcessAlive(runtimePid),
     })
@@ -2831,6 +2851,7 @@ async function handleSpawnNativeProcess(
       teamName,
       agentName: sanitizedName,
       agentId: teammateId,
+      bootstrapRunId,
       sinceMs: Date.parse(launchBoundaryIso),
       isStillAlive: () => isProcessAlive(runtimePid),
     })

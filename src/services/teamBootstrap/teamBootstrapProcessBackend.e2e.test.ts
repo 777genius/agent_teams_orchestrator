@@ -123,6 +123,7 @@ const agentId = getArg('--agent-id')
 const teammateRuntime = getArg('--teammate-runtime')
 const teammateRuntimeEnv = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME
 const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
+const bootstrapRunId = process.env.CLAUDE_CODE_BOOTSTRAP_RUN_ID
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
 const markerPath = process.env.FAKE_TEAMMATE_SPAWN_MARKER
@@ -147,6 +148,7 @@ async function writeEvent(type, detail, extra = {}) {
       teamName,
       agentName,
       agentId,
+      ...(bootstrapRunId ? { bootstrapRunId } : {}),
       cwd: process.cwd(),
       detail,
       ...extra,
@@ -600,6 +602,9 @@ describe('supervised process teammate backend e2e', () => {
     expect(
       events.find(event => event.type === 'runtime_ready')?.pid,
     ).toBe(alice?.runtimePid)
+    expect(
+      events.find(event => event.type === 'runtime_ready')?.bootstrapRunId,
+    ).toBeTruthy()
     const mailboxWritten = events.find(
       event => event.type === 'mailbox_bootstrap_written',
     )
@@ -670,6 +675,72 @@ describe('supervised process teammate backend e2e', () => {
     expect(
       events.some(event => String(event.detail ?? '').includes('stale')),
     ).toBe(false)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('keeps same-run runtime events across process teammate startup retries', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'exit-before-ready',
+    })
+    const bootstrapRunId = `retry-run-${Date.now()}`
+
+    let firstFailure: Error | null = null
+    try {
+      await __handleSpawnNativeProcessForTests(
+        {
+          name: 'alice',
+          prompt: BOOTSTRAP_PROMPT,
+          team_name: fixture.teamName,
+          cwd: fixture.projectRealpath,
+          bootstrapRunId,
+        },
+        fixture.context,
+      )
+    } catch (error) {
+      firstFailure = error as Error
+    }
+    expect(firstFailure?.message).toContain('exited immediately')
+
+    process.env.FAKE_TEAMMATE_MODE = 'success'
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        bootstrapRunId,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const processSpawnedEvents = events.filter(
+      event => event.type === 'process_spawned',
+    )
+    const runtimeReady = events.find(event => event.type === 'runtime_ready')
+    expect(processSpawnedEvents).toHaveLength(2)
+    expect(
+      new Set(processSpawnedEvents.map(event => event.pid)).size,
+    ).toBe(2)
+    expect(runtimeReady?.bootstrapRunId).toBe(bootstrapRunId)
+    const eventTypes = events.map(event => event.type)
+    expect(eventTypes.indexOf('failed')).toBeLessThan(
+      eventTypes.lastIndexOf('process_spawned'),
+    )
 
     await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)

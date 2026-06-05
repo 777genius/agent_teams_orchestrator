@@ -520,6 +520,7 @@ function isBootstrapTransportStageEvent(event: TeammateRuntimeEvent): boolean {
     event.type === 'process_spawned' ||
     event.type === 'stdout_attached' ||
     event.type === 'cli_started' ||
+    event.type === 'startup_checkpoint' ||
     event.type === 'runtime_ready' ||
     event.type === 'inbox_poller_ready' ||
     event.type === 'mailbox_bootstrap_written' ||

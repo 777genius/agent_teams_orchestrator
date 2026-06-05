@@ -3,7 +3,7 @@ import { appendFileSync } from 'fs';
 import React from 'react';
 import { logEvent } from 'src/services/analytics/index.js';
 import { gracefulShutdown, gracefulShutdownSync } from 'src/utils/gracefulShutdown.js';
-import { type ChannelEntry, getAllowedChannels, setAllowedChannels, setHasDevChannels, setSessionTrustAccepted, setStatsStore } from './bootstrap/state.js';
+import { type ChannelEntry, getAllowedChannels, getSessionId, setAllowedChannels, setHasDevChannels, setSessionTrustAccepted, setStatsStore } from './bootstrap/state.js';
 import type { Command } from './commands.js';
 import { createStatsStore, type StatsStore } from './context/stats.js';
 import { getSystemContext } from './context.js';
@@ -29,6 +29,10 @@ import type { PermissionMode } from './utils/permissions/PermissionMode.js';
 import { getBaseRenderOptions } from './utils/renderOptions.js';
 import { getSettingsWithAllErrors } from './utils/settings/allErrors.js';
 import { hasAutoModeOptIn, hasSkipDangerousModePermissionPrompt } from './utils/settings/settings.js';
+import { getCwd } from './utils/cwd.js';
+import { getAgentId, getAgentName, getTeamName, isTeammate } from './utils/teammate.js';
+import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV, writeChildOwnedTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
 export function completeOnboarding(): void {
   saveGlobalConfig(current => ({
     ...current,
@@ -91,12 +95,36 @@ export function showSetupDialog<T = void>(root: Root, renderer: (done: (result: 
     </AppStateProvider>);
 }
 
+function writeHeadlessTeammateRenderReady(): void {
+  if (process.env[TEAMMATE_RUNTIME_ENV] !== 'headless' || !isTeammate()) {
+    return;
+  }
+  const teamName = getTeamName();
+  const agentName = getAgentName();
+  if (!teamName || !agentName) {
+    return;
+  }
+  void writeChildOwnedTeammateRuntimeEvent({
+    type: 'runtime_ready',
+    teamName,
+    agentName,
+    agentId: getAgentId(),
+    runId: getSessionId(),
+    bootstrapRunId:
+      process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim() || undefined,
+    cwd: getCwd(),
+    source: 'interactiveHelpers.renderAndRun',
+    detail: 'repl rendered'
+  });
+}
+
 /**
  * Render the main UI into the root and wait for it to exit.
  * Handles the common epilogue: start deferred prefetches, wait for exit, graceful shutdown.
  */
 export async function renderAndRun(root: Root, element: React.ReactNode): Promise<void> {
   root.render(element);
+  writeHeadlessTeammateRenderReady();
   startDeferredPrefetches();
   await root.waitUntilExit();
   await gracefulShutdown(0);

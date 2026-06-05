@@ -10,11 +10,14 @@ export const TEAMMATE_RUNTIME_EVENTS_ENV =
   'CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH'
 export const TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV =
   'CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN'
+export const TEAMMATE_BOOTSTRAP_RUN_ID_ENV =
+  'CLAUDE_CODE_BOOTSTRAP_RUN_ID'
 
 export type TeammateRuntimeEventType =
   | 'process_spawned'
   | 'stdout_attached'
   | 'cli_started'
+  | 'startup_checkpoint'
   | 'runtime_ready'
   | 'inbox_poller_ready'
   | 'mailbox_bootstrap_written'
@@ -430,6 +433,7 @@ const BOOTSTRAP_TRANSPORT_STAGE_RANK: Partial<
   process_spawned: 10,
   stdout_attached: 20,
   cli_started: 30,
+  startup_checkpoint: 35,
   runtime_ready: 40,
   inbox_poller_ready: 50,
   mailbox_bootstrap_written: 60,
@@ -549,12 +553,20 @@ function selectLastRelevantBootstrapTransportEvent(
 ): TeammateRuntimeEvent | undefined {
   let selected: TeammateRuntimeEvent | undefined
   let selectedRank = -1
+  let selectedTimestampMs = -1
   for (const event of events) {
     const rank = BOOTSTRAP_TRANSPORT_STAGE_RANK[event.type] ?? -1
     if (rank < 0) continue
-    if (!selected || rank >= selectedRank) {
+    const timestampMs = Date.parse(event.timestamp)
+    const comparableTimestampMs = Number.isFinite(timestampMs) ? timestampMs : -1
+    if (
+      !selected ||
+      rank > selectedRank ||
+      (rank === selectedRank && comparableTimestampMs >= selectedTimestampMs)
+    ) {
       selected = event
       selectedRank = rank
+      selectedTimestampMs = comparableTimestampMs
     }
   }
   return selected
@@ -682,6 +694,7 @@ export async function waitForTeammateRuntimeEvent(params: {
   teamName?: string
   agentName?: string
   agentId?: string
+  bootstrapRunId?: string
   sinceMs?: number
   pollIntervalMs?: number
   isStillAlive?: () => boolean
@@ -701,13 +714,17 @@ export async function waitForTeammateRuntimeEvent(params: {
 
     try {
       const events = await readRecentTeammateRuntimeEvents(params.eventsPath)
+      const matchesBootstrapRun = (event: TeammateRuntimeEvent): boolean =>
+        !params.bootstrapRunId ||
+        !event.bootstrapRunId ||
+        event.bootstrapRunId === params.bootstrapRunId
       const matchesExpectedRuntime = (event: TeammateRuntimeEvent): boolean => {
         if (
           typeof params.pid === 'number' &&
           event.pid === params.pid &&
           isRuntimeEventFreshEnough(event, params.sinceMs)
         ) {
-          return true
+          return matchesBootstrapRun(event)
         }
         if (
           typeof params.pid !== 'number' &&
@@ -715,17 +732,20 @@ export async function waitForTeammateRuntimeEvent(params: {
           !params.agentName &&
           !params.agentId
         ) {
-          return true
+          return matchesBootstrapRun(event)
         }
         if (!params.teamName || (!params.agentName && !params.agentId)) {
           return false
         }
-        return matchesStrictRuntimeIdentity(event, {
-          teamName: params.teamName,
-          agentName: params.agentName,
-          agentId: params.agentId,
-          sinceMs: params.sinceMs,
-        })
+        return (
+          matchesBootstrapRun(event) &&
+          matchesStrictRuntimeIdentity(event, {
+            teamName: params.teamName,
+            agentName: params.agentName,
+            agentId: params.agentId,
+            sinceMs: params.sinceMs,
+          })
+        )
       }
       const matchedEvents = events.filter(matchesExpectedRuntime)
       const match = events.find(

@@ -160,6 +160,108 @@ describe('teammateRuntimeEvents helpers', () => {
     }
   })
 
+  it('ignores same-pid readiness from a different bootstrap run when present', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'runtime_ready',
+      eventsPath,
+      pid: 1111,
+      bootstrapRunId: 'old-run',
+    })
+
+    const result = await waitForTeammateRuntimeEvent({
+      eventsPath,
+      type: 'runtime_ready',
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1111,
+      bootstrapRunId: 'new-run',
+      isStillAlive: () => true,
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toContain('timed out waiting for runtime_ready')
+    }
+  })
+
+  it('reports startup checkpoints as the last runtime stage before runtime_ready', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'cli_started',
+      eventsPath,
+      pid: 1111,
+      detail: 'teammateRuntime=headless',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'startup_checkpoint',
+      eventsPath,
+      pid: 1111,
+      detail: 'commands_agents_loaded',
+    })
+
+    const result = await waitForTeammateRuntimeEvent({
+      eventsPath,
+      type: 'runtime_ready',
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1111,
+      isStillAlive: () => true,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        'timed out waiting for runtime_ready; last runtime stage: startup_checkpoint: commands_agents_loaded',
+    })
+  })
+
+  it('uses the newest same-rank startup checkpoint when event writes arrive out of order', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await fs.writeFile(
+      eventsPath,
+      [
+        {
+          version: 1,
+          type: 'cli_started',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          pid: 1111,
+        },
+        {
+          version: 1,
+          type: 'startup_checkpoint',
+          timestamp: '2026-01-01T00:00:02.000Z',
+          pid: 1111,
+          detail: 'initial_state_created',
+        },
+        {
+          version: 1,
+          type: 'startup_checkpoint',
+          timestamp: '2026-01-01T00:00:01.000Z',
+          pid: 1111,
+          detail: 'ink_root_created',
+        },
+      ]
+        .map(event => JSON.stringify(event))
+        .join('\n') + '\n',
+    )
+
+    const result = await waitForTeammateRuntimeEvent({
+      eventsPath,
+      type: 'runtime_ready',
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1111,
+      isStillAlive: () => true,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        'timed out waiting for runtime_ready; last runtime stage: startup_checkpoint: initial_state_created',
+    })
+  })
+
   it('accepts a fresh identity-matched event when a Windows wrapper pid differs', async () => {
     const eventsPath = await createRuntimeLogPath()
     const sinceMs = Date.now()

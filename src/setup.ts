@@ -65,6 +65,8 @@ export async function setup(
   messagingSocketPath?: string,
 ): Promise<void> {
   logForDiagnosticsNoPII('info', 'setup_started')
+  const isHeadlessTeammateRuntime =
+    process.env.CLAUDE_CODE_TEAMMATE_RUNTIME === 'headless'
 
   // Check for Node.js version < 18
   const nodeVersion = process.version.match(/^v(\d+)\./)?.[1]
@@ -112,7 +114,7 @@ export async function setup(
   // Terminal backup restoration — interactive only. Print mode doesn't
   // interact with terminal settings; the next interactive session will
   // detect and restore any interrupted setup.
-  if (!getIsNonInteractiveSession()) {
+  if (!getIsNonInteractiveSession() && !isHeadlessTeammateRuntime) {
     // iTerm2 backup check only when swarms enabled
     if (isAgentSwarmsEnabled()) {
       const restoredIterm2Backup = await checkAndRestoreITerm2Backup()
@@ -383,7 +385,7 @@ export async function setup(
   // Pre-fetch data for Logo v2 - await to ensure it's ready before logo renders.
   // --bare / SIMPLE: skip — release notes are interactive-UI display data,
   // and getRecentActivity() reads up to 10 session JSONL files.
-  if (!isBareMode()) {
+  if (!isBareMode() && !isHeadlessTeammateRuntime) {
     const { hasReleaseNotes } = await checkForReleaseNotes(
       getGlobalConfig().lastReleaseNotesSeen,
     )

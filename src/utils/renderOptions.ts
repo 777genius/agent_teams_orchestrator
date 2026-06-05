@@ -8,6 +8,13 @@ import { logError } from './log.js'
 // Cached stdin override - computed once per process
 let cachedStdinOverride: ReadStream | undefined | null = null
 let cachedHeadlessStdout: NodeJS.WriteStream | undefined
+const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
+
+export function shouldSkipStdinOverrideForHeadlessTeammate(
+  teammateRuntimeEnv: string | undefined = process.env[TEAMMATE_RUNTIME_ENV],
+): boolean {
+  return teammateRuntimeEnv === 'headless'
+}
 
 /**
  * Gets a ReadStream for /dev/tty when stdin is piped.
@@ -18,6 +25,13 @@ function getStdinOverride(): ReadStream | undefined {
   // Return cached result if already computed
   if (cachedStdinOverride !== null) {
     return cachedStdinOverride
+  }
+
+  // Headless process teammates have their own stdin handling and must not try
+  // to recover an interactive terminal before startup readiness is emitted.
+  if (shouldSkipStdinOverrideForHeadlessTeammate()) {
+    cachedStdinOverride = undefined
+    return undefined
   }
 
   // No override needed if stdin is already a TTY

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { getHeadlessTeammateRenderOptions } from './renderOptions.js'
+import {
+  getHeadlessTeammateRenderOptions,
+  shouldSkipStdinOverrideForHeadlessTeammate,
+} from './renderOptions.js'
 
 describe('headless teammate render options', () => {
   test('routes Ink output to a non-TTY discard stream', () => {
@@ -19,5 +22,11 @@ describe('headless teammate render options', () => {
     expect(options.patchConsole).toBe(false)
     expect(options.stderr).toBe(process.stderr)
     expect(options.onFrame).toBe(onFrame)
+  })
+
+  test('skips stdin override for headless teammate runtime', () => {
+    expect(shouldSkipStdinOverrideForHeadlessTeammate('headless')).toBe(true)
+    expect(shouldSkipStdinOverrideForHeadlessTeammate('terminal')).toBe(false)
+    expect(shouldSkipStdinOverrideForHeadlessTeammate(undefined)).toBe(false)
   })
 })

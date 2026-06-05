@@ -45,7 +45,10 @@ import {
 } from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
-import { writeChildOwnedTeammateRuntimeEvent } from '../utils/swarm/teammateRuntimeEvents.js'
+import {
+  TEAMMATE_BOOTSTRAP_RUN_ID_ENV,
+  writeChildOwnedTeammateRuntimeEvent,
+} from '../utils/swarm/teammateRuntimeEvents.js'
 import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBridge.js'
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
 import {
@@ -3507,6 +3510,8 @@ export function useInboxPoller({
         const teamName = getTeamName(currentAppState.teamContext)
         const agentId = getAgentId() ?? currentAppState.teamContext?.selfAgentId
         const runId = getSessionId()
+        const bootstrapRunId =
+          process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim() || undefined
         void (async () => {
           await writeChildOwnedTeammateRuntimeEvent({
             type: 'runtime_ready',
@@ -3514,7 +3519,9 @@ export function useInboxPoller({
             agentName,
             agentId,
             runId,
+            bootstrapRunId,
             cwd: getCwd(),
+            source: 'useInboxPoller',
             detail: 'inbox poller mounted',
           })
           await writeChildOwnedTeammateRuntimeEvent({
@@ -3523,6 +3530,8 @@ export function useInboxPoller({
             agentName,
             agentId,
             runId,
+            bootstrapRunId,
+            source: 'useInboxPoller',
           })
         })()
       }
