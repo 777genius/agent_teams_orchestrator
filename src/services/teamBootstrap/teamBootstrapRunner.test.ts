@@ -17,11 +17,31 @@ import {
   getTeammateRuntimePaths,
   writeTeammateRuntimeEvent,
 } from 'src/utils/swarm/teammateRuntimeEvents.js'
+import { writeToMailbox } from 'src/utils/teammateMailbox.js'
 
 let tempDirs: string[] = []
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR
 const originalSubmittedConfirmationTimeoutMs =
   process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS
+
+async function sleepMs(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function waitUntil(
+  predicate: () => boolean,
+  label: string,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return
+    }
+    await sleepMs(10)
+  }
+  throw new Error(`Timed out waiting for ${label}`)
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -769,6 +789,374 @@ describe('team bootstrap readiness contract', () => {
     const bobState = rawState.members.find(member => member.name === 'bob')
     expect(bobState?.status).toBe('failed')
     expect(bobState?.failureReason).toContain('submitted-confirmation timeout')
+  })
+
+  test('waits for Codex process bootstrap confirmation before spawning the next Codex member', async () => {
+    const tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'bootstrap-codex-backpressure-'),
+    )
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS = '2000'
+
+    const teamName = `team-${Date.now()}`
+    const runId = 'run-codex-backpressure'
+    const runtimePids = new Map([
+      ['alice', 1234],
+      ['bob', 5678],
+    ])
+    const spawnOrder: string[] = []
+    const spawnedMembers = new Map<
+      string,
+      {
+        agentId: string
+        runtimePid: number
+        bootstrapExpectedAfter: string
+      }
+    >()
+    const writeMailboxBootstrapConfirmation = async (name: string): Promise<void> => {
+      const agentId = `${name}@${teamName}`
+      const timestamp = new Date().toISOString()
+      await writeToMailbox(
+        'team-lead',
+        {
+          from: agentId,
+          text: JSON.stringify({
+            type: 'idle_notification',
+            from: agentId,
+            timestamp,
+            idleReason: 'available',
+          }),
+          timestamp,
+        },
+        teamName,
+      )
+    }
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            ...spawnedMembers.entries(),
+          ].map(([name, member]) => ({
+            name,
+            agentId: member.agentId,
+            backendType: 'process',
+            runtimePid: member.runtimePid,
+            bootstrapExpectedAfter: member.bootstrapExpectedAfter,
+            bootstrapRunId: runId,
+          })),
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async input => {
+        const name = String(input.name)
+        const runtimePid = runtimePids.get(name)
+        if (!runtimePid) {
+          throw new Error(`unexpected member ${name}`)
+        }
+        const agentId = `${name}@${teamName}`
+        spawnOrder.push(name)
+        spawnedMembers.set(name, {
+          agentId,
+          runtimePid,
+          bootstrapExpectedAfter: new Date().toISOString(),
+        })
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name,
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: `process:${runtimePid}`,
+            backend_type: 'process',
+            runtime_pid: runtimePid,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    await writeToMailbox(
+      'team-lead',
+      {
+        from: `alice@${teamName}`,
+        text: JSON.stringify({
+          type: 'idle_notification',
+          from: `alice@${teamName}`,
+          timestamp: '2026-01-01T00:00:00.000Z',
+          idleReason: 'available',
+        }),
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+      teamName,
+    )
+
+    const resultPromise = runTeamBootstrap({
+      request: {
+        version: 1,
+        runId,
+        requestHash: 'hash-codex-backpressure',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+            provider: 'codex',
+          },
+          {
+            originalName: 'bob',
+            displayName: 'bob',
+            normalizedName: 'bob',
+            prompt: 'hello',
+            provider: 'codex',
+          },
+        ],
+        bootstrapTimeoutMs: 5_000,
+        continueOnPartialFailure: true,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    await waitUntil(() => spawnOrder.length >= 1, 'first Codex spawn')
+    await sleepMs(120)
+    expect(spawnOrder).toEqual(['alice'])
+
+    await writeMailboxBootstrapConfirmation('alice')
+
+    await waitUntil(() => spawnOrder.length >= 2, 'second Codex spawn')
+    expect(spawnOrder).toEqual(['alice', 'bob'])
+
+    await writeMailboxBootstrapConfirmation('bob')
+
+    const result = await resultPromise
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      throw new Error('expected successful Codex bootstrap')
+    }
+    expect(result.summary.terminalStatus).toBe('completed')
+    expect(result.summary.registeredMembers).toEqual(['alice', 'bob'])
+    expect(result.summary.failedMembers).toEqual([])
+  })
+
+  test('continues Codex bootstrap after a backpressured member hits submitted-confirmation timeout', async () => {
+    const tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'bootstrap-codex-timeout-continues-'),
+    )
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    process.env.CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS = '80'
+
+    const teamName = `team-${Date.now()}`
+    const runId = 'run-codex-backpressure-timeout'
+    const aliceAgentId = `alice@${teamName}`
+    const bobAgentId = `bob@${teamName}`
+    const aliceRuntimePid = 1234
+    const bobRuntimePid = 5678
+    const spawnOrder: string[] = []
+    const spawnedMembers = new Map<
+      string,
+      {
+        agentId: string
+        runtimePid: number
+        bootstrapExpectedAfter: string
+      }
+    >()
+
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath: getTeammateRuntimePaths({
+        teamName,
+        agentName: 'alice',
+      }).eventsPath,
+      pid: aliceRuntimePid,
+      teamName,
+      agentName: 'alice',
+      agentId: aliceAgentId,
+      bootstrapRunId: runId,
+      bootstrapMessageId: 'bootstrap-alice-1',
+      detail: 'messageId=bootstrap-alice-1',
+      source: 'test',
+    })
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            ...spawnedMembers.entries(),
+          ].map(([name, member]) => ({
+            name,
+            agentId: member.agentId,
+            backendType: 'process',
+            runtimePid: member.runtimePid,
+            bootstrapExpectedAfter: member.bootstrapExpectedAfter,
+            bootstrapRunId: runId,
+          })),
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async input => {
+        const name = String(input.name)
+        const runtimePid = name === 'alice' ? aliceRuntimePid : bobRuntimePid
+        const agentId = name === 'alice' ? aliceAgentId : bobAgentId
+        spawnOrder.push(name)
+        spawnedMembers.set(name, {
+          agentId,
+          runtimePid,
+          bootstrapExpectedAfter: '2026-01-01T00:00:00.000Z',
+        })
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name,
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: `process:${runtimePid}`,
+            backend_type: 'process',
+            runtime_pid: runtimePid,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    const resultPromise = runTeamBootstrap({
+      request: {
+        version: 1,
+        runId,
+        requestHash: 'hash-codex-backpressure-timeout',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+            provider: 'codex',
+          },
+          {
+            originalName: 'bob',
+            displayName: 'bob',
+            normalizedName: 'bob',
+            prompt: 'hello',
+            provider: 'codex',
+          },
+        ],
+        bootstrapTimeoutMs: 5_000,
+        continueOnPartialFailure: true,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    await waitUntil(() => spawnOrder.length >= 2, 'second Codex spawn after timeout')
+
+    const timestamp = new Date().toISOString()
+    await writeToMailbox(
+      'team-lead',
+      {
+        from: bobAgentId,
+        text: JSON.stringify({
+          type: 'idle_notification',
+          from: bobAgentId,
+          timestamp,
+          idleReason: 'available',
+        }),
+        timestamp,
+      },
+      teamName,
+    )
+
+    const result = await resultPromise
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      throw new Error('expected partial Codex bootstrap success')
+    }
+    expect(spawnOrder).toEqual(['alice', 'bob'])
+    expect(result.summary.terminalStatus).toBe('partial_success')
+    expect(result.summary.registeredMembers).toEqual(['bob'])
+    expect(result.summary.failedMembers).toHaveLength(1)
+    expect(result.summary.failedMembers[0]).toMatchObject({ name: 'alice' })
+    expect(result.summary.failedMembers[0]?.reason).toContain(
+      'submitted-confirmation timeout (80ms)',
+    )
   })
 
   test('process teammate runtime failure fails bootstrap without waiting for timeout', async () => {

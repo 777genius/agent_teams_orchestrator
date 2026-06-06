@@ -354,6 +354,27 @@ function assertPrimaryBootstrapProviderSupported(member: TeamBootstrapRequest['m
   )
 }
 
+function shouldWaitForCodexBootstrapConfirmationBeforeNextSpawn(params: {
+  member: TeamBootstrapRequest['members'][number]
+  backendType?: string
+}): boolean {
+  return params.member.provider === 'codex' && params.backendType === 'process'
+}
+
+async function readRegisteredBootstrapExpectedAfter(params: {
+  deps: Pick<TeamBootstrapRunnerDeps, 'readTeamFileAsync'>
+  teamName: string
+  memberName: string
+  agentId?: string
+}): Promise<string | null> {
+  const teamFile = await params.deps.readTeamFileAsync(params.teamName)
+  const normalizedMemberName = params.memberName.trim()
+  const registered =
+    teamFile?.members.find(member => member.agentId === params.agentId) ??
+    teamFile?.members.find(member => member.name?.trim() === normalizedMemberName)
+  return registered?.bootstrapExpectedAfter ?? null
+}
+
 function resolveBootstrapSubmittedConfirmationTimeoutMs(
   env: NodeJS.ProcessEnv = process.env,
 ): number {
@@ -650,6 +671,9 @@ async function waitForRequiredBootstrapConfirmations(params: {
   const confirmedMembers = new Set<string>()
 
   for (const member of params.request.members) {
+    if (params.failedMembers.some(failed => failed.name === member.displayName)) {
+      continue
+    }
     const registered = params.membersByName.get(member.displayName)
     const agentId = registered?.agentId
     if (!agentId) {
@@ -1051,16 +1075,17 @@ export async function runTeamBootstrap(params: {
               result.data.runtime_pid > 0
                 ? result.data.runtime_pid
                 : undefined
+            const backendType =
+              'backend_type' in result.data &&
+              typeof result.data.backend_type === 'string'
+                ? result.data.backend_type
+                : undefined
             await stateStore.markMemberResult(
               member.displayName,
               {
                 status: 'registered',
                 agentId: result.data.agent_id,
-                backendType:
-                  'backend_type' in result.data &&
-                  typeof result.data.backend_type === 'string'
-                    ? result.data.backend_type
-                    : undefined,
+                backendType,
                 runtimePid,
               },
               now,
@@ -1073,13 +1098,45 @@ export async function runTeamBootstrap(params: {
                   outcome: 'spawned',
                   agentId: result.data.agent_id,
                   teammateId: result.data.teammate_id,
-                  backendType:
-                    'backend_type' in result.data &&
-                    typeof result.data.backend_type === 'string'
-                      ? result.data.backend_type
-                      : undefined,
+                  backendType,
                 }),
             )
+            if (
+              shouldWaitForCodexBootstrapConfirmationBeforeNextSpawn({
+                member,
+                backendType,
+              })
+            ) {
+              const bootstrapExpectedAfter = await readRegisteredBootstrapExpectedAfter({
+                deps,
+                teamName: params.request.teamName,
+                memberName: member.displayName,
+                agentId: result.data.agent_id,
+              })
+              await waitForRequiredBootstrapConfirmations({
+                request: {
+                  ...params.request,
+                  members: [member],
+                },
+                stateStore,
+                failedMembers,
+                membersByName: new Map([
+                  [
+                    member.displayName,
+                    {
+                      agentId: result.data.agent_id,
+                      bootstrapExpectedAfter,
+                      backendType,
+                      runtimePid,
+                      bootstrapRunId: params.request.runId,
+                    },
+                  ],
+                ]),
+                timeoutStartedAt,
+                monotonicNow,
+                now,
+              })
+            }
           } catch (error) {
             const reason = errorMessage(error)
             failedMembers.push({ name: member.displayName, reason })
