@@ -768,6 +768,74 @@ describe('supervised process teammate backend e2e', () => {
     expect(await pathExists(fixture.markerPath)).toBe(false)
   })
 
+  it('does not require Claude workspace trust for Codex process teammates', async () => {
+    const fixture = await createFixture({ trusted: false })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        provider: 'codex',
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(result.data.provider).toBe('codex')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await waitForEvents(runtimePaths.eventsPath, [
+      'process_spawned',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    expect(await pathExists(fixture.markerPath)).toBe(true)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('does not require Claude workspace trust for OpenCode process teammates', async () => {
+    const fixture = await createFixture({ trusted: false })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        provider: 'opencode',
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(result.data.provider).toBe('opencode')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await waitForEvents(runtimePaths.eventsPath, [
+      'process_spawned',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    expect(await pathExists(fixture.markerPath)).toBe(true)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
   it('fails before trust checks when cwd is not a directory', async () => {
     const fixture = await createFixture({ trusted: true })
     const fileCwd = join(fixture.projectRealpath, 'not-a-directory.txt')

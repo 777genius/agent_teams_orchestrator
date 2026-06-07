@@ -217,6 +217,25 @@ function crossesProviderBoundary(
   )
 }
 
+function requiresClaudeWorkspaceTrust(provider: TeammateProvider): boolean {
+  return provider === 'anthropic'
+}
+
+function assertHeadlessProcessWorkspaceTrustAccepted(input: {
+  provider: TeammateProvider
+  teammateName: string
+  workingDir: string
+}): void {
+  if (!requiresClaudeWorkspaceTrust(input.provider)) {
+    return
+  }
+  if (!isPathTrusted(input.workingDir)) {
+    throw new Error(
+      `Teammate "${input.teammateName}" cannot start in headless process runtime because Claude workspace trust is not accepted for "${input.workingDir}". This trust is required only for Anthropic/Claude teammates. Open that workspace once in Claude Code and accept trust, then launch the team again.`,
+    )
+  }
+}
+
 type SeparateProcessRequirementReason =
   | 'provider-mismatch'
   | 'codex-native-runtime'
@@ -2486,11 +2505,11 @@ async function handleSpawnNativeProcess(
       `Teammate "${sanitizedName}" cannot start because cwd "${workingDir}" is unavailable: ${errorMessage(error)}`,
     )
   }
-  if (!isPathTrusted(workingDir)) {
-    throw new Error(
-      `Teammate "${sanitizedName}" cannot start in headless process runtime because workspace trust is not accepted for "${workingDir}". Open that workspace once interactively and accept trust, then launch the team again.`,
-    )
-  }
+  assertHeadlessProcessWorkspaceTrustAccepted({
+    provider,
+    teammateName: sanitizedName,
+    workingDir,
+  })
   await ensureTeammateRuntimePaths(runtimePaths)
   if (
     await shouldResetNativeProcessRuntimeEvents({
