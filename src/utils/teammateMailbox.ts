@@ -41,6 +41,11 @@ const LOCK_OPTIONS = {
   },
 }
 
+export type TeammateMessageKind =
+  | 'agent_error'
+  | 'member_work_sync_nudge'
+  | 'task_comment_notification'
+
 export type TeammateMessage = {
   messageId: string
   from: string
@@ -51,7 +56,7 @@ export type TeammateMessage = {
   claimedAt?: string
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
-  messageKind?: 'agent_error'
+  messageKind?: TeammateMessageKind
 }
 
 export function isAgentErrorNotificationMessage(
@@ -1471,6 +1476,7 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
         !!claimedBySessionId &&
         (!message.claimedAt ||
           Number.isNaN(claimedAtMs) ||
+          claimedAtMs > nowMs ||
           nowMs - claimedAtMs >= staleClaimTimeoutMs)
 
       if (!claimedBySessionId || claimedBySessionId === sessionId || claimIsStale) {

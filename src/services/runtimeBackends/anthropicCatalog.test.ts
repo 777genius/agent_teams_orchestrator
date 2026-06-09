@@ -12,6 +12,23 @@ describe('anthropic runtime catalog', () => {
   test('normalizes live Anthropic models into the curated Agent Teams catalog', () => {
     const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
       {
+        id: 'claude-opus-4-8',
+        type: 'model',
+        display_name: 'Claude Opus 4.8',
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: {
+            supported: true,
+            low: { supported: true },
+            medium: { supported: true },
+            high: { supported: true },
+            max: { supported: true },
+          },
+          image_input: { supported: true },
+        },
+      },
+      {
         id: 'claude-opus-4-7',
         type: 'model',
         display_name: 'Claude Opus 4.7',
@@ -90,14 +107,34 @@ describe('anthropic runtime catalog', () => {
     ])
 
     expect(
+      catalog.models.find((model) => model.launchModel === 'opus'),
+    ).toMatchObject({
+      displayName: 'Opus 4.8',
+      badgeLabel: 'Opus 4.8',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      source: 'anthropic-models-api',
+    })
+    expect(
       catalog.models.find((model) => model.launchModel === 'opus[1m]'),
     ).toMatchObject({
-      displayName: 'Opus 4.7 (1M)',
+      displayName: 'Opus 4.8 (1M)',
       hidden: true,
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
-      supportsFastMode: false,
+      supportsFastMode: true,
       source: 'anthropic-models-api',
+    })
+    expect(
+      catalog.models.find((model) => model.launchModel === 'claude-opus-4-8'),
+    ).toMatchObject({
+      displayName: 'Opus 4.8',
+      hidden: true,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      source: 'anthropic-models-api',
+      badgeLabel: null,
     })
     expect(
       catalog.models.find((model) => model.launchModel === 'claude-opus-4-6'),
@@ -195,6 +232,8 @@ describe('anthropic runtime catalog', () => {
     expect(
       catalog.models.find((model) => model.launchModel === 'opus'),
     ).toMatchObject({
+      displayName: 'Opus 4.8',
+      badgeLabel: 'Opus 4.8',
       supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
       defaultReasoningEffort: 'high',
       source: 'static-fallback',

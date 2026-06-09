@@ -94,7 +94,9 @@ import {
   isPermissionResponse,
   isShutdownRequest,
   markMessageAsReadByIndex,
+  markMessagesAsReadByIds,
   readMailbox,
+  type TeammateMessage,
   writeToMailbox,
 } from '../teammateMailbox.js'
 import { unregisterAgent as unregisterPerfettoAgent } from '../telemetry/perfettoTracing.js'
@@ -113,6 +115,56 @@ import { TEAMMATE_SYSTEM_PROMPT_ADDENDUM } from './teammatePromptAddendum.js'
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
 
 const PERMISSION_POLL_INTERVAL_MS = 500
+
+export function selectNextInProcessMailboxMessageIndex(
+  messages: readonly Pick<TeammateMessage, 'read' | 'from' | 'messageKind'>[],
+): number {
+  const workSyncIndex = messages.findIndex(
+    message => !message.read && message.messageKind === 'member_work_sync_nudge',
+  )
+  if (workSyncIndex !== -1) {
+    return workSyncIndex
+  }
+
+  const leadIndex = messages.findIndex(
+    message => !message.read && message.from === TEAM_LEAD_NAME,
+  )
+  if (leadIndex !== -1) {
+    return leadIndex
+  }
+
+  return messages.findIndex(message => !message.read)
+}
+
+export function shouldDeferInProcessMailboxReadAck(
+  message: Partial<Pick<TeammateMessage, 'messageKind'>>,
+): boolean {
+  return message.messageKind === 'member_work_sync_nudge'
+}
+
+type MarkMessagesAsReadByIdsFn = typeof markMessagesAsReadByIds
+
+export async function tryMarkDeferredInProcessMailboxReadAck({
+  agentName,
+  teamName,
+  messageId,
+  markRead = markMessagesAsReadByIds,
+}: {
+  agentName: string
+  teamName: string
+  messageId: string
+  markRead?: MarkMessagesAsReadByIdsFn
+}): Promise<boolean> {
+  try {
+    await markRead(agentName, [messageId], teamName)
+    return true
+  } catch (error) {
+    logForDebugging(
+      `[inProcessRunner] failed to mark deferred work-sync message as read for ${agentName}: ${error}`,
+    )
+    return false
+  }
+}
 
 /**
  * Creates a canUseTool function for in-process teammates that properly resolves
@@ -679,6 +731,7 @@ type WaitResult =
       from: string
       color?: string
       summary?: string
+      deferredReadAckMessageId?: string
     }
   | {
       type: 'aborted'
@@ -811,25 +864,9 @@ async function waitForNextPromptOrShutdown(
         }
       }
 
-      // No shutdown request found. Prioritize team-lead messages over peer
-      // messages — the leader represents user intent and coordination, so
-      // their messages should not be starved behind peer-to-peer chatter.
-      // Fall back to FIFO for peer messages.
-      let selectedIndex = -1
-
-      // Check for unread team-lead messages first
-      for (let i = 0; i < allMessages.length; i++) {
-        const m = allMessages[i]
-        if (m && !m.read && m.from === TEAM_LEAD_NAME) {
-          selectedIndex = i
-          break
-        }
-      }
-
-      // Fall back to first unread message (any sender)
-      if (selectedIndex === -1) {
-        selectedIndex = allMessages.findIndex(m => !m.read)
-      }
+      // No shutdown request found. Prioritize work-sync control traffic next
+      // so idle in-process teammates do not sit on a nudge behind older chatter.
+      const selectedIndex = selectNextInProcessMailboxMessageIndex(allMessages)
 
       if (selectedIndex !== -1) {
         const msg = allMessages[selectedIndex]
@@ -837,17 +874,23 @@ async function waitForNextPromptOrShutdown(
           logForDebugging(
             `[inProcessRunner] ${identity.agentName} received new message from ${msg.from} (index ${selectedIndex})`,
           )
-          await markMessageAsReadByIndex(
-            identity.agentName,
-            identity.teamName,
-            selectedIndex,
-          )
+          const deferReadAck = shouldDeferInProcessMailboxReadAck(msg)
+          if (!deferReadAck) {
+            await markMessageAsReadByIndex(
+              identity.agentName,
+              identity.teamName,
+              selectedIndex,
+            )
+          }
           return {
             type: 'new_message',
             message: msg.text,
             from: msg.from,
             color: msg.color,
             summary: msg.summary,
+            ...(deferReadAck
+              ? { deferredReadAckMessageId: msg.messageId }
+              : {}),
           }
         }
       }
@@ -1022,6 +1065,7 @@ export async function runInProcessTeammate(
   )
   let currentPrompt = wrappedInitialPrompt
   let shouldExit = false
+  let deferredReadAckMessageId: string | undefined
 
   // Try to claim an available task immediately so the UI can show activity
   // from the very start. The idle loop handles claiming for subsequent tasks.
@@ -1305,6 +1349,15 @@ export async function runInProcessTeammate(
         break
       }
 
+      if (deferredReadAckMessageId && !workWasAborted) {
+        await tryMarkDeferredInProcessMailboxReadAck({
+          agentName: identity.agentName,
+          teamName: identity.teamName,
+          messageId: deferredReadAckMessageId,
+        })
+      }
+      deferredReadAckMessageId = undefined
+
       // If work was aborted (Escape), log it and add interrupt message, then continue to idle state
       if (workWasAborted) {
         logForDebugging(
@@ -1402,6 +1455,7 @@ export async function runInProcessTeammate(
           logForDebugging(
             `[inProcessRunner] ${identity.agentId} received new message from ${waitResult.from}`,
           )
+          deferredReadAckMessageId = waitResult.deferredReadAckMessageId
           // Messages from the user should be plain text (not wrapped in XML)
           // Messages from other teammates get XML wrapper for identification
           if (waitResult.from === 'user') {

@@ -731,7 +731,10 @@ export type Attachment =
 export type TeammateMailboxAttachment = {
   type: 'teammate_mailbox'
   messages: Array<{
-    messageKind?: 'agent_error'
+    messageKind?:
+      | 'agent_error'
+      | 'member_work_sync_nudge'
+      | 'task_comment_notification'
     from: string
     text: string
     timestamp: string
@@ -3627,14 +3630,29 @@ export async function getTeammateMailboxAttachments(
   const currentSessionId = getSessionId()
 
   const allUnreadMessages = await readUnreadMessages(agentName, teamName)
+  const shouldReadFileBackedWorkSyncNudges =
+    !mailboxDeliveryScope.inProcessTeammate &&
+    (shouldReadRegularMailboxMessagesFromFile ||
+      shouldReadProtocolMailboxMessagesFromFile)
+  const fileBackedWorkSyncNudgeMessages = shouldReadFileBackedWorkSyncNudges
+    ? allUnreadMessages.filter(m => m.messageKind === 'member_work_sync_nudge')
+    : []
   const fileBackedRegularMessages = shouldReadRegularMailboxMessagesFromFile
-    ? allUnreadMessages.filter(m => isRegularInteractiveMailboxMessage(m))
+    ? allUnreadMessages.filter(
+        m =>
+          m.messageKind !== 'member_work_sync_nudge' &&
+          isRegularInteractiveMailboxMessage(m),
+      )
     : []
   const fileBackedProtocolMessages = shouldReadProtocolMailboxMessagesFromFile
-    ? allUnreadMessages.filter(m => isStructuredProtocolMessage(m.text))
+    ? allUnreadMessages.filter(
+        m =>
+          m.messageKind !== 'member_work_sync_nudge' &&
+          isStructuredProtocolMessage(m.text),
+      )
     : []
   logForDebugging(
-    `[MailboxBridge] Found ${allUnreadMessages.length} unread message(s) for "${agentName}" (${fileBackedRegularMessages.length} regular and ${fileBackedProtocolMessages.length} protocol message(s) eligible for file-backed attachment delivery)`,
+    `[MailboxBridge] Found ${allUnreadMessages.length} unread message(s) for "${agentName}" (${fileBackedRegularMessages.length} regular, ${fileBackedProtocolMessages.length} protocol, and ${fileBackedWorkSyncNudgeMessages.length} work-sync nudge message(s) eligible for file-backed attachment delivery)`,
   )
 
   // Also check AppState.inbox for pending messages (queued mid-turn by useInboxPoller)
@@ -3654,18 +3672,25 @@ export async function getTeammateMailboxAttachments(
             isLiveInboxMirrorMessageOwnedBySession(m, currentSessionId),
         )
       : [] // Viewer, in-process, and non-interactive paths are read-only w.r.t. live ownership
+  const liveAttachmentEligibleInboxMessages =
+    liveOwnedPendingInboxMessages.filter(
+      message => message.messageKind !== 'member_work_sync_nudge',
+    )
+  const heldWorkSyncNudgeInboxMessages =
+    liveOwnedPendingInboxMessages.length -
+    liveAttachmentEligibleInboxMessages.length
   const silentPendingInboxMessages = shouldUseLiveInboxOwnerPath
-    ? liveOwnedPendingInboxMessages.filter(message =>
+    ? liveAttachmentEligibleInboxMessages.filter(message =>
         isSilentRegularMailboxMessageForLiveContext(message),
       )
     : []
   const pendingInboxMessages = shouldUseLiveInboxOwnerPath
-    ? liveOwnedPendingInboxMessages.filter(
+    ? liveAttachmentEligibleInboxMessages.filter(
         message => !isSilentRegularMailboxMessageForLiveContext(message),
       )
     : []
   logForDebugging(
-    `[SwarmMailbox] Found ${pendingInboxMessages.length} deliverable pending message(s) and ${silentPendingInboxMessages.length} silent pending message(s) in AppState.inbox`,
+    `[SwarmMailbox] Found ${pendingInboxMessages.length} deliverable pending message(s), ${silentPendingInboxMessages.length} silent pending message(s), and ${heldWorkSyncNudgeInboxMessages} work-sync nudge message(s) held for poller proof in AppState.inbox`,
   )
 
   // Combine both sources of messages. Interactive regular teammate delivery now
@@ -3674,7 +3699,10 @@ export async function getTeammateMailboxAttachments(
   const seen = new Set<string>()
   let allMessages: Array<{
     messageId?: string
-    messageKind?: 'agent_error'
+    messageKind?:
+      | 'agent_error'
+      | 'member_work_sync_nudge'
+      | 'task_comment_notification'
     from: string
     text: string
     timestamp: string
@@ -3683,6 +3711,7 @@ export async function getTeammateMailboxAttachments(
   }> = []
 
   for (const m of [
+    ...fileBackedWorkSyncNudgeMessages,
     ...fileBackedRegularMessages,
     ...fileBackedProtocolMessages,
     ...pendingInboxMessages,
@@ -3791,20 +3820,23 @@ export async function getTeammateMailboxAttachments(
       messages: allMessages,
     },
   ]
+  const fileBackedRegularMessagesToFinalize = fileBackedRegularMessages.filter(
+    message => message.messageKind !== 'member_work_sync_nudge',
+  )
 
   // File-backed regular messages are delivered only in observer/non-interactive
   // paths; exact mark-read keeps this path narrow without mutating structured rows.
   if (
-    fileBackedRegularMessages.length > 0 &&
+    fileBackedRegularMessagesToFinalize.length > 0 &&
     shouldFinalizeFileBackedRegularMessages
   ) {
     await markMessagesAsReadByIds(
       agentName,
-      fileBackedRegularMessages.map(message => message.messageId),
+      fileBackedRegularMessagesToFinalize.map(message => message.messageId),
       teamName,
     )
     logForDebugging(
-      `[MailboxBridge] marked ${fileBackedRegularMessages.length} file-backed regular message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
+      `[MailboxBridge] marked ${fileBackedRegularMessagesToFinalize.length} file-backed regular message(s) as read for agent="${agentName}" team="${teamName || 'default'}"`,
     )
   }
 

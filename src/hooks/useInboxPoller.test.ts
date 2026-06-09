@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   extractTaskRefFromMailboxText,
   findBootstrapAttemptOutcome,
+  findMemberWorkSyncNudgeOutcome,
   findOrdinaryAttemptExecutionError,
   findOrdinaryDirectReplyFallback,
   findOrdinaryDirectReplyOutcome,
@@ -13,6 +14,7 @@ import {
   getBootstrapInlineHandoffPrompt,
   getOrdinaryInlineHandoffPrompt,
   getOrdinaryRecoveryInlineHandoffPrompt,
+  getProcessingOrdinaryMessage,
   getOrdinaryPendingMessage,
   getBootstrapPendingMessage,
   getQueuedMailboxMetaPrompt,
@@ -185,6 +187,34 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         ],
       })?.messageId,
     ).toBe('regular')
+  })
+
+  test('prioritizes member work-sync nudges over older ordinary rows', () => {
+    expect(
+      getOrdinaryPendingMessage({
+        pendingMessages: [
+          {
+            id: 'older',
+            messageId: 'regular-before-nudge',
+            mailboxClaimedBySessionId: 's',
+            from: 'user',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:00.000Z',
+            text: 'Ping before work sync.',
+          },
+          {
+            id: 'nudge',
+            messageId: 'work-sync-nudge',
+            mailboxClaimedBySessionId: 's',
+            from: 'system',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+            messageKind: 'member_work_sync_nudge',
+          },
+        ],
+      })?.messageId,
+    ).toBe('work-sync-nudge')
   })
 
   test('builds an inline ordinary mailbox handoff from the row itself', () => {
@@ -1587,6 +1617,1119 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     ).toEqual({ type: 'finalize' })
   })
 
+  test('detects successful member_work_sync_report after a work-sync nudge', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: 'report accepted',
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('report')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
+  })
+
+  test('work-sync nudge waits while member_work_sync_report result is pending', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('pending_tool')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1_000,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        now: 1_000 + 119_999,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'noop' })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1_000,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        now: 1_000 + 120_000,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('work-sync nudge waits while member_work_sync_status result is pending', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('pending_tool')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1_000,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        now: 1_000 + 119_999,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'noop' })
+  })
+
+  test('does not accept rejected member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: JSON.stringify({
+            accepted: false,
+            code: 'stale_agenda_fingerprint',
+            message: 'Report rejected.',
+          }),
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('does not accept generic non-empty member_work_sync_report output as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: 'ok',
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('does not accept object-content rejected member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: {
+            accepted: false,
+            code: 'report_token_invalid',
+            message: 'Report rejected.',
+          },
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+  })
+
+  test('accepts object-content accepted member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: {
+            accepted: true,
+            state: 'still_working',
+          },
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('report')
+  })
+
+  test('does not accept wrapped rejected member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: [
+            {
+              text: [
+                'Report rejected.',
+                JSON.stringify({
+                  accepted: false,
+                  code: 'stale_agenda_fingerprint',
+                  message: 'Report rejected for agenda {old}.',
+                }),
+                'Call status again.',
+              ].join('\n'),
+              type: 'text',
+            },
+          ],
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+  })
+
+  test('accepts later member_work_sync_report after an earlier rejected report', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const firstAssistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report-stale',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const firstToolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: JSON.stringify({
+            accepted: false,
+            code: 'stale_agenda_fingerprint',
+          }),
+          is_error: false,
+          tool_use_id: 'tool-report-stale',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+    const secondAssistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-report-current',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const secondToolResult = createUserMessage({
+      content: [
+        {
+          content: JSON.stringify({
+            accepted: true,
+            state: 'still_working',
+          }),
+          is_error: false,
+          tool_use_id: 'tool-report-current',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+    const messages = [submitted, firstAssistant, firstToolResult, secondAssistant, secondToolResult]
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages,
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('report')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'finalize' })
+  })
+
+  test('prefers wrapped accepted flag over earlier JSON objects in report result', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: [
+            {
+              text: [
+                'Debug context:',
+                JSON.stringify({ tool: 'member_work_sync_report' }),
+                'Result:',
+                JSON.stringify({
+                  accepted: false,
+                  code: 'stale_agenda_fingerprint',
+                }),
+              ].join('\n'),
+              type: 'text',
+            },
+          ],
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+  })
+
+  test('does not let earlier accepted debug JSON override a later rejected report result', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: [
+            {
+              text: [
+                'Previous debug context:',
+                JSON.stringify({ accepted: true, source: 'previous_attempt' }),
+                'Actual result:',
+                JSON.stringify({
+                  accepted: false,
+                  code: 'stale_agenda_fingerprint',
+                }),
+              ].join('\n'),
+              type: 'text',
+            },
+          ],
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+  })
+
+  test('does not accept plain-text rejected member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: 'Report rejected. Call member_work_sync_status again.',
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+  })
+
+  test('does not accept plain-text stale member_work_sync_report as work-sync proof', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        {
+          id: 'tool-report',
+          input: { memberName: 'atlas', state: 'still_working', teamName: 'best-team' },
+          name: 'mcp__agent-teams__member_work_sync_report',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+        {
+          content: 'Report fingerprint is stale. Read current member work sync status and retry.',
+          is_error: false,
+          tool_use_id: 'tool-report',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('work-sync nudge stays pending after status-only activity', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-status',
+          input: { memberName: 'atlas', teamName: 'best-team' },
+          name: 'member_work_sync_status',
+          type: 'tool_use',
+        } as never,
+        { text: 'Status checked, still working.', type: 'text' } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'status ok',
+          is_error: false,
+          tool_use_id: 'tool-status',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      findMemberWorkSyncNudgeOutcome({
+        messages: [submitted, assistant, toolResult],
+        submitUserMessageUuid: 'ordinary-uuid',
+      }),
+    ).toBe('status')
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('work-sync nudge waits briefly when the submitted turn has no activity yet', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1_000,
+          timer: null,
+        },
+        messages: [submitted],
+        now: 1_000 + 119_999,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'noop' })
+  })
+
+  test('work-sync nudge retries when the submitted turn has no activity for the stall window', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1_000,
+          timer: null,
+        },
+        messages: [submitted],
+        now: 1_000 + 120_000,
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('work-sync nudge does not finalize on plain assistant acknowledgement', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [{ text: 'Принял, продолжаю.', type: 'text' } as never],
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('work-sync nudge does not finalize on message_send without report', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const assistant = createAssistantMessage({
+      content: [
+        {
+          id: 'tool-message-send',
+          input: {
+            from: 'atlas',
+            summary: 'Still working',
+            teamName: 'best-team',
+            text: 'Still working.',
+            to: 'user',
+          },
+          name: 'agent-teams_message_send',
+          type: 'tool_use',
+        } as never,
+      ],
+    })
+    const toolResult = createUserMessage({
+      content: [
+        {
+          content: 'sent ok',
+          is_error: false,
+          tool_use_id: 'tool-message-send',
+          type: 'tool_result',
+        } as never,
+      ],
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, assistant, toolResult],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-work-sync',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+        teamName: 'best-team',
+      }),
+    ).toEqual({ type: 'schedule_cooldown', cooldownMs: 120000 })
+  })
+
+  test('ordinary processing selection skips cooling-down rows', () => {
+    const selected = getProcessingOrdinaryMessage({
+      messages: [
+        {
+          id: 'row-cooling',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-cooling',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Waiting for cooldown.',
+        },
+        {
+          id: 'row-active',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-active',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:01:00.000Z',
+          text: 'Active message.',
+        },
+      ],
+      getAttemptStatus: messageId =>
+        messageId === 'mailbox-cooling' ? 'cooling_down' : 'in_flight',
+    })
+
+    expect(selected?.id).toBe('row-active')
+  })
+
+  test('ordinary processing selection leaves only cooling-down rows unselected', () => {
+    const selected = getProcessingOrdinaryMessage({
+      messages: [
+        {
+          id: 'row-cooling',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-cooling',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Waiting for cooldown.',
+        },
+      ],
+      getAttemptStatus: () => 'cooling_down',
+    })
+
+    expect(selected).toBeUndefined()
+  })
+
+  test('ordinary processing selection can rescue a cooling-down row after late terminal activity', () => {
+    const selected = getProcessingOrdinaryMessage({
+      messages: [
+        {
+          id: 'row-cooling',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-cooling',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check.',
+        },
+        {
+          id: 'row-active',
+          mailboxClaimedBySessionId: 'session-1',
+          messageId: 'mailbox-active',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:01:00.000Z',
+          text: 'Active message.',
+        },
+      ],
+      getAttemptStatus: messageId =>
+        messageId === 'mailbox-cooling' ? 'cooling_down' : 'in_flight',
+      shouldProcessCoolingDown: message => message.messageId === 'mailbox-cooling',
+    })
+
+    expect(selected?.id).toBe('row-cooling')
+  })
+
   test('lifecycle - ordinary non-user row does not finalize on system-only activity', () => {
     const submitted = createUserMessage({
       content: 'ordinary handoff',
@@ -1605,6 +2748,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
           timer: null,
         },
         messages: [submitted, system],
+        now: 1000,
         processingOrdinaryMessage: {
           id: 'row-regular',
           messageId: 'mailbox-regular',
@@ -1616,6 +2760,40 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         },
       }),
     ).toEqual({ type: 'noop' })
+  })
+
+  test('lifecycle - ordinary row with no post-submit activity eventually cools down', () => {
+    const submitted = createUserMessage({
+      content: 'ordinary handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted],
+        now: 120_001,
+        processingOrdinaryMessage: {
+          id: 'row-regular',
+          messageId: 'mailbox-regular',
+          mailboxClaimedBySessionId: 'session-1',
+          from: 'team-lead',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Возьми следующую задачу.',
+        },
+      }),
+    ).toEqual({
+      type: 'schedule_cooldown',
+      cooldownMs: 5000,
+    })
   })
 
   test('detects Codex native timeout API error after an ordinary mailbox submit', () => {
@@ -1755,6 +2933,83 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       detail: 'Rate limit reached.',
       reason: 'execution_failed',
       taskRef: '545b704e',
+    })
+  })
+
+  test('work-sync API error schedules retry cooldown instead of terminal failure', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'Rate limit reached.',
+      errorDetails: 'Rate limit reached.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, apiError],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          messageId: 'mailbox-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+      }),
+    ).toEqual({
+      type: 'schedule_cooldown',
+      cooldownMs: 120000,
+    })
+  })
+
+  test('work-sync timeout schedules retry cooldown instead of timeout terminal failure', () => {
+    const submitted = createUserMessage({
+      content: 'work sync handoff',
+      isMeta: true,
+      uuid: 'ordinary-uuid',
+    })
+    const timeout = createAssistantAPIErrorMessage({
+      content: 'Codex native exec timed out after 120000ms of inactivity.',
+      errorDetails: 'Codex native exec timed out after 120000ms of inactivity.',
+    })
+
+    expect(
+      getOrdinaryProcessingAction({
+        attempt: {
+          cooldownUntil: 0,
+          status: 'in_flight',
+          submitUserMessageUuid: 'ordinary-uuid',
+          submittedAt: 1,
+          timer: null,
+        },
+        messages: [submitted, timeout],
+        processingOrdinaryMessage: {
+          id: 'row-work-sync',
+          messageId: 'mailbox-work-sync',
+          mailboxClaimedBySessionId: 'session-1',
+          messageKind: 'member_work_sync_nudge',
+          from: 'system',
+          status: 'processing',
+          timestamp: '2026-04-09T13:00:00.000Z',
+          text: 'Work sync check: call member_work_sync_status then member_work_sync_report.',
+        },
+        recoveryAttemptCount: 1,
+      }),
+    ).toEqual({
+      type: 'schedule_cooldown',
+      cooldownMs: 120000,
     })
   })
 

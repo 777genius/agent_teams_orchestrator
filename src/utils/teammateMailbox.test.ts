@@ -571,6 +571,42 @@ describe('teammateMailbox', () => {
     ).toBe(true)
   })
 
+  it('treats future claimedAt as stale so rows do not stay blocked', async () => {
+    await writeToMailbox(
+      'team-lead',
+      {
+        from: 'alice',
+        text: 'future-claim-message',
+        timestamp: '2026-01-04T00:10:00.000Z',
+      },
+      'my-team',
+    )
+
+    const [initialClaim] = await claimUnreadRegularMessages(
+      'team-lead',
+      'session-a',
+      'my-team',
+      {
+        now: '2026-01-04T00:20:00.000Z',
+      },
+    )
+    expect(initialClaim.claimedBySessionId).toBe('session-a')
+
+    const claimedBySessionB = await claimUnreadRegularMessages(
+      'team-lead',
+      'session-b',
+      'my-team',
+      {
+        now: '2026-01-04T00:10:01.000Z',
+      },
+    )
+
+    expect(claimedBySessionB.map(message => message.text)).toEqual([
+      'future-claim-message',
+    ])
+    expect(claimedBySessionB[0]?.claimedBySessionId).toBe('session-b')
+  })
+
   it('allows same-session recovery without waiting for stale timeout', async () => {
     await writeToMailbox(
       'team-lead',

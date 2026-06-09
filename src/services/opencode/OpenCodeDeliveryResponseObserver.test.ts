@@ -334,6 +334,306 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.toolCallNames).toContain('member_work_sync_report')
   })
 
+  test('does not classify rejected member work sync report as response proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-rejected',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-rejected',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-rejected". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-rejected',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-rejected',
+          text: 'Report rejected, retrying status.',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-rejected',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: { accepted: false, code: 'stale_agenda_fingerprint' },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+    expect(observed.toolCallNames).toContain('member_work_sync_report')
+  })
+
+  test('detects nested rejected member work sync report output', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-nested-rejected',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-nested-rejected',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-nested-rejected". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-nested-rejected',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-nested-rejected',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-nested-rejected',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: { result: { accepted: false, code: 'report_token_invalid' } },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+  })
+
+  test('rejected member work sync report overrides a visible message_send proof', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-rejected-visible',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-rejected-visible',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-rejected-visible". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-rejected-visible',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-rejected-visible',
+          toolCalls: [
+            {
+              callId: 'tool-message-send-before-rejected-report',
+              toolName: 'agent-teams_message_send',
+              title: null,
+              status: 'completed',
+              input: {
+                relayOfMessageId: 'msg-work-sync-report-rejected-visible',
+                text: 'I am still working.',
+              },
+              output: { messageId: 'reply-1' },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+            {
+              callId: 'tool-work-sync-report-rejected-visible',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: { accepted: false, code: 'report_token_invalid' },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+    expect(observed.toolCallNames).toContain('message_send')
+    expect(observed.toolCallNames).toContain('member_work_sync_report')
+  })
+
+  test('later accepted member work sync report overrides an earlier rejected report', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-retry-accepted',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-retry-accepted',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-retry-accepted". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-retry-rejected',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-retry-accepted',
+          text: 'First report was stale, retrying with fresh status.',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-retry-rejected',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { state: 'still_working' },
+              output: { accepted: false, code: 'stale_agenda_fingerprint' },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+        message({
+          id: 'assistant-work-sync-report-retry-accepted',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-retry-accepted',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-retry-accepted',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { state: 'still_working' },
+              output: { accepted: true, state: 'still_working' },
+              outputText: null,
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('responded_non_visible_tool')
+    expect(observed.reason).toBeNull()
+    expect(observed.assistantMessageId).toBe('assistant-work-sync-report-retry-accepted')
+    expect(observed.toolCallNames).toContain('member_work_sync_report')
+  })
+
+  test('detects wrapped rejected member work sync report output', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-wrapped-rejected',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-wrapped-rejected',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-wrapped-rejected". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-wrapped-rejected',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-wrapped-rejected',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-wrapped-rejected',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: null,
+              outputText: [
+                'Debug context:',
+                JSON.stringify({ tool: 'member_work_sync_report' }),
+                'Result:',
+                JSON.stringify({ accepted: false, code: 'report_token_invalid' }),
+              ].join('\n'),
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+  })
+
+  test('detects plain-text rejected member work sync report output', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-text-rejected',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-text-rejected',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-text-rejected". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-text-rejected',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-text-rejected',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-text-rejected',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: null,
+              outputText: 'Report rejected. Call member_work_sync_status again.',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+  })
+
+  test('detects plain-text stale member work sync report output', () => {
+    const observed = observeOpenCodeDeliveryResponse({
+      inboundMessageId: 'msg-work-sync-report-text-stale',
+      summary: summary([
+        message({
+          id: 'user-work-sync-report-text-stale',
+          role: 'user',
+          text: 'The inbound app messageId is "msg-work-sync-report-text-stale". Run work sync.',
+        }),
+        message({
+          id: 'assistant-work-sync-report-text-stale',
+          role: 'assistant',
+          parentId: 'user-work-sync-report-text-stale',
+          toolCalls: [
+            {
+              callId: 'tool-work-sync-report-text-stale',
+              toolName: 'mcp__agent-teams__member_work_sync_report',
+              title: null,
+              status: 'completed',
+              input: { reportToken: 'token-1', agendaFingerprint: 'fingerprint-1' },
+              output: null,
+              outputText: 'Report fingerprint is stale. Read current member work sync status and retry.',
+              outputPreview: null,
+              startedAt: null,
+              completedAt: null,
+              isError: false,
+            },
+          ],
+        }),
+      ]),
+    })
+
+    expect(observed.state).toBe('tool_error')
+    expect(observed.reason).toBe('member_work_sync_report_rejected')
+  })
+
   test('normalizes underscore-prefixed member work sync report tools', () => {
     const observed = observeOpenCodeDeliveryResponse({
       inboundMessageId: 'msg-work-sync-report-underscore',

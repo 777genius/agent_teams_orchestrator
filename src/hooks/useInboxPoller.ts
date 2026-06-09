@@ -138,6 +138,9 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 const INBOX_POLL_INTERVAL_MS = 1000
 const BOOTSTRAP_RETRY_COOLDOWN_MS = 5000
 const ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS = 5000
+const ORDINARY_DIRECT_MESSAGE_IN_FLIGHT_STALL_MS = 2 * 60 * 1000
+const MEMBER_WORK_SYNC_NUDGE_RETRY_COOLDOWN_MS = 2 * 60 * 1000
+const MEMBER_WORK_SYNC_NUDGE_IN_FLIGHT_STALL_MS = 2 * 60 * 1000
 const ORDINARY_DIRECT_MESSAGE_MAX_AUTO_RECOVERY_ATTEMPTS = 1
 const BOOTSTRAP_MEMBER_BRIEFING_READINESS_GRACE_MS = 15000
 // Native mailbox poller only. OpenCode runtime delivery is direct bridge prompt
@@ -310,7 +313,7 @@ export function getOrdinaryPendingMessage({
 }: {
   pendingMessages: readonly PendingInboxMirrorMessage[]
 }): PendingInboxMirrorMessage | undefined {
-  return pendingMessages.find(
+  const actionableMessages = pendingMessages.filter(
     message =>
       !!message.messageId &&
       message.messageKind !== 'agent_error' &&
@@ -320,6 +323,32 @@ export function getOrdinaryPendingMessage({
         isBootstrapMailboxInstructionText(message.text)
       ),
   )
+
+  return (
+    actionableMessages.find(message => message.messageKind === 'member_work_sync_nudge')
+    ?? actionableMessages[0]
+  )
+}
+
+export function getProcessingOrdinaryMessage({
+  messages,
+  getAttemptStatus,
+  shouldProcessCoolingDown,
+}: {
+  messages: readonly PendingInboxMirrorMessage[]
+  getAttemptStatus: (messageId: string) => 'in_flight' | 'cooling_down' | undefined
+  shouldProcessCoolingDown?: (message: PendingInboxMirrorMessage) => boolean
+}): PendingInboxMirrorMessage | undefined {
+  return messages.find(message => {
+    if (message.status !== 'processing' || !message.messageId) {
+      return false
+    }
+    const attemptStatus = getAttemptStatus(message.messageId)
+    return (
+      attemptStatus !== 'cooling_down' ||
+      shouldProcessCoolingDown?.(message) === true
+    )
+  })
 }
 
 export function shouldDeferPendingInboxDelivery(params: {
@@ -683,6 +712,7 @@ async function writeAgentErrorLeadNotification({
 
 type BootstrapAttemptOutcome = 'member_briefing' | 'team_lead_fallback' | 'none'
 type OrdinaryAttemptOutcome = 'user_send_message' | 'none'
+type MemberWorkSyncNudgeOutcome = 'report' | 'status' | 'pending_tool' | 'none'
 type OrdinaryDirectReplyFallback = {
   text: string
 }
@@ -1189,6 +1219,367 @@ function isFatalBootstrapAttemptExecutionError(
   )
 }
 
+function isAgentTeamsMemberWorkSyncToolName(
+  name: string,
+  action: 'report' | 'status',
+): boolean {
+  const normalized = name.trim().toLowerCase()
+  const suffix = `member_work_sync_${action}`
+  return (
+    normalized === suffix ||
+    normalized === `agent-teams_${suffix}` ||
+    normalized === `agent_teams_${suffix}` ||
+    normalized === `mcp__agent-teams__${suffix}` ||
+    normalized === `mcp__agent_teams__${suffix}`
+  )
+}
+
+function getToolResultText(block: { content?: unknown }): string {
+  const content = block.content
+  if (typeof content === 'string') {
+    return content
+  }
+  if (!Array.isArray(content)) {
+    return ''
+  }
+  return content
+    .flatMap(item => {
+      if (
+        item &&
+        typeof item === 'object' &&
+        'text' in item &&
+        typeof item.text === 'string'
+      ) {
+        return [item.text]
+      }
+      return []
+    })
+    .join('\n')
+}
+
+function tryParseToolResultObject(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function parseEmbeddedToolResultObject(text: string): Record<string, unknown> | null {
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let firstParsed: Record<string, unknown> | null = null
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (start === -1) {
+      if (char === '{') {
+        start = index
+        depth = 1
+        inString = false
+        escaped = false
+      }
+      continue
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+    if (char === '{') {
+      depth += 1
+      continue
+    }
+    if (char !== '}') {
+      continue
+    }
+
+    depth -= 1
+    if (depth === 0) {
+      const parsed = tryParseToolResultObject(text.slice(start, index + 1))
+      if (parsed) {
+        if (typeof parsed.accepted === 'boolean') {
+          return parsed
+        }
+        firstParsed ??= parsed
+      }
+      start = -1
+    }
+  }
+
+  return firstParsed
+}
+
+function parseToolResultObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim()
+  if (!trimmed) {
+    return null
+  }
+  return tryParseToolResultObject(trimmed) ?? parseEmbeddedToolResultObject(trimmed)
+}
+
+function collectAcceptedFlagsFromToolResultText(text: string): boolean[] {
+  const trimmed = text.trim()
+  if (!trimmed) {
+    return []
+  }
+
+  const exact = tryParseToolResultObject(trimmed)
+  if (exact) {
+    return collectAcceptedFlagsFromToolResultContent(exact)
+  }
+
+  const flags: boolean[] = []
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (start === -1) {
+      if (char === '{') {
+        start = index
+        depth = 1
+        inString = false
+        escaped = false
+      }
+      continue
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+    if (char === '{') {
+      depth += 1
+      continue
+    }
+    if (char !== '}') {
+      continue
+    }
+
+    depth -= 1
+    if (depth === 0) {
+      const parsed = tryParseToolResultObject(text.slice(start, index + 1))
+      if (parsed) {
+        collectAcceptedFlagsFromToolResultContent(parsed, flags)
+      }
+      start = -1
+    }
+  }
+
+  return flags
+}
+
+function collectAcceptedFlagsFromToolResultContent(
+  content: unknown,
+  flags: boolean[] = [],
+): boolean[] {
+  if (typeof content === 'string') {
+    flags.push(...collectAcceptedFlagsFromToolResultText(content))
+    if (isRejectedMemberWorkSyncReportText(content)) {
+      flags.push(false)
+    }
+    return flags
+  }
+
+  if (Array.isArray(content)) {
+    content.forEach(item => collectAcceptedFlagsFromToolResultContent(item, flags))
+    return flags
+  }
+
+  if (!content || typeof content !== 'object') {
+    return flags
+  }
+
+  const record = content as Record<string, unknown>
+  if (typeof record.accepted === 'boolean') {
+    flags.push(record.accepted)
+  }
+
+  for (const key of ['content', 'text', 'result', 'output', 'data'] as const) {
+    if (key in record) {
+      collectAcceptedFlagsFromToolResultContent(record[key], flags)
+    }
+  }
+
+  return flags
+}
+
+function getAcceptedFlagFromToolResultContent(content: unknown): boolean | null {
+  const flags = collectAcceptedFlagsFromToolResultContent(content)
+  if (flags.includes(false)) {
+    return false
+  }
+  if (flags.includes(true)) {
+    return true
+  }
+  return null
+}
+
+function isRejectedMemberWorkSyncReportText(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim().toLowerCase()
+  return (
+    /\baccepted\s*[:=]\s*false\b/.test(normalized) ||
+    /"accepted"\s*:\s*false/.test(normalized) ||
+    /\bnot\s+accepted\b/.test(normalized) ||
+    /\breport\s+rejected\b/.test(normalized) ||
+    /\breport\s+(?:was\s+)?(?:not\s+accepted|failed)\b/.test(normalized) ||
+    /\bmember_work_sync_report\s+(?:not\s+accepted|rejected|failed)\b/.test(normalized) ||
+    /\breport_rejected(?::|_|\b)/.test(normalized) ||
+    /\bstale[_\s-]+(?:agenda[_\s-]+)?fingerprint\b/.test(normalized) ||
+    /\binvalid[_\s-]+report[_\s-]+token\b/.test(normalized) ||
+    /\breport[_\s-]+token[_\s-]+invalid\b/.test(normalized) ||
+    /\bidentity[_\s-]+(?:untrusted|mismatch)\b/.test(normalized) ||
+    /\bmember[_\s-]+inactive\b/.test(normalized) ||
+    /\breserved[_\s-]+or[_\s-]+invalid[_\s-]+member\b/.test(normalized) ||
+    /\bteam[_\s-]+runtime[_\s-]+inactive\b/.test(normalized) ||
+    /\bforeign[_\s-]+task[_\s-]+id\b/.test(normalized) ||
+    /\bcaught[_\s-]+up[_\s-]+rejected[_\s-]+actionable[_\s-]+items[_\s-]+exist\b/.test(normalized) ||
+    /\bstill[_\s-]+working[_\s-]+rejected[_\s-]+agenda[_\s-]+empty\b/.test(normalized) ||
+    /\bblocked[_\s-]+without[_\s-]+evidence\b/.test(normalized) ||
+    /\breport fingerprint is stale\b/.test(normalized) ||
+    /\breport token is (?:invalid|required)\b/.test(normalized) ||
+    /\bcannot report caught_up while actionable work remains\b/.test(normalized) ||
+    /\bcannot report still_working when no actionable work remains\b/.test(normalized)
+  )
+}
+
+function isAcceptedMemberWorkSyncReportText(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim().toLowerCase()
+  return (
+    /\baccepted\s*[:=]\s*true\b/.test(normalized) ||
+    /"accepted"\s*:\s*true/.test(normalized) ||
+    /\breport\s+(?:was\s+)?accepted\b/.test(normalized) ||
+    /\bmember_work_sync_report\s+(?:was\s+)?accepted\b/.test(normalized)
+  )
+}
+
+function isAcceptedMemberWorkSyncReportToolResult(block: {
+  content?: unknown
+  is_error?: boolean
+}): boolean {
+  if (block.is_error === true) {
+    return false
+  }
+  const acceptedFlag = getAcceptedFlagFromToolResultContent(block.content)
+  if (acceptedFlag !== null) {
+    return acceptedFlag
+  }
+  const text = getToolResultText(block)
+  const parsed = parseToolResultObject(text)
+  if (parsed && typeof parsed.accepted === 'boolean') {
+    return parsed.accepted
+  }
+  if (isRejectedMemberWorkSyncReportText(text)) {
+    return false
+  }
+  return isAcceptedMemberWorkSyncReportText(text)
+}
+
+export function findMemberWorkSyncNudgeOutcome({
+  messages,
+  submitUserMessageUuid,
+}: {
+  messages: AppState['messages']
+  submitUserMessageUuid: string
+}): MemberWorkSyncNudgeOutcome {
+  const startIndex = messages.findIndex(
+    message => message.type === 'user' && message.uuid === submitUserMessageUuid,
+  )
+  if (startIndex === -1) {
+    return 'none'
+  }
+
+  const pendingReportToolUseIds = new Set<string>()
+  const pendingStatusToolUseIds = new Set<string>()
+  let sawSuccessfulStatus = false
+
+  for (let i = startIndex + 1; i < messages.length; i++) {
+    const message = messages[i]
+    if (!message) {
+      continue
+    }
+
+    if (message.type === 'user') {
+      if (isToolResultUserMessage(message)) {
+        for (const block of message.message.content) {
+          if (block.type !== 'tool_result') {
+            continue
+          }
+          if (pendingReportToolUseIds.has(block.tool_use_id)) {
+            pendingReportToolUseIds.delete(block.tool_use_id)
+            if (
+              block.is_error !== true &&
+              isAcceptedMemberWorkSyncReportToolResult(block)
+            ) {
+              return 'report'
+            }
+          }
+          if (pendingStatusToolUseIds.has(block.tool_use_id)) {
+            pendingStatusToolUseIds.delete(block.tool_use_id)
+            if (block.is_error !== true) {
+              sawSuccessfulStatus = true
+            }
+          }
+        }
+        continue
+      }
+      break
+    }
+
+    if (message.type !== 'assistant') {
+      continue
+    }
+
+    for (const block of message.message.content) {
+      if (block.type !== 'tool_use') {
+        continue
+      }
+      if (isAgentTeamsMemberWorkSyncToolName(block.name, 'report')) {
+        pendingReportToolUseIds.add(block.id)
+        continue
+      }
+      if (isAgentTeamsMemberWorkSyncToolName(block.name, 'status')) {
+        pendingStatusToolUseIds.add(block.id)
+      }
+    }
+  }
+
+  if (pendingReportToolUseIds.size > 0 || pendingStatusToolUseIds.size > 0) {
+    return 'pending_tool'
+  }
+  return sawSuccessfulStatus ? 'status' : 'none'
+}
+
 export function findOrdinaryDirectReplyFallback({
   messages,
   submitUserMessageUuid,
@@ -1293,7 +1684,7 @@ type OrdinaryProcessingAction =
   | { type: 'noop' }
   | { type: 'reset_to_pending' }
   | { type: 'finalize' }
-  | { type: 'schedule_cooldown' }
+  | { type: 'schedule_cooldown'; cooldownMs?: number }
   | {
       type: 'schedule_recovery'
       detail: string
@@ -1403,12 +1794,14 @@ export function getBootstrapProcessingAction({
 export function getOrdinaryProcessingAction({
   attempt,
   messages,
+  now = Date.now(),
   processingOrdinaryMessage,
   recoveryAttemptCount = 0,
   teamName,
 }: {
   attempt?: OrdinaryAttemptState
   messages: AppState['messages']
+  now?: number
   processingOrdinaryMessage?: PendingInboxMirrorMessage
   recoveryAttemptCount?: number
   teamName?: string
@@ -1436,9 +1829,60 @@ export function getOrdinaryProcessingAction({
   })
   const requiresUserReply =
     processingOrdinaryMessage.from.trim().toLowerCase() === 'user'
+  const requiresWorkSyncReport =
+    processingOrdinaryMessage.messageKind === 'member_work_sync_nudge'
+  const workSyncOutcome = requiresWorkSyncReport
+    ? findMemberWorkSyncNudgeOutcome({
+        messages,
+        submitUserMessageUuid: attempt.submitUserMessageUuid,
+      })
+    : 'none'
 
-  if (outcome === 'user_send_message') {
+  if (requiresWorkSyncReport) {
+    if (workSyncOutcome === 'report') {
+      return { type: 'finalize' }
+    }
+  }
+
+  if (!requiresWorkSyncReport && outcome === 'user_send_message') {
     return { type: 'finalize' }
+  }
+
+  if (
+    requiresWorkSyncReport &&
+    attempt.status === 'in_flight' &&
+    executionError
+  ) {
+    return {
+      type: 'schedule_cooldown',
+      cooldownMs: MEMBER_WORK_SYNC_NUDGE_RETRY_COOLDOWN_MS,
+    }
+  }
+
+  if (
+    requiresWorkSyncReport &&
+    attempt.status === 'in_flight' &&
+    workSyncOutcome === 'pending_tool'
+  ) {
+    if (now - attempt.submittedAt < MEMBER_WORK_SYNC_NUDGE_IN_FLIGHT_STALL_MS) {
+      return { type: 'noop' }
+    }
+    return {
+      type: 'schedule_cooldown',
+      cooldownMs: MEMBER_WORK_SYNC_NUDGE_RETRY_COOLDOWN_MS,
+    }
+  }
+
+  if (
+    requiresWorkSyncReport &&
+    attempt.status === 'in_flight' &&
+    !observedPostSubmitActivity &&
+    now - attempt.submittedAt >= MEMBER_WORK_SYNC_NUDGE_IN_FLIGHT_STALL_MS
+  ) {
+    return {
+      type: 'schedule_cooldown',
+      cooldownMs: MEMBER_WORK_SYNC_NUDGE_RETRY_COOLDOWN_MS,
+    }
   }
 
   if (
@@ -1494,7 +1938,19 @@ export function getOrdinaryProcessingAction({
     return { type: 'noop' }
   }
 
-  if (!requiresUserReply && observedPostSubmitActivity) {
+  if (
+    !requiresWorkSyncReport &&
+    attempt.status === 'in_flight' &&
+    !observedPostSubmitActivity &&
+    now - attempt.submittedAt >= ORDINARY_DIRECT_MESSAGE_IN_FLIGHT_STALL_MS
+  ) {
+    return {
+      type: 'schedule_cooldown',
+      cooldownMs: ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS,
+    }
+  }
+
+  if (!requiresUserReply && !requiresWorkSyncReport && observedPostSubmitActivity) {
     return { type: 'finalize' }
   }
 
@@ -1516,7 +1972,12 @@ export function getOrdinaryProcessingAction({
     if (!observedPostSubmitActivity) {
       return { type: 'noop' }
     }
-    return { type: 'schedule_cooldown' }
+    return {
+      type: 'schedule_cooldown',
+      ...(requiresWorkSyncReport
+        ? { cooldownMs: MEMBER_WORK_SYNC_NUDGE_RETRY_COOLDOWN_MS }
+        : {}),
+    }
   }
 
   return { type: 'noop' }
@@ -2516,9 +2977,34 @@ export function useInboxPoller({
         .map(message => message.messageId)
         .filter((messageId): messageId is string => !!messageId),
     )
-    const processingOrdinaryMessage = activeOrdinaryMessages.find(
-      message => message.status === 'processing' && !!message.messageId,
-    )
+    const transcriptMessages = getMessages()
+    const processingOrdinaryMessage = getProcessingOrdinaryMessage({
+      messages: activeOrdinaryMessages,
+      getAttemptStatus: messageId =>
+        ordinaryAttemptsRef.current.get(messageId)?.status,
+      shouldProcessCoolingDown: message => {
+        if (!message.messageId) {
+          return false
+        }
+        const coolingAttempt = ordinaryAttemptsRef.current.get(message.messageId)
+        if (coolingAttempt?.status !== 'cooling_down') {
+          return false
+        }
+        const action = getOrdinaryProcessingAction({
+          attempt: coolingAttempt,
+          messages: transcriptMessages,
+          processingOrdinaryMessage: message,
+          recoveryAttemptCount:
+            ordinaryRecoveryRef.current.get(message.messageId)?.attemptCount ?? 0,
+          ...(teamName ? { teamName } : {}),
+        })
+        return (
+          action.type === 'finalize' ||
+          action.type === 'deliver_assistant_text' ||
+          action.type === 'notify_failure'
+        )
+      },
+    })
 
     for (const [messageId, attempt] of bootstrapAttemptsRef.current.entries()) {
       if (!activeBootstrapMessageIds.has(messageId)) {
@@ -2565,7 +3051,7 @@ export function useInboxPoller({
       )
       const processingAction = getOrdinaryProcessingAction({
         attempt,
-        messages: getMessages(),
+        messages: transcriptMessages,
         processingOrdinaryMessage,
         recoveryAttemptCount:
           ordinaryRecoveryRef.current.get(processingOrdinaryMessage.messageId)
@@ -2844,6 +3330,8 @@ export function useInboxPoller({
       }
 
       if (processingAction.type === 'schedule_cooldown' && attempt) {
+        const cooldownMs =
+          processingAction.cooldownMs ?? ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS
         const timer = setTimeout(() => {
           ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId!)
           setAppState(prev => ({
@@ -2857,12 +3345,12 @@ export function useInboxPoller({
               ),
             },
           }))
-        }, ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS)
+        }, cooldownMs)
 
         ordinaryAttemptsRef.current.set(processingOrdinaryMessage.messageId, {
           ...attempt,
           timer,
-          cooldownUntil: now + ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS,
+          cooldownUntil: now + cooldownMs,
           status: 'cooling_down',
         })
         return

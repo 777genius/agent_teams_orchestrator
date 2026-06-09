@@ -94,6 +94,44 @@ function compactText(value: string | null | undefined): string {
   return String(value || '').replace(/\s+/g, ' ').trim()
 }
 
+function isRejectedMemberWorkSyncReportText(text: string): boolean {
+  const normalized = compactText(text).toLowerCase()
+  return (
+    /\baccepted\s*[:=]\s*false\b/.test(normalized) ||
+    /"accepted"\s*:\s*false/.test(normalized) ||
+    /\bnot\s+accepted\b/.test(normalized) ||
+    /\breport\s+rejected\b/.test(normalized) ||
+    /\breport\s+(?:was\s+)?(?:not\s+accepted|failed)\b/.test(normalized) ||
+    /\bmember_work_sync_report\s+(?:not\s+accepted|rejected|failed)\b/.test(normalized) ||
+    /\breport_rejected(?::|_|\b)/.test(normalized) ||
+    /\bstale[_\s-]+(?:agenda[_\s-]+)?fingerprint\b/.test(normalized) ||
+    /\binvalid[_\s-]+report[_\s-]+token\b/.test(normalized) ||
+    /\breport[_\s-]+token[_\s-]+invalid\b/.test(normalized) ||
+    /\bidentity[_\s-]+(?:untrusted|mismatch)\b/.test(normalized) ||
+    /\bmember[_\s-]+inactive\b/.test(normalized) ||
+    /\breserved[_\s-]+or[_\s-]+invalid[_\s-]+member\b/.test(normalized) ||
+    /\bteam[_\s-]+runtime[_\s-]+inactive\b/.test(normalized) ||
+    /\bforeign[_\s-]+task[_\s-]+id\b/.test(normalized) ||
+    /\bcaught[_\s-]+up[_\s-]+rejected[_\s-]+actionable[_\s-]+items[_\s-]+exist\b/.test(normalized) ||
+    /\bstill[_\s-]+working[_\s-]+rejected[_\s-]+agenda[_\s-]+empty\b/.test(normalized) ||
+    /\bblocked[_\s-]+without[_\s-]+evidence\b/.test(normalized) ||
+    /\breport fingerprint is stale\b/.test(normalized) ||
+    /\breport token is (?:invalid|required)\b/.test(normalized) ||
+    /\bcannot report caught_up while actionable work remains\b/.test(normalized) ||
+    /\bcannot report still_working when no actionable work remains\b/.test(normalized)
+  )
+}
+
+function isAcceptedMemberWorkSyncReportText(text: string): boolean {
+  const normalized = compactText(text).toLowerCase()
+  return (
+    /\baccepted\s*[:=]\s*true\b/.test(normalized) ||
+    /"accepted"\s*:\s*true/.test(normalized) ||
+    /\breport\s+(?:was\s+)?accepted\b/.test(normalized) ||
+    /\bmember_work_sync_report\s+(?:was\s+)?accepted\b/.test(normalized)
+  )
+}
+
 function messagePreview(message: OpenCodeCanonicalMessage | null): string | null {
   if (!message) return null
   return (
@@ -108,6 +146,36 @@ function isMeaningfulNonVisibleTool(toolName: string): boolean {
   if (toolName.startsWith('task_')) return true
   if (toolName === 'member_work_sync_report') return true
   return EXECUTION_TOOL_NAMES.has(toolName)
+}
+
+function isRejectedMemberWorkSyncReportTool(
+  tool: OpenCodeCanonicalToolCall,
+  normalizedToolName: string,
+): boolean {
+  if (normalizedToolName !== 'member_work_sync_report') return false
+  const acceptedFlags = collectAcceptedFlagsFromValue([
+    tool.output,
+    tool.outputText,
+    tool.outputPreview,
+  ])
+  if (acceptedFlags.includes(false)) return true
+  const texts = [compactText(tool.outputText), compactText(tool.outputPreview)].filter(Boolean)
+  return texts.some(text => isRejectedMemberWorkSyncReportText(text))
+}
+
+function isAcceptedMemberWorkSyncReportTool(
+  tool: OpenCodeCanonicalToolCall,
+  normalizedToolName: string,
+): boolean {
+  if (normalizedToolName !== 'member_work_sync_report') return false
+  const acceptedFlags = collectAcceptedFlagsFromValue([
+    tool.output,
+    tool.outputText,
+    tool.outputPreview,
+  ])
+  if (acceptedFlags.includes(true) && !acceptedFlags.includes(false)) return true
+  const texts = [compactText(tool.outputText), compactText(tool.outputPreview)].filter(Boolean)
+  return texts.some(text => isAcceptedMemberWorkSyncReportText(text))
 }
 
 function isErroredTool(tool: OpenCodeCanonicalToolCall): boolean {
@@ -131,6 +199,109 @@ function parseJsonRecord(value: string | null | undefined): Record<string, unkno
   } catch {
     return null
   }
+}
+
+function tryParseJsonRecord(value: string): Record<string, unknown> | null {
+  try {
+    return asRecord(JSON.parse(value))
+  } catch {
+    return null
+  }
+}
+
+function parseEmbeddedJsonRecord(value: string | null | undefined): Record<string, unknown> | null {
+  const text = value?.trim()
+  if (!text) return null
+  const exact = tryParseJsonRecord(text)
+  if (exact) return exact
+
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let firstParsed: Record<string, unknown> | null = null
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (start === -1) {
+      if (char === '{') {
+        start = index
+        depth = 1
+        inString = false
+        escaped = false
+      }
+      continue
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+    if (char === '{') {
+      depth += 1
+      continue
+    }
+    if (char !== '}') {
+      continue
+    }
+
+    depth -= 1
+    if (depth === 0) {
+      const parsed = tryParseJsonRecord(text.slice(start, index + 1))
+      if (parsed) {
+        if (typeof parsed.accepted === 'boolean') {
+          return parsed
+        }
+        firstParsed ??= parsed
+      }
+      start = -1
+    }
+  }
+
+  return firstParsed
+}
+
+function collectAcceptedFlagsFromValue(value: unknown, flags: boolean[] = []): boolean[] {
+  if (typeof value === 'string') {
+    const parsed = parseEmbeddedJsonRecord(value)
+    if (typeof parsed?.accepted === 'boolean') {
+      flags.push(parsed.accepted)
+    } else if (isRejectedMemberWorkSyncReportText(value)) {
+      flags.push(false)
+    }
+    return flags
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach(item => collectAcceptedFlagsFromValue(item, flags))
+    return flags
+  }
+
+  const record = asRecord(value)
+  if (!record) return flags
+
+  if (typeof record.accepted === 'boolean') {
+    flags.push(record.accepted)
+  }
+
+  for (const key of ['content', 'text', 'result', 'output', 'data'] as const) {
+    if (key in record) {
+      collectAcceptedFlagsFromValue(record[key], flags)
+    }
+  }
+
+  return flags
 }
 
 function getNestedRecord(
@@ -279,6 +450,8 @@ function classifyChildren(input: {
 
   let hasRunningTool = false
   let hasErroredMeaningfulTool = false
+  let hasRejectedMemberWorkSyncReport = false
+  let hasAcceptedMemberWorkSyncReport = false
   let best: OpenCodeDeliveryResponseObservation | null = null
   const observedToolNames = new Set<string>()
 
@@ -318,6 +491,14 @@ function classifyChildren(input: {
           hasErroredMeaningfulTool = true
         }
         continue
+      }
+
+      if (isRejectedMemberWorkSyncReportTool(tool, normalizedName)) {
+        hasRejectedMemberWorkSyncReport = true
+        continue
+      }
+      if (isAcceptedMemberWorkSyncReportTool(tool, normalizedName)) {
+        hasAcceptedMemberWorkSyncReport = true
       }
 
       if (normalizedName === 'message_send') {
@@ -362,6 +543,9 @@ function classifyChildren(input: {
 
     const text = compactText(child.text) || compactText(child.previewText)
     if (text) {
+      if (hasRejectedMemberWorkSyncReport && !hasAcceptedMemberWorkSyncReport) {
+        continue
+      }
       const candidate = buildObservation({
         state: 'responded_plain_text',
         deliveredUserMessageId,
@@ -377,13 +561,6 @@ function classifyChildren(input: {
     }
   }
 
-  if (best) {
-    return {
-      ...best,
-      toolCallNames: [...observedToolNames],
-    }
-  }
-
   if (hasRunningTool || input.rawStatus === 'busy' || input.rawStatus === 'retry') {
     return buildObservation({
       state: 'pending',
@@ -393,6 +570,24 @@ function classifyChildren(input: {
       latestAssistantPreview: messagePreview(input.children[input.children.length - 1] ?? null),
       reason: 'assistant_response_pending',
     })
+  }
+
+  if (hasRejectedMemberWorkSyncReport && !hasAcceptedMemberWorkSyncReport) {
+    return buildObservation({
+      state: 'tool_error',
+      deliveredUserMessageId,
+      assistantMessageId: input.children[input.children.length - 1]?.id ?? null,
+      toolCallNames: [...observedToolNames],
+      latestAssistantPreview: messagePreview(input.children[input.children.length - 1] ?? null),
+      reason: 'member_work_sync_report_rejected',
+    })
+  }
+
+  if (best) {
+    return {
+      ...best,
+      toolCallNames: [...observedToolNames],
+    }
   }
 
   if (hasErroredMeaningfulTool) {
