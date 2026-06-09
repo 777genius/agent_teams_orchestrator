@@ -566,6 +566,69 @@ describe('executeCodexNativeTurn', () => {
     }
   })
 
+  test('passes app-owned launch config settings to native config overrides', async () => {
+    const previousSettings = getFlagSettingsInline()
+    let observedConfigOverrides: string[] | undefined
+
+    try {
+      setFlagSettingsInline({
+        codex: {
+          forced_login_method: 'chatgpt',
+          agent_teams_launch_config: {
+            config_overrides: [
+              'service_tier="flex"',
+              'service_tier="fast"',
+              'features.fast_mode=true',
+              'forced_login_method="api"',
+            ],
+          },
+        },
+      })
+
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedConfigOverrides = options.configOverrides
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'none',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedConfigOverrides).toEqual([
+        'service_tier="flex"',
+        'service_tier="fast"',
+        'features.fast_mode=true',
+      ])
+    } finally {
+      setFlagSettingsInline(previousSettings)
+    }
+  })
+
   test('passes validated custom provider settings to native exec config overrides', async () => {
     const previousSettings = getFlagSettingsInline()
     let observedConfigOverrides: string[] | undefined

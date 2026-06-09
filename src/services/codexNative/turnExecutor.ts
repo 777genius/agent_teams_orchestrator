@@ -35,6 +35,7 @@ import {
 } from './appServerApproval.js'
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
+import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -607,6 +608,7 @@ export async function* executeCodexNativeTurn(
           strictMcpConfig: getStrictMcpConfig(),
         }),
         ...buildCodexNativeWorkspaceTrustConfigOverrides(),
+        ...buildCodexNativeLaunchConfigOverrides(),
       ],
       disabledFeatures: resolveCodexNativeDisabledFeatures({
         apiKey,
