@@ -243,16 +243,10 @@ async function ensureDirectorySymlink(linkPath: string, targetPath: string): Pro
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     if (await isDirectorySymlinkTo(linkPath, targetPath)) {
       return
     }
-
-    await rm(linkPath, { recursive: true, force: true }).catch(error => {
-      if (getErrnoCode(error) !== 'ENOENT') {
-        throw error
-      }
-    })
 
     try {
       await symlink(targetPath, linkPath, 'dir')
@@ -265,14 +259,21 @@ async function ensureDirectorySymlink(linkPath: string, targetPath: string): Pro
         return
       }
     }
+
+    await rm(linkPath, { recursive: true, force: true }).catch(error => {
+      if (getErrnoCode(error) !== 'ENOENT') {
+        throw error
+      }
+    })
   }
 
   if (await isDirectorySymlinkTo(linkPath, targetPath)) {
     return
   }
-  await rm(linkPath, { recursive: true, force: true })
+
   try {
     await symlink(targetPath, linkPath, 'dir')
+    return
   } catch (error) {
     if (getErrnoCode(error) === 'EEXIST' && await isDirectorySymlinkTo(linkPath, targetPath)) {
       return

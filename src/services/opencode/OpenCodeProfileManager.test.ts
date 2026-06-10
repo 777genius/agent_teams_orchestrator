@@ -1,6 +1,8 @@
 import { lstat, mkdtemp, mkdir, readlink, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
@@ -24,6 +26,35 @@ import {
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
+}
+
+async function runBunScript(
+  scriptPath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', chunk => {
+      stdout += String(chunk)
+    })
+    child.stderr.on('data', chunk => {
+      stderr += String(chunk)
+    })
+    child.on('error', reject)
+    child.on('close', code => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(`script exited with code ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`))
+    })
+  })
 }
 
 describe('OpenCodeProfileManager project behavior contract', () => {
@@ -644,6 +675,68 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(new Set(profiles.map(profile => profile.profileRootKey))).toEqual(
         new Set([firstProfile.profileRootKey]),
       )
+      expect(repairedStat.isSymbolicLink()).toBe(true)
+      expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
+        path.join(firstProfile.xdgCacheHome, 'config-node_modules'),
+      )
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
+  test('handles profile node_modules repair across separate process preparation races', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-process-race')
+    const appCacheHome = path.join(tempDir, 'app-cache-process-race')
+    const projectPath = path.join(tempDir, 'project-process-race')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    try {
+      await mkdir(projectPath, { recursive: true })
+      const manager = new OpenCodeProfileManager()
+      const firstProfile = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+      const profileNodeModulesPath = path.join(
+        firstProfile.xdgConfigHome,
+        'opencode',
+        'node_modules',
+      )
+      await rm(profileNodeModulesPath, { recursive: true, force: true })
+      await mkdir(profileNodeModulesPath, { recursive: true })
+      await writeFile(path.join(profileNodeModulesPath, 'stale.txt'), 'stale directory\n', 'utf8')
+
+      const profileManagerUrl = pathToFileURL(
+        path.resolve('src/services/opencode/OpenCodeProfileManager.ts'),
+      ).href
+      const scriptPath = path.join(tempDir, 'prepare-opencode-profile.mjs')
+      await writeFile(
+        scriptPath,
+        `const { OpenCodeProfileManager } = await import(${JSON.stringify(profileManagerUrl)});
+await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppMcp: false });
+`,
+        'utf8',
+      )
+      const childEnv = {
+        ...process.env,
+        [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: appDataHome,
+        [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: appCacheHome,
+      }
+
+      await Promise.all(
+        Array.from({ length: 8 }, () => runBunScript(scriptPath, [projectPath], childEnv)),
+      )
+
+      const repairedStat = await lstat(profileNodeModulesPath)
+      const repairedTarget = await readlink(profileNodeModulesPath)
       expect(repairedStat.isSymbolicLink()).toBe(true)
       expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
         path.join(firstProfile.xdgCacheHome, 'config-node_modules'),

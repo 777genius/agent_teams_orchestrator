@@ -566,7 +566,7 @@ describe('executeCodexNativeTurn', () => {
     }
   })
 
-  test('passes app-owned launch config settings to native config overrides', async () => {
+  test('passes supported app-owned launch config settings to native config overrides', async () => {
     const previousSettings = getFlagSettingsInline()
     let observedConfigOverrides: string[] | undefined
 
@@ -620,7 +620,6 @@ describe('executeCodexNativeTurn', () => {
       )
 
       expect(observedConfigOverrides).toEqual([
-        'service_tier="flex"',
         'service_tier="fast"',
         'features.fast_mode=true',
       ])
@@ -759,6 +758,110 @@ describe('executeCodexNativeTurn', () => {
       ])
     } finally {
       setFlagSettingsInline(previousSettings)
+    }
+  })
+
+  test('isolates user config by default for native exec', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedIgnoreUserConfig: boolean | undefined
+
+    try {
+      delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedIgnoreUserConfig = options.ignoreUserConfig
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedIgnoreUserConfig).toBe(true)
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
+    }
+  })
+
+  test('allows explicit user config isolation opt-out for native exec', async () => {
+    const previousIgnoreUserConfig =
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+    let observedIgnoreUserConfig: boolean | undefined
+
+    try {
+      process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG = 'false'
+      await collectMessages(
+        executeCodexNativeTurn(baseParams(), {
+          runExec: async function* (options) {
+            observedIgnoreUserConfig = options.ignoreUserConfig
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'assistant_text',
+                itemId: 'item_0',
+                text: 'OK',
+              },
+            }
+            yield {
+              type: 'normalized_event',
+              event: {
+                type: 'turn_completed',
+              },
+            }
+            return {
+              identity: {
+                executablePath: '/usr/local/bin/codex',
+                executableSource: 'system-path',
+                version: 'codex-cli 0.117.0',
+              },
+              threadId: null,
+              credentialSource: 'ambient-process-env',
+              completionPolicy: 'ephemeral',
+              finalHistoryCompleteness: 'live-only',
+              finalUsageAuthority: 'live-turn-completed',
+            }
+          },
+        }),
+      )
+
+      expect(observedIgnoreUserConfig).toBe(false)
+    } finally {
+      if (previousIgnoreUserConfig === undefined) {
+        delete process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG
+      } else {
+        process.env.CLAUDE_CODE_CODEX_NATIVE_IGNORE_USER_CONFIG =
+          previousIgnoreUserConfig
+      }
     }
   })
 

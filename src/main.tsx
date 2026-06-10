@@ -172,6 +172,7 @@ import { type ProcessedResume, processResumedConversation } from 'src/utils/sess
 import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
 import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV, writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
+import { resolveStartupMcpConfig } from './services/teamBootstrap/headlessStartupMcpConfig.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
@@ -2329,6 +2330,7 @@ async function run(): Promise<CommanderCommand> {
         event: 'startup' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         durationMs: Math.round(process.uptime() * 1000)
       });
+      writeHeadlessTeammateStartupCheckpoint('startup_timer_logged');
       let onboardingShown = false;
       if (!isHeadlessTeammateRuntime) {
         logForDebugging('[STARTUP] Running showSetupScreens()...');
@@ -2401,6 +2403,7 @@ async function run(): Promise<CommanderCommand> {
       if (!orgValidation.valid) {
         await exitWithError(root, orgValidation.message);
       }
+      writeHeadlessTeammateStartupCheckpoint('force_login_org_validated');
     }
 
     // If gracefulShutdown was initiated (e.g., user rejected trust dialog),
@@ -2417,10 +2420,11 @@ async function run(): Promise<CommanderCommand> {
     // code in untrusted directories before user consent.
     // Must be after inline plugins are set (if any) so --plugin-dir LSP servers are included.
     initializeLspServerManager();
+    writeHeadlessTeammateStartupCheckpoint('lsp_manager_initialized');
 
     // Show settings validation errors after trust is established
     // MCP config errors don't block settings from loading, so exclude them
-    if (!isNonInteractiveSession) {
+    if (!isNonInteractiveSession && !isHeadlessTeammateRuntime) {
       const {
         errors
       } = getSettingsWithErrors();
@@ -2432,6 +2436,7 @@ async function run(): Promise<CommanderCommand> {
         });
       }
     }
+    writeHeadlessTeammateStartupCheckpoint('settings_errors_checked');
 
     // Check quota status, fast mode, passes eligibility, and bootstrap data
     // after trust is established. These make API calls which could trigger
@@ -2474,13 +2479,23 @@ async function run(): Promise<CommanderCommand> {
     if (!isNonInteractiveSession) {
       void refreshExampleCommands(); // Pre-fetch example commands (runs git log, no API call)
     }
+    writeHeadlessTeammateStartupCheckpoint('startup_prefetches_started');
 
     // Resolve MCP configs (started early, overlaps with setup/trust dialog work)
+    writeHeadlessTeammateStartupCheckpoint('mcp_configs_wait_started');
+    const mcpConfigResolution = await resolveStartupMcpConfig(mcpConfigPromise, {
+      headlessTeammateRuntime: isHeadlessTeammateRuntime
+    });
     const {
       servers: existingMcpConfigs
-    } = await mcpConfigPromise;
-    writeHeadlessTeammateStartupCheckpoint('mcp_configs_loaded');
-    logForDebugging(`[STARTUP] MCP configs resolved in ${mcpConfigResolvedMs}ms (awaited at +${Date.now() - mcpConfigStart}ms)`);
+    } = mcpConfigResolution.result;
+    if (mcpConfigResolution.timedOut) {
+      writeHeadlessTeammateStartupCheckpoint('mcp_configs_timeout');
+      logForDebugging(`[STARTUP] MCP configs did not resolve within ${mcpConfigResolution.timeoutMs}ms for headless teammate; continuing with explicit MCP config only`);
+    } else {
+      writeHeadlessTeammateStartupCheckpoint('mcp_configs_loaded');
+      logForDebugging(`[STARTUP] MCP configs resolved in ${mcpConfigResolvedMs}ms (awaited at +${Date.now() - mcpConfigStart}ms)`);
+    }
     // CLI flag (--mcp-config) should override file-based configs, matching settings precedence
     const allMcpConfigs = {
       ...existingMcpConfigs,

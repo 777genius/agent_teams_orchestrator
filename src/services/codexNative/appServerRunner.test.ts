@@ -1,4 +1,8 @@
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, test } from 'bun:test'
 
@@ -45,6 +49,96 @@ async function collect(
 }
 
 describe('runCodexNativeAppServer', () => {
+  test('runs app-server with a Codex home overlay that omits user config.toml', async () => {
+    const fake = createFakeCodexAppServer()
+    const sourceHome = await mkdtemp(path.join(tmpdir(), 'codex-home-source-'))
+    const previousCodexHome = process.env.CODEX_HOME
+    let spawnedCodexHome: string | undefined
+
+    await writeFile(path.join(sourceHome, 'config.toml'), 'service_tier = "priority"\n')
+    await writeFile(path.join(sourceHome, 'auth.json'), '{"tokens":true}\n')
+
+    fake.stdin.on('data', chunk => {
+      for (const line of String(chunk).split('\n')) {
+        if (!line.trim()) continue
+        const message = JSON.parse(line) as {
+          id?: number | string
+          method?: string
+        }
+
+        if (message.method === 'initialize') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {},
+          })
+          continue
+        }
+
+        if (message.method === 'thread/start') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { thread: { id: 'thread-1' } },
+          })
+          continue
+        }
+
+        if (message.method === 'turn/start') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { turn: { id: 'turn-1', status: 'inProgress' } },
+          })
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: {
+              threadId: 'thread-1',
+              turn: { id: 'turn-1', status: 'completed' },
+            },
+          })
+        }
+      }
+    })
+
+    try {
+      process.env.CODEX_HOME = sourceHome
+      await collect(
+        runCodexNativeAppServer(
+          {
+            prompt: 'Reply PONG',
+            cwd: '/tmp/demo',
+            model: 'gpt-5.4',
+            requestApproval: async () => ({ allow: true }),
+          },
+          {
+            which: () => '/usr/local/bin/codex',
+            resolveVersion: () => 'codex-cli 0.125.0',
+            spawnProcess: (_executablePath, _args, options) => {
+              spawnedCodexHome = options.env.CODEX_HOME
+              expect(spawnedCodexHome).toBeTruthy()
+              expect(spawnedCodexHome).not.toBe(sourceHome)
+              expect(existsSync(path.join(spawnedCodexHome!, 'config.toml'))).toBe(false)
+              expect(existsSync(path.join(spawnedCodexHome!, 'auth.json'))).toBe(true)
+              return fake.child as never
+            },
+          },
+        ),
+      )
+
+      expect(spawnedCodexHome).toBeTruthy()
+      expect(existsSync(spawnedCodexHome!)).toBe(false)
+    } finally {
+      if (previousCodexHome === undefined) {
+        delete process.env.CODEX_HOME
+      } else {
+        process.env.CODEX_HOME = previousCodexHome
+      }
+      await rm(sourceHome, { recursive: true, force: true })
+    }
+  })
+
   test('round-trips a real app-server approval request into the injected approval handler', async () => {
     const fake = createFakeCodexAppServer()
     const approvalResponses: Array<Record<string, unknown>> = []

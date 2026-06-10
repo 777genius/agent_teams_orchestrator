@@ -345,7 +345,10 @@ function shouldIgnoreCodexNativeUserConfig(
     return true
   }
   const value = env[CODEX_NATIVE_IGNORE_USER_CONFIG_ENV]?.trim().toLowerCase()
-  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+  if (!value) {
+    return true
+  }
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
 }
 
 function resolveCodexNativeDisabledFeatures(params: {
@@ -356,8 +359,8 @@ function resolveCodexNativeDisabledFeatures(params: {
     return []
   }
 
-  // Codex API-key auth cannot sync ChatGPT remote plugins. Keep user config and
-  // MCP overrides intact, but disable the unsupported plugin subsystem.
+  // Codex API-key auth cannot sync ChatGPT remote plugins. Keep app-owned MCP
+  // overrides intact, but disable the unsupported plugin subsystem.
   return ['plugins']
 }
 

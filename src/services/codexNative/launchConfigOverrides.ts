@@ -2,11 +2,11 @@ import { getFlagSettingsInline } from '../../bootstrap/state.js'
 
 const LAUNCH_CONFIG_SETTINGS_KEY = 'agent_teams_launch_config'
 const CONFIG_OVERRIDES_KEY = 'config_overrides'
-const MAX_LAUNCH_CONFIG_OVERRIDE_COUNT = 8
+const FAST_SERVICE_TIER_OVERRIDE = 'service_tier="fast"'
+const FAST_MODE_FEATURE_OVERRIDE = 'features.fast_mode=true'
 const SAFE_LAUNCH_CONFIG_OVERRIDES = new Set([
-  'service_tier="flex"',
-  'service_tier="fast"',
-  'features.fast_mode=true',
+  FAST_SERVICE_TIER_OVERRIDE,
+  FAST_MODE_FEATURE_OVERRIDE,
 ])
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -32,7 +32,8 @@ export function buildCodexNativeLaunchConfigOverrides(params?: {
     return []
   }
 
-  const overrides: string[] = []
+  let hasFastServiceTier = false
+  let hasFastModeFeature = false
   for (const rawOverride of rawOverrides) {
     if (typeof rawOverride !== 'string') {
       continue
@@ -40,13 +41,15 @@ export function buildCodexNativeLaunchConfigOverrides(params?: {
     if (!SAFE_LAUNCH_CONFIG_OVERRIDES.has(rawOverride)) {
       continue
     }
-    if (overrides.includes(rawOverride)) {
-      continue
+    if (rawOverride === FAST_SERVICE_TIER_OVERRIDE) {
+      hasFastServiceTier = true
     }
-    overrides.push(rawOverride)
-    if (overrides.length >= MAX_LAUNCH_CONFIG_OVERRIDE_COUNT) {
-      break
+    if (rawOverride === FAST_MODE_FEATURE_OVERRIDE) {
+      hasFastModeFeature = true
     }
   }
-  return overrides
+
+  return hasFastServiceTier && hasFastModeFeature
+    ? [FAST_SERVICE_TIER_OVERRIDE, FAST_MODE_FEATURE_OVERRIDE]
+    : []
 }

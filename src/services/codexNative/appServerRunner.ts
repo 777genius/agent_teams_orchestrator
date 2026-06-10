@@ -1,4 +1,14 @@
 import { type ChildProcess } from 'node:child_process'
+import {
+  cp,
+  lstat,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+} from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import path from 'node:path'
 import readline from 'node:readline'
 
 import { killProcessTree } from '../../utils/processKill.js'
@@ -101,6 +111,9 @@ type QueuedObservation =
   | { type: 'runner_done' }
 
 const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS = 120_000
+const CODEX_CONFIG_FILE_NAME = 'config.toml'
+const CODEX_APP_SERVER_HOME_PREFIX = 'codex-app-server-home-'
+const REQUIRED_CODEX_HOME_OVERLAY_ENTRIES = new Set(['accounts', 'auth.json'])
 
 function defaultResolveVersion(executablePath: string): string | null {
   try {
@@ -145,6 +158,85 @@ function buildAppServerArgs(options: CodexNativeAppServerRunnerOptions): string[
     args.push('--disable', feature)
   }
   return args
+}
+
+function resolveCodexHome(env: NodeJS.ProcessEnv): string {
+  return env.CODEX_HOME?.trim() || path.join(homedir(), '.codex')
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as NodeJS.ErrnoException).code === 'ENOENT',
+  )
+}
+
+async function linkCodexHomeEntry(
+  entryName: string,
+  sourcePath: string,
+  targetPath: string,
+): Promise<void> {
+  const stats = await lstat(sourcePath)
+  try {
+    await symlink(sourcePath, targetPath, stats.isDirectory() ? 'dir' : 'file')
+    return
+  } catch (symlinkError) {
+    try {
+      await cp(sourcePath, targetPath, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+        verbatimSymlinks: true,
+      })
+    } catch {
+      if (REQUIRED_CODEX_HOME_OVERLAY_ENTRIES.has(entryName)) {
+        throw symlinkError
+      }
+    }
+  }
+}
+
+async function createCodexAppServerHomeOverlay(
+  env: NodeJS.ProcessEnv,
+): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => Promise<void> }> {
+  const sourceHome = resolveCodexHome(env)
+  const overlayHome = await mkdtemp(path.join(tmpdir(), CODEX_APP_SERVER_HOME_PREFIX))
+
+  try {
+    let entries: Awaited<ReturnType<typeof readdir>>
+    try {
+      entries = await readdir(sourceHome, { withFileTypes: true })
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error
+      }
+      entries = []
+    }
+
+    for (const entry of entries) {
+      if (entry.name === CODEX_CONFIG_FILE_NAME) {
+        continue
+      }
+      await linkCodexHomeEntry(
+        entry.name,
+        path.join(sourceHome, entry.name),
+        path.join(overlayHome, entry.name),
+      )
+    }
+  } catch (error) {
+    await rm(overlayHome, { recursive: true, force: true }).catch(() => undefined)
+    throw error
+  }
+
+  return {
+    env: {
+      ...env,
+      CODEX_HOME: overlayHome,
+    },
+    cleanup: () => rm(overlayHome, { recursive: true, force: true }),
+  }
 }
 
 function createObservationQueue() {
@@ -412,25 +504,33 @@ export async function* runCodexNativeAppServer(
     env.CODEX_API_KEY = options.apiKey
   }
 
-  const child =
-    deps.spawnProcess?.(executablePath, buildAppServerArgs(options), {
-      cwd: options.cwd,
-      env,
-      signal: options.abortSignal,
-      detached: process.platform !== 'win32',
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    }) ??
-    spawnPortableCli(executablePath, buildAppServerArgs(options), {
-      cwd: options.cwd,
-      env,
-      signal: options.abortSignal,
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
+  const codexHomeOverlay = await createCodexAppServerHomeOverlay(env)
+  let child: SpawnedCodexAppServerProcess
+  try {
+    child =
+      deps.spawnProcess?.(executablePath, buildAppServerArgs(options), {
+        cwd: options.cwd,
+        env: codexHomeOverlay.env,
+        signal: options.abortSignal,
+        detached: process.platform !== 'win32',
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }) ??
+      spawnPortableCli(executablePath, buildAppServerArgs(options), {
+        cwd: options.cwd,
+        env: codexHomeOverlay.env,
+        signal: options.abortSignal,
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+  } catch (error) {
+    await codexHomeOverlay.cleanup().catch(() => undefined)
+    throw error
+  }
 
   if (!child.stdin || !child.stdout) {
+    await codexHomeOverlay.cleanup().catch(() => undefined)
     throw new Error('Codex app-server stdio is unavailable.')
   }
 
@@ -699,6 +799,7 @@ export async function* runCodexNativeAppServer(
     throw error
   } finally {
     cleanup()
+    await codexHomeOverlay.cleanup().catch(() => undefined)
   }
 
   return {
