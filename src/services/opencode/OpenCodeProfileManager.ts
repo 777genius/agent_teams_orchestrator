@@ -113,6 +113,58 @@ const ATLAS_CLOUD_PROVIDER_CONFIG = {
   models: ATLAS_CLOUD_OPENCODE_MODELS,
 } as const
 
+const XIAOMI_MIMO_TOKEN_PLAN_MODELS = {
+  'mimo-v2.5-pro': {
+    name: 'mimo-v2.5-pro',
+    limit: {
+      context: 1_048_576,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text'],
+      output: ['text'],
+    },
+  },
+  'mimo-v2.5': {
+    name: 'mimo-v2.5',
+    limit: {
+      context: 1_048_576,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text', 'image'],
+      output: ['text'],
+    },
+  },
+} as const
+
+const XIAOMI_TOKEN_PLAN_PROVIDER_CONFIGS = {
+  'xiaomi-token-plan-ams': {
+    npm: '@ai-sdk/openai-compatible',
+    name: 'Xiaomi MiMo Token Plan - Europe',
+    options: {
+      baseURL: 'https://token-plan-ams.xiaomimimo.com/v1',
+    },
+    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
+  },
+  'xiaomi-token-plan-sgp': {
+    npm: '@ai-sdk/openai-compatible',
+    name: 'Xiaomi MiMo Token Plan - Singapore',
+    options: {
+      baseURL: 'https://token-plan-sgp.xiaomimimo.com/v1',
+    },
+    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
+  },
+  'xiaomi-token-plan-cn': {
+    npm: '@ai-sdk/openai-compatible',
+    name: 'Xiaomi MiMo Token Plan - China',
+    options: {
+      baseURL: 'https://token-plan-cn.xiaomimimo.com/v1',
+    },
+    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
+  },
+} as const
+
 function hashString(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
@@ -403,6 +455,7 @@ export function buildManagedConfig(
     snapshot: true,
     provider: {
       [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
+      ...XIAOMI_TOKEN_PLAN_PROVIDER_CONFIGS,
     },
     agent: {
       [OPEN_CODE_TEAMMATE_AGENT_NAME]: {

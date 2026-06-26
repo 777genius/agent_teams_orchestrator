@@ -202,6 +202,49 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
   })
 
+  test('seeds Xiaomi MiMo Token Plan OpenCode providers for regional Token Plan endpoints', () => {
+    const managedConfig = buildManagedConfig()
+
+    expect(managedConfig.provider).toMatchObject({
+      'xiaomi-token-plan-ams': {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'Xiaomi MiMo Token Plan - Europe',
+        options: {
+          baseURL: 'https://token-plan-ams.xiaomimimo.com/v1',
+        },
+        models: {
+          'mimo-v2.5-pro': {
+            name: 'mimo-v2.5-pro',
+            limit: {
+              context: 1_048_576,
+              output: 131_072,
+            },
+            modalities: {
+              input: ['text'],
+              output: ['text'],
+            },
+          },
+          'mimo-v2.5': {
+            modalities: {
+              input: ['text', 'image'],
+              output: ['text'],
+            },
+          },
+        },
+      },
+      'xiaomi-token-plan-sgp': {
+        options: {
+          baseURL: 'https://token-plan-sgp.xiaomimimo.com/v1',
+        },
+      },
+      'xiaomi-token-plan-cn': {
+        options: {
+          baseURL: 'https://token-plan-cn.xiaomimimo.com/v1',
+        },
+      },
+    })
+  })
+
   test('can prepare a managed profile without the app MCP overlay for model-only probes', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
     const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]

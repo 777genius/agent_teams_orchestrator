@@ -151,6 +151,19 @@ type SafeValue<T> =
   | { ok: true; value: T }
   | { ok: false; message: string }
 
+const XIAOMI_TOKEN_PLAN_PROVIDER_IDS = [
+  'xiaomi-token-plan-ams',
+  'xiaomi-token-plan-sgp',
+  'xiaomi-token-plan-cn',
+] as const
+const XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET = new Set<string>(XIAOMI_TOKEN_PLAN_PROVIDER_IDS)
+const XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES = Object.fromEntries(
+  XIAOMI_TOKEN_PLAN_PROVIDER_IDS.map(providerId => [
+    providerId,
+    [`${providerId}/mimo-v2.5-pro`, `${providerId}/mimo-v2.5`],
+  ]),
+) as Record<string, readonly string[]>
+
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   atlascloud: 'Atlas Cloud',
@@ -170,19 +183,31 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   togetherai: 'Together AI',
   vercel: 'Vercel AI Gateway',
   xai: 'xAI',
+  'xiaomi-token-plan-ams': 'Xiaomi MiMo Token Plan - Europe',
+  'xiaomi-token-plan-cn': 'Xiaomi MiMo Token Plan - China',
+  'xiaomi-token-plan-sgp': 'Xiaomi MiMo Token Plan - Singapore',
   zai: 'Z.AI',
   zenmux: 'ZenMux',
 }
 
-const SEEDED_PROVIDER_IDS = ['openrouter', 'opencode', 'atlascloud'] as const
+const SEEDED_PROVIDER_IDS = [
+  'openrouter',
+  'opencode',
+  'atlascloud',
+  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+] as const
 const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>(['atlascloud'])
-const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>(['atlascloud'])
+const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
+  'atlascloud',
+  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+])
 const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
   atlascloud: [
     'atlascloud/deepseek-ai/deepseek-v3.2',
     'atlascloud/deepseek-ai/deepseek-v4-flash',
     'atlascloud/zai-org/glm-5.1',
   ],
+  ...XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES,
 }
 const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   ...SEEDED_PROVIDER_IDS,
@@ -272,6 +297,25 @@ function normalizeProviderId(value: string | null | undefined): string | null {
   return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
 }
 
+function isXiaomiTokenPlanProviderId(providerId: string): boolean {
+  return XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET.has(providerId)
+}
+
+function getXiaomiTokenPlanApiKeyError(providerId: string, apiKey: string): string | null {
+  if (!isXiaomiTokenPlanProviderId(providerId)) {
+    return null
+  }
+
+  if (apiKey.startsWith('sk-')) {
+    return 'Xiaomi Token Plan providers require a tp-... API key. Pay-as-you-go sk-... keys cannot be used with Token Plan Base URLs.'
+  }
+  if (!apiKey.startsWith('tp-')) {
+    return 'Xiaomi Token Plan API key must start with tp-. Copy the key from the Token Plan page.'
+  }
+
+  return null
+}
+
 function normalizePositiveLimit(value: number | null | undefined): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return null
@@ -337,6 +381,7 @@ function redactSecret(message: string, secret: string | null | undefined): strin
 function redactDiagnostic(message: string): string {
   return message
     .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted]')
+    .replace(/tp-[A-Za-z0-9_-]{5,}/g, '[redacted]')
     .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, '$1[redacted]')
     .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"']+/gi, '$1[redacted]')
     .slice(0, 1_600)
@@ -861,6 +906,26 @@ function normalizeSetupMetadata(
   return normalized
 }
 
+function getCuratedApiSetupProfile(providerId: string): {
+  description: string
+  secretLabel: string
+  secretPlaceholder: string
+} {
+  if (isXiaomiTokenPlanProviderId(providerId)) {
+    return {
+      description: 'Use the Xiaomi Token Plan key from the Token Plan dashboard. After connect, select the Xiaomi MiMo model under the OpenCode runtime.',
+      secretLabel: 'Token Plan API key',
+      secretPlaceholder: 'tp-xxxxx',
+    }
+  }
+
+  return {
+    description: 'OpenCode documents this provider as an API-key /connect provider. The app verifies the live OpenCode connection before saving.',
+    secretLabel: 'API key',
+    secretPlaceholder: 'Paste API key',
+  }
+}
+
 function buildProviderSetupForm(input: {
   providerId: string
   displayName: string
@@ -892,6 +957,7 @@ function buildProviderSetupForm(input: {
   }
 
   if (input.knownProviderIds.has(input.providerId) && CURATED_API_BOOTSTRAP_PROVIDER_IDS.has(input.providerId)) {
+    const curatedProfile = getCuratedApiSetupProfile(input.providerId)
     return {
       runtimeId: 'opencode',
       providerId: input.providerId,
@@ -899,14 +965,14 @@ function buildProviderSetupForm(input: {
       method: 'api',
       supported: true,
       title: `Connect ${input.displayName}`,
-      description: 'OpenCode documents this provider as an API-key /connect provider. The app verifies the live OpenCode connection before saving.',
+      description: curatedProfile.description,
       submitLabel: 'Connect',
       disabledReason: null,
       source: 'curated',
       secret: {
         key: 'key',
-        label: 'API key',
-        placeholder: 'Paste API key',
+        label: curatedProfile.secretLabel,
+        placeholder: curatedProfile.secretPlaceholder,
         required: true,
       },
       prompts: [],
@@ -2780,6 +2846,10 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     const apiKey = input.apiKey?.trim() ?? ''
     if (!apiKey) {
       return providerManagementError('auth-required', 'API key is required')
+    }
+    const xiaomiTokenPlanApiKeyError = getXiaomiTokenPlanApiKeyError(providerId, apiKey)
+    if (xiaomiTokenPlanApiKeyError) {
+      return providerManagementError('auth-required', xiaomiTokenPlanApiKeyError)
     }
 
     return this.withManagedOpenCodeClient(

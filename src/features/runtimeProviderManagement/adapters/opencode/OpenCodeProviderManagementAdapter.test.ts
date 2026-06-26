@@ -153,6 +153,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'openrouter',
       'opencode',
       'atlascloud',
+      'xiaomi-token-plan-cn',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-sgp',
     ])
   })
 
@@ -420,6 +423,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'opencode',
       'openai',
       'atlascloud',
+      'xiaomi-token-plan-cn',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-sgp',
     ])
 
     const openai = result.value.providers.find(provider => provider.providerId === 'openai')
@@ -784,6 +790,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'openrouter',
       'atlascloud',
       'cloudflare-workers-ai',
+      'xiaomi-token-plan-cn',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-sgp',
     ])
     expect(result.value.entries.find(entry =>
       entry.providerId === 'cloudflare-workers-ai')?.actions.map(action => action.id)).toEqual(['connect'])
@@ -1122,6 +1131,100 @@ describe('OpenCodeProviderManagementAdapter', () => {
         label: 'API key',
       },
     })
+  })
+
+  test('loads curated Xiaomi MiMo Token Plan setup with Token Plan key copy', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory({
+          availableProviders: ['xiaomi-token-plan-ams'],
+          models: ['xiaomi-token-plan-ams/mimo-v2.5-pro'],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'xiaomi-token-plan-ams',
+                name: 'Xiaomi MiMo Token Plan - Europe',
+                models: { 'mimo-v2.5-pro': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadSetupForm({
+      runtimeId: 'opencode',
+      providerId: 'xiaomi-token-plan-ams',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value).toMatchObject({
+      providerId: 'xiaomi-token-plan-ams',
+      displayName: 'Xiaomi MiMo Token Plan - Europe',
+      method: 'api',
+      supported: true,
+      source: 'curated',
+      secret: {
+        label: 'Token Plan API key',
+        placeholder: 'tp-xxxxx',
+      },
+    })
+    expect(result.value.description).toContain('Token Plan dashboard')
+  })
+
+  test('rejects Xiaomi Token Plan pay-as-you-go keys before OpenCode auth writes', async () => {
+    let probeCalled = false
+    let setProviderAuthCalled = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCalled = true
+          return inventory()
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async () => {
+            setProviderAuthCalled = true
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await adapter.connectProvider({
+      runtimeId: 'opencode',
+      providerId: 'xiaomi-token-plan-ams',
+      method: 'api',
+      apiKey: 'sk-paygo-secret',
+      metadata: {},
+    })
+
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('auth-required')
+    expect(failure.message).toContain('tp-...')
+    expect(failure.message).not.toContain('sk-paygo-secret')
+    expect(probeCalled).toBe(false)
+    expect(setProviderAuthCalled).toBe(false)
   })
 
   test('connects prompted API auth with metadata and persists the full app-managed auth shape', async () => {
@@ -1466,6 +1569,114 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }])
     expect(result.value).toMatchObject({
       providerId: 'atlascloud',
+      state: 'connected',
+      ownership: ['managed'],
+    })
+  })
+
+  test('connects Xiaomi MiMo Token Plan through curated OpenCode provider config', async () => {
+    const authWrites: Array<{ authPath: string; providerId: string; key: string }> = []
+    const modelProbes: Array<{ selectedModel: string; bypassCache: boolean | undefined }> = []
+    let authApplied = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => inventory(options?.bypassCache
+          ? {
+              connectedProviders: [
+                {
+                  id: 'xiaomi-token-plan-ams',
+                  authHint: 'api',
+                  source: 'credentials',
+                  credentialScopes: ['managed'],
+                },
+              ],
+              availableProviders: ['xiaomi-token-plan-ams'],
+              models: ['xiaomi-token-plan-ams/mimo-v2.5-pro'],
+            }
+          : {
+              connectedProviders: [],
+              availableProviders: ['xiaomi-token-plan-ams'],
+              models: ['xiaomi-token-plan-ams/mimo-v2.5-pro'],
+            }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'xiaomi-token-plan-ams',
+                name: 'Xiaomi MiMo Token Plan - Europe',
+                models: {
+                  'mimo-v2.5-pro': {},
+                  'mimo-v2.5': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xiaomi-token-plan-ams', name: 'Xiaomi MiMo Token Plan - Europe' }],
+            connected: authApplied ? ['xiaomi-token-plan-ams'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async () => {
+            authApplied = true
+            return true
+          },
+        }),
+      },
+      authStore: {
+        upsertApiAuth: async input => {
+          authWrites.push({
+            authPath: input.authPath,
+            providerId: input.providerId,
+            key: input.auth.key,
+          })
+        },
+        removeCredential: async () => {},
+      },
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push({
+            selectedModel: input.selectedModel,
+            bypassCache: input.bypassCache,
+          })
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'xiaomi-token-plan-ams',
+      apiKey: 'tp-user-token',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(authWrites).toEqual([
+      {
+        authPath: '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        providerId: 'xiaomi-token-plan-ams',
+        key: 'tp-user-token',
+      },
+      {
+        authPath: '/tmp/profile/data/opencode/auth.json',
+        providerId: 'xiaomi-token-plan-ams',
+        key: 'tp-user-token',
+      },
+    ])
+    expect(modelProbes).toEqual([{
+      selectedModel: 'xiaomi-token-plan-ams/mimo-v2.5-pro',
+      bypassCache: true,
+    }])
+    expect(result.value).toMatchObject({
+      providerId: 'xiaomi-token-plan-ams',
       state: 'connected',
       ownership: ['managed'],
     })
