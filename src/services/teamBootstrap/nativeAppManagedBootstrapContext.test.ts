@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 import {
+  buildNativeAppManagedBootstrapPrivatePrompt,
   buildNativeAppManagedBootstrapPrefixText,
   hashNativeBootstrapText,
   loadNativeAppManagedBootstrapContextInjection,
@@ -72,6 +73,32 @@ describe('native app-managed bootstrap context handoff', () => {
     expect(loaded.bootstrapProofToken).toBe('hidden-proof-token')
     expect(loaded.prefixMessagesText).toContain(context.contextText)
     expect(loaded.prefixMessagesText).not.toContain('hidden-proof-token')
+  })
+
+  test('bootstrap prompts allow startup task pickup instead of forcing idle', async () => {
+    const context = makeContext({
+      contextText: [
+        '<agent_teams_native_bootstrap_context>',
+        'Current task briefing:',
+        'Actionable:',
+        '- #seed1234 [status=pending] Pre-seeded work (owner=alice, actionOwner=@alice)',
+        '</agent_teams_native_bootstrap_context>',
+      ].join('\n'),
+    })
+
+    const privatePrompt = buildNativeAppManagedBootstrapPrivatePrompt()
+    const prefixText = buildNativeAppManagedBootstrapPrefixText(context)
+
+    expect(privatePrompt).toContain('if it shows Actionable assigned work for you')
+    expect(privatePrompt).toContain('Startup context loaded.')
+    expect(privatePrompt).toContain('Do not output "(no content)"')
+    expect(privatePrompt).toContain('use the task tools and task protocol in this same turn')
+    expect(privatePrompt).not.toContain('Then stop and wait for real work.')
+    expect(prefixText).toContain('if it shows Actionable assigned work for you')
+    expect(prefixText).toContain('Startup context loaded.')
+    expect(prefixText).toContain('Do not output "(no content)"')
+    expect(prefixText).toContain('use the task tools and task protocol in this same turn')
+    expect(prefixText).not.toContain('Reply locally once, then stop.')
   })
 
   test('rejects symlink context files', async () => {
