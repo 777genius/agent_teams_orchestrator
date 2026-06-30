@@ -179,22 +179,26 @@ export function getActiveBootstrapMemberBriefingContext(params: {
     return null
   }
 
-  const bootstrapMirror = appState.inbox.messages.find(
-    message =>
+  let bootstrapMirror: AppState['inbox']['messages'][number] | undefined
+  for (const message of appState.inbox.messages) {
+    if (
       (message.status === 'pending' || message.status === 'processing') &&
       message.from === TEAM_LEAD_NAME &&
       message.mailboxClaimedBySessionId === currentSessionId &&
-      isBootstrapMailboxInstructionText(message.text),
-  )
+      isBootstrapMailboxInstructionText(message.text)
+    ) {
+      bootstrapMirror = message
+    }
+  }
 
-  if (!bootstrapMirror) {
+  if (!bootstrapMirror?.messageId) {
     return null
   }
 
   return {
     teamName,
     memberName,
-    bootstrapMirrorId: bootstrapMirror.messageId ?? bootstrapMirror.id,
+    bootstrapMirrorId: bootstrapMirror.messageId,
     bootstrapMessageId: bootstrapMirror.messageId,
   }
 }

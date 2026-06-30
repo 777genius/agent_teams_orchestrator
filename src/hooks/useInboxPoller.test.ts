@@ -17,6 +17,8 @@ import {
   getProcessingOrdinaryMessage,
   getOrdinaryPendingMessage,
   getBootstrapPendingMessage,
+  getBootstrapMessageIdsToFinalize,
+  getBootstrapProcessingMessage,
   getQueuedMailboxMetaPrompt,
   resolveOrdinaryUserDirectReplyProtocol,
   buildAgentErrorNotificationText,
@@ -124,7 +126,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     )
   })
 
-  test('finds the first actionable bootstrap row for teammate sessions', () => {
+  test('finds the actionable bootstrap row for teammate sessions', () => {
     expect(
       getBootstrapPendingMessage({
         isTeammateSession: true,
@@ -150,6 +152,214 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         ],
       })?.messageId,
     ).toBe('b')
+  })
+
+  test('prefers the last appended bootstrap row when stale launch rows are still pending', () => {
+    expect(
+      getBootstrapPendingMessage({
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'old-row',
+            messageId: 'old-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:05.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'regular-row',
+            messageId: 'regular',
+            mailboxClaimedBySessionId: 's',
+            from: 'user',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:02.000Z',
+            text: 'Ping.',
+          },
+          {
+            id: 'new-row',
+            messageId: 'new-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:03.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      })?.messageId,
+    ).toBe('new-bootstrap')
+  })
+
+  test('ignores non-pending bootstrap rows when choosing delivery', () => {
+    expect(
+      getBootstrapPendingMessage({
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'processing-row',
+            messageId: 'processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:03.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'processed-row',
+            messageId: 'processed-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processed',
+            timestamp: '2026-04-09T13:00:04.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      }),
+    ).toBeUndefined()
+  })
+
+  test('collects all active bootstrap rows for finalization', () => {
+    expect(
+      getBootstrapMessageIdsToFinalize({
+        messages: [
+          {
+            id: 'old-row',
+            messageId: 'old-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'new-row',
+            messageId: 'new-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:03.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'regular-row',
+            messageId: 'regular',
+            mailboxClaimedBySessionId: 's',
+            from: 'user',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:04.000Z',
+            text: 'Ping.',
+          },
+        ],
+      }),
+    ).toEqual(['old-bootstrap', 'new-bootstrap'])
+  })
+
+  test('finds the newest processing bootstrap row when no fresh pending row exists', () => {
+    expect(
+      getBootstrapProcessingMessage({
+        messages: [
+          {
+            id: 'old-processing-row',
+            messageId: 'old-processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'new-processing-row',
+            messageId: 'new-processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:00.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      })?.messageId,
+    ).toBe('new-processing-bootstrap')
+  })
+
+  test('lets the newest pending bootstrap row outrank stale processing rows', () => {
+    expect(
+      getBootstrapProcessingMessage({
+        messages: [
+          {
+            id: 'stale-processing-row',
+            messageId: 'stale-processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'fresh-pending-row',
+            messageId: 'fresh-pending-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:00.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      }),
+    ).toBeUndefined()
+  })
+
+  test('does not fall back to stale processing bootstrap rows when the newest active row is unprocessable', () => {
+    expect(
+      getBootstrapProcessingMessage({
+        messages: [
+          {
+            id: 'stale-processing-row',
+            messageId: 'stale-processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'newer-processing-row-without-message-id',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:00.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      }),
+    ).toBeUndefined()
+  })
+
+  test('keeps processing the newest bootstrap row when older pending rows remain', () => {
+    expect(
+      getBootstrapProcessingMessage({
+        messages: [
+          {
+            id: 'stale-pending-row',
+            messageId: 'stale-pending-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'pending',
+            timestamp: '2026-04-09T13:00:01.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+          {
+            id: 'current-processing-row',
+            messageId: 'current-processing-bootstrap',
+            mailboxClaimedBySessionId: 's',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-09T13:00:00.000Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"harbor-labs"}',
+          },
+        ],
+      })?.messageId,
+    ).toBe('current-processing-bootstrap')
   })
 
   test('finds the first actionable ordinary regular row', () => {
@@ -450,6 +660,27 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
         ],
       }),
     ).toBe(false)
+  })
+
+  test('defers while loading when only an already-processing bootstrap row exists', () => {
+    expect(
+      shouldDeferPendingInboxDelivery({
+        isLoading: true,
+        focusedInputDialog: undefined,
+        isTeammateSession: true,
+        pendingMessages: [
+          {
+            id: 'bootstrap-row',
+            messageId: 'bootstrap-msg',
+            mailboxClaimedBySessionId: 'session-1',
+            from: 'team-lead',
+            status: 'processing',
+            timestamp: '2026-04-22T19:50:57.224Z',
+            text: 'Your FIRST action: call MCP tool member_briefing with: {"teamName":"relay-works-6","memberName":"alice"}',
+          },
+        ],
+      }),
+    ).toBe(true)
   })
 
   test('still defers ordinary teammate delivery while loading', () => {

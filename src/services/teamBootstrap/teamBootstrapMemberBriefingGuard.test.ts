@@ -59,6 +59,51 @@ describe('teamBootstrapMemberBriefingGuard', () => {
     })
   })
 
+  test('uses the newest live-owned bootstrap row when stale rows remain active', () => {
+    expect(
+      getActiveBootstrapMemberBriefingContext({
+        appState: createAppState([
+          createBootstrapMirror({
+            id: 'stale-bootstrap-row',
+            messageId: 'stale-bootstrap-msg',
+            status: 'processing',
+            timestamp: '2026-04-10T10:00:01.000Z',
+          }),
+          createBootstrapMirror({
+            id: 'current-bootstrap-row',
+            messageId: 'current-bootstrap-msg',
+            status: 'pending',
+            timestamp: '2026-04-10T10:00:00.000Z',
+          }),
+        ]),
+        currentSessionId: 'session-1',
+        isTeammateSession: true,
+        teamName: 'vector-room',
+        memberName: 'bob',
+      }),
+    ).toEqual({
+      teamName: 'vector-room',
+      memberName: 'bob',
+      bootstrapMirrorId: 'current-bootstrap-msg',
+      bootstrapMessageId: 'current-bootstrap-msg',
+    })
+  })
+
+  test('does not build bootstrap context from rows without mailbox message id', () => {
+    const mirror = createBootstrapMirror()
+    delete mirror.messageId
+
+    expect(
+      getActiveBootstrapMemberBriefingContext({
+        appState: createAppState([mirror]),
+        currentSessionId: 'session-1',
+        isTeammateSession: true,
+        teamName: 'vector-room',
+        memberName: 'bob',
+      }),
+    ).toBeNull()
+  })
+
   test('returns no bootstrap context outside teammate bootstrap', () => {
     expect(
       getActiveBootstrapMemberBriefingContext({

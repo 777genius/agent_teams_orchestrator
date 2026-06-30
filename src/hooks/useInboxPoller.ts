@@ -301,11 +301,64 @@ export function getBootstrapPendingMessage({
     return undefined
   }
 
-  return pendingMessages.find(
-    message =>
-      message.from === TEAM_LEAD_NAME &&
-      isBootstrapMailboxInstructionText(message.text),
-  )
+  let selected: PendingInboxMirrorMessage | undefined
+  for (const message of pendingMessages) {
+    if (
+      message.status !== 'pending' ||
+      message.from !== TEAM_LEAD_NAME ||
+      !isBootstrapMailboxInstructionText(message.text)
+    ) {
+      continue
+    }
+    selected = message
+  }
+  return selected
+}
+
+export function getBootstrapMessageIdsToFinalize({
+  messages,
+}: {
+  messages: readonly PendingInboxMirrorMessage[]
+}): string[] {
+  return [
+    ...new Set(
+      messages
+        .filter(
+          (
+            message,
+          ): message is PendingInboxMirrorMessage & { messageId: string } =>
+            typeof message.messageId === 'string' &&
+            message.messageId.length > 0 &&
+            message.from === TEAM_LEAD_NAME &&
+            isBootstrapMailboxInstructionText(message.text),
+        )
+        .map(message => message.messageId),
+    ),
+  ]
+}
+
+export function getBootstrapProcessingMessage({
+  messages,
+}: {
+  messages: readonly PendingInboxMirrorMessage[]
+}): PendingInboxMirrorMessage | undefined {
+  let newestActiveBootstrap: PendingInboxMirrorMessage | undefined
+  for (const message of messages) {
+    if (
+      message.from !== TEAM_LEAD_NAME ||
+      !isBootstrapMailboxInstructionText(message.text)
+    ) {
+      continue
+    }
+    if (message.status !== 'pending' && message.status !== 'processing') {
+      continue
+    }
+    newestActiveBootstrap = message
+  }
+  return newestActiveBootstrap?.status === 'processing' &&
+    !!newestActiveBootstrap.messageId
+    ? newestActiveBootstrap
+    : undefined
 }
 
 export function getOrdinaryPendingMessage({
@@ -2955,6 +3008,7 @@ export function useInboxPoller({
     const liveOwnedMessages = liveOwnedMessagesForGate
     const activeBootstrapMessages = liveOwnedMessages.filter(
       message =>
+        (message.status === 'pending' || message.status === 'processing') &&
         isBootstrapMailboxInstructionText(message.text) &&
         message.from === TEAM_LEAD_NAME,
     )
@@ -3375,9 +3429,20 @@ export function useInboxPoller({
       }
     }
 
-    const processingBootstrapMessage = activeBootstrapMessages.find(
-      message => message.status === 'processing' && !!message.messageId,
+    const pendingMessages = currentAppState.inbox.messages.filter(
+      m =>
+        m.status === 'pending' &&
+        m.messageKind !== 'agent_error' &&
+        isLiveInboxMirrorMessageOwnedBySession(m, sessionId),
     )
+    const bootstrapPendingMessage = getBootstrapPendingMessage({
+      pendingMessages,
+      isTeammateSession: isTeammate(),
+    })
+
+    const processingBootstrapMessage = getBootstrapProcessingMessage({
+      messages: activeBootstrapMessages,
+    })
 
     if (processingBootstrapMessage?.messageId) {
       const attempt = bootstrapAttemptsRef.current.get(
@@ -3432,19 +3497,33 @@ export function useInboxPoller({
 
         void (async () => {
           try {
+            const bootstrapMessageIdsToFinalize = getBootstrapMessageIdsToFinalize({
+              messages: activeBootstrapMessages,
+            })
             await finalizeClaimedMessagesAsRead(
               agentName,
-              [processingBootstrapMessage.messageId!],
+              bootstrapMessageIdsToFinalize.length > 0
+                ? bootstrapMessageIdsToFinalize
+                : [processingBootstrapMessage.messageId!],
               sessionId,
               teamName,
             )
 
             const processingRowId = processingBootstrapMessage.id
+            const processedBootstrapRowIds = new Set(
+              activeBootstrapMessages.map(message => message.id),
+            )
+            const processedBootstrapMessageIds = new Set(
+              bootstrapMessageIdsToFinalize,
+            )
             setAppState(prev => ({
               ...prev,
               inbox: {
                 messages: prev.inbox.messages.map(message =>
-                  message.id === processingRowId
+                  message.id === processingRowId ||
+                  processedBootstrapRowIds.has(message.id) ||
+                  (!!message.messageId &&
+                    processedBootstrapMessageIds.has(message.messageId))
                     ? { ...message, status: 'processed' as const }
                     : message,
                 ),
@@ -3494,31 +3573,51 @@ export function useInboxPoller({
         void (async () => {
           try {
             if (teamName) {
-              await writeAgentErrorLeadNotification({
-                agentName,
-                teamName,
-                text: buildAgentErrorNotificationText({
-                  memberName: agentName,
-                  detail: processingAction.detail,
-                  action: 'failed bootstrap after teammate startup',
-                }),
-                summary: 'Agent bootstrap failed',
-              })
+              try {
+                await writeAgentErrorLeadNotification({
+                  agentName,
+                  teamName,
+                  text: buildAgentErrorNotificationText({
+                    memberName: agentName,
+                    detail: processingAction.detail,
+                    action: 'failed bootstrap after teammate startup',
+                  }),
+                  summary: 'Agent bootstrap failed',
+                })
+              } catch (error) {
+                logForDebugging(
+                  `[InboxPoller] Failed to notify about bootstrap failure for row ${processingBootstrapMessage.messageId}: ${String(error)}`,
+                )
+              }
             }
 
+            const bootstrapMessageIdsToFinalize = getBootstrapMessageIdsToFinalize({
+              messages: activeBootstrapMessages,
+            })
             await finalizeClaimedMessagesAsRead(
               agentName,
-              [processingBootstrapMessage.messageId!],
+              bootstrapMessageIdsToFinalize.length > 0
+                ? bootstrapMessageIdsToFinalize
+                : [processingBootstrapMessage.messageId!],
               sessionId,
               teamName,
             )
 
             const processingRowId = processingBootstrapMessage.id
+            const processedBootstrapRowIds = new Set(
+              activeBootstrapMessages.map(message => message.id),
+            )
+            const processedBootstrapMessageIds = new Set(
+              bootstrapMessageIdsToFinalize,
+            )
             setAppState(prev => ({
               ...prev,
               inbox: {
                 messages: prev.inbox.messages.map(message =>
-                  message.id === processingRowId
+                  message.id === processingRowId ||
+                  processedBootstrapRowIds.has(message.id) ||
+                  (!!message.messageId &&
+                    processedBootstrapMessageIds.has(message.messageId))
                     ? { ...message, status: 'processed' as const }
                     : message,
                 ),
@@ -3607,12 +3706,6 @@ export function useInboxPoller({
       }
     }
 
-    const pendingMessages = currentAppState.inbox.messages.filter(
-      m =>
-        m.status === 'pending' &&
-        m.messageKind !== 'agent_error' &&
-        isLiveInboxMirrorMessageOwnedBySession(m, sessionId),
-    )
     const processedMessages = currentAppState.inbox.messages.filter(
       m => m.status === 'processed',
     )
@@ -3633,10 +3726,6 @@ export function useInboxPoller({
 
     if (pendingMessages.length === 0) return
 
-    const bootstrapPendingMessage = getBootstrapPendingMessage({
-      pendingMessages,
-      isTeammateSession: isTeammate(),
-    })
     const ordinaryPendingMessage =
       bootstrapPendingMessage == null
         ? getOrdinaryPendingMessage({ pendingMessages })
@@ -3925,6 +4014,46 @@ export function useInboxPoller({
         })
 
         const bootstrapRowId = bootstrapPendingMessage.id
+        const obsoleteBootstrapRows = activeBootstrapMessages.filter(
+          message => message.messageId !== bootstrapPendingMessage.messageId,
+        )
+        const obsoleteBootstrapMessageIds = getBootstrapMessageIdsToFinalize({
+          messages: obsoleteBootstrapRows,
+        })
+        if (obsoleteBootstrapRows.length > 0) {
+          const obsoleteBootstrapRowIds = new Set(
+            obsoleteBootstrapRows.map(message => message.id),
+          )
+          const obsoleteBootstrapMessageIdSet = new Set(
+            obsoleteBootstrapMessageIds,
+          )
+          void (async () => {
+            try {
+              await finalizeClaimedMessagesAsRead(
+                agentName,
+                obsoleteBootstrapMessageIds,
+                sessionId,
+                teamName,
+              )
+              setAppState(prev => ({
+                ...prev,
+                inbox: {
+                  messages: prev.inbox.messages.map(message =>
+                    obsoleteBootstrapRowIds.has(message.id) ||
+                    (!!message.messageId &&
+                      obsoleteBootstrapMessageIdSet.has(message.messageId))
+                      ? { ...message, status: 'processed' as const }
+                      : message,
+                  ),
+                },
+              }))
+            } catch (error) {
+              logForDebugging(
+                `[InboxPoller] Failed to finalize obsolete bootstrap rows after submit: ${String(error)}`,
+              )
+            }
+          })()
+        }
         setAppState(prev => ({
           ...prev,
           inbox: {
