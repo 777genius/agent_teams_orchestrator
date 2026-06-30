@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import net from 'node:net'
-import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { sleep } from '../../utils/sleep.js'
 import { killProcessTree, killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
@@ -550,10 +551,7 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
-    await mkdir(path.dirname(registryPath), { recursive: true })
-    const tempPath = `${registryPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
-    await writeFile(tempPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
-    await rename(tempPath, registryPath)
+    await writeJsonFileAtomic(registryPath, registry, { indent: 2 })
   }
 
   private buildPersistentHostRecord(

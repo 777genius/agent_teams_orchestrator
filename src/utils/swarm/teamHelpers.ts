@@ -1,8 +1,9 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises'
+import { readFileSync } from 'fs'
+import { mkdir, readFile, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { getSessionCreatedTeams } from '../../bootstrap/state.js'
+import { writeFileAtomic, writeFileAtomicSync, writeJsonFileAtomic } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { getTeamsDir } from '../envUtils.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
@@ -205,15 +206,8 @@ async function writeTeamFileAtomicAsync(
   teamName: string,
   teamFile: TeamFile,
 ): Promise<void> {
-  const teamDir = getTeamDir(teamName)
   const teamFilePath = getTeamFilePath(teamName)
-  const tempPath = join(
-    teamDir,
-    `config.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  )
-  await mkdir(teamDir, { recursive: true })
-  await writeFile(tempPath, jsonStringify(teamFile, null, 2))
-  await rename(tempPath, teamFilePath)
+  await writeJsonFileAtomic(teamFilePath, teamFile, { indent: 2 })
 }
 
 async function reclaimStaleTeamFileLock(lockDir: string): Promise<boolean> {
@@ -273,7 +267,7 @@ export async function withTeamFileLock<T>(
     try {
       await mkdir(lockDir)
       try {
-        await writeFile(
+        await writeFileAtomic(
           join(lockDir, 'metadata.json'),
           jsonStringify({ pid: process.pid, createdAt: Date.now() }),
         )
@@ -473,9 +467,7 @@ export async function readTeamFileAsync(
  */
 // sync IO: called from sync context
 function writeTeamFile(teamName: string, teamFile: TeamFile): void {
-  const teamDir = getTeamDir(teamName)
-  mkdirSync(teamDir, { recursive: true })
-  writeFileSync(getTeamFilePath(teamName), jsonStringify(teamFile, null, 2))
+  writeFileAtomicSync(getTeamFilePath(teamName), jsonStringify(teamFile, null, 2))
 }
 
 /**

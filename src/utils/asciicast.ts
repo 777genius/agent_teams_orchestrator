@@ -1,6 +1,7 @@
-import { appendFile, rename } from 'fs/promises'
+import { appendFile } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { getOriginalCwd, getSessionId } from '../bootstrap/state.js'
+import { renamePathWithRetry } from './atomicWrite.js'
 import { createBufferedWriter } from './bufferedWriter.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { logForDebugging } from './debug.js'
@@ -98,7 +99,7 @@ export async function renameRecordingForSession(): Promise<void> {
   const oldName = basename(oldPath)
   const newName = basename(newPath)
   try {
-    await rename(oldPath, newPath)
+    await renamePathWithRetry(oldPath, newPath)
     recordingState.filePath = newPath
     logForDebugging(`[asciicast] Renamed recording: ${oldName} → ${newName}`)
   } catch {

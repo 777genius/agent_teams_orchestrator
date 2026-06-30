@@ -13,6 +13,7 @@ import { dirname, join } from 'path'
 import { z } from 'zod/v4'
 import { getProjectRoot, getSessionId } from '../bootstrap/state.js'
 import { registerCleanup } from './cleanupRegistry.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import { logForDebugging } from './debug.js'
 import { getErrnoCode } from './errors.js'
 import { isProcessRunning } from './genericProcessUtils.js'
@@ -138,7 +139,7 @@ export async function tryAcquireSchedulerLock(
   // see a live PID and don't steal it.
   if (existing?.sessionId === sessionId) {
     if (existing.pid !== process.pid) {
-      await writeFile(getLockPath(dir), jsonStringify(lock))
+      await writeFileAtomic(getLockPath(dir), jsonStringify(lock))
       registerLockCleanup(opts)
     }
     return true

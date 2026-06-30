@@ -1,5 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 
 const OPEN_CODE_MANAGED_PREFERENCES_FILE = 'agent-teams-runtime-preferences.json'
 const OPEN_CODE_GLOBAL_MANAGED_PREFERENCES_FILE = 'global-runtime-preferences.json'
@@ -70,11 +72,8 @@ export async function writeOpenCodeManagedRuntimePreferences(
   profileRootPath: string,
   preferences: OpenCodeManagedRuntimePreferences,
 ): Promise<void> {
-  await mkdir(profileRootPath, { recursive: true })
   const preferencesPath = getOpenCodeManagedPreferencesPath(profileRootPath)
-  const tempPath = `${preferencesPath}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tempPath, `${JSON.stringify(preferences, null, 2)}\n`, 'utf8')
-  await rename(tempPath, preferencesPath)
+  await writeJsonFileAtomic(preferencesPath, preferences, { indent: 2 })
 }
 
 export async function setOpenCodeManagedDefaultModel(
@@ -100,9 +99,6 @@ export async function setOpenCodeManagedGlobalDefaultModel(
     updatedAt: new Date().toISOString(),
   }
   const preferencesPath = getOpenCodeGlobalManagedPreferencesPath(dataRootPath)
-  await mkdir(path.dirname(preferencesPath), { recursive: true })
-  const tempPath = `${preferencesPath}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tempPath, `${JSON.stringify(preferences, null, 2)}\n`, 'utf8')
-  await rename(tempPath, preferencesPath)
+  await writeJsonFileAtomic(preferencesPath, preferences, { indent: 2 })
   return preferences
 }

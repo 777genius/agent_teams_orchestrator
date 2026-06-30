@@ -14,13 +14,14 @@
 
 import axios from 'axios'
 import { createHash } from 'crypto'
-import { open, unlink } from 'fs/promises'
+import { unlink } from 'fs/promises'
 import { getOauthConfig, OAUTH_BETA_HEADER } from '../../constants/oauth.js'
 import {
   checkAndRefreshOAuthTokenIfNeeded,
   getAnthropicApiKeyWithSource,
   getClaudeAIOAuthTokens,
 } from '../../utils/auth.js'
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { registerCleanup } from '../../utils/cleanupRegistry.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { classifyAxiosError, getErrnoCode } from '../../utils/errors.js'
@@ -367,15 +368,7 @@ async function fetchRemoteManagedSettings(
 async function saveSettings(settings: SettingsJson): Promise<void> {
   try {
     const path = getSettingsPath()
-    const handle = await open(path, 'w', 0o600)
-    try {
-      await handle.writeFile(jsonStringify(settings, null, 2), {
-        encoding: 'utf-8',
-      })
-      await handle.datasync()
-    } finally {
-      await handle.close()
-    }
+    await writeFileAtomic(path, jsonStringify(settings, null, 2), { mode: 0o600 })
     logForDebugging(`Remote settings: Saved to ${path}`)
   } catch (error) {
     logForDebugging(

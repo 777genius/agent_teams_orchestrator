@@ -7,6 +7,7 @@ import { createHash } from 'crypto'
 import { chmod, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import type { McpServerConfig } from '../../services/mcp/types.js'
+import { writeFileAtomic } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { parseAndValidateManifestFromBytes } from '../dxt/helpers.js'
 import { parseZipModes, unzipFile } from '../dxt/zip.js'
@@ -473,7 +474,7 @@ async function saveCacheMetadata(
   const metadataPath = getMetadataPath(cacheDir, source)
 
   await getFsImplementation().mkdir(cacheDir)
-  await writeFile(metadataPath, jsonStringify(metadata, null, 2), 'utf-8')
+  await writeFileAtomic(metadataPath, jsonStringify(metadata, null, 2))
 }
 
 /**

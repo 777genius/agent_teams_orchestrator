@@ -57,6 +57,45 @@ import {
 } from './types.js'
 import { getProjectMcpServerStatus } from './utils.js'
 
+const MCP_CONFIG_RENAME_MAX_ATTEMPTS = 20
+const MCP_CONFIG_RENAME_RETRY_BASE_DELAY_MS = 40
+const MCP_CONFIG_RENAME_RETRY_MAX_DELAY_MS = 250
+const MCP_CONFIG_RENAME_RETRY_JITTER_MS = 25
+const MCP_CONFIG_RETRYABLE_RENAME_ERROR_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function getRenameRetryDelayMs(attemptIndex: number): number {
+  const attempt = attemptIndex + 1
+  const backoff = Math.min(
+    MCP_CONFIG_RENAME_RETRY_MAX_DELAY_MS,
+    MCP_CONFIG_RENAME_RETRY_BASE_DELAY_MS * attempt,
+  )
+  return backoff + Math.floor(Math.random() * (MCP_CONFIG_RENAME_RETRY_JITTER_MS + 1))
+}
+
+function isRetryableRenameError(error: unknown): boolean {
+  const code = getErrnoCode(error)
+  return !!code && MCP_CONFIG_RETRYABLE_RENAME_ERROR_CODES.has(code)
+}
+
+async function renameMcpConfigWithRetry(fromPath: string, toPath: string): Promise<void> {
+  for (let attemptIndex = 0; attemptIndex < MCP_CONFIG_RENAME_MAX_ATTEMPTS; attemptIndex += 1) {
+    try {
+      await rename(fromPath, toPath)
+      return
+    } catch (error) {
+      const hasAttemptsLeft = attemptIndex + 1 < MCP_CONFIG_RENAME_MAX_ATTEMPTS
+      if (!hasAttemptsLeft || !isRetryableRenameError(error)) {
+        throw error
+      }
+      await sleep(getRenameRetryDelayMs(attemptIndex))
+    }
+  }
+}
+
 /**
  * Get the path to the managed MCP configuration file
  */
@@ -198,7 +237,7 @@ async function writeMcpjsonFile(config: McpJsonConfig): Promise<void> {
     if (existingMode !== undefined) {
       await chmod(tempPath, existingMode)
     }
-    await rename(tempPath, mcpJsonPath)
+    await renameMcpConfigWithRetry(tempPath, mcpJsonPath)
   } catch (e: unknown) {
     // Clean up temp file on failure
     try {

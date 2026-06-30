@@ -4,7 +4,7 @@
  */
 
 import { createWriteStream, writeFileSync } from 'fs'
-import { readdir, readFile, writeFile } from 'fs/promises'
+import { readdir, readFile } from 'fs/promises'
 import { join } from 'path'
 import { pipeline } from 'stream/promises'
 import {
@@ -17,6 +17,7 @@ import { getSessionId } from '../bootstrap/state.js'
 import { logEvent } from '../services/analytics/index.js'
 import { logForDebugging } from './debug.js'
 import { toError } from './errors.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import { getDesktopPath } from './file.js'
 import { getFsImplementation } from './fsOperations.js'
 import { logError } from './log.js'
@@ -247,9 +248,7 @@ export async function performHeapDump(
     const diagPath = join(dumpDir, diagFilename)
 
     // Write diagnostics first (cheap, unlikely to fail)
-    await writeFile(diagPath, jsonStringify(diagnostics, null, 2), {
-      mode: 0o600,
-    })
+    await writeFileAtomic(diagPath, jsonStringify(diagnostics, null, 2), { mode: 0o600 })
     logForDebugging(`[HeapDump] Diagnostics written to ${diagPath}`)
 
     // Write heap snapshot (this can crash for very large heaps)

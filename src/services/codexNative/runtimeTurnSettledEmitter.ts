@@ -1,8 +1,8 @@
-import { mkdir, rename, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { getSessionId } from '../../bootstrap/state.js'
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { getAgentId, getAgentName, getTeamName } from '../../utils/teammate.js'
 
 export const RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV =
@@ -95,15 +95,10 @@ export class FileCodexNativeTurnSettledEmitter
       return
     }
 
-    const incomingDir = join(spoolRoot, 'incoming')
-    await mkdir(incomingDir, { recursive: true })
-
     const stamp = event.recordedAt.replace(/[-:.]/g, '')
     const suffix = `${process.pid}-${randomUUID()}`
-    const tempPath = join(incomingDir, `.turn-settled.${suffix}`)
-    const finalPath = join(incomingDir, `${stamp}-${basename(tempPath)}.codex.json`)
-    await writeFile(tempPath, `${JSON.stringify(event)}\n`, 'utf8')
-    await rename(tempPath, finalPath)
+    const finalPath = join(spoolRoot, 'incoming', `${stamp}-.turn-settled.${suffix}.codex.json`)
+    await writeFileAtomic(finalPath, `${JSON.stringify(event)}\n`)
   }
 }
 

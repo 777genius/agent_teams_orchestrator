@@ -1,8 +1,15 @@
 import { randomUUID } from 'node:crypto'
+import {
+  chmodSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
-const ATOMIC_RENAME_MAX_ATTEMPTS = 8
+const ATOMIC_RENAME_MAX_ATTEMPTS = 20
 const ATOMIC_RENAME_RETRY_BASE_DELAY_MS = 40
 const ATOMIC_RENAME_RETRY_MAX_DELAY_MS = 250
 const ATOMIC_RENAME_RETRY_JITTER_MS = 25
@@ -61,6 +68,10 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
 function resolveDeps(overrides?: Partial<AtomicWriteDeps>): AtomicWriteDeps {
   return {
     mkdir: overrides?.mkdir ?? fs.mkdir,
@@ -111,6 +122,82 @@ async function moveFileIntoPlace(
 
   await deps.copyFile(tempPath, finalPath)
   await deps.unlink(tempPath).catch(() => undefined)
+}
+
+function renameWithRetrySync(
+  tempPath: string,
+  finalPath: string,
+  rename: typeof renameSync = renameSync,
+): void {
+  for (let attemptIndex = 0; attemptIndex < ATOMIC_RENAME_MAX_ATTEMPTS; attemptIndex += 1) {
+    try {
+      rename(tempPath, finalPath)
+      return
+    } catch (error) {
+      const hasAttemptsLeft = attemptIndex + 1 < ATOMIC_RENAME_MAX_ATTEMPTS
+      if (!hasAttemptsLeft || !isRetryableRenameError(error)) {
+        throw error
+      }
+      sleepSync(defaultRetryDelayMs(attemptIndex))
+    }
+  }
+}
+
+export async function renamePathWithRetry(
+  fromPath: string,
+  toPath: string,
+  deps: Partial<Pick<AtomicWriteDeps, 'rename' | 'sleep' | 'getRetryDelayMs'>> = {},
+): Promise<void> {
+  const rename = deps.rename ?? fs.rename
+  const sleep = deps.sleep ?? defaultSleep
+  const getRetryDelayMs = deps.getRetryDelayMs ?? defaultRetryDelayMs
+
+  for (let attemptIndex = 0; attemptIndex < ATOMIC_RENAME_MAX_ATTEMPTS; attemptIndex += 1) {
+    try {
+      await rename(fromPath, toPath)
+      return
+    } catch (error) {
+      const hasAttemptsLeft = attemptIndex + 1 < ATOMIC_RENAME_MAX_ATTEMPTS
+      if (!hasAttemptsLeft || !isRetryableRenameError(error)) {
+        throw error
+      }
+      await sleep(getRetryDelayMs(attemptIndex))
+    }
+  }
+}
+
+export function renamePathWithRetrySync(
+  fromPath: string,
+  toPath: string,
+  deps: { renameSync?: typeof renameSync } = {},
+): void {
+  renameWithRetrySync(fromPath, toPath, deps.renameSync)
+}
+
+export function writeFileAtomicSync(
+  filePath: string,
+  content: string,
+  options: Pick<AtomicWriteOptions, 'encoding' | 'mode'> = {},
+): void {
+  const tempPath = join(
+    dirname(filePath),
+    `${basename(filePath)}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`,
+  )
+
+  try {
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(tempPath, content, {
+      encoding: options.encoding ?? 'utf8',
+      mode: options.mode,
+    })
+    if (options.mode !== undefined) {
+      chmodSync(tempPath, options.mode)
+    }
+    renameWithRetrySync(tempPath, filePath)
+  } catch (error) {
+    rmSync(tempPath, { force: true })
+    throw error
+  }
 }
 
 export async function writeFileAtomic(

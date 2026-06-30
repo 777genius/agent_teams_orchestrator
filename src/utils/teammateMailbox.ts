@@ -20,6 +20,7 @@ import { count } from './array.js'
 import { logForDebugging } from './debug.js'
 import { getTeamsDir } from './envUtils.js'
 import { getErrnoCode } from './errors.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import { lazySchema } from './lazySchema.js'
 import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
@@ -257,7 +258,7 @@ export async function writeToMailbox(
 
     messages.push(newMessage)
 
-    await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
     logForDebugging(
       `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
     )
@@ -406,7 +407,7 @@ export async function markMessageAsReadByIndex(
 
     messages[messageIndex] = { ...message, read: true }
 
-    await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
     logForDebugging(
       `[TeammateMailbox] markMessageAsReadByIndex: marked message at index ${messageIndex} as read`,
     )
@@ -479,7 +480,7 @@ export async function markMessagesAsRead(
     // messages comes from jsonParse — fresh, unshared objects safe to mutate
     for (const m of messages) m.read = true
 
-    await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
     logForDebugging(
       `[TeammateMailbox] markMessagesAsRead: WROTE ${unreadCount} message(s) as read to ${inboxPath}`,
     )
@@ -1498,7 +1499,7 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
     }
 
     if (didMutateClaims) {
-      await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+      await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
     }
 
     return {
@@ -1590,11 +1591,7 @@ export async function markMessagesAsReadByIds(
     })
 
     if (didMutate) {
-      await writeFile(
-        inboxPath,
-        jsonStringify(updatedMessages, null, 2),
-        'utf-8',
-      )
+      await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1659,11 +1656,7 @@ export async function finalizeClaimedMessagesAsRead(
     })
 
     if (didMutate) {
-      await writeFile(
-        inboxPath,
-        jsonStringify(updatedMessages, null, 2),
-        'utf-8',
-      )
+      await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1711,7 +1704,7 @@ export async function markMessagesAsReadByPredicate(
       !m.read && predicate(m) ? { ...m, read: true } : m,
     )
 
-    await writeFile(inboxPath, jsonStringify(updatedMessages, null, 2), 'utf-8')
+    await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
   } catch (error) {
     const code = getErrnoCode(error)
     if (code === 'ENOENT') {

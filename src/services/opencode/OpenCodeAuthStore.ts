@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
@@ -82,13 +83,7 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
 }
 
 async function writeOpenCodeAuthStore(filePath: string, authStore: OpenCodeAuthStore): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true })
-  const tempPath = path.join(
-    path.dirname(filePath),
-    `.auth.json.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
-  )
-  await writeFile(tempPath, `${JSON.stringify(authStore, null, 2)}\n`, 'utf8')
-  await rename(tempPath, filePath)
+  await writeJsonFileAtomic(filePath, authStore, { indent: 2 })
 }
 
 export function mergeOpenCodeAuthStores(input: {

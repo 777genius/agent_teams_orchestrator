@@ -1,6 +1,7 @@
-import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises'
-import { dirname, join } from 'path'
+import { readFile, stat, unlink } from 'fs/promises'
+import { join } from 'path'
 import { z } from 'zod/v4'
+import { writeFileAtomic } from '../utils/atomicWrite.js'
 import { logForDebugging } from '../utils/debug.js'
 import { isENOENT } from '../utils/errors.js'
 import { getWorktreePathsPortable } from '../utils/getWorktreePathsPortable.js'
@@ -65,8 +66,7 @@ export async function writeBridgePointer(
 ): Promise<void> {
   const path = getBridgePointerPath(dir)
   try {
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, jsonStringify(pointer), 'utf8')
+    await writeFileAtomic(path, jsonStringify(pointer))
     logForDebugging(`[bridge:pointer] wrote ${path}`)
   } catch (err: unknown) {
     logForDebugging(`[bridge:pointer] write failed: ${err}`, { level: 'warn' })

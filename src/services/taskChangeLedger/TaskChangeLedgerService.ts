@@ -8,10 +8,8 @@ import {
   open,
   readdir,
   readFile,
-  rename,
   rm,
   stat,
-  writeFile,
 } from 'fs/promises'
 import { diffLines } from 'diff'
 import { dirname, isAbsolute, join, relative, resolve } from 'path'
@@ -21,6 +19,7 @@ import {
   getSessionId,
   getSessionProjectDir,
 } from '../../bootstrap/state.js'
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
 import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
 import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
@@ -745,9 +744,7 @@ async function pathExists(filePath: string): Promise<boolean> {
 
 async function writeAtomic(filePath: string, content: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true, mode: 0o700 })
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
-  await writeFile(tmpPath, content, { encoding: 'utf8', mode: 0o600 })
-  await rename(tmpPath, filePath)
+  await writeFileAtomic(filePath, content, { mode: 0o600 })
 }
 
 function serializeShellSnapshot(snapshot: ShellSnapshot): SerializedShellSnapshot {

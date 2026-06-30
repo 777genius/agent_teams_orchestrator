@@ -35,13 +35,13 @@ import {
   lstat,
   readdir,
   readFile,
-  rename,
   rm,
   stat,
   writeFile,
 } from 'fs/promises'
 import { tmpdir } from 'os'
 import { basename, dirname, join } from 'path'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { parseZipModes, unzipFile } from '../dxt/zip.js'
 import { isEnvTruthy } from '../envUtils.js'
@@ -188,7 +188,7 @@ export async function atomicWriteToZipCache(
     } else {
       await writeFile(tmpPath, data)
     }
-    await rename(tmpPath, targetPath)
+    await renamePathWithRetry(tmpPath, targetPath)
   } catch (error) {
     // Clean up tmp file on failure
     try {

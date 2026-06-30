@@ -20,7 +20,6 @@ import {
   readdir,
   readlink,
   realpath,
-  rename,
   rm,
   rmdir,
   stat,
@@ -37,6 +36,7 @@ import {
 import { getMaxVersion, shouldSkipVersion } from '../autoUpdater.js'
 import { registerCleanup } from '../cleanupRegistry.js'
 import { getGlobalConfig, saveGlobalConfig } from '../config.js'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { getCurrentInstallationType } from '../doctorDiagnostic.js'
 import { env } from '../env.js'
@@ -312,7 +312,7 @@ async function atomicMoveToInstallPath(
     // would fail with EXDEV if staging and install are on different filesystems.
     await copyFile(stagedBinaryPath, tempInstallPath)
     await chmod(tempInstallPath, 0o755)
-    await rename(tempInstallPath, installPath)
+    await renamePathWithRetry(tempInstallPath, installPath)
     logForDebugging(`Atomically installed binary to ${installPath}`)
   } catch (error) {
     // Clean up temp file if it exists
@@ -671,7 +671,7 @@ async function updateSymlink(
         // Use rename strategy to handle file locking on Windows
         // Rename always works even for running executables, unlike delete
         const oldFileName = `${symlinkPath}.old.${Date.now()}`
-        await rename(symlinkPath, oldFileName)
+        await renamePathWithRetry(symlinkPath, oldFileName)
 
         // Try to copy new executable, with rollback on failure
         try {
@@ -685,7 +685,7 @@ async function updateSymlink(
         } catch (copyError) {
           // Copy failed - restore the old executable
           try {
-            await rename(oldFileName, symlinkPath)
+            await renamePathWithRetry(oldFileName, symlinkPath)
           } catch (restoreError) {
             // Critical: User left without working executable - prioritize restore error
             const errorWithCause = new Error(
@@ -776,7 +776,7 @@ async function updateSymlink(
     await symlink(targetPath, tempSymlink)
 
     // Atomically rename to final name (replaces existing)
-    await rename(tempSymlink, symlinkPath)
+    await renamePathWithRetry(tempSymlink, symlinkPath)
     logForDebugging(
       `Atomically updated symlink ${symlinkPath} -> ${targetPath}`,
     )

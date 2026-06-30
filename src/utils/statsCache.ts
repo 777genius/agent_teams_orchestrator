@@ -7,6 +7,7 @@ import { logForDebugging } from './debug.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { errorMessage } from './errors.js'
 import { getFsImplementation } from './fsOperations.js'
+import { renamePathWithRetry } from './atomicWrite.js'
 import { logError } from './log.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { DailyActivity, DailyModelTokens, SessionStats } from './stats.js'
@@ -238,7 +239,7 @@ export async function saveStatsCache(
     }
 
     // Atomic rename
-    await fs.rename(tempPath, cachePath)
+    await renamePathWithRetry(tempPath, cachePath, { rename: fs.rename })
     logForDebugging(
       `Stats cache saved successfully (lastComputedDate: ${cache.lastComputedDate})`,
     )

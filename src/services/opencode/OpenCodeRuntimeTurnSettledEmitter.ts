@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, rename, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
+
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 
 export const RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV =
   'AGENT_TEAMS_RUNTIME_TURN_SETTLED_SPOOL_ROOT'
@@ -49,15 +50,10 @@ export class FileOpenCodeRuntimeTurnSettledEmitter
       return
     }
 
-    const incomingDir = join(spoolRoot, 'incoming')
-    await mkdir(incomingDir, { recursive: true })
-
     const stamp = event.recordedAt.replace(/[-:.]/g, '')
     const suffix = `${process.pid}-${randomUUID()}`
-    const tempPath = join(incomingDir, `.turn-settled.${suffix}`)
-    const finalPath = join(incomingDir, `${stamp}-${basename(tempPath)}.opencode.json`)
-    await writeFile(tempPath, `${JSON.stringify(event)}\n`, 'utf8')
-    await rename(tempPath, finalPath)
+    const finalPath = join(spoolRoot, 'incoming', `${stamp}-.turn-settled.${suffix}.opencode.json`)
+    await writeFileAtomic(finalPath, `${JSON.stringify(event)}\n`)
   }
 }
 

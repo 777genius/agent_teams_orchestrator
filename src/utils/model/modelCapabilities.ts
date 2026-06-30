@@ -1,5 +1,4 @@
 import { readFileSync } from 'fs'
-import { mkdir, writeFile } from 'fs/promises'
 import isEqual from 'lodash-es/isEqual.js'
 import memoize from 'lodash-es/memoize.js'
 import { join } from 'path'
@@ -12,6 +11,7 @@ import { getClaudeConfigHomeDir } from '../envUtils.js'
 import { safeParseJSON } from '../json.js'
 import { lazySchema } from '../lazySchema.js'
 import { isEssentialTrafficOnly } from '../privacyLevel.js'
+import { writeFileAtomic } from '../atomicWrite.js'
 import { jsonStringify } from '../slowOperations.js'
 import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from './providers.js'
 
@@ -103,11 +103,7 @@ export async function refreshModelCapabilities(): Promise<void> {
       return
     }
 
-    await mkdir(getCacheDir(), { recursive: true })
-    await writeFile(path, jsonStringify({ models, timestamp: Date.now() }), {
-      encoding: 'utf-8',
-      mode: 0o600,
-    })
+    await writeFileAtomic(path, jsonStringify({ models, timestamp: Date.now() }), { mode: 0o600 })
     loadCache.cache.delete(path)
     logForDebugging(`[modelCapabilities] cached ${models.length} models`)
   } catch (error) {

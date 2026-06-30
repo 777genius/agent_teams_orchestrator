@@ -9,11 +9,12 @@
  */
 
 import axios from 'axios'
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { dirname, join, resolve, sep } from 'path'
 import { waitForScrollIdle } from '../../bootstrap/state.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
 import { logEvent } from '../../services/analytics/index.js'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { parseZipModes, unzipFile } from '../dxt/zip.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
@@ -141,7 +142,7 @@ export async function fetchOfficialMarketplaceFromGcs(
     // doesn't exist — acceptable for a background refresh (caller retries next
     // startup if it crashes here).
     await rm(installLocation, { recursive: true, force: true })
-    await rename(staging, installLocation)
+    await renamePathWithRetry(staging, installLocation)
 
     outcome = 'updated'
     return sha

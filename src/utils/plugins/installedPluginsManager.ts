@@ -14,6 +14,7 @@
  */
 
 import { dirname, join } from 'path'
+import { renamePathWithRetrySync } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { errorMessage, isENOENT, toError } from '../errors.js'
 import { getFsImplementation } from '../fsOperations.js'
@@ -124,7 +125,7 @@ export function migrateToSinglePluginFile(): void {
   try {
     // Case 1: Try renaming v2→main directly; ENOENT = v2 doesn't exist
     try {
-      fs.renameSync(v2FilePath, mainFilePath)
+      renamePathWithRetrySync(v2FilePath, mainFilePath, { renameSync: fs.renameSync })
       logForDebugging(
         `Renamed installed_plugins_v2.json to installed_plugins.json`,
       )

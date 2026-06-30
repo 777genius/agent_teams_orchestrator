@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { lazySchema } from '../../utils/lazySchema.js'
@@ -86,7 +87,7 @@ async function saveSyncedMeta(
   await mkdir(localMemDir, { recursive: true })
   const meta: SyncedMeta = { syncedFrom: snapshotTimestamp }
   try {
-    await writeFile(syncedPath, jsonStringify(meta))
+    await writeFileAtomic(syncedPath, jsonStringify(meta))
   } catch (e) {
     logForDebugging(`Failed to save snapshot sync metadata: ${e}`)
   }

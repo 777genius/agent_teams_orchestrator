@@ -1,5 +1,5 @@
 import { feature } from 'bun:bundle'
-import { chmod, mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises'
+import { chmod, mkdir, readdir, readFile, unlink } from 'fs/promises'
 import { join } from 'path'
 import {
   getOriginalCwd,
@@ -7,6 +7,7 @@ import {
   onSessionSwitch,
 } from '../bootstrap/state.js'
 import { registerCleanup } from './cleanupRegistry.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import { logForDebugging } from './debug.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { errorMessage, isFsInaccessible } from './errors.js'
@@ -74,7 +75,7 @@ export async function registerSession(): Promise<boolean> {
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 })
     await chmod(dir, 0o700)
-    await writeFile(
+    await writeFileAtomic(
       pidFile,
       jsonStringify({
         pid: process.pid,
@@ -120,7 +121,7 @@ async function updatePidFile(patch: Record<string, unknown>): Promise<void> {
       string,
       unknown
     >
-    await writeFile(pidFile, jsonStringify({ ...data, ...patch }))
+    await writeFileAtomic(pidFile, jsonStringify({ ...data, ...patch }))
   } catch (e) {
     logForDebugging(
       `[concurrentSessions] updatePidFile failed: ${errorMessage(e)}`,

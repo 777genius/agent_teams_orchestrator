@@ -1,8 +1,8 @@
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
-import { jsonStringify } from '../../utils/slowOperations.js'
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
@@ -344,10 +344,7 @@ export class OpenCodeCommandOutcomeStore {
   }
 
   private async writeStore(store: OutcomeStoreShape): Promise<void> {
-    await this.ensureParentDir()
-    const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
-    await writeFile(tempPath, `${jsonStringify(store, null, 2)}\n`, 'utf8')
-    await rename(tempPath, this.filePath)
+    await writeJsonFileAtomic(this.filePath, store, { indent: 2 })
   }
 
   async upsert(patch: OpenCodeCommandOutcomePatch): Promise<OpenCodeCommandOutcomeRecord> {

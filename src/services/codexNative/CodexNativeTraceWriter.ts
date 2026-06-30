@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto'
-import { copyFile, mkdir, open, readdir, rename, rm, stat, type FileHandle } from 'fs/promises'
+import { copyFile, mkdir, open, readdir, rm, stat, type FileHandle } from 'fs/promises'
 import { homedir } from 'os'
 import path from 'path'
 
 import { touchBoardTaskLogFreshnessSignal } from '../boardTaskActivity/TaskLogFreshnessSignal.js'
+import { renamePathWithRetry } from '../../utils/atomicWrite.js'
 import { getAgentName, getTeamName } from '../../utils/teammate.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
@@ -360,7 +361,7 @@ export class CodexNativeTraceWriter {
     this.file = null
     if (this.tmpPath && this.processedPath) {
       await mkdir(path.dirname(this.processedPath), { recursive: true, mode: 0o700 })
-      await rename(this.tmpPath, this.processedPath).catch(async error => {
+      await renamePathWithRetry(this.tmpPath, this.processedPath).catch(async error => {
         if ((error as NodeJS.ErrnoException).code !== 'EXDEV' || !this.tmpPath || !this.processedPath) {
           throw error
         }

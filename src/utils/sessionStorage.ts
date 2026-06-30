@@ -72,6 +72,7 @@ import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { isFsInaccessible } from './errors.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import type { FileHistorySnapshot } from './fileHistory.js'
 import { formatFileSize } from './format.js'
 import { getFsImplementation } from './fsOperations.js'
@@ -286,8 +287,7 @@ export async function writeAgentMetadata(
   metadata: AgentMetadata,
 ): Promise<void> {
   const path = getAgentMetadataPath(agentId)
-  await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(metadata))
+  await writeFileAtomic(path, JSON.stringify(metadata))
 }
 
 export async function readAgentMetadata(
@@ -340,8 +340,7 @@ export async function writeRemoteAgentMetadata(
   metadata: RemoteAgentMetadata,
 ): Promise<void> {
   const path = getRemoteAgentMetadataPath(taskId)
-  await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(metadata))
+  await writeFileAtomic(path, JSON.stringify(metadata))
 }
 
 export async function readRemoteAgentMetadata(

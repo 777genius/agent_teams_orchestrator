@@ -38,7 +38,6 @@ import {
   readFile,
   readlink,
   realpath,
-  rename,
   rm,
   rmdir,
   stat,
@@ -47,6 +46,7 @@ import {
 import memoize from 'lodash-es/memoize.js'
 import { basename, dirname, join, relative, resolve, sep } from 'path'
 import { getInlinePlugins } from '../../bootstrap/state.js'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import {
   BUILTIN_MARKETPLACE_NAME,
   getBuiltinPlugins,
@@ -827,7 +827,7 @@ export async function installFromGitSubdir(
     // message that references the source path, not internal temp dirs.
     const resolvedSubdir = validatePathWithinBase(cloneDir, subdirPath)
     try {
-      await rename(resolvedSubdir, targetPath)
+      await renamePathWithRetry(resolvedSubdir, targetPath)
     } catch (e: unknown) {
       if (isENOENT(e)) {
         throw new Error(
@@ -1085,7 +1085,7 @@ export async function cachePlugin(
     await rm(finalPath, { recursive: true, force: true })
   }
 
-  await rename(tempPath, finalPath)
+  await renamePathWithRetry(tempPath, finalPath)
 
   logForDebugging(`Successfully cached plugin ${manifest.name} to ${finalPath}`)
 

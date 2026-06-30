@@ -24,6 +24,7 @@ import {
 } from './fileRead.js'
 import { fileReadCache } from './fileReadCache.js'
 import { getFsImplementation, safeResolvePath } from './fsOperations.js'
+import { renamePathWithRetrySync } from './atomicWrite.js'
 import { logError } from './log.js'
 import { expandPath } from './path.js'
 import { getPlatform } from './platform.js'
@@ -434,7 +435,7 @@ export function writeFileSyncAndFlush_DEPRECATED(
     // Atomic rename (on POSIX systems, this is atomic)
     // On Windows, this will overwrite the destination if it exists
     logForDebugging(`Renaming ${tempPath} to ${targetPath}`)
-    fs.renameSync(tempPath, targetPath)
+    renamePathWithRetrySync(tempPath, targetPath, { renameSync: fs.renameSync })
     logForDebugging(`File ${targetPath} written atomically`)
   } catch (atomicError) {
     logForDebugging(`Failed to write file atomically: ${atomicError}`, {

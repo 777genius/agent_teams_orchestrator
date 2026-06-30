@@ -10,8 +10,9 @@
 
 import axios from 'axios'
 import { randomBytes } from 'crypto'
-import { readFile, rename, unlink, writeFile } from 'fs/promises'
+import { readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
 import { getFsImplementation } from '../fsOperations.js'
@@ -165,7 +166,7 @@ async function saveInstallCountsCache(
     })
 
     // Atomic rename
-    await rename(tempPath, cachePath)
+    await renamePathWithRetry(tempPath, cachePath)
     logForDebugging('Install counts cache saved successfully')
   } catch (error) {
     logError(error)

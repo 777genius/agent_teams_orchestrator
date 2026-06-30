@@ -16,6 +16,7 @@ import { isEnvDefinedFalsy, isEnvTruthy } from '../envUtils.js'
 import { isENOENT, toError } from '../errors.js'
 import { getFsImplementation } from '../fsOperations.js'
 import { getProcessCommand } from '../genericProcessUtils.js'
+import { renamePathWithRetrySync } from '../atomicWrite.js'
 import { logError } from '../log.js'
 import {
   jsonParse,
@@ -219,7 +220,7 @@ function writeLockFile(
       encoding: 'utf8',
       flush: true,
     })
-    fs.renameSync(tempPath, lockFilePath)
+    renamePathWithRetrySync(tempPath, lockFilePath, { renameSync: fs.renameSync })
   } catch (error) {
     // Clean up temp file on failure (best-effort)
     try {

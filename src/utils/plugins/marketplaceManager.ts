@@ -24,6 +24,7 @@ import isEqual from 'lodash-es/isEqual.js'
 import memoize from 'lodash-es/memoize.js'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { isEnvTruthy } from '../envUtils.js'
 import {
@@ -1735,7 +1736,7 @@ async function loadAndCacheMarketplace(
         }
         await fs.rm(finalCachePath, { recursive: true, force: true })
         // Rename temp cache to final name
-        await fs.rename(temporaryCachePath, finalCachePath)
+        await renamePathWithRetry(temporaryCachePath, finalCachePath, { rename: fs.rename })
         temporaryCachePath = finalCachePath
         cleanupNeeded = false // Successfully renamed, no cleanup needed
       } catch (error) {

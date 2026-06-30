@@ -13,8 +13,9 @@
  */
 
 import { randomBytes } from 'crypto'
-import { readFile, rename, unlink, writeFile } from 'fs/promises'
+import { readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { getFsImplementation } from '../fsOperations.js'
 import { logError } from '../log.js'
@@ -97,7 +98,7 @@ async function writeToDisk(
       encoding: 'utf-8',
       mode: 0o600,
     })
-    await rename(tempPath, filePath)
+    await renamePathWithRetry(tempPath, filePath)
     cache = plugins
   } catch (error) {
     logError(error)

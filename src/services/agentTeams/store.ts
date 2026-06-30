@@ -4,12 +4,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   rmSync,
-  writeFileSync,
 } from 'fs'
 import { dirname, join } from 'path'
 import { getGlobalConfig, saveGlobalConfig } from '../../utils/config.js'
+import { writeFileAtomicSync } from '../../utils/atomicWrite.js'
 import type {
   AgentTeamsCapabilitiesRecord,
   AgentTeamsSessionRecord,
@@ -311,21 +310,13 @@ function writeAppDataState(storePath: string, state: AgentTeamsState): void {
     // chmod is best-effort on platforms/filesystems that support it.
   }
 
-  const tmpPath = join(dir, `.tmp.${randomUUID()}`)
+  writeFileAtomicSync(storePath, `${JSON.stringify(record, null, 2)}\n`, {
+    mode: IDENTITY_FILE_MODE,
+  })
   try {
-    writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: IDENTITY_FILE_MODE,
-    })
-    renameSync(tmpPath, storePath)
-    try {
-      chmodSync(storePath, IDENTITY_FILE_MODE)
-    } catch {
-      // chmod is best-effort on platforms/filesystems that support it.
-    }
-  } catch (error) {
-    rmSync(tmpPath, { force: true })
-    throw error
+    chmodSync(storePath, IDENTITY_FILE_MODE)
+  } catch {
+    // chmod is best-effort on platforms/filesystems that support it.
   }
 }
 

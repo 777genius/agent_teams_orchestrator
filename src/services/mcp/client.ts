@@ -250,8 +250,9 @@ const isComputerUseMCPServer = feature('CHICAGO_MCP')
     ).isComputerUseMCPServer
   : undefined
 
-import { mkdir, readFile, unlink, writeFile } from 'fs/promises'
-import { dirname, join } from 'path'
+import { readFile, unlink } from 'fs/promises'
+import { join } from 'path'
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import {
   getAgentId,
@@ -312,8 +313,7 @@ function setMcpAuthCacheEntry(serverId: string): void {
       const cache = await getMcpAuthCache()
       cache[serverId] = { timestamp: Date.now() }
       const cachePath = getMcpAuthCachePath()
-      await mkdir(dirname(cachePath), { recursive: true })
-      await writeFile(cachePath, jsonStringify(cache))
+      await writeFileAtomic(cachePath, jsonStringify(cache))
       // Invalidate the read cache so subsequent reads see the new entry.
       // Safe because writeChain serializes writes: the next write's
       // getMcpAuthCache() call will re-read the file with this entry present.

@@ -3,10 +3,9 @@
  */
 
 import { mkdtemp, writeFile } from 'node:fs/promises'
-import { chmodSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
 import {
   getChromeFlagOverride,
   getFlagDisallowedTools,
@@ -19,6 +18,7 @@ import {
   getStrictMcpConfig,
 } from '../../bootstrap/state.js'
 import { normalizeApiKeyForConfig } from '../authPortable.js'
+import { writeFileAtomicSync } from '../atomicWrite.js'
 import { quote } from '../bash/shellQuote.js'
 import { isInBundledMode } from '../bundledMode.js'
 import { getCustomApiKeyStatus } from '../config.js'
@@ -460,14 +460,8 @@ function materializeAppManagedAnthropicChildSettingsFile(input: {
     : helperSettings
   const dir = dirname(input.helperSettingsPath)
   const outputPath = join(dir, `child-runtime-settings-${input.provider}.json`)
-  const tmpPath = `${outputPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
   try {
-    writeFileSync(tmpPath, `${JSON.stringify(merged, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    })
-    chmodSync(tmpPath, 0o600)
-    renameSync(tmpPath, outputPath)
+    writeFileAtomicSync(outputPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 })
     chmodSync(outputPath, 0o600)
     return outputPath
   } catch {

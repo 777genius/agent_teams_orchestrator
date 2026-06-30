@@ -4,6 +4,7 @@ import { dirname, join } from 'path'
 import { coerce } from 'semver'
 import { getIsNonInteractiveSession } from '../bootstrap/state.js'
 import { getGlobalConfig, saveGlobalConfig } from './config.js'
+import { writeFileAtomic } from './atomicWrite.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { toError } from './errors.js'
 import { logError } from './log.js'
@@ -102,11 +103,8 @@ export async function fetchAndStoreChangelog(): Promise<void> {
 
     const cachePath = getChangelogCachePath()
 
-    // Ensure cache directory exists
-    await mkdir(dirname(cachePath), { recursive: true })
-
     // Write changelog to cache file
-    await writeFile(cachePath, changelogContent, { encoding: 'utf-8' })
+    await writeFileAtomic(cachePath, changelogContent)
     changelogMemoryCache = changelogContent
 
     // Update timestamp in config

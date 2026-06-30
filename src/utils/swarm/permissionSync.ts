@@ -21,6 +21,7 @@
 import { mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
+import { writeFileAtomic } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { getErrnoCode } from '../errors.js'
 import { lazySchema } from '../lazySchema.js'
@@ -222,14 +223,14 @@ export async function writePermissionRequest(
 
   // Create a directory-level lock file for atomic writes
   const lockFilePath = join(lockDir, '.lock')
-  await writeFile(lockFilePath, '', 'utf-8')
+  await writeFile(lockFilePath, '', { encoding: 'utf-8', flag: 'a' })
 
   let release: (() => Promise<void>) | undefined
   try {
     release = await lockfile.lock(lockFilePath)
 
     // Write the request file
-    await writeFile(pendingPath, jsonStringify(request, null, 2), 'utf-8')
+    await writeFileAtomic(pendingPath, jsonStringify(request, null, 2))
 
     logForDebugging(
       `[PermissionSync] Wrote pending request ${request.id} from ${request.workerName} for ${request.toolName}`,
@@ -374,7 +375,7 @@ export async function resolvePermission(
   const resolvedPath = getResolvedRequestPath(team, requestId)
   const lockFilePath = join(getPendingDir(team), '.lock')
 
-  await writeFile(lockFilePath, '', 'utf-8')
+  await writeFile(lockFilePath, '', { encoding: 'utf-8', flag: 'a' })
 
   let release: (() => Promise<void>) | undefined
   try {
@@ -417,11 +418,7 @@ export async function resolvePermission(
     }
 
     // Write to resolved directory
-    await writeFile(
-      resolvedPath,
-      jsonStringify(resolvedRequest, null, 2),
-      'utf-8',
-    )
+    await writeFileAtomic(resolvedPath, jsonStringify(resolvedRequest, null, 2))
 
     // Remove from pending directory
     await unlink(pendingPath)

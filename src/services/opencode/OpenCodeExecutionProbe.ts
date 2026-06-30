@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 
+import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import {
@@ -332,8 +333,7 @@ async function writePersistentProbeCache(
     expiresAtMs: nowMs() + ttlMs,
     result: cloneProbeResult(result),
   }
-  await mkdir(path.dirname(cacheFilePath), { recursive: true })
-  await writeFile(cacheFilePath, `${JSON.stringify(cacheFile)}\n`, { encoding: 'utf8' })
+  await writeFileAtomic(cacheFilePath, `${JSON.stringify(cacheFile)}\n`)
 }
 
 export class OpenCodeExecutionProbe {

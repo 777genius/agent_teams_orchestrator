@@ -6,7 +6,7 @@
  */
 
 import { randomBytes } from 'crypto'
-import { rename, rm } from 'fs/promises'
+import { rm } from 'fs/promises'
 import { dirname, join, resolve, sep } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -14,6 +14,7 @@ import {
   logEvent,
 } from '../../services/analytics/index.js'
 import { getCwd } from '../cwd.js'
+import { renamePathWithRetry } from '../atomicWrite.js'
 import { toError } from '../errors.js'
 import { getFsImplementation } from '../fsOperations.js'
 import { logError } from '../log.js'
@@ -191,12 +192,12 @@ export async function cacheAndRegisterPlugin(
         dirname(cacheResult.path),
         `.claude-plugin-temp-${Date.now()}-${randomBytes(4).toString('hex')}`,
       )
-      await rename(cacheResult.path, tempPath)
+      await renamePathWithRetry(cacheResult.path, tempPath)
       await getFsImplementation().mkdir(dirname(versionedPath))
-      await rename(tempPath, versionedPath)
+      await renamePathWithRetry(tempPath, versionedPath)
     } else {
       // Move the cached plugin to the versioned location
-      await rename(cacheResult.path, versionedPath)
+      await renamePathWithRetry(cacheResult.path, versionedPath)
     }
     finalPath = versionedPath
   }

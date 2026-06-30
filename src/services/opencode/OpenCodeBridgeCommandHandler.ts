@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -61,6 +61,7 @@ import {
   getClaudeConfigHomeDir,
   isEnvDefinedFalsy,
 } from '../../utils/envUtils.js'
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -1427,10 +1428,7 @@ async function writePersistedAppMcpToolProof(
     proof,
   }
 
-  await mkdir(nodePath.dirname(cachePath), { recursive: true })
-  const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
-  await writeFile(tmpPath, `${JSON.stringify(cache)}\n`, 'utf8')
-  await rename(tmpPath, cachePath)
+  await writeJsonFileAtomic(cachePath, cache)
 }
 
 async function proveAppMcpTools(

@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-import { writeJsonFileAtomic } from './atomicWrite.js'
+import { renamePathWithRetry, writeJsonFileAtomic } from './atomicWrite.js'
 
 let tempDirs: string[] = []
 
@@ -69,6 +69,41 @@ describe('writeJsonFileAtomic', () => {
     })
   }
 
+  test('continues retrying beyond short antivirus-style locks', async () => {
+    const dir = await createTempDir()
+    const finalPath = path.join(dir, 'config.json')
+    const sleeps: number[] = []
+    let renameAttempts = 0
+
+    await writeJsonFileAtomic(
+      finalPath,
+      { ok: true },
+      {
+        indent: 2,
+        deps: {
+          now: () => 127,
+          randomId: () => 'id-long-lock',
+          getRetryDelayMs: () => 1,
+          sleep: async ms => {
+            sleeps.push(ms)
+          },
+          rename: (async (from, to) => {
+            renameAttempts += 1
+            if (renameAttempts < 12) {
+              throw errno('EPERM')
+            }
+            await fs.rename(from, to)
+          }) as typeof fs.rename,
+        },
+      },
+    )
+
+    expect(renameAttempts).toBe(12)
+    expect(sleeps).toHaveLength(11)
+    expect(JSON.parse(await fs.readFile(finalPath, 'utf8'))).toEqual({ ok: true })
+    expect(await listTempFiles(dir, 'config.json')).toEqual([])
+  })
+
   test('does not retry missing temp rename failures', async () => {
     const dir = await createTempDir()
     const finalPath = path.join(dir, 'bootstrap-state.json')
@@ -128,8 +163,8 @@ describe('writeJsonFileAtomic', () => {
       ),
     ).rejects.toThrow('EPERM')
 
-    expect(renameAttempts).toBe(8)
-    expect(sleeps).toEqual([1, 1, 1, 1, 1, 1, 1])
+    expect(renameAttempts).toBe(20)
+    expect(sleeps).toEqual(Array.from({ length: 19 }, () => 1))
     expect(await listTempFiles(dir, 'bootstrap-state.json')).toEqual([])
   })
 
@@ -156,5 +191,43 @@ describe('writeJsonFileAtomic', () => {
     expect(renameAttempts).toBe(1)
     expect(JSON.parse(await fs.readFile(finalPath, 'utf8'))).toEqual({ ok: true })
     expect(await listTempFiles(dir, 'bootstrap-state.json')).toEqual([])
+  })
+})
+
+describe('renamePathWithRetry', () => {
+  test('retries transient managed path rename failures', async () => {
+    const sleeps: number[] = []
+    let renameAttempts = 0
+
+    await renamePathWithRetry('/tmp/source', '/tmp/target', {
+      getRetryDelayMs: () => 1,
+      sleep: async ms => {
+        sleeps.push(ms)
+      },
+      rename: (async () => {
+        renameAttempts += 1
+        if (renameAttempts < 3) {
+          throw errno('EPERM')
+        }
+      }) as typeof fs.rename,
+    })
+
+    expect(renameAttempts).toBe(3)
+    expect(sleeps).toEqual([1, 1])
+  })
+
+  test('does not treat cross-device managed path renames as file-copy atomic writes', async () => {
+    let renameAttempts = 0
+
+    await expect(
+      renamePathWithRetry('/tmp/source-dir', '/tmp/target-dir', {
+        rename: (async () => {
+          renameAttempts += 1
+          throw errno('EXDEV')
+        }) as typeof fs.rename,
+      }),
+    ).rejects.toThrow('EXDEV')
+
+    expect(renameAttempts).toBe(1)
   })
 })

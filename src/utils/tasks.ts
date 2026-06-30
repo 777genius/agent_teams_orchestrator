@@ -6,6 +6,7 @@ import { uniq } from './array.js'
 import { logForDebugging } from './debug.js'
 import { getClaudeConfigHomeDir, getTeamsDir, isEnvTruthy } from './envUtils.js'
 import { errorMessage, getErrnoCode } from './errors.js'
+import { writeFileAtomic, writeJsonFileAtomic } from './atomicWrite.js'
 import { lazySchema } from './lazySchema.js'
 import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
@@ -128,7 +129,7 @@ async function writeHighWaterMark(
   value: number,
 ): Promise<void> {
   const path = getHighWaterMarkPath(taskListId)
-  await writeFile(path, String(value))
+  await writeFileAtomic(path, String(value))
 }
 
 export function isTodoV2Enabled(): boolean {
@@ -298,7 +299,7 @@ export async function createTask(
     const id = String(highestId + 1)
     const task: Task = { id, ...taskData }
     const path = getTaskPath(taskListId, id)
-    await writeFile(path, jsonStringify(task, null, 2))
+    await writeJsonFileAtomic(path, task, { indent: 2 })
     notifyTasksUpdated()
     return id
   } finally {
@@ -363,7 +364,7 @@ async function updateTaskUnsafe(
   }
   const updated: Task = { ...existing, ...updates, id: taskId }
   const path = getTaskPath(taskListId, taskId)
-  await writeFile(path, jsonStringify(updated, null, 2))
+  await writeJsonFileAtomic(path, updated, { indent: 2 })
   notifyTasksUpdated()
   return updated
 }

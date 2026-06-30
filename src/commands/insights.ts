@@ -9,7 +9,6 @@ import {
   readFile,
   rm,
   unlink,
-  writeFile,
 } from 'fs/promises'
 import { tmpdir } from 'os'
 import { extname, join } from 'path'
@@ -21,6 +20,7 @@ import {
   LEGACY_AGENT_TOOL_NAME,
 } from '../tools/AgentTool/constants.js'
 import type { LogOption } from '../types/logs.js'
+import { writeFileAtomic } from '../utils/atomicWrite.js'
 import { getClaudeConfigHomeDir } from '../utils/envUtils.js'
 import { toError } from '../utils/errors.js'
 import { execFileNoThrow } from '../utils/execFileNoThrow.js'
@@ -968,10 +968,7 @@ async function saveFacets(facets: SessionFacets): Promise<void> {
     // Directory may already exist
   }
   const facetPath = join(getFacetsDir(), `${facets.session_id}.json`)
-  await writeFile(facetPath, jsonStringify(facets, null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  })
+  await writeFileAtomic(facetPath, jsonStringify(facets, null, 2), { mode: 0o600 })
 }
 
 async function loadCachedSessionMeta(
@@ -993,10 +990,7 @@ async function saveSessionMeta(meta: SessionMeta): Promise<void> {
     // Directory may already exist
   }
   const metaPath = join(getSessionMetaDir(), `${meta.session_id}.json`)
-  await writeFile(metaPath, jsonStringify(meta, null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  })
+  await writeFileAtomic(metaPath, jsonStringify(meta, null, 2), { mode: 0o600 })
 }
 
 async function extractFacetsFromAPI(
@@ -3009,10 +3003,7 @@ export async function generateUsageReport(options?: {
   }
 
   const htmlPath = join(getDataDir(), 'report.html')
-  await writeFile(htmlPath, htmlReport, {
-    encoding: 'utf-8',
-    mode: 0o600,
-  })
+  await writeFileAtomic(htmlPath, htmlReport, { mode: 0o600 })
 
   return {
     insights,

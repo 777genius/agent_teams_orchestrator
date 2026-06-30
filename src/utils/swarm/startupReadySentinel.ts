@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { AppState } from '../../state/AppState.js'
+import { writeFileAtomic } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 
 export const TEAMMATE_STARTUP_READY_SENTINEL_ENV =
@@ -88,7 +89,7 @@ export async function writeStartupReadySentinel(params: {
   }
 
   try {
-    await writeFile(params.filePath, JSON.stringify(payload), { mode: 0o600 })
+    await writeFileAtomic(params.filePath, JSON.stringify(payload), { mode: 0o600 })
   } catch (error) {
     // Best-effort only. Parent may already have timed out and cleaned the temp
     // dir, and that must never break the child session after startup.
