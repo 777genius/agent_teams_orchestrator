@@ -162,6 +162,103 @@ describe('runtime backend registry Anthropic catalog integration', () => {
     })
   })
 
+  test('anthropic runtime status exposes account-scoped live Fable, Mythos, and Sonnet 5 models', () => {
+    const anthropic = buildAnthropicRuntimeStatus({
+      auth: {
+        authenticated: true,
+        authMethod: 'claude.ai',
+      },
+      modelCatalog: {
+        schemaVersion: 1,
+        providerId: 'anthropic',
+        source: 'anthropic-models-api',
+        status: 'ready',
+        fetchedAt: '2026-07-02T00:00:00.000Z',
+        staleAt: '2026-07-02T00:10:00.000Z',
+        defaultModelId: 'claude-fable-5',
+        defaultLaunchModel: 'claude-fable-5',
+        models: [
+          {
+            id: 'claude-fable-5',
+            launchModel: 'claude-fable-5',
+            displayName: 'Fable 5',
+            hidden: false,
+            supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+            defaultReasoningEffort: 'high',
+            inputModalities: ['text', 'image', 'pdf'],
+            supportsFastMode: false,
+            supportsPersonality: false,
+            isDefault: true,
+            upgrade: false,
+            source: 'anthropic-models-api',
+          },
+          {
+            id: 'claude-mythos-5',
+            launchModel: 'claude-mythos-5',
+            displayName: 'Mythos 5',
+            hidden: false,
+            supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+            defaultReasoningEffort: 'high',
+            inputModalities: ['text', 'image'],
+            supportsFastMode: false,
+            supportsPersonality: false,
+            isDefault: false,
+            upgrade: false,
+            source: 'anthropic-models-api',
+          },
+          {
+            id: 'claude-sonnet-5',
+            launchModel: 'claude-sonnet-5',
+            displayName: 'Sonnet 5',
+            hidden: false,
+            supportedReasoningEfforts: ['low', 'medium', 'high'],
+            defaultReasoningEffort: 'high',
+            inputModalities: ['text', 'image'],
+            supportsFastMode: false,
+            supportsPersonality: false,
+            isDefault: false,
+            upgrade: false,
+            source: 'anthropic-models-api',
+          },
+        ],
+        diagnostics: {
+          configReadState: 'ready',
+          appServerState: 'healthy',
+        },
+      },
+      visibleModels: ['claude-fable-5', 'claude-mythos-5', 'claude-sonnet-5'],
+      reasoningEfforts: ['low', 'medium', 'high', 'max'],
+      fastMode: {
+        supported: true,
+        available: false,
+        reason: null,
+        source: 'runtime',
+      },
+      extensions: {
+        plugins: { status: 'supported', ownership: 'shared', reason: null },
+        mcp: { status: 'supported', ownership: 'shared', reason: null },
+        skills: { status: 'supported', ownership: 'shared', reason: null },
+        apiKeys: { status: 'supported', ownership: 'shared', reason: null },
+      },
+    })
+
+    expect(anthropic.models).toEqual([
+      'claude-fable-5',
+      'claude-mythos-5',
+      'claude-sonnet-5',
+    ])
+    expect(anthropic.modelCatalog?.defaultLaunchModel).toBe('claude-fable-5')
+    expect(anthropic.modelCatalog?.models.map(model => model.launchModel)).toEqual([
+      'claude-fable-5',
+      'claude-mythos-5',
+      'claude-sonnet-5',
+    ])
+    expect(anthropic.runtimeCapabilities?.modelCatalog).toEqual({
+      dynamic: true,
+      source: 'anthropic-models-api',
+    })
+  })
+
   test('exposes subscription rate limits for Anthropic subscription auth', () => {
     expect(buildMinimalAnthropicStatus('claude.ai').subscriptionRateLimits).toEqual({
       primary: {

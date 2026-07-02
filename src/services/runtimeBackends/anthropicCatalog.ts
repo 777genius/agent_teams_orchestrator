@@ -435,9 +435,44 @@ function resolveFallbackPreferredModelId(
     : null
 }
 
+function resolveEffortsFromCapabilities(
+  model: AnthropicApiModelInfo | null,
+): RuntimeReasoningEffort[] | null {
+  const capabilities = model?.capabilities
+  if (!isRecord(capabilities)) {
+    return null
+  }
+  const effortCapability = capabilities.effort
+  if (!readCapabilitySupport(effortCapability)) {
+    return null
+  }
+  if (!isRecord(effortCapability)) {
+    return ['low', 'medium', 'high']
+  }
+
+  const efforts = ANTHROPIC_EFFORT_ORDER.filter((effort) =>
+    readCapabilitySupport(effortCapability[effort]),
+  )
+  const resolvedModelId = normalizeResolvedModelId(model)
+  if (
+    resolvedModelId &&
+    effortCapability.max === undefined &&
+    modelSupportsMaxEffort(resolvedModelId) &&
+    !efforts.includes('max')
+  ) {
+    efforts.push('max')
+  }
+  return efforts.length > 0 ? efforts : ['low', 'medium', 'high']
+}
+
 function resolveRuntimeBackedAnthropicEfforts(
   model: AnthropicApiModelInfo | null,
 ): RuntimeReasoningEffort[] {
+  const capabilityEfforts = resolveEffortsFromCapabilities(model)
+  if (capabilityEfforts) {
+    return capabilityEfforts
+  }
+
   const resolvedModelId = normalizeResolvedModelId(model)
   if (!resolvedModelId || !modelSupportsEffort(resolvedModelId)) {
     return []
@@ -579,6 +614,43 @@ function createAnthropicCatalogItem(params: {
   }
 }
 
+function createLiveAnthropicCatalogItem(params: {
+  model: AnthropicApiModelInfo
+  isDefault: boolean
+}): RuntimeProviderModelCatalogItem | null {
+  const id = params.model.id?.trim()
+  if (!id || !isModelAllowed(id)) {
+    return null
+  }
+
+  return {
+    id,
+    launchModel: id,
+    displayName: cleanAnthropicDisplayName(params.model.display_name, id),
+    hidden: false,
+    supportedReasoningEfforts: resolveRuntimeBackedAnthropicEfforts(
+      params.model,
+    ),
+    defaultReasoningEffort: resolveAnthropicDefaultReasoningEffort(
+      params.model,
+    ),
+    supportsFastMode: resolveAnthropicFastModeSupport(params.model),
+    inputModalities: parseAnthropicInputModalities(params.model),
+    supportsPersonality: false,
+    isDefault: params.isDefault,
+    upgrade: false,
+    source: 'anthropic-models-api',
+    badgeLabel: null,
+    statusMessage: null,
+    metadata: {
+      context:
+        typeof params.model.max_input_tokens === 'number'
+          ? params.model.max_input_tokens
+          : null,
+    },
+  }
+}
+
 function dedupeCatalogModels(
   models: RuntimeProviderModelCatalogItem[],
 ): RuntimeProviderModelCatalogItem[] {
@@ -629,57 +701,80 @@ function buildAnthropicCatalogFromDefinitions(params: {
   diagnosticsMessage?: string | null
   diagnosticsCode?: string | null
 }): RuntimeProviderModelCatalog {
-  const models = dedupeCatalogModels(
-    ANTHROPIC_LAUNCH_DEFINITIONS.flatMap((definition) => {
-      const liveModel =
-        definition.preferredLiveIds
-          .map(
-            (candidateId) =>
-              params.liveModelsById.get(normalizeModelKey(candidateId)) ?? null,
-          )
-          .find((candidate) => {
-            if (!candidate) {
-              return false
-            }
-            if (definition.requiresOneMillionContext) {
-              return supportsOneMillionContext(candidate)
-            }
-            return true
-          }) ?? null
+  const curatedModels = ANTHROPIC_LAUNCH_DEFINITIONS.flatMap((definition) => {
+    const liveModel =
+      definition.preferredLiveIds
+        .map(
+          (candidateId) =>
+            params.liveModelsById.get(normalizeModelKey(candidateId)) ?? null,
+        )
+        .find((candidate) => {
+          if (!candidate) {
+            return false
+          }
+          if (definition.requiresOneMillionContext) {
+            return supportsOneMillionContext(candidate)
+          }
+          return true
+        }) ?? null
 
-      if (liveModel && !isModelAllowed(definition.launchModel)) {
-        return []
-      }
+    if (liveModel && !isModelAllowed(definition.launchModel)) {
+      return []
+    }
 
-      if (liveModel) {
-        return [
-          createAnthropicCatalogItem({
-            definition,
-            liveModel,
-            isDefault:
-              definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
-            source: 'anthropic-models-api',
-          }),
-        ]
-      }
-
-      if (!isModelAllowed(definition.launchModel)) {
-        return []
-      }
-
+    if (liveModel) {
       return [
         createAnthropicCatalogItem({
           definition,
-          liveModel: null,
-          isDefault: definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
-          source: 'static-fallback',
-          statusMessage: params.liveSourceEnabled
-            ? 'Using compatibility fallback because the live Anthropic catalog did not confirm this launch value.'
-            : 'Using static fallback because the live Anthropic catalog is unavailable.',
+          liveModel,
+          isDefault:
+            definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
+          source: 'anthropic-models-api',
         }),
       ]
-    }),
+    }
+
+    if (!isModelAllowed(definition.launchModel)) {
+      return []
+    }
+
+    return [
+      createAnthropicCatalogItem({
+        definition,
+        liveModel: null,
+        isDefault: definition.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL,
+        source: 'static-fallback',
+        statusMessage: params.liveSourceEnabled
+          ? 'Using compatibility fallback because the live Anthropic catalog did not confirm this launch value.'
+          : 'Using static fallback because the live Anthropic catalog is unavailable.',
+      }),
+    ]
+  })
+
+  const representedLiveIds = new Set(
+    curatedModels.flatMap((model) => [
+      normalizeModelKey(model.id),
+      normalizeModelKey(model.launchModel),
+    ]),
   )
+  const livePassthroughModels = params.liveSourceEnabled
+    ? Array.from(params.liveModelsById.values()).flatMap((model) => {
+        const id = normalizeModelKey(model.id)
+        if (!id || representedLiveIds.has(id)) {
+          return []
+        }
+        const item = createLiveAnthropicCatalogItem({
+          model,
+          isDefault: false,
+        })
+        return item ? [item] : []
+      })
+    : []
+
+  const models = dedupeCatalogModels([
+    ...curatedModels,
+    ...livePassthroughModels,
+  ])
 
   const defaultModelId =
     models.find((model) => model.launchModel === ANTHROPIC_DEFAULT_LAUNCH_MODEL)
@@ -869,7 +964,10 @@ function cacheAnthropicCatalog(
 export function getAnthropicVisibleRuntimeModels(
   catalog: RuntimeProviderModelCatalog,
 ): string[] {
-  if (catalog.source === 'anthropic-compatible-api') {
+  if (
+    catalog.source === 'anthropic-compatible-api' ||
+    catalog.source === 'anthropic-models-api'
+  ) {
     return catalog.models
       .filter((model) => !model.hidden)
       .map((model) => model.launchModel)

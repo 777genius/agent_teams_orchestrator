@@ -168,6 +168,100 @@ describe('anthropic runtime catalog', () => {
     })
   })
 
+  test('surfaces live Anthropic models that are not in curated launch definitions', () => {
+    const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
+      {
+        id: 'claude-fable-5',
+        type: 'model',
+        display_name: 'Claude Fable 5',
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: {
+            supported: true,
+            low: { supported: true },
+            medium: { supported: true },
+            high: { supported: true },
+            max: { supported: true },
+          },
+          image_input: { supported: true },
+          pdf_input: { supported: true },
+        },
+      },
+      {
+        id: 'claude-sonnet-5',
+        type: 'model',
+        display_name: 'Claude Sonnet 5',
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: {
+            supported: true,
+            low: { supported: true },
+            medium: { supported: true },
+            high: { supported: true },
+          },
+          image_input: { supported: true },
+        },
+      },
+      {
+        id: 'claude-mythos-5',
+        type: 'model',
+        display_name: 'Claude Mythos 5',
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: {
+            supported: true,
+            low: { supported: true },
+            medium: { supported: true },
+            high: { supported: true },
+            max: { supported: true },
+          },
+          image_input: { supported: true },
+        },
+      },
+    ])
+
+    expect(getAnthropicVisibleRuntimeModels(catalog)).toEqual(
+      expect.arrayContaining([
+        'claude-fable-5',
+        'claude-sonnet-5',
+        'claude-mythos-5',
+      ]),
+    )
+    expect(
+      catalog.models.find((model) => model.launchModel === 'claude-fable-5'),
+    ).toMatchObject({
+      displayName: 'Fable 5',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+      inputModalities: ['text', 'image', 'pdf'],
+      source: 'anthropic-models-api',
+      statusMessage: null,
+      metadata: {
+        context: 1_000_000,
+      },
+    })
+    expect(
+      catalog.models.find((model) => model.launchModel === 'claude-sonnet-5'),
+    ).toMatchObject({
+      displayName: 'Sonnet 5',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high'],
+      source: 'anthropic-models-api',
+    })
+    expect(
+      catalog.models.find((model) => model.launchModel === 'claude-mythos-5'),
+    ).toMatchObject({
+      displayName: 'Mythos 5',
+      hidden: false,
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'max'],
+      source: 'anthropic-models-api',
+    })
+  })
+
   test('normalizes Anthropic-compatible models without requiring Claude model ids', () => {
     const catalog = buildAnthropicCompatibleRuntimeModelCatalogFromApiModels([
       {
