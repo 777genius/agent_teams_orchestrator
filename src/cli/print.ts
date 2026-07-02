@@ -89,6 +89,11 @@ import { parsePluginIdentifier } from 'src/utils/plugins/pluginIdentifier.js'
 import { validateUuid } from 'src/utils/uuid.js'
 import { fromArray } from 'src/utils/generators.js'
 import { ask } from 'src/QueryEngine.js'
+import {
+  isSyntheticQueuedCommandReplay,
+  protocolKindForOrigin,
+  protocolKindFromUserContent,
+} from 'src/utils/replayProvenance.js'
 import type { PermissionPromptTool } from 'src/utils/queryHelpers.js'
 import {
   createFileStateCacheWithSizeLimit,
@@ -1343,6 +1348,7 @@ function runHeadlessStreaming(
           uuid: crumb.uuid,
           timestamp: crumb.timestamp,
           isReplay: true,
+          isSynthetic: true,
         } satisfies SDKUserMessageReplay)
       }
     }
@@ -2071,6 +2077,22 @@ function runHeadlessStreaming(
           if (options.replayUserMessages && batch.length > 1) {
             for (const c of batch) {
               if (c.uuid && c.uuid !== command.uuid) {
+                const commandProtocolKind =
+                  c.protocolKind ?? protocolKindFromUserContent(c.value)
+                const origin =
+                  c.origin ??
+                  (c.mode === 'task-notification'
+                    ? ({ kind: 'task-notification' } as const)
+                    : c.isMeta && commandProtocolKind === undefined
+                      ? ({ kind: 'coordinator' } as const)
+                      : undefined)
+                const protocolKind =
+                  commandProtocolKind ?? protocolKindForOrigin(origin)
+                const isSyntheticReplay = isSyntheticQueuedCommandReplay({
+                  ...c,
+                  origin,
+                  protocolKind,
+                })
                 output.enqueue({
                   type: 'user',
                   message: { role: 'user', content: c.value },
@@ -2078,6 +2100,9 @@ function runHeadlessStreaming(
                   parent_tool_use_id: null,
                   uuid: c.uuid,
                   isReplay: true,
+                  ...(isSyntheticReplay ? { isSynthetic: true } : {}),
+                  ...(origin ? { origin } : {}),
+                  ...(protocolKind ? { protocolKind } : {}),
                 } satisfies SDKUserMessageReplay)
               }
             }
@@ -2709,6 +2734,8 @@ function runHeadlessStreaming(
               mode: 'prompt',
               value: formatted,
               uuid: randomUUID(),
+              isMeta: true,
+              protocolKind: TEAMMATE_MESSAGE_TAG,
             })
             void run()
             return // run() will come back here after processing
@@ -4185,6 +4212,11 @@ function runHeadlessStreaming(
               uuid: message.uuid,
               timestamp: message.timestamp,
               isReplay: true,
+              ...(message.isSynthetic ? { isSynthetic: true } : {}),
+              ...(message.origin ? { origin: message.origin } : {}),
+              ...(message.protocolKind
+                ? { protocolKind: message.protocolKind }
+                : {}),
             } as SDKUserMessageReplay)
           }
           // Historical dup = transcript already has this turn's output, so it

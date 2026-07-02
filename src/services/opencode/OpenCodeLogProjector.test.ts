@@ -226,6 +226,257 @@ describe('OpenCodeLogProjector', () => {
     )
   })
 
+  test('marks user-role teammate protocol messages as meta', () => {
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 1,
+        messages: [
+          {
+            id: 'msg-teammate-protocol',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 100,
+            completedAt: 100,
+            text: '<teammate-message teammate_id="alice">looks good</teammate-message>',
+            reasoningText: '',
+            previewText: 'looks good',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: '<teammate-message teammate_id="alice">looks good</teammate-message>',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    expect(projection.messages).toEqual([
+      expect.objectContaining({
+        uuid: 'msg-teammate-protocol',
+        type: 'user',
+        isMeta: true,
+        isSynthetic: true,
+        protocolKind: 'teammate-message',
+      }),
+    ])
+  })
+
+  test('marks Human-prefixed user-role teammate protocol messages as meta', () => {
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 1,
+        messages: [
+          {
+            id: 'msg-human-prefixed-teammate-protocol',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 100,
+            completedAt: 100,
+            text: 'Human: <teammate-message teammate_id="alice">looks good</teammate-message>',
+            reasoningText: '',
+            previewText:
+              'Human: <teammate-message teammate_id="alice">looks good</teammate-message>',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: 'Human: <teammate-message teammate_id="alice">looks good</teammate-message>',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    expect(projection.messages).toEqual([
+      expect.objectContaining({
+        uuid: 'msg-human-prefixed-teammate-protocol',
+        type: 'user',
+        isMeta: true,
+        isSynthetic: true,
+        protocolKind: 'teammate-message',
+      }),
+    ])
+  })
+
+  test('marks other non-human user-role protocol messages as meta', () => {
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 3,
+        messages: [
+          {
+            id: 'msg-channel-protocol',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 100,
+            completedAt: 100,
+            text: '<channel-message channel="alerts">deploy finished</channel-message>',
+            reasoningText: '',
+            previewText:
+              '<channel-message channel="alerts">deploy finished</channel-message>',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: '<channel-message channel="alerts">deploy finished</channel-message>',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+          {
+            id: 'msg-cross-session-protocol',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 101,
+            completedAt: 101,
+            text: 'Human: <cross-session-message from="lead">status?</cross-session-message>',
+            reasoningText: '',
+            previewText:
+              'Human: <cross-session-message from="lead">status?</cross-session-message>',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: 'Human: <cross-session-message from="lead">status?</cross-session-message>',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+          {
+            id: 'msg-tick-protocol',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 102,
+            completedAt: 102,
+            text: '<tick>12:00:00</tick>',
+            reasoningText: '',
+            previewText: '<tick>12:00:00</tick>',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: '<tick>12:00:00</tick>',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    expect(projection.messages).toEqual([
+      expect.objectContaining({
+        uuid: 'msg-channel-protocol',
+        type: 'user',
+        isMeta: true,
+        isSynthetic: true,
+        protocolKind: 'channel-message',
+      }),
+      expect.objectContaining({
+        uuid: 'msg-cross-session-protocol',
+        type: 'user',
+        isMeta: true,
+        isSynthetic: true,
+        protocolKind: 'cross-session-message',
+      }),
+      expect.objectContaining({
+        uuid: 'msg-tick-protocol',
+        type: 'user',
+        isMeta: true,
+        isSynthetic: true,
+        protocolKind: 'tick',
+      }),
+    ])
+  })
+
+  test('keeps ordinary user-role status text visible even when it starts with Human', () => {
+    const projection = projector.projectSummary(
+      buildSummary({
+        messageCount: 1,
+        messages: [
+          {
+            id: 'msg-human-text',
+            parentId: null,
+            role: 'user',
+            agent: null,
+            providerId: 'opencode',
+            modelId: 'big-pickle',
+            createdAt: 100,
+            completedAt: 100,
+            text: 'Human: I tested the feature looks good',
+            reasoningText: '',
+            previewText: 'Human: I tested the feature looks good',
+            partTypes: ['text'],
+            reasoningPartCount: 0,
+            toolCalls: [],
+            contentBlocks: [
+              {
+                type: 'text',
+                text: 'Human: I tested the feature looks good',
+              },
+            ],
+            finishReason: null,
+            errorName: null,
+            errorMessage: null,
+            hasError: false,
+          },
+        ],
+      }),
+    )
+
+    expect(projection.messages).toEqual([
+      expect.objectContaining({
+        uuid: 'msg-human-text',
+        type: 'user',
+        isMeta: false,
+      }),
+    ])
+  })
+
   test('projects assistant runtime errors into synthetic system log messages', () => {
     const projection = projector.projectSummary(
       buildSummary({

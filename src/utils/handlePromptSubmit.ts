@@ -30,6 +30,11 @@ import type { ProcessUserInputContext } from './processUserInput/processUserInpu
 import { processUserInput } from './processUserInput/processUserInput.js'
 import type { QueryGuard } from './QueryGuard.js'
 import { queryCheckpoint, startQueryProfile } from './queryProfiler.js'
+import {
+  protocolKindForOrigin,
+  protocolKindFromUserContent,
+  shouldInferProtocolKindFromLegacyContent,
+} from './replayProvenance.js'
 import { runWithWorkload } from './workloadContext.js'
 
 function exit(): void {
@@ -500,14 +505,38 @@ async function executeUserInput(params: ExecuteUserInputParams): Promise<void> {
         // derivation at messages.ts (case 'queued_command'); intentionally
         // does NOT mirror its isMeta:true so idle-dequeued notifications stay
         // visible in the transcript via UserAgentNotificationMessage.
+        const commandProtocolKind =
+          cmd.protocolKind ??
+          (shouldInferProtocolKindFromLegacyContent(cmd)
+            ? protocolKindFromUserContent(cmd.value)
+            : undefined)
         const origin =
           cmd.origin ??
           (cmd.mode === 'task-notification'
             ? ({ kind: 'task-notification' } as const)
-            : undefined)
+            : cmd.isMeta && commandProtocolKind === undefined
+              ? ({ kind: 'coordinator' } as const)
+              : undefined)
+        const protocolKind = commandProtocolKind ?? protocolKindForOrigin(origin)
+        const isSyntheticProvenance =
+          cmd.isMeta === true ||
+          protocolKind !== undefined ||
+          (origin !== undefined && origin.kind !== 'human')
         if (origin) {
           for (const m of result.messages) {
             if (m.type === 'user') m.origin = origin
+          }
+        }
+        if (protocolKind) {
+          for (const m of result.messages) {
+            if (m.type === 'user') {
+              m.protocolKind = protocolKind
+            }
+          }
+        }
+        if (isSyntheticProvenance) {
+          for (const m of result.messages) {
+            if (m.type === 'user') m.isSynthetic = true
           }
         }
         newMessages.push(...result.messages)

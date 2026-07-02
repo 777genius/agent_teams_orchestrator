@@ -488,6 +488,8 @@ export type OpenCodeProjectedLogMessage = {
   model?: string
   agentName?: string
   isMeta: boolean
+  isSynthetic?: boolean
+  protocolKind?: string
   sessionId: string
   toolCalls: OpenCodeProjectedLogToolCall[]
   toolResults: OpenCodeProjectedLogToolResult[]

@@ -29,6 +29,7 @@ import { isEnvTruthy } from '../utils/envUtils.js';
 import { isFullscreenEnvEnabled } from '../utils/fullscreen.js';
 import { applyGrouping } from '../utils/groupToolUses.js';
 import { buildMessageLookups, createAssistantMessage, deriveUUID, getMessagesAfterCompactBoundary, getToolUseID, getToolUseIDs, hasUnresolvedHooksFromLookup, isNotEmptyMessage, normalizeMessages, reorderMessagesInUI, type StreamingThinking, type StreamingToolUse, shouldShowUserMessage } from '../utils/messages.js';
+import { classifyUserTurnProvenance } from '../utils/replayProvenance.js';
 import { plural } from '../utils/stringUtils.js';
 import { renderableSearchText } from '../utils/transcriptSearch.js';
 import { Divider } from './design-system/Divider.js';
@@ -94,6 +95,12 @@ export function filterForBriefTool<T extends {
   type: string;
   subtype?: string;
   isMeta?: boolean;
+  isSynthetic?: boolean;
+  isReplay?: boolean;
+  isCompactSummary?: boolean;
+  toolUseResult?: unknown;
+  origin?: { kind?: string };
+  protocolKind?: string;
   isApiErrorMessage?: boolean;
   message?: {
     content: Array<{
@@ -140,8 +147,8 @@ export function filterForBriefTool<T extends {
       if (block?.type === 'tool_result') {
         return block.tool_use_id !== undefined && briefToolUseIDs.has(block.tool_use_id);
       }
-      // Real user input only — drop meta/tick messages.
-      return !msg.isMeta;
+      // Real user input only - drop meta, synthetic replay, and protocol rows.
+      return classifyUserTurnProvenance(msg) === 'human';
     }
     if (msg.type === 'attachment') {
       // Human input drained mid-turn arrives as a queued_command attachment
@@ -169,6 +176,12 @@ export function filterForBriefTool<T extends {
 export function dropTextInBriefTurns<T extends {
   type: string;
   isMeta?: boolean;
+  isSynthetic?: boolean;
+  isReplay?: boolean;
+  isCompactSummary?: boolean;
+  toolUseResult?: unknown;
+  origin?: { kind?: string };
+  protocolKind?: string;
   message?: {
     content: Array<{
       type: string;
@@ -177,7 +190,7 @@ export function dropTextInBriefTurns<T extends {
   };
 }>(messages: T[], briefToolNames: string[]): T[] {
   const nameSet = new Set(briefToolNames);
-  // First pass: find which turns (bounded by non-meta user messages) contain
+  // First pass: find which turns (bounded by human user messages) contain
   // a Brief tool_use. Tag each assistant text block with its turn index.
   const turnsWithBrief = new Set<number>();
   const textIndexToTurn: number[] = [];
@@ -185,7 +198,11 @@ export function dropTextInBriefTurns<T extends {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
     const block = msg.message?.content[0];
-    if (msg.type === 'user' && block?.type !== 'tool_result' && !msg.isMeta) {
+    if (
+      msg.type === 'user' &&
+      block?.type !== 'tool_result' &&
+      classifyUserTurnProvenance(msg) === 'human'
+    ) {
       turn++;
       continue;
     }

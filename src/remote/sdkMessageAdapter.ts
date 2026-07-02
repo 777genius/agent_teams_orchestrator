@@ -17,6 +17,7 @@ import type {
 import { logForDebugging } from '../utils/debug.js'
 import { fromSDKCompactMetadata } from '../utils/messages/mappers.js'
 import { createUserMessage } from '../utils/messages.js'
+import { isSyntheticSDKUserReplay } from '../utils/replayProvenance.js'
 
 /**
  * Converts SDKMessage from CCR to REPL Message types.
@@ -190,8 +191,15 @@ export function convertSDKMessage(
             toolUseResult: msg.tool_use_result,
             uuid: msg.uuid,
             timestamp: msg.timestamp,
+            isSynthetic: msg.isSynthetic ? true : undefined,
+            isReplay: msg.isReplay ? true : undefined,
+            origin: msg.origin,
+            protocolKind: msg.protocolKind,
           }),
         }
+      }
+      if (isSyntheticSDKUserReplay(msg)) {
+        return { type: 'ignored' }
       }
       // When converting historical events, user-typed messages need to be
       // rendered (they weren't added locally by the REPL). Skip tool_results
@@ -205,6 +213,10 @@ export function convertSDKMessage(
               toolUseResult: msg.tool_use_result,
               uuid: msg.uuid,
               timestamp: msg.timestamp,
+              isSynthetic: msg.isSynthetic ? true : undefined,
+              isReplay: msg.isReplay ? true : undefined,
+              origin: msg.origin,
+              protocolKind: msg.protocolKind,
             }),
           }
         }

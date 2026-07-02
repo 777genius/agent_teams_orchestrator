@@ -6,6 +6,7 @@ import type { Message } from '../../types/message.js';
 import { getCwd } from '../../utils/cwd.js';
 import { resolveExportFilePath } from '../../utils/exportPath.js';
 import { renderMessagesToPlainText } from '../../utils/exportRenderer.js';
+import { classifyUserTurnProvenance } from '../../utils/replayProvenance.js';
 import { writeFileSync_DEPRECATED } from '../../utils/slowOperations.js';
 function formatTimestamp(date: Date): string {
   const year = date.getFullYear();
@@ -17,11 +18,22 @@ function formatTimestamp(date: Date): string {
   return `${year}-${month}-${day}-${hours}${minutes}${seconds}`;
 }
 export function extractFirstPrompt(messages: Message[]): string {
-  const firstUserMessage = messages.find(msg => msg.type === 'user');
-  if (!firstUserMessage || firstUserMessage.type !== 'user') {
-    return '';
+  for (const message of messages) {
+    if (!isExportPromptCandidate(message)) continue;
+    const result = extractPromptText(message);
+    if (result) return result;
   }
-  const content = firstUserMessage.message?.content;
+  return '';
+}
+
+function isExportPromptCandidate(message: Message): message is Extract<Message, { type: 'user' }> {
+  if (message.type !== 'user') return false;
+  if (message.isCompactSummary) return false;
+  return classifyUserTurnProvenance(message) === 'human';
+}
+
+function extractPromptText(message: Extract<Message, { type: 'user' }>): string {
+  const content = message.message?.content;
   let result = '';
   if (typeof content === 'string') {
     result = content.trim();

@@ -12,6 +12,7 @@ import type {
   TranscriptMessage,
 } from '../../types/logs.js'
 import { parseJSONL } from '../../utils/json.js'
+import { classifyUserTurnProvenance } from '../../utils/replayProvenance.js'
 import {
   getProjectDir,
   getTranscriptPath,
@@ -51,6 +52,14 @@ export function deriveFirstPrompt(
   return (
     raw.replace(/\s+/g, ' ').trim().slice(0, 100) || 'Branched conversation'
   )
+}
+
+function isBranchPromptCandidate(
+  message: SerializedMessage,
+): message is Extract<SerializedMessage, { type: 'user' }> {
+  if (message.type !== 'user') return false
+  if (message.isCompactSummary) return false
+  return classifyUserTurnProvenance(message) === 'human'
 }
 
 /**
@@ -240,7 +249,7 @@ export async function call(
     // Build LogOption for resume
     const now = new Date()
     const firstPrompt = deriveFirstPrompt(
-      serializedMessages.find(m => m.type === 'user'),
+      serializedMessages.find(isBranchPromptCandidate),
     )
 
     // Save custom title - use provided title or firstPrompt as default

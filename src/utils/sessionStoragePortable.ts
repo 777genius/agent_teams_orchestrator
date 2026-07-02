@@ -12,6 +12,7 @@ import { join } from 'path'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { getWorktreePathsPortable } from './getWorktreePathsPortable.js'
 import { djb2Hash } from './hash.js'
+import { classifyUserTurnProvenance } from './replayProvenance.js'
 
 /** Size of the head/tail buffer for lite metadata reads. */
 export const LITE_READ_BUF_SIZE = 65536
@@ -140,8 +141,9 @@ const COMMAND_NAME_RE = /<command-name>(.*?)<\/command-name>/
 /**
  * Extracts the first meaningful user prompt from a JSONL head chunk.
  *
- * Skips tool_result messages, isMeta, isCompactSummary, command-name messages,
- * and auto-generated patterns (session hooks, tick, IDE metadata, etc.).
+ * Skips tool_result messages, isMeta, isSynthetic, isCompactSummary,
+ * command-name messages, and auto-generated patterns (session hooks, tick,
+ * IDE metadata, etc.).
  * Truncates to 200 chars.
  */
 export function extractFirstPromptFromHead(head: string): string {
@@ -155,18 +157,12 @@ export function extractFirstPromptFromHead(head: string): string {
 
     if (!line.includes('"type":"user"') && !line.includes('"type": "user"'))
       continue
-    if (line.includes('"tool_result"')) continue
-    if (line.includes('"isMeta":true') || line.includes('"isMeta": true'))
-      continue
-    if (
-      line.includes('"isCompactSummary":true') ||
-      line.includes('"isCompactSummary": true')
-    )
-      continue
+    if (isSkippableFirstPromptLine(line)) continue
 
     try {
       const entry = JSON.parse(line) as Record<string, unknown>
       if (entry.type !== 'user') continue
+      if (classifyUserTurnProvenance(entry) !== 'human') continue
 
       const message = entry.message as Record<string, unknown> | undefined
       if (!message) continue
@@ -211,6 +207,39 @@ export function extractFirstPromptFromHead(head: string): string {
   }
   if (commandFallback) return commandFallback
   return ''
+}
+
+function isSkippableFirstPromptLine(line: string): boolean {
+  if (line.includes('"tool_result"')) return true
+  if (line.includes('"isMeta":true') || line.includes('"isMeta": true'))
+    return true
+  if (
+    line.includes('"isSynthetic":true') ||
+    line.includes('"isSynthetic": true')
+  )
+    return true
+  if (
+    line.includes('"isCompactSummary":true') ||
+    line.includes('"isCompactSummary": true')
+  )
+    return true
+  if (line.includes('"protocolKind":')) return true
+  if (
+    line.includes('"kind":"coordinator"') ||
+    line.includes('"kind": "coordinator"') ||
+    line.includes('"kind":"task-notification"') ||
+    line.includes('"kind": "task-notification"') ||
+    line.includes('"kind":"channel"') ||
+    line.includes('"kind": "channel"') ||
+    line.includes('"kind":"cross-session"') ||
+    line.includes('"kind": "cross-session"') ||
+    line.includes('"kind":"tick"') ||
+    line.includes('"kind": "tick"') ||
+    line.includes('"kind":"teammate"') ||
+    line.includes('"kind": "teammate"')
+  )
+    return true
+  return false
 }
 
 // ---------------------------------------------------------------------------

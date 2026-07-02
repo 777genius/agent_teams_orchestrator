@@ -1,3 +1,11 @@
+import {
+  CHANNEL_MESSAGE_TAG,
+  CROSS_SESSION_MESSAGE_TAG,
+  TASK_NOTIFICATION_TAG,
+  TEAMMATE_MESSAGE_TAG,
+  TICK_TAG,
+} from '../../constants/xml.js'
+
 import type {
   OpenCodeCanonicalContentBlock,
   OpenCodeCanonicalMessage,
@@ -12,6 +20,14 @@ import type {
 type OpenCodeLogProjectorClock = () => number
 
 const MAX_PROJECTED_TOOL_RESULT_TEXT_CHARS = 8_000
+const NON_HUMAN_USER_PROTOCOL_TAGS = [
+  CHANNEL_MESSAGE_TAG,
+  CROSS_SESSION_MESSAGE_TAG,
+  TASK_NOTIFICATION_TAG,
+  TEAMMATE_MESSAGE_TAG,
+  TICK_TAG,
+] as const
+const HUMAN_REPLAY_PREFIX = 'Human:'
 
 function asFiniteTimestamp(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
@@ -22,6 +38,28 @@ function toIsoTimestamp(
   fallbackTimestamp: number,
 ): string {
   return new Date(asFiniteTimestamp(value) ?? fallbackTimestamp).toISOString()
+}
+
+function getNonHumanUserProtocolKind(
+  message: OpenCodeCanonicalMessage,
+): string | undefined {
+  const texts = [
+    message.text,
+    ...message.contentBlocks.flatMap(block =>
+      block.type === 'text' ? [block.text] : [],
+    ),
+  ]
+  for (const raw of texts) {
+    const text = raw.trimStart()
+    const protocolText = text.startsWith(HUMAN_REPLAY_PREFIX)
+      ? text.slice(HUMAN_REPLAY_PREFIX.length).trimStart()
+      : text
+    const protocolKind = NON_HUMAN_USER_PROTOCOL_TAGS.find(tag =>
+      protocolText.startsWith(`<${tag}`),
+    )
+    if (protocolKind) return protocolKind
+  }
+  return undefined
 }
 
 function buildFallbackUuid(params: {
@@ -306,6 +344,8 @@ function buildUserLogMessage(params: {
     return null
   }
 
+  const protocolKind = getNonHumanUserProtocolKind(params.message)
+
   return {
     uuid: params.message.id ?? buildFallbackUuid({
       sessionId: params.sessionId,
@@ -319,7 +359,9 @@ function buildUserLogMessage(params: {
     content,
     model: buildModelRef(params.message),
     agentName: params.message.agent ?? undefined,
-    isMeta: false,
+    isMeta: protocolKind !== undefined,
+    isSynthetic: protocolKind !== undefined ? true : undefined,
+    protocolKind,
     sessionId: params.sessionId,
     toolCalls: [],
     toolResults: [],

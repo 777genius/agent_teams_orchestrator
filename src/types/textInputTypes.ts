@@ -339,6 +339,7 @@ export type QueuedCommand = {
    * undefined = human (keyboard).
    */
   origin?: MessageOrigin
+  protocolKind?: string
   /**
    * Workload tag threaded through to cc_workload= in the billing-header
    * attribution block. The queue is the async boundary between the cron

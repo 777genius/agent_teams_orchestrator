@@ -92,6 +92,7 @@ import { useSwarmInitialization } from '../hooks/useSwarmInitialization.js';
 import { useTeammateViewAutoExit } from '../hooks/useTeammateViewAutoExit.js';
 import { errorMessage } from '../utils/errors.js';
 import { isHumanTurn } from '../utils/messagePredicates.js';
+import { protocolKindFromUserContent } from '../utils/replayProvenance.js';
 import { logError } from '../utils/log.js';
 // Dead code elimination: conditional imports
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
@@ -2695,7 +2696,7 @@ export function REPL({
     // processTextPrompt) — both pushed length past 1 on turn one, so the
     // title silently fell through to the "Claude Code" default.
     if (!titleDisabled && !sessionTitle && !agentTitle && !haikuTitleAttemptedRef.current) {
-      const firstUserMessage = newMessages.find(m => m.type === 'user' && !m.isMeta);
+      const firstUserMessage = newMessages.find(isHumanTurn);
       const text = firstUserMessage?.type === 'user' ? getContentText(firstUserMessage.message.content) : null;
       // Skip synthetic breadcrumbs — slash-command output, prompt-skill
       // expansions (/commit → <command-message>), local-command headers
@@ -2906,7 +2907,7 @@ export function REPL({
       // Extract and enqueue user message text, skipping meta messages
       // (e.g. expanded skill content, tick prompts) that should not be
       // replayed as user-visible text.
-      newMessages.filter((m): m is UserMessage => m.type === 'user' && !m.isMeta).map(_ => getContentText(_.message.content)).filter(_ => _ !== null).forEach((msg, i) => {
+      newMessages.filter(isHumanTurn).map(_ => getContentText(_.message.content)).filter(_ => _ !== null).forEach((msg, i) => {
         enqueue({
           value: msg,
           mode: 'prompt'
@@ -4052,9 +4053,14 @@ export function REPL({
     setAbortController(newAbortController);
 
     // Create a user message with the formatted content (includes XML wrapper)
+    const protocolKind = protocolKindFromUserContent(content);
+    const isSyntheticIncomingPrompt =
+      options?.isMeta === true || protocolKind !== undefined;
     const userMessage = createUserMessage({
       content,
-      isMeta: options?.isMeta ? true : undefined
+      isMeta: isSyntheticIncomingPrompt ? true : undefined,
+      isSynthetic: isSyntheticIncomingPrompt ? true : undefined,
+      protocolKind,
     });
     void onQuery([...(options?.prefixMessages ?? []), userMessage], newAbortController, true, [], mainLoopModel);
     return {
