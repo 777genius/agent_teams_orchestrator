@@ -63,8 +63,16 @@ describe('teammateRuntimeEvents helpers', () => {
 
   it('retries a hung runtime event append so readiness markers are not lost', async () => {
     const eventsPath = await createRuntimeLogPath()
-    spyOn(fs, 'appendFile').mockImplementationOnce(
-      () => new Promise<never>(() => {}) as never,
+    const appendFile = fs.appendFile
+    let shouldHang = true
+    spyOn(fs, 'appendFile').mockImplementation(
+      ((path, data, options) => {
+        if (shouldHang && path === eventsPath) {
+          shouldHang = false
+          return new Promise<never>(() => {}) as never
+        }
+        return appendFile(path, data, options)
+      }) as typeof fs.appendFile,
     )
 
     const startedAt = Date.now()
