@@ -23,6 +23,7 @@ import {
   readAndClaimInteractiveMailboxSnapshot,
   readMailbox,
   readUnreadMessages,
+  supersedeStaleLeadBootstrapMessages,
   writeToMailbox,
   writeToMailboxVerified,
 } from './teammateMailbox.js'
@@ -219,6 +220,69 @@ describe('teammateMailbox', () => {
       totalMessages: 1,
     })
     expect(await readMailbox('atlas', 'my-team')).toHaveLength(1)
+  })
+
+  it('supersedes only stale lead-authored bootstrap rows before writing a fresh launch prompt', async () => {
+    await writeToMailbox(
+      'atlas',
+      {
+        messageId: 'old-bootstrap',
+        from: 'team-lead',
+        text: 'Your FIRST action: call MCP tool member_briefing for run-old',
+        timestamp: '2026-01-02T00:00:00.000Z',
+      },
+      'my-team',
+    )
+    await writeToMailbox(
+      'atlas',
+      {
+        messageId: 'old-regular',
+        from: 'team-lead',
+        text: 'regular note from lead',
+        timestamp: '2026-01-02T00:00:01.000Z',
+      },
+      'my-team',
+    )
+    await writeToMailbox(
+      'atlas',
+      {
+        messageId: 'fresh-bootstrap',
+        from: 'team-lead',
+        text: 'Your FIRST action: call MCP tool member_briefing for run-new',
+        timestamp: '2026-01-02T00:01:00.000Z',
+      },
+      'my-team',
+    )
+    await writeToMailbox(
+      'atlas',
+      {
+        messageId: 'peer-bootstrap-looking-row',
+        from: 'bob',
+        text: 'Your FIRST action: call MCP tool member_briefing for run-old',
+        timestamp: '2026-01-02T00:00:00.000Z',
+      },
+      'my-team',
+    )
+
+    const superseded = await supersedeStaleLeadBootstrapMessages('atlas', {
+      teamName: 'my-team',
+      beforeIso: '2026-01-02T00:00:30.000Z',
+      isBootstrapInstructionText: text => text.includes('member_briefing'),
+    })
+
+    expect(superseded).toEqual(['old-bootstrap'])
+    const messages = await readMailbox('atlas', 'my-team')
+    expect(
+      messages.map(message => ({
+        id: message.messageId,
+        read: message.read,
+      })),
+    ).toEqual([
+      { id: 'old-bootstrap', read: true },
+      { id: 'old-regular', read: false },
+      { id: 'fresh-bootstrap', read: false },
+      { id: 'peer-bootstrap-looking-row', read: false },
+    ])
   })
 
   it('preserves agent error message kind in the team lead inbox', async () => {

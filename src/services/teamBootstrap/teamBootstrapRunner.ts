@@ -68,6 +68,35 @@ const DEFAULT_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS = 180_000
 const BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_ENV =
   'CLAUDE_TEAM_BOOTSTRAP_SUBMITTED_CONFIRMATION_TIMEOUT_MS'
 const BOOTSTRAP_SUBMITTED_EVENT_FUTURE_TOLERANCE_MS = 5_000
+const BOOTSTRAP_AUDIT_RUNTIME_EVENT_READ_MAX_BYTES = 4 * 1024 * 1024
+const BOOTSTRAP_AUDIT_RUNTIME_EVENT_READ_MAX_LINES = 4096
+// Per-member fence: never hand a single member less than this, but also never
+// let one member consume the whole remaining bootstrap budget (starving the
+// members spawned after it - a cold CLI start alone can take 30-70s on a
+// loaded machine).
+const BOOTSTRAP_MEMBER_TIMEOUT_FLOOR_MS = 60_000
+// Skip the repair pass entirely when less budget than this remains - a
+// respawn that cannot even reach runtime_ready only burns the audit window.
+const BOOTSTRAP_REPAIR_MIN_REMAINING_BUDGET_MS = 45_000
+
+export function getFencedMemberBootstrapTimeoutMs(
+  remainingMs: number,
+  membersLeft: number,
+): number {
+  const boundedRemaining = Math.max(1, remainingMs)
+  const boundedMembersLeft = Math.max(1, membersLeft)
+  const share = Math.floor(boundedRemaining / boundedMembersLeft)
+  if (boundedMembersLeft <= 1) {
+    return boundedRemaining
+  }
+  if (
+    boundedRemaining >=
+    BOOTSTRAP_MEMBER_TIMEOUT_FLOOR_MS * boundedMembersLeft
+  ) {
+    return Math.max(BOOTSTRAP_MEMBER_TIMEOUT_FLOOR_MS, share)
+  }
+  return Math.max(1, share)
+}
 
 let testDeps: Partial<TeamBootstrapRunnerDeps> | null = null
 
@@ -580,7 +609,10 @@ async function readProcessBootstrapRuntimeEvents(params: {
     teamName: params.teamName,
     agentName: params.memberName,
   }).eventsPath
-  const events = await readRecentTeammateRuntimeEvents(eventsPath)
+  const events = await readRecentTeammateRuntimeEvents(eventsPath, {
+    maxBytes: BOOTSTRAP_AUDIT_RUNTIME_EVENT_READ_MAX_BYTES,
+    maxLines: BOOTSTRAP_AUDIT_RUNTIME_EVENT_READ_MAX_LINES,
+  })
   return events.filter(event => isCurrentProcessBootstrapEvent(event, params))
 }
 
@@ -966,197 +998,257 @@ export async function runTeamBootstrap(params: {
           params.emit.phaseChanged('spawning_members'),
         )
         const failedMembers: Array<{ name: string; reason: string }> = []
-
-        for (const [memberIndex, member] of params.request.members.entries()) {
-          assertTimeoutBudget(`before spawning teammate "${member.displayName}"`)
-          await validateWorkspace(
-            `before spawning teammate "${member.displayName}"`,
-          )
-          assertStableTeamBootstrapRuntimeIdentity({
-            teamName: params.request.teamName,
-            expected: runtimeIdentity,
-          })
-          const spawnDelayMs = getBootstrapSpawnDelayMs(
-            params.request.members,
-            memberIndex,
-          )
-          if (spawnDelayMs > 0) {
-            assertTimeoutBudget(
-              `before staggered spawn delay for teammate "${member.displayName}"`,
-            )
-            await sleep(spawnDelayMs)
-            assertTimeoutBudget(
-              `after staggered spawn delay for teammate "${member.displayName}"`,
-            )
-            await validateWorkspace(
-              `after staggered spawn delay for teammate "${member.displayName}"`,
-            )
+        const recordMemberFailure = (name: string, reason: string): void => {
+          const existing = failedMembers.find(failed => failed.name === name)
+          if (existing) {
+            existing.reason = reason
+          } else {
+            failedMembers.push({ name, reason })
           }
-          await stateStore.markMemberSpawnStarted(member.displayName, now)
-          await emitBootstrapProgressSafely(
-            `member_spawn_started:${member.displayName}`,
-            () => params.emit.memberSpawnStarted(member.displayName),
-          )
-          try {
-            assertPrimaryBootstrapProviderSupported(member)
-            const model = normalizeBootstrapModelSelection(member.model)
-            const result = await spawnTeammateWithTransientStartupRetry({
-              deps,
-              context: params.context,
-              teamName: params.request.teamName,
-              memberName: member.displayName,
-              remainingBudgetMs: getRemainingBootstrapBudgetMs,
-              buildInput: () => ({
-                name: member.displayName,
-                prompt: member.prompt,
-                team_name: params.request.teamName,
-                ...(member.cwd && member.isolation !== 'worktree'
-                  ? { cwd: member.cwd }
-                  : {}),
-                ...(model ? { model } : {}),
-                ...(member.provider ? { provider: member.provider } : {}),
-                ...(member.effort ? { effort: member.effort as never } : {}),
-                ...(member.isolation === 'worktree' ? { isolation: 'worktree' as const } : {}),
-                ...(member.agentType ? { agent_type: member.agentType } : {}),
-                ...(member.description ? { description: member.description } : {}),
-                ...(member.mcpConfigPath ? { mcp_config: member.mcpConfigPath } : {}),
-                ...(member.mcpSettingSources
-                  ? { mcp_setting_sources: member.mcpSettingSources }
-                  : {}),
-                ...(member.strictMcpConfig !== undefined
-                  ? { strict_mcp_config: member.strictMcpConfig }
-                  : {}),
-                ...(member.nativeAppManagedBootstrap
-                  ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
-                  : {}),
-                bootstrapRunId: params.request.runId,
-                bootstrapTimeoutMs: getRemainingBootstrapBudgetMs(),
-                ...(member.useSplitPane !== undefined
-                  ? { use_splitpane: member.useSplitPane }
-                  : {}),
-                ...(member.planModeRequired
-                  ? { plan_mode_required: member.planModeRequired }
-                  : {}),
-              }),
-            })
+        }
+        const clearMemberFailure = (name: string): void => {
+          const index = failedMembers.findIndex(failed => failed.name === name)
+          if (index >= 0) {
+            failedMembers.splice(index, 1)
+          }
+        }
 
-            const duplicate = result.data as Partial<DuplicateSkippedOutput>
-            if (duplicate.status === 'duplicate_skipped') {
-              const duplicateOutcome =
-                duplicate.reason === 'already_running'
-                  ? 'already_running'
-                  : 'duplicate_pending'
+        const runMemberSpawnPass = async (
+          passMembers: typeof params.request.members,
+          passPhase: 'initial' | 'repair',
+        ): Promise<void> => {
+          for (const [memberIndex, member] of passMembers.entries()) {
+            assertTimeoutBudget(`before spawning teammate "${member.displayName}"`)
+            await validateWorkspace(
+              `before spawning teammate "${member.displayName}"`,
+            )
+            assertStableTeamBootstrapRuntimeIdentity({
+              teamName: params.request.teamName,
+              expected: runtimeIdentity,
+            })
+            // Repair attempts skip the staggered delay: budget is already tight.
+            const spawnDelayMs =
+              passPhase === 'initial'
+                ? getBootstrapSpawnDelayMs(passMembers, memberIndex)
+                : 0
+            if (spawnDelayMs > 0) {
+              assertTimeoutBudget(
+                `before staggered spawn delay for teammate "${member.displayName}"`,
+              )
+              await sleep(spawnDelayMs)
+              assertTimeoutBudget(
+                `after staggered spawn delay for teammate "${member.displayName}"`,
+              )
+              await validateWorkspace(
+                `after staggered spawn delay for teammate "${member.displayName}"`,
+              )
+            }
+            await stateStore.markMemberSpawnStarted(member.displayName, now)
+            await emitBootstrapProgressSafely(
+              `member_spawn_started:${member.displayName}`,
+              () => params.emit.memberSpawnStarted(member.displayName),
+            )
+            try {
+              assertPrimaryBootstrapProviderSupported(member)
+              const model = normalizeBootstrapModelSelection(member.model)
+              const result = await spawnTeammateWithTransientStartupRetry({
+                deps,
+                context: params.context,
+                teamName: params.request.teamName,
+                memberName: member.displayName,
+                remainingBudgetMs: getRemainingBootstrapBudgetMs,
+                buildInput: () => ({
+                  name: member.displayName,
+                  prompt: member.prompt,
+                  team_name: params.request.teamName,
+                  ...(member.cwd && member.isolation !== 'worktree'
+                    ? { cwd: member.cwd }
+                    : {}),
+                  ...(model ? { model } : {}),
+                  ...(member.provider ? { provider: member.provider } : {}),
+                  ...(member.effort ? { effort: member.effort as never } : {}),
+                  ...(member.isolation === 'worktree'
+                    ? { isolation: 'worktree' as const }
+                    : {}),
+                  ...(member.agentType ? { agent_type: member.agentType } : {}),
+                  ...(member.description ? { description: member.description } : {}),
+                  ...(member.mcpConfigPath
+                    ? { mcp_config: member.mcpConfigPath }
+                    : {}),
+                  ...(member.mcpSettingSources
+                    ? { mcp_setting_sources: member.mcpSettingSources }
+                    : {}),
+                  ...(member.strictMcpConfig !== undefined
+                    ? { strict_mcp_config: member.strictMcpConfig }
+                    : {}),
+                  ...(member.nativeAppManagedBootstrap
+                    ? {
+                        nativeAppManagedBootstrap:
+                          member.nativeAppManagedBootstrap,
+                      }
+                    : {}),
+                  bootstrapRunId: params.request.runId,
+                  // Fair-share fence: one slow or stuck teammate must not eat
+                  // the whole remaining budget and starve later members.
+                  bootstrapTimeoutMs: getFencedMemberBootstrapTimeoutMs(
+                    getRemainingBootstrapBudgetMs(),
+                    passMembers.length - memberIndex,
+                  ),
+                  ...(member.useSplitPane !== undefined
+                    ? { use_splitpane: member.useSplitPane }
+                    : {}),
+                  ...(member.planModeRequired
+                    ? { plan_mode_required: member.planModeRequired }
+                    : {}),
+                }),
+              })
+
+              const duplicate = result.data as Partial<DuplicateSkippedOutput>
+              if (duplicate.status === 'duplicate_skipped') {
+                const duplicateOutcome =
+                  duplicate.reason === 'already_running'
+                    ? 'already_running'
+                    : 'duplicate_pending'
+                clearMemberFailure(member.displayName)
+                await stateStore.markMemberResult(
+                  member.displayName,
+                  {
+                    status: 'registered',
+                    agentId: duplicate.agent_id,
+                    failureReason: duplicate.reason,
+                  },
+                  now,
+                )
+                await emitBootstrapProgressSafely(
+                  `member_spawn_result:${member.displayName}:${duplicateOutcome}`,
+                  () =>
+                    params.emit.memberSpawnResult({
+                      memberName: member.displayName,
+                      outcome: duplicateOutcome,
+                      agentId: duplicate.agent_id,
+                      teammateId: duplicate.teammate_id,
+                      reason: duplicate.reason,
+                    }),
+                )
+                continue
+              }
+
+              const runtimePid =
+                'runtime_pid' in result.data &&
+                typeof result.data.runtime_pid === 'number' &&
+                result.data.runtime_pid > 0
+                  ? result.data.runtime_pid
+                  : undefined
+              const backendType =
+                'backend_type' in result.data &&
+                typeof result.data.backend_type === 'string'
+                  ? result.data.backend_type
+                  : undefined
+              clearMemberFailure(member.displayName)
               await stateStore.markMemberResult(
                 member.displayName,
                 {
                   status: 'registered',
-                  agentId: duplicate.agent_id,
-                  failureReason: duplicate.reason,
+                  agentId: result.data.agent_id,
+                  backendType,
+                  runtimePid,
                 },
                 now,
               )
               await emitBootstrapProgressSafely(
-                `member_spawn_result:${member.displayName}:${duplicateOutcome}`,
+                `member_spawn_result:${member.displayName}:spawned`,
                 () =>
                   params.emit.memberSpawnResult({
                     memberName: member.displayName,
-                    outcome: duplicateOutcome,
-                    agentId: duplicate.agent_id,
-                    teammateId: duplicate.teammate_id,
-                    reason: duplicate.reason,
+                    outcome: 'spawned',
+                    agentId: result.data.agent_id,
+                    teammateId: result.data.teammate_id,
+                    backendType,
                   }),
               )
-              continue
-            }
-
-            const runtimePid =
-              'runtime_pid' in result.data &&
-              typeof result.data.runtime_pid === 'number' &&
-              result.data.runtime_pid > 0
-                ? result.data.runtime_pid
-                : undefined
-            const backendType =
-              'backend_type' in result.data &&
-              typeof result.data.backend_type === 'string'
-                ? result.data.backend_type
-                : undefined
-            await stateStore.markMemberResult(
-              member.displayName,
-              {
-                status: 'registered',
-                agentId: result.data.agent_id,
-                backendType,
-                runtimePid,
-              },
-              now,
-            )
-            await emitBootstrapProgressSafely(
-              `member_spawn_result:${member.displayName}:spawned`,
-              () =>
-                params.emit.memberSpawnResult({
-                  memberName: member.displayName,
-                  outcome: 'spawned',
-                  agentId: result.data.agent_id,
-                  teammateId: result.data.teammate_id,
+              if (
+                shouldWaitForCodexBootstrapConfirmationBeforeNextSpawn({
+                  member,
                   backendType,
-                }),
-            )
-            if (
-              shouldWaitForCodexBootstrapConfirmationBeforeNextSpawn({
-                member,
-                backendType,
-              })
-            ) {
-              const bootstrapExpectedAfter = await readRegisteredBootstrapExpectedAfter({
-                deps,
-                teamName: params.request.teamName,
-                memberName: member.displayName,
-                agentId: result.data.agent_id,
-              })
-              await waitForRequiredBootstrapConfirmations({
-                request: {
-                  ...params.request,
-                  members: [member],
+                })
+              ) {
+                const bootstrapExpectedAfter =
+                  await readRegisteredBootstrapExpectedAfter({
+                    deps,
+                    teamName: params.request.teamName,
+                    memberName: member.displayName,
+                    agentId: result.data.agent_id,
+                  })
+                await waitForRequiredBootstrapConfirmations({
+                  request: {
+                    ...params.request,
+                    members: [member],
+                  },
+                  stateStore,
+                  failedMembers,
+                  membersByName: new Map([
+                    [
+                      member.displayName,
+                      {
+                        agentId: result.data.agent_id,
+                        bootstrapExpectedAfter,
+                        backendType,
+                        runtimePid,
+                        bootstrapRunId: params.request.runId,
+                      },
+                    ],
+                  ]),
+                  timeoutStartedAt,
+                  monotonicNow,
+                  now,
+                })
+              }
+            } catch (error) {
+              const reason = errorMessage(error)
+              recordMemberFailure(member.displayName, reason)
+              await stateStore.markMemberResult(
+                member.displayName,
+                {
+                  status: 'failed',
+                  failureReason: reason,
                 },
-                stateStore,
-                failedMembers,
-                membersByName: new Map([
-                  [
-                    member.displayName,
-                    {
-                      agentId: result.data.agent_id,
-                      bootstrapExpectedAfter,
-                      backendType,
-                      runtimePid,
-                      bootstrapRunId: params.request.runId,
-                    },
-                  ],
-                ]),
-                timeoutStartedAt,
-                monotonicNow,
                 now,
-              })
+              )
+              await emitBootstrapProgressSafely(
+                `member_spawn_result:${member.displayName}:failed`,
+                () =>
+                  params.emit.memberSpawnResult({
+                    memberName: member.displayName,
+                    outcome: 'failed',
+                    reason,
+                  }),
+              )
             }
-          } catch (error) {
-            const reason = errorMessage(error)
-            failedMembers.push({ name: member.displayName, reason })
-            await stateStore.markMemberResult(
-              member.displayName,
-              {
-                status: 'failed',
-                failureReason: reason,
-              },
-              now,
-            )
-            await emitBootstrapProgressSafely(
-              `member_spawn_result:${member.displayName}:failed`,
-              () =>
-                params.emit.memberSpawnResult({
-                  memberName: member.displayName,
-                  outcome: 'failed',
-                  reason,
-                }),
-            )
+          }
+        }
+
+        await runMemberSpawnPass(params.request.members, 'initial')
+
+        if (failedMembers.length > 0) {
+          const repairMembers = params.request.members.filter(member =>
+            failedMembers.some(failed => failed.name === member.displayName),
+          )
+          if (
+            repairMembers.length > 0 &&
+            getRemainingBootstrapBudgetMs() >=
+              BOOTSTRAP_REPAIR_MIN_REMAINING_BUDGET_MS
+          ) {
+            // One bounded repair attempt for members that failed the initial
+            // pass (budget starvation, stale-inbox race, transient runtime
+            // hiccup) while budget remains, instead of failing the launch.
+            // A repair-pass abort must not fail members that already
+            // registered - any fatal condition re-asserts at the audit
+            // boundary right below.
+            try {
+              await runMemberSpawnPass(repairMembers, 'repair')
+            } catch {
+              // Failure reasons for unrepaired members are already recorded.
+            }
           }
         }
 

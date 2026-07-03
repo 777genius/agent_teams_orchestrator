@@ -46,6 +46,10 @@ import {
   writeTeamFileAsync,
 } from '../../utils/swarm/teamHelpers.js'
 import {
+  readMailbox,
+  writeToMailbox,
+} from '../../utils/teammateMailbox.js'
+import {
   __setTeamBootstrapRunnerDepsForTests,
   runTeamBootstrap,
 } from './teamBootstrapRunner.js'
@@ -124,6 +128,7 @@ const teammateRuntime = getArg('--teammate-runtime')
 const teammateRuntimeEnv = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME
 const eventsPath = process.env.CLAUDE_CODE_TEAMMATE_RUNTIME_EVENTS_PATH
 const bootstrapRunId = process.env.CLAUDE_CODE_BOOTSTRAP_RUN_ID
+const bootstrapProofToken = process.env.CLAUDE_CODE_BOOTSTRAP_PROOF_TOKEN
 const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
 const markerPath = process.env.FAKE_TEAMMATE_SPAWN_MARKER
@@ -347,6 +352,31 @@ try {
       },
     )
     await sleep(60_000)
+    process.exit(0)
+  }
+  if (mode === 'stale-mirror-current-proof-after-inbox-ready') {
+    const staleMirror = { bootstrapMirrorId: 'stale-bootstrap-mirror' }
+    await writeEvent(
+      'bootstrap_submitted',
+      'submitted stale mirror with current bootstrap context',
+      staleMirror,
+    )
+    await writeEvent(
+      'bootstrap_confirmed',
+      JSON.stringify({
+        source: 'native_app_managed_bootstrap_private_turn',
+        bootstrapProofToken,
+        runId: bootstrapRunId,
+        contextHash: 'fake-context-hash',
+        briefingHash: 'fake-briefing-hash',
+      }),
+      {
+        ...staleMirror,
+        bootstrapProofToken,
+        source: 'native_app_managed_bootstrap_private_turn',
+      },
+    )
+    await sleep(1_000)
     process.exit(0)
   }
   if (mode === 'submit-rejected-terminal') {
@@ -675,6 +705,63 @@ describe('supervised process teammate backend e2e', () => {
     expect(
       events.some(event => String(event.detail ?? '').includes('stale')),
     ).toBe(false)
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
+  it('supersedes stale lead bootstrap rows before the process poller reads the inbox', async () => {
+    const fixture = await createFixture({ trusted: true })
+    await writeToMailbox(
+      'alice',
+      {
+        messageId: 'stale-bootstrap-row',
+        from: TEAM_LEAD_NAME,
+        text: 'Your FIRST action: call MCP tool member_briefing from a prior failed launch',
+        timestamp: '2026-01-02T00:00:00.000Z',
+      },
+      fixture.teamName,
+    )
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const mailbox = await readMailbox('alice', fixture.teamName)
+    const staleRow = mailbox.find(message => message.messageId === 'stale-bootstrap-row')
+    const freshRow = mailbox.find(
+      message =>
+        message.messageId !== 'stale-bootstrap-row' &&
+        message.text.includes(BOOTSTRAP_PROMPT),
+    )
+    expect(staleRow?.read).toBe(true)
+    expect(freshRow?.read).toBe(false)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, [
+      'mailbox_bootstrap_written',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const submitted = events.find(event => event.type === 'bootstrap_submitted')
+    expect(mailboxWritten?.detail).toContain('supersededStaleBootstrapRows=1')
+    expect(submitted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
 
     await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
     runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
@@ -1384,6 +1471,63 @@ describe('supervised process teammate backend e2e', () => {
     )
   })
 
+  it('accepts current proof-token confirmation even when the submitted mirror is stale', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'stale-mirror-current-proof-after-inbox-ready',
+    })
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        bootstrapTimeoutMs: 2_000,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(
+      runtimePaths.eventsPath,
+      [
+        'mailbox_bootstrap_written',
+        'bootstrap_submitted',
+        'bootstrap_confirmed',
+        'bootstrap_proof_accepted',
+      ],
+      3_000,
+    )
+    const mailboxWritten = events.find(
+      event => event.type === 'mailbox_bootstrap_written',
+    )
+    const submitted = events.find(event => event.type === 'bootstrap_submitted')
+    const proofAccepted = events.find(
+      event => event.type === 'bootstrap_proof_accepted',
+    )
+    expect(submitted?.bootstrapMirrorId).toBe('stale-bootstrap-mirror')
+    expect(submitted?.bootstrapMirrorId).not.toBe(
+      mailboxWritten?.bootstrapMirrorId,
+    )
+    expect(proofAccepted?.bootstrapMirrorId).toBe(
+      mailboxWritten?.bootstrapMirrorId,
+    )
+    expect(proofAccepted?.detail).toContain(
+      'acceptedVia=proof_token_confirmed',
+    )
+
+    await waitForCondition(() => !isProcessAlive(result.data.runtime_pid!), 5_000)
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
+  })
+
   it('fails clearly when the runtime exits after submit attempt before durable bootstrap submission', async () => {
     const fixture = await createFixture({
       trusted: true,
@@ -1651,6 +1795,7 @@ async function createFixture(options: {
     | 'skip-bootstrap-submit-after-inbox-ready'
     | 'exit-after-bootstrap-submit-attempt'
     | 'stale-submit-wrong-run-after-inbox-ready'
+    | 'stale-mirror-current-proof-after-inbox-ready'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'

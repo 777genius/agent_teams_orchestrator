@@ -544,6 +544,230 @@ describe('teammateRuntimeEvents helpers', () => {
     }
   })
 
+  it('accepts a current bootstrap confirmation by proof token even when the submitted mirror is stale', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      detail: 'messageId=bootstrap-current',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      detail: 'messageId=bootstrap-stale',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      bootstrapProofToken: 'proof-current',
+      detail: 'proof token matched current context',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      bootstrapProofToken: 'proof-current',
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('submitted')
+    if (result.type === 'submitted') {
+      expect(result.acceptedVia).toBe('proof_token_confirmed')
+      expect(result.event.type).toBe('bootstrap_confirmed')
+      expect(result.event.bootstrapMirrorId).toBe('bootstrap-stale')
+    }
+  })
+
+  it('accepts proof-token confirmation even after many retryable submit rejections push it deep in the log', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'mailbox_bootstrap_written',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      detail: 'messageId=bootstrap-current',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      detail: 'messageId=bootstrap-stale',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      bootstrapProofToken: 'proof-current',
+      detail: 'proof token matched current context',
+    })
+
+    for (let index = 0; index < 300; index += 1) {
+      await writeTeammateRuntimeEvent({
+        type: 'bootstrap_submit_rejected',
+        eventsPath,
+        pid: 1234,
+        teamName: 'signal-ops',
+        agentName: 'atlas',
+        bootstrapRunId: 'run-new',
+        bootstrapMirrorId: 'bootstrap-current',
+        retryable: true,
+        detail: `submit rejected by local prompt handler; reason=query_active; index=${index}`,
+      })
+    }
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      bootstrapProofToken: 'proof-current',
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('submitted')
+    if (result.type === 'submitted') {
+      expect(result.acceptedVia).toBe('proof_token_confirmed')
+      expect(result.event.type).toBe('bootstrap_confirmed')
+      expect(result.event.bootstrapMirrorId).toBe('bootstrap-stale')
+    }
+  })
+
+  it('accepts current context-load proof only when a submitted turn exists', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_context_loaded',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      bootstrapProofToken: 'proof-current',
+      detail: 'loaded current bootstrap context',
+    })
+
+    const noSubmit = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      bootstrapProofToken: 'proof-current',
+      isStillAlive: () => true,
+    })
+    expect(noSubmit.type).toBe('timeout')
+
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      detail: 'messageId=bootstrap-stale',
+    })
+
+    const submitted = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      bootstrapProofToken: 'proof-current',
+      isStillAlive: () => true,
+    })
+
+    expect(submitted.type).toBe('submitted')
+    if (submitted.type === 'submitted') {
+      expect(submitted.acceptedVia).toBe('proof_token_context_loaded')
+      expect(submitted.event.type).toBe('bootstrap_context_loaded')
+      expect(submitted.event.bootstrapMirrorId).toBe('bootstrap-stale')
+    }
+  })
+
+  it('rejects wrong proof tokens even when a stale mirror has a submitted turn', async () => {
+    const eventsPath = await createRuntimeLogPath()
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_submitted',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      detail: 'messageId=bootstrap-stale',
+    })
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-stale',
+      bootstrapProofToken: 'proof-old',
+      detail: 'old proof token',
+    })
+
+    const result = await waitForBootstrapSubmissionOutcome({
+      eventsPath,
+      timeoutMs: 30,
+      pollIntervalMs: 10,
+      pid: 1234,
+      teamName: 'signal-ops',
+      agentName: 'atlas',
+      bootstrapRunId: 'run-new',
+      bootstrapMirrorId: 'bootstrap-current',
+      bootstrapProofToken: 'proof-current',
+      isStillAlive: () => true,
+    })
+
+    expect(result.type).toBe('timeout')
+  })
+
   it('ignores stale submitted and failed events before the launch start time', async () => {
     const eventsPath = await createRuntimeLogPath()
     await writeTeammateRuntimeEvent({

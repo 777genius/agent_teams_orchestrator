@@ -27,6 +27,7 @@ export type TeammateRuntimeEventType =
   | 'bootstrap_submit_rejected'
   | 'bootstrap_submit_accepted_without_uuid'
   | 'bootstrap_submitted'
+  | 'bootstrap_proof_accepted'
   | 'bootstrap_context_loaded'
   | 'bootstrap_confirmed'
   | 'heartbeat'
@@ -119,6 +120,8 @@ const MAX_RUNTIME_EVENT_DETAIL_CHARS = 500
 const MAX_RUNTIME_EVENT_LINE_CHARS = 16 * 1024
 const MAX_RECENT_RUNTIME_EVENT_BYTES = 256 * 1024
 const MAX_RECENT_RUNTIME_EVENT_LINES = 256
+const MAX_BOOTSTRAP_SUBMISSION_RUNTIME_EVENT_BYTES = 4 * 1024 * 1024
+const MAX_BOOTSTRAP_SUBMISSION_RUNTIME_EVENT_LINES = 4096
 const DEFAULT_RUNTIME_EVENT_WRITE_ATTEMPT_TIMEOUT_MS = 2_000
 const RUNTIME_EVENT_WRITE_RETRY_DELAYS_MS = [20, 50, 100] as const
 const TRANSIENT_RUNTIME_EVENT_WRITE_ERROR_CODES = new Set([
@@ -422,8 +425,17 @@ export async function readRecentTeammateRuntimeEvents(
   }
 }
 
+export type BootstrapSubmissionAcceptedVia =
+  | 'mirror'
+  | 'proof_token_confirmed'
+  | 'proof_token_context_loaded'
+
 export type BootstrapSubmissionOutcome =
-  | { type: 'submitted'; event: TeammateRuntimeEvent }
+  | {
+      type: 'submitted'
+      event: TeammateRuntimeEvent
+      acceptedVia: BootstrapSubmissionAcceptedVia
+    }
   | { type: 'terminal_failure'; reason: string; event?: TeammateRuntimeEvent }
   | { type: 'timeout'; lastStage?: TeammateRuntimeEvent; reason: string }
 
@@ -588,6 +600,66 @@ function isFreshRetryableBootstrapSubmitRejection(
   return Number.isFinite(eventMs) && nowMs - eventMs <= freshMs
 }
 
+function findProofTokenAcceptedBootstrapEvent(input: {
+  events: readonly TeammateRuntimeEvent[]
+  expected: {
+    pid?: number
+    teamName?: string
+    agentName?: string
+    agentId?: string
+    bootstrapRunId?: string
+    sinceMs?: number
+  }
+  bootstrapProofToken: string
+}): Extract<BootstrapSubmissionOutcome, { type: 'submitted' }> | undefined {
+  // Proof-token evidence is matched WITHOUT mirror scoping on purpose: a
+  // stale mirror row still routes the teammate to the current context file,
+  // whose token uniquely identifies this spawn.
+  const identityEvents = input.events.filter(event =>
+    matchesBootstrapSubmissionIdentity(event, input.expected),
+  )
+  const reversedIdentityEvents = [...identityEvents].reverse()
+  const confirmed = reversedIdentityEvents.find(
+    event =>
+      event.type === 'bootstrap_confirmed' &&
+      event.bootstrapProofToken === input.bootstrapProofToken,
+  )
+  if (confirmed) {
+    return {
+      type: 'submitted',
+      event: confirmed,
+      acceptedVia: 'proof_token_confirmed',
+    }
+  }
+  const contextLoaded = reversedIdentityEvents.find(
+    event =>
+      event.type === 'bootstrap_context_loaded' &&
+      event.bootstrapProofToken === input.bootstrapProofToken,
+  )
+  if (!contextLoaded) {
+    return undefined
+  }
+  // Require a real prompt submission alongside the loaded context so a
+  // context read without a submitted turn is not treated as bootstrap.
+  const submittedAnyMirror = reversedIdentityEvents.find(event => {
+    if (event.type !== 'bootstrap_submitted') {
+      return false
+    }
+    if (!contextLoaded.bootstrapMirrorId || !event.bootstrapMirrorId) {
+      return true
+    }
+    return event.bootstrapMirrorId === contextLoaded.bootstrapMirrorId
+  })
+  if (!submittedAnyMirror) {
+    return undefined
+  }
+  return {
+    type: 'submitted',
+    event: contextLoaded,
+    acceptedVia: 'proof_token_context_loaded',
+  }
+}
+
 export async function waitForBootstrapSubmissionOutcome(params: {
   eventsPath: string
   timeoutMs: number
@@ -597,6 +669,7 @@ export async function waitForBootstrapSubmissionOutcome(params: {
   agentId?: string
   bootstrapRunId?: string
   bootstrapMirrorId?: string
+  bootstrapProofToken?: string
   sinceMs?: number
   pollIntervalMs?: number
   retryableSubmitGraceMs?: number
@@ -612,6 +685,12 @@ export async function waitForBootstrapSubmissionOutcome(params: {
   )
   const baseDeadlineMs = startedAt + params.timeoutMs
   const finalDeadlineMs = baseDeadlineMs + retryableSubmitGraceMs
+  const runtimeEventReadOptions = params.bootstrapProofToken
+    ? {
+        maxBytes: MAX_BOOTSTRAP_SUBMISSION_RUNTIME_EVENT_BYTES,
+        maxLines: MAX_BOOTSTRAP_SUBMISSION_RUNTIME_EVENT_LINES,
+      }
+    : undefined
   let lastStage: TeammateRuntimeEvent | undefined
 
   while (Date.now() < finalDeadlineMs) {
@@ -623,12 +702,39 @@ export async function waitForBootstrapSubmissionOutcome(params: {
       }
     }
 
-    const events = (await readRecentTeammateRuntimeEvents(params.eventsPath)).filter(
-      event => matchesBootstrapSubmissionIdentity(event, params),
+    const allEvents = await readRecentTeammateRuntimeEvents(
+      params.eventsPath,
+      runtimeEventReadOptions,
+    )
+    const events = allEvents.filter(event =>
+      matchesBootstrapSubmissionIdentity(event, params),
     )
     const submitted = events.find(event => event.type === 'bootstrap_submitted')
     if (submitted) {
-      return { type: 'submitted', event: submitted }
+      return { type: 'submitted', event: submitted, acceptedVia: 'mirror' }
+    }
+    // Content-addressed acceptance: the bootstrap proof token is minted per
+    // spawn and embedded in this run's context payload, so any event carrying
+    // it proves the teammate loaded the CURRENT bootstrap content - even when
+    // the teammate picked up a stale mailbox mirror row (different mirrorId)
+    // left behind by an earlier failed launch. Without this, a semantically
+    // successful bootstrap is failed on transport identity alone.
+    if (params.bootstrapProofToken) {
+      const proofAccepted = findProofTokenAcceptedBootstrapEvent({
+        events: allEvents,
+        expected: {
+          pid: params.pid,
+          teamName: params.teamName,
+          agentName: params.agentName,
+          agentId: params.agentId,
+          bootstrapRunId: params.bootstrapRunId,
+          sinceMs: params.sinceMs,
+        },
+        bootstrapProofToken: params.bootstrapProofToken,
+      })
+      if (proofAccepted) {
+        return proofAccepted
+      }
     }
     const terminal = [...events].reverse().find(event => {
       if (event.type === 'failed' || event.type === 'exited') return true

@@ -477,7 +477,7 @@ export async function markMessagesAsRead(
       `[TeammateMailbox] markMessagesAsRead: ${unreadCount} unread of ${messages.length} total`,
     )
 
-    // messages comes from jsonParse — fresh, unshared objects safe to mutate
+    // messages comes from jsonParse - fresh, unshared objects safe to mutate
     for (const m of messages) m.read = true
 
     await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
@@ -500,6 +500,96 @@ export async function markMessagesAsRead(
     if (release) {
       await release()
       logForDebugging(`[TeammateMailbox] markMessagesAsRead: lock released`)
+    }
+  }
+}
+
+/**
+ * Mark stale lead bootstrap instruction rows as read so a fresh launch's
+ * bootstrap prompt is the only pending bootstrap row in the inbox.
+ *
+ * Teammates killed mid-bootstrap leave their instruction row pending; on the
+ * next launch the poller can mirror and submit that stale row first, which
+ * blocks the current bootstrap prompt behind an active query (query_active)
+ * until the launch times out. Superseding old rows at write time removes the
+ * race. Only unread lead-authored rows matching the caller's bootstrap text
+ * detector and strictly older than `beforeIso` are touched - user DMs and
+ * regular teammate messages are never affected.
+ *
+ * @returns messageIds of the superseded rows (empty when none matched)
+ */
+export async function supersedeStaleLeadBootstrapMessages(
+  agentName: string,
+  params: {
+    teamName?: string
+    beforeIso: string
+    isBootstrapInstructionText: (text: string) => boolean
+  },
+): Promise<string[]> {
+  const inboxPath = getInboxPath(agentName, params.teamName)
+  const beforeMs = Date.parse(params.beforeIso)
+  if (!Number.isFinite(beforeMs)) {
+    return []
+  }
+
+  const lockFilePath = `${inboxPath}.lock`
+  let release: (() => Promise<void>) | undefined
+  try {
+    release = await lockfile.lock(inboxPath, {
+      lockfilePath: lockFilePath,
+      ...LOCK_OPTIONS,
+    })
+
+    // Re-read after acquiring the lock to operate on the latest state.
+    const messages = await readMailbox(agentName, params.teamName)
+    if (messages.length === 0) {
+      return []
+    }
+
+    const supersededIds: string[] = []
+    for (const message of messages) {
+      if (message.read || message.from !== TEAM_LEAD_NAME) {
+        continue
+      }
+      const timestampMs = Date.parse(message.timestamp)
+      if (!Number.isFinite(timestampMs) || timestampMs >= beforeMs) {
+        continue
+      }
+      if (!params.isBootstrapInstructionText(message.text)) {
+        continue
+      }
+      // messages comes from jsonParse - fresh, unshared objects safe to mutate
+      message.read = true
+      supersededIds.push(message.messageId)
+    }
+    if (supersededIds.length === 0) {
+      return []
+    }
+
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+    logForDebugging(
+      `[TeammateMailbox] superseded ${supersededIds.length} stale bootstrap row(s) for ${agentName}: ${supersededIds.join(', ')}`,
+    )
+    return supersededIds
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') {
+      return []
+    }
+    logForDebugging(
+      `[TeammateMailbox] supersedeStaleLeadBootstrapMessages FAILED for ${agentName}: ${error}`,
+    )
+    logError(error)
+    return []
+  } finally {
+    if (release) {
+      try {
+        await release()
+      } catch (error) {
+        logForDebugging(
+          `[TeammateMailbox] supersedeStaleLeadBootstrapMessages lock release failed for ${agentName}: ${error}`,
+        )
+      }
     }
   }
 }

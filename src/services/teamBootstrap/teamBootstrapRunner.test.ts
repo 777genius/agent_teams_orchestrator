@@ -10,6 +10,7 @@ import {
   assertBootstrapRuntimeWorkspace,
   deriveBootstrapTerminalStatus,
   emitBootstrapProgressSafely,
+  getFencedMemberBootstrapTimeoutMs,
   runTeamBootstrap,
   shouldCreateTeamForBootstrap,
 } from './teamBootstrapRunner.js'
@@ -135,6 +136,25 @@ describe('team bootstrap create-vs-launch policy', () => {
     ).toThrow(
       'Deterministic bootstrap cannot launch team "atlas-hq" because the team config does not exist.',
     )
+  })
+})
+
+describe('team bootstrap member timeout fence', () => {
+  test('splits a healthy launch budget across remaining members', () => {
+    expect(getFencedMemberBootstrapTimeoutMs(300_000, 4)).toBe(75_000)
+    expect(getFencedMemberBootstrapTimeoutMs(170_000, 2)).toBe(85_000)
+  })
+
+  test('does not allocate more than the remaining launch budget', () => {
+    expect(getFencedMemberBootstrapTimeoutMs(29_000, 1)).toBe(29_000)
+  })
+
+  test('keeps a minimum useful timeout while enough budget remains', () => {
+    expect(getFencedMemberBootstrapTimeoutMs(180_000, 3)).toBe(60_000)
+  })
+
+  test('fair-shares a constrained budget instead of starving later members', () => {
+    expect(getFencedMemberBootstrapTimeoutMs(90_000, 3)).toBe(30_000)
   })
 })
 
@@ -457,6 +477,132 @@ describe('team bootstrap readiness contract', () => {
           },
         ],
         bootstrapTimeoutMs: 30_000,
+        continueOnPartialFailure: false,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: {
+        getAppState: () => ({
+          teamContext: {
+            teamName,
+            teamFilePath: '',
+            leadAgentId: 'team-lead',
+            teammates: {},
+            isLeader: true,
+          },
+          toolPermissionContext: { mode: 'default' },
+          mainLoopModel: undefined,
+        }),
+        setAppState: () => {},
+      } as never,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    expect(spawnCalls).toBe(2)
+    expect(result.ok).toBe(true)
+  })
+
+  test('repairs a member that failed the initial spawn pass while budget remains', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bootstrap-repair-'))
+    tempDirs.push(tempDir)
+    process.env.CLAUDE_CONFIG_DIR = tempDir
+    const teamName = `team-${Date.now()}`
+    const agentId = `alice@${teamName}`
+    const runtimePid = 1234
+    const proofToken = 'repair-proof-token'
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName,
+      agentName: 'alice',
+    })
+    let spawnCalls = 0
+
+    await writeTeammateRuntimeEvent({
+      type: 'bootstrap_confirmed',
+      eventsPath: runtimePaths.eventsPath,
+      pid: runtimePid,
+      teamName,
+      agentName: 'alice',
+      agentId,
+      bootstrapRunId: 'run-repair-1',
+      source: 'member_briefing_tool_success',
+      bootstrapProofToken: proofToken,
+    })
+
+    __setTeamBootstrapRunnerDepsForTests({
+      readTeamFileAsync: async () =>
+        ({
+          members: [
+            {
+              name: 'alice',
+              agentId,
+              bootstrapExpectedAfter: '2026-04-29T00:00:00.000Z',
+              bootstrapProofToken: proofToken,
+              bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+              backendType: 'process',
+              runtimePid,
+              bootstrapRunId: 'run-repair-1',
+            },
+          ],
+        }) as never,
+      updateTeamFileAsync: async () => ({ status: 'updated' }) as never,
+      unregisterTeamForSessionCleanup: () => {},
+      spawnTeammate: async () => {
+        spawnCalls += 1
+        if (spawnCalls === 1) {
+          throw new Error('non-transient spawn setup failed')
+        }
+        return {
+          data: {
+            teammate_id: agentId,
+            agent_id: agentId,
+            name: 'alice',
+            team_name: teamName,
+            tmux_session_name: 'process',
+            tmux_window_name: 'process',
+            tmux_pane_id: `process:${runtimePid}`,
+            backend_type: 'process',
+            runtime_pid: runtimePid,
+          },
+        } as never
+      },
+      teamCreateCall: async () => {},
+    })
+
+    const result = await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId: 'run-repair-1',
+        requestHash: 'hash-repair-1',
+        mode: 'launch',
+        teamName,
+        cwd: process.cwd(),
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: 'hello',
+            provider: 'anthropic',
+          },
+        ],
+        bootstrapTimeoutMs: 90_000,
         continueOnPartialFailure: false,
         permissionSeedTools: [],
         emitStructuredEvents: true,

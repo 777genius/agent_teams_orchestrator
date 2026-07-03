@@ -104,6 +104,7 @@ import {
 import {
   ensureTeammateRuntimePaths,
   getTeammateRuntimePaths,
+  readRecentTeammateRuntimeEvents,
   readTeammateRuntimeEvents,
   TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV,
   TEAMMATE_BOOTSTRAP_RUN_ID_ENV,
@@ -120,6 +121,7 @@ import {
   parseBootstrapRuntimeProofDetail,
   validateBootstrapRuntimeProofEnvelope,
 } from '../../services/teamBootstrap/bootstrapProofValidation.js'
+import { isBootstrapMailboxInstructionText } from '../../services/teamBootstrap/teamBootstrapMemberBriefingGuard.js'
 import {
   readTeamFileAsync,
   sanitizeAgentName,
@@ -148,6 +150,7 @@ import {
 import {
   classifyIdleNotification,
   readMailbox,
+  supersedeStaleLeadBootstrapMessages,
   type TeammateMessage,
   writeToMailbox,
   writeToMailboxVerified,
@@ -164,7 +167,7 @@ import {
 function getDefaultTeammateModel(leaderModel: string | null): string {
   const configured = getGlobalConfig().teammateDefaultModel
   if (configured === null) {
-    // User picked "Default" in the /config picker — follow the leader.
+    // User picked "Default" in the /config picker - follow the leader.
     return leaderModel ?? getHardcodedTeammateModelFallback()
   }
   if (configured !== undefined) {
@@ -1402,6 +1405,8 @@ const DEFAULT_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS = 30_000
 const PROCESS_BOOTSTRAP_SUBMITTED_TIMEOUT_MS = 90_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_GRACE_MS = 45_000
 const PROCESS_BOOTSTRAP_RETRYABLE_SUBMIT_FRESH_MS = 10_000
+const PROCESS_BOOTSTRAP_RUNTIME_EVENT_READ_MAX_BYTES = 4 * 1024 * 1024
+const PROCESS_BOOTSTRAP_RUNTIME_EVENT_READ_MAX_LINES = 4096
 const PROCESS_LOG_TAIL_BYTES = 8 * 1024
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME'
 
@@ -1438,7 +1443,10 @@ async function shouldResetNativeProcessRuntimeEvents(params: {
   eventsPath: string
   bootstrapRunId: string
 }): Promise<boolean> {
-  const events = await readTeammateRuntimeEvents(params.eventsPath)
+  const events = await readRecentTeammateRuntimeEvents(params.eventsPath, {
+    maxBytes: PROCESS_BOOTSTRAP_RUNTIME_EVENT_READ_MAX_BYTES,
+    maxLines: PROCESS_BOOTSTRAP_RUNTIME_EVENT_READ_MAX_LINES,
+  })
   return !events.some(event => event.bootstrapRunId === params.bootstrapRunId)
 }
 
@@ -1863,6 +1871,11 @@ async function handleSpawnSplitPane(
       bootstrapProofToken,
       spec: input.nativeAppManagedBootstrap,
     })
+  await supersedeStaleLeadBootstrapMessages(sanitizedName, {
+    teamName,
+    beforeIso: launchBoundaryIso,
+    isBootstrapInstructionText: isBootstrapMailboxInstructionText,
+  })
   try {
     const envStr = buildInheritedEnvVars({
       provider,
@@ -2185,6 +2198,11 @@ async function handleSpawnSeparateWindow(
       bootstrapProofToken,
       spec: input.nativeAppManagedBootstrap,
     })
+  await supersedeStaleLeadBootstrapMessages(sanitizedName, {
+    teamName,
+    beforeIso: launchBoundaryIso,
+    isBootstrapInstructionText: isBootstrapMailboxInstructionText,
+  })
   try {
     const envStr = buildInheritedEnvVars({
       provider,
@@ -2603,6 +2621,19 @@ async function handleSpawnNativeProcess(
       spec: input.nativeAppManagedBootstrap,
     })
 
+  // Supersede bootstrap rows left pending by earlier failed launches BEFORE
+  // the child process starts polling its inbox. A stale pending row makes the
+  // poller submit the old prompt first, which then blocks the current
+  // bootstrap prompt behind query_active until the launch budget expires.
+  const supersededBootstrapRows = await supersedeStaleLeadBootstrapMessages(
+    sanitizedName,
+    {
+      teamName,
+      beforeIso: launchBoundaryIso,
+      isBootstrapInstructionText: isBootstrapMailboxInstructionText,
+    },
+  )
+
   try {
     stdoutLog = createWriteStream(runtimePaths.stdoutPath, {
       flags: 'a',
@@ -2856,7 +2887,7 @@ async function handleSpawnNativeProcess(
       bootstrapRunId,
       source: 'spawnMultiAgent.process',
       bootstrapMirrorId: bootstrapMailboxWrite.messageId,
-      detail: `messageId=${bootstrapMailboxWrite.messageId}; readbackAttempts=${bootstrapMailboxWrite.attempts}; totalMessages=${bootstrapMailboxWrite.totalMessages}`,
+      detail: `messageId=${bootstrapMailboxWrite.messageId}; readbackAttempts=${bootstrapMailboxWrite.attempts}; totalMessages=${bootstrapMailboxWrite.totalMessages}; supersededStaleBootstrapRows=${supersededBootstrapRows.length}`,
     })
 
     const inboxPollerReady = await waitForTeammateRuntimeEvent({
@@ -2923,6 +2954,7 @@ async function handleSpawnNativeProcess(
       agentId: teammateId,
       bootstrapRunId,
       bootstrapMirrorId: bootstrapMailboxWrite.messageId,
+      bootstrapProofToken,
       sinceMs: Date.parse(launchBoundaryIso),
       retryableSubmitGraceMs:
         bootstrapDeadlineMs === undefined
@@ -2957,6 +2989,26 @@ async function handleSpawnNativeProcess(
       throw new Error(
         `Teammate process ${teammateId} did not submit bootstrap prompt: ${detail}`,
       )
+    }
+    if (bootstrapSubmitted.acceptedVia !== 'mirror') {
+      // The teammate proved it loaded THIS spawn's bootstrap content (proof
+      // token match) while submitting via a different mailbox mirror row -
+      // typically a stale row left behind by an earlier failed launch.
+      // Record the acceptance path so launch diagnostics can distinguish it.
+      await writeParentOwnedTeammateRuntimeEvent({
+        type: 'bootstrap_proof_accepted',
+        eventsPath: runtimePaths.eventsPath,
+        pid: runtimePid,
+        teamName,
+        agentName: sanitizedName,
+        agentId: teammateId,
+        runId: getSessionId(),
+        bootstrapRunId,
+        source: 'spawnMultiAgent.process',
+        bootstrapProofToken,
+        bootstrapMirrorId: bootstrapMailboxWrite.messageId,
+        detail: `acceptedVia=${bootstrapSubmitted.acceptedVia}; expectedMirrorId=${bootstrapMailboxWrite.messageId}; observedMirrorId=${bootstrapSubmitted.event.bootstrapMirrorId ?? 'none'}`,
+      })
     }
 
     setAppState(prev => ({
