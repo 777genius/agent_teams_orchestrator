@@ -43,6 +43,15 @@ const ANTHROPIC_STATIC_VISIBLE_MODELS = new Set([
   'sonnet',
   'haiku',
 ])
+const ANTHROPIC_CLAUDE_CODE_REMOVED_MODEL_PREFIXES = [
+  'claude-opus-4-1',
+  'claude-opus-4-20250514',
+  'claude-sonnet-4-20250514',
+] as const
+const ANTHROPIC_UNSELECTABLE_LIFECYCLE_STATES = new Set([
+  'deprecated',
+  'retired',
+])
 const ANTHROPIC_EFFORT_ORDER: RuntimeReasoningEffort[] = [
   'low',
   'medium',
@@ -61,6 +70,11 @@ export type AnthropicApiModelInfo = {
   max_input_tokens?: number | null
   max_tokens?: number | null
   capabilities?: Record<string, unknown> | null
+  deprecated?: boolean
+  status?: string
+  state?: string
+  lifecycle?: Record<string, unknown> | null
+  deprecation?: Record<string, unknown> | null
 }
 
 type AnthropicApiModelListResponse = {
@@ -377,7 +391,55 @@ function shouldAcceptFirstPartyAnthropicModel(
   model: AnthropicApiModelInfo,
 ): boolean {
   return (
-    model.type === 'model' && normalizeModelKey(model.id).startsWith('claude-')
+    model.type === 'model' &&
+    normalizeModelKey(model.id).startsWith('claude-') &&
+    !isFirstPartyAnthropicModelRemovedFromClaudeCode(model)
+  )
+}
+
+function modelIdMatchesPrefix(modelId: string, prefix: string): boolean {
+  return modelId === prefix || modelId.startsWith(`${prefix}-`)
+}
+
+function hasUnselectableLifecycleState(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return ANTHROPIC_UNSELECTABLE_LIFECYCLE_STATES.has(
+      value.trim().toLowerCase(),
+    )
+  }
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return [
+    value.status,
+    value.state,
+    value.current_state,
+    value.lifecycle_state,
+  ].some(hasUnselectableLifecycleState)
+}
+
+function isFirstPartyAnthropicModelRemovedFromClaudeCode(
+  model: AnthropicApiModelInfo,
+): boolean {
+  if (model.deprecated === true) {
+    return true
+  }
+
+  if (
+    [
+      model.status,
+      model.state,
+      model.lifecycle,
+      model.deprecation,
+    ].some(hasUnselectableLifecycleState)
+  ) {
+    return true
+  }
+
+  const modelId = normalizeModelKey(model.id)
+  return ANTHROPIC_CLAUDE_CODE_REMOVED_MODEL_PREFIXES.some((prefix) =>
+    modelIdMatchesPrefix(modelId, prefix),
   )
 }
 
@@ -815,6 +877,10 @@ function createLiveModelIndex(
   const indexedModels = new Map<string, AnthropicApiModelInfo>()
 
   for (const model of models) {
+    if (!shouldAcceptFirstPartyAnthropicModel(model)) {
+      continue
+    }
+
     const modelId = normalizeModelKey(model.id)
     if (!modelId) {
       continue
