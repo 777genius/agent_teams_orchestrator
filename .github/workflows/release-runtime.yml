@@ -1,7 +1,10 @@
 name: Release Runtime
-run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent-teams-ai' }}@${{ inputs.target_release_tag || github.ref_name }}
+run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent-teams-ai' }}@${{ inputs.target_release_tag || (github.event_name == 'push' && format('runtime-{0}', github.ref_name) || github.ref_name) }}
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       source_ref:
@@ -61,7 +64,13 @@ jobs:
           source_ref="${INPUT_SOURCE_REF:-${GITHUB_REF_NAME}}"
           source_commit="$(git rev-parse HEAD)"
           target_repo="${INPUT_TARGET_RELEASE_REPO:-${DEFAULT_TARGET_RELEASE_REPO}}"
-          target_tag="${INPUT_TARGET_RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          if [[ -n "${INPUT_TARGET_RELEASE_TAG:-}" ]]; then
+            target_tag="$INPUT_TARGET_RELEASE_TAG"
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            target_tag="runtime-${GITHUB_REF_NAME}"
+          else
+            target_tag="$GITHUB_REF_NAME"
+          fi
           runtime_version="${INPUT_RUNTIME_VERSION:-${GITHUB_REF_NAME}}"
           runtime_version="${runtime_version#v}"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
