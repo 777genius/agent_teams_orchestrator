@@ -10,7 +10,11 @@ import type {
   SDKUserMessageReplay,
 } from '../../entrypoints/agentSdkTypes.js'
 import { getFastModeState } from '../../utils/fastMode.js'
-import { type EffortValue, resolveAppliedEffort } from '../../utils/effort.js'
+import {
+  type EffortValue,
+  getEffortEnvOverride,
+  resolveAppliedEffort,
+} from '../../utils/effort.js'
 import {
   createAssistantAPIErrorMessage,
   extractTextContent,
@@ -318,16 +322,19 @@ export function resolveCodexNativeApprovalLaunchPolicy(
 function mapEffortToCodexNativeReasoningEffort(
   model: string,
   effortValue: EffortValue | undefined,
-): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null {
+  const envOverride = getEffortEnvOverride()
+  const explicitlyRequestedEffort =
+    envOverride === null ? undefined : (envOverride ?? effortValue)
   const resolved = resolveAppliedEffort(model, effortValue)
   if (resolved === undefined) {
     return null
   }
+  if (explicitlyRequestedEffort === 'max') {
+    return 'max'
+  }
   if (typeof resolved === 'number') {
     return 'high'
-  }
-  if (resolved === 'max') {
-    return 'xhigh'
   }
   return resolved
 }

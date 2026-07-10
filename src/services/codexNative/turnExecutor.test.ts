@@ -253,6 +253,52 @@ describe('executeCodexNativeTurn', () => {
     expect(observedAbsoluteTimeoutMs).toBe(3_600_000)
   })
 
+  test.each(['max', 'ultra'] as const)(
+    'passes %s effort to Codex without downgrading it',
+    async (effort) => {
+      let observedReasoningEffort: string | null | undefined
+
+      await collectMessages(
+        executeCodexNativeTurn(
+          baseParams({ model: 'gpt-5.6-sol', effortValue: effort }),
+          {
+            runExec: async function* (options) {
+              observedReasoningEffort = options.reasoningEffort
+              yield {
+                type: 'normalized_event',
+                event: {
+                  type: 'assistant_text',
+                  itemId: 'item_0',
+                  text: 'OK',
+                },
+              }
+              yield {
+                type: 'normalized_event',
+                event: {
+                  type: 'turn_completed',
+                },
+              }
+              return {
+                identity: {
+                  executablePath: '/usr/local/bin/codex',
+                  executableSource: 'system-path',
+                  version: 'codex-cli 0.144.1',
+                },
+                threadId: null,
+                credentialSource: 'ambient-process-env',
+                completionPolicy: 'ephemeral',
+                finalHistoryCompleteness: 'live-only',
+                finalUsageAuthority: 'live-turn-completed',
+              }
+            },
+          },
+        ),
+      )
+
+      expect(observedReasoningEffort).toBe(effort)
+    },
+  )
+
   test('maps bypass permissions to Codex native never-approval mode', async () => {
     let observedApprovalPolicy: 'never' | 'on-request' | null | undefined
 

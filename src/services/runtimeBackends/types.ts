@@ -60,6 +60,7 @@ export type RuntimeReasoningEffort =
   | 'high'
   | 'xhigh'
   | 'max'
+  | 'ultra'
 
 export type RuntimeProviderModelCatalogSource =
   | 'anthropic-models-api'
