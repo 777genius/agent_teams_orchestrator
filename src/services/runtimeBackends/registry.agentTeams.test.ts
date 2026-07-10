@@ -484,7 +484,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         },
         reasoningEffort: {
           supported: true,
-          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
           configPassthrough: true,
         },
       })

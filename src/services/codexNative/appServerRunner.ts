@@ -68,7 +68,15 @@ export type CodexNativeAppServerRunnerOptions = {
   imagePaths?: string[]
   cwd: string
   model?: string | null
-  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null
+  reasoningEffort?:
+    | 'minimal'
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'xhigh'
+    | 'max'
+    | 'ultra'
+    | null
   ephemeral?: boolean
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null

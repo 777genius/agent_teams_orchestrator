@@ -127,6 +127,52 @@ describe('buildCodexNativeExecArgs', () => {
     ])
   })
 
+  test('passes Codex max reasoning through model_reasoning_effort config', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'max',
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-m',
+      'gpt-5.6-sol',
+      '-c',
+      'model_reasoning_effort="max"',
+      '-',
+    ])
+  })
+
+  test('passes Codex ultra reasoning through model_reasoning_effort config', () => {
+    expect(
+      buildCodexNativeExecArgs({
+        prompt: 'Reply only with OK',
+        cwd: '/tmp/demo',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      }),
+    ).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '-C',
+      '/tmp/demo',
+      '--ephemeral',
+      '-m',
+      'gpt-5.6-sol',
+      '-c',
+      'model_reasoning_effort="ultra"',
+      '-',
+    ])
+  })
+
   test('passes forced login method and MCP config overrides through -c flags', () => {
     expect(
       buildCodexNativeExecArgs({

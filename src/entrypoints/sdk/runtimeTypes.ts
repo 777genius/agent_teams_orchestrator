@@ -1,7 +1,15 @@
 import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/types.js'
 import type { ZodTypeAny } from 'zod/v4'
 
-export type EffortLevel = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type EffortLevel =
+  | 'none'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultra'
 
 export const EFFORT_LEVELS = [
   'none',
@@ -11,6 +19,7 @@ export const EFFORT_LEVELS = [
   'high',
   'xhigh',
   'max',
+  'ultra',
 ] as const satisfies readonly EffortLevel[]
 
 export type AnyZodRawShape = Record<string, ZodTypeAny>

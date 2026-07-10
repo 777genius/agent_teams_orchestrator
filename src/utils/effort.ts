@@ -254,6 +254,8 @@ export function getEffortLevelDescription(level: EffortLevel): string {
       return 'Extra high reasoning for supported Codex models'
     case 'max':
       return 'Maximum capability with deepest reasoning (Opus 4.8, Opus 4.7, and Opus 4.6)'
+    case 'ultra':
+      return 'Ultra reasoning for supported Codex models'
   }
 }
 

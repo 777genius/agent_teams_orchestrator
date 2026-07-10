@@ -33,7 +33,14 @@ export interface CodexAppServerApprovalDecision {
   message?: string
 }
 
-export type CodexAppServerEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export type CodexAppServerEffort =
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultra'
 
 export type CodexAppServerApprovalRequestHandler = (
   approval: CodexAppServerToolApprovalRequest,

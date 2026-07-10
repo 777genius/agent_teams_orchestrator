@@ -1015,7 +1015,7 @@ export async function getUnifiedRuntimeStatusPayload(
           },
           reasoningEffort: {
             supported: true,
-            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
             configPassthrough: true,
           },
         },
@@ -1064,7 +1064,7 @@ export async function getUnifiedRuntimeStatusPayload(
           },
           reasoningEffort: {
             supported: true,
-            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
             configPassthrough: true,
           },
         },
