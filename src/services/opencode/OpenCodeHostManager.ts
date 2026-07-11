@@ -10,6 +10,7 @@ import { sleep } from '../../utils/sleep.js'
 import { killProcessTree, killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
@@ -28,6 +29,7 @@ const OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS = 2_000
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
+const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 const OPENTUI_TEMP_DYLIB_RE = /^\.bbb[0-9a-f]+-[0-9a-f]+\.dylib$/i
@@ -1066,8 +1068,22 @@ export class OpenCodeHostManager {
     const profile =
       params.preparedProfile ??
       (await this.prepareProfile(params.projectPath, params.profileOptions))
+    const binaryPath = resolveOpenCodeBinaryPath()
+    if (binaryPath) {
+      const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
+        binaryPath,
+        profile,
+      })
+      if (pluginPrewarm && pluginPrewarm.code !== 0) {
+        throw new Error(
+          pluginPrewarm.error ||
+            pluginPrewarm.stderr.trim() ||
+            'Failed to install managed OpenCode provider plugins',
+        )
+      }
+    }
     const hostLifetime = params.hostLifetime ?? 'persistent'
-    const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
+    const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}`
     const hostKey =
       params.hostKey?.trim() ||
       (hostLifetime === 'process'

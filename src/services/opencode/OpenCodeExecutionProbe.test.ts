@@ -4,7 +4,10 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
-import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import {
+  OpenCodeExecutionProbe,
+  resolveOpenCodeExecutionProbeContextTokens,
+} from './OpenCodeExecutionProbe.js'
 import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
 
 import type {
@@ -53,6 +56,12 @@ const host: OpenCodeHostHandle = {
   resolvedConfigFingerprint: 'resolved-fingerprint',
   diagnostics: [],
 }
+
+test('keeps native subscription CLI probes above their hidden bootstrap context', () => {
+  expect(resolveOpenCodeExecutionProbeContextTokens('cursor-acp/auto')).toBe(262_144)
+  expect(resolveOpenCodeExecutionProbeContextTokens('kiro/auto')).toBe(262_144)
+  expect(resolveOpenCodeExecutionProbeContextTokens('opencode/big-pickle')).toBe(32_000)
+})
 
 describe('OpenCodeExecutionProbe', () => {
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
@@ -241,6 +250,102 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.diagnostics.join('\n')).toContain(
       'Model verification completed with non-matching assistant output',
     )
+  })
+
+  test('does not treat a plain-text Cursor authentication error as execution proof', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{
+                type: 'text',
+                text: "cursor-acp error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.",
+              }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('not_authenticated')
+    expect(result.reason).toContain('Authentication required')
+  })
+
+  test('does not treat a plain-text Cursor usage-limit error as execution proof', async () => {
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{
+                type: 'text',
+                text: "cursor-acp error: You've hit your Cursor usage limit",
+              }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('Cursor usage limit')
   })
 
   test('can release execution probe lease without disposing the live host', async () => {
@@ -766,12 +871,17 @@ describe('OpenCodeExecutionProbe', () => {
         ...host,
         profile: cachedProfile,
       }
-      const makeProbe = () => new OpenCodeExecutionProbe({
+      const makeProbe = (
+        resolvedConfigFingerprint = cachedHost.resolvedConfigFingerprint,
+      ) => new OpenCodeExecutionProbe({
         persistentCache: true,
         persistentCacheRoot: tempDir,
         sleep: async () => new Promise(resolve => setTimeout(resolve, 1)),
         hostManager: {
-          ensureHost: async () => cachedHost,
+          ensureHost: async () => ({
+            ...cachedHost,
+            resolvedConfigFingerprint,
+          }),
           releaseHost: async () => {},
         },
         clientFactory: {
@@ -829,7 +939,7 @@ describe('OpenCodeExecutionProbe', () => {
         makeProbe().probeModel(input),
         makeProbe().probeModel(input),
       ])
-      const third = await makeProbe().probeModel(input)
+      const third = await makeProbe('resolved-after-app-mcp-refresh').probeModel(input)
 
       expect(first.outcome).toBe('available')
       expect(second.outcome).toBe('available')

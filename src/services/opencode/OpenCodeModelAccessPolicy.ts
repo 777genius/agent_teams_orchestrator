@@ -66,6 +66,11 @@ export type OpenCodeModelRouteMetadata = {
 
 const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([
   'atomic-chat',
+  // These managed plugins authenticate through their provider-owned local CLI
+  // sessions. They do not put a credential in OpenCode's auth store, so every
+  // route still requires a successful execution proof before launch.
+  'cursor-acp',
+  'kiro',
   'llama.cpp',
   'llamacpp',
   'lmstudio',
