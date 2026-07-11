@@ -1,8 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
-import {
-  getUnifiedRuntimeStatusPayload,
-} from '../../services/runtimeBackends/registry.js'
+import { getUnifiedRuntimeStatusPayload } from '../../services/runtimeBackends/registry.js'
 import { openCodeExecutionProbe } from '../../services/opencode/OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
 import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvisioningProbe.js'
@@ -30,6 +28,8 @@ import {
   type ProviderManagementRuntimeId,
   type ProviderManagementView,
   type ProviderModelTestResult,
+  type ProviderOAuthAuthorization,
+  type ProviderOAuthFlowObserver,
   type ProviderSetupForm,
   type RuntimeProviderModelsView,
 } from '../../features/runtimeProviderManagement/index.js'
@@ -39,9 +39,11 @@ import type {
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { readFile, writeFile } from 'node:fs/promises'
+import { createInterface } from 'node:readline'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
 const STDOUT_EXIT_SETTLE_TIMEOUT_MS = 50
+export const RUNTIME_PROVIDER_OAUTH_EVENT_PREFIX = '@@agent-teams-runtime-provider-oauth@@'
 
 type RuntimeProviderTarget = RuntimeProviderId | 'all'
 type RuntimeProviderManagementTarget = ProviderManagementRuntimeId
@@ -52,7 +54,7 @@ function exitRuntimeCommand(exitCode: number): void {
 }
 
 async function withRuntimeJsonStdoutGuardedResponse<T>(
-  operation: () => Promise<T>,
+  operation: (stdoutWrite: RuntimeStdoutWrite) => Promise<T>,
   writeResponse: (result: T, stdoutWrite: RuntimeStdoutWrite) => Promise<number>,
   recoverOperationError?: (error: unknown) => T,
 ): Promise<void> {
@@ -70,7 +72,7 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
   try {
     let result: T
     try {
-      result = await operation()
+      result = await operation(originalWrite)
     } catch (error) {
       if (!recoverOperationError) {
         throw error
@@ -163,22 +165,19 @@ function truncateForText(value: string | null | undefined, limit = 120): string 
 function isSensitiveFieldKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '')
   return (
-    normalized === 'key'
-    || normalized.endsWith('apikey')
-    || normalized.endsWith('authtoken')
-    || normalized.endsWith('token')
-    || normalized.endsWith('secret')
-    || normalized.endsWith('password')
-    || normalized === 'authorization'
-    || normalized === 'cookie'
-    || normalized.endsWith('clientsecret')
+    normalized === 'key' ||
+    normalized.endsWith('apikey') ||
+    normalized.endsWith('authtoken') ||
+    normalized.endsWith('token') ||
+    normalized.endsWith('secret') ||
+    normalized.endsWith('password') ||
+    normalized === 'authorization' ||
+    normalized === 'cookie' ||
+    normalized.endsWith('clientsecret')
   )
 }
 
-function sanitizeOpenCodeVerifyValue(
-  value: unknown,
-  keyHint?: string,
-): unknown {
+function sanitizeOpenCodeVerifyValue(value: unknown, keyHint?: string): unknown {
   if (value === null || value === undefined) {
     return value
   }
@@ -259,12 +258,15 @@ export async function runtimeStatus(opts: {
   provider?: RuntimeProviderTarget
   summary?: boolean
 }): Promise<void> {
-  const providerFilter =
-    opts.provider && opts.provider !== 'all' ? opts.provider : undefined
+  const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
   const loadPayload = () =>
-    getUnifiedRuntimeStatusPayload(providerFilter, {}, {
-      detailLevel: opts.summary ? 'summary' : 'full',
-    })
+    getUnifiedRuntimeStatusPayload(
+      providerFilter,
+      {},
+      {
+        detailLevel: opts.summary ? 'summary' : 'full',
+      },
+    )
 
   if (opts.text) {
     const payload = await loadPayload()
@@ -275,20 +277,19 @@ export async function runtimeStatus(opts: {
       printProviderStatus(provider)
     }
   } else {
-    await withRuntimeJsonStdoutGuardedResponse(
-      loadPayload,
-      async (payload, stdoutWrite) => {
-        await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite)
-        return 0
-      },
-    )
+    await withRuntimeJsonStdoutGuardedResponse(loadPayload, async (payload, stdoutWrite) => {
+      await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite)
+      return 0
+    })
     return
   }
 
   process.exit(0)
 }
 
-function printOpenCodeVerification(snapshot: Awaited<ReturnType<typeof openCodeProvisioningProbe.probe>>): void {
+function printOpenCodeVerification(
+  snapshot: Awaited<ReturnType<typeof openCodeProvisioningProbe.probe>>,
+): void {
   process.stdout.write('OpenCode live verification:\n')
   process.stdout.write(`  detected: ${snapshot.detected ? 'yes' : 'no'}\n`)
   process.stdout.write(`  host healthy: ${snapshot.hostHealthy ? 'yes' : 'no'}\n`)
@@ -302,54 +303,46 @@ function printOpenCodeVerification(snapshot: Awaited<ReturnType<typeof openCodeP
   }
   if (snapshot.profile) {
     process.stdout.write(`  profile root: ${snapshot.profile.profileRootKey}\n`)
-    process.stdout.write(
-      `  behavior fingerprint: ${snapshot.profile.projectBehaviorFingerprint}\n`,
-    )
-    process.stdout.write(
-      `  managed config: ${snapshot.profile.managedConfigFingerprint}\n`,
-    )
+    process.stdout.write(`  behavior fingerprint: ${snapshot.profile.projectBehaviorFingerprint}\n`)
+    process.stdout.write(`  managed config: ${snapshot.profile.managedConfigFingerprint}\n`)
     process.stdout.write(
       `  behavior sources: ${snapshot.profile.behaviorSources.join(', ') || 'none'}\n`,
     )
   }
   if (snapshot.config) {
-    process.stdout.write(
-      `  default agent: ${formatValue(snapshot.config.default_agent)}\n`,
-    )
-    process.stdout.write(
-      `  share mode: ${formatValue(snapshot.config.share)}\n`,
-    )
-    process.stdout.write(
-      `  snapshot: ${String(snapshot.config.snapshot ?? 'unknown')}\n`,
-    )
-    process.stdout.write(
-      `  autoupdate: ${String(snapshot.config.autoupdate ?? 'unknown')}\n`,
-    )
+    process.stdout.write(`  default agent: ${formatValue(snapshot.config.default_agent)}\n`)
+    process.stdout.write(`  share mode: ${formatValue(snapshot.config.share)}\n`)
+    process.stdout.write(`  snapshot: ${String(snapshot.config.snapshot ?? 'unknown')}\n`)
+    process.stdout.write(`  autoupdate: ${String(snapshot.config.autoupdate ?? 'unknown')}\n`)
   }
   process.stdout.write(
     `  connected providers: ${(snapshot.providers?.connected ?? []).join(', ') || 'none'}\n`,
   )
   process.stdout.write(
-    `  config providers: ${(snapshot.configProviders?.providers ?? []).map(provider => provider.id).filter(Boolean).join(', ') || 'none'}\n`,
+    `  config providers: ${
+      (snapshot.configProviders?.providers ?? [])
+        .map(provider => provider.id)
+        .filter(Boolean)
+        .join(', ') || 'none'
+    }\n`,
   )
   process.stdout.write(
-    `  agents: ${snapshot.agents.map(agent => agent.name).filter(Boolean).join(', ') || 'none'}\n`,
+    `  agents: ${
+      snapshot.agents
+        .map(agent => agent.name)
+        .filter(Boolean)
+        .join(', ') || 'none'
+    }\n`,
   )
-  process.stdout.write(
-    `  mcp: ${Object.keys(snapshot.mcp ?? {}).join(', ') || 'none'}\n`,
-  )
+  process.stdout.write(`  mcp: ${Object.keys(snapshot.mcp ?? {}).join(', ') || 'none'}\n`)
   if (snapshot.appMcp) {
     process.stdout.write(`  app mcp status: ${snapshot.appMcp.status}\n`)
     process.stdout.write(`  app mcp server: ${snapshot.appMcp.serverName}\n`)
-    process.stdout.write(
-      `  app mcp matched: ${formatValue(snapshot.appMcp.matchedServerName)}\n`,
-    )
+    process.stdout.write(`  app mcp matched: ${formatValue(snapshot.appMcp.matchedServerName)}\n`)
     process.stdout.write(
       `  app mcp connected: ${snapshot.appMcp.connected === null ? 'unknown' : snapshot.appMcp.connected ? 'yes' : 'no'}\n`,
     )
-    process.stdout.write(
-      `  app mcp source: ${formatValue(snapshot.appMcp.launchSource)}\n`,
-    )
+    process.stdout.write(`  app mcp source: ${formatValue(snapshot.appMcp.launchSource)}\n`)
   }
   if (snapshot.host?.diagnostics.length) {
     process.stdout.write('  host diagnostics:\n')
@@ -395,18 +388,26 @@ export async function runtimeVerify(opts: {
   const provider = opts.provider ?? 'all'
 
   if (provider !== 'opencode' && provider !== 'all') {
-    throw new Error(`runtime verify is currently only implemented for OpenCode, received "${provider}"`)
+    throw new Error(
+      `runtime verify is currently only implemented for OpenCode, received "${provider}"`,
+    )
   }
 
   const snapshot = await openCodeProvisioningProbe.probe()
   if (opts.text) {
     printOpenCodeVerification(snapshot)
   } else {
-    process.stdout.write(jsonStringify({
-      schemaVersion: 1,
-      providerId: 'opencode',
-      snapshot: sanitizeOpenCodeVerifyValue(snapshot),
-    }, null, 2) + '\n')
+    process.stdout.write(
+      jsonStringify(
+        {
+          schemaVersion: 1,
+          providerId: 'opencode',
+          snapshot: sanitizeOpenCodeVerifyValue(snapshot),
+        },
+        null,
+        2,
+      ) + '\n',
+    )
   }
 
   process.exit(0)
@@ -421,7 +422,9 @@ export async function runtimeVerifyModel(opts: {
   const provider = opts.provider ?? 'all'
 
   if (provider !== 'opencode' && provider !== 'all') {
-    throw new Error(`runtime verify-model is currently only implemented for OpenCode, received "${provider}"`)
+    throw new Error(
+      `runtime verify-model is currently only implemented for OpenCode, received "${provider}"`,
+    )
   }
 
   const result = await openCodeExecutionProbe.probeModel({
@@ -431,17 +434,25 @@ export async function runtimeVerifyModel(opts: {
   if (opts.text) {
     printOpenCodeModelProbe(result)
   } else {
-    process.stdout.write(jsonStringify({
-      schemaVersion: 1,
-      providerId: 'opencode',
-      result,
-    }, null, 2) + '\n')
+    process.stdout.write(
+      jsonStringify(
+        {
+          schemaVersion: 1,
+          providerId: 'opencode',
+          result,
+        },
+        null,
+        2,
+      ) + '\n',
+    )
   }
 
   process.exit(0)
 }
 
-function printOpenCodeSessionReconcile(result: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>): void {
+function printOpenCodeSessionReconcile(
+  result: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>,
+): void {
   process.stdout.write('OpenCode session reconcile:\n')
   process.stdout.write(`  session: ${result.record.opencodeSessionId}\n`)
   process.stdout.write(`  model: ${result.record.selectedModel}\n`)
@@ -456,9 +467,7 @@ function printOpenCodeSessionReconcile(result: Awaited<ReturnType<typeof openCod
   process.stdout.write(`  message count: ${result.summary.messageCount}\n`)
   process.stdout.write(`  tool calls: ${result.summary.toolCallCount}\n`)
   process.stdout.write(`  errors: ${result.summary.errorCount}\n`)
-  process.stdout.write(
-    `  last cursor: ${formatValue(result.record.lastCanonicalCursor)}\n`,
-  )
+  process.stdout.write(`  last cursor: ${formatValue(result.record.lastCanonicalCursor)}\n`)
   process.stdout.write(
     `  latest assistant: ${formatValue(result.summary.latestAssistantPreview)}\n`,
   )
@@ -473,7 +482,9 @@ function printOpenCodeSessionReconcile(result: Awaited<ReturnType<typeof openCod
   }
 }
 
-function printOpenCodeSessionTranscript(result: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>): void {
+function printOpenCodeSessionTranscript(
+  result: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>,
+): void {
   process.stdout.write('OpenCode session transcript:\n')
   process.stdout.write(`  session: ${result.record.opencodeSessionId}\n`)
   process.stdout.write(`  model: ${result.record.selectedModel}\n`)
@@ -519,7 +530,9 @@ function printOpenCodeSessionTranscript(result: Awaited<ReturnType<typeof openCo
   }
 }
 
-function printOpenCodeSessionPreview(result: Awaited<ReturnType<typeof openCodeSessionBridge.observePreview>>): void {
+function printOpenCodeSessionPreview(
+  result: Awaited<ReturnType<typeof openCodeSessionBridge.observePreview>>,
+): void {
   process.stdout.write('OpenCode session preview:\n')
   process.stdout.write(`  session: ${result.record.opencodeSessionId}\n`)
   process.stdout.write(`  model: ${result.record.selectedModel}\n`)
@@ -571,11 +584,15 @@ async function resolveOpenCodeSessionRecordForCli(opts: {
   }
 
   const records = (await openCodeSessionStore.list()).filter(record => {
-    return record.teamId === opts.team && record.memberName === opts.member && matchesSession(record)
+    return (
+      record.teamId === opts.team && record.memberName === opts.member && matchesSession(record)
+    )
   })
 
   if (sessionId && records.length === 0) {
-    throw new Error(`No stored OpenCode session record for ${opts.team}/${opts.member} with session ${sessionId}`)
+    throw new Error(
+      `No stored OpenCode session record for ${opts.team}/${opts.member} with session ${sessionId}`,
+    )
   }
 
   if (records.length > 1) {
@@ -603,7 +620,9 @@ export async function runtimeReconcile(opts: {
 }): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
-    throw new Error(`runtime reconcile is currently only implemented for OpenCode, received "${provider}"`)
+    throw new Error(
+      `runtime reconcile is currently only implemented for OpenCode, received "${provider}"`,
+    )
   }
 
   const record = await resolveOpenCodeSessionRecordForCli(opts)
@@ -615,11 +634,17 @@ export async function runtimeReconcile(opts: {
   if (opts.text) {
     printOpenCodeSessionReconcile(result)
   } else {
-    process.stdout.write(jsonStringify({
-      schemaVersion: 1,
-      providerId: 'opencode',
-      result,
-    }, null, 2) + '\n')
+    process.stdout.write(
+      jsonStringify(
+        {
+          schemaVersion: 1,
+          providerId: 'opencode',
+          result,
+        },
+        null,
+        2,
+      ) + '\n',
+    )
   }
 
   process.exit(0)
@@ -637,7 +662,9 @@ export async function runtimePreview(opts: {
 }): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
-    throw new Error(`runtime preview is currently only implemented for OpenCode, received "${provider}"`)
+    throw new Error(
+      `runtime preview is currently only implemented for OpenCode, received "${provider}"`,
+    )
   }
 
   const record = await resolveOpenCodeSessionRecordForCli(opts)
@@ -650,11 +677,17 @@ export async function runtimePreview(opts: {
   if (opts.text) {
     printOpenCodeSessionPreview(result)
   } else {
-    process.stdout.write(jsonStringify({
-      schemaVersion: 1,
-      providerId: 'opencode',
-      result,
-    }, null, 2) + '\n')
+    process.stdout.write(
+      jsonStringify(
+        {
+          schemaVersion: 1,
+          providerId: 'opencode',
+          result,
+        },
+        null,
+        2,
+      ) + '\n',
+    )
   }
 
   process.exit(0)
@@ -674,7 +707,9 @@ export async function runtimeTranscript(opts: {
 }): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
-    throw new Error(`runtime transcript is currently only implemented for OpenCode, received "${provider}"`)
+    throw new Error(
+      `runtime transcript is currently only implemented for OpenCode, received "${provider}"`,
+    )
   }
 
   const record = await resolveOpenCodeSessionRecordForCli(opts)
@@ -689,23 +724,28 @@ export async function runtimeTranscript(opts: {
       `  projected log messages: ${String(result.logProjection.projectedMessageCount)} (${String(result.logProjection.syntheticMessageCount)} synthetic)\n`,
     )
   } else {
-    const payload = jsonStringify({
-      schemaVersion: 1,
-      providerId: 'opencode',
-      transcript: {
-        sessionId: result.record.opencodeSessionId,
-        durableState: result.summary.durableState,
-        staleReason: result.summary.staleReason,
-        messageCount: result.summary.messageCount,
-        toolCallCount: result.summary.toolCallCount,
-        errorCount: result.summary.errorCount,
-        latestAssistantText: result.summary.latestAssistantText,
-        latestAssistantPreview: result.summary.latestAssistantPreview,
-        messages: opts.projectionOnly ? [] : result.summary.messages,
-        diagnostics: result.summary.diagnostics,
-        logProjection: result.logProjection,
-      },
-    }, null, 2) + '\n'
+    const payload =
+      jsonStringify(
+        {
+          schemaVersion: 1,
+          providerId: 'opencode',
+          transcript: {
+            sessionId: result.record.opencodeSessionId,
+            durableState: result.summary.durableState,
+            staleReason: result.summary.staleReason,
+            messageCount: result.summary.messageCount,
+            toolCallCount: result.summary.toolCallCount,
+            errorCount: result.summary.errorCount,
+            latestAssistantText: result.summary.latestAssistantText,
+            latestAssistantPreview: result.summary.latestAssistantPreview,
+            messages: opts.projectionOnly ? [] : result.summary.messages,
+            diagnostics: result.summary.diagnostics,
+            logProjection: result.logProjection,
+          },
+        },
+        null,
+        2,
+      ) + '\n'
     if (opts.output?.trim()) {
       await writeFile(opts.output.trim(), payload, 'utf8')
     } else {
@@ -728,7 +768,8 @@ export async function runtimeOpenCodeCommand(opts: {
     }
     const watchdog = setTimeout(() => process.exit(exitCode), 5_000)
     watchdog.unref?.()
-    signalCleanupPromise = openCodeHostManager.disposeUnregisteredOwnedHosts()
+    signalCleanupPromise = openCodeHostManager
+      .disposeUnregisteredOwnedHosts()
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(watchdog)
@@ -803,11 +844,16 @@ export async function runtimeOpenCodeLedgerBackfill(opts: {
     attributionMode: opts.attributionMode === 'strict-delivery' ? 'strict-delivery' : 'compatible',
     dryRun: opts.dryRun === true,
   })
-  const payload = jsonStringify({
-    schemaVersion: 1,
-    providerId: 'opencode',
-    result,
-  }, null, 2) + '\n'
+  const payload =
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        providerId: 'opencode',
+        result,
+      },
+      null,
+      2,
+    ) + '\n'
   if (opts.output?.trim()) {
     await writeFile(opts.output.trim(), payload, 'utf8')
   } else {
@@ -859,7 +905,9 @@ function normalizeProviderManagementRuntime(
 ): RuntimeProviderManagementTarget {
   const normalized = runtime?.trim() || 'opencode'
   if (normalized !== 'opencode') {
-    throw new Error(`runtime providers is currently only implemented for OpenCode, received "${normalized}"`)
+    throw new Error(
+      `runtime providers is currently only implemented for OpenCode, received "${normalized}"`,
+    )
   }
   return normalized
 }
@@ -869,7 +917,7 @@ function normalizeProviderDirectoryFilter(
 ): ProviderDirectoryFilter | null {
   const normalized = filter?.trim()
   return normalized && PROVIDER_DIRECTORY_FILTERS.has(normalized)
-    ? normalized as ProviderDirectoryFilter
+    ? (normalized as ProviderDirectoryFilter)
     : null
 }
 
@@ -888,8 +936,47 @@ async function readStdinJsonObject(): Promise<Record<string, unknown> | null> {
   }
   const parsed = JSON.parse(raw) as unknown
   return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? parsed as Record<string, unknown>
+    ? (parsed as Record<string, unknown>)
     : null
+}
+
+type StdinJsonLineReader = {
+  readObject(): Promise<Record<string, unknown> | null>
+  close(): void
+}
+
+function createStdinJsonLineReader(): StdinJsonLineReader {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
+  const iterator = lines[Symbol.asyncIterator]()
+  return {
+    async readObject() {
+      const next = await iterator.next()
+      if (next.done || !next.value.trim()) {
+        return null
+      }
+      const parsed = JSON.parse(next.value) as unknown
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null
+    },
+    close() {
+      lines.close()
+    },
+  }
+}
+
+async function writeProviderOAuthAuthorizationEvent(
+  authorization: ProviderOAuthAuthorization,
+  stdoutWrite: RuntimeStdoutWrite,
+): Promise<void> {
+  await writeStdoutAndDrain(
+    `${RUNTIME_PROVIDER_OAUTH_EVENT_PREFIX}${jsonStringify({
+      schemaVersion: 1,
+      event: 'authorization',
+      ...authorization,
+    })}\n`,
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementViewResponse(
@@ -898,12 +985,19 @@ async function writeProviderManagementViewResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(view ? { view } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(view ? { view } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementDirectoryResponse(
@@ -912,12 +1006,19 @@ async function writeProviderManagementDirectoryResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(directory ? { directory } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(directory ? { directory } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementProviderResponse(
@@ -926,12 +1027,19 @@ async function writeProviderManagementProviderResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(provider ? { provider } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(provider ? { provider } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementSetupFormResponse(
@@ -940,12 +1048,19 @@ async function writeProviderManagementSetupFormResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(setupForm ? { setupForm } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(setupForm ? { setupForm } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementModelsResponse(
@@ -954,12 +1069,19 @@ async function writeProviderManagementModelsResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(models ? { models } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(models ? { models } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 async function writeProviderManagementModelTestResponse(
@@ -968,12 +1090,19 @@ async function writeProviderManagementModelTestResponse(
   error: ProviderManagementError | null,
   stdoutWrite?: RuntimeStdoutWrite,
 ): Promise<void> {
-  await writeStdoutAndDrain(jsonStringify({
-    schemaVersion: 1,
-    runtimeId,
-    ...(result ? { result } : {}),
-    ...(error ? { error } : {}),
-  }, null, 2) + '\n', stdoutWrite)
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(result ? { result } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
 }
 
 function authRequiredError(message: string): ProviderManagementError {
@@ -1009,8 +1138,8 @@ function compactProviderManagementView(view: ProviderManagementView): ProviderMa
         return true
       }
 
-      return provider.actions.some(action =>
-        action.enabled && (action.id === 'connect' || action.id === 'forget')
+      return provider.actions.some(
+        action => action.enabled && (action.id === 'connect' || action.id === 'forget'),
       )
     }),
   }
@@ -1024,10 +1153,11 @@ export async function runtimeProvidersView(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => loadProviderManagementView(openCodeProviderManagementAdapter, {
-      runtimeId,
-      projectPath: opts.projectPath?.trim() || null,
-    }),
+    () =>
+      loadProviderManagementView(openCodeProviderManagementAdapter, {
+        runtimeId,
+        projectPath: opts.projectPath?.trim() || null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementViewResponse(
@@ -1058,15 +1188,16 @@ export async function runtimeProvidersDirectory(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => loadProviderDirectory(openCodeProviderManagementAdapter, {
-      runtimeId,
-      projectPath: opts.projectPath?.trim() || null,
-      query: opts.query?.trim() || null,
-      filter: normalizeProviderDirectoryFilter(opts.filter),
-      limit: opts.limit ?? null,
-      cursor: opts.cursor?.trim() || null,
-      refresh: opts.refresh === true,
-    }),
+    () =>
+      loadProviderDirectory(openCodeProviderManagementAdapter, {
+        runtimeId,
+        projectPath: opts.projectPath?.trim() || null,
+        query: opts.query?.trim() || null,
+        filter: normalizeProviderDirectoryFilter(opts.filter),
+        limit: opts.limit ?? null,
+        cursor: opts.cursor?.trim() || null,
+        refresh: opts.refresh === true,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementDirectoryResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1088,11 +1219,12 @@ export async function runtimeProvidersSetupForm(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => loadProviderSetupForm(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId: opts.provider?.trim(),
-      projectPath: opts.projectPath?.trim() || null,
-    }),
+    () =>
+      loadProviderSetupForm(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        projectPath: opts.projectPath?.trim() || null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementSetupFormResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1112,17 +1244,16 @@ function normalizeConnectProviderPayload(input: {
   projectPath?: string | null
   payload: Record<string, unknown>
 }): ConnectProviderInput {
-  const method = typeof input.payload.method === 'string'
-    ? input.payload.method.trim()
-    : 'api'
+  const method = typeof input.payload.method === 'string' ? input.payload.method.trim() : 'api'
   if (method !== 'api' && method !== 'oauth' && method !== 'manual') {
     throw new Error(`Unsupported provider setup method: ${method || '(empty)'}`)
   }
-  const apiKey = typeof input.payload.apiKey === 'string'
-    ? input.payload.apiKey
-    : typeof input.payload.key === 'string'
-      ? input.payload.key
-      : null
+  const apiKey =
+    typeof input.payload.apiKey === 'string'
+      ? input.payload.apiKey
+      : typeof input.payload.key === 'string'
+        ? input.payload.key
+        : null
   const metadata: Record<string, string> = {}
   const rawMetadata = input.payload.metadata
   if (rawMetadata && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata)) {
@@ -1132,6 +1263,20 @@ function normalizeConnectProviderPayload(input: {
       }
     }
   }
+  const authMethodIndex =
+    typeof input.payload.authMethodIndex === 'number' &&
+    Number.isInteger(input.payload.authMethodIndex) &&
+    input.payload.authMethodIndex >= 0
+      ? input.payload.authMethodIndex
+      : null
+  const authOptionId =
+    typeof input.payload.authOptionId === 'string'
+      ? input.payload.authOptionId.trim() || null
+      : null
+  const oauthOperationId =
+    typeof input.payload.oauthOperationId === 'string'
+      ? input.payload.oauthOperationId.trim() || null
+      : null
 
   return {
     runtimeId: input.runtimeId,
@@ -1139,6 +1284,9 @@ function normalizeConnectProviderPayload(input: {
     method,
     apiKey,
     metadata,
+    authMethodIndex,
+    authOptionId,
+    oauthOperationId,
     projectPath: input.projectPath,
   }
 }
@@ -1148,12 +1296,13 @@ export async function runtimeProvidersConnect(opts: {
   provider: string
   projectPath?: string
   stdinJson?: boolean
+  stdinJsonLines?: boolean
   json?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   const providerId = opts.provider?.trim()
 
-  if (!opts.stdinJson) {
+  if (!opts.stdinJson && !opts.stdinJsonLines) {
     await exitWithProviderManagementProviderResponse({
       runtimeId,
       provider: null,
@@ -1163,9 +1312,10 @@ export async function runtimeProvidersConnect(opts: {
     return
   }
 
+  const lineReader = opts.stdinJsonLines ? createStdinJsonLineReader() : null
   let payload: Record<string, unknown> | null = null
   try {
-    payload = await readStdinJsonObject()
+    payload = lineReader ? await lineReader.readObject() : await readStdinJsonObject()
   } catch {
     await exitWithProviderManagementProviderResponse({
       runtimeId,
@@ -1207,19 +1357,79 @@ export async function runtimeProvidersConnect(opts: {
     return
   }
 
-  await withRuntimeJsonStdoutGuardedResponse(
-    () => connectProvider(openCodeProviderManagementAdapter, connectInput),
-    async (result, stdoutWrite) => {
-      if (!('error' in result)) {
-        await writeProviderManagementProviderResponse(runtimeId, result.value, null, stdoutWrite)
-        return 0
-      }
+  let signalCleanupPromise: Promise<void> | null = null
+  const cleanupOAuthHostAndExit = (exitCode: number): void => {
+    if (signalCleanupPromise) {
+      return
+    }
+    const watchdog = setTimeout(() => process.exit(exitCode), 5_000)
+    watchdog.unref?.()
+    signalCleanupPromise = openCodeHostManager
+      .disposeUnregisteredOwnedHosts()
+      .catch(() => undefined)
+      .finally(() => {
+        clearTimeout(watchdog)
+        process.exit(exitCode)
+      })
+  }
+  const onSigterm = () => cleanupOAuthHostAndExit(143)
+  const onSigint = () => cleanupOAuthHostAndExit(130)
+  if (connectInput.method === 'oauth') {
+    process.once('SIGTERM', onSigterm)
+    process.once('SIGINT', onSigint)
+  }
 
-      await writeProviderManagementProviderResponse(runtimeId, null, result.error, stdoutWrite)
-      return 1
-    },
-    recoverProviderManagementError(connectInput.apiKey),
-  )
+  try {
+    await withRuntimeJsonStdoutGuardedResponse(
+      async stdoutWrite => {
+        let observer: ProviderOAuthFlowObserver | undefined
+        if (connectInput.method === 'oauth') {
+          if (!lineReader) {
+            return {
+              ok: false,
+              error: authRequiredError('OAuth setup requires --stdin-json-lines'),
+            } satisfies ProviderManagementResult<ProviderConnection>
+          }
+          observer = {
+            authorizationReady: async authorization => {
+              await writeProviderOAuthAuthorizationEvent(authorization, stdoutWrite)
+              if (authorization.completionMethod !== 'code') {
+                return
+              }
+              const response = await lineReader.readObject()
+              const responseType = typeof response?.type === 'string' ? response.type.trim() : ''
+              const operationId =
+                typeof response?.operationId === 'string' ? response.operationId.trim() : ''
+              const code = typeof response?.code === 'string' ? response.code.trim() : ''
+              if (
+                responseType !== 'oauth-code' ||
+                operationId !== authorization.operationId ||
+                !code
+              ) {
+                throw new Error('OAuth authorization code response is invalid')
+              }
+              return { code }
+            },
+          }
+        }
+        return connectProvider(openCodeProviderManagementAdapter, connectInput, observer)
+      },
+      async (result, stdoutWrite) => {
+        if (!('error' in result)) {
+          await writeProviderManagementProviderResponse(runtimeId, result.value, null, stdoutWrite)
+          return 0
+        }
+
+        await writeProviderManagementProviderResponse(runtimeId, null, result.error, stdoutWrite)
+        return 1
+      },
+      recoverProviderManagementError(connectInput.apiKey),
+    )
+  } finally {
+    process.off('SIGTERM', onSigterm)
+    process.off('SIGINT', onSigint)
+    lineReader?.close()
+  }
 }
 
 export async function runtimeProvidersConnectApiKey(opts: {
@@ -1265,12 +1475,13 @@ export async function runtimeProvidersConnectApiKey(opts: {
   }
 
   await withRuntimeJsonStdoutGuardedResponse(
-    () => connectProviderWithApiKey(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId,
-      apiKey,
-      projectPath: opts.projectPath?.trim() || null,
-    }),
+    () =>
+      connectProviderWithApiKey(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId,
+        apiKey,
+        projectPath: opts.projectPath?.trim() || null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementProviderResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1292,11 +1503,12 @@ export async function runtimeProvidersForget(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => forgetManagedProvider(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId: opts.provider?.trim(),
-      projectPath: opts.projectPath?.trim() || null,
-    }),
+    () =>
+      forgetManagedProvider(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        projectPath: opts.projectPath?.trim() || null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementProviderResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1320,13 +1532,14 @@ export async function runtimeProvidersModels(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => loadProviderModels(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId: opts.provider?.trim(),
-      projectPath: opts.projectPath?.trim() || null,
-      query: opts.query?.trim() || null,
-      limit: opts.limit ?? null,
-    }),
+    () =>
+      loadProviderModels(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        projectPath: opts.projectPath?.trim() || null,
+        query: opts.query?.trim() || null,
+        limit: opts.limit ?? null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementModelsResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1349,12 +1562,13 @@ export async function runtimeProvidersTestModel(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => testProviderModel(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId: opts.provider?.trim(),
-      modelId: opts.model?.trim(),
-      projectPath: opts.projectPath?.trim() || null,
-    }),
+    () =>
+      testProviderModel(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        modelId: opts.model?.trim(),
+        projectPath: opts.projectPath?.trim() || null,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementModelTestResponse(runtimeId, result.value, null, stdoutWrite)
@@ -1380,14 +1594,15 @@ export async function runtimeProvidersSetDefault(opts: {
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
   await withRuntimeJsonStdoutGuardedResponse(
-    () => setProviderDefaultModel(openCodeProviderManagementAdapter, {
-      runtimeId,
-      providerId: opts.provider?.trim(),
-      modelId: opts.model?.trim(),
-      projectPath: opts.projectPath?.trim() || null,
-      scope: opts.scope === 'all-projects' ? 'all_projects' : 'project',
-      probe: opts.probe === true,
-    }),
+    () =>
+      setProviderDefaultModel(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        modelId: opts.model?.trim(),
+        projectPath: opts.projectPath?.trim() || null,
+        scope: opts.scope === 'all-projects' ? 'all_projects' : 'project',
+        probe: opts.probe === true,
+      }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
         await writeProviderManagementViewResponse(

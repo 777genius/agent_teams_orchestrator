@@ -67,7 +67,7 @@ type FetchJsonResult = {
 type OpenCodeHostManagerDeps = {
   prepareProfile?: (
     projectPath?: string | null,
-    options?: OpenCodePrepareProfileOptions
+    options?: OpenCodePrepareProfileOptions,
   ) => Promise<OpenCodePreparedProfile>
   allocateLoopbackPort?: () => Promise<number>
   fetchJson?: (url: string, init?: RequestInit) => Promise<FetchJsonResult>
@@ -150,7 +150,9 @@ export type OpenCodePersistentHostReconcileResult = {
 }
 
 function hashJson(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value) ?? '').digest('hex')
+  return createHash('sha256')
+    .update(JSON.stringify(value) ?? '')
+    .digest('hex')
 }
 
 function hashText(value: string): string {
@@ -172,7 +174,8 @@ function normalizeResolvedFingerprintValue(
     const normalized = value.map(item => normalizeResolvedFingerprintValue(item, scope))
     if (scope === 'configProviders' || scope === 'agents') {
       return normalized.sort((left, right) =>
-        JSON.stringify(left).localeCompare(JSON.stringify(right)))
+        JSON.stringify(left).localeCompare(JSON.stringify(right)),
+      )
     }
     return normalized
   }
@@ -182,15 +185,17 @@ function normalizeResolvedFingerprintValue(
   }
 
   const record = value as Record<string, unknown>
-  return Object.keys(record).sort().reduce<Record<string, unknown>>((acc, key) => {
-    // Host transport details like loopback port and inherited environment
-    // are expected to drift across host restarts and must not stale sessions.
-    if (key === 'environment' || key === 'server') {
+  return Object.keys(record)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      // Host transport details like loopback port and inherited environment
+      // are expected to drift across host restarts and must not stale sessions.
+      if (key === 'environment' || key === 'server') {
+        return acc
+      }
+      acc[key] = normalizeResolvedFingerprintValue(record[key], scope)
       return acc
-    }
-    acc[key] = normalizeResolvedFingerprintValue(record[key], scope)
-    return acc
-  }, {})
+    }, {})
 }
 
 async function allocateLoopbackPort(): Promise<number> {
@@ -216,10 +221,7 @@ async function allocateLoopbackPort(): Promise<number> {
   })
 }
 
-async function fetchJson(
-  url: string,
-  init?: RequestInit,
-): Promise<FetchJsonResult> {
+async function fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
   const response = await fetch(url, init)
   const text = await response.text()
 
@@ -289,16 +291,16 @@ function normalizeOpenCodeHostHealthTimeoutMs(timeoutMs?: number | null): number
   if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {
     return OPEN_CODE_HOST_HEALTH_TIMEOUT_MS
   }
-  return Math.min(
-    Math.max(Math.trunc(timeoutMs), 1),
-    OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS,
-  )
+  return Math.min(Math.max(Math.trunc(timeoutMs), 1), OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS)
 }
 
 export function createOpenCodePreflightHostLeaseInput(scope: string): OpenCodeHostLeaseInput {
   const normalizedScope =
-    scope.trim().replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96)
-    || 'probe'
+    scope
+      .trim()
+      .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 96) || 'probe'
   return {
     teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
     laneId: OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID,
@@ -347,9 +349,7 @@ export function buildOpenCodeHostSpawnOptions(
   }
 }
 
-function normalizePersistentHostLeases(
-  value: unknown,
-): Record<string, PersistentHostLeaseRecord> {
+function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {}
   }
@@ -361,26 +361,24 @@ function normalizePersistentHostLeases(
     }
     const lease = rawLease as Partial<PersistentHostLeaseRecord>
     if (
-      typeof lease.teamId !== 'string'
-      || typeof lease.laneId !== 'string'
-      || typeof lease.memberName !== 'string'
-      || typeof lease.createdAt !== 'string'
-      || typeof lease.updatedAt !== 'string'
+      typeof lease.teamId !== 'string' ||
+      typeof lease.laneId !== 'string' ||
+      typeof lease.memberName !== 'string' ||
+      typeof lease.createdAt !== 'string' ||
+      typeof lease.updatedAt !== 'string'
     ) {
       continue
     }
-    const leaseKey = typeof lease.leaseKey === 'string' && lease.leaseKey.trim()
-      ? lease.leaseKey
-      : key
+    const leaseKey =
+      typeof lease.leaseKey === 'string' && lease.leaseKey.trim() ? lease.leaseKey : key
     leases[leaseKey] = {
       leaseKey,
       teamId: lease.teamId,
       laneId: lease.laneId,
       memberName: lease.memberName,
       runId: typeof lease.runId === 'string' && lease.runId.trim() ? lease.runId : null,
-      sessionId: typeof lease.sessionId === 'string' && lease.sessionId.trim()
-        ? lease.sessionId
-        : null,
+      sessionId:
+        typeof lease.sessionId === 'string' && lease.sessionId.trim() ? lease.sessionId : null,
       createdAt: lease.createdAt,
       updatedAt: lease.updatedAt,
     }
@@ -400,8 +398,8 @@ export class OpenCodeHostManager {
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
   ): Promise<OpenCodePreparedProfile> {
-    const prepareProfile = this.deps.prepareProfile
-      ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
+    const prepareProfile =
+      this.deps.prepareProfile ?? openCodeProfileManager.prepareProfile.bind(openCodeProfileManager)
     return prepareProfile(projectPath, options)
   }
 
@@ -505,10 +503,7 @@ export class OpenCodeHostManager {
     return false
   }
 
-  private async cleanupOpenTuiTempArtifactsIfUnused(
-    tempPath: string,
-    pid?: number,
-  ): Promise<void> {
+  private async cleanupOpenTuiTempArtifactsIfUnused(tempPath: string, pid?: number): Promise<void> {
     if (typeof pid === 'number' && pid > 0 && this.isProcessAlive(pid)) {
       return
     }
@@ -525,7 +520,9 @@ export class OpenCodeHostManager {
     }
 
     try {
-      const parsed = JSON.parse(await readFile(registryPath, 'utf8')) as Partial<PersistentHostRegistryShape>
+      const parsed = JSON.parse(
+        await readFile(registryPath, 'utf8'),
+      ) as Partial<PersistentHostRegistryShape>
       if (parsed.schemaVersion !== 1 || !parsed.hosts || typeof parsed.hosts !== 'object') {
         return { schemaVersion: 1, hosts: {} }
       }
@@ -546,7 +543,9 @@ export class OpenCodeHostManager {
     }
   }
 
-  private async writePersistentRegistryUnlocked(registry: PersistentHostRegistryShape): Promise<void> {
+  private async writePersistentRegistryUnlocked(
+    registry: PersistentHostRegistryShape,
+  ): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return
@@ -690,11 +689,11 @@ export class OpenCodeHostManager {
       const sessionId = input.sessionId?.trim() || previous?.sessionId || null
       const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
       if (
-        previous
-        && previous.runId === runId
-        && previous.sessionId === sessionId
-        && Number.isFinite(previousUpdatedAtMs)
-        && nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
+        previous &&
+        previous.runId === runId &&
+        previous.sessionId === sessionId &&
+        Number.isFinite(previousUpdatedAtMs) &&
+        nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
       ) {
         return
       }
@@ -765,17 +764,18 @@ export class OpenCodeHostManager {
   private async adoptPersistentHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    resolveConfigFingerprint: boolean,
   ): Promise<OpenCodeHostHandle | null> {
     const record = (await this.readPersistentRegistry()).hosts[hostKey]
     if (!record) {
       return null
     }
     if (
-      record.projectPath !== profile.projectPath
-      || record.profileRootKey !== profile.profileRootKey
-      || record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
-      || record.managedConfigFingerprint !== profile.managedConfigFingerprint
-      || !this.isProcessAlive(record.pid)
+      record.projectPath !== profile.projectPath ||
+      record.profileRootKey !== profile.profileRootKey ||
+      record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint ||
+      record.managedConfigFingerprint !== profile.managedConfigFingerprint ||
+      !this.isProcessAlive(record.pid)
     ) {
       await this.removePersistentHost(hostKey).catch(() => undefined)
       return null
@@ -800,8 +800,11 @@ export class OpenCodeHostManager {
       resolvedConfigFingerprint: record.resolvedConfigFingerprint,
       diagnostics: [`adopted persistent OpenCode host pid=${record.pid}`],
     }
-    handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(handle.baseUrl)
-      ?? record.resolvedConfigFingerprint
+    if (resolveConfigFingerprint) {
+      handle.resolvedConfigFingerprint =
+        (await this.getResolvedConfigFingerprint(handle.baseUrl)) ??
+        record.resolvedConfigFingerprint
+    }
     this.hosts.set(hostKey, {
       handle,
       child: null,
@@ -840,9 +843,7 @@ export class OpenCodeHostManager {
       healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(getHealthTimeoutMs())
     }
 
-    throw new Error(
-      `OpenCode host did not become healthy within ${healthTimeoutMs}ms`,
-    )
+    throw new Error(`OpenCode host did not become healthy within ${healthTimeoutMs}ms`)
   }
 
   private async getResolvedConfigFingerprint(baseUrl: string): Promise<string | null> {
@@ -868,28 +869,21 @@ export class OpenCodeHostManager {
 
       const fingerprintSource = {
         config:
-          config.status === 200
-            ? normalizeResolvedFingerprintValue(config.data, 'config')
-            : null,
+          config.status === 200 ? normalizeResolvedFingerprintValue(config.data, 'config') : null,
         configProviders:
           configProviders.status === 200
             ? normalizeResolvedFingerprintValue(configProviders.data, 'configProviders')
             : null,
         agents:
-          agents.status === 200
-            ? normalizeResolvedFingerprintValue(agents.data, 'agents')
-            : null,
-        mcp:
-          mcp.status === 200
-            ? normalizeResolvedFingerprintValue(mcp.data, 'mcp')
-            : null,
+          agents.status === 200 ? normalizeResolvedFingerprintValue(agents.data, 'agents') : null,
+        mcp: mcp.status === 200 ? normalizeResolvedFingerprintValue(mcp.data, 'mcp') : null,
       }
 
       if (
-        fingerprintSource.config === null
-        && fingerprintSource.configProviders === null
-        && fingerprintSource.agents === null
-        && fingerprintSource.mcp === null
+        fingerprintSource.config === null &&
+        fingerprintSource.configProviders === null &&
+        fingerprintSource.agents === null &&
+        fingerprintSource.mcp === null
       ) {
         return null
       }
@@ -981,6 +975,7 @@ export class OpenCodeHostManager {
     hostKey: string,
     profile: OpenCodePreparedProfile,
     lifetime: OpenCodeHostLifetime,
+    resolveConfigFingerprint: boolean,
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
@@ -1036,7 +1031,9 @@ export class OpenCodeHostManager {
         () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
       )
       handle.version = health.version
-      handle.resolvedConfigFingerprint = await this.getResolvedConfigFingerprint(baseUrl)
+      handle.resolvedConfigFingerprint = resolveConfigFingerprint
+        ? await this.getResolvedConfigFingerprint(baseUrl)
+        : profile.managedConfigFingerprint
       handle.state = 'healthy'
       if (lifetime === 'persistent') {
         await this.upsertPersistentHost(handle)
@@ -1049,33 +1046,35 @@ export class OpenCodeHostManager {
       this.hosts.delete(hostKey)
       await this.forceKillSpawnedHostProcess(child)
       await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
-      const diagnosticSuffix = diagnostics.length > 0
-        ? ` Diagnostics: ${diagnostics.join(' | ')}`
-        : ''
+      const diagnosticSuffix =
+        diagnostics.length > 0 ? ` Diagnostics: ${diagnostics.join(' | ')}` : ''
       throw new Error(`${message}${diagnosticSuffix}`)
     }
   }
 
-  async ensureHost(params: {
-    projectPath?: string | null
-    hostKey?: string | null
-    profileOptions?: OpenCodePrepareProfileOptions
-    preparedProfile?: OpenCodePreparedProfile
-    healthTimeoutMs?: number | null
-    hostLifetime?: OpenCodeHostLifetime
-  } = {}): Promise<OpenCodeHostHandle> {
-    const profile = params.preparedProfile ?? await this.prepareProfile(params.projectPath, params.profileOptions)
+  async ensureHost(
+    params: {
+      projectPath?: string | null
+      hostKey?: string | null
+      profileOptions?: OpenCodePrepareProfileOptions
+      preparedProfile?: OpenCodePreparedProfile
+      healthTimeoutMs?: number | null
+      hostLifetime?: OpenCodeHostLifetime
+      resolveConfigFingerprint?: boolean
+    } = {},
+  ): Promise<OpenCodeHostHandle> {
+    const profile =
+      params.preparedProfile ??
+      (await this.prepareProfile(params.projectPath, params.profileOptions))
     const hostLifetime = params.hostLifetime ?? 'persistent'
-    const baseHostKey =
-      `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
+    const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}`
     const hostKey =
-      params.hostKey?.trim()
-      || (
-        hostLifetime === 'process'
-          ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
-          : baseHostKey
-      )
+      params.hostKey?.trim() ||
+      (hostLifetime === 'process'
+        ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
+        : baseHostKey)
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
+    const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
     const existing = this.hosts.get(hostKey)
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
@@ -1101,10 +1100,11 @@ export class OpenCodeHostManager {
     this.pendingHostHealthTimeoutMs.set(hostKey, healthTimeoutMs)
     const createPromise = (async () => {
       return this.withPersistentHostStartupLock(hostKey, async () => {
-        const adopted = hostLifetime === 'persistent'
-          ? await this.adoptPersistentHost(hostKey, profile)
-          : null
-        return adopted ?? this.createHost(hostKey, profile, hostLifetime)
+        const adopted =
+          hostLifetime === 'persistent'
+            ? await this.adoptPersistentHost(hostKey, profile, resolveConfigFingerprint)
+            : null
+        return adopted ?? this.createHost(hostKey, profile, hostLifetime, resolveConfigFingerprint)
       })
     })().finally(() => {
       this.pendingHosts.delete(hostKey)
@@ -1383,13 +1383,15 @@ export class OpenCodeHostManager {
         }
 
         if (
-          !force
-          && droppedStaleLeaseCount === 0
-          && typeof options.staleAgeMs === 'number'
-          && options.staleAgeMs > 0
+          !force &&
+          droppedStaleLeaseCount === 0 &&
+          typeof options.staleAgeMs === 'number' &&
+          options.staleAgeMs > 0
         ) {
           const updatedAtMs = Date.parse(record.updatedAt)
-          const ageMs = Number.isFinite(updatedAtMs) ? nowMs - updatedAtMs : Number.POSITIVE_INFINITY
+          const ageMs = Number.isFinite(updatedAtMs)
+            ? nowMs - updatedAtMs
+            : Number.POSITIVE_INFINITY
           if (ageMs < options.staleAgeMs) {
             hosts.push({
               hostKey,
@@ -1452,7 +1454,10 @@ export class OpenCodeHostManager {
     })
   }
 
-  async releaseHost(hostKey: string): Promise<void> {
+  async releaseHost(
+    hostKey: string,
+    options: { keepPersistentAlive?: boolean } = {},
+  ): Promise<void> {
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return
@@ -1460,6 +1465,9 @@ export class OpenCodeHostManager {
 
     entry.refCount = Math.max(0, entry.refCount - 1)
     if (entry.refCount === 0) {
+      if (entry.lifetime === 'persistent' && options.keepPersistentAlive) {
+        return
+      }
       if (entry.ownedByProcess) {
         await this.disposeHost(hostKey)
       } else {

@@ -8,10 +8,12 @@ import {
   doesOpenCodeAuthStoreIncludeSource,
   mergeOpenCodeAuthStores,
   readOpenCodeAuthProviderSummaries,
+  readOpenCodeAuthCredential,
   reconcileOpenCodeManagedAuthStore,
   removeOpenCodeAuthCredential,
   syncOpenCodeManagedAuthStore,
   upsertOpenCodeApiAuthCredential,
+  upsertOpenCodeAuthCredential,
 } from './OpenCodeAuthStore.js'
 
 describe('OpenCodeAuthStore', () => {
@@ -139,7 +141,10 @@ describe('OpenCodeAuthStore', () => {
       managedAuthPath,
     })
 
-    const reconciled = JSON.parse(await readFile(managedAuthPath, 'utf8')) as Record<string, unknown>
+    const reconciled = JSON.parse(await readFile(managedAuthPath, 'utf8')) as Record<
+      string,
+      unknown
+    >
     expect(reconciled).toEqual({
       openrouter: { type: 'api', key: 'global-key' },
       openai: { type: 'oauth', token: 'fresh-local' },
@@ -205,6 +210,25 @@ describe('OpenCodeAuthStore', () => {
         },
       },
     })
+  })
+
+  test('copies opaque OAuth credentials without changing provider-specific fields', async () => {
+    const authPath = path.join(tempDir, 'data', 'opencode', 'auth.json')
+    const credential = {
+      type: 'oauth',
+      access: 'opaque-access-token',
+      refresh: 'opaque-refresh-token',
+      expires: 1_900_000_000_000,
+      accountId: 'subscription-account',
+    }
+
+    await upsertOpenCodeAuthCredential({
+      authPath,
+      providerId: 'XAI',
+      credential,
+    })
+
+    expect(await readOpenCodeAuthCredential({ authPath, providerId: 'xai' })).toEqual(credential)
   })
 
   test('reports whether managed auth includes all local source entries', () => {

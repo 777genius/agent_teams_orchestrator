@@ -8,6 +8,9 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePendingPermission,
   OpenCodeProviderAuthMethod,
+  OpenCodeProviderOAuthAuthorization,
+  OpenCodeProviderOAuthAuthorizeInput,
+  OpenCodeProviderOAuthCallbackInput,
   OpenCodeProviderResponse,
   OpenCodeServerDocResponse,
   OpenCodeSessionStatusInput,
@@ -20,6 +23,14 @@ export type OpenCodeClient = {
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc(): Promise<OpenCodeServerDocResponse>
+  authorizeProviderOAuth(
+    providerId: string,
+    body: OpenCodeProviderOAuthAuthorizeInput,
+  ): Promise<OpenCodeProviderOAuthAuthorization>
+  completeProviderOAuth(
+    providerId: string,
+    body: OpenCodeProviderOAuthCallbackInput,
+  ): Promise<boolean>
   setProviderAuth(providerId: string, body: OpenCodeApiAuthInput): Promise<boolean>
   deleteProviderAuth(providerId: string): Promise<boolean>
   listAgents(): Promise<OpenCodeAgentResponse[]>
@@ -32,7 +43,10 @@ export type OpenCodeClient = {
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
   getSessionMessage?(id: string, messageID: string): Promise<OpenCodeMessage | null>
   getPermissions(): Promise<OpenCodePendingPermission[]>
-  listExperimentalToolIds(input?: { directory?: string | null; workspace?: string | null }): Promise<string[]>
+  listExperimentalToolIds(input?: {
+    directory?: string | null
+    workspace?: string | null
+  }): Promise<string[]>
   listExperimentalTools(input: {
     directory?: string | null
     workspace?: string | null
@@ -85,6 +99,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
+const PROVIDER_OAUTH_AUTHORIZE_TIMEOUT_MS = 30_000
+const PROVIDER_OAUTH_CALLBACK_TIMEOUT_MS = 330_000
 
 function buildQueryPath(path: string, query: Record<string, string | null | undefined>): string {
   const params = new URLSearchParams()
@@ -125,9 +141,7 @@ export class OpenCodeClientFactory {
     ): Promise<T> => {
       const controller = new AbortController()
       const timeout = setTimeout(() => {
-        controller.abort(
-          new Error(`OpenCode request timed out after ${timeoutMs}ms for ${path}`),
-        )
+        controller.abort(new Error(`OpenCode request timed out after ${timeoutMs}ms for ${path}`))
       }, timeoutMs)
 
       try {
@@ -154,8 +168,27 @@ export class OpenCodeClientFactory {
       getConfig: () => request<OpenCodeConfigResponse>('/config'),
       getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
       getProviders: () => request<OpenCodeProviderResponse>('/provider'),
-      getProviderAuth: () => request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
+      getProviderAuth: () =>
+        request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
       getServerDoc: () => request<OpenCodeServerDocResponse>('/doc'),
+      authorizeProviderOAuth: (providerId, body) =>
+        request<OpenCodeProviderOAuthAuthorization>(
+          `/provider/${encodeURIComponent(providerId)}/oauth/authorize`,
+          {
+            method: 'POST',
+            body: JSON.stringify(body),
+          },
+          PROVIDER_OAUTH_AUTHORIZE_TIMEOUT_MS,
+        ),
+      completeProviderOAuth: (providerId, body) =>
+        request<boolean>(
+          `/provider/${encodeURIComponent(providerId)}/oauth/callback`,
+          {
+            method: 'POST',
+            body: JSON.stringify(body),
+          },
+          PROVIDER_OAUTH_CALLBACK_TIMEOUT_MS,
+        ),
       setProviderAuth: (providerId, body) =>
         request<boolean>(`/auth/${encodeURIComponent(providerId)}`, {
           method: 'PUT',
@@ -193,7 +226,8 @@ export class OpenCodeClientFactory {
           body: JSON.stringify(body ?? {}),
         }),
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
-      getSessionStatus: () => request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),
+      getSessionStatus: () =>
+        request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),
       getSessionMessages: (id, limit) =>
         request<OpenCodeMessage[]>(
           `/session/${id}/message${typeof limit === 'number' ? `?limit=${limit}` : ''}`,
@@ -208,21 +242,29 @@ export class OpenCodeClientFactory {
             const messages = await request<OpenCodeMessage[]>(
               `/session/${encodeURIComponent(id)}/message`,
             ).catch(() => [])
-            return messages.find(message => {
-              const info = message.info && typeof message.info === 'object' ? message.info : null
-              return info?.id === messageID
-            }) ?? null
+            return (
+              messages.find(message => {
+                const info = message.info && typeof message.info === 'object' ? message.info : null
+                return info?.id === messageID
+              }) ?? null
+            )
           }
           throw error
         }
       },
       getPermissions: () =>
-        request<OpenCodePendingPermission[]>('/permission', undefined, PERMISSION_REQUEST_TIMEOUT_MS),
+        request<OpenCodePendingPermission[]>(
+          '/permission',
+          undefined,
+          PERMISSION_REQUEST_TIMEOUT_MS,
+        ),
       listExperimentalToolIds: input =>
-        request<string[]>(buildQueryPath('/experimental/tool/ids', {
-          directory: input?.directory,
-          workspace: input?.workspace,
-        })),
+        request<string[]>(
+          buildQueryPath('/experimental/tool/ids', {
+            directory: input?.directory,
+            workspace: input?.workspace,
+          }),
+        ),
       listExperimentalTools: input =>
         request<Array<{ id?: string; name?: string; parameters?: unknown }>>(
           buildQueryPath('/experimental/tool', {
@@ -256,10 +298,14 @@ export class OpenCodeClientFactory {
         let lastError: unknown = null
         for (const path of candidatePaths) {
           try {
-            return await request<unknown>(path, {
-              method: 'POST',
-              body: JSON.stringify(payload),
-            }, PERMISSION_REQUEST_TIMEOUT_MS)
+            return await request<unknown>(
+              path,
+              {
+                method: 'POST',
+                body: JSON.stringify(payload),
+              },
+              PERMISSION_REQUEST_TIMEOUT_MS,
+            )
           } catch (error) {
             lastError = error
           }
@@ -269,15 +315,23 @@ export class OpenCodeClientFactory {
           : new Error(`OpenCode permission answer failed for ${body.requestId}`)
       },
       sendSessionMessage: (id, body) =>
-        request<OpenCodeMessage>(`/session/${id}/message`, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        }, MESSAGE_REQUEST_TIMEOUT_MS),
+        request<OpenCodeMessage>(
+          `/session/${id}/message`,
+          {
+            method: 'POST',
+            body: JSON.stringify(body),
+          },
+          MESSAGE_REQUEST_TIMEOUT_MS,
+        ),
       promptSessionAsync: async (id, body) => {
-        await request<void>(`/session/${id}/prompt_async`, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        }, MESSAGE_REQUEST_TIMEOUT_MS)
+        await request<void>(
+          `/session/${id}/prompt_async`,
+          {
+            method: 'POST',
+            body: JSON.stringify(body),
+          },
+          MESSAGE_REQUEST_TIMEOUT_MS,
+        )
       },
       abortSession: id =>
         request<boolean>(`/session/${id}/abort`, {

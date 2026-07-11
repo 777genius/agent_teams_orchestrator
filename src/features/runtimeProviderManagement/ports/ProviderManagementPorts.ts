@@ -8,6 +8,7 @@ import type {
   ProviderConnection,
   ProviderDirectoryView,
   ProviderManagementResult,
+  ProviderOAuthFlowObserver,
   ProviderManagementView,
   ProviderModelTestResult,
   ProviderSetupForm,
@@ -38,6 +39,7 @@ export interface ProviderManagementDirectoryQueryPort {
 export interface ProviderManagementCommandPort {
   connectProvider(
     input: ConnectProviderInput,
+    observer?: ProviderOAuthFlowObserver,
   ): Promise<ProviderManagementResult<ProviderConnection>>
   connectWithApiKey(
     input: ConnectProviderApiKeyInput,

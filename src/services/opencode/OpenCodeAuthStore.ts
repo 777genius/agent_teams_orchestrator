@@ -5,7 +5,8 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
-type OpenCodeAuthEntry = Record<string, unknown>
+export type OpenCodeAuthCredential = Record<string, unknown>
+type OpenCodeAuthEntry = OpenCodeAuthCredential
 type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 
 const authStoreWriteQueues = new Map<string, Promise<void>>()
@@ -20,7 +21,13 @@ async function withAuthStoreWriteLock<T>(
   const current = new Promise<void>(resolve => {
     release = resolve
   })
-  authStoreWriteQueues.set(lockKey, previous.then(() => current, () => current))
+  authStoreWriteQueues.set(
+    lockKey,
+    previous.then(
+      () => current,
+      () => current,
+    ),
+  )
 
   await previous.catch(() => undefined)
   try {
@@ -35,7 +42,7 @@ async function withAuthStoreWriteLock<T>(
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : null
 }
 
@@ -82,7 +89,23 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
   return authStore
 }
 
-async function writeOpenCodeAuthStore(filePath: string, authStore: OpenCodeAuthStore): Promise<void> {
+export async function readOpenCodeAuthCredential(input: {
+  authPath: string
+  providerId: string
+}): Promise<OpenCodeAuthCredential | null> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  const authStore = await readOpenCodeAuthStore(input.authPath)
+  const credential = authStore[providerId]
+  return credential ? { ...credential } : null
+}
+
+async function writeOpenCodeAuthStore(
+  filePath: string,
+  authStore: OpenCodeAuthStore,
+): Promise<void> {
   await writeJsonFileAtomic(filePath, authStore, { indent: 2 })
 }
 
@@ -157,6 +180,28 @@ export async function upsertOpenCodeApiAuthCredential(input: {
   })
 }
 
+export async function upsertOpenCodeAuthCredential(input: {
+  authPath: string
+  providerId: string
+  credential: OpenCodeAuthCredential
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  const credentialType =
+    typeof input.credential.type === 'string' ? input.credential.type.trim().toLowerCase() : ''
+  if (!credentialType) {
+    throw new Error('OpenCode auth credential type is required')
+  }
+
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    const authStore = await readOpenCodeAuthStore(input.authPath)
+    authStore[providerId] = { ...input.credential, type: credentialType }
+    await writeOpenCodeAuthStore(input.authPath, authStore)
+  })
+}
+
 export async function upsertOpenCodeApiAuth(
   authPath: string,
   rawProviderId: string,
@@ -223,9 +268,10 @@ export async function readOpenCodeAuthProviderSummaries(
   return Object.entries(authStore)
     .map(([providerId, entry]) => ({
       id: providerId,
-      authHint: typeof entry.type === 'string' && entry.type.trim()
-        ? entry.type.trim().toLowerCase()
-        : null,
+      authHint:
+        typeof entry.type === 'string' && entry.type.trim()
+          ? entry.type.trim().toLowerCase()
+          : null,
       source: 'credentials' as const,
       ...(credentialScopes ? { credentialScopes } : {}),
     }))

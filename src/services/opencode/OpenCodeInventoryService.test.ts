@@ -93,24 +93,16 @@ describe('OpenCodeInventoryService parsers', () => {
     })
 
     expect(maxActive).toBe(1)
-    expect(calls).toEqual([
-      '--version',
-      'providers list',
-      'models --verbose',
-      'agent list',
-    ])
+    expect(calls).toEqual(['--version', 'providers list', 'models --verbose', 'agent list'])
     expect(result.modelsResult.stdout).toBe('models --verbose')
     expect(result.agentsResult.stdout).toBe('agent list')
   })
 
   test('returns a degraded inventory snapshot when OpenCode probing stalls', async () => {
-    const result = await withOpenCodeInventoryProbeTimeout(
-      new Promise(() => {}),
-      {
-        projectPath: '/tmp/project',
-        timeoutMs: 1,
-      },
-    )
+    const result = await withOpenCodeInventoryProbeTimeout(new Promise(() => {}), {
+      projectPath: '/tmp/project',
+      timeoutMs: 1,
+    })
 
     expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(true)
     expect(result.projectPath).toBe(path.resolve('/tmp/project'))
@@ -129,16 +121,13 @@ describe('OpenCodeInventoryService parsers', () => {
       models: ['openrouter/openai/gpt-5.4'],
     })
 
-    const result = await withOpenCodeInventoryProbeTimeout(
-      Promise.resolve(completed),
-      {
-        projectPath: '/tmp/project',
-        timeoutMs: 50,
-        onTimeout: () => {
-          timedOut = true
-        },
+    const result = await withOpenCodeInventoryProbeTimeout(Promise.resolve(completed), {
+      projectPath: '/tmp/project',
+      timeoutMs: 50,
+      onTimeout: () => {
+        timedOut = true
       },
-    )
+    })
 
     expect(result).toBe(completed)
     expect(timedOut).toBe(false)
@@ -155,17 +144,14 @@ describe('OpenCodeInventoryService parsers', () => {
     progress.enterStep('opencode providers list')
     now += 41
 
-    const result = await withOpenCodeInventoryProbeTimeout(
-      new Promise(() => {}),
-      {
-        projectPath: '/tmp/project',
-        timeoutMs: 1,
-        progress,
-        onTimeout: () => {
-          aborted = true
-        },
+    const result = await withOpenCodeInventoryProbeTimeout(new Promise(() => {}), {
+      projectPath: '/tmp/project',
+      timeoutMs: 1,
+      progress,
+      onTimeout: () => {
+        aborted = true
       },
-    )
+    })
 
     expect(aborted).toBe(true)
     expect(result.probeError).toBe(
@@ -194,10 +180,25 @@ describe('OpenCodeInventoryService parsers', () => {
       },
     })
 
-    expect(calls).toEqual([
-      '--version',
-      'providers list',
-    ])
+    expect(calls).toEqual(['--version', 'providers list'])
+    expect(result.modelsResult.stdout).toBe('')
+    expect(result.agentsResult.stdout).toBe('')
+  })
+
+  test('profile inventory prepares auth and config state without spawning OpenCode CLI probes', async () => {
+    const calls: string[] = []
+
+    const result = await collectOpenCodeInventoryCommandResults({
+      mode: 'profile',
+      execOpenCode: async args => {
+        calls.push(args.join(' '))
+        return { stdout: args.join(' '), stderr: '', code: 0 }
+      },
+    })
+
+    expect(calls).toEqual([])
+    expect(result.versionResult.stdout).toBe('')
+    expect(result.providersResult.stdout).toBe('')
     expect(result.modelsResult.stdout).toBe('')
     expect(result.agentsResult.stdout).toBe('')
   })
@@ -488,13 +489,15 @@ llama.cpp/qwen3-coder:a3b local
     expect(isOpenCodeBuiltinFreeModelId(' openai/gpt-5.4 ', parsed.modelMetadata)).toBe(false)
     expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
     expect(isOpenCodeModelFree('openai/gpt-5.4', parsed.modelMetadata)).toBe(false)
-    expect(
-      isOpenCodeModelFree('openrouter/anthropic/claude-haiku-4.5', parsed.modelMetadata),
-    ).toBe(true)
+    expect(isOpenCodeModelFree('openrouter/anthropic/claude-haiku-4.5', parsed.modelMetadata)).toBe(
+      true,
+    )
     expect(isOpenCodeModelFree('openrouter/openai/gpt-oss-20b:free', parsed.modelMetadata)).toBe(
       true,
     )
-    expect(parsed.modelMetadata.find(item => item.id === 'llama.cpp/qwen3-coder:a3b')?.context).toBe(32768)
+    expect(
+      parsed.modelMetadata.find(item => item.id === 'llama.cpp/qwen3-coder:a3b')?.context,
+    ).toBe(32768)
     expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
   })
 })

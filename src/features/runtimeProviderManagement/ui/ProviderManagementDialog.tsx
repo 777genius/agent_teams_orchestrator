@@ -22,9 +22,10 @@ type ProviderManagementDialogProps = {
   onConnectWithApiKey?: (
     input: ConnectProviderApiKeyInput,
   ) => Promise<ProviderManagementResult<ProviderConnection>>
-  onForgetManagedCredential?: (
-    input: { runtimeId: ProviderManagementView['runtimeId']; providerId: string },
-  ) => Promise<ProviderManagementResult<ProviderConnection>>
+  onForgetManagedCredential?: (input: {
+    runtimeId: ProviderManagementView['runtimeId']
+    providerId: string
+  }) => Promise<ProviderManagementResult<ProviderConnection>>
   onProviderChanged?: (provider: ProviderConnection) => void
 }
 
@@ -102,10 +103,7 @@ export function reduceProviderManagementDialogState(
 ): ProviderManagementDialogState {
   switch (event.type) {
     case 'sync-view': {
-      if (
-        state.selectedProviderId
-        && event.providerIds.includes(state.selectedProviderId)
-      ) {
+      if (state.selectedProviderId && event.providerIds.includes(state.selectedProviderId)) {
         return state
       }
       return {
@@ -194,9 +192,7 @@ export function getPreferredProviderAction(
   provider: ProviderConnection,
 ): ProviderActionDescriptor | null {
   for (const actionId of ACTION_PRIORITY) {
-    const enabledAction = provider.actions.find(
-      action => action.id === actionId && action.enabled,
-    )
+    const enabledAction = provider.actions.find(action => action.id === actionId && action.enabled)
     if (enabledAction) return enabledAction
   }
   return provider.actions[0] ?? null
@@ -242,23 +238,23 @@ function RuntimeSection({ view }: { view: ProviderManagementView }): React.React
     <Box flexDirection="column">
       <Text bold>Runtime</Text>
       <Box>
-        <Text>CLI              </Text>
+        <Text>CLI </Text>
         <Text color={getRuntimeColor(view.runtime.state)}>
           {RUNTIME_STATE_LABELS[view.runtime.state]}
         </Text>
-        <Text dimColor>       {view.runtime.cliPath ?? 'not found'}</Text>
+        <Text dimColor> {view.runtime.cliPath ?? 'not found'}</Text>
       </Box>
       <Box>
-        <Text>Version          </Text>
+        <Text>Version </Text>
         <Text dimColor>{view.runtime.version ?? 'unknown'}</Text>
       </Box>
       <Box>
-        <Text>Managed profile  </Text>
+        <Text>Managed profile </Text>
         <Text>{view.runtime.managedProfile}</Text>
-        <Text dimColor>      local OpenCode config is not modified</Text>
+        <Text dimColor> local OpenCode config is not modified</Text>
       </Box>
       <Box>
-        <Text>Local auth       </Text>
+        <Text>Local auth </Text>
         <Text>{view.runtime.localAuth}</Text>
       </Box>
     </Box>
@@ -283,9 +279,7 @@ function ProviderRow({
         {PROVIDER_STATE_LABELS[provider.state].padEnd(15)}
       </Text>
       <Text dimColor>{detail.padEnd(32)}</Text>
-      <Text dimColor={Boolean(action && !action.enabled)}>
-        {action?.label ?? ''}
-      </Text>
+      <Text dimColor={Boolean(action && !action.enabled)}>{action?.label ?? ''}</Text>
     </Box>
   )
 }
@@ -367,7 +361,7 @@ function ApiKeyConnectForm({
     <Box flexDirection="column">
       <Text bold>Connect {provider.displayName}</Text>
       <Box>
-        <Text>API key  </Text>
+        <Text>API key </Text>
         <TextInput
           value={value}
           onChange={onChange}
@@ -395,8 +389,7 @@ function DefaultsSection({ view }: { view: ProviderManagementView }): React.Reac
       <Text bold>Default for teams</Text>
       <Text dimColor>Auto: prefer verified connected provider</Text>
       <Text>
-        Current:{' '}
-        <Text dimColor>{view.defaultModel ?? view.fallbackModel ?? 'not selected'}</Text>
+        Current: <Text dimColor>{view.defaultModel ?? view.fallbackModel ?? 'not selected'}</Text>
       </Text>
     </Box>
   )
@@ -409,7 +402,9 @@ function DiagnosticsSection({ diagnostics }: { diagnostics: readonly string[] })
 
   return (
     <Box flexDirection="column">
-      <Text bold color="warning">Diagnostics</Text>
+      <Text bold color="warning">
+        Diagnostics
+      </Text>
       {diagnostics.slice(0, 4).map((diagnostic, index) => (
         <Text key={`${index}:${diagnostic}`} dimColor>
           {figures.warning} {diagnostic}
@@ -443,18 +438,14 @@ export function ProviderManagementDialog({
   }, [providerSignature, view.providers])
 
   const providers = useMemo(
-    () => view.providers.map(
-      provider => providerOverrides[provider.providerId] ?? provider,
-    ),
+    () => view.providers.map(provider => providerOverrides[provider.providerId] ?? provider),
     [providerOverrides, view.providers],
   )
-  const effectiveView = useMemo(
-    () => ({ ...view, providers }),
-    [providers, view],
-  )
-  const selectedProvider = providers.find(
-    provider => provider.providerId === state.selectedProviderId,
-  ) ?? providers[0] ?? null
+  const effectiveView = useMemo(() => ({ ...view, providers }), [providers, view])
+  const selectedProvider =
+    providers.find(provider => provider.providerId === state.selectedProviderId) ??
+    providers[0] ??
+    null
   const selectedIndex = selectedProvider
     ? providers.findIndex(provider => provider.providerId === selectedProvider.providerId)
     : -1
@@ -469,9 +460,8 @@ export function ProviderManagementDialog({
 
   const selectRelativeProvider = (delta: number) => {
     if (providers.length === 0) return
-    const nextIndex = selectedIndex < 0
-      ? 0
-      : (selectedIndex + delta + providers.length) % providers.length
+    const nextIndex =
+      selectedIndex < 0 ? 0 : (selectedIndex + delta + providers.length) % providers.length
     const provider = providers[nextIndex]
     if (provider) {
       dispatch({ type: 'select-provider', providerId: provider.providerId })
@@ -498,7 +488,10 @@ export function ProviderManagementDialog({
       return
     }
     if (!onConnectWithApiKey) {
-      dispatch({ type: 'submit-failed', message: 'Connect handler is not available' })
+      dispatch({
+        type: 'submit-failed',
+        message: 'Connect handler is not available',
+      })
       return
     }
 
@@ -508,7 +501,7 @@ export function ProviderManagementDialog({
       providerId: selectedProvider.providerId,
       apiKey: value.trim(),
     })
-    if (!result.ok) {
+    if ('error' in result) {
       dispatch({ type: 'submit-failed', message: result.error.message })
       return
     }
@@ -530,7 +523,10 @@ export function ProviderManagementDialog({
       return
     }
     if (!onForgetManagedCredential) {
-      dispatch({ type: 'submit-failed', message: 'Forget handler is not available' })
+      dispatch({
+        type: 'submit-failed',
+        message: 'Forget handler is not available',
+      })
       return
     }
 
@@ -539,7 +535,7 @@ export function ProviderManagementDialog({
       runtimeId: view.runtimeId,
       providerId: provider.providerId,
     })
-    if (!result.ok) {
+    if ('error' in result) {
       dispatch({ type: 'submit-failed', message: result.error.message })
       return
     }
@@ -571,35 +567,44 @@ export function ProviderManagementDialog({
     }
   }
 
-  useInput((_input, key) => {
-    if (key.upArrow) {
-      selectRelativeProvider(-1)
-      return
-    }
-    if (key.downArrow) {
-      selectRelativeProvider(1)
-      return
-    }
-    if (key.return) {
-      runPreferredAction()
-      return
-    }
-  }, { isActive: state.mode === 'list' })
+  useInput(
+    (_input, key) => {
+      if (key.upArrow) {
+        selectRelativeProvider(-1)
+        return
+      }
+      if (key.downArrow) {
+        selectRelativeProvider(1)
+        return
+      }
+      if (key.return) {
+        runPreferredAction()
+        return
+      }
+    },
+    { isActive: state.mode === 'list' },
+  )
 
-  useInput((input, key) => {
-    if (key.escape || (input === 'c' && key.ctrl)) {
-      dispatch({ type: 'cancel-connect' })
-    }
-  }, { isActive: state.mode === 'connect' })
+  useInput(
+    (input, key) => {
+      if (key.escape || (input === 'c' && key.ctrl)) {
+        dispatch({ type: 'cancel-connect' })
+      }
+    },
+    { isActive: state.mode === 'connect' },
+  )
 
-  useInput((input) => {
-    if (!selectedProvider || state.status === 'submitting') return
-    if (input === 'c') {
-      startConnect(selectedProvider)
-    } else if (input === 'f') {
-      void forgetSelectedProvider(selectedProvider)
-    }
-  }, { isActive: state.mode === 'list' })
+  useInput(
+    input => {
+      if (!selectedProvider || state.status === 'submitting') return
+      if (input === 'c') {
+        startConnect(selectedProvider)
+      } else if (input === 'f') {
+        void forgetSelectedProvider(selectedProvider)
+      }
+    },
+    { isActive: state.mode === 'list' },
+  )
 
   const connectedCount = providers.filter(provider => provider.state === 'connected').length
   const modelCount = providers.reduce((count, provider) => count + provider.modelCount, 0)
@@ -611,9 +616,7 @@ export function ProviderManagementDialog({
       onCancel={onCancel}
       color="permission"
       isCancelActive={state.mode === 'list'}
-      inputGuide={() => (
-        <Text>{getProviderManagementInputGuide(state.mode)}</Text>
-      )}
+      inputGuide={() => <Text>{getProviderManagementInputGuide(state.mode)}</Text>}
     >
       <Box flexDirection="column" gap={1}>
         <RuntimeSection view={effectiveView} />
@@ -630,19 +633,19 @@ export function ProviderManagementDialog({
             status={state.status}
             statusMessage={state.statusMessage}
             onChange={value => dispatch({ type: 'update-api-key', value })}
-            onCursorOffsetChange={offset => dispatch({
-              type: 'update-api-key-cursor',
-              offset,
-            })}
+            onCursorOffsetChange={offset =>
+              dispatch({
+                type: 'update-api-key-cursor',
+                offset,
+              })
+            }
             onSubmit={value => {
               void submitApiKey(value)
             }}
           />
         ) : null}
         {state.mode !== 'connect' && state.statusMessage ? (
-          <Text color={state.status === 'error' ? 'error' : 'success'}>
-            {state.statusMessage}
-          </Text>
+          <Text color={state.status === 'error' ? 'error' : 'success'}>{state.statusMessage}</Text>
         ) : null}
         <DefaultsSection view={effectiveView} />
         <DiagnosticsSection diagnostics={view.diagnostics} />

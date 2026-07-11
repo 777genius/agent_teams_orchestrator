@@ -29,7 +29,7 @@ export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
 
-type OpenCodeInventoryProbeMode = 'full' | 'summary'
+type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
@@ -91,9 +91,7 @@ export function createOpenCodeInventoryProbeProgressTracker(
       return {
         elapsedMs,
         currentStep: currentStep?.label ?? null,
-        currentStepElapsedMs: currentStep
-          ? Math.max(0, now() - currentStep.startedAtMs)
-          : null,
+        currentStepElapsedMs: currentStep ? Math.max(0, now() - currentStep.startedAtMs) : null,
         completedSteps: completedSteps.slice(-6),
       }
     },
@@ -113,7 +111,10 @@ type CacheEntry = {
 }
 
 function normalizeProviderId(value: string): string {
-  return normalizeOpenCodeProviderId(value.replace(/\s+/g, '-')) ?? value.trim().toLowerCase().replace(/\s+/g, '-')
+  return (
+    normalizeOpenCodeProviderId(value.replace(/\s+/g, '-')) ??
+    value.trim().toLowerCase().replace(/\s+/g, '-')
+  )
 }
 
 function getTrimmedNonEmptyLines(output: string): string[] {
@@ -139,12 +140,9 @@ function parseOpenCodeConnectedProviderLine(
 
   const lowerLastToken = lastToken.toLowerCase()
   const isAuthHint =
-    lowerLastToken === 'api'
-    || lowerLastToken === 'oauth'
-    || (
-      /^[A-Z0-9_:-]+$/.test(lastToken)
-      && (lastToken.includes('_') || lastToken.includes(':'))
-    )
+    lowerLastToken === 'api' ||
+    lowerLastToken === 'oauth' ||
+    (/^[A-Z0-9_:-]+$/.test(lastToken) && (lastToken.includes('_') || lastToken.includes(':')))
 
   if (!isAuthHint || parts.length === 1) {
     return { provider: trimmed, authHint: null }
@@ -157,11 +155,13 @@ function parseOpenCodeConnectedProviderLine(
 }
 
 export function parseOpenCodeModelsOutput(output: string): string[] {
-  return Array.from(new Set(
-    getTrimmedNonEmptyLines(output)
-      .map(line => parseFirstOpenCodeModelToken(line)?.raw)
-      .filter((model): model is string => Boolean(model)),
-  ))
+  return Array.from(
+    new Set(
+      getTrimmedNonEmptyLines(output)
+        .map(line => parseFirstOpenCodeModelToken(line)?.raw)
+        .filter((model): model is string => Boolean(model)),
+    ),
+  )
 }
 
 export function getOpenCodeVerboseModelsArgs(): string[] {
@@ -298,14 +298,22 @@ export async function collectOpenCodeInventoryCommandResults(input: {
   mode: OpenCodeInventoryProbeMode
   execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
 }): Promise<OpenCodeInventoryCommandResults> {
-  const versionResult = await input.execOpenCode(['--version'])
-  const providersResult = await input.execOpenCode(['providers', 'list'])
-  const modelsResult = input.mode === 'summary'
-    ? EMPTY_OPEN_CODE_COMMAND_RESULT
-    : await input.execOpenCode(getOpenCodeVerboseModelsArgs())
-  const agentsResult = input.mode === 'summary'
-    ? EMPTY_OPEN_CODE_COMMAND_RESULT
-    : await input.execOpenCode(['agent', 'list'])
+  const versionResult =
+    input.mode === 'profile'
+      ? EMPTY_OPEN_CODE_COMMAND_RESULT
+      : await input.execOpenCode(['--version'])
+  const providersResult =
+    input.mode === 'profile'
+      ? EMPTY_OPEN_CODE_COMMAND_RESULT
+      : await input.execOpenCode(['providers', 'list'])
+  const modelsResult =
+    input.mode !== 'full'
+      ? EMPTY_OPEN_CODE_COMMAND_RESULT
+      : await input.execOpenCode(getOpenCodeVerboseModelsArgs())
+  const agentsResult =
+    input.mode !== 'full'
+      ? EMPTY_OPEN_CODE_COMMAND_RESULT
+      : await input.execOpenCode(['agent', 'list'])
 
   return {
     versionResult,
@@ -319,9 +327,7 @@ export function isOpenCodeInventoryTimeoutMessage(message: string | null | undef
   return message?.startsWith(OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX) === true
 }
 
-export function isOpenCodeInventoryTimeoutSnapshot(
-  snapshot: OpenCodeInventorySnapshot,
-): boolean {
+export function isOpenCodeInventoryTimeoutSnapshot(snapshot: OpenCodeInventorySnapshot): boolean {
   return isOpenCodeInventoryTimeoutMessage(snapshot.probeError)
 }
 
@@ -391,11 +397,13 @@ export async function withOpenCodeInventoryProbeTimeout(
       new Promise<OpenCodeInventorySnapshot>(resolve => {
         timeout = setTimeout(() => {
           input.onTimeout?.()
-          resolve(buildOpenCodeInventoryTimeoutSnapshot({
-            projectPath: input.projectPath,
-            timeoutMs: input.timeoutMs,
-            progress: input.progress?.snapshot() ?? null,
-          }))
+          resolve(
+            buildOpenCodeInventoryTimeoutSnapshot({
+              projectPath: input.projectPath,
+              timeoutMs: input.timeoutMs,
+              progress: input.progress?.snapshot() ?? null,
+            }),
+          )
         }, input.timeoutMs)
       }),
     ])
@@ -470,7 +478,10 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
   models: string[]
   modelMetadata: OpenCodeModelMetadata[]
 } {
-  const lines = stripAnsi(output).split(/\r?\n/g).map(line => line.trim()).filter(Boolean)
+  const lines = stripAnsi(output)
+    .split(/\r?\n/g)
+    .map(line => line.trim())
+    .filter(Boolean)
   const models: string[] = []
   const modelMetadata: OpenCodeModelMetadata[] = []
 
@@ -529,9 +540,9 @@ export function isOpenCodeBuiltinFreeModelId(
 ): boolean {
   const normalizedModelId = modelId?.trim()
   return Boolean(
-    normalizedModelId
-      && isOpenCodeBuiltinProviderModelId(normalizedModelId)
-      && isOpenCodeModelFree(normalizedModelId, modelMetadata),
+    normalizedModelId &&
+    isOpenCodeBuiltinProviderModelId(normalizedModelId) &&
+    isOpenCodeModelFree(normalizedModelId, modelMetadata),
   )
 }
 
@@ -605,12 +616,12 @@ function mergeConnectedProviders(
 
     const key = `${provider.source}:${providerId}`
     const existing = merged.get(key)
-    const credentialScopes = provider.source === 'credentials'
-      ? Array.from(new Set([
-        ...(existing?.credentialScopes ?? []),
-        ...(provider.credentialScopes ?? []),
-      ]))
-      : []
+    const credentialScopes =
+      provider.source === 'credentials'
+        ? Array.from(
+            new Set([...(existing?.credentialScopes ?? []), ...(provider.credentialScopes ?? [])]),
+          )
+        : []
     merged.set(key, {
       id: providerId,
       authHint: provider.authHint ?? existing?.authHint ?? null,
@@ -650,10 +661,13 @@ export class OpenCodeInventoryService {
     this.cache.clear()
   }
 
-  private getCommandFailureMessage(result: {
-    stderr: string
-    error?: string
-  }, fallback: string): string {
+  private getCommandFailureMessage(
+    result: {
+      stderr: string
+      error?: string
+    },
+    fallback: string,
+  ): string {
     return result.error ?? (result.stderr.trim() || fallback)
   }
 
@@ -721,30 +735,31 @@ export class OpenCodeInventoryService {
     }
 
     const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
-    const profile = await openCodeProfileManager.prepareProfile(resolvedProjectPath, {
-      includeAppMcp: options.includeAppMcp !== false,
-      toolApprovalMode,
-    }).finally(() => {
-      leaveProfileStep?.()
-    })
-    const {
-      versionResult,
-      providersResult,
-      modelsResult,
-      agentsResult,
-    } = await collectOpenCodeInventoryCommandResults({
-      mode,
-      execOpenCode: args => this.execOpenCode(binaryPath, args, profile, {
-        abortSignal: options.abortSignal,
-        progress: options.progress,
-      }),
-    })
+    const profile = await openCodeProfileManager
+      .prepareProfile(resolvedProjectPath, {
+        includeAppMcp: options.includeAppMcp !== false,
+        toolApprovalMode,
+      })
+      .finally(() => {
+        leaveProfileStep?.()
+      })
+    const { versionResult, providersResult, modelsResult, agentsResult } =
+      await collectOpenCodeInventoryCommandResults({
+        mode,
+        execOpenCode: args =>
+          this.execOpenCode(binaryPath, args, profile, {
+            abortSignal: options.abortSignal,
+            progress: options.progress,
+          }),
+      })
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
     const globalAuthProviderIds = new Set(
       (profile.globalAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(() => [])
+        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
+            () => [],
+          )
         : []
       ).map(provider => provider.id),
     )
@@ -780,7 +795,7 @@ export class OpenCodeInventoryService {
       ...managedAuthProviders,
     ])
     const verboseModels =
-      mode === 'summary'
+      mode !== 'full'
         ? {
             models: [],
             modelMetadata: [],
@@ -797,9 +812,10 @@ export class OpenCodeInventoryService {
         progress: options.progress,
       })
       finalModelsResult = fallbackModelsResult
-      models = fallbackModelsResult.code === 0
-        ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
-        : []
+      models =
+        fallbackModelsResult.code === 0
+          ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
+          : []
       modelMetadata = []
     }
     const agents = agentsResult.code === 0 ? parseOpenCodeAgentListOutput(agentsResult.stdout) : []
@@ -807,7 +823,9 @@ export class OpenCodeInventoryService {
     const availableProviders = Array.from(
       new Set([
         ...connectedProviders.map(provider => provider.id),
-        ...models.map(model => parseOpenCodeProviderScopedModelRef(model)?.providerId).filter(Boolean),
+        ...models
+          .map(model => parseOpenCodeProviderScopedModelRef(model)?.providerId)
+          .filter(Boolean),
       ]),
     ).sort()
 
@@ -816,22 +834,19 @@ export class OpenCodeInventoryService {
       diagnostics.push('Managed OpenCode auth differs from the source auth store')
     }
     if (providersResult.code !== 0) {
-      diagnostics.push(this.getCommandFailureMessage(
-        providersResult,
-        'Failed to query OpenCode providers',
-      ))
+      diagnostics.push(
+        this.getCommandFailureMessage(providersResult, 'Failed to query OpenCode providers'),
+      )
     }
     if (finalModelsResult.code !== 0) {
-      diagnostics.push(this.getCommandFailureMessage(
-        finalModelsResult,
-        'Failed to query OpenCode models',
-      ))
+      diagnostics.push(
+        this.getCommandFailureMessage(finalModelsResult, 'Failed to query OpenCode models'),
+      )
     }
     if (mode === 'full' && agentsResult.code !== 0) {
-      diagnostics.push(this.getCommandFailureMessage(
-        agentsResult,
-        'Failed to query OpenCode agents',
-      ))
+      diagnostics.push(
+        this.getCommandFailureMessage(agentsResult, 'Failed to query OpenCode agents'),
+      )
     }
 
     const snapshot: OpenCodeInventorySnapshot = {
@@ -846,7 +861,7 @@ export class OpenCodeInventoryService {
       modelMetadata,
       agents,
       authStorePath: providerParse.authStorePath ?? profile.managedAuthPath,
-      probeError: diagnostics.length > 0 ? diagnostics[0] ?? 'OpenCode probe failed' : null,
+      probeError: diagnostics.length > 0 ? (diagnostics[0] ?? 'OpenCode probe failed') : null,
       diagnostics,
     }
 

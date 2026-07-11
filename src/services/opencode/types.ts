@@ -144,6 +144,22 @@ export type OpenCodeApiAuthInput = {
   metadata?: Record<string, string>
 }
 
+export type OpenCodeProviderOAuthAuthorizeInput = {
+  method: number
+  inputs?: Record<string, string>
+}
+
+export type OpenCodeProviderOAuthAuthorization = {
+  url: string
+  method: 'auto' | 'code'
+  instructions: string
+}
+
+export type OpenCodeProviderOAuthCallbackInput = {
+  method: number
+  code?: string
+}
+
 export type OpenCodeServerDocResponse = {
   paths?: Record<string, Record<string, unknown>>
 }
@@ -191,16 +207,9 @@ export type OpenCodeMcpStatusEntry = Record<string, unknown>
 
 export type OpenCodeMcpResponse = Record<string, OpenCodeMcpStatusEntry>
 
-export type OpenCodeAppMcpStatus =
-  | 'present'
-  | 'attached'
-  | 'missing'
-  | 'attach_failed'
+export type OpenCodeAppMcpStatus = 'present' | 'attached' | 'missing' | 'attach_failed'
 
-export type OpenCodeAppMcpLaunchSource =
-  | 'env-override'
-  | 'workspace-dist'
-  | 'workspace-src'
+export type OpenCodeAppMcpLaunchSource = 'env-override' | 'workspace-dist' | 'workspace-src'
 
 export type OpenCodeAppMcpSummary = {
   serverName: string
@@ -257,9 +266,7 @@ export type OpenCodeSessionStatusInput =
 
 export type OpenCodeBootstrapMode = 'app_managed_context' | 'model_tool_checkin'
 
-export type OpenCodeBootstrapEvidenceSource =
-  | 'app_managed_bootstrap'
-  | 'runtime_bootstrap_checkin'
+export type OpenCodeBootstrapEvidenceSource = 'app_managed_bootstrap' | 'runtime_bootstrap_checkin'
 
 export type OpenCodeAppManagedBootstrapRecord = {
   schemaVersion: 1
@@ -322,11 +329,7 @@ export type OpenCodeMessage = {
   parts: OpenCodeMessagePart[]
 }
 
-export type OpenCodeCanonicalMessageRole =
-  | 'user'
-  | 'assistant'
-  | 'system'
-  | 'unknown'
+export type OpenCodeCanonicalMessageRole = 'user' | 'assistant' | 'system' | 'unknown'
 
 export type OpenCodeDurableSessionState =
   | 'idle'
@@ -367,11 +370,7 @@ export type OpenCodeCanonicalMessage = {
   hasError: boolean
 }
 
-export type OpenCodeCanonicalToolStatus =
-  | 'running'
-  | 'completed'
-  | 'errored'
-  | 'unknown'
+export type OpenCodeCanonicalToolStatus = 'running' | 'completed' | 'errored' | 'unknown'
 
 export type OpenCodeCanonicalToolCall = {
   callId: string | null
@@ -511,7 +510,11 @@ export type OpenCodeLogProjection = {
   messages: OpenCodeProjectedLogMessage[]
 }
 
-export type OpenCodeExecutionProbeOutcome = 'available' | 'unavailable' | 'not_authenticated' | 'unknown'
+export type OpenCodeExecutionProbeOutcome =
+  | 'available'
+  | 'unavailable'
+  | 'not_authenticated'
+  | 'unknown'
 
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'

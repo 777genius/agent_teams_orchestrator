@@ -1,10 +1,6 @@
 export type ProviderManagementRuntimeId = 'opencode'
 
-export type ProviderRuntimeState =
-  | 'ready'
-  | 'needs-auth'
-  | 'needs-setup'
-  | 'degraded'
+export type ProviderRuntimeState = 'ready' | 'needs-auth' | 'needs-setup' | 'degraded'
 
 export type ManagedProfileState = 'active' | 'missing' | 'stale'
 
@@ -17,11 +13,7 @@ export type ProviderConnectionState =
   | 'ignored'
   | 'error'
 
-export type ProviderOwnership =
-  | 'managed'
-  | 'local'
-  | 'env'
-  | 'project'
+export type ProviderOwnership = 'managed' | 'local' | 'env' | 'project'
 
 export type ProviderAuthMethod = 'api' | 'oauth' | 'wellknown'
 
@@ -52,11 +44,23 @@ export type ProviderSetupPrompt = {
   when: ProviderSetupPromptCondition | null
 }
 
-export type ProviderSetupFormSource =
-  | 'opencode-auth'
-  | 'curated'
-  | 'oauth'
-  | 'manual'
+export type ProviderSetupAuthOption = {
+  id: string
+  method: Exclude<ProviderSetupMethod, 'manual'>
+  methodIndex: number | null
+  label: string
+  supported: boolean
+  disabledReason: string | null
+  secret: {
+    key: 'key'
+    label: string
+    placeholder: string | null
+    required: boolean
+  } | null
+  prompts: readonly ProviderSetupPrompt[]
+}
+
+export type ProviderSetupFormSource = 'opencode-auth' | 'curated' | 'oauth' | 'manual'
 
 export type ProviderSetupForm = {
   runtimeId: ProviderManagementRuntimeId
@@ -76,6 +80,27 @@ export type ProviderSetupForm = {
     required: boolean
   } | null
   prompts: readonly ProviderSetupPrompt[]
+  authOptions: readonly ProviderSetupAuthOption[]
+  defaultAuthOptionId: string | null
+}
+
+export type ProviderOAuthCompletionMethod = 'auto' | 'code'
+
+export type ProviderOAuthAuthorization = {
+  operationId: string
+  providerId: string
+  displayName: string
+  authOptionId: string
+  methodIndex: number
+  authorizationUrl: string
+  instructions: string
+  completionMethod: ProviderOAuthCompletionMethod
+}
+
+export interface ProviderOAuthFlowObserver {
+  authorizationReady(
+    authorization: ProviderOAuthAuthorization,
+  ): Promise<{ code?: string | null } | void>
 }
 
 export type ProviderActionId =
@@ -87,9 +112,7 @@ export type ProviderActionId =
   | 'configure'
   | 'unignore'
 
-export type ProviderActionOwnershipScope =
-  | ProviderOwnership
-  | 'runtime'
+export type ProviderActionOwnershipScope = ProviderOwnership | 'runtime'
 
 export type ProviderActionDescriptor = {
   id: ProviderActionId
@@ -154,21 +177,19 @@ export type ProviderDirectoryFilter =
 export type ProviderSetupKind =
   | 'connected'
   | 'connect-api-key'
+  | 'connect-oauth'
   | 'configure-manually'
   | 'requires-environment'
   | 'available-readonly'
   | 'unsupported'
 
-export type ProviderDirectorySource =
-  | 'opencode-provider'
-  | 'config-provider'
-  | 'inventory'
-  | 'seed'
+export type ProviderDirectorySource = 'opencode-provider' | 'config-provider' | 'inventory' | 'seed'
 
 export type ProviderDirectoryEntry = {
   providerId: string
   displayName: string
   state: ProviderConnectionState
+  connectedAuthHint: string | null
   setupKind: ProviderSetupKind
   ownership: readonly ProviderOwnership[]
   recommended: boolean
@@ -248,11 +269,7 @@ export type OpenCodeRuntimeModelRouteKind =
   | 'configured_local'
   | 'catalog_provider'
 
-export type OpenCodeRuntimeModelProofState =
-  | 'not_required'
-  | 'needs_probe'
-  | 'verified'
-  | 'failed'
+export type OpenCodeRuntimeModelProofState = 'not_required' | 'needs_probe' | 'verified' | 'failed'
 
 export type RuntimeProviderModel = {
   modelId: string
@@ -302,6 +319,9 @@ export type ConnectProviderInput = {
   method: ProviderSetupMethod
   apiKey?: string | null
   metadata?: Record<string, string> | null
+  authMethodIndex?: number | null
+  authOptionId?: string | null
+  oauthOperationId?: string | null
 } & ProjectScopedProviderManagementInput
 
 export type ProviderSelectionInput = {
