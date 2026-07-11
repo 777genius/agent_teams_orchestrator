@@ -1,5 +1,13 @@
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
+  getOpenCodeCuratedSubscriptionProvider,
+  getOpenCodeCuratedSubscriptionProviderIds,
+  getOpenCodeFastCuratedSubscriptionProviderIds,
+  getOpenCodeSeededSubscriptionProviderIds,
+  OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS,
+  validateOpenCodeCuratedSubscriptionKey,
+} from '../../../../services/opencode/OpenCodeCuratedSubscriptionCatalog.js'
+import {
   readOpenCodeAuthCredential,
   removeOpenCodeAuthCredential,
   upsertOpenCodeAuthCredential,
@@ -166,24 +174,17 @@ type OpenCodeProviderManagementAdapterDeps = {
 
 type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
 
-const XIAOMI_TOKEN_PLAN_PROVIDER_IDS = [
-  'xiaomi-token-plan-ams',
-  'xiaomi-token-plan-sgp',
-  'xiaomi-token-plan-cn',
-] as const
-const XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET = new Set<string>(XIAOMI_TOKEN_PLAN_PROVIDER_IDS)
-const MINIMAX_CODING_PLAN_PROVIDER_ID = 'minimax-coding-plan'
-const ZAI_CODING_PLAN_PROVIDER_ID = 'zai-coding-plan'
-const FAST_CURATED_SETUP_PROVIDER_IDS = new Set<string>([
-  MINIMAX_CODING_PLAN_PROVIDER_ID,
-  ZAI_CODING_PLAN_PROVIDER_ID,
-])
-const XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES = Object.fromEntries(
-  XIAOMI_TOKEN_PLAN_PROVIDER_IDS.map(providerId => [
-    providerId,
-    [`${providerId}/mimo-v2.5-pro`, `${providerId}/mimo-v2.5`],
+const FAST_CURATED_SETUP_PROVIDER_IDS = new Set<string>(
+  getOpenCodeFastCuratedSubscriptionProviderIds(),
+)
+const CURATED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeCuratedSubscriptionProviderIds()
+const SEEDED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeSeededSubscriptionProviderIds()
+const CURATED_SUBSCRIPTION_PROVIDER_LABELS = Object.fromEntries(
+  OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => [
+    definition.id,
+    definition.displayName,
   ]),
-) as Record<string, readonly string[]>
+)
 
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -195,7 +196,6 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   groq: 'Groq',
   llmgateway: 'LLM Gateway',
   mistral: 'Mistral',
-  'minimax-coding-plan': 'MiniMax Token Plan',
   moonshotai: 'Moonshot AI',
   ollama: 'Ollama',
   opencode: 'OpenCode Zen',
@@ -205,24 +205,28 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   togetherai: 'Together AI',
   vercel: 'Vercel AI Gateway',
   xai: 'xAI',
-  'xiaomi-token-plan-ams': 'Xiaomi MiMo Token Plan - Europe',
-  'xiaomi-token-plan-cn': 'Xiaomi MiMo Token Plan - China',
-  'xiaomi-token-plan-sgp': 'Xiaomi MiMo Token Plan - Singapore',
   zai: 'Z.AI',
-  'zai-coding-plan': 'Z.AI Coding Plan',
   zenmux: 'ZenMux',
+  ...CURATED_SUBSCRIPTION_PROVIDER_LABELS,
 }
 
 const SEEDED_PROVIDER_IDS = [
   'openrouter',
   'opencode',
   'atlascloud',
-  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+  ...SEEDED_SUBSCRIPTION_PROVIDER_IDS,
 ] as const
-const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>(['atlascloud'])
+const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
+  'atlascloud',
+  'kiro',
+  'cursor-acp',
+])
 const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
   'atlascloud',
-  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+  'github-copilot',
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+    .filter(definition => definition.requireConnectExecutionProof)
+    .map(definition => definition.id),
 ])
 const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
   atlascloud: [
@@ -230,10 +234,24 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/deepseek-ai/deepseek-v4-flash',
     'atlascloud/zai-org/glm-5.1',
   ],
-  ...XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES,
+  'github-copilot': [
+    'github-copilot/gpt-5-mini',
+    'github-copilot/gpt-4.1',
+    'github-copilot/gpt-5',
+  ],
+  ...Object.fromEntries(
+    OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+      .filter(definition => definition.modelProbePreferences.length > 0)
+      .map(definition => [definition.id, definition.modelProbePreferences]),
+  ),
 }
 const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
-  ...SEEDED_PROVIDER_IDS,
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+    .filter(definition => definition.credentialKind === 'api-key')
+    .map(definition => definition.id),
+  'openrouter',
+  'opencode',
+  'atlascloud',
   'anthropic',
   'cerebras',
   'deepseek',
@@ -242,14 +260,12 @@ const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   'groq',
   'llmgateway',
   'mistral',
-  MINIMAX_CODING_PLAN_PROVIDER_ID,
   'moonshotai',
   'opencode-go',
   'togetherai',
   'vercel',
   'xai',
   'zai',
-  ZAI_CODING_PLAN_PROVIDER_ID,
   'zenmux',
 ])
 const DEFAULT_DIRECTORY_LIMIT = 50
@@ -356,40 +372,6 @@ function normalizeDirectoryCursor(value: string | null | undefined): number {
 function normalizeProviderId(value: string | null | undefined): string | null {
   const normalized = value?.trim().toLowerCase()
   return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
-}
-
-function isXiaomiTokenPlanProviderId(providerId: string): boolean {
-  return XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET.has(providerId)
-}
-
-function getXiaomiTokenPlanApiKeyError(providerId: string, apiKey: string): string | null {
-  if (!isXiaomiTokenPlanProviderId(providerId)) {
-    return null
-  }
-
-  if (apiKey.startsWith('sk-')) {
-    return 'Xiaomi Token Plan providers require a tp-... API key. Pay-as-you-go sk-... keys cannot be used with Token Plan Base URLs.'
-  }
-  if (!apiKey.startsWith('tp-')) {
-    return 'Xiaomi Token Plan API key must start with tp-. Copy the key from the Token Plan page.'
-  }
-
-  return null
-}
-
-function getMiniMaxCodingPlanApiKeyError(providerId: string, apiKey: string): string | null {
-  if (providerId !== MINIMAX_CODING_PLAN_PROVIDER_ID) {
-    return null
-  }
-
-  if (apiKey.startsWith('sk-') && !apiKey.startsWith('sk-cp-')) {
-    return 'MiniMax Token Plan requires an sk-cp-... subscription key. Regular pay-as-you-go sk-... keys cannot use the Token Plan route.'
-  }
-  if (!apiKey.startsWith('sk-cp-')) {
-    return 'MiniMax Token Plan subscription key must start with sk-cp-. Copy it from the Token Plan page.'
-  }
-
-  return null
 }
 
 function normalizePositiveLimit(value: number | null | undefined): number | null {
@@ -975,6 +957,34 @@ function buildOpenCodeSetupAuthOptions(input: {
   })
 }
 
+function isSuperGrokDeviceAuthOption(option: ProviderSetupAuthOption): boolean {
+  if (option.method !== 'oauth') {
+    return false
+  }
+  const label = option.label.toLowerCase()
+  return (
+    label.includes('device') ||
+    label.includes('browser code') ||
+    label.includes('headless') ||
+    label.includes('remote') ||
+    label.includes('vps')
+  )
+}
+
+function prepareSuperGrokAuthOptions(
+  options: readonly ProviderSetupAuthOption[],
+): ProviderSetupAuthOption[] {
+  return options.map(option => {
+    if (!isSuperGrokDeviceAuthOption(option)) {
+      return option
+    }
+    return {
+      ...option,
+      label: 'SuperGrok browser code (recommended)',
+    }
+  })
+}
+
 function promptConditionMatches(
   condition: ProviderSetupPromptCondition | null,
   metadata: Record<string, string>,
@@ -1020,31 +1030,9 @@ function getCuratedApiSetupProfile(providerId: string): {
   secretLabel: string
   secretPlaceholder: string
 } {
-  if (isXiaomiTokenPlanProviderId(providerId)) {
-    return {
-      description:
-        'Use the Xiaomi Token Plan key from the Token Plan dashboard. After connect, select the Xiaomi MiMo model under the OpenCode runtime.',
-      secretLabel: 'Token Plan API key',
-      secretPlaceholder: 'tp-xxxxx',
-    }
-  }
-
-  if (providerId === MINIMAX_CODING_PLAN_PROVIDER_ID) {
-    return {
-      description:
-        'Use the sk-cp-... subscription key from your MiniMax Token Plan page. This provider uses the Token Plan endpoint and quota, not pay-as-you-go API balance.',
-      secretLabel: 'Token Plan subscription key',
-      secretPlaceholder: 'sk-cp-...',
-    }
-  }
-
-  if (providerId === ZAI_CODING_PLAN_PROVIDER_ID) {
-    return {
-      description:
-        'Use the API key from your GLM Coding Plan page. This provider uses the dedicated Z.AI coding endpoint and Coding Plan quota.',
-      secretLabel: 'GLM Coding Plan API key',
-      secretPlaceholder: 'Paste Coding Plan key',
-    }
+  const curatedSubscription = getOpenCodeCuratedSubscriptionProvider(providerId)
+  if (curatedSubscription) {
+    return curatedSubscription.setup
   }
 
   return {
@@ -1063,10 +1051,14 @@ function buildProviderSetupForm(input: {
   capabilities?: OpenCodeProviderManagementCapabilities
 }): ProviderSetupForm {
   const capabilities = input.capabilities ?? EMPTY_CAPABILITIES
-  const authOptions = buildOpenCodeSetupAuthOptions({
+  let authOptions = buildOpenCodeSetupAuthOptions({
     methods: input.methods,
     capabilities,
   })
+
+  if (input.providerId === 'xai') {
+    authOptions = prepareSuperGrokAuthOptions(authOptions)
+  }
 
   if (
     input.providerId === 'xai' &&
@@ -1109,7 +1101,13 @@ function buildProviderSetupForm(input: {
     })
   }
 
-  const selectedOption = authOptions.find(option => option.supported) ?? authOptions[0] ?? null
+  const selectedOption =
+    (input.providerId === 'xai'
+      ? authOptions.find(option => option.supported && isSuperGrokDeviceAuthOption(option))
+      : null) ??
+    authOptions.find(option => option.supported) ??
+    authOptions[0] ??
+    null
   if (selectedOption) {
     const curatedProfile =
       selectedOption.id === 'api:curated' ? getCuratedApiSetupProfile(input.providerId) : null
@@ -1122,10 +1120,17 @@ function buildProviderSetupForm(input: {
       title: `Connect ${input.displayName}`,
       description:
         curatedProfile?.description ??
-        (selectedOption.method === 'oauth'
+        (input.providerId === 'xai' && isSuperGrokDeviceAuthOption(selectedOption)
+          ? 'Open xAI in your browser, enter the short device code, and return here. OpenCode securely completes the SuperGrok sign-in and token refresh.'
+          : selectedOption.method === 'oauth'
           ? 'Sign in through the provider in your browser. OpenCode handles authorization and token refresh without exposing OAuth tokens to the desktop UI.'
           : 'Credential is stored in the app-managed OpenCode profile.'),
-      submitLabel: selectedOption.method === 'oauth' ? 'Continue in browser' : 'Connect',
+      submitLabel:
+        input.providerId === 'xai' && isSuperGrokDeviceAuthOption(selectedOption)
+          ? 'Get browser code'
+          : selectedOption.method === 'oauth'
+            ? 'Continue in browser'
+            : 'Connect',
       disabledReason: selectedOption.disabledReason,
       source: curatedProfile
         ? 'curated'
@@ -2196,6 +2201,13 @@ function getProviderCredentialValidationModelId(input: {
     return null
   }
 
+  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]?.find(
+    modelId => modelIds.includes(modelId),
+  )
+  if (preferredModelId) {
+    return preferredModelId
+  }
+
   const defaultModelId = getDefaultModelForProvider(
     input.providerId,
     input.inventory,
@@ -2204,13 +2216,6 @@ function getProviderCredentialValidationModelId(input: {
   )
   if (defaultModelId && modelIds.includes(defaultModelId)) {
     return defaultModelId
-  }
-
-  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]?.find(
-    modelId => modelIds.includes(modelId),
-  )
-  if (preferredModelId) {
-    return preferredModelId
   }
 
   return modelIds[0] ?? null
@@ -2623,6 +2628,53 @@ export class OpenCodeProviderManagementAdapter
             .catch(() => undefined),
         ),
     )
+  }
+
+  private async verifyConnectedProviderExecution(input: {
+    providerId: string
+    inventory: OpenCodeInventorySnapshot
+    configProviders: OpenCodeConfigProvidersResponse | null
+    providers: OpenCodeProviderResponse | null
+    secretToRedact?: string | null
+  }): Promise<ProviderManagementResult<null>> {
+    if (!requiresConnectExecutionProof(input.providerId)) {
+      return { ok: true, value: null }
+    }
+
+    const validationModelId = getProviderCredentialValidationModelId({
+      providerId: input.providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
+    if (!validationModelId) {
+      return providerManagementError(
+        'model-missing',
+        `OpenCode did not expose a probeable model for provider ${input.providerId}`,
+      )
+    }
+
+    const probeResult = await this.getExecutionProbe().probeModel({
+      selectedModel: validationModelId,
+      projectPath: input.inventory.projectPath,
+      bypassCache: true,
+    })
+    if (probeResult.outcome === 'available') {
+      return { ok: true, value: null }
+    }
+
+    const probeReason = redactSecret(
+      probeResult.reason ?? `Model probe failed for ${validationModelId}`,
+      input.secretToRedact ?? '',
+    )
+    return probeResult.outcome === 'not_authenticated'
+      ? providerManagementError(
+          'auth-failed',
+          probeResult.reason
+            ? probeReason
+            : `Provider authentication failed for ${validationModelId}`,
+        )
+      : providerManagementError('model-test-failed', probeReason)
   }
 
   private async withManagedOpenCodeClient<T>(
@@ -3356,6 +3408,21 @@ export class OpenCodeProviderManagementAdapter
             `OpenCode completed OAuth but did not report provider ${providerId} as connected`,
           )
         }
+        const executionProof = await this.verifyConnectedProviderExecution({
+          providerId,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
+        })
+        if (!executionProof.ok) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+          })
+          return executionProof
+        }
         return { ok: true, value: provider }
       },
       {
@@ -3389,13 +3456,12 @@ export class OpenCodeProviderManagementAdapter
     if (!apiKey) {
       return providerManagementError('auth-required', 'API key is required')
     }
-    const xiaomiTokenPlanApiKeyError = getXiaomiTokenPlanApiKeyError(providerId, apiKey)
-    if (xiaomiTokenPlanApiKeyError) {
-      return providerManagementError('auth-required', xiaomiTokenPlanApiKeyError)
-    }
-    const miniMaxCodingPlanApiKeyError = getMiniMaxCodingPlanApiKeyError(providerId, apiKey)
-    if (miniMaxCodingPlanApiKeyError) {
-      return providerManagementError('auth-required', miniMaxCodingPlanApiKeyError)
+    const curatedSubscriptionKeyError = validateOpenCodeCuratedSubscriptionKey(
+      providerId,
+      apiKey,
+    )
+    if (curatedSubscriptionKeyError) {
+      return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
 
     return this.withManagedOpenCodeClient(
@@ -3616,52 +3682,21 @@ export class OpenCodeProviderManagementAdapter
             `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
           )
         }
-        if (requiresConnectExecutionProof(providerId)) {
-          const validationModelId = getProviderCredentialValidationModelId({
+        const executionProof = await this.verifyConnectedProviderExecution({
+          providerId,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
+          secretToRedact: apiKey,
+        })
+        if (!executionProof.ok) {
+          await this.rollbackProviderAuth({
+            client,
             providerId,
-            inventory: refresh.inventory,
-            configProviders,
-            providers,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
           })
-          if (!validationModelId) {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-            })
-            return providerManagementError(
-              'model-missing',
-              `OpenCode did not expose a probeable model for provider ${providerId}`,
-            )
-          }
-
-          const probeResult = await this.getExecutionProbe().probeModel({
-            selectedModel: validationModelId,
-            projectPath: refresh.inventory.projectPath,
-            bypassCache: true,
-          })
-          if (probeResult.outcome !== 'available') {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-            })
-            const probeReason = redactSecret(
-              probeResult.reason ?? `Model probe failed for ${validationModelId}`,
-              apiKey,
-            )
-            if (probeResult.outcome === 'not_authenticated') {
-              return providerManagementError(
-                'auth-failed',
-                probeResult.reason
-                  ? probeReason
-                  : `Provider authentication failed for ${validationModelId}`,
-              )
-            }
-            return providerManagementError('model-test-failed', probeReason)
-          }
+          return executionProof
         }
         return { ok: true, value: provider }
       },

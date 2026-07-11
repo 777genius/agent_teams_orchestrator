@@ -1,7 +1,9 @@
+import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
 
 import { getCwd } from '../../utils/cwd.js'
+import * as lockfile from '../../utils/lockfile.js'
 import { killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import {
@@ -11,7 +13,15 @@ import {
 } from './OpenCodeModelRef.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import {
+  getOpenCodeManagedSubscriptionPluginPackages,
+  isOpenCodeCuratedSubscriptionProviderId,
+} from './OpenCodeCuratedSubscriptionCatalog.js'
+import {
+  areOpenCodeManagedPluginCachesReady,
+  openCodeProfileManager,
+  repairEmptyOpenCodeManagedPluginCaches,
+} from './OpenCodeProfileManager.js'
 
 import type {
   OpenCodeAgentMode,
@@ -28,6 +38,16 @@ export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
+const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = 45_000
+const OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS = {
+  stale: 30_000,
+  update: 5_000,
+  retries: {
+    retries: 120,
+    minTimeout: 50,
+    maxTimeout: 250,
+  },
+}
 
 type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 
@@ -297,6 +317,7 @@ export function execOpenCodePortableCommand(input: {
 export async function collectOpenCodeInventoryCommandResults(input: {
   mode: OpenCodeInventoryProbeMode
   execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
+  modelsResult?: OpenCodeCommandResult
 }): Promise<OpenCodeInventoryCommandResults> {
   const versionResult =
     input.mode === 'profile'
@@ -309,7 +330,7 @@ export async function collectOpenCodeInventoryCommandResults(input: {
   const modelsResult =
     input.mode !== 'full'
       ? EMPTY_OPEN_CODE_COMMAND_RESULT
-      : await input.execOpenCode(getOpenCodeVerboseModelsArgs())
+      : input.modelsResult ?? await input.execOpenCode(getOpenCodeVerboseModelsArgs())
   const agentsResult =
     input.mode !== 'full'
       ? EMPTY_OPEN_CODE_COMMAND_RESULT
@@ -321,6 +342,66 @@ export async function collectOpenCodeInventoryCommandResults(input: {
     modelsResult,
     agentsResult,
   }
+}
+
+async function withManagedPluginInstallLock<T>(
+  profile: OpenCodePreparedProfile,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const lockPath = path.join(
+    profile.xdgCacheHome,
+    'opencode',
+    'managed-subscription-plugin-install.lock',
+  )
+  await mkdir(path.dirname(lockPath), { recursive: true })
+  await writeFile(lockPath, '', { flag: 'a' })
+
+  let release: (() => Promise<void>) | undefined
+  try {
+    release = await lockfile.lock(lockPath, OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS)
+    await repairEmptyOpenCodeManagedPluginCaches(profile.xdgCacheHome)
+    return await callback()
+  } finally {
+    if (release) {
+      await release()
+    }
+  }
+}
+
+function profileUsesManagedSubscriptionPlugins(profile: OpenCodePreparedProfile): boolean {
+  const configuredPlugins = Array.isArray(profile.managedConfig.plugin)
+    ? profile.managedConfig.plugin.filter((value): value is string => typeof value === 'string')
+    : []
+  const managedPlugins = new Set(getOpenCodeManagedSubscriptionPluginPackages())
+  return configuredPlugins.some(plugin => managedPlugins.has(plugin))
+}
+
+export async function prewarmOpenCodeManagedSubscriptionPlugins(input: {
+  binaryPath: string
+  profile: OpenCodePreparedProfile
+  abortSignal?: AbortSignal
+  progress?: OpenCodeInventoryProbeProgressTracker
+}): Promise<OpenCodeCommandResult | undefined> {
+  if (!profileUsesManagedSubscriptionPlugins(input.profile)) {
+    return undefined
+  }
+  return withManagedPluginInstallLock(input.profile, async () => {
+    if (await areOpenCodeManagedPluginCachesReady(input.profile.xdgCacheHome)) {
+      return undefined
+    }
+    const leaveStep = input.progress?.enterStep('install managed OpenCode provider plugins')
+    try {
+      return await execOpenCodePortableCommand({
+        binaryPath: input.binaryPath,
+        args: getOpenCodeVerboseModelsArgs(),
+        profile: input.profile,
+        abortSignal: input.abortSignal,
+        timeoutMs: OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS,
+      })
+    } finally {
+      leaveStep?.()
+    }
+  })
 }
 
 export function isOpenCodeInventoryTimeoutMessage(message: string | null | undefined): boolean {
@@ -526,6 +607,13 @@ export function isOpenCodeModelFree(
   modelMetadata: readonly OpenCodeModelMetadata[] | undefined,
 ): boolean {
   const normalizedModelId = modelId.trim()
+  const providerId = normalizedModelId.split('/', 1)[0] ?? ''
+  // Subscription catalogs often publish zero monetary cost because usage is
+  // deducted from a purchased plan quota. That is not a free model and must
+  // not be advertised as usable without connecting the subscription.
+  if (isOpenCodeCuratedSubscriptionProviderId(providerId)) {
+    return false
+  }
   if (normalizedModelId.toLowerCase().endsWith(':free')) {
     return true
   }
@@ -678,6 +766,7 @@ export class OpenCodeInventoryService {
     options: {
       abortSignal?: AbortSignal
       progress?: OpenCodeInventoryProbeProgressTracker
+      timeoutMs?: number
     } = {},
   ): Promise<OpenCodeCommandResult> {
     const leaveStep = options.progress?.enterStep(`opencode ${args.join(' ')}`)
@@ -687,7 +776,7 @@ export class OpenCodeInventoryService {
         args,
         profile,
         abortSignal: options.abortSignal,
-        timeoutMs: OPEN_CODE_PROBE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS,
       })
     } finally {
       leaveStep?.()
@@ -738,20 +827,33 @@ export class OpenCodeInventoryService {
     const profile = await openCodeProfileManager
       .prepareProfile(resolvedProjectPath, {
         includeAppMcp: options.includeAppMcp !== false,
+        includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
       })
       .finally(() => {
         leaveProfileStep?.()
       })
-    const { versionResult, providersResult, modelsResult, agentsResult } =
-      await collectOpenCodeInventoryCommandResults({
+    const prewarmedModelsResult =
+      mode === 'full'
+        ? await prewarmOpenCodeManagedSubscriptionPlugins({
+            binaryPath,
+            profile,
+            abortSignal: options.abortSignal,
+            progress: options.progress,
+          })
+        : undefined
+    const collectCommandResults = () =>
+      collectOpenCodeInventoryCommandResults({
         mode,
+        modelsResult: prewarmedModelsResult,
         execOpenCode: args =>
           this.execOpenCode(binaryPath, args, profile, {
             abortSignal: options.abortSignal,
             progress: options.progress,
           }),
       })
+    const { versionResult, providersResult, modelsResult, agentsResult } =
+      await collectCommandResults()
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)

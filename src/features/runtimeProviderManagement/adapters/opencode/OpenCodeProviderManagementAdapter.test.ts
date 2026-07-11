@@ -149,10 +149,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.providers.map(provider => provider.providerId)).toEqual([
       'openrouter',
       'opencode',
+      'kiro',
       'atlascloud',
+      'cursor-acp',
+      'kimi-for-coding',
       'xiaomi-token-plan-cn',
       'xiaomi-token-plan-ams',
       'xiaomi-token-plan-sgp',
+      'zai-coding-plan',
     ])
   })
 
@@ -433,10 +437,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'openrouter',
       'opencode',
       'openai',
+      'kiro',
       'atlascloud',
+      'cursor-acp',
+      'kimi-for-coding',
       'xiaomi-token-plan-cn',
       'xiaomi-token-plan-ams',
       'xiaomi-token-plan-sgp',
+      'zai-coding-plan',
     ])
 
     const openai = result.value.providers.find(provider => provider.providerId === 'openai')
@@ -508,6 +516,57 @@ describe('OpenCodeProviderManagementAdapter', () => {
       detail: 'Provider is visible in the OpenCode model catalog',
     })
     expect(atlasCloud?.actions.map(action => action.id)).toEqual(['connect'])
+  })
+
+  test('does not report plugin-backed plans connected from config-only provider rows', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [],
+            availableProviders: ['kiro', 'cursor-acp'],
+            models: ['kiro/auto', 'cursor-acp/auto'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              { id: 'kiro', name: 'Kiro', models: { auto: {} } },
+              { id: 'cursor-acp', name: 'Cursor ACP', models: { auto: {} } },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [
+              { id: 'kiro', name: 'Kiro' },
+              { id: 'cursor-acp', name: 'Cursor ACP' },
+            ],
+            connected: ['kiro', 'cursor-acp'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            kiro: [{ type: 'oauth' }],
+            'cursor-acp': [{ type: 'api' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    for (const providerId of ['kiro', 'cursor-acp']) {
+      const provider = result.value.providers.find(entry => entry.providerId === providerId)
+      expect(provider?.state).toBe('available')
+      expect(provider?.ownership).toEqual([])
+      expect(provider?.actions.map(action => action.id)).toContain('test')
+    }
   })
 
   test('keeps the current OpenCode default in the configured models panel even before catalog hydration', async () => {
@@ -860,9 +919,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'openrouter',
       'atlascloud',
       'cloudflare-workers-ai',
+      'kimi-for-coding',
       'xiaomi-token-plan-cn',
       'xiaomi-token-plan-ams',
       'xiaomi-token-plan-sgp',
+      'zai-coding-plan',
     ])
     expect(
       result.value.entries
@@ -1228,11 +1289,19 @@ describe('OpenCodeProviderManagementAdapter', () => {
       method: 'oauth',
       supported: true,
       source: 'oauth',
-      defaultAuthOptionId: 'oauth:0',
+      defaultAuthOptionId: 'oauth:1',
+      submitLabel: 'Get browser code',
+      description: expect.stringContaining('short device code'),
     })
     expect(result.value.authOptions).toMatchObject([
       { id: 'oauth:0', method: 'oauth', methodIndex: 0, supported: true },
-      { id: 'oauth:1', method: 'oauth', methodIndex: 1, supported: true },
+      {
+        id: 'oauth:1',
+        method: 'oauth',
+        methodIndex: 1,
+        supported: true,
+        label: 'SuperGrok browser code (recommended)',
+      },
       { id: 'api:2', method: 'api', methodIndex: 2, supported: true },
     ])
   })
@@ -1423,6 +1492,116 @@ describe('OpenCodeProviderManagementAdapter', () => {
     )
   })
 
+  test('does not report Copilot Free as connected when the official OpenCode model rejects execution', async () => {
+    let connected = false
+    let deleteProviderAuthCalled = false
+    const removedCredentials: Array<{ authPath: string; providerId: string }> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: connected
+              ? [
+                  {
+                    id: 'github-copilot',
+                    authHint: 'oauth',
+                    source: 'credentials',
+                    credentialScopes: ['managed'],
+                  },
+                ]
+              : [],
+            availableProviders: ['github-copilot'],
+            models: ['github-copilot/gpt-5-mini'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'github-copilot', name: 'GitHub Copilot' }],
+            connected: connected ? ['github-copilot'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'github-copilot': [{ type: 'oauth', label: 'Sign in with GitHub' }],
+          }),
+          getServerDoc: async () => ({
+            paths: {
+              '/auth/{providerID}': { delete: {} },
+              '/provider/{providerID}/oauth/authorize': { post: {} },
+              '/provider/{providerID}/oauth/callback': { post: {} },
+            },
+          }),
+          authorizeProviderOAuth: async () => ({
+            url: 'https://github.com/login/device',
+            method: 'auto',
+            instructions: 'Complete authorization in your browser.',
+          }),
+          completeProviderOAuth: async () => {
+            connected = true
+            return true
+          },
+          deleteProviderAuth: async () => {
+            deleteProviderAuthCalled = true
+            connected = false
+            return true
+          },
+        }),
+      },
+      authStore: {
+        readCredential: async () => ({ type: 'oauth', access: 'copilot-free-token' }),
+        upsertCredential: async () => {},
+        removeCredential: async input => {
+          removedCredentials.push(input)
+        },
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+      },
+      executionProbe: {
+        probeModel: async input =>
+          executionProbeResult(
+            input.selectedModel,
+            'unavailable',
+            'The selected model is unsupported for this Copilot account',
+          ),
+      },
+    })
+
+    const result = await adapter.connectProvider(
+      {
+        runtimeId: 'opencode',
+        providerId: 'github-copilot',
+        method: 'oauth',
+        authMethodIndex: 0,
+        authOptionId: 'oauth:0',
+        oauthOperationId: 'copilot-free-test',
+        metadata: {},
+      },
+      { authorizationReady: async () => undefined },
+    )
+
+    const failure = expectFailure(result)
+    expect(failure.code).toBe('model-test-failed')
+    expect(failure.message).toContain('unsupported for this Copilot account')
+    expect(deleteProviderAuthCalled).toBe(true)
+    expect(removedCredentials).toEqual([
+      {
+        authPath: '/tmp/profile/data/opencode/auth.json',
+        providerId: 'github-copilot',
+      },
+      {
+        authPath:
+          '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        providerId: 'github-copilot',
+      },
+    ])
+  })
+
   test('passes a future provider authorization code through the generic OAuth callback contract', async () => {
     let connected = false
     const callbacks: Array<Record<string, unknown>> = []
@@ -1596,6 +1775,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
       runtimeId: 'opencode',
       providerId: 'zai-coding-plan',
     })
+    const kimiResult = await adapter.loadSetupForm({
+      runtimeId: 'opencode',
+      providerId: 'kimi-for-coding',
+    })
 
     expect(miniMaxResult.ok).toBe(true)
     if (!miniMaxResult.ok) return
@@ -1622,8 +1805,79 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     })
     expect(zaiResult.value.description).toContain('dedicated Z.AI coding endpoint')
+
+    expect(kimiResult.ok).toBe(true)
+    if (!kimiResult.ok) return
+    expect(kimiResult.value).toMatchObject({
+      displayName: 'Kimi Code Membership',
+      method: 'api',
+      supported: true,
+      source: 'curated',
+      secret: {
+        label: 'Kimi Code membership key',
+        placeholder: 'Paste Kimi Code membership key',
+      },
+    })
+    expect(kimiResult.value.description).toContain('Kimi membership quota')
     expect(probeCalled).toBe(false)
     expect(ensureHostCalled).toBe(false)
+  })
+
+  test('finds Kimi Code Membership as an inline-connectable curated provider', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            availableProviders: ['kimi-for-coding'],
+            models: [
+              'kimi-for-coding/kimi-for-coding',
+              'kimi-for-coding/kimi-for-coding-highspeed',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'kimi-for-coding',
+                name: 'Kimi Code Membership',
+                models: {
+                  'kimi-for-coding': {},
+                  'kimi-for-coding-highspeed': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'kimi-for-coding',
+      limit: 10,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries).toHaveLength(1)
+    expect(result.value.entries[0]).toMatchObject({
+      providerId: 'kimi-for-coding',
+      displayName: 'Kimi Code Membership',
+      setupKind: 'connect-api-key',
+      actions: [{ id: 'connect', label: 'Connect', enabled: true }],
+      metadata: {
+        supportedInlineAuth: true,
+      },
+    })
   })
 
   test('finds MiniMax Coding Plan as an inline-connectable directory provider', async () => {
@@ -2234,12 +2488,18 @@ describe('OpenCodeProviderManagementAdapter', () => {
                     },
                   ],
                   availableProviders: ['xiaomi-token-plan-ams'],
-                  models: ['xiaomi-token-plan-ams/mimo-v2.5-pro'],
+                  models: [
+                    'xiaomi-token-plan-ams/mimo-v2.5-pro',
+                    'xiaomi-token-plan-ams/mimo-v2.5-tts-voicedesign',
+                  ],
                 }
               : {
                   connectedProviders: [],
                   availableProviders: ['xiaomi-token-plan-ams'],
-                  models: ['xiaomi-token-plan-ams/mimo-v2.5-pro'],
+                  models: [
+                    'xiaomi-token-plan-ams/mimo-v2.5-pro',
+                    'xiaomi-token-plan-ams/mimo-v2.5-tts-voicedesign',
+                  ],
                 },
           ),
       },
@@ -2257,10 +2517,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
                 models: {
                   'mimo-v2.5-pro': {},
                   'mimo-v2.5': {},
+                  'mimo-v2.5-tts-voicedesign': {},
                 },
               },
             ],
-            default: {},
+            default: {
+              'xiaomi-token-plan-ams': 'mimo-v2.5-tts-voicedesign',
+            },
           }),
           getProviders: async () => ({
             all: [
@@ -2270,7 +2533,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
               },
             ],
             connected: authApplied ? ['xiaomi-token-plan-ams'] : [],
-            default: {},
+            default: {
+              'xiaomi-token-plan-ams': 'mimo-v2.5-tts-voicedesign',
+            },
           }),
           getProviderAuth: async () => ({}),
           setProviderAuth: async () => {
@@ -2332,6 +2597,138 @@ describe('OpenCodeProviderManagementAdapter', () => {
       ownership: ['managed'],
     })
   })
+
+  test.each([
+    {
+      providerId: 'zai-coding-plan',
+      displayName: 'Z.AI Coding Plan',
+      apiKey: 'zai-coding-plan-test-key',
+      modelId: 'zai-coding-plan/glm-5.2',
+    },
+    {
+      providerId: 'minimax-coding-plan',
+      displayName: 'MiniMax Token Plan (minimax.io)',
+      apiKey: 'sk-cp-minimax-test-key',
+      modelId: 'minimax-coding-plan/MiniMax-M3',
+    },
+    {
+      providerId: 'kimi-for-coding',
+      displayName: 'Kimi Code Membership',
+      apiKey: 'kimi-membership-test-key',
+      modelId: 'kimi-for-coding/kimi-for-coding',
+    },
+  ])(
+    'connects $providerId only after mirroring auth and proving its subscription model',
+    async ({ providerId, displayName, apiKey, modelId }) => {
+      const authWrites: Array<{
+        authPath: string
+        providerId: string
+        key: string
+      }> = []
+      const modelProbes: Array<{
+        selectedModel: string
+        bypassCache: boolean | undefined
+      }> = []
+      let authApplied = false
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async (_projectPath, options) =>
+            inventory({
+              connectedProviders: options?.bypassCache
+                ? [
+                    {
+                      id: providerId,
+                      authHint: 'api',
+                      source: 'credentials',
+                      credentialScopes: ['managed'],
+                    },
+                  ]
+                : [],
+              availableProviders: [providerId],
+              models: [modelId],
+            }),
+        },
+        hostManager: {
+          ensureHost: async () => host(),
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({
+              providers:
+                providerId === 'kimi-for-coding'
+                  ? [
+                      {
+                        id: providerId,
+                        name: displayName,
+                        models: { [modelId.slice(providerId.length + 1)]: {} },
+                      },
+                    ]
+                  : [],
+              default: {},
+            }),
+            getProviders: async () => ({
+              all: [{ id: providerId, name: displayName }],
+              connected: authApplied ? [providerId] : [],
+              default: {},
+            }),
+            getProviderAuth: async () => ({}),
+            setProviderAuth: async () => {
+              authApplied = true
+              return true
+            },
+          }),
+        },
+        authStore: {
+          upsertApiAuth: async input => {
+            authWrites.push({
+              authPath: input.authPath,
+              providerId: input.providerId,
+              key: input.auth.key,
+            })
+          },
+          removeCredential: async () => {},
+        },
+        executionProbe: {
+          probeModel: async input => {
+            modelProbes.push({
+              selectedModel: input.selectedModel,
+              bypassCache: input.bypassCache,
+            })
+            return executionProbeResult(input.selectedModel)
+          },
+        },
+      })
+
+      const result = await adapter.connectWithApiKey({
+        runtimeId: 'opencode',
+        providerId,
+        apiKey,
+      })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(authWrites).toEqual([
+        {
+          authPath:
+            '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+          providerId,
+          key: apiKey,
+        },
+        {
+          authPath: '/tmp/profile/data/opencode/auth.json',
+          providerId,
+          key: apiKey,
+        },
+      ])
+      expect(modelProbes).toEqual([{ selectedModel: modelId, bypassCache: true }])
+      expect(result.value).toMatchObject({
+        providerId,
+        state: 'connected',
+        ownership: ['managed'],
+      })
+    },
+  )
 
   test('rejects Atlas Cloud connect when the user-provided API key fails model execution proof', async () => {
     const authWrites: Array<{

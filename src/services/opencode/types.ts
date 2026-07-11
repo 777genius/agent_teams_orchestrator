@@ -17,6 +17,7 @@ export type OpenCodeToolApprovalMode = 'auto' | 'manual'
 export type OpenCodePrepareProfileOptions = {
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
   includeAppMcp?: boolean
+  includeManagedSubscriptionPlugins?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
 }
 

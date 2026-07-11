@@ -496,6 +496,18 @@ llama.cpp/qwen3-coder:a3b local
       true,
     )
     expect(
+      isOpenCodeModelFree('kimi-for-coding/k2p7', [
+        {
+          id: 'kimi-for-coding/k2p7',
+          cost: { input: 0, output: 0 },
+          context: 262_144,
+          limits: { context: 262_144 },
+          free: true,
+          raw: {},
+        },
+      ]),
+    ).toBe(false)
+    expect(
       parsed.modelMetadata.find(item => item.id === 'llama.cpp/qwen3-coder:a3b')?.context,
     ).toBe(32768)
     expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
