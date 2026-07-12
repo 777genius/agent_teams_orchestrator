@@ -18,6 +18,7 @@ import {
   syncOpenCodeManagedAuthStore,
   upsertOpenCodeApiAuthCredential,
   upsertOpenCodeAuthCredential,
+  withOpenCodeOAuthRefreshLock,
 } from './OpenCodeAuthStore.js'
 
 describe('OpenCodeAuthStore', () => {
@@ -143,6 +144,59 @@ await upsertOpenCodeApiAuthCredential({
     expect(exitCodes).toEqual(providerIds.map(() => 0))
     expect(Object.keys(JSON.parse(await readFile(authPath, 'utf8'))).sort()).toEqual(providerIds)
   }, 15_000)
+
+  test('serializes one provider OAuth refresh across separate processes', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'profiles', 'project', 'data', 'opencode', 'auth.json')
+    const counterPath = path.join(tempDir, 'refresh-count')
+    const startPath = path.join(tempDir, 'refresh-start')
+    const scriptPath = path.join(tempDir, 'refresh-auth.ts')
+    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
+    await writeFile(
+      scriptPath,
+      `import { access, readFile, writeFile } from 'node:fs/promises'
+import { withOpenCodeOAuthRefreshLock } from ${JSON.stringify(authStoreUrl)}
+while (await access(process.argv[4]).then(() => false).catch(() => true)) {
+  await new Promise(resolve => setTimeout(resolve, 5))
+}
+await withOpenCodeOAuthRefreshLock({
+  authPath: process.argv[2],
+  providerId: 'xai',
+  operation: async () => {
+    const current = Number(await readFile(process.argv[3], 'utf8').catch(() => '0'))
+    await new Promise(resolve => setTimeout(resolve, 30))
+    await writeFile(process.argv[3], String(current + 1), 'utf8')
+  },
+})
+`,
+      'utf8',
+    )
+    const children = Array.from({ length: 4 }, () => Bun.spawn({
+      cmd: [process.execPath, scriptPath, authPath, counterPath, startPath],
+      cwd: process.cwd(),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    }))
+    await writeFile(startPath, 'go\n', 'utf8')
+
+    expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0, 0])
+    expect(await readFile(counterPath, 'utf8')).toBe('4')
+  }, 15_000)
+
+  test('recovers an OAuth refresh lock left by a dead process', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'profiles', 'project', 'data', 'opencode', 'auth.json')
+    const lockPath = path.join(tempDir, 'opencode', 'auth.json.xai.oauth-refresh.agent-teams.lock')
+    await mkdir(path.dirname(lockPath), { recursive: true })
+    await writeFile(lockPath, JSON.stringify({
+      id: 'dead-owner',
+      createdAtMs: Date.now(),
+      pid: 2_147_483_647,
+    }), 'utf8')
+    await expect(withOpenCodeOAuthRefreshLock({
+      authPath,
+      providerId: 'xai',
+      operation: async () => 'recovered',
+    })).resolves.toBe('recovered')
+  })
 
   test('reconciles managed auth to current sources and drops stale providers', async () => {
     const globalAuthPath = path.join(tempDir, 'global-auth.json')
