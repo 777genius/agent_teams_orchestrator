@@ -218,8 +218,10 @@ const SEEDED_PROVIDER_IDS = [
 ] as const
 const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
   'atlascloud',
+  'github-copilot',
   'kiro',
   'cursor-acp',
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => definition.id),
 ])
 const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
   'atlascloud',
@@ -235,8 +237,8 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/zai-org/glm-5.1',
   ],
   'github-copilot': [
-    'github-copilot/gpt-5-mini',
     'github-copilot/gpt-4.1',
+    'github-copilot/gpt-5-mini',
     'github-copilot/gpt-5',
   ],
   ...Object.fromEntries(
@@ -272,6 +274,7 @@ const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -295,6 +298,46 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null
+}
+
+function canonicalizeCredentialValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeCredentialValue)
+  }
+  const record = asRecord(value)
+  if (!record) {
+    return value
+  }
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map(key => [key, canonicalizeCredentialValue(record[key])]),
+  )
+}
+
+function credentialsEqual(
+  left: OpenCodeAuthCredential,
+  right: OpenCodeAuthCredential,
+): boolean {
+  return JSON.stringify(canonicalizeCredentialValue(left)) ===
+    JSON.stringify(canonicalizeCredentialValue(right))
+}
+
+function waitForAbortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) {
+    return Promise.resolve(false)
+  }
+  return new Promise(resolve => {
+    const onAbort = () => {
+      clearTimeout(timeout)
+      resolve(false)
+    }
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(true)
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function asString(value: unknown): string | null {
@@ -2613,6 +2656,7 @@ export class OpenCodeProviderManagementAdapter
     providerId: string
     authPaths: readonly (string | null | undefined)[]
     canDeleteProviderAuth: boolean
+    previousCredentials?: ReadonlyMap<string, OpenCodeAuthCredential | null>
   }): Promise<void> {
     if (input.canDeleteProviderAuth && input.client.deleteProviderAuth) {
       await input.client.deleteProviderAuth(input.providerId).catch(() => undefined)
@@ -2622,12 +2666,78 @@ export class OpenCodeProviderManagementAdapter
     await Promise.all(
       input.authPaths
         .filter((authPath): authPath is string => Boolean(authPath))
-        .map(authPath =>
-          authStore
-            .removeCredential({ authPath, providerId: input.providerId })
-            .catch(() => undefined),
-        ),
+        .map(authPath => {
+          const previousCredential = input.previousCredentials?.get(authPath) ?? null
+          return previousCredential
+            ? authStore
+                .upsertCredential({
+                  authPath,
+                  providerId: input.providerId,
+                  credential: previousCredential,
+                })
+                .catch(() => undefined)
+            : authStore
+                .removeCredential({ authPath, providerId: input.providerId })
+                .catch(() => undefined)
+        }),
     )
+  }
+
+  private async captureProviderAuthSnapshot(input: {
+    providerId: string
+    authPaths: readonly string[]
+  }): Promise<ReadonlyMap<string, OpenCodeAuthCredential | null>> {
+    const authStore = this.getAuthStore()
+    const uniquePaths = Array.from(new Set(input.authPaths))
+    const credentials = await Promise.all(
+      uniquePaths.map(authPath =>
+        authStore.readCredential({ authPath, providerId: input.providerId }),
+      ),
+    )
+    return new Map(uniquePaths.map((authPath, index) => [authPath, credentials[index] ?? null]))
+  }
+
+  private isNewOAuthCredential(
+    credential: OpenCodeAuthCredential | null,
+    previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>,
+  ): credential is OpenCodeAuthCredential {
+    if (credential?.type !== 'oauth') {
+      return false
+    }
+    return !Array.from(previousCredentials.values()).some(
+      previous => previous !== null && credentialsEqual(credential, previous),
+    )
+  }
+
+  private async waitForNewOAuthCredential(input: {
+    authPath: string
+    providerId: string
+    previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+    signal: AbortSignal
+  }): Promise<OpenCodeAuthCredential | null> {
+    const authStore = this.getAuthStore()
+    while (!input.signal.aborted) {
+      try {
+        const credential = await authStore.readCredential({
+          authPath: input.authPath,
+          providerId: input.providerId,
+        })
+        if (this.isNewOAuthCredential(credential, input.previousCredentials)) {
+          return credential
+        }
+      } catch {
+        // Atomic auth-store replacement can make one poll transiently unreadable.
+      }
+      if (
+        !(await waitForAbortableDelay(
+          COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS,
+          input.signal,
+        ))
+      ) {
+        return null
+      }
+    }
+    return null
   }
 
   private async verifyConnectedProviderExecution(input: {
@@ -3259,6 +3369,34 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
+        const authPaths = new Set<string>([managedAuthPath, globalAuthPath])
+        try {
+          for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
+            authPaths.add(authPath)
+          }
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to enumerate OpenCode auth stores: ${error.message}`
+              : 'Unable to enumerate OpenCode auth stores',
+          )
+        }
+        let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+        try {
+          previousCredentials = await this.captureProviderAuthSnapshot({
+            providerId,
+            authPaths: Array.from(authPaths),
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to preserve the existing ${providerId} credential: ${error.message}`
+              : `Unable to preserve the existing ${providerId} credential`,
+          )
+        }
+
         let authorization: OpenCodeProviderOAuthAuthorization
         try {
           authorization = await client.authorizeProviderOAuth(providerId, {
@@ -3307,19 +3445,68 @@ export class OpenCodeProviderManagementAdapter
           return providerManagementError('auth-required', 'OAuth authorization code is required')
         }
 
-        let completed: boolean
-        try {
-          completed = await client.completeProviderOAuth(providerId, {
-            method: methodIndex,
-            ...(authorizationCode ? { code: authorizationCode } : {}),
+        const callbackOutcomePromise = Promise.resolve()
+          .then(() =>
+            client.completeProviderOAuth!(providerId, {
+              method: methodIndex,
+              ...(authorizationCode ? { code: authorizationCode } : {}),
+            }),
+          )
+          .then(
+            completed => ({ kind: 'callback' as const, completed }),
+            error => ({ kind: 'callback-error' as const, error }),
+          )
+
+        let oauthCredential: OpenCodeAuthCredential | null = null
+        let callbackOutcome:
+          | Awaited<typeof callbackOutcomePromise>
+          | { kind: 'credential'; credential: OpenCodeAuthCredential }
+        if (providerId === 'github-copilot' && authorization.method === 'auto') {
+          const credentialWatcher = new AbortController()
+          callbackOutcome = await Promise.race([
+            callbackOutcomePromise,
+            this.waitForNewOAuthCredential({
+              authPath: managedAuthPath,
+              providerId,
+              previousCredentials,
+              signal: credentialWatcher.signal,
+            }).then(credential =>
+              credential
+                ? { kind: 'credential' as const, credential }
+                : { kind: 'callback-error' as const, error: new Error('OAuth recovery stopped') },
+            ),
+          ])
+          credentialWatcher.abort()
+          if (callbackOutcome.kind === 'credential') {
+            oauthCredential = callbackOutcome.credential
+          }
+        } else {
+          callbackOutcome = await callbackOutcomePromise
+        }
+
+        if (callbackOutcome.kind === 'callback-error') {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
           })
-        } catch (error) {
           return providerManagementError(
             'auth-failed',
-            error instanceof Error ? error.message : `OAuth callback failed for ${providerId}`,
+            callbackOutcome.error instanceof Error
+              ? callbackOutcome.error.message
+              : `OAuth callback failed for ${providerId}`,
           )
         }
-        if (completed !== true) {
+        if (callbackOutcome.kind === 'callback' && callbackOutcome.completed !== true) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
           return providerManagementError(
             'auth-failed',
             `OpenCode did not complete OAuth for ${providerId}`,
@@ -3327,27 +3514,42 @@ export class OpenCodeProviderManagementAdapter
         }
 
         const authStore = this.getAuthStore()
-        const oauthCredential = await authStore.readCredential({
-          authPath: managedAuthPath,
-          providerId,
-        })
-        if (oauthCredential?.type !== 'oauth') {
+        if (!oauthCredential) {
+          try {
+            oauthCredential = await authStore.readCredential({
+              authPath: managedAuthPath,
+              providerId,
+            })
+          } catch (error) {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: Array.from(authPaths),
+              canDeleteProviderAuth: capabilities.deleteAuth,
+              previousCredentials,
+            })
+            return providerManagementError(
+              'auth-failed',
+              error instanceof Error
+                ? `OpenCode OAuth credential could not be read: ${error.message}`
+                : 'OpenCode OAuth credential could not be read',
+            )
+          }
+        }
+        if (!this.isNewOAuthCredential(oauthCredential, previousCredentials)) {
           await this.rollbackProviderAuth({
             client,
             providerId,
-            authPaths: [managedAuthPath, globalAuthPath],
+            authPaths: Array.from(authPaths),
             canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
-            `OpenCode completed OAuth but did not persist an OAuth credential for ${providerId}`,
+            `OpenCode completed OAuth but did not persist a new OAuth credential for ${providerId}`,
           )
         }
 
-        const authPaths = new Set<string>([managedAuthPath, globalAuthPath])
-        for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
-          authPaths.add(authPath)
-        }
         try {
           for (const authPath of authPaths) {
             await authStore.upsertCredential({
@@ -3362,6 +3564,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: Array.from(authPaths),
             canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
@@ -3402,6 +3605,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: Array.from(authPaths),
             canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
@@ -3420,6 +3624,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: Array.from(authPaths),
             canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
           })
           return executionProof
         }
@@ -3560,10 +3765,45 @@ export class OpenCodeProviderManagementAdapter
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         }
 
-        const authApplied = await client.setProviderAuth(providerId, {
-          ...authBody,
-        })
+        let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+        try {
+          previousCredentials = await this.captureProviderAuthSnapshot({
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to preserve the existing ${providerId} credential: ${error.message}`
+              : `Unable to preserve the existing ${providerId} credential`,
+          )
+        }
+
+        let authApplied: boolean
+        try {
+          authApplied = await client.setProviderAuth(providerId, { ...authBody })
+        } catch (error) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
+          })
+          const message = error instanceof Error
+            ? redactSecret(error.message, apiKey)
+            : `OpenCode failed to apply API-key auth for provider ${providerId}`
+          return providerManagementError('auth-failed', message)
+        }
         if (authApplied !== true) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
+          })
           return providerManagementError(
             'auth-failed',
             `OpenCode did not apply API-key auth for provider ${providerId}`,
@@ -3590,6 +3830,7 @@ export class OpenCodeProviderManagementAdapter
               providerId,
               authPaths: [globalAuthPath, managedAuthPath],
               canDeleteProviderAuth,
+              previousCredentials,
             })
             return providerManagementError(
               'provider-missing',
@@ -3605,6 +3846,7 @@ export class OpenCodeProviderManagementAdapter
               providerId,
               authPaths: [globalAuthPath, managedAuthPath],
               canDeleteProviderAuth,
+              previousCredentials,
             })
             return providerManagementError(
               'auth-failed',
@@ -3631,6 +3873,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
@@ -3664,6 +3907,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'provider-missing',
@@ -3676,6 +3920,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
@@ -3695,6 +3940,7 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return executionProof
         }
