@@ -1188,6 +1188,97 @@ describe('OpenCodeSessionBridge', () => {
     }])
   })
 
+  test('refreshes expiring xAI OAuth before contacting the teammate host', async () => {
+    const order: string[] = []
+    let prepareProfileCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => {
+        prepareProfileCalls += 1
+        order.push(`prepare:${prepareProfileCalls}`)
+        return profile
+      },
+      oauthRefreshCoordinator: {
+        ensureFreshForPrompt: async input => {
+          order.push('refresh')
+          expect(input).toEqual({
+            selectedModel: 'xai/grok-4.3',
+            projectPath: '/tmp/project',
+            profile,
+          })
+          return { checked: true, refreshed: true }
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          order.push('host')
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'message-1' }, parts: [] }),
+          promptSessionAsync: async () => {
+            order.push('prompt')
+          },
+          abortSession: async () => true,
+        }),
+      },
+      fanOutOAuthCredential: async () => {
+        order.push('fanout')
+      },
+    })
+
+    await bridge.promptAsync(buildRecord({ selectedModel: 'xai/grok-4.3' }), {
+      text: 'Reply with exactly: pong',
+    })
+
+    expect(order).toEqual([
+      'prepare:1',
+      'refresh',
+      'prepare:2',
+      'host',
+      'prompt',
+      'fanout',
+    ])
+  })
+
+  test('does not contact the teammate host when proactive xAI refresh fails', async () => {
+    let ensureHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      oauthRefreshCoordinator: {
+        ensureFreshForPrompt: async () => {
+          throw new Error('SuperGrok OAuth refresh failed before prompt: invalid_grant')
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+    })
+
+    await expect(bridge.promptAsync(
+      buildRecord({ selectedModel: 'xai/grok-4.3' }),
+      { text: 'do not deliver' },
+    )).rejects.toThrow('invalid_grant')
+    expect(ensureHostCalls).toBe(0)
+  })
+
   test('posts prompt_async with app-owned message id and waits for OpenCode turn-settled observation', async () => {
     const promptBodies: unknown[] = []
     const observationMarks: string[] = []

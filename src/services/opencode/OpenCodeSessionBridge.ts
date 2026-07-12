@@ -8,6 +8,7 @@ import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { reserveOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
+import { openCodeOAuthRefreshCoordinator } from './OpenCodeOAuthRefreshCoordinator.js'
 import { openCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -44,6 +45,10 @@ type OpenCodeSessionBridgeDeps = {
   offlineReader?: Pick<typeof openCodeOfflineSessionReader, 'readSession'>
   previewObserver?: Pick<typeof openCodePreviewObserver, 'observeSession'>
   turnSettledObserver?: Pick<typeof openCodeTurnSettledObserver, 'observe'>
+  oauthRefreshCoordinator?: Pick<
+    typeof openCodeOAuthRefreshCoordinator,
+    'ensureFreshForPrompt'
+  >
   prepareProfile?: (
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
@@ -255,6 +260,10 @@ export class OpenCodeSessionBridge {
 
   private get offlineReader() {
     return this.deps.offlineReader ?? openCodeOfflineSessionReader
+  }
+
+  private get oauthRefreshCoordinator() {
+    return this.deps.oauthRefreshCoordinator ?? openCodeOAuthRefreshCoordinator
   }
 
   private async fanOutOAuthCredentialAfterPrompt(
@@ -580,6 +589,27 @@ export class OpenCodeSessionBridge {
     } finally {
       await this.hostManager.releaseHost(host.hostKey)
     }
+  }
+
+  private async withSessionPromptHost<T>(
+    record: OpenCodeSessionRecord,
+    callback: (context: {
+      baseUrl: string
+      profile: OpenCodePreparedProfile
+      resolvedConfigFingerprint: string | null
+      runtimePid: number | null
+    }) => Promise<T>,
+  ): Promise<T> {
+    let sessionProfile = await this.prepareProfileForSessionRecord(record)
+    const refreshResult = await this.oauthRefreshCoordinator.ensureFreshForPrompt({
+      selectedModel: record.selectedModel,
+      projectPath: record.projectPath,
+      profile: sessionProfile.profile,
+    })
+    if (refreshResult.refreshed) {
+      sessionProfile = await this.prepareProfileForSessionRecord(record)
+    }
+    return this.withSessionHost(record, callback, sessionProfile.profile)
   }
 
   private buildUpdatedRecord(
@@ -926,7 +956,7 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<OpenCodeMessage> {
-    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
         return await client.sendSessionMessage(record.opencodeSessionId, {
@@ -962,7 +992,7 @@ export class OpenCodeSessionBridge {
     injectionVerifiedAt: string
     alreadyPresent: boolean
   }> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
       const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
         if (!message) {
@@ -1064,7 +1094,7 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<void> {
-    await this.withSessionHost(record, async ({ baseUrl, profile }) => {
+    await this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
         await client.promptSessionAsync(record.opencodeSessionId, {
@@ -1102,7 +1132,7 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
-    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
@@ -1229,7 +1259,7 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
-    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
         const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
