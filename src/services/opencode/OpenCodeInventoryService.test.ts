@@ -7,6 +7,7 @@ import {
   collectOpenCodeInventoryCommandResults,
   createOpenCodeInventoryProbeProgressTracker,
   execOpenCodePortableCommand,
+  filterOpenCodeConnectedProvidersForRuntime,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
@@ -18,6 +19,7 @@ import {
   parseOpenCodeModelsOutput,
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
+  supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
 
@@ -58,6 +60,36 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('requires an OpenCode version with native SuperGrok OAuth support', () => {
+    expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
+    expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)
+    expect(supportsOpenCodeSuperGrokOAuth('opencode 1.17.18')).toBe(true)
+    expect(supportsOpenCodeSuperGrokOAuth(null)).toBe(false)
+  })
+
+  test('filters unsupported SuperGrok OAuth without hiding xAI API credentials', () => {
+    const providers = [
+      { id: 'xai', authHint: 'oauth', source: 'credentials' as const },
+      { id: 'xai', authHint: 'xai_api_key', source: 'environment' as const },
+      { id: 'openai', authHint: 'oauth', source: 'credentials' as const },
+    ]
+
+    expect(filterOpenCodeConnectedProvidersForRuntime({
+      providers,
+      version: '1.15.6',
+    })).toEqual({
+      connectedProviders: [providers[1], providers[2]],
+      unsupportedSuperGrokOAuth: true,
+    })
+    expect(filterOpenCodeConnectedProvidersForRuntime({
+      providers,
+      version: '1.15.7',
+    })).toEqual({
+      connectedProviders: providers,
+      unsupportedSuperGrokOAuth: false,
+    })
+  })
+
   test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
       OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,

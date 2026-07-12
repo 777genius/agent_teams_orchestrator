@@ -6,6 +6,7 @@ import { getCwd } from '../../utils/cwd.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
+import { gte } from '../../utils/semver.js'
 import {
   normalizeOpenCodeProviderId,
   parseFirstOpenCodeModelToken,
@@ -32,6 +33,43 @@ import type {
   OpenCodePreparedProfile,
   OpenCodeToolApprovalMode,
 } from './types.js'
+
+export const OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION = '1.15.7'
+
+export function supportsOpenCodeSuperGrokOAuth(version: string | null | undefined): boolean {
+  const normalizedVersion = version?.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0]
+  if (!normalizedVersion) {
+    return false
+  }
+  try {
+    return gte(normalizedVersion, OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION)
+  } catch {
+    return false
+  }
+}
+
+export function filterOpenCodeConnectedProvidersForRuntime(input: {
+  providers: readonly OpenCodeConnectedProvider[]
+  version: string | null
+}): {
+  connectedProviders: OpenCodeConnectedProvider[]
+  unsupportedSuperGrokOAuth: boolean
+} {
+  const unsupportedSuperGrokOAuth = input.providers.some(
+    provider =>
+      provider.id === 'xai'
+      && provider.authHint === 'oauth'
+      && !supportsOpenCodeSuperGrokOAuth(input.version),
+  )
+  return {
+    connectedProviders: unsupportedSuperGrokOAuth
+      ? input.providers.filter(
+          provider => !(provider.id === 'xai' && provider.authHint === 'oauth'),
+        )
+      : [...input.providers],
+    unsupportedSuperGrokOAuth,
+  }
+}
 
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
@@ -892,10 +930,17 @@ export class OpenCodeInventoryService {
         credentialScopes: credentialScopesForProvider(provider.id),
       }
     })
-    const connectedProviders = mergeConnectedProviders([
+    const discoveredConnectedProviders = mergeConnectedProviders([
       ...cliConnectedProviders,
       ...managedAuthProviders,
     ])
+    const {
+      connectedProviders,
+      unsupportedSuperGrokOAuth,
+    } = filterOpenCodeConnectedProvidersForRuntime({
+      providers: discoveredConnectedProviders,
+      version,
+    })
     const verboseModels =
       mode !== 'full'
         ? {
@@ -934,6 +979,11 @@ export class OpenCodeInventoryService {
     const diagnostics: string[] = []
     if (profile.authState === 'stale') {
       diagnostics.push('Managed OpenCode auth differs from the source auth store')
+    }
+    if (unsupportedSuperGrokOAuth) {
+      diagnostics.push(
+        `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${version ?? 'an unknown version'}`,
+      )
     }
     if (providersResult.code !== 0) {
       diagnostics.push(

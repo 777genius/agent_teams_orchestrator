@@ -9,6 +9,7 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
+import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
 import {
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
@@ -47,6 +48,7 @@ type OpenCodeExecutionProbeDeps = {
     providerId: string
     sourceAuthPath: string
   }) => Promise<void>
+  withOAuthRefreshLock?: typeof withOpenCodeOAuthRefreshLock
 }
 
 type ProbeCacheFile = {
@@ -632,6 +634,36 @@ export class OpenCodeExecutionProbe {
   }
 
   private async runProbeModelWithHost(input: {
+    params: {
+      selectedModel: string
+      projectPath?: string | null
+      prompt?: string
+      expectedOutput?: string
+    }
+    host: OpenCodeHostHandle
+    startedAtMs: number
+    prompt: string
+    expectedOutput: string
+    probeTimeoutMs: number
+    pollIntervalMs: number
+    diagnostics: Set<string>
+    cacheFilePath: string | null
+  }): Promise<OpenCodeExecutionProbeResult> {
+    const providerId = parseProviderScopedModel(input.params.selectedModel).providerID
+    if (providerId !== 'xai') {
+      return this.runProbeModelWithHostUnlocked(input)
+    }
+
+    const withOAuthRefreshLock = this.deps.withOAuthRefreshLock
+      ?? withOpenCodeOAuthRefreshLock
+    return withOAuthRefreshLock({
+      authPath: input.host.profile.managedAuthPath,
+      providerId,
+      operation: () => this.runProbeModelWithHostUnlocked(input),
+    })
+  }
+
+  private async runProbeModelWithHostUnlocked(input: {
     params: {
       selectedModel: string
       projectPath?: string | null

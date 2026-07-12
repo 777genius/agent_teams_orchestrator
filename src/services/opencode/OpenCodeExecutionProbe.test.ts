@@ -188,6 +188,7 @@ describe('OpenCodeExecutionProbe', () => {
 
   test('fans out a potentially rotated xAI OAuth credential after a real model probe', async () => {
     const fanOutInputs: Array<{ providerId: string; sourceAuthPath: string }> = []
+    const refreshLockInputs: Array<{ authPath: string; providerId: string }> = []
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -224,6 +225,13 @@ describe('OpenCodeExecutionProbe', () => {
       fanOutOAuthCredential: async input => {
         fanOutInputs.push(input)
       },
+      withOAuthRefreshLock: async input => {
+        refreshLockInputs.push({
+          authPath: input.authPath,
+          providerId: input.providerId,
+        })
+        return input.operation()
+      },
     })
 
     const result = await probe.probeModel({
@@ -236,6 +244,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(fanOutInputs).toEqual([{
       providerId: 'xai',
       sourceAuthPath: profile.managedAuthPath,
+    }])
+    expect(refreshLockInputs).toEqual([{
+      authPath: profile.managedAuthPath,
+      providerId: 'xai',
     }])
   })
 

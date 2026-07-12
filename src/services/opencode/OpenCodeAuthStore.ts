@@ -1,8 +1,7 @@
-import { randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises'
-import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
+import { withOpenCodeAuthCoordinationLock } from './OpenCodeAuthCoordinationLock.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
@@ -10,184 +9,15 @@ export type OpenCodeAuthCredential = Record<string, unknown>
 type OpenCodeAuthEntry = OpenCodeAuthCredential
 type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 
-const authStoreWriteQueues = new Map<string, Promise<void>>()
-const oauthRefreshQueues = new Map<string, Promise<void>>()
-const AUTH_STORE_LOCK_TIMEOUT_MS = 5_000
-const AUTH_STORE_LOCK_STALE_MS = 30_000
-const AUTH_STORE_LOCK_RETRY_MS = 25
-const OAUTH_REFRESH_LOCK_TIMEOUT_MS = 150_000
-const OAUTH_REFRESH_LOCK_STALE_MS = 180_000
-const OAUTH_REFRESH_LOCK_RETRY_MS = 50
-
-type AuthStoreLockOwner = {
-  id: string
-  createdAtMs: number
-  pid: number
-}
-
-function resolveAuthStoreCoordinationPath(filePath: string): string {
-  const resolved = path.resolve(filePath)
-  const profileMarker = `${path.sep}opencode${path.sep}profiles${path.sep}`
-  const profileMarkerIndex = resolved.indexOf(profileMarker)
-  if (profileMarkerIndex < 0) {
-    return resolved
-  }
-  return path.join(resolved.slice(0, profileMarkerIndex), 'opencode', 'auth.json')
-}
-
-function isNodeErrorWithCode(error: unknown, code: string): boolean {
-  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === code)
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false
-  }
-  if (pid === process.pid) {
-    return true
-  }
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return !isNodeErrorWithCode(error, 'ESRCH')
-  }
-}
-
-async function readAuthStoreLockOwner(lockPath: string): Promise<AuthStoreLockOwner | null> {
-  try {
-    const parsed = JSON.parse(await readFile(lockPath, 'utf8')) as Partial<AuthStoreLockOwner>
-    return typeof parsed.id === 'string'
-      && typeof parsed.createdAtMs === 'number'
-      && Number.isFinite(parsed.createdAtMs)
-      && typeof parsed.pid === 'number'
-      ? {
-          id: parsed.id,
-          createdAtMs: parsed.createdAtMs,
-          pid: parsed.pid,
-        }
-      : null
-  } catch {
-    return null
-  }
-}
-
-async function removeStaleAuthStoreLock(
-  lockPath: string,
-  nowMs: number,
-  staleMs: number,
-): Promise<boolean> {
-  try {
-    const [owner, lockStat] = await Promise.all([
-      readAuthStoreLockOwner(lockPath),
-      stat(lockPath),
-    ])
-    if (owner && !isProcessAlive(owner.pid)) {
-      await unlink(lockPath)
-      return true
-    }
-    const createdAtMs = owner?.createdAtMs ?? lockStat.mtimeMs
-    if (nowMs - createdAtMs <= staleMs) {
-      return false
-    }
-    await unlink(lockPath)
-    return true
-  } catch {
-    return false
-  }
-}
-
-async function acquireExclusiveFileLock(input: {
-  lockPath: string
-  timeoutMs: number
-  staleMs: number
-  retryMs: number
-  description: string
-}): Promise<() => Promise<void>> {
-  const { lockPath } = input
-  await mkdir(path.dirname(lockPath), { recursive: true })
-  const deadlineMs = Date.now() + input.timeoutMs
-
-  for (;;) {
-    const owner: AuthStoreLockOwner = {
-      id: randomUUID(),
-      createdAtMs: Date.now(),
-      pid: process.pid,
-    }
-    try {
-      const handle = await open(lockPath, 'wx', 0o600)
-      try {
-        await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8')
-      } catch (error) {
-        await handle.close().catch(() => undefined)
-        await unlink(lockPath).catch(() => undefined)
-        throw error
-      }
-      return async () => {
-        await handle.close().catch(() => undefined)
-        const currentOwner = await readAuthStoreLockOwner(lockPath)
-        if (currentOwner?.id === owner.id) {
-          await unlink(lockPath).catch(() => undefined)
-        }
-      }
-    } catch (error) {
-      if (!isNodeErrorWithCode(error, 'EEXIST')) {
-        throw error
-      }
-      if (await removeStaleAuthStoreLock(lockPath, Date.now(), input.staleMs)) {
-        continue
-      }
-      if (Date.now() >= deadlineMs) {
-        throw new Error(`Timed out waiting for ${input.description}`)
-      }
-      await delay(input.retryMs)
-    }
-  }
-}
-
-async function acquireAuthStoreFileLock(filePath: string): Promise<() => Promise<void>> {
-  const coordinationPath = resolveAuthStoreCoordinationPath(filePath)
-  return acquireExclusiveFileLock({
-    lockPath: `${coordinationPath}.agent-teams.lock`,
-    timeoutMs: AUTH_STORE_LOCK_TIMEOUT_MS,
-    staleMs: AUTH_STORE_LOCK_STALE_MS,
-    retryMs: AUTH_STORE_LOCK_RETRY_MS,
-    description: `OpenCode auth store lock: ${coordinationPath}`,
-  })
-}
-
 async function withAuthStoreWriteLock<T>(
   filePath: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const lockKey = path.resolve(filePath)
-  const previous = authStoreWriteQueues.get(lockKey) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>(resolve => {
-    release = resolve
+  return withOpenCodeAuthCoordinationLock({
+    authPath: filePath,
+    operation,
+    description: 'OpenCode auth store coordination lock',
   })
-  const queued = previous.then(
-    () => current,
-    () => current,
-  )
-  authStoreWriteQueues.set(lockKey, queued)
-
-  await previous.catch(() => undefined)
-  let releaseFileLock: (() => Promise<void>) | null = null
-  try {
-    releaseFileLock = await acquireAuthStoreFileLock(filePath)
-    return await operation()
-  } finally {
-    await releaseFileLock?.()
-    release()
-    if (authStoreWriteQueues.get(lockKey) === queued) {
-      authStoreWriteQueues.delete(lockKey)
-    }
-  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -211,37 +41,11 @@ export async function withOpenCodeOAuthRefreshLock<T>(input: {
     throw new Error('OpenCode OAuth refresh provider id is invalid')
   }
 
-  const coordinationPath = resolveAuthStoreCoordinationPath(input.authPath)
-  const lockPath = `${coordinationPath}.${providerId}.oauth-refresh.agent-teams.lock`
-  const previous = oauthRefreshQueues.get(lockPath) ?? Promise.resolve()
-  let release!: () => void
-  const current = new Promise<void>(resolve => {
-    release = resolve
+  return withOpenCodeAuthCoordinationLock({
+    authPath: input.authPath,
+    operation: input.operation,
+    description: `OpenCode ${providerId} OAuth refresh coordination lock`,
   })
-  const queued = previous.then(
-    () => current,
-    () => current,
-  )
-  oauthRefreshQueues.set(lockPath, queued)
-
-  await previous.catch(() => undefined)
-  let releaseFileLock: (() => Promise<void>) | null = null
-  try {
-    releaseFileLock = await acquireExclusiveFileLock({
-      lockPath,
-      timeoutMs: OAUTH_REFRESH_LOCK_TIMEOUT_MS,
-      staleMs: OAUTH_REFRESH_LOCK_STALE_MS,
-      retryMs: OAUTH_REFRESH_LOCK_RETRY_MS,
-      description: `OpenCode ${providerId} OAuth refresh lock`,
-    })
-    return await input.operation()
-  } finally {
-    await releaseFileLock?.()
-    release()
-    if (oauthRefreshQueues.get(lockPath) === queued) {
-      oauthRefreshQueues.delete(lockPath)
-    }
-  }
 }
 
 async function readOptionalJson(filePath: string): Promise<unknown | null> {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -170,7 +170,7 @@ await withOpenCodeOAuthRefreshLock({
 `,
       'utf8',
     )
-    const children = Array.from({ length: 4 }, () => Bun.spawn({
+    const children = Array.from({ length: 12 }, () => Bun.spawn({
       cmd: [process.execPath, scriptPath, authPath, counterPath, startPath],
       cwd: process.cwd(),
       stdout: 'ignore',
@@ -178,25 +178,129 @@ await withOpenCodeOAuthRefreshLock({
     }))
     await writeFile(startPath, 'go\n', 'utf8')
 
-    expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0, 0])
-    expect(await readFile(counterPath, 'utf8')).toBe('4')
+    expect(await Promise.all(children.map(child => child.exited))).toEqual(
+      Array.from({ length: children.length }, () => 0),
+    )
+    expect(await readFile(counterPath, 'utf8')).toBe(String(children.length))
   }, 15_000)
 
   test('recovers an OAuth refresh lock left by a dead process', async () => {
     const authPath = path.join(tempDir, 'opencode', 'profiles', 'project', 'data', 'opencode', 'auth.json')
-    const lockPath = path.join(tempDir, 'opencode', 'auth.json.xai.oauth-refresh.agent-teams.lock')
-    await mkdir(path.dirname(lockPath), { recursive: true })
-    await writeFile(lockPath, JSON.stringify({
-      id: 'dead-owner',
-      createdAtMs: Date.now(),
-      pid: 2_147_483_647,
-    }), 'utf8')
+    const readyPath = path.join(tempDir, 'dead-owner-ready')
+    const scriptPath = path.join(tempDir, 'hold-refresh-auth.ts')
+    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
+    await writeFile(
+      scriptPath,
+      `import { writeFile } from 'node:fs/promises'
+import { withOpenCodeOAuthRefreshLock } from ${JSON.stringify(authStoreUrl)}
+await withOpenCodeOAuthRefreshLock({
+  authPath: process.argv[2],
+  providerId: 'xai',
+  operation: async () => {
+    await writeFile(process.argv[3], 'ready', 'utf8')
+    await new Promise(() => {})
+  },
+})
+`,
+      'utf8',
+    )
+    const child = Bun.spawn({
+      cmd: [process.execPath, scriptPath, authPath, readyPath],
+      cwd: process.cwd(),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    })
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (await access(readyPath).then(() => true).catch(() => false)) {
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(await access(readyPath).then(() => true).catch(() => false)).toBe(true)
+    child.kill()
+    await child.exited
+
     await expect(withOpenCodeOAuthRefreshLock({
       authPath,
       providerId: 'xai',
       operation: async () => 'recovered',
     })).resolves.toBe('recovered')
+  }, 15_000)
+
+  test('keeps nested auth writes reentrant while an OAuth refresh owns coordination', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'profiles', 'project', 'data', 'opencode', 'auth.json')
+    await withOpenCodeOAuthRefreshLock({
+      authPath,
+      providerId: 'xai',
+      operation: async () => {
+        await upsertOpenCodeAuthCredential({
+          authPath,
+          providerId: 'xai',
+          credential: {
+            type: 'oauth',
+            access: 'rotated-access',
+            refresh: 'rotated-refresh',
+            expires: Date.now() + 3_600_000,
+          },
+        })
+      },
+    })
+
+    await expect(readOpenCodeAuthCredential({ authPath, providerId: 'xai' }))
+      .resolves.toMatchObject({ access: 'rotated-access' })
   })
+
+  test('blocks cross-process profile auth writes until OAuth refresh coordination releases', async () => {
+    const managedAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'project',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    const startPath = path.join(tempDir, 'profile-write-start')
+    const finishedPath = path.join(tempDir, 'profile-write-finished')
+    const scriptPath = path.join(tempDir, 'write-during-refresh.ts')
+    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
+    await writeFile(
+      scriptPath,
+      `import { access, writeFile } from 'node:fs/promises'
+import { upsertOpenCodeApiAuthCredential } from ${JSON.stringify(authStoreUrl)}
+while (await access(process.argv[3]).then(() => false).catch(() => true)) {
+  await new Promise(resolve => setTimeout(resolve, 5))
+}
+await upsertOpenCodeApiAuthCredential({
+  authPath: process.argv[2],
+  providerId: 'openrouter',
+  apiKey: 'test-key',
+})
+await writeFile(process.argv[4], 'finished', 'utf8')
+`,
+      'utf8',
+    )
+    const child = Bun.spawn({
+      cmd: [process.execPath, scriptPath, globalAuthPath, startPath, finishedPath],
+      cwd: process.cwd(),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    })
+
+    await withOpenCodeOAuthRefreshLock({
+      authPath: managedAuthPath,
+      providerId: 'xai',
+      operation: async () => {
+        await writeFile(startPath, 'go', 'utf8')
+        await new Promise(resolve => setTimeout(resolve, 100))
+        expect(await access(finishedPath).then(() => true).catch(() => false)).toBe(false)
+      },
+    })
+
+    expect(await child.exited).toBe(0)
+    expect(await access(finishedPath).then(() => true).catch(() => false)).toBe(true)
+  }, 15_000)
 
   test('reconciles managed auth to current sources and drops stale providers', async () => {
     const globalAuthPath = path.join(tempDir, 'global-auth.json')

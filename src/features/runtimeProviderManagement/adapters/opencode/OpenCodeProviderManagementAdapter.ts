@@ -13,15 +13,18 @@ import {
   upsertOpenCodeAuthCredential,
   upsertOpenCodeApiAuth,
   upsertOpenCodeApiAuthCredential,
+  withOpenCodeOAuthRefreshLock,
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+  OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION,
   createOpenCodeInventoryProbeProgressTracker,
   isOpenCodeInventoryTimeoutSnapshot,
   isOpenCodeModelFree,
   openCodeInventoryService,
+  supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
 } from '../../../../services/opencode/OpenCodeInventoryService.js'
 import { openCodeExecutionProbe } from '../../../../services/opencode/OpenCodeExecutionProbe.js'
@@ -233,6 +236,12 @@ const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
     .map(definition => definition.id),
 ])
 const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
+  xai: [
+    'xai/grok-4.3',
+    'xai/grok-4.5',
+    'xai/grok-4.20-0309-reasoning',
+    'xai/grok-4.20-0309-non-reasoning',
+  ],
   atlascloud: [
     'atlascloud/deepseek-ai/deepseek-v3.2',
     'atlascloud/deepseek-ai/deepseek-v4-flash',
@@ -1292,7 +1301,22 @@ function getDefaultModelForProvider(
   if (!modelId) {
     return null
   }
-  return modelId.startsWith(`${providerId}/`) ? modelId : `${providerId}/${modelId}`
+  const scopedModelId = modelId.startsWith(`${providerId}/`)
+    ? modelId
+    : `${providerId}/${modelId}`
+  if (providerId !== 'xai' || !/\b(?:image|video)\b/i.test(scopedModelId)) {
+    return scopedModelId
+  }
+
+  const availableModelIds = collectProviderModelIds({
+    providerId,
+    inventory,
+    configProviders,
+    providers,
+  })
+  return CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES.xai?.find(modelId =>
+    availableModelIds.includes(modelId)
+  ) ?? availableModelIds.find(modelId => !/\b(?:image|video)\b/i.test(modelId)) ?? scopedModelId
 }
 
 function getDefaultModel(
@@ -1313,9 +1337,12 @@ function getDefaultModel(
     const normalizedProviderId = normalizeProviderId(providerId)
     const normalizedModelId = asString(modelId)
     if (normalizedProviderId && normalizedModelId) {
-      return normalizedModelId.startsWith(`${normalizedProviderId}/`)
-        ? normalizedModelId
-        : `${normalizedProviderId}/${normalizedModelId}`
+      return getDefaultModelForProvider(
+        normalizedProviderId,
+        inventory,
+        configProviders,
+        providers,
+      )
     }
   }
   return null
@@ -1572,6 +1599,13 @@ function buildProviderConnections(input: {
     const modelCount = modelCounts.get(providerId) ?? 0
     const authMethods = normalizeAuthMethods(input.providerAuth?.[providerId])
     const connected = connectedProviders.has(providerId)
+    const superGrokRuntimeUpdateRequired =
+      providerId === 'xai'
+      && !connected
+      && !supportsOpenCodeSuperGrokOAuth(input.inventory.version)
+      && input.inventory.diagnostics.some(diagnostic =>
+        diagnostic.startsWith('SuperGrok OAuth requires OpenCode ')
+      )
     const configuredAuthless = providerHasConfiguredAuthlessModels({
       providerId,
       inventory: input.inventory,
@@ -1588,7 +1622,9 @@ function buildProviderConnections(input: {
       connectedProvider,
       inventory: input.inventory,
     })
-    const state: ProviderConnection['state'] = displayConnected
+    const state: ProviderConnection['state'] = superGrokRuntimeUpdateRequired
+      ? 'error'
+      : displayConnected
       ? 'connected'
       : modelCount > 0
         ? 'available'
@@ -1608,16 +1644,28 @@ function buildProviderConnections(input: {
         input.providers,
       ),
       authMethods,
-      actions: buildProviderActions({
-        providerId,
-        connected: displayConnected,
-        modelCount,
-        authMethods,
-        ownership,
-        capabilities: input.capabilities,
-        configuredAuthless,
-      }),
-      detail: displayConnected
+      actions: superGrokRuntimeUpdateRequired
+        ? [providerAction({
+            id: 'configure',
+            label: 'OpenCode update required',
+            enabled: false,
+            disabledReason:
+              `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer. Update OpenCode, then refresh providers.`,
+            requiresSecret: false,
+            ownershipScope: 'runtime',
+          })]
+        : buildProviderActions({
+            providerId,
+            connected: displayConnected,
+            modelCount,
+            authMethods,
+            ownership,
+            capabilities: input.capabilities,
+            configuredAuthless,
+          }),
+      detail: superGrokRuntimeUpdateRequired
+        ? `Saved SuperGrok OAuth needs OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer before it can be used.`
+        : displayConnected
         ? getConnectedProviderDetail(ownership)
         : configuredAuthless && modelCount > 0
           ? 'Configured local OpenCode model route is available'
@@ -3252,6 +3300,33 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private async connectProviderWithOAuth(
+    input: ConnectProviderInput,
+    observer: ProviderOAuthFlowObserver | undefined,
+  ): Promise<ProviderManagementResult<ProviderConnection>> {
+    if (normalizeProviderId(input.providerId) !== 'xai') {
+      return this.connectProviderWithOAuthUnlocked(input, observer)
+    }
+
+    const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+    const inventory = await this.probeInventory(inventoryService, input.projectPath, {
+      mode: 'profile',
+    })
+    const managedAuthPath = inventory.profile?.managedAuthPath
+    if (!managedAuthPath) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        'OpenCode managed auth store is required for SuperGrok OAuth setup',
+      )
+    }
+
+    return withOpenCodeOAuthRefreshLock({
+      authPath: managedAuthPath,
+      providerId: 'xai',
+      operation: () => this.connectProviderWithOAuthUnlocked(input, observer),
+    })
+  }
+
+  private async connectProviderWithOAuthUnlocked(
     input: ConnectProviderInput,
     observer: ProviderOAuthFlowObserver | undefined,
   ): Promise<ProviderManagementResult<ProviderConnection>> {

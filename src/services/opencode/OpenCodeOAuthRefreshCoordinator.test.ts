@@ -178,6 +178,58 @@ describe('OpenCodeOAuthRefreshCoordinator', () => {
       .resolves.toEqual(refreshedCredential)
   })
 
+  test('keeps rotating persisted OAuth credentials across expiry cycles and coordinator restarts', async () => {
+    let now = Date.now()
+    let probeCalls = 0
+    await upsertOpenCodeAuthCredential({
+      authPath,
+      providerId: 'xai',
+      credential: {
+        type: 'oauth',
+        access: 'access-0',
+        refresh: 'refresh-0',
+        expires: now - 1,
+      },
+    })
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      const expires = now + 600_000
+      const coordinatorAfterRestart = new OpenCodeOAuthRefreshCoordinator({
+        nowMs: () => now,
+        probeModel: async () => {
+          probeCalls += 1
+          await upsertOpenCodeAuthCredential({
+            authPath,
+            providerId: 'xai',
+            credential: {
+              type: 'oauth',
+              access: `access-${cycle}`,
+              refresh: `refresh-${cycle}`,
+              expires,
+            },
+          })
+          return probeResult('available')
+        },
+      })
+
+      await Promise.all(Array.from({ length: 3 }, () =>
+        coordinatorAfterRestart.ensureFreshForPrompt({
+          selectedModel: 'xai/grok-4.3',
+          projectPath: '/tmp/project',
+          profile: profile(authPath),
+        })))
+      await expect(readOpenCodeAuthCredential({ authPath, providerId: 'xai' }))
+        .resolves.toMatchObject({
+          access: `access-${cycle}`,
+          refresh: `refresh-${cycle}`,
+          expires,
+        })
+      now = expires + 1
+    }
+
+    expect(probeCalls).toBe(3)
+  })
+
   test('blocks the real prompt when refresh is rejected', async () => {
     const now = Date.now()
     const coordinator = new OpenCodeOAuthRefreshCoordinator({

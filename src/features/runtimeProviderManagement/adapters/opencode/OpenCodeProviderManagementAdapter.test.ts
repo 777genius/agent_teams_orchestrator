@@ -584,6 +584,124 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
+  test('reports saved SuperGrok OAuth as unusable when OpenCode is too old', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            version: '1.15.6',
+            connectedProviders: [],
+            availableProviders: ['xai'],
+            models: ['xai/grok-4.3', 'xai/grok-imagine-video'],
+            diagnostics: [
+              'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{
+              id: 'xai',
+              name: 'xAI',
+              models: { 'grok-4.3': {}, 'grok-imagine-video': {} },
+            }],
+            default: { xai: 'grok-imagine-video' },
+          }),
+          getProviders: async () => ({
+            all: [{
+              id: 'xai',
+              name: 'xAI',
+              models: { 'grok-4.3': {}, 'grok-imagine-video': {} },
+            }],
+            connected: ['xai'],
+            default: { xai: 'grok-imagine-video' },
+          }),
+          getProviderAuth: async () => ({
+            xai: [{ type: 'api', label: 'xAI API key' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const xai = result.value.providers.find(provider => provider.providerId === 'xai')
+    expect(result.value.defaultModel).toBe('xai/grok-4.3')
+    expect(xai).toMatchObject({
+      state: 'error',
+      ownership: [],
+      defaultModelId: 'xai/grok-4.3',
+      detail: expect.stringContaining('1.15.7'),
+      actions: [
+        expect.objectContaining({
+          id: 'configure',
+          enabled: false,
+          label: 'OpenCode update required',
+        }),
+      ],
+    })
+  })
+
+  test('keeps xAI connected through an environment API key when old SuperGrok OAuth is unusable', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            version: '1.15.6',
+            connectedProviders: [
+              {
+                id: 'xai',
+                authHint: 'xai_api_key',
+                source: 'environment',
+              },
+            ],
+            availableProviders: ['xai'],
+            models: ['xai/grok-4.3'],
+            diagnostics: [
+              'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            connected: ['xai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            xai: [{ type: 'api', label: 'xAI API key' }],
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.providers.find(provider => provider.providerId === 'xai')).toMatchObject({
+      state: 'connected',
+      ownership: ['env'],
+      detail: 'Connected via OpenCode environment credential',
+    })
+  })
+
   test('does not report curated subscription plans connected from config-only provider rows', async () => {
     const providerIds = [
       'zai-coding-plan',
