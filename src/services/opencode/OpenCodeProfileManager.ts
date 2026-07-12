@@ -21,8 +21,9 @@ import {
 } from './OpenCodeCuratedSubscriptionCatalog.js'
 import {
   doesOpenCodeAuthStoreIncludeSource,
-  mergeOpenCodeAuthStores,
-  reconcileOpenCodeManagedAuthStore,
+  fanOutOpenCodeOAuthCredential,
+  mergeOpenCodeAuthStoresWithFreshestOAuth,
+  reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
   removeOpenCodeAuthCredential,
@@ -588,6 +589,29 @@ type KiroCliAuthProbe = (
   platform: NodeJS.Platform,
 ) => Promise<boolean>
 
+type CursorAgentAuthProbe = (
+  executablePath: string,
+  platform: NodeJS.Platform,
+) => Promise<boolean>
+
+const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
+
+const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
+  await new Promise<boolean>(resolve => {
+    execFile(
+      executablePath,
+      ['status'],
+      {
+        timeout: 15_000,
+        windowsHide: true,
+        shell: platform === 'win32',
+      },
+      (error, stdout, stderr) => {
+        resolve(!error && /\blogged in\b/i.test(`${stdout}\n${stderr}`))
+      },
+    )
+  })
+
 const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
   await new Promise<boolean>(resolve => {
     execFile(
@@ -603,6 +627,86 @@ const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
       },
     )
   })
+
+function isCursorAgentAuthMarker(credential: Record<string, unknown> | null): boolean {
+  return credential?.type === 'api' && credential.key === CURSOR_AGENT_AUTH_MARKER
+}
+
+export async function ensureOpenCodeCursorPluginAuthCredential(input: {
+  globalAuthPath: string
+  managedAuthPath: string
+  cursorAgentExecutablePath: string
+  platform?: NodeJS.Platform
+  probe?: CursorAgentAuthProbe
+}): Promise<boolean> {
+  const [globalCredential, managedCredential] = await Promise.all([
+    readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
+    readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'cursor-acp' }),
+  ])
+  const explicitCredential = [globalCredential, managedCredential].find(
+    credential => credential && !isCursorAgentAuthMarker(credential),
+  )
+  if (explicitCredential) {
+    await Promise.all([
+      globalCredential === explicitCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'cursor-acp',
+            credential: explicitCredential,
+          }),
+      managedCredential === explicitCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'cursor-acp',
+            credential: explicitCredential,
+          }),
+    ])
+    return false
+  }
+
+  const authenticated = await (input.probe ?? probeCursorAgentAuth)(
+    input.cursorAgentExecutablePath,
+    input.platform ?? process.platform,
+  ).catch(() => false)
+  if (!authenticated) {
+    await Promise.all([
+      isCursorAgentAuthMarker(globalCredential)
+        ? removeOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'cursor-acp',
+          })
+        : Promise.resolve(),
+      isCursorAgentAuthMarker(managedCredential)
+        ? removeOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'cursor-acp',
+          })
+        : Promise.resolve(),
+    ])
+    return false
+  }
+
+  const credential = { type: 'api', key: CURSOR_AGENT_AUTH_MARKER }
+  await Promise.all([
+    isCursorAgentAuthMarker(globalCredential)
+      ? Promise.resolve()
+      : upsertOpenCodeAuthCredential({
+          authPath: input.globalAuthPath,
+          providerId: 'cursor-acp',
+          credential,
+        }),
+    isCursorAgentAuthMarker(managedCredential)
+      ? Promise.resolve()
+      : upsertOpenCodeAuthCredential({
+          authPath: input.managedAuthPath,
+          providerId: 'cursor-acp',
+          credential,
+        }),
+  ])
+  return !isCursorAgentAuthMarker(globalCredential) || !isCursorAgentAuthMarker(managedCredential)
+}
 
 export async function ensureOpenCodeKiroPluginAuthCredential(input: {
   globalAuthPath: string
@@ -925,6 +1029,14 @@ export class OpenCodeProfileManager {
       .sort((left, right) => left.localeCompare(right))
   }
 
+  async fanOutOAuthCredential(providerId: string, sourceAuthPath: string): Promise<void> {
+    await fanOutOpenCodeOAuthCredential({
+      providerId,
+      sourceAuthPath,
+      targetAuthPaths: [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
+    })
+  }
+
   private getProjectPath(projectPath?: string | null): string {
     return path.resolve(projectPath?.trim() || getCwd())
   }
@@ -1061,16 +1173,25 @@ export class OpenCodeProfileManager {
       globalAuthFingerprint,
       sourceAuthSources,
     })
-    await reconcileOpenCodeManagedAuthStore({
+    await reconcileOpenCodeManagedAuthStores({
       sourceAuthPaths: authSourcePaths,
+      globalAuthPath,
       managedAuthPath,
+      peerManagedAuthPaths: await this.listManagedAuthPaths(),
     })
     if (nativeCliCredentialBridge) {
-      await ensureOpenCodeKiroPluginAuthCredential({
-        globalAuthPath,
-        managedAuthPath,
-        kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
-      })
+      await Promise.all([
+        ensureOpenCodeCursorPluginAuthCredential({
+          globalAuthPath,
+          managedAuthPath,
+          cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
+        }),
+        ensureOpenCodeKiroPluginAuthCredential({
+          globalAuthPath,
+          managedAuthPath,
+          kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
+        }),
+      ])
     }
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
@@ -1085,7 +1206,7 @@ export class OpenCodeProfileManager {
         const managed = await readOpenCodeAuthStore(managedAuthPath)
         let expectedAuth: Awaited<ReturnType<typeof readOpenCodeAuthStore>> = {}
         for (const authSourcePath of authSourcePaths) {
-          expectedAuth = mergeOpenCodeAuthStores({
+          expectedAuth = mergeOpenCodeAuthStoresWithFreshestOAuth({
             source: await readOpenCodeAuthStore(authSourcePath),
             managed: expectedAuth,
           })

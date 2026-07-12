@@ -10,6 +10,7 @@ import {
   buildManagedConfig,
   buildManagedConfigFingerprint,
   collectProjectBehaviorMetadata,
+  ensureOpenCodeCursorPluginAuthCredential,
   ensureOpenCodeKiroPluginAuthCredential,
   ensureOpenCodeNativeCliCredentialBridge,
   OpenCodeProfileManager,
@@ -17,6 +18,10 @@ import {
 } from './OpenCodeProfileManager.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import { applyOpenCodeAutoUpdatePolicy } from './OpenCodeAutoUpdatePolicy.js'
+import {
+  readOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
+} from './OpenCodeAuthStore.js'
 import {
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
@@ -248,6 +253,15 @@ describe('OpenCodeProfileManager project behavior contract', () => {
             tool_call: true,
             interleaved: { field: 'reasoning_content' },
           },
+          'glm-5.1': {
+            reasoning: true,
+            tool_call: true,
+            interleaved: { field: 'reasoning_content' },
+          },
+          'glm-5': {
+            reasoning: true,
+            tool_call: true,
+          },
           'glm-5-turbo': {
             reasoning: true,
             tool_call: true,
@@ -403,6 +417,74 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       .toBe(`kiro:${hostHomePath}`)
   })
 
+  test('seeds the Cursor plugin marker after the official CLI reports authenticated', async () => {
+    const globalAuthPath = path.join(tempDir, 'cursor-global-auth.json')
+    const managedAuthPath = path.join(tempDir, 'cursor-managed-auth.json')
+    const probe = mock(async () => true)
+
+    expect(await ensureOpenCodeCursorPluginAuthCredential({
+      globalAuthPath,
+      managedAuthPath,
+      cursorAgentExecutablePath: '/test/cursor-agent',
+      platform: 'linux',
+      probe,
+    })).toBe(true)
+
+    for (const authPath of [globalAuthPath, managedAuthPath]) {
+      expect(JSON.parse(await readFile(authPath, 'utf8'))).toMatchObject({
+        'cursor-acp': { type: 'api', key: 'cursor-agent' },
+      })
+    }
+    expect(probe).toHaveBeenCalledTimes(1)
+  })
+
+  test('removes only the managed Cursor marker after the official CLI logs out', async () => {
+    const globalAuthPath = path.join(tempDir, 'cursor-logged-out-global.json')
+    const managedAuthPath = path.join(tempDir, 'cursor-logged-out-managed.json')
+    const store = JSON.stringify({
+      'cursor-acp': { type: 'api', key: 'cursor-agent' },
+      openai: { type: 'oauth', access: 'keep-me' },
+    })
+    await Promise.all([
+      writeFile(globalAuthPath, store),
+      writeFile(managedAuthPath, store),
+    ])
+
+    expect(await ensureOpenCodeCursorPluginAuthCredential({
+      globalAuthPath,
+      managedAuthPath,
+      cursorAgentExecutablePath: '/test/cursor-agent',
+      probe: async () => false,
+    })).toBe(false)
+
+    for (const authPath of [globalAuthPath, managedAuthPath]) {
+      expect(JSON.parse(await readFile(authPath, 'utf8'))).toEqual({
+        openai: { type: 'oauth', access: 'keep-me' },
+      })
+    }
+  })
+
+  test('preserves an explicit Cursor API credential without probing the CLI marker', async () => {
+    const globalAuthPath = path.join(tempDir, 'cursor-explicit-global.json')
+    const managedAuthPath = path.join(tempDir, 'cursor-explicit-managed.json')
+    await writeFile(globalAuthPath, JSON.stringify({
+      'cursor-acp': { type: 'api', key: 'real-user-key' },
+    }))
+    const probe = mock(async () => false)
+
+    expect(await ensureOpenCodeCursorPluginAuthCredential({
+      globalAuthPath,
+      managedAuthPath,
+      cursorAgentExecutablePath: '/test/cursor-agent',
+      probe,
+    })).toBe(false)
+
+    expect(JSON.parse(await readFile(managedAuthPath, 'utf8'))).toMatchObject({
+      'cursor-acp': { type: 'api', key: 'real-user-key' },
+    })
+    expect(probe).not.toHaveBeenCalled()
+  })
+
   test('seeds the Kiro plugin OAuth marker after the official CLI reports authenticated', async () => {
     const globalAuthPath = path.join(tempDir, 'kiro-global-auth.json')
     const managedAuthPath = path.join(tempDir, 'kiro-managed-auth.json')
@@ -536,7 +618,79 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
       }
     }
-  })
+  }, 15_000)
+
+  test('recovers a refreshed xAI OAuth credential from a peer during restart preparation', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousHome = process.env.HOME
+    const previousXdgDataHome = process.env.XDG_DATA_HOME
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    const appDataHome = path.join(tempDir, 'app-data-oauth-restart')
+    const appCacheHome = path.join(tempDir, 'app-cache-oauth-restart')
+    const homePath = path.join(tempDir, 'home-oauth-restart')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    process.env.HOME = homePath
+    process.env.XDG_DATA_HOME = path.join(homePath, '.local', 'share')
+    process.env.XDG_CONFIG_HOME = path.join(homePath, '.config')
+
+    const now = Date.now()
+    const stale = {
+      type: 'oauth',
+      access: 'expired-access',
+      refresh: 'refresh-before-rotation',
+      expires: now - 60_000,
+      accountId: 'supergrok-account',
+    }
+    const rotated = {
+      type: 'oauth',
+      access: 'refreshed-access',
+      refresh: 'refresh-after-rotation',
+      expires: now + 3_600_000,
+      accountId: 'supergrok-account',
+    }
+
+    try {
+      const manager = new OpenCodeProfileManager()
+      await upsertOpenCodeAuthCredential({
+        authPath: manager.getGlobalAuthPath(),
+        providerId: 'xai',
+        credential: stale,
+      })
+      const activeProfile = await manager.prepareProfile(path.join(tempDir, 'active-project'), {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      })
+      await upsertOpenCodeAuthCredential({
+        authPath: activeProfile.managedAuthPath,
+        providerId: 'xai',
+        credential: rotated,
+      })
+
+      const restartedProfile = await manager.prepareProfile(path.join(tempDir, 'restarted-project'), {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      })
+
+      await expect(Promise.all([
+        readOpenCodeAuthCredential({ authPath: manager.getGlobalAuthPath(), providerId: 'xai' }),
+        readOpenCodeAuthCredential({ authPath: activeProfile.managedAuthPath, providerId: 'xai' }),
+        readOpenCodeAuthCredential({ authPath: restartedProfile.managedAuthPath, providerId: 'xai' }),
+      ])).resolves.toEqual([rotated, rotated, rotated])
+    } finally {
+      if (previousDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      if (previousCacheHome === undefined) delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      else process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousXdgDataHome
+      if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+    }
+  }, 15_000)
 
   test('imports only safe user OpenCode config into managed profile content', async () => {
     const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
@@ -1026,7 +1180,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
       }
     }
-  })
+  }, 15_000)
 
   test('handles profile node_modules repair across separate process preparation races', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
@@ -1088,7 +1242,7 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
         process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
       }
     }
-  })
+  }, 20_000)
 
   test('syncs app-global OpenCode auth before real local auth so fresh login wins conflicts', () => {
     expect(

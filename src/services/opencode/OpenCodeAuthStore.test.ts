@@ -1,15 +1,19 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   doesOpenCodeAuthStoreIncludeSource,
+  fanOutOpenCodeOAuthCredential,
   mergeOpenCodeAuthStores,
+  mergeOpenCodeAuthStoresWithFreshestOAuth,
   readOpenCodeAuthProviderSummaries,
   readOpenCodeAuthCredential,
   reconcileOpenCodeManagedAuthStore,
+  reconcileOpenCodeManagedAuthStores,
   removeOpenCodeAuthCredential,
   syncOpenCodeManagedAuthStore,
   upsertOpenCodeApiAuthCredential,
@@ -106,6 +110,40 @@ describe('OpenCodeAuthStore', () => {
     })
   })
 
+  test('serializes auth writes across separate processes without dropping providers', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'auth.json')
+    const startPath = path.join(tempDir, 'start')
+    const scriptPath = path.join(tempDir, 'write-auth.ts')
+    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
+    await writeFile(
+      scriptPath,
+      `import { access } from 'node:fs/promises'
+import { upsertOpenCodeApiAuthCredential } from ${JSON.stringify(authStoreUrl)}
+while (await access(process.argv[4]).then(() => false).catch(() => true)) {
+  await new Promise(resolve => setTimeout(resolve, 5))
+}
+await upsertOpenCodeApiAuthCredential({
+  authPath: process.argv[3],
+  providerId: process.argv[2],
+  apiKey: 'key-' + process.argv[2],
+})
+`,
+      'utf8',
+    )
+    const providerIds = Array.from({ length: 8 }, (_, index) => `provider-${index}`)
+    const children = providerIds.map(providerId => Bun.spawn({
+      cmd: [process.execPath, scriptPath, providerId, authPath, startPath],
+      cwd: process.cwd(),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    }))
+    await writeFile(startPath, 'go\n', 'utf8')
+    const exitCodes = await Promise.all(children.map(child => child.exited))
+
+    expect(exitCodes).toEqual(providerIds.map(() => 0))
+    expect(Object.keys(JSON.parse(await readFile(authPath, 'utf8'))).sort()).toEqual(providerIds)
+  }, 15_000)
+
   test('reconciles managed auth to current sources and drops stale providers', async () => {
     const globalAuthPath = path.join(tempDir, 'global-auth.json')
     const localAuthPath = path.join(tempDir, 'local-auth.json')
@@ -160,6 +198,153 @@ describe('OpenCodeAuthStore', () => {
     ).toEqual({
       openrouter: { type: 'api', key: 'local-key' },
     })
+  })
+
+  test('keeps the OAuth credential with the newer expiry across source precedence', () => {
+    expect(
+      mergeOpenCodeAuthStoresWithFreshestOAuth({
+        source: {
+          xai: {
+            type: 'oauth',
+            access: 'stale-source-access',
+            refresh: 'stale-source-refresh',
+            expires: 1_000,
+          },
+          openrouter: { type: 'api', key: 'new-source-key' },
+        },
+        managed: {
+          xai: {
+            type: 'oauth',
+            access: 'fresh-managed-access',
+            refresh: 'fresh-managed-refresh',
+            expires: 2_000,
+          },
+          openrouter: { type: 'api', key: 'old-managed-key' },
+        },
+      }),
+    ).toEqual({
+      xai: {
+        type: 'oauth',
+        access: 'fresh-managed-access',
+        refresh: 'fresh-managed-refresh',
+        expires: 2_000,
+      },
+      openrouter: { type: 'api', key: 'new-source-key' },
+    })
+  })
+
+  test('fans a rotated OAuth credential out to global and managed profile stores', async () => {
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    const activeAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'active',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const peerAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'peer',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const stale = {
+      type: 'oauth',
+      access: 'stale-access',
+      refresh: 'stale-refresh',
+      expires: 1_000,
+    }
+    const rotated = {
+      type: 'oauth',
+      access: 'rotated-access',
+      refresh: 'rotated-refresh',
+      expires: 2_000,
+    }
+    await Promise.all([
+      upsertOpenCodeAuthCredential({ authPath: globalAuthPath, providerId: 'xai', credential: stale }),
+      upsertOpenCodeAuthCredential({ authPath: activeAuthPath, providerId: 'xai', credential: rotated }),
+      upsertOpenCodeAuthCredential({ authPath: peerAuthPath, providerId: 'xai', credential: stale }),
+    ])
+
+    await fanOutOpenCodeOAuthCredential({
+      providerId: 'xai',
+      sourceAuthPath: activeAuthPath,
+      targetAuthPaths: [globalAuthPath, activeAuthPath, peerAuthPath],
+    })
+
+    await expect(Promise.all(
+      [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
+        readOpenCodeAuthCredential({ authPath, providerId: 'xai' }),
+      ),
+    )).resolves.toEqual([rotated, rotated, rotated])
+  })
+
+  test('recovers a rotated managed OAuth credential and prevents stale restart overwrite', async () => {
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    const localAuthPath = path.join(tempDir, 'local-opencode', 'auth.json')
+    const activeAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'active',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const restartedAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'restarted',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const stale = {
+      type: 'oauth',
+      access: 'stale-access',
+      refresh: 'stale-refresh',
+      expires: 1_000,
+    }
+    const rotated = {
+      type: 'oauth',
+      access: 'rotated-access',
+      refresh: 'rotated-refresh',
+      expires: 2_000,
+    }
+    await Promise.all([
+      upsertOpenCodeAuthCredential({ authPath: globalAuthPath, providerId: 'xai', credential: stale }),
+      upsertOpenCodeAuthCredential({ authPath: localAuthPath, providerId: 'xai', credential: stale }),
+      upsertOpenCodeAuthCredential({ authPath: activeAuthPath, providerId: 'xai', credential: rotated }),
+    ])
+
+    await reconcileOpenCodeManagedAuthStores({
+      sourceAuthPaths: [globalAuthPath, localAuthPath],
+      globalAuthPath,
+      managedAuthPath: restartedAuthPath,
+      peerManagedAuthPaths: [activeAuthPath, restartedAuthPath],
+    })
+
+    await expect(Promise.all(
+      [globalAuthPath, activeAuthPath, restartedAuthPath].map(authPath =>
+        readOpenCodeAuthCredential({ authPath, providerId: 'xai' }),
+      ),
+    )).resolves.toEqual([rotated, rotated, rotated])
+
+    await reconcileOpenCodeManagedAuthStores({
+      sourceAuthPaths: [globalAuthPath, localAuthPath],
+      globalAuthPath,
+      managedAuthPath: restartedAuthPath,
+      peerManagedAuthPaths: [activeAuthPath, restartedAuthPath],
+    })
+    await expect(
+      readOpenCodeAuthCredential({ authPath: restartedAuthPath, providerId: 'xai' }),
+    ).resolves.toEqual(rotated)
   })
 
   test('writes and removes API-key auth without leaking the secret in provider summaries', async () => {

@@ -9,6 +9,11 @@ import {
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
 import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
+import {
+  fanOutOpenCodeOAuthCredential,
+  readOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
+} from './OpenCodeAuthStore.js'
 
 import type {
   OpenCodeHostHandle,
@@ -179,6 +184,243 @@ describe('OpenCodeExecutionProbe', () => {
       },
       hostLifetime: 'process',
     })
+  })
+
+  test('fans out a potentially rotated xAI OAuth credential after a real model probe', async () => {
+    const fanOutInputs: Array<{ providerId: string; sourceAuthPath: string }> = []
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      fanOutOAuthCredential: async input => {
+        fanOutInputs.push(input)
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'xai/grok-4.3',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(fanOutInputs).toEqual([{
+      providerId: 'xai',
+      sourceAuthPath: profile.managedAuthPath,
+    }])
+  })
+
+  test('simulates an expired xAI access token refresh and persists the rotated credential', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-xai-refresh-success-'))
+    const globalAuthPath = path.join(tempDir, 'global', 'opencode', 'auth.json')
+    const activeAuthPath = path.join(tempDir, 'profiles', 'active', 'opencode', 'auth.json')
+    const peerAuthPath = path.join(tempDir, 'profiles', 'peer', 'opencode', 'auth.json')
+    const expiredCredential = {
+      type: 'oauth',
+      access: 'expired-access',
+      refresh: 'refresh-before-rotation',
+      expires: Date.now() - 60_000,
+      accountId: 'supergrok-account',
+    }
+    const rotatedCredential = {
+      type: 'oauth',
+      access: 'refreshed-access',
+      refresh: 'refresh-after-rotation',
+      expires: Date.now() + 3_600_000,
+      accountId: 'supergrok-account',
+    }
+    const refreshProfile = {
+      ...profile,
+      managedAuthPath: activeAuthPath,
+    }
+    const refreshHost = {
+      ...host,
+      profile: refreshProfile,
+    }
+
+    try {
+      await Promise.all(
+        [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
+          upsertOpenCodeAuthCredential({
+            authPath,
+            providerId: 'xai',
+            credential: expiredCredential,
+          }),
+        ),
+      )
+
+      const probe = new OpenCodeExecutionProbe({
+        hostManager: {
+          ensureHost: async () => refreshHost,
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfig: async () => { throw new Error('not used') },
+            getConfigProviders: async () => { throw new Error('not used') },
+            getProviders: async () => { throw new Error('not used') },
+            getProviderAuth: async () => { throw new Error('not used') },
+            listAgents: async () => { throw new Error('not used') },
+            getMcp: async () => { throw new Error('not used') },
+            createSession: async () => ({ id: 'session-1' }),
+            getSession: async () => ({ id: 'session-1' }),
+            getSessionStatus: async () => ({ 'session-1': 'idle' }),
+            getSessionMessages: async () => [{
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            }],
+            getPermissions: async () => [],
+            sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+            promptSessionAsync: async () => {
+              await upsertOpenCodeAuthCredential({
+                authPath: activeAuthPath,
+                providerId: 'xai',
+                credential: rotatedCredential,
+              })
+            },
+            abortSession: async () => true,
+          }),
+        },
+        fanOutOAuthCredential: async input => {
+          await fanOutOpenCodeOAuthCredential({
+            ...input,
+            targetAuthPaths: [globalAuthPath, activeAuthPath, peerAuthPath],
+          })
+        },
+      })
+
+      const result = await probe.probeModel({
+        selectedModel: 'xai/grok-4.3',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+      })
+
+      expect(result.outcome).toBe('available')
+      await expect(Promise.all(
+        [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
+          readOpenCodeAuthCredential({ authPath, providerId: 'xai' }),
+        ),
+      )).resolves.toEqual([rotatedCredential, rotatedCredential, rotatedCredential])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('preserves the previous xAI credential when an expired-token refresh fails', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-xai-refresh-failure-'))
+    const globalAuthPath = path.join(tempDir, 'global', 'opencode', 'auth.json')
+    const activeAuthPath = path.join(tempDir, 'profiles', 'active', 'opencode', 'auth.json')
+    const peerAuthPath = path.join(tempDir, 'profiles', 'peer', 'opencode', 'auth.json')
+    const expiredCredential = {
+      type: 'oauth',
+      access: 'expired-access',
+      refresh: 'still-valid-refresh-token',
+      expires: Date.now() - 60_000,
+      accountId: 'supergrok-account',
+    }
+    const refreshProfile = {
+      ...profile,
+      managedAuthPath: activeAuthPath,
+    }
+    const refreshHost = {
+      ...host,
+      profile: refreshProfile,
+    }
+
+    try {
+      await Promise.all(
+        [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
+          upsertOpenCodeAuthCredential({
+            authPath,
+            providerId: 'xai',
+            credential: expiredCredential,
+          }),
+        ),
+      )
+
+      const probe = new OpenCodeExecutionProbe({
+        hostManager: {
+          ensureHost: async () => refreshHost,
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfig: async () => { throw new Error('not used') },
+            getConfigProviders: async () => { throw new Error('not used') },
+            getProviders: async () => { throw new Error('not used') },
+            getProviderAuth: async () => { throw new Error('not used') },
+            listAgents: async () => { throw new Error('not used') },
+            getMcp: async () => { throw new Error('not used') },
+            createSession: async () => ({ id: 'session-1' }),
+            getSession: async () => ({ id: 'session-1' }),
+            getSessionStatus: async () => ({}),
+            getSessionMessages: async () => [],
+            getPermissions: async () => [],
+            sendSessionMessage: async () => ({ info: { id: 'msg-assistant-1' }, parts: [] }),
+            promptSessionAsync: async () => {
+              throw new Error('xAI token refresh failed: invalid_grant')
+            },
+            abortSession: async () => true,
+          }),
+        },
+        fanOutOAuthCredential: async input => {
+          await fanOutOpenCodeOAuthCredential({
+            ...input,
+            targetAuthPaths: [globalAuthPath, activeAuthPath, peerAuthPath],
+          })
+        },
+      })
+
+      const result = await probe.probeModel({
+        selectedModel: 'xai/grok-4.3',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+      })
+
+      expect(result.outcome).toBe('not_authenticated')
+      expect(result.reason).toContain('token refresh failed')
+      await expect(Promise.all(
+        [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
+          readOpenCodeAuthCredential({ authPath, providerId: 'xai' }),
+        ),
+      )).resolves.toEqual([expiredCredential, expiredCredential, expiredCredential])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
   })
 
   test('treats a completed non-empty assistant response as execution proof even when it is not PONG', async () => {

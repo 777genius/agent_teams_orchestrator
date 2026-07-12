@@ -48,6 +48,10 @@ type OpenCodeSessionBridgeDeps = {
     projectPath?: string | null,
     options?: OpenCodePrepareProfileOptions,
   ) => Promise<OpenCodePreparedProfile>
+  fanOutOAuthCredential?: (input: {
+    providerId: string
+    sourceAuthPath: string
+  }) => Promise<void>
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -251,6 +255,24 @@ export class OpenCodeSessionBridge {
 
   private get offlineReader() {
     return this.deps.offlineReader ?? openCodeOfflineSessionReader
+  }
+
+  private async fanOutOAuthCredentialAfterPrompt(
+    record: OpenCodeSessionRecord,
+    profile: OpenCodePreparedProfile,
+  ): Promise<void> {
+    if (parseProviderScopedModel(record.selectedModel).providerID !== 'xai') {
+      return
+    }
+    const input = {
+      providerId: 'xai',
+      sourceAuthPath: profile.managedAuthPath,
+    }
+    if (this.deps.fanOutOAuthCredential) {
+      await this.deps.fanOutOAuthCredential(input)
+      return
+    }
+    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath)
   }
 
   private async prepareProfile(
@@ -524,6 +546,7 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     callback: (context: {
       baseUrl: string
+      profile: OpenCodePreparedProfile
       resolvedConfigFingerprint: string | null
       runtimePid: number | null
     }) => Promise<T>,
@@ -550,6 +573,7 @@ export class OpenCodeSessionBridge {
     try {
       return await callback({
         baseUrl: host.baseUrl,
+        profile: sessionProfile.profile,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
       })
@@ -902,18 +926,22 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<OpenCodeMessage> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
+    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
-      return client.sendSessionMessage(record.opencodeSessionId, {
-        agent: params.agent,
-        noReply: params.noReply,
-        system: params.system,
-        model: parseProviderScopedModel(record.selectedModel),
-        parts: buildOpenCodePromptParts({
-          text: params.text,
-          parts: params.parts,
-        }),
-      })
+      try {
+        return await client.sendSessionMessage(record.opencodeSessionId, {
+          agent: params.agent,
+          noReply: params.noReply,
+          system: params.system,
+          model: parseProviderScopedModel(record.selectedModel),
+          parts: buildOpenCodePromptParts({
+            text: params.text,
+            parts: params.parts,
+          }),
+        })
+      } finally {
+        await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
+      }
     })
   }
 
@@ -1036,18 +1064,22 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<void> {
-    await this.withSessionHost(record, async ({ baseUrl }) => {
+    await this.withSessionHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
-      await client.promptSessionAsync(record.opencodeSessionId, {
-        agent: params.agent,
-        noReply: params.noReply,
-        system: params.system,
-        model: parseProviderScopedModel(record.selectedModel),
-        parts: buildOpenCodePromptParts({
-          text: params.text,
-          parts: params.parts,
-        }),
-      })
+      try {
+        await client.promptSessionAsync(record.opencodeSessionId, {
+          agent: params.agent,
+          noReply: params.noReply,
+          system: params.system,
+          model: parseProviderScopedModel(record.selectedModel),
+          parts: buildOpenCodePromptParts({
+            text: params.text,
+            parts: params.parts,
+          }),
+        })
+      } finally {
+        await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
+      }
     })
   }
 
@@ -1070,7 +1102,7 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
-    return this.withSessionHost(record, async ({ baseUrl }) => {
+    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
       const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
@@ -1137,6 +1169,7 @@ export class OpenCodeSessionBridge {
         throw error
       } finally {
         observation.dispose()
+        await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
       }
     })
   }
@@ -1196,40 +1229,44 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
-    return this.withSessionHost(record, async ({ baseUrl }) => {
+    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
       const client = this.clientFactory.create(baseUrl)
-      const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
-      const runtimePromptMessageId = allocation.runtimePromptMessageId
-      const hookDiagnostics: string[] = [...allocation.diagnostics]
-      await params.onPromptSubmitting?.({
-        sessionId: record.opencodeSessionId,
-        runtimePromptMessageId,
-        baseUrl,
-      })
-      await client.promptSessionAsync(record.opencodeSessionId, {
-        messageID: runtimePromptMessageId,
-        agent: params.agent,
-        noReply: false,
-        system: params.system,
-        model: parseProviderScopedModel(record.selectedModel),
-        parts: buildOpenCodePromptParts({
-          text: params.text,
-          parts: params.parts,
-        }),
-      })
       try {
-        await params.onPromptAccepted?.({
+        const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
+        const runtimePromptMessageId = allocation.runtimePromptMessageId
+        const hookDiagnostics: string[] = [...allocation.diagnostics]
+        await params.onPromptSubmitting?.({
           sessionId: record.opencodeSessionId,
           runtimePromptMessageId,
+          baseUrl,
         })
-      } catch (error) {
-        hookDiagnostics.push(
-          `OpenCode prompt accepted hook failed - ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-      return {
-        runtimePromptMessageId,
-        hookDiagnostics,
+        await client.promptSessionAsync(record.opencodeSessionId, {
+          messageID: runtimePromptMessageId,
+          agent: params.agent,
+          noReply: false,
+          system: params.system,
+          model: parseProviderScopedModel(record.selectedModel),
+          parts: buildOpenCodePromptParts({
+            text: params.text,
+            parts: params.parts,
+          }),
+        })
+        try {
+          await params.onPromptAccepted?.({
+            sessionId: record.opencodeSessionId,
+            runtimePromptMessageId,
+          })
+        } catch (error) {
+          hookDiagnostics.push(
+            `OpenCode prompt accepted hook failed - ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        return {
+          runtimePromptMessageId,
+          hookDiagnostics,
+        }
+      } finally {
+        await this.fanOutOAuthCredentialAfterPrompt(record, profile).catch(() => undefined)
       }
     })
   }

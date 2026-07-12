@@ -9,7 +9,10 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
-import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
+import {
+  OPEN_CODE_MODEL_PROBE_AGENT_NAME,
+  openCodeProfileManager,
+} from './OpenCodeProfileManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -40,6 +43,10 @@ type OpenCodeExecutionProbeDeps = {
   pollIntervalMs?: number
   persistentCache?: boolean
   persistentCacheRoot?: string
+  fanOutOAuthCredential?: (input: {
+    providerId: string
+    sourceAuthPath: string
+  }) => Promise<void>
 }
 
 type ProbeCacheFile = {
@@ -383,6 +390,17 @@ export class OpenCodeExecutionProbe {
     return this.deps.persistentCache ?? (this.deps.clientFactory == null)
   }
 
+  private async fanOutOAuthCredential(input: {
+    providerId: string
+    sourceAuthPath: string
+  }): Promise<void> {
+    if (this.deps.fanOutOAuthCredential) {
+      await this.deps.fanOutOAuthCredential(input)
+      return
+    }
+    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath)
+  }
+
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const cacheKey = buildProbeCacheKey(params)
     if (!params.bypassCache) {
@@ -643,6 +661,16 @@ export class OpenCodeExecutionProbe {
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
+      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
+        await this.fanOutOAuthCredential({
+          providerId: 'xai',
+          sourceAuthPath: host.profile.managedAuthPath,
+        }).catch(error => {
+          result.diagnostics.push(
+            `OpenCode xAI OAuth credential sync failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
+      }
       if (cacheFilePath) {
         await writePersistentProbeCache(
           cacheFilePath,

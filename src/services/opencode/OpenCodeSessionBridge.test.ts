@@ -1147,6 +1147,47 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('fans out a rotated xAI OAuth credential after a runtime prompt', async () => {
+    const fanOutInputs: Array<{ providerId: string; sourceAuthPath: string }> = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-new' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'message-1' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      fanOutOAuthCredential: async input => {
+        fanOutInputs.push(input)
+      },
+    })
+
+    await bridge.promptAsync(buildRecord({ selectedModel: 'xai/grok-4.3' }), {
+      text: 'Reply with exactly: pong',
+    })
+
+    expect(fanOutInputs).toEqual([{
+      providerId: 'xai',
+      sourceAuthPath: profile.managedAuthPath,
+    }])
+  })
+
   test('posts prompt_async with app-owned message id and waits for OpenCode turn-settled observation', async () => {
     const promptBodies: unknown[] = []
     const observationMarks: string[] = []
