@@ -262,6 +262,85 @@ describe('anthropic runtime catalog', () => {
     })
   })
 
+  test('does not surface deprecated or Claude Code removed first-party Anthropic models', () => {
+    const catalog = buildAnthropicRuntimeModelCatalogFromApiModels([
+      {
+        id: 'claude-fable-5',
+        type: 'model',
+        display_name: 'Claude Fable 5',
+        max_input_tokens: 1_000_000,
+        max_tokens: 128_000,
+        capabilities: {
+          effort: {
+            supported: true,
+            low: { supported: true },
+            medium: { supported: true },
+            high: { supported: true },
+            max: { supported: true },
+          },
+          image_input: { supported: true },
+        },
+      },
+      {
+        id: 'claude-opus-4-1-20250805',
+        type: 'model',
+        display_name: 'Claude Opus 4.1',
+        max_input_tokens: 200_000,
+        max_tokens: 32_000,
+        capabilities: {
+          image_input: { supported: true },
+        },
+      },
+      {
+        id: 'claude-sonnet-4-20250514',
+        type: 'model',
+        display_name: 'Claude Sonnet 4',
+        max_input_tokens: 200_000,
+        max_tokens: 32_000,
+        capabilities: {
+          image_input: { supported: true },
+        },
+      },
+      {
+        id: 'claude-future-deprecated',
+        type: 'model',
+        display_name: 'Claude Future Deprecated',
+        deprecated: true,
+        max_input_tokens: 200_000,
+        max_tokens: 32_000,
+      },
+      {
+        id: 'claude-future-retired',
+        type: 'model',
+        display_name: 'Claude Future Retired',
+        lifecycle: {
+          status: 'retired',
+        },
+        max_input_tokens: 200_000,
+        max_tokens: 32_000,
+      },
+    ])
+
+    expect(getAnthropicVisibleRuntimeModels(catalog)).toContain(
+      'claude-fable-5',
+    )
+    expect(getAnthropicVisibleRuntimeModels(catalog)).not.toContain(
+      'claude-opus-4-1-20250805',
+    )
+    expect(getAnthropicVisibleRuntimeModels(catalog)).not.toContain(
+      'claude-sonnet-4-20250514',
+    )
+    expect(getAnthropicVisibleRuntimeModels(catalog)).not.toContain(
+      'claude-future-deprecated',
+    )
+    expect(getAnthropicVisibleRuntimeModels(catalog)).not.toContain(
+      'claude-future-retired',
+    )
+    expect(
+      catalog.models.some((model) => model.launchModel === 'claude-opus-4-1-20250805'),
+    ).toBe(false)
+  })
+
   test('normalizes Anthropic-compatible models without requiring Claude model ids', () => {
     const catalog = buildAnthropicCompatibleRuntimeModelCatalogFromApiModels([
       {

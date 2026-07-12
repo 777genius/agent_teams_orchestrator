@@ -11,6 +11,7 @@ import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
   buildOpenCodeHostSpawnOptions,
+  resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
 
@@ -82,6 +83,21 @@ function createMockChildProcess(pid = 4242): {
   }
 }
 
+test('changes the persistent host identity when the OpenCode binary changes', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-binary-identity-'))
+  const binaryPath = path.join(tempDir, 'opencode')
+  try {
+    await writeFile(binaryPath, 'version-one')
+    const first = await resolveOpenCodeBinaryHostIdentity(binaryPath)
+    expect(await resolveOpenCodeBinaryHostIdentity(binaryPath)).toBe(first)
+
+    await writeFile(binaryPath, 'version-two-with-a-different-size')
+    expect(await resolveOpenCodeBinaryHostIdentity(binaryPath)).not.toBe(first)
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
 function createDeferred<T = void>(): {
   promise: Promise<T>
   resolve: (value: T | PromiseLike<T>) => void
@@ -124,7 +140,11 @@ describe('OpenCodeHostManager', () => {
   })
 
   test('keeps process-scoped OpenCode hosts attached on Windows to avoid console popup detachment', () => {
-    expect(buildOpenCodeHostSpawnOptions(baseProfile, 'win32', { lifetime: 'process' })).toMatchObject({
+    expect(
+      buildOpenCodeHostSpawnOptions(baseProfile, 'win32', {
+        lifetime: 'process',
+      }),
+    ).toMatchObject({
       detached: false,
       stdio: 'ignore',
       windowsHide: true,
@@ -154,7 +174,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43138,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -230,12 +250,15 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => 43139,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
         }
         if (url.endsWith('/config')) {
-          return { status: 200, data: { server: { port: 43139 }, default_agent: 'teammate' } }
+          return {
+            status: 200,
+            data: { server: { port: 43139 }, default_agent: 'teammate' },
+          }
         }
         if (url.endsWith('/config/providers')) {
           return { status: 200, data: { providers: [], default: {} } }
@@ -282,10 +305,7 @@ describe('OpenCodeHostManager', () => {
       tmpPath,
     }
     const dylibPath = path.join(tmpPath, '.bbb6fbfdecfffefd-00000000.dylib')
-    const spawnedHosts = [
-      createMockChildProcess(43139),
-      createMockChildProcess(43140),
-    ]
+    const spawnedHosts = [createMockChildProcess(43139), createMockChildProcess(43140)]
     const alivePids = new Set<number>([43139, 43140])
     let spawnIndex = 0
     let nextPort = 43139
@@ -294,7 +314,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => profile,
       allocateLoopbackPort: async () => nextPort++,
       spawnHostProcess: () => spawnedHosts[spawnIndex++].child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return { status: 200, data: { healthy: true, version: '1.4.0' } }
         }
@@ -481,6 +501,48 @@ describe('OpenCodeHostManager', () => {
     expect(spawned.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
   })
 
+  test('keeps an explicitly persistent host alive for adoption by the next CLI process', async () => {
+    const spawned = createMockChildProcess(43118)
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43118,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.15.7' } }
+        }
+        if (url.endsWith('/config')) {
+          return { status: 200, data: { default_agent: 'teammate' } }
+        }
+        if (url.endsWith('/config/providers')) {
+          return { status: 200, data: { providers: [], default: {} } }
+        }
+        if (url.endsWith('/agent')) {
+          return { status: 200, data: [] }
+        }
+        if (url.endsWith('/mcp')) {
+          return { status: 200, data: {} }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    await manager.ensureHost({
+      hostKey: 'provider-management-host',
+      hostLifetime: 'persistent',
+    })
+    await manager.releaseHost('provider-management-host', {
+      keepPersistentAlive: true,
+    })
+
+    expect(manager.getHost('provider-management-host')?.state).toBe('healthy')
+    expect(spawned.killedSignals).toEqual([])
+
+    await manager.disposeHost('provider-management-host')
+  })
+
   test('keeps a healthy host usable when resolved fingerprint probing fails', async () => {
     const spawned = createMockChildProcess()
 
@@ -488,7 +550,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43120,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -517,7 +579,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43112,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -561,7 +623,9 @@ describe('OpenCodeHostManager', () => {
     spawned.child.emit('exit', 1, null)
 
     expect(handle.state).toBe('degraded')
-    expect(handle.diagnostics.some(message => message.includes('process exited with code 1'))).toBe(true)
+    expect(handle.diagnostics.some(message => message.includes('process exited with code 1'))).toBe(
+      true,
+    )
     expect(manager.getHost('host-key')).toBeNull()
   })
 
@@ -637,7 +701,9 @@ describe('OpenCodeHostManager', () => {
       expect(spawnCount).toBe(1)
       expect(adopted.pid).toBe(created.pid)
       expect(adopted.baseUrl).toBe(created.baseUrl)
-      expect(adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+      expect(
+        adopted.diagnostics.some(message => message.includes('adopted persistent OpenCode host')),
+      ).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -728,7 +794,9 @@ describe('OpenCodeHostManager', () => {
       expect(spawnCount).toBe(1)
       expect(second.pid).toBe(first.pid)
       expect(second.baseUrl).toBe(first.baseUrl)
-      expect(second.diagnostics.some(message => message.includes('adopted persistent OpenCode host'))).toBe(true)
+      expect(
+        second.diagnostics.some(message => message.includes('adopted persistent OpenCode host')),
+      ).toBe(true)
     } finally {
       allowHealthProbe.resolve()
       await rm(tempDir, { recursive: true, force: true })
@@ -823,7 +891,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43134,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           if (healthCalls === 0) {
             ;(spawned.child.stdout as PassThrough).write('server booting\n')
@@ -877,7 +945,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43136,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 503,
@@ -894,15 +962,15 @@ describe('OpenCodeHostManager', () => {
         killedSignals.push({ pid, signal })
       },
       now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
-      sleepMs: async (ms) => {
+      sleepMs: async ms => {
         nowMs += ms
       },
       persistentRegistryPath: null,
     })
 
-    await expect(manager.ensureHost({ hostKey: 'host-key', healthTimeoutMs: 5_000 })).rejects.toThrow(
-      'OpenCode host did not become healthy within 5000ms',
-    )
+    await expect(
+      manager.ensureHost({ hostKey: 'host-key', healthTimeoutMs: 5_000 }),
+    ).rejects.toThrow('OpenCode host did not become healthy within 5000ms')
 
     expect(manager.getHost('host-key')).toBeNull()
     expect(killedSignals).toEqual([
@@ -922,13 +990,11 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43137,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: nowMs >= 5_250 ? 200 : 503,
-            data: nowMs >= 5_250
-              ? { healthy: true, version: '1.4.0' }
-              : { healthy: false },
+            data: nowMs >= 5_250 ? { healthy: true, version: '1.4.0' } : { healthy: false },
           }
         }
         if (url.endsWith('/config')) {
@@ -958,7 +1024,7 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       now: () => new Date(Date.parse('2026-04-24T10:00:00.000Z') + nowMs),
-      sleepMs: async (ms) => {
+      sleepMs: async ms => {
         sleepCalls += 1
         if (sleepCalls === 1) {
           firstSleepStarted.resolve()
@@ -969,7 +1035,10 @@ describe('OpenCodeHostManager', () => {
       persistentRegistryPath: null,
     })
 
-    const first = manager.ensureHost({ hostKey: 'host-key', healthTimeoutMs: 5_000 })
+    const first = manager.ensureHost({
+      hostKey: 'host-key',
+      healthTimeoutMs: 5_000,
+    })
     await firstSleepStarted.promise
     const second = manager.ensureHost({ hostKey: 'host-key' })
     allowSleep.resolve()
@@ -992,7 +1061,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43135,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -1057,7 +1126,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43136,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -1128,7 +1197,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43137,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -1195,7 +1264,7 @@ describe('OpenCodeHostManager', () => {
         prepareProfile: async () => baseProfile,
         allocateLoopbackPort: async () => 43115,
         spawnHostProcess: () => spawned.child,
-        fetchJson: async (url) => {
+        fetchJson: async url => {
           if (url.endsWith('/global/health')) {
             return { status: 200, data: { healthy: true, version: '1.4.0' } }
           }
@@ -1293,10 +1362,11 @@ describe('OpenCodeHostManager', () => {
         }),
         'utf8',
       )
-      const createManager = () => new OpenCodeHostManager({
-        now: () => new Date('2026-04-24T10:01:00.000Z'),
-        persistentRegistryPath: registryPath,
-      })
+      const createManager = () =>
+        new OpenCodeHostManager({
+          now: () => new Date('2026-04-24T10:01:00.000Z'),
+          persistentRegistryPath: registryPath,
+        })
 
       await Promise.all([
         createManager().retainHostLease('host-key', {
@@ -1357,7 +1427,7 @@ describe('OpenCodeHostManager', () => {
         'utf8',
       )
       const manager = new OpenCodeHostManager({
-        fetchJson: async (url) => {
+        fetchJson: async url => {
           disposeUrls.push(url)
           return { status: 200, data: { ok: true } }
         },
@@ -1521,7 +1591,7 @@ describe('OpenCodeHostManager', () => {
         'utf8',
       )
       const manager = new OpenCodeHostManager({
-        fetchJson: async (url) => {
+        fetchJson: async url => {
           disposedUrls.push(url)
           return { status: 200, data: { ok: true } }
         },
@@ -1633,7 +1703,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43113,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,
@@ -1643,77 +1713,84 @@ describe('OpenCodeHostManager', () => {
         if (url.endsWith('/config')) {
           return {
             status: 200,
-            data: phase === 'initial'
-              ? {
-                  server: { port: 43113 },
-                  default_agent: 'teammate',
-                  mcp: {
-                    'agent-teams': {
-                      command: ['node', 'cli.js'],
-                      environment: { PATH: '/usr/bin', TMPDIR: '/tmp/a' },
+            data:
+              phase === 'initial'
+                ? {
+                    server: { port: 43113 },
+                    default_agent: 'teammate',
+                    mcp: {
+                      'agent-teams': {
+                        command: ['node', 'cli.js'],
+                        environment: { PATH: '/usr/bin', TMPDIR: '/tmp/a' },
+                      },
+                    },
+                  }
+                : {
+                    server: { port: 45888 },
+                    default_agent: 'teammate',
+                    mcp: {
+                      'agent-teams': {
+                        command: ['node', 'cli.js'],
+                        environment: {
+                          PATH: '/opt/homebrew/bin',
+                          TMPDIR: '/tmp/b',
+                        },
+                      },
                     },
                   },
-                }
-              : {
-                  server: { port: 45888 },
-                  default_agent: 'teammate',
-                  mcp: {
-                    'agent-teams': {
-                      command: ['node', 'cli.js'],
-                      environment: { PATH: '/opt/homebrew/bin', TMPDIR: '/tmp/b' },
-                    },
-                  },
-                },
           }
         }
         if (url.endsWith('/config/providers')) {
           return {
             status: 200,
-            data: phase === 'initial'
-              ? {
-                  providers: [
-                    { id: 'openai', models: { 'gpt-5.4-mini': {} } },
-                    { id: 'moonshot', models: { 'kimi-k2': {} } },
-                  ],
-                }
-              : {
-                  providers: [
-                    { id: 'moonshot', models: { 'kimi-k2': {} } },
-                    { id: 'openai', models: { 'gpt-5.4-mini': {} } },
-                  ],
-                },
+            data:
+              phase === 'initial'
+                ? {
+                    providers: [
+                      { id: 'openai', models: { 'gpt-5.4-mini': {} } },
+                      { id: 'moonshot', models: { 'kimi-k2': {} } },
+                    ],
+                  }
+                : {
+                    providers: [
+                      { id: 'moonshot', models: { 'kimi-k2': {} } },
+                      { id: 'openai', models: { 'gpt-5.4-mini': {} } },
+                    ],
+                  },
           }
         }
         if (url.endsWith('/agent')) {
           return {
             status: 200,
-            data: phase === 'initial'
-              ? [
-                  { name: 'teammate', mode: 'primary' },
-                  { name: 'reviewer', mode: 'subagent' },
-                ]
-              : [
-                  { name: 'reviewer', mode: 'subagent' },
-                  { name: 'teammate', mode: 'primary' },
-                ],
+            data:
+              phase === 'initial'
+                ? [
+                    { name: 'teammate', mode: 'primary' },
+                    { name: 'reviewer', mode: 'subagent' },
+                  ]
+                : [
+                    { name: 'reviewer', mode: 'subagent' },
+                    { name: 'teammate', mode: 'primary' },
+                  ],
           }
         }
         if (url.endsWith('/mcp')) {
           return {
             status: 200,
-            data: phase === 'initial'
-              ? {
-                  'agent-teams': {
-                    connected: true,
-                    transport: { pid: 999, port: 1234 },
+            data:
+              phase === 'initial'
+                ? {
+                    'agent-teams': {
+                      connected: true,
+                      transport: { pid: 999, port: 1234 },
+                    },
+                  }
+                : {
+                    'agent-teams': {
+                      connected: false,
+                      transport: { pid: 1001, port: 5678 },
+                    },
                   },
-                }
-              : {
-                  'agent-teams': {
-                    connected: false,
-                    transport: { pid: 1001, port: 5678 },
-                  },
-                },
           }
         }
         return {
@@ -1742,7 +1819,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43127,
       spawnHostProcess: () => spawned.child,
-      fetchJson: async (url) => {
+      fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
             status: 200,

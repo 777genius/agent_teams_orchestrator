@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { Readable } from 'node:stream'
 
 import {
   openCodeProviderManagementAdapter,
@@ -38,6 +39,119 @@ function minimalProviderView(): ProviderManagementView {
 }
 
 describe('runtime provider stdout contract', () => {
+  test('streams generic OAuth authorization and accepts a matching code over stdin JSON lines', async () => {
+    const originalConnectProvider = openCodeProviderManagementAdapter.connectProvider
+    const originalStdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin')
+    const originalStdoutWrite = process.stdout.write
+    const originalStderrWrite = process.stderr.write
+    const originalExit = process.exit
+    const originalExitCode = process.exitCode
+    const stdout: string[] = []
+    const stderr: string[] = []
+
+    try {
+      process.exitCode = undefined
+      Object.defineProperty(process, 'stdin', {
+        configurable: true,
+        value: Readable.from([
+          `${JSON.stringify({
+            method: 'oauth',
+            authMethodIndex: 0,
+            authOptionId: 'oauth:0',
+            oauthOperationId: 'oauth-code-operation-123',
+            metadata: {},
+          })}\n`,
+          `${JSON.stringify({
+            type: 'oauth-code',
+            operationId: 'oauth-code-operation-123',
+            code: 'provider-returned-code',
+          })}\n`,
+        ]),
+      })
+      process.stdout.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
+        stdout.push(String(chunk))
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        writeCallback?.()
+        return true
+      }) as typeof process.stdout.write
+      process.stderr.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
+        stderr.push(String(chunk))
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        writeCallback?.()
+        return true
+      }) as typeof process.stderr.write
+      process.exit = (() => undefined as never) as typeof process.exit
+      openCodeProviderManagementAdapter.connectProvider = async (_input, observer) => {
+        const response = await observer?.authorizationReady({
+          operationId: 'oauth-code-operation-123',
+          providerId: 'future-oauth-provider',
+          displayName: 'Future OAuth Provider',
+          authOptionId: 'oauth:0',
+          methodIndex: 0,
+          authorizationUrl: 'https://login.example.test/authorize?state=opaque',
+          instructions: 'Paste the returned code.',
+          completionMethod: 'code',
+        })
+        expect(response).toEqual({ code: 'provider-returned-code' })
+        return {
+          ok: true,
+          value: {
+            providerId: 'future-oauth-provider',
+            displayName: 'Future OAuth Provider',
+            state: 'connected',
+            ownership: ['managed'],
+            recommended: false,
+            modelCount: 1,
+            defaultModelId: null,
+            authMethods: ['oauth'],
+            actions: [],
+            detail: null,
+          },
+        }
+      }
+
+      await runtimeProvidersConnect({
+        runtime: 'opencode',
+        provider: 'future-oauth-provider',
+        stdinJsonLines: true,
+        json: true,
+      })
+
+      expect(stdout[0]).toStartWith('@@agent-teams-runtime-provider-oauth@@')
+      expect(stdout.join('')).toContain('"completionMethod":"code"')
+      expect(stdout.join('')).toContain('"providerId": "future-oauth-provider"')
+      expect(stdout.join('')).not.toContain('provider-returned-code')
+      expect(stderr).toEqual([])
+    } finally {
+      openCodeProviderManagementAdapter.connectProvider = originalConnectProvider
+      if (originalStdinDescriptor) {
+        Object.defineProperty(process, 'stdin', originalStdinDescriptor)
+      }
+      process.stdout.write = originalStdoutWrite
+      process.stderr.write = originalStderrWrite
+      process.exit = originalExit
+      process.exitCode = originalExitCode
+    }
+  })
+
   test('keeps provider JSON stdout clean when runtime code writes noisy stdout', async () => {
     const originalLoadView = openCodeProviderManagementAdapter.loadView
     const originalStdoutWrite = process.stdout.write
@@ -49,7 +163,11 @@ describe('runtime provider stdout contract', () => {
 
     try {
       process.exitCode = undefined
-      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+      process.stdout.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
         stdout.push(String(chunk))
         const writeCallback =
           typeof encodingOrCallback === 'function'
@@ -60,7 +178,11 @@ describe('runtime provider stdout contract', () => {
         writeCallback?.()
         return true
       }) as typeof process.stdout.write
-      process.stderr.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+      process.stderr.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
         stderr.push(String(chunk))
         const writeCallback =
           typeof encodingOrCallback === 'function'
@@ -78,17 +200,20 @@ describe('runtime provider stdout contract', () => {
 
       openCodeProviderManagementAdapter.loadView = async () => {
         process.stdout.write('noisy stdout before result\n')
-        const result = new Proxy({
-          ok: true,
-          value: minimalProviderView(),
-        }, {
-          has(target, property) {
-            if (property === 'error') {
-              process.stdout.write('noisy stdout while response is being selected\n')
-            }
-            return property in target
+        const result = new Proxy(
+          {
+            ok: true,
+            value: minimalProviderView(),
           },
-        }) as ProviderManagementResult<ProviderManagementView>
+          {
+            has(target, property) {
+              if (property === 'error') {
+                process.stdout.write('noisy stdout while response is being selected\n')
+              }
+              return property in target
+            },
+          },
+        ) as ProviderManagementResult<ProviderManagementView>
         return result
       }
 
@@ -128,7 +253,11 @@ describe('runtime provider stdout contract', () => {
 
     try {
       process.exitCode = undefined
-      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+      process.stdout.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
         stdout.push(String(chunk))
         const writeCallback =
           typeof encodingOrCallback === 'function'
@@ -139,7 +268,11 @@ describe('runtime provider stdout contract', () => {
         writeCallback?.()
         return true
       }) as typeof process.stdout.write
-      process.stderr.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+      process.stderr.write = ((
+        chunk: unknown,
+        encodingOrCallback?: unknown,
+        callback?: unknown,
+      ) => {
         stderr.push(String(chunk))
         const writeCallback =
           typeof encodingOrCallback === 'function'
@@ -193,20 +326,22 @@ describe('runtime provider stdout contract', () => {
   for (const scenario of [
     {
       name: 'connect without stdin json',
-      run: () => runtimeProvidersConnect({
-        runtime: 'opencode',
-        provider: 'openrouter',
-        json: true,
-      }),
+      run: () =>
+        runtimeProvidersConnect({
+          runtime: 'opencode',
+          provider: 'openrouter',
+          json: true,
+        }),
       message: 'Provider setup payload must be supplied through --stdin-json',
     },
     {
       name: 'connect api key without stdin key',
-      run: () => runtimeProvidersConnectApiKey({
-        runtime: 'opencode',
-        provider: 'openrouter',
-        json: true,
-      }),
+      run: () =>
+        runtimeProvidersConnectApiKey({
+          runtime: 'opencode',
+          provider: 'openrouter',
+          json: true,
+        }),
       message: 'API key must be supplied through --stdin-key',
     },
   ]) {
@@ -220,7 +355,11 @@ describe('runtime provider stdout contract', () => {
 
       try {
         process.exitCode = undefined
-        process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        process.stdout.write = ((
+          chunk: unknown,
+          encodingOrCallback?: unknown,
+          callback?: unknown,
+        ) => {
           stdout.push(String(chunk))
           const writeCallback =
             typeof encodingOrCallback === 'function'
@@ -231,7 +370,11 @@ describe('runtime provider stdout contract', () => {
           writeCallback?.()
           return true
         }) as typeof process.stdout.write
-        process.stderr.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        process.stderr.write = ((
+          chunk: unknown,
+          encodingOrCallback?: unknown,
+          callback?: unknown,
+        ) => {
           stderr.push(String(chunk))
           const writeCallback =
             typeof encodingOrCallback === 'function'

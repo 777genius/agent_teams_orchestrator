@@ -3,8 +3,64 @@ import { describe, expect, test } from 'bun:test'
 import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
 describe('OpenCodeClientFactory permissions API', () => {
+  test('delegates generic provider OAuth authorization and callback to OpenCode', async () => {
+    const requests: Array<{
+      url: string
+      method: string | undefined
+      body: unknown
+    }> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (input, init) => {
+        requests.push({
+          url: String(input),
+          method: init?.method,
+          body: JSON.parse(String(init?.body ?? '{}')),
+        })
+        const authorization = String(input).endsWith('/authorize')
+        return new Response(
+          JSON.stringify(
+            authorization
+              ? {
+                  url: 'https://accounts.x.ai/oauth2/authorize?state=test',
+                  method: 'auto',
+                  instructions: 'Complete authorization in the browser.',
+                }
+              : true,
+          ),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        )
+      },
+    })
+    const client = factory.create('http://127.0.0.1:4096')
+
+    await expect(client.authorizeProviderOAuth('xai', { method: 0 })).resolves.toMatchObject({
+      method: 'auto',
+    })
+    await expect(client.completeProviderOAuth('xai', { method: 0 })).resolves.toBe(true)
+
+    expect(requests).toEqual([
+      {
+        url: 'http://127.0.0.1:4096/provider/xai/oauth/authorize',
+        method: 'POST',
+        body: { method: 0 },
+      },
+      {
+        url: 'http://127.0.0.1:4096/provider/xai/oauth/callback',
+        method: 'POST',
+        body: { method: 0 },
+      },
+    ])
+  })
+
   test('sets provider API auth through the OpenCode auth endpoint', async () => {
-    const requests: Array<{ url: string; method: string | undefined; body: unknown }> = []
+    const requests: Array<{
+      url: string
+      method: string | undefined
+      body: unknown
+    }> = []
     const factory = new OpenCodeClientFactory({
       fetchImpl: async (input, init) => {
         requests.push({
@@ -19,16 +75,19 @@ describe('OpenCodeClientFactory permissions API', () => {
       },
     })
 
-    await expect(factory.create('http://127.0.0.1:4096').setProviderAuth(
-      'openrouter',
-      { type: 'api', key: 'sk-test' },
-    )).resolves.toBe(true)
+    await expect(
+      factory
+        .create('http://127.0.0.1:4096')
+        .setProviderAuth('openrouter', { type: 'api', key: 'sk-test' }),
+    ).resolves.toBe(true)
 
-    expect(requests).toEqual([{
-      url: 'http://127.0.0.1:4096/auth/openrouter',
-      method: 'PUT',
-      body: { type: 'api', key: 'sk-test' },
-    }])
+    expect(requests).toEqual([
+      {
+        url: 'http://127.0.0.1:4096/auth/openrouter',
+        method: 'PUT',
+        body: { type: 'api', key: 'sk-test' },
+      },
+    ])
   })
 
   test('deletes provider auth through the OpenCode auth endpoint', async () => {
@@ -46,14 +105,16 @@ describe('OpenCodeClientFactory permissions API', () => {
       },
     })
 
-    await expect(factory.create('http://127.0.0.1:4096').deleteProviderAuth(
-      'openrouter',
-    )).resolves.toBe(true)
+    await expect(
+      factory.create('http://127.0.0.1:4096').deleteProviderAuth('openrouter'),
+    ).resolves.toBe(true)
 
-    expect(requests).toEqual([{
-      url: 'http://127.0.0.1:4096/auth/openrouter',
-      method: 'DELETE',
-    }])
+    expect(requests).toEqual([
+      {
+        url: 'http://127.0.0.1:4096/auth/openrouter',
+        method: 'DELETE',
+      },
+    ])
   })
 
   test('lists pending permissions from the SDK v2 endpoint without trailing slash', async () => {
@@ -112,8 +173,9 @@ describe('OpenCodeClientFactory permissions API', () => {
       },
     })
 
-    await expect(factory.create('http://127.0.0.1:4096').listExperimentalToolIds())
-      .resolves.toEqual(['agent-teams_runtime_deliver_message'])
+    await expect(
+      factory.create('http://127.0.0.1:4096').listExperimentalToolIds(),
+    ).resolves.toEqual(['agent-teams_runtime_deliver_message'])
     expect(paths).toEqual(['http://127.0.0.1:4096/experimental/tool/ids'])
   })
 
@@ -150,11 +212,13 @@ describe('OpenCodeClientFactory permissions API', () => {
       },
     })
 
-    await expect(factory.create('http://127.0.0.1:4096').listExperimentalTools({
-      directory: '/repo',
-      provider: 'opencode',
-      model: 'big-pickle',
-    })).resolves.toEqual([{ id: 'agent-teams_runtime_deliver_message' }])
+    await expect(
+      factory.create('http://127.0.0.1:4096').listExperimentalTools({
+        directory: '/repo',
+        provider: 'opencode',
+        model: 'big-pickle',
+      }),
+    ).resolves.toEqual([{ id: 'agent-teams_runtime_deliver_message' }])
     expect(paths).toEqual([
       'http://127.0.0.1:4096/experimental/tool?directory=%2Frepo&provider=opencode&model=big-pickle',
     ])

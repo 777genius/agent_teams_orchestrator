@@ -19,7 +19,15 @@ export type CodexNativeExecRunnerOptions = {
   prompt: string
   cwd: string
   model?: string | null
-  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null
+  reasoningEffort?:
+    | 'minimal'
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'xhigh'
+    | 'max'
+    | 'ultra'
+    | null
   approvalPolicy?: 'never' | 'on-request' | null
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access' | null
   additionalWritableDirectories?: string[]

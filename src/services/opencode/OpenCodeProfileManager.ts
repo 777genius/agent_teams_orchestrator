@@ -1,5 +1,6 @@
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readlink, readdir, readFile, rm, stat, symlink } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readlink, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { Dirent } from 'node:fs'
@@ -15,10 +16,18 @@ import {
   resolveOpenCodeAppMcpLaunchConfig,
 } from './OpenCodeMcpManager.js'
 import {
+  getOpenCodeCuratedSubscriptionProviderConfigs,
+  getOpenCodeManagedSubscriptionPluginPackages,
+} from './OpenCodeCuratedSubscriptionCatalog.js'
+import {
   doesOpenCodeAuthStoreIncludeSource,
-  mergeOpenCodeAuthStores,
-  reconcileOpenCodeManagedAuthStore,
+  fanOutOpenCodeOAuthCredential,
+  mergeOpenCodeAuthStoresWithFreshestOAuth,
+  reconcileOpenCodeManagedAuthStores,
+  readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
+  removeOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
 } from './OpenCodeAuthStore.js'
 import {
   readOpenCodeGlobalManagedRuntimePreferences,
@@ -111,58 +120,6 @@ const ATLAS_CLOUD_PROVIDER_CONFIG = {
     baseURL: 'https://api.atlascloud.ai/v1',
   },
   models: ATLAS_CLOUD_OPENCODE_MODELS,
-} as const
-
-const XIAOMI_MIMO_TOKEN_PLAN_MODELS = {
-  'mimo-v2.5-pro': {
-    name: 'mimo-v2.5-pro',
-    limit: {
-      context: 1_048_576,
-      output: 131_072,
-    },
-    modalities: {
-      input: ['text'],
-      output: ['text'],
-    },
-  },
-  'mimo-v2.5': {
-    name: 'mimo-v2.5',
-    limit: {
-      context: 1_048_576,
-      output: 131_072,
-    },
-    modalities: {
-      input: ['text', 'image'],
-      output: ['text'],
-    },
-  },
-} as const
-
-const XIAOMI_TOKEN_PLAN_PROVIDER_CONFIGS = {
-  'xiaomi-token-plan-ams': {
-    npm: '@ai-sdk/openai-compatible',
-    name: 'Xiaomi MiMo Token Plan - Europe',
-    options: {
-      baseURL: 'https://token-plan-ams.xiaomimimo.com/v1',
-    },
-    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
-  },
-  'xiaomi-token-plan-sgp': {
-    npm: '@ai-sdk/openai-compatible',
-    name: 'Xiaomi MiMo Token Plan - Singapore',
-    options: {
-      baseURL: 'https://token-plan-sgp.xiaomimimo.com/v1',
-    },
-    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
-  },
-  'xiaomi-token-plan-cn': {
-    npm: '@ai-sdk/openai-compatible',
-    name: 'Xiaomi MiMo Token Plan - China',
-    options: {
-      baseURL: 'https://token-plan-cn.xiaomimimo.com/v1',
-    },
-    models: XIAOMI_MIMO_TOKEN_PLAN_MODELS,
-  },
 } as const
 
 function hashString(value: string): string {
@@ -455,7 +412,7 @@ export function buildManagedConfig(
     snapshot: true,
     provider: {
       [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
-      ...XIAOMI_TOKEN_PLAN_PROVIDER_CONFIGS,
+      ...getOpenCodeCuratedSubscriptionProviderConfigs(),
     },
     agent: {
       [OPEN_CODE_TEAMMATE_AGENT_NAME]: {
@@ -566,6 +523,329 @@ function deepMergeOpenCodeConfig(
     merged[key] = value
   }
   return merged
+}
+
+export function applyOpenCodeManagedSubscriptionPlugins(
+  config: Record<string, unknown>,
+): void {
+  const configuredPlugins = Array.isArray(config.plugin)
+    ? config.plugin.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : []
+  config.plugin = [
+    ...new Set([
+      ...configuredPlugins,
+      ...getOpenCodeManagedSubscriptionPluginPackages(),
+    ]),
+  ]
+}
+
+export async function repairEmptyOpenCodeManagedPluginCaches(
+  xdgCacheHome: string,
+): Promise<void> {
+  const packagesRoot = path.join(xdgCacheHome, 'opencode', 'packages')
+  await Promise.all(
+    getOpenCodeManagedSubscriptionPluginPackages().map(async packageSpec => {
+      const packageCachePath = path.join(packagesRoot, packageSpec)
+      let entries: string[]
+      try {
+        entries = await readdir(packageCachePath)
+      } catch (error) {
+        if (getErrnoCode(error) === 'ENOENT') {
+          return
+        }
+        throw error
+      }
+      // OpenCode can leave this directory empty if the app closes during the
+      // first package install. Its resolver then treats the path as cached and
+      // never retries, so remove only the provably empty managed cache entry.
+      if (entries.length === 0) {
+        await rm(packageCachePath, { recursive: true, force: true })
+      }
+    }),
+  )
+}
+
+export async function areOpenCodeManagedPluginCachesReady(
+  xdgCacheHome: string,
+): Promise<boolean> {
+  const packagesRoot = path.join(xdgCacheHome, 'opencode', 'packages')
+  const readiness = await Promise.all(
+    getOpenCodeManagedSubscriptionPluginPackages().map(packageSpec =>
+      fileExists(path.join(packagesRoot, packageSpec, 'package.json')),
+    ),
+  )
+  return readiness.every(Boolean)
+}
+
+interface OpenCodeNativeCliCredentialBridge {
+  binPath: string
+  cursorAgentExecutablePath: string
+  kiroCliExecutablePath: string
+  hostHomePath: string
+}
+
+type KiroCliAuthProbe = (
+  executablePath: string,
+  platform: NodeJS.Platform,
+) => Promise<boolean>
+
+type CursorAgentAuthProbe = (
+  executablePath: string,
+  platform: NodeJS.Platform,
+) => Promise<boolean>
+
+const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
+
+const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
+  await new Promise<boolean>(resolve => {
+    execFile(
+      executablePath,
+      ['status'],
+      {
+        timeout: 15_000,
+        windowsHide: true,
+        shell: platform === 'win32',
+      },
+      (error, stdout, stderr) => {
+        resolve(!error && /\blogged in\b/i.test(`${stdout}\n${stderr}`))
+      },
+    )
+  })
+
+const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
+  await new Promise<boolean>(resolve => {
+    execFile(
+      executablePath,
+      ['whoami', '--format', 'json'],
+      {
+        timeout: 15_000,
+        windowsHide: true,
+        shell: platform === 'win32',
+      },
+      (error, stdout) => {
+        resolve(!error && stdout.trim().length > 0)
+      },
+    )
+  })
+
+function isCursorAgentAuthMarker(credential: Record<string, unknown> | null): boolean {
+  return credential?.type === 'api' && credential.key === CURSOR_AGENT_AUTH_MARKER
+}
+
+export async function ensureOpenCodeCursorPluginAuthCredential(input: {
+  globalAuthPath: string
+  managedAuthPath: string
+  cursorAgentExecutablePath: string
+  platform?: NodeJS.Platform
+  probe?: CursorAgentAuthProbe
+}): Promise<boolean> {
+  const [globalCredential, managedCredential] = await Promise.all([
+    readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
+    readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'cursor-acp' }),
+  ])
+  const explicitCredential = [globalCredential, managedCredential].find(
+    credential => credential && !isCursorAgentAuthMarker(credential),
+  )
+  if (explicitCredential) {
+    await Promise.all([
+      globalCredential === explicitCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'cursor-acp',
+            credential: explicitCredential,
+          }),
+      managedCredential === explicitCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'cursor-acp',
+            credential: explicitCredential,
+          }),
+    ])
+    return false
+  }
+
+  const authenticated = await (input.probe ?? probeCursorAgentAuth)(
+    input.cursorAgentExecutablePath,
+    input.platform ?? process.platform,
+  ).catch(() => false)
+  if (!authenticated) {
+    await Promise.all([
+      isCursorAgentAuthMarker(globalCredential)
+        ? removeOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'cursor-acp',
+          })
+        : Promise.resolve(),
+      isCursorAgentAuthMarker(managedCredential)
+        ? removeOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'cursor-acp',
+          })
+        : Promise.resolve(),
+    ])
+    return false
+  }
+
+  const credential = { type: 'api', key: CURSOR_AGENT_AUTH_MARKER }
+  await Promise.all([
+    isCursorAgentAuthMarker(globalCredential)
+      ? Promise.resolve()
+      : upsertOpenCodeAuthCredential({
+          authPath: input.globalAuthPath,
+          providerId: 'cursor-acp',
+          credential,
+        }),
+    isCursorAgentAuthMarker(managedCredential)
+      ? Promise.resolve()
+      : upsertOpenCodeAuthCredential({
+          authPath: input.managedAuthPath,
+          providerId: 'cursor-acp',
+          credential,
+        }),
+  ])
+  return !isCursorAgentAuthMarker(globalCredential) || !isCursorAgentAuthMarker(managedCredential)
+}
+
+export async function ensureOpenCodeKiroPluginAuthCredential(input: {
+  globalAuthPath: string
+  managedAuthPath: string
+  kiroCliExecutablePath: string
+  platform?: NodeJS.Platform
+  probe?: KiroCliAuthProbe
+  now?: () => number
+}): Promise<boolean> {
+  const now = (input.now ?? Date.now)()
+  const [globalCredential, managedCredential] = await Promise.all([
+    readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
+    readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
+  ])
+  const existingCredential = globalCredential ?? managedCredential
+  const existingExpiry =
+    typeof existingCredential?.expires === 'number' ? existingCredential.expires : null
+  const existingCredentialIsFresh = Boolean(
+    existingCredential
+      && (existingExpiry === null || existingExpiry > now + 5 * 60 * 1000),
+  )
+  if (existingCredential && existingCredentialIsFresh) {
+    await Promise.all([
+      globalCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+      managedCredential
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+    ])
+    return false
+  }
+
+  const authenticated = await (input.probe ?? probeKiroCliAuth)(
+    input.kiroCliExecutablePath,
+    input.platform ?? process.platform,
+  ).catch(() => false)
+  if (!authenticated) {
+    if (existingCredential) {
+      await Promise.all([
+        removeOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'kiro' }),
+        removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
+      ])
+    }
+    return false
+  }
+
+  // opencode-kiro only needs an OAuth presence marker to run its provider
+  // options loader. Real authentication and refresh remain owned by kiro-cli.
+  const credential = {
+    type: 'oauth',
+    access: 'authenticated',
+    refresh: '',
+    expires: now + 8 * 60 * 60 * 1000,
+  }
+  await Promise.all([
+    upsertOpenCodeAuthCredential({
+      authPath: input.globalAuthPath,
+      providerId: 'kiro',
+      credential,
+    }),
+    upsertOpenCodeAuthCredential({
+      authPath: input.managedAuthPath,
+      providerId: 'kiro',
+      credential,
+    }),
+  ])
+  return true
+}
+
+function quotePosixShellValue(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
+function escapeWindowsBatchValue(value: string): string {
+  return value.replaceAll('%', '%%')
+}
+
+export async function ensureOpenCodeNativeCliCredentialBridge(
+  profileRootPath: string,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<OpenCodeNativeCliCredentialBridge> {
+  const hostHomePath = (
+    platform === 'win32'
+      ? hostEnv.USERPROFILE?.trim() || hostEnv.HOME?.trim()
+      : hostEnv.HOME?.trim() || hostEnv.USERPROFILE?.trim()
+  ) || os.homedir()
+  const hostPath = hostEnv.PATH ?? ''
+  const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
+  await mkdir(binPath, { recursive: true })
+
+  const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
+    if (platform === 'win32') {
+      const bridgePath = path.join(binPath, `${command}.cmd`)
+      const content = [
+        '@echo off',
+        `set "HOME=${escapeWindowsBatchValue(hostHomePath)}"`,
+        `set "USERPROFILE=${escapeWindowsBatchValue(hostHomePath)}"`,
+        'set "XDG_CONFIG_HOME="',
+        'set "XDG_DATA_HOME="',
+        'set "XDG_CACHE_HOME="',
+        `set "PATH=${escapeWindowsBatchValue(hostPath)}"`,
+        `${command}.cmd %*`,
+        'exit /b %ERRORLEVEL%',
+        '',
+      ].join('\r\n')
+      await writeFile(bridgePath, content, 'utf8')
+      return bridgePath
+    }
+
+    const bridgePath = path.join(binPath, command)
+    const content = [
+      '#!/bin/sh',
+      `export HOME=${quotePosixShellValue(hostHomePath)}`,
+      `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
+      'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
+      `export PATH=${quotePosixShellValue(hostPath)}`,
+      `exec ${command} "$@"`,
+      '',
+    ].join('\n')
+    await writeFile(bridgePath, content, 'utf8')
+    await chmod(bridgePath, 0o700)
+    return bridgePath
+  }
+
+  const [cursorAgentExecutablePath, kiroCliExecutablePath] = await Promise.all([
+    writeBridge('cursor-agent'),
+    writeBridge('kiro-cli'),
+  ])
+  return { binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath }
 }
 
 function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> {
@@ -749,6 +1029,14 @@ export class OpenCodeProfileManager {
       .sort((left, right) => left.localeCompare(right))
   }
 
+  async fanOutOAuthCredential(providerId: string, sourceAuthPath: string): Promise<void> {
+    await fanOutOpenCodeOAuthCredential({
+      providerId,
+      sourceAuthPath,
+      targetAuthPaths: [this.getGlobalAuthPath(), ...(await this.listManagedAuthPaths())],
+    })
+  }
+
   private getProjectPath(projectPath?: string | null): string {
     return path.resolve(projectPath?.trim() || getCwd())
   }
@@ -827,6 +1115,9 @@ export class OpenCodeProfileManager {
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
+    if (options.includeManagedSubscriptionPlugins !== false) {
+      applyOpenCodeManagedSubscriptionPlugins(managedConfig)
+    }
     applyManagedPathEnvironmentToMcpConfig(managedConfig, {
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
@@ -860,6 +1151,11 @@ export class OpenCodeProfileManager {
       mkdir(xdgCacheHome, { recursive: true }),
       mkdir(sharedNpmCachePath, { recursive: true }),
     ])
+    let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
+    if (options.includeManagedSubscriptionPlugins !== false) {
+      await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
+      nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath)
+    }
     await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
 
     const globalAuthExists = await fileExists(globalAuthPath)
@@ -877,10 +1173,26 @@ export class OpenCodeProfileManager {
       globalAuthFingerprint,
       sourceAuthSources,
     })
-    await reconcileOpenCodeManagedAuthStore({
+    await reconcileOpenCodeManagedAuthStores({
       sourceAuthPaths: authSourcePaths,
+      globalAuthPath,
       managedAuthPath,
+      peerManagedAuthPaths: await this.listManagedAuthPaths(),
     })
+    if (nativeCliCredentialBridge) {
+      await Promise.all([
+        ensureOpenCodeCursorPluginAuthCredential({
+          globalAuthPath,
+          managedAuthPath,
+          cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
+        }),
+        ensureOpenCodeKiroPluginAuthCredential({
+          globalAuthPath,
+          managedAuthPath,
+          kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
+        }),
+      ])
+    }
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
     const authState = await (async () => {
@@ -894,7 +1206,7 @@ export class OpenCodeProfileManager {
         const managed = await readOpenCodeAuthStore(managedAuthPath)
         let expectedAuth: Awaited<ReturnType<typeof readOpenCodeAuthStore>> = {}
         for (const authSourcePath of authSourcePaths) {
-          expectedAuth = mergeOpenCodeAuthStores({
+          expectedAuth = mergeOpenCodeAuthStoresWithFreshestOAuth({
             source: await readOpenCodeAuthStore(authSourcePath),
             managed: expectedAuth,
           })
@@ -922,6 +1234,16 @@ export class OpenCodeProfileManager {
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
       OPENCODE_DISABLE_CLAUDE_CODE: '1',
       OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
+    }
+    if (nativeCliCredentialBridge) {
+      env.PATH = [nativeCliCredentialBridge.binPath, process.env.PATH]
+        .filter((value): value is string => Boolean(value))
+        .join(path.delimiter)
+      env.CURSOR_ACP_HOME_DIR =
+        process.env.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
+      env.CURSOR_AGENT_EXECUTABLE =
+        process.env.CURSOR_AGENT_EXECUTABLE?.trim()
+        || nativeCliCredentialBridge.cursorAgentExecutablePath
     }
     delete env.OPENCODE_CONFIG
 

@@ -1,5 +1,5 @@
 name: Release Runtime
-run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent-teams-ai' }}@${{ inputs.target_release_tag || github.ref_name }}
+run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent_teams_orchestrator' }}@${{ inputs.target_release_tag || github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ on:
         required: false
         type: string
       target_release_repo:
-        description: Public repo that should receive the runtime assets
+        description: Repository that should receive the runtime assets
         required: false
-        default: 777genius/agent-teams-ai
+        default: 777genius/agent_teams_orchestrator
         type: string
       target_release_tag:
         description: Release tag in the public repo, for example v1.4.0
@@ -26,7 +26,7 @@ permissions:
   contents: read
 
 env:
-  DEFAULT_TARGET_RELEASE_REPO: 777genius/agent-teams-ai
+  DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator
 
 jobs:
   prepare-release:

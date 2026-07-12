@@ -663,6 +663,10 @@ async function buildOpenCodeStatus(
               context: metadata.context,
               limits: metadata.limits,
               free: metadata.free,
+              releaseDate:
+                typeof metadata.raw.release_date === 'string'
+                  ? metadata.raw.release_date
+                  : null,
               opencode: opencodeMetadata,
             }
           : {
@@ -1015,7 +1019,7 @@ export async function getUnifiedRuntimeStatusPayload(
           },
           reasoningEffort: {
             supported: true,
-            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
             configPassthrough: true,
           },
         },
@@ -1064,7 +1068,7 @@ export async function getUnifiedRuntimeStatusPayload(
           },
           reasoningEffort: {
             supported: true,
-            values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+            values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
             configPassthrough: true,
           },
         },

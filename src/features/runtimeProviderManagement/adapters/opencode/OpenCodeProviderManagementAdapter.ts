@@ -1,11 +1,20 @@
+import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
-  openCodeClientFactory,
-} from '../../../../services/opencode/OpenCodeClientFactory.js'
+  getOpenCodeCuratedSubscriptionProvider,
+  getOpenCodeCuratedSubscriptionProviderIds,
+  getOpenCodeFastCuratedSubscriptionProviderIds,
+  getOpenCodeSeededSubscriptionProviderIds,
+  OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS,
+  validateOpenCodeCuratedSubscriptionKey,
+} from '../../../../services/opencode/OpenCodeCuratedSubscriptionCatalog.js'
 import {
+  readOpenCodeAuthCredential,
   removeOpenCodeAuthCredential,
+  upsertOpenCodeAuthCredential,
   upsertOpenCodeApiAuth,
   upsertOpenCodeApiAuthCredential,
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
+import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
@@ -36,6 +45,9 @@ import type {
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
   OpenCodeProviderAuthMethod,
+  OpenCodeProviderOAuthAuthorization,
+  OpenCodeProviderOAuthAuthorizeInput,
+  OpenCodeProviderOAuthCallbackInput,
   OpenCodeProviderListEntry,
   OpenCodeProviderResponse,
   OpenCodeServerDocResponse,
@@ -64,9 +76,11 @@ import type {
   ProviderModelAvailability,
   ProviderModelTestResult,
   ProviderOwnership,
+  ProviderOAuthFlowObserver,
   ProviderRuntimeState,
   ProviderSelectionInput,
   ProviderSetupForm,
+  ProviderSetupAuthOption,
   ProviderSetupPrompt,
   ProviderSetupPromptCondition,
   ProviderSetupPromptOption,
@@ -89,16 +103,21 @@ type OpenCodeInventoryServiceLike = {
   clearCache?(): void
 }
 
-type OpenCodeHostManagerLike = Pick<
-  typeof openCodeHostManager,
-  'ensureHost' | 'releaseHost'
->
+type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
 
 type OpenCodeProviderManagementClient = {
   getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
   getProviders(): Promise<OpenCodeProviderResponse>
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc?(): Promise<OpenCodeServerDocResponse>
+  authorizeProviderOAuth?(
+    providerId: string,
+    body: OpenCodeProviderOAuthAuthorizeInput,
+  ): Promise<OpenCodeProviderOAuthAuthorization>
+  completeProviderOAuth?(
+    providerId: string,
+    body: OpenCodeProviderOAuthCallbackInput,
+  ): Promise<boolean>
   setProviderAuth?(providerId: string, body: OpenCodeApiAuthInput): Promise<boolean>
   deleteProviderAuth?(providerId: string): Promise<boolean>
 }
@@ -123,10 +142,16 @@ type OpenCodeProviderManagementAdapterDeps = {
       apiKey: string
       metadata?: Record<string, string> | null
     }): Promise<void>
-    removeCredential(input: {
+    readCredential?(input: {
       authPath: string
       providerId: string
+    }): Promise<OpenCodeAuthCredential | null>
+    upsertCredential?(input: {
+      authPath: string
+      providerId: string
+      credential: OpenCodeAuthCredential
     }): Promise<void>
+    removeCredential(input: { authPath: string; providerId: string }): Promise<void>
   }
   profileManager?: {
     listManagedAuthPaths(): Promise<string[]>
@@ -147,22 +172,19 @@ type OpenCodeProviderManagementAdapterDeps = {
   inventoryTimeoutMs?: number
 }
 
-type SafeValue<T> =
-  | { ok: true; value: T }
-  | { ok: false; message: string }
+type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
 
-const XIAOMI_TOKEN_PLAN_PROVIDER_IDS = [
-  'xiaomi-token-plan-ams',
-  'xiaomi-token-plan-sgp',
-  'xiaomi-token-plan-cn',
-] as const
-const XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET = new Set<string>(XIAOMI_TOKEN_PLAN_PROVIDER_IDS)
-const XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES = Object.fromEntries(
-  XIAOMI_TOKEN_PLAN_PROVIDER_IDS.map(providerId => [
-    providerId,
-    [`${providerId}/mimo-v2.5-pro`, `${providerId}/mimo-v2.5`],
+const FAST_CURATED_SETUP_PROVIDER_IDS = new Set<string>(
+  getOpenCodeFastCuratedSubscriptionProviderIds(),
+)
+const CURATED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeCuratedSubscriptionProviderIds()
+const SEEDED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeSeededSubscriptionProviderIds()
+const CURATED_SUBSCRIPTION_PROVIDER_LABELS = Object.fromEntries(
+  OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => [
+    definition.id,
+    definition.displayName,
   ]),
-) as Record<string, readonly string[]>
+)
 
 const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
@@ -183,23 +205,30 @@ const KNOWN_PROVIDER_LABELS: Record<string, string> = {
   togetherai: 'Together AI',
   vercel: 'Vercel AI Gateway',
   xai: 'xAI',
-  'xiaomi-token-plan-ams': 'Xiaomi MiMo Token Plan - Europe',
-  'xiaomi-token-plan-cn': 'Xiaomi MiMo Token Plan - China',
-  'xiaomi-token-plan-sgp': 'Xiaomi MiMo Token Plan - Singapore',
   zai: 'Z.AI',
   zenmux: 'ZenMux',
+  ...CURATED_SUBSCRIPTION_PROVIDER_LABELS,
 }
 
 const SEEDED_PROVIDER_IDS = [
   'openrouter',
   'opencode',
   'atlascloud',
-  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+  ...SEEDED_SUBSCRIPTION_PROVIDER_IDS,
 ] as const
-const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>(['atlascloud'])
+const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
+  'atlascloud',
+  'github-copilot',
+  'kiro',
+  'cursor-acp',
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => definition.id),
+])
 const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
   'atlascloud',
-  ...XIAOMI_TOKEN_PLAN_PROVIDER_IDS,
+  'github-copilot',
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+    .filter(definition => definition.requireConnectExecutionProof)
+    .map(definition => definition.id),
 ])
 const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
   atlascloud: [
@@ -207,10 +236,24 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/deepseek-ai/deepseek-v4-flash',
     'atlascloud/zai-org/glm-5.1',
   ],
-  ...XIAOMI_TOKEN_PLAN_MODEL_PROBE_PREFERENCES,
+  'github-copilot': [
+    'github-copilot/gpt-4.1',
+    'github-copilot/gpt-5-mini',
+    'github-copilot/gpt-5',
+  ],
+  ...Object.fromEntries(
+    OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+      .filter(definition => definition.modelProbePreferences.length > 0)
+      .map(definition => [definition.id, definition.modelProbePreferences]),
+  ),
 }
 const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
-  ...SEEDED_PROVIDER_IDS,
+  ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
+    .filter(definition => definition.credentialKind === 'api-key')
+    .map(definition => definition.id),
+  'openrouter',
+  'opencode',
+  'atlascloud',
   'anthropic',
   'cerebras',
   'deepseek',
@@ -231,6 +274,7 @@ const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -240,20 +284,96 @@ type ProviderDirectoryCacheEntry = {
 
 type OpenCodeProviderManagementCapabilities = {
   deleteAuth: boolean
+  authorizeOAuth: boolean
+  completeOAuth: boolean
 }
 
 const EMPTY_CAPABILITIES: OpenCodeProviderManagementCapabilities = {
   deleteAuth: false,
+  authorizeOAuth: false,
+  completeOAuth: false,
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : null
+}
+
+function canonicalizeCredentialValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeCredentialValue)
+  }
+  const record = asRecord(value)
+  if (!record) {
+    return value
+  }
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map(key => [key, canonicalizeCredentialValue(record[key])]),
+  )
+}
+
+function credentialsEqual(
+  left: OpenCodeAuthCredential,
+  right: OpenCodeAuthCredential,
+): boolean {
+  return JSON.stringify(canonicalizeCredentialValue(left)) ===
+    JSON.stringify(canonicalizeCredentialValue(right))
+}
+
+function waitForAbortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) {
+    return Promise.resolve(false)
+  }
+  return new Promise(resolve => {
+    const onAbort = () => {
+      clearTimeout(timeout)
+      resolve(false)
+    }
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(true)
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function normalizeOAuthOperationId(value: string | null | undefined): string | null {
+  const normalized = value?.trim() ?? ''
+  return normalized && normalized.length <= 128 && /^[a-z0-9._:-]+$/i.test(normalized)
+    ? normalized
+    : null
+}
+
+function normalizeOAuthMethodIndex(value: number | null | undefined): number | null {
+  return Number.isInteger(value) && Number(value) >= 0 ? Number(value) : null
+}
+
+function normalizeOAuthAuthorizationUrl(value: string): string | null {
+  if (!value.trim() || value.length > 8_192) {
+    return null
+  }
+  try {
+    const url = new URL(value)
+    const loopbackHttp =
+      url.protocol === 'http:' &&
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]')
+    if (url.protocol !== 'https:' && !loopbackHttp) {
+      return null
+    }
+    if (url.username || url.password) {
+      return null
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
 }
 
 function normalizeQuery(value: string | null | undefined): string {
@@ -295,25 +415,6 @@ function normalizeDirectoryCursor(value: string | null | undefined): number {
 function normalizeProviderId(value: string | null | undefined): string | null {
   const normalized = value?.trim().toLowerCase()
   return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
-}
-
-function isXiaomiTokenPlanProviderId(providerId: string): boolean {
-  return XIAOMI_TOKEN_PLAN_PROVIDER_ID_SET.has(providerId)
-}
-
-function getXiaomiTokenPlanApiKeyError(providerId: string, apiKey: string): string | null {
-  if (!isXiaomiTokenPlanProviderId(providerId)) {
-    return null
-  }
-
-  if (apiKey.startsWith('sk-')) {
-    return 'Xiaomi Token Plan providers require a tp-... API key. Pay-as-you-go sk-... keys cannot be used with Token Plan Base URLs.'
-  }
-  if (!apiKey.startsWith('tp-')) {
-    return 'Xiaomi Token Plan API key must start with tp-. Copy the key from the Token Plan page.'
-  }
-
-  return null
 }
 
 function normalizePositiveLimit(value: number | null | undefined): number | null {
@@ -401,10 +502,7 @@ function appendViewDiagnostics(
   }
   return {
     ...view,
-    diagnostics: [
-      ...view.diagnostics,
-      ...appendedDiagnostics,
-    ],
+    diagnostics: [...view.diagnostics, ...appendedDiagnostics],
   }
 }
 
@@ -466,18 +564,18 @@ function addManagedProviderToInventory(
   if (!normalizedProviderId) {
     return inventory
   }
-  const connectedProviders = inventory.connectedProviders
-    .filter(provider => normalizeProviderId(provider.id) !== normalizedProviderId)
+  const connectedProviders = inventory.connectedProviders.filter(
+    provider => normalizeProviderId(provider.id) !== normalizedProviderId,
+  )
   connectedProviders.push({
     id: normalizedProviderId,
     authHint: 'api',
     source: 'credentials',
     credentialScopes: ['managed'],
   })
-  const availableProviders = Array.from(new Set([
-    ...inventory.availableProviders,
-    normalizedProviderId,
-  ])).sort()
+  const availableProviders = Array.from(
+    new Set([...inventory.availableProviders, normalizedProviderId]),
+  ).sort()
   return {
     ...inventory,
     connectedProviders,
@@ -493,10 +591,9 @@ function removeManagedProviderFromInventory(
   if (!normalizedProviderId) {
     return inventory
   }
-  const availableProviders = Array.from(new Set([
-    ...inventory.availableProviders,
-    normalizedProviderId,
-  ])).sort()
+  const availableProviders = Array.from(
+    new Set([...inventory.availableProviders, normalizedProviderId]),
+  ).sort()
   return {
     ...inventory,
     connectedProviders: inventory.connectedProviders.flatMap(provider => {
@@ -506,13 +603,14 @@ function removeManagedProviderFromInventory(
       if (provider.source !== 'credentials') {
         return [provider]
       }
-      const remainingScopes = provider.credentialScopes
-        ?.filter(scope => scope === 'local') ?? []
+      const remainingScopes = provider.credentialScopes?.filter(scope => scope === 'local') ?? []
       return remainingScopes.length > 0
-        ? [{
-            ...provider,
-            credentialScopes: remainingScopes,
-          }]
+        ? [
+            {
+              ...provider,
+              credentialScopes: remainingScopes,
+            },
+          ]
         : []
     }),
     availableProviders,
@@ -530,20 +628,16 @@ function applyManagedDefaultToInventory(
   if (!profile) {
     return inventory
   }
-  const projectDefaultModelId = input.scope === 'project'
-    ? input.modelId
-    : profile.projectDefaultModelId
-  const allProjectsDefaultModelId = input.scope === 'all_projects'
-    ? input.modelId
-    : profile.allProjectsDefaultModelId
-  const effectiveManagedDefaultModelId =
-    projectDefaultModelId ?? allProjectsDefaultModelId ?? null
-  const effectiveManagedDefaultSource =
-    projectDefaultModelId
-      ? 'project' as const
-      : allProjectsDefaultModelId
-        ? 'all_projects' as const
-        : null
+  const projectDefaultModelId =
+    input.scope === 'project' ? input.modelId : profile.projectDefaultModelId
+  const allProjectsDefaultModelId =
+    input.scope === 'all_projects' ? input.modelId : profile.allProjectsDefaultModelId
+  const effectiveManagedDefaultModelId = projectDefaultModelId ?? allProjectsDefaultModelId ?? null
+  const effectiveManagedDefaultSource = projectDefaultModelId
+    ? ('project' as const)
+    : allProjectsDefaultModelId
+      ? ('all_projects' as const)
+      : null
   return {
     ...inventory,
     profile: {
@@ -759,18 +853,6 @@ function getProviderAuthMethods(
   return normalizeProviderAuthMap(providerAuth).get(providerId) ?? []
 }
 
-function getApiAuthMethod(
-  methods: readonly OpenCodeProviderAuthMethod[],
-): OpenCodeProviderAuthMethod | null {
-  return methods.find(method => method.type?.trim().toLowerCase() === 'api') ?? null
-}
-
-function getOauthAuthMethod(
-  methods: readonly OpenCodeProviderAuthMethod[],
-): OpenCodeProviderAuthMethod | null {
-  return methods.find(method => method.type?.trim().toLowerCase() === 'oauth') ?? null
-}
-
 function normalizeSetupPromptOption(value: unknown): ProviderSetupPromptOption | null {
   const record = asRecord(value)
   if (!record) {
@@ -818,7 +900,9 @@ function normalizeSetupPrompt(value: unknown): ProviderSetupPrompt | null {
     return null
   }
   const options = Array.isArray(record.options)
-    ? record.options.map(normalizeSetupPromptOption).filter((option): option is ProviderSetupPromptOption => Boolean(option))
+    ? record.options
+        .map(normalizeSetupPromptOption)
+        .filter((option): option is ProviderSetupPromptOption => Boolean(option))
     : []
   const promptType = type === 'select' ? 'select' : 'text'
   return {
@@ -846,9 +930,7 @@ function isSecretPromptKey(key: string): boolean {
   )
 }
 
-function splitApiAuthPrompts(
-  method: OpenCodeProviderAuthMethod,
-): {
+function splitApiAuthPrompts(method: OpenCodeProviderAuthMethod): {
   secretLabel: string
   secretPlaceholder: string | null
   prompts: ProviderSetupPrompt[]
@@ -864,6 +946,86 @@ function splitApiAuthPrompts(
       .filter(prompt => prompt !== secretPrompt)
       .map(prompt => ({ ...prompt, secret: false })),
   }
+}
+
+function buildOpenCodeSetupAuthOptions(input: {
+  methods: readonly OpenCodeProviderAuthMethod[]
+  capabilities: OpenCodeProviderManagementCapabilities
+}): ProviderSetupAuthOption[] {
+  return input.methods.flatMap<ProviderSetupAuthOption>((method, methodIndex) => {
+    const methodType = method.type?.trim().toLowerCase()
+    const label =
+      asString(method.label) ?? (methodType === 'oauth' ? 'Sign in with OAuth' : 'API key')
+    if (methodType === 'api') {
+      const { secretLabel, secretPlaceholder, prompts } = splitApiAuthPrompts(method)
+      return [
+        {
+          id: `api:${methodIndex}`,
+          method: 'api' as const,
+          methodIndex,
+          label,
+          supported: true,
+          disabledReason: null,
+          secret: {
+            key: 'key' as const,
+            label: secretLabel,
+            placeholder: secretPlaceholder,
+            required: true,
+          },
+          prompts,
+        },
+      ]
+    }
+    if (methodType === 'oauth') {
+      const supported = input.capabilities.authorizeOAuth && input.capabilities.completeOAuth
+      const prompts = (method.prompts ?? [])
+        .map(normalizeSetupPrompt)
+        .filter((prompt): prompt is ProviderSetupPrompt => Boolean(prompt))
+      return [
+        {
+          id: `oauth:${methodIndex}`,
+          method: 'oauth' as const,
+          methodIndex,
+          label,
+          supported,
+          disabledReason: supported
+            ? null
+            : 'Update OpenCode to a version that exposes provider OAuth authorize and callback endpoints.',
+          secret: null,
+          prompts,
+        },
+      ]
+    }
+    return []
+  })
+}
+
+function isSuperGrokDeviceAuthOption(option: ProviderSetupAuthOption): boolean {
+  if (option.method !== 'oauth') {
+    return false
+  }
+  const label = option.label.toLowerCase()
+  return (
+    label.includes('device') ||
+    label.includes('browser code') ||
+    label.includes('headless') ||
+    label.includes('remote') ||
+    label.includes('vps')
+  )
+}
+
+function prepareSuperGrokAuthOptions(
+  options: readonly ProviderSetupAuthOption[],
+): ProviderSetupAuthOption[] {
+  return options.map(option => {
+    if (!isSuperGrokDeviceAuthOption(option)) {
+      return option
+    }
+    return {
+      ...option,
+      label: 'SuperGrok browser code (recommended)',
+    }
+  })
 }
 
 function promptConditionMatches(
@@ -885,13 +1047,13 @@ function promptConditionMatches(
   }
 }
 
-function normalizeSetupMetadata(
-  form: ProviderSetupForm,
+function normalizeSetupPromptMetadata(
+  prompts: readonly ProviderSetupPrompt[],
   metadata: Record<string, string> | null | undefined,
 ): Record<string, string> {
   const source = metadata ?? {}
   const normalized: Record<string, string> = {}
-  for (const prompt of form.prompts) {
+  for (const prompt of prompts) {
     if (!promptConditionMatches(prompt.when, { ...source, ...normalized })) {
       continue
     }
@@ -911,16 +1073,14 @@ function getCuratedApiSetupProfile(providerId: string): {
   secretLabel: string
   secretPlaceholder: string
 } {
-  if (isXiaomiTokenPlanProviderId(providerId)) {
-    return {
-      description: 'Use the Xiaomi Token Plan key from the Token Plan dashboard. After connect, select the Xiaomi MiMo model under the OpenCode runtime.',
-      secretLabel: 'Token Plan API key',
-      secretPlaceholder: 'tp-xxxxx',
-    }
+  const curatedSubscription = getOpenCodeCuratedSubscriptionProvider(providerId)
+  if (curatedSubscription) {
+    return curatedSubscription.setup
   }
 
   return {
-    description: 'OpenCode documents this provider as an API-key /connect provider. The app verifies the live OpenCode connection before saving.',
+    description:
+      'OpenCode documents this provider as an API-key /connect provider. The app verifies the live OpenCode connection before saving.',
     secretLabel: 'API key',
     secretPlaceholder: 'Paste API key',
   }
@@ -931,44 +1091,49 @@ function buildProviderSetupForm(input: {
   displayName: string
   knownProviderIds: Set<string>
   methods: readonly OpenCodeProviderAuthMethod[]
+  capabilities?: OpenCodeProviderManagementCapabilities
 }): ProviderSetupForm {
-  const apiMethod = getApiAuthMethod(input.methods)
-  if (apiMethod) {
-    const { secretLabel, secretPlaceholder, prompts } = splitApiAuthPrompts(apiMethod)
-    return {
-      runtimeId: 'opencode',
-      providerId: input.providerId,
-      displayName: input.displayName,
-      method: 'api',
-      supported: true,
-      title: `Connect ${input.displayName}`,
-      description: 'Credential is stored only in the app-managed OpenCode profile.',
-      submitLabel: 'Connect',
-      disabledReason: null,
-      source: 'opencode-auth',
-      secret: {
-        key: 'key',
-        label: secretLabel,
-        placeholder: secretPlaceholder,
-        required: true,
-      },
-      prompts,
-    }
+  const capabilities = input.capabilities ?? EMPTY_CAPABILITIES
+  let authOptions = buildOpenCodeSetupAuthOptions({
+    methods: input.methods,
+    capabilities,
+  })
+
+  if (input.providerId === 'xai') {
+    authOptions = prepareSuperGrokAuthOptions(authOptions)
   }
 
-  if (input.knownProviderIds.has(input.providerId) && CURATED_API_BOOTSTRAP_PROVIDER_IDS.has(input.providerId)) {
+  if (
+    input.providerId === 'xai' &&
+    input.knownProviderIds.has(input.providerId) &&
+    !authOptions.some(option => option.method === 'oauth')
+  ) {
+    authOptions.unshift({
+      id: 'oauth:update-required',
+      method: 'oauth',
+      methodIndex: null,
+      label: 'SuperGrok subscription - update OpenCode to 1.15.7 or newer',
+      supported: false,
+      disabledReason:
+        'SuperGrok OAuth requires OpenCode 1.15.7 or newer. Update OpenCode, then refresh providers.',
+      secret: null,
+      prompts: [],
+    })
+  }
+
+  if (
+    !authOptions.some(option => option.method === 'api') &&
+    input.knownProviderIds.has(input.providerId) &&
+    CURATED_API_BOOTSTRAP_PROVIDER_IDS.has(input.providerId)
+  ) {
     const curatedProfile = getCuratedApiSetupProfile(input.providerId)
-    return {
-      runtimeId: 'opencode',
-      providerId: input.providerId,
-      displayName: input.displayName,
+    authOptions.push({
+      id: 'api:curated',
       method: 'api',
+      methodIndex: null,
+      label: curatedProfile.secretLabel,
       supported: true,
-      title: `Connect ${input.displayName}`,
-      description: curatedProfile.description,
-      submitLabel: 'Connect',
       disabledReason: null,
-      source: 'curated',
       secret: {
         key: 'key',
         label: curatedProfile.secretLabel,
@@ -976,24 +1141,49 @@ function buildProviderSetupForm(input: {
         required: true,
       },
       prompts: [],
-    }
+    })
   }
 
-  const oauthMethod = getOauthAuthMethod(input.methods)
-  if (oauthMethod) {
+  const selectedOption =
+    (input.providerId === 'xai'
+      ? authOptions.find(option => option.supported && isSuperGrokDeviceAuthOption(option))
+      : null) ??
+    authOptions.find(option => option.supported) ??
+    authOptions[0] ??
+    null
+  if (selectedOption) {
+    const curatedProfile =
+      selectedOption.id === 'api:curated' ? getCuratedApiSetupProfile(input.providerId) : null
     return {
       runtimeId: 'opencode',
       providerId: input.providerId,
       displayName: input.displayName,
-      method: 'oauth',
-      supported: false,
-      title: `Connect ${input.displayName} in OpenCode`,
-      description: 'OpenCode exposes OAuth for this provider. Use /connect in OpenCode until the desktop OAuth bridge is supported.',
-      submitLabel: 'Connect in OpenCode',
-      disabledReason: 'OAuth setup is not automated in this app yet',
-      source: 'oauth',
-      secret: null,
-      prompts: [],
+      method: selectedOption.method,
+      supported: selectedOption.supported,
+      title: `Connect ${input.displayName}`,
+      description:
+        curatedProfile?.description ??
+        (input.providerId === 'xai' && isSuperGrokDeviceAuthOption(selectedOption)
+          ? 'Open xAI in your browser, enter the short device code, and return here. OpenCode securely completes the SuperGrok sign-in and token refresh.'
+          : selectedOption.method === 'oauth'
+          ? 'Sign in through the provider in your browser. OpenCode handles authorization and token refresh without exposing OAuth tokens to the desktop UI.'
+          : 'Credential is stored in the app-managed OpenCode profile.'),
+      submitLabel:
+        input.providerId === 'xai' && isSuperGrokDeviceAuthOption(selectedOption)
+          ? 'Get browser code'
+          : selectedOption.method === 'oauth'
+            ? 'Continue in browser'
+            : 'Connect',
+      disabledReason: selectedOption.disabledReason,
+      source: curatedProfile
+        ? 'curated'
+        : selectedOption.method === 'oauth'
+          ? 'oauth'
+          : 'opencode-auth',
+      secret: selectedOption.secret,
+      prompts: selectedOption.prompts,
+      authOptions,
+      defaultAuthOptionId: selectedOption.id,
     }
   }
 
@@ -1010,6 +1200,8 @@ function buildProviderSetupForm(input: {
     source: 'manual',
     secret: null,
     prompts: [],
+    authOptions: [],
+    defaultAuthOptionId: null,
   }
 }
 
@@ -1024,8 +1216,9 @@ function getOwnership(input: {
 
   if (input.connectedProvider?.source === 'credentials') {
     if (input.connectedProvider.credentialScopes?.length) {
-      return input.connectedProvider.credentialScopes
-        .filter(scope => scope === 'managed' || scope === 'local')
+      return input.connectedProvider.credentialScopes.filter(
+        scope => scope === 'managed' || scope === 'local',
+      )
     }
     return ['managed']
   }
@@ -1093,8 +1286,7 @@ function getDefaultModelForProvider(
   }
 
   const modelId =
-    asString(configProviders?.default?.[providerId]) ??
-    asString(providers?.default?.[providerId])
+    asString(configProviders?.default?.[providerId]) ?? asString(providers?.default?.[providerId])
   if (!modelId) {
     return null
   }
@@ -1186,7 +1378,24 @@ function getCapabilities(
 ): OpenCodeProviderManagementCapabilities {
   return {
     deleteAuth: hasOpenCodeServerMethod(serverDoc, '/auth/{providerID}', 'delete'),
+    authorizeOAuth: hasOpenCodeServerMethod(
+      serverDoc,
+      '/provider/{providerID}/oauth/authorize',
+      'post',
+    ),
+    completeOAuth: hasOpenCodeServerMethod(
+      serverDoc,
+      '/provider/{providerID}/oauth/callback',
+      'post',
+    ),
   }
+}
+
+function canConnectWithOAuth(
+  authMethods: readonly ProviderAuthMethod[],
+  capabilities: OpenCodeProviderManagementCapabilities,
+): boolean {
+  return authMethods.includes('oauth') && capabilities.authorizeOAuth && capabilities.completeOAuth
 }
 
 function canConnectWithApiKey(
@@ -1243,6 +1452,18 @@ function buildProviderActions(input: {
       ]
     }
 
+    if (canConnectWithOAuth(input.authMethods, input.capabilities)) {
+      return [
+        providerAction({
+          id: 'connect',
+          label: 'Connect',
+          enabled: true,
+          requiresSecret: false,
+          ownershipScope: 'managed',
+        }),
+      ]
+    }
+
     if (canConnectWithApiKey(input.providerId, input.authMethods)) {
       return [
         providerAction({
@@ -1259,9 +1480,10 @@ function buildProviderActions(input: {
       return [
         providerAction({
           id: 'configure',
-          label: 'Connect in OpenCode',
+          label: 'OpenCode update required',
           enabled: false,
-          disabledReason: 'OpenCode exposes OAuth for this provider; use /connect until OAuth setup is supported in the app',
+          disabledReason:
+            'This OpenCode runtime exposes OAuth methods but not the OAuth bridge endpoints. Update OpenCode and refresh providers.',
           requiresSecret: false,
           ownershipScope: 'runtime',
         }),
@@ -1282,18 +1504,18 @@ function buildProviderActions(input: {
 
   const actions: ProviderActionDescriptor[] = []
   const hasModels = input.modelCount !== 0
-  const noModelsReason = input.modelCount === 0
-    ? 'No models reported for this provider'
-    : null
+  const noModelsReason = input.modelCount === 0 ? 'No models reported for this provider' : null
 
   if (hasModels) {
-    actions.push(providerAction({
-      id: 'use',
-      label: 'Use',
-      enabled: true,
-      requiresSecret: false,
-      ownershipScope: 'runtime',
-    }))
+    actions.push(
+      providerAction({
+        id: 'use',
+        label: 'Use',
+        enabled: true,
+        requiresSecret: false,
+        ownershipScope: 'runtime',
+      }),
+    )
   }
 
   actions.push(
@@ -1316,13 +1538,15 @@ function buildProviderActions(input: {
   )
 
   if (input.ownership.includes('managed') && input.capabilities.deleteAuth) {
-    actions.push(providerAction({
-      id: 'forget',
-      label: 'Forget',
-      enabled: true,
-      requiresSecret: false,
-      ownershipScope: 'managed',
-    }))
+    actions.push(
+      providerAction({
+        id: 'forget',
+        label: 'Forget',
+        enabled: true,
+        requiresSecret: false,
+        ownershipScope: 'managed',
+      }),
+    )
   }
 
   return actions
@@ -1397,7 +1621,7 @@ function buildProviderConnections(input: {
           ? 'Configured local OpenCode model route is available'
           : modelCount > 0
             ? 'Provider is visible in the OpenCode model catalog'
-          : null,
+            : null,
     })
   }
 
@@ -1415,17 +1639,27 @@ function collectProviderDirectorySources(input: {
     sources.add('seed')
   }
   if (
-    input.inventory.availableProviders.some(providerId => normalizeProviderId(providerId) === input.providerId) ||
-    input.inventory.connectedProviders.some(provider => normalizeProviderId(provider.id) === input.providerId)
+    input.inventory.availableProviders.some(
+      providerId => normalizeProviderId(providerId) === input.providerId,
+    ) ||
+    input.inventory.connectedProviders.some(
+      provider => normalizeProviderId(provider.id) === input.providerId,
+    )
   ) {
     sources.add('inventory')
   }
-  if (input.configProviders?.providers?.some(provider => normalizeProviderId(provider.id) === input.providerId)) {
+  if (
+    input.configProviders?.providers?.some(
+      provider => normalizeProviderId(provider.id) === input.providerId,
+    )
+  ) {
     sources.add('config-provider')
   }
   if (
     input.providers?.all?.some(provider => normalizeProviderId(provider.id) === input.providerId) ||
-    input.providers?.connected?.some(providerId => normalizeProviderId(providerId) === input.providerId)
+    input.providers?.connected?.some(
+      providerId => normalizeProviderId(providerId) === input.providerId,
+    )
   ) {
     sources.add('opencode-provider')
   }
@@ -1451,7 +1685,9 @@ function buildProviderManagementAccessCatalog(input: {
   providers: OpenCodeProviderResponse | null
 }): OpenCodeModelAccessCatalog {
   return {
-    connectedProviders: Array.from(getConnectedProviderMap(input.inventory, input.providers).keys()),
+    connectedProviders: Array.from(
+      getConnectedProviderMap(input.inventory, input.providers).keys(),
+    ),
     models: input.inventory.models,
     modelMetadata: input.inventory.modelMetadata,
     configProviders: input.configProviders,
@@ -1480,9 +1716,13 @@ function getProviderSetupKind(input: {
   providerId: string
   modelCount: number | null
   authMethods: readonly ProviderAuthMethod[]
+  capabilities: OpenCodeProviderManagementCapabilities
 }): ProviderDirectoryEntry['setupKind'] {
   if (input.connected) {
     return 'connected'
+  }
+  if (canConnectWithOAuth(input.authMethods, input.capabilities)) {
+    return 'connect-oauth'
   }
   if (canConnectWithApiKey(input.providerId, input.authMethods)) {
     return 'connect-api-key'
@@ -1536,7 +1776,10 @@ function buildProviderDirectoryActions(input: {
     return [
       providerAction({
         id: 'configure',
-        label: input.setupKind === 'requires-environment' ? 'Requires environment' : 'Manual setup required',
+        label:
+          input.setupKind === 'requires-environment'
+            ? 'Requires environment'
+            : 'Manual setup required',
         enabled: false,
         disabledReason: 'OpenCode did not expose an app-managed setup schema for this provider',
         requiresSecret: false,
@@ -1563,6 +1806,9 @@ function getProviderDirectoryDetail(input: {
   }
   if (input.setupKind === 'connect-api-key') {
     return 'App-managed API-key setup is available for this provider'
+  }
+  if (input.setupKind === 'connect-oauth') {
+    return 'App-managed OAuth setup is available for this provider'
   }
   if (input.modelCount !== null && input.modelCount > 0) {
     return 'Models are visible, but no connected credential was reported'
@@ -1600,7 +1846,7 @@ function providerDirectoryEntryMatchesFilter(
     case 'configured':
       return entry.sources.includes('config-provider')
     case 'connectable':
-      return entry.setupKind === 'connect-api-key'
+      return entry.setupKind === 'connect-api-key' || entry.setupKind === 'connect-oauth'
     case 'manual':
       return (
         entry.setupKind === 'configure-manually' ||
@@ -1621,7 +1867,7 @@ function sortProviderDirectoryEntries(
     if (entry.state === 'connected') return 0
     if (entry.metadata.configuredAuthless) return 1
     if (isRecommendedProvider(entry.providerId)) return 2
-    if (entry.setupKind === 'connect-api-key') return 3
+    if (entry.setupKind === 'connect-api-key' || entry.setupKind === 'connect-oauth') return 3
     if (entry.setupKind === 'available-readonly') return 4
     if (entry.setupKind === 'configure-manually' || entry.setupKind === 'requires-environment') {
       return 5
@@ -1658,9 +1904,10 @@ function buildProviderDirectory(input: {
   const providerIds = getKnownProviderIds(input)
   const query = normalizeQuery(input.query)
   const filter = normalizeDirectoryFilter(input.filter)
-  const limit = input.limit === Number.MAX_SAFE_INTEGER
-    ? Number.MAX_SAFE_INTEGER
-    : normalizeDirectoryLimit(input.limit)
+  const limit =
+    input.limit === Number.MAX_SAFE_INTEGER
+      ? Number.MAX_SAFE_INTEGER
+      : normalizeDirectoryLimit(input.limit)
   const offset = normalizeDirectoryCursor(input.cursor)
   const malformedProviderRows = countMalformedProviderRows({
     configProviders: input.configProviders,
@@ -1695,6 +1942,7 @@ function buildProviderDirectory(input: {
       providerId,
       modelCount,
       authMethods,
+      capabilities,
     })
     const state: ProviderConnection['state'] = displayConnected
       ? 'connected'
@@ -1717,6 +1965,7 @@ function buildProviderDirectory(input: {
       providerId,
       displayName: getProviderDisplayName(providerId, entry),
       state,
+      connectedAuthHint: displayConnected ? (connectedProvider?.authHint ?? null) : null,
       setupKind,
       ownership,
       recommended: isRecommendedProvider(providerId),
@@ -1750,9 +1999,10 @@ function buildProviderDirectory(input: {
       }),
       metadata: {
         hasKnownModels: modelCount !== null && modelCount > 0,
-        requiresManualConfig: !configuredAuthless
-          && (setupKind === 'configure-manually' || setupKind === 'requires-environment'),
-        supportedInlineAuth: setupKind === 'connect-api-key',
+        requiresManualConfig:
+          !configuredAuthless &&
+          (setupKind === 'configure-manually' || setupKind === 'requires-environment'),
+        supportedInlineAuth: setupKind === 'connect-api-key' || setupKind === 'connect-oauth',
         configuredAuthless,
       },
     }
@@ -1766,9 +2016,10 @@ function buildProviderDirectory(input: {
   }
 
   const sortedEntries = sortProviderDirectoryEntries(directoryEntries)
-  const returnedEntries = limit === Number.MAX_SAFE_INTEGER
-    ? sortedEntries.slice(offset)
-    : sortedEntries.slice(offset, offset + limit)
+  const returnedEntries =
+    limit === Number.MAX_SAFE_INTEGER
+      ? sortedEntries.slice(offset)
+      : sortedEntries.slice(offset, offset + limit)
   const nextOffset = offset + returnedEntries.length
 
   return {
@@ -1803,13 +2054,13 @@ function filterAndPageProviderDirectory(input: {
   const filter = normalizeDirectoryFilter(input.filter)
   const limit = normalizeDirectoryLimit(input.limit)
   const offset = normalizeDirectoryCursor(input.cursor)
-  const matchingEntries = input.directory.entries.filter(entry =>
-    providerDirectoryEntryMatchesQuery(
-      entry,
-      input.modelIdsByProviderId?.[entry.providerId] ?? [],
-      query,
-    ) &&
-    providerDirectoryEntryMatchesFilter(entry, filter)
+  const matchingEntries = input.directory.entries.filter(
+    entry =>
+      providerDirectoryEntryMatchesQuery(
+        entry,
+        input.modelIdsByProviderId?.[entry.providerId] ?? [],
+        query,
+      ) && providerDirectoryEntryMatchesFilter(entry, filter),
   )
   const returnedEntries = matchingEntries.slice(offset, offset + limit)
   const nextOffset = offset + returnedEntries.length
@@ -1852,10 +2103,11 @@ function buildView(input: {
     configProviders: input.configProviders,
     providers: input.providers,
   })
-  const launchableRouteCount = configuredModels.filter(model =>
-    model.routeKind === 'configured_local'
-    || model.routeKind === 'builtin_free'
-    || model.routeKind === 'connected_provider'
+  const launchableRouteCount = configuredModels.filter(
+    model =>
+      model.routeKind === 'configured_local' ||
+      model.routeKind === 'builtin_free' ||
+      model.routeKind === 'connected_provider',
   ).length
   const defaultModel = getDefaultModel(input.inventory, input.configProviders, input.providers)
   const fallbackModel = getFallbackModel(input.inventory)
@@ -1901,19 +2153,18 @@ async function readLiveView(input: {
 }): Promise<ProviderManagementView> {
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
-    : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeServerDocResponse | null>)
+    : Promise.resolve({
+        ok: true,
+        value: null,
+      } as SafeValue<OpenCodeServerDocResponse | null>)
 
-  const [
-    configProvidersResult,
-    providersResult,
-    providerAuthResult,
-    serverDocResult,
-  ] = await Promise.all([
-    safeRead(() => input.client.getConfigProviders()),
-    safeRead(() => input.client.getProviders()),
-    safeRead(() => input.client.getProviderAuth()),
-    serverDocRead,
-  ])
+  const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+    await Promise.all([
+      safeRead(() => input.client.getConfigProviders()),
+      safeRead(() => input.client.getProviders()),
+      safeRead(() => input.client.getProviderAuth()),
+      serverDocRead,
+    ])
 
   const diagnostics = [
     ...(input.diagnostics ?? []),
@@ -1957,8 +2208,9 @@ function collectProviderModelIds(input: {
     }
   }
 
-  const configProvider = input.configProviders?.providers?.find(provider =>
-    normalizeProviderId(provider.id) === input.providerId)
+  const configProvider = input.configProviders?.providers?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )
   const configModels = asRecord(configProvider?.models)
   for (const modelId of Object.keys(configModels ?? {})) {
     const normalizedModelId = modelId.trim()
@@ -1967,8 +2219,9 @@ function collectProviderModelIds(input: {
     }
   }
 
-  const liveProvider = input.providers?.all?.find(provider =>
-    normalizeProviderId(provider.id) === input.providerId)
+  const liveProvider = input.providers?.all?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )
   const liveModels = asRecord(liveProvider?.models)
   for (const modelId of Object.keys(liveModels ?? {})) {
     const normalizedModelId = modelId.trim()
@@ -1991,6 +2244,13 @@ function getProviderCredentialValidationModelId(input: {
     return null
   }
 
+  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]?.find(
+    modelId => modelIds.includes(modelId),
+  )
+  if (preferredModelId) {
+    return preferredModelId
+  }
+
   const defaultModelId = getDefaultModelForProvider(
     input.providerId,
     input.inventory,
@@ -1999,12 +2259,6 @@ function getProviderCredentialValidationModelId(input: {
   )
   if (defaultModelId && modelIds.includes(defaultModelId)) {
     return defaultModelId
-  }
-
-  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]
-    ?.find(modelId => modelIds.includes(modelId))
-  if (preferredModelId) {
-    return preferredModelId
   }
 
   return modelIds[0] ?? null
@@ -2104,14 +2358,16 @@ function buildProviderModelsView(input: {
     configProviders: input.configProviders,
     providers: input.providers,
   })
-    .map(modelId => buildRuntimeProviderModel({
-      providerId: input.providerId,
-      modelId,
-      providerEntry: entries.get(input.providerId),
-      defaultModelId,
-      inventory: input.inventory,
-      accessCatalog,
-    }))
+    .map(modelId =>
+      buildRuntimeProviderModel({
+        providerId: input.providerId,
+        modelId,
+        providerEntry: entries.get(input.providerId),
+        defaultModelId,
+        inventory: input.inventory,
+        accessCatalog,
+      }),
+    )
     .filter(model => providerModelMatchesQuery(model, query))
 
   return {
@@ -2155,9 +2411,9 @@ function buildConfiguredOpenCodeModels(input: {
         accessCatalog,
       })
       if (
-        model.routeKind === 'configured_local'
-        || model.routeKind === 'builtin_free'
-        || model.modelId === defaultModel
+        model.routeKind === 'configured_local' ||
+        model.routeKind === 'builtin_free' ||
+        model.modelId === defaultModel
       ) {
         modelsById.set(model.modelId, {
           ...model,
@@ -2219,9 +2475,10 @@ function buildProviderModelTestResult(input: {
     modelId: input.modelId,
     ok: input.probe.outcome === 'available',
     availability,
-    message: input.probe.outcome === 'available'
-      ? 'Model probe passed'
-      : input.probe.reason ?? 'Model probe failed',
+    message:
+      input.probe.outcome === 'available'
+        ? 'Model probe passed'
+        : (input.probe.reason ?? 'Model probe failed'),
     diagnostics: input.probe.diagnostics,
   }
 }
@@ -2253,10 +2510,10 @@ function getModelAccessError(input: {
   }
 
   if (
-    input.access.kind !== 'credentialed'
-    && input.access.kind !== 'builtin_free'
-    && input.access.kind !== 'configured_authless'
-    && input.access.kind !== 'verified'
+    input.access.kind !== 'credentialed' &&
+    input.access.kind !== 'builtin_free' &&
+    input.access.kind !== 'configured_authless' &&
+    input.access.kind !== 'verified'
   ) {
     return providerManagementError(
       input.action === 'test' ? 'model-test-failed' : 'auth-required',
@@ -2267,7 +2524,12 @@ function getModelAccessError(input: {
   return null
 }
 
-export class OpenCodeProviderManagementAdapter implements ProviderManagementQueryPort, ProviderManagementDirectoryQueryPort, ProviderManagementCommandPort {
+export class OpenCodeProviderManagementAdapter
+  implements
+    ProviderManagementQueryPort,
+    ProviderManagementDirectoryQueryPort,
+    ProviderManagementCommandPort
+{
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
@@ -2364,6 +2626,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         await upsertOpenCodeApiAuth(input.authPath, input.providerId, input.auth)
       },
       upsertApiKey: configured?.upsertApiKey ?? upsertOpenCodeApiAuthCredential,
+      readCredential: configured?.readCredential ?? readOpenCodeAuthCredential,
+      upsertCredential: configured?.upsertCredential ?? upsertOpenCodeAuthCredential,
       removeCredential: removeOpenCodeAuthCredential,
       ...(configured?.removeCredential ? { removeCredential: configured.removeCredential } : {}),
     }
@@ -2374,11 +2638,13 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
   }
 
   private getManagedPreferences() {
-    return this.deps.managedPreferences ?? {
-      setDefaultModel: setOpenCodeManagedDefaultModel,
-      setAllProjectsDefaultModel: (modelId: string) =>
-        setOpenCodeManagedGlobalDefaultModel(resolveClaudeMultimodelPaths().data, modelId),
-    }
+    return (
+      this.deps.managedPreferences ?? {
+        setDefaultModel: setOpenCodeManagedDefaultModel,
+        setAllProjectsDefaultModel: (modelId: string) =>
+          setOpenCodeManagedGlobalDefaultModel(resolveClaudeMultimodelPaths().data, modelId),
+      }
+    )
   }
 
   private getProfileManager() {
@@ -2390,6 +2656,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     providerId: string
     authPaths: readonly (string | null | undefined)[]
     canDeleteProviderAuth: boolean
+    previousCredentials?: ReadonlyMap<string, OpenCodeAuthCredential | null>
   }): Promise<void> {
     if (input.canDeleteProviderAuth && input.client.deleteProviderAuth) {
       await input.client.deleteProviderAuth(input.providerId).catch(() => undefined)
@@ -2399,12 +2666,125 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     await Promise.all(
       input.authPaths
         .filter((authPath): authPath is string => Boolean(authPath))
-        .map(authPath =>
-          authStore
-            .removeCredential({ authPath, providerId: input.providerId })
-            .catch(() => undefined),
-        ),
+        .map(authPath => {
+          const previousCredential = input.previousCredentials?.get(authPath) ?? null
+          return previousCredential
+            ? authStore
+                .upsertCredential({
+                  authPath,
+                  providerId: input.providerId,
+                  credential: previousCredential,
+                })
+                .catch(() => undefined)
+            : authStore
+                .removeCredential({ authPath, providerId: input.providerId })
+                .catch(() => undefined)
+        }),
     )
+  }
+
+  private async captureProviderAuthSnapshot(input: {
+    providerId: string
+    authPaths: readonly string[]
+  }): Promise<ReadonlyMap<string, OpenCodeAuthCredential | null>> {
+    const authStore = this.getAuthStore()
+    const uniquePaths = Array.from(new Set(input.authPaths))
+    const credentials = await Promise.all(
+      uniquePaths.map(authPath =>
+        authStore.readCredential({ authPath, providerId: input.providerId }),
+      ),
+    )
+    return new Map(uniquePaths.map((authPath, index) => [authPath, credentials[index] ?? null]))
+  }
+
+  private isNewOAuthCredential(
+    credential: OpenCodeAuthCredential | null,
+    previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>,
+  ): credential is OpenCodeAuthCredential {
+    if (credential?.type !== 'oauth') {
+      return false
+    }
+    return !Array.from(previousCredentials.values()).some(
+      previous => previous !== null && credentialsEqual(credential, previous),
+    )
+  }
+
+  private async waitForNewOAuthCredential(input: {
+    authPath: string
+    providerId: string
+    previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+    signal: AbortSignal
+  }): Promise<OpenCodeAuthCredential | null> {
+    const authStore = this.getAuthStore()
+    while (!input.signal.aborted) {
+      try {
+        const credential = await authStore.readCredential({
+          authPath: input.authPath,
+          providerId: input.providerId,
+        })
+        if (this.isNewOAuthCredential(credential, input.previousCredentials)) {
+          return credential
+        }
+      } catch {
+        // Atomic auth-store replacement can make one poll transiently unreadable.
+      }
+      if (
+        !(await waitForAbortableDelay(
+          COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS,
+          input.signal,
+        ))
+      ) {
+        return null
+      }
+    }
+    return null
+  }
+
+  private async verifyConnectedProviderExecution(input: {
+    providerId: string
+    inventory: OpenCodeInventorySnapshot
+    configProviders: OpenCodeConfigProvidersResponse | null
+    providers: OpenCodeProviderResponse | null
+    secretToRedact?: string | null
+  }): Promise<ProviderManagementResult<null>> {
+    if (!requiresConnectExecutionProof(input.providerId)) {
+      return { ok: true, value: null }
+    }
+
+    const validationModelId = getProviderCredentialValidationModelId({
+      providerId: input.providerId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    })
+    if (!validationModelId) {
+      return providerManagementError(
+        'model-missing',
+        `OpenCode did not expose a probeable model for provider ${input.providerId}`,
+      )
+    }
+
+    const probeResult = await this.getExecutionProbe().probeModel({
+      selectedModel: validationModelId,
+      projectPath: input.inventory.projectPath,
+      bypassCache: true,
+    })
+    if (probeResult.outcome === 'available') {
+      return { ok: true, value: null }
+    }
+
+    const probeReason = redactSecret(
+      probeResult.reason ?? `Model probe failed for ${validationModelId}`,
+      input.secretToRedact ?? '',
+    )
+    return probeResult.outcome === 'not_authenticated'
+      ? providerManagementError(
+          'auth-failed',
+          probeResult.reason
+            ? probeReason
+            : `Provider authentication failed for ${validationModelId}`,
+        )
+      : providerManagementError('model-test-failed', probeReason)
   }
 
   private async withManagedOpenCodeClient<T>(
@@ -2419,6 +2799,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     options: {
       failureCode?: ProviderManagementErrorCode
       secretToRedact?: string | null
+      inventoryMode?: 'full' | 'summary' | 'profile'
+      hostLifetime?: 'persistent' | 'process'
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -2430,13 +2812,12 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, projectPath)
+    const inventory = await this.probeInventory(inventoryService, projectPath, {
+      mode: options.inventoryMode ?? 'full',
+    })
 
     if (!inventory.detected) {
-      return providerManagementError(
-        'runtime-missing',
-        'OpenCode CLI not detected on PATH',
-      )
+      return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
     }
     if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
       return providerManagementError(
@@ -2447,12 +2828,14 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
+    const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
 
     try {
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
-        hostLifetime: 'process',
+        hostLifetime,
+        resolveConfigFingerprint: false,
       })
       const client = clientFactory.create(host.baseUrl)
       return await run({ inventory, inventoryService, host, client })
@@ -2464,7 +2847,11 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       )
     } finally {
       if (host) {
-        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        await hostManager
+          .releaseHost(host.hostKey, {
+            keepPersistentAlive: hostLifetime === 'persistent',
+          })
+          .catch(() => undefined)
       }
     }
   }
@@ -2525,7 +2912,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime: 'process',
+        hostLifetime: 'persistent',
+        resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
       const client = clientFactory.create(host.baseUrl)
@@ -2555,7 +2943,9 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       }
     } finally {
       if (host) {
-        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        await hostManager
+          .releaseHost(host.hostKey, { keepPersistentAlive: true })
+          .catch(() => undefined)
       }
     }
   }
@@ -2572,7 +2962,9 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, input.projectPath)
+    const inventory = await this.probeInventory(inventoryService, input.projectPath, {
+      mode: 'profile',
+    })
 
     if (!inventory.detected) {
       return {
@@ -2618,7 +3010,8 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime: 'process',
+        hostLifetime: 'persistent',
+        resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
       const cacheKey = this.getDirectoryCacheKey({
@@ -2646,18 +3039,17 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       const client = clientFactory.create(host.baseUrl)
       const serverDocRead = client.getServerDoc
         ? safeRead(() => client.getServerDoc!())
-        : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeServerDocResponse | null>)
-      const [
-        configProvidersResult,
-        providersResult,
-        providerAuthResult,
-        serverDocResult,
-      ] = await Promise.all([
-        safeRead(() => client.getConfigProviders()),
-        safeRead(() => client.getProviders()),
-        safeRead(() => client.getProviderAuth()),
-        serverDocRead,
-      ])
+        : Promise.resolve({
+            ok: true,
+            value: null,
+          } as SafeValue<OpenCodeServerDocResponse | null>)
+      const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+        await Promise.all([
+          safeRead(() => client.getConfigProviders()),
+          safeRead(() => client.getProviders()),
+          safeRead(() => client.getProviderAuth()),
+          serverDocRead,
+        ])
       const diagnostics = [
         ...inventory.diagnostics,
         ...safeReadDiagnostics(configProvidersResult),
@@ -2714,7 +3106,9 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
       }
     } finally {
       if (host) {
-        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        await hostManager
+          .releaseHost(host.hostKey, { keepPersistentAlive: true })
+          .catch(() => undefined)
       }
     }
   }
@@ -2726,16 +3120,41 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     if (!providerId) {
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
+    if (input.runtimeId !== 'opencode') {
+      return providerManagementError(
+        'unsupported-runtime',
+        `Provider management is not available for ${input.runtimeId}`,
+        false,
+      )
+    }
+    if (FAST_CURATED_SETUP_PROVIDER_IDS.has(providerId)) {
+      return {
+        ok: true,
+        value: buildProviderSetupForm({
+          providerId,
+          displayName: getProviderDisplayName(providerId),
+          knownProviderIds: new Set([providerId]),
+          methods: [],
+        }),
+      }
+    }
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
       async ({ inventory, client }) => {
-        const [configProvidersResult, providersResult, providerAuthResult] = await Promise.all([
-          safeRead(() => client.getConfigProviders()),
-          safeRead(() => client.getProviders()),
-          safeRead(() => client.getProviderAuth()),
-        ])
+        const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+          await Promise.all([
+            safeRead(() => client.getConfigProviders()),
+            safeRead(() => client.getProviders()),
+            safeRead(() => client.getProviderAuth()),
+            client.getServerDoc
+              ? safeRead(() => client.getServerDoc!())
+              : Promise.resolve({
+                  ok: true,
+                  value: null,
+                } as SafeValue<OpenCodeServerDocResponse | null>),
+          ])
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
         const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
@@ -2759,9 +3178,11 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             displayName: getProviderDisplayName(providerId, entries.get(providerId)),
             knownProviderIds: liveProviderIds,
             methods: getProviderAuthMethods(providerAuth, providerId),
+            capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
           }),
         }
       },
+      { inventoryMode: 'profile' },
     )
   }
 
@@ -2828,12 +3249,405 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     })
   }
 
+  private async connectProviderWithOAuth(
+    input: ConnectProviderInput,
+    observer: ProviderOAuthFlowObserver | undefined,
+  ): Promise<ProviderManagementResult<ProviderConnection>> {
+    const providerId = normalizeProviderId(input.providerId)
+    const methodIndex = normalizeOAuthMethodIndex(input.authMethodIndex)
+    const operationId = normalizeOAuthOperationId(input.oauthOperationId)
+    if (!providerId) {
+      return providerManagementError('provider-missing', 'Provider id is invalid')
+    }
+    if (methodIndex === null) {
+      return providerManagementError('auth-required', 'OAuth auth method selection is required')
+    }
+    if (!operationId) {
+      return providerManagementError('auth-required', 'OAuth operation id is required')
+    }
+    if (!observer) {
+      return providerManagementError(
+        'unsupported-auth-method',
+        'This client cannot complete interactive OpenCode OAuth. Use an Agent Teams client with OAuth progress support.',
+      )
+    }
+
+    return this.withManagedOpenCodeClient(
+      input.runtimeId,
+      input.projectPath,
+      async ({ inventory, inventoryService, host, client }) => {
+        if (!client.authorizeProviderOAuth || !client.completeProviderOAuth) {
+          return providerManagementError(
+            'unsupported-auth-method',
+            'This OpenCode runtime does not expose provider OAuth bridge endpoints. Update OpenCode and refresh providers.',
+          )
+        }
+        const managedAuthPath = inventory.profile?.managedAuthPath
+        const globalAuthPath = inventory.profile?.globalAuthPath
+        if (!managedAuthPath || !globalAuthPath) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode managed and global auth stores are required for OAuth setup',
+          )
+        }
+
+        const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+          await Promise.all([
+            safeRead(() => client.getConfigProviders()),
+            safeRead(() => client.getProviders()),
+            safeRead(() => client.getProviderAuth()),
+            client.getServerDoc
+              ? safeRead(() => client.getServerDoc!())
+              : Promise.resolve({
+                  ok: true,
+                  value: null,
+                } as SafeValue<OpenCodeServerDocResponse | null>),
+          ])
+        const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+        const providers = providersResult.ok ? providersResult.value : null
+        const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
+        const capabilities = getCapabilities(serverDocResult.ok ? serverDocResult.value : null)
+        if (!capabilities.authorizeOAuth || !capabilities.completeOAuth) {
+          return providerManagementError(
+            'unsupported-auth-method',
+            'Update OpenCode to a version that supports provider OAuth authorize and callback endpoints.',
+          )
+        }
+
+        const liveProviderIds = getLiveProviderIds({
+          inventory,
+          configProviders,
+          providers,
+        })
+        if (!liveProviderIds.has(providerId)) {
+          return providerManagementError(
+            'provider-missing',
+            `OpenCode provider ${providerId} was not found in the live catalog`,
+          )
+        }
+        const methods = getProviderAuthMethods(providerAuth, providerId)
+        const selectedMethod = methods[methodIndex]
+        if (selectedMethod?.type?.trim().toLowerCase() !== 'oauth') {
+          return providerManagementError(
+            'unsupported-auth-method',
+            `OpenCode auth method ${methodIndex} is not an OAuth method for provider ${providerId}`,
+          )
+        }
+        const entries = getProviderEntries(configProviders, providers)
+        const displayName = getProviderDisplayName(providerId, entries.get(providerId))
+        const setupForm = buildProviderSetupForm({
+          providerId,
+          displayName,
+          knownProviderIds: liveProviderIds,
+          methods,
+          capabilities,
+        })
+        const authOption = setupForm.authOptions.find(
+          option => option.method === 'oauth' && option.methodIndex === methodIndex,
+        )
+        if (!authOption?.supported) {
+          return providerManagementError(
+            'unsupported-auth-method',
+            authOption?.disabledReason ??
+              `OAuth method ${methodIndex} is not supported for ${providerId}`,
+          )
+        }
+        if (input.authOptionId?.trim() && input.authOptionId.trim() !== authOption.id) {
+          return providerManagementError(
+            'auth-required',
+            'OAuth auth option no longer matches the live OpenCode catalog',
+          )
+        }
+
+        let oauthInputs: Record<string, string>
+        try {
+          oauthInputs = normalizeSetupPromptMetadata(authOption.prompts, input.metadata)
+        } catch (error) {
+          return providerManagementError(
+            'auth-required',
+            error instanceof Error ? error.message : 'OAuth setup metadata is invalid',
+          )
+        }
+
+        const authPaths = new Set<string>([managedAuthPath, globalAuthPath])
+        try {
+          for (const authPath of await this.getProfileManager().listManagedAuthPaths()) {
+            authPaths.add(authPath)
+          }
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to enumerate OpenCode auth stores: ${error.message}`
+              : 'Unable to enumerate OpenCode auth stores',
+          )
+        }
+        let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+        try {
+          previousCredentials = await this.captureProviderAuthSnapshot({
+            providerId,
+            authPaths: Array.from(authPaths),
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to preserve the existing ${providerId} credential: ${error.message}`
+              : `Unable to preserve the existing ${providerId} credential`,
+          )
+        }
+
+        let authorization: OpenCodeProviderOAuthAuthorization
+        try {
+          authorization = await client.authorizeProviderOAuth(providerId, {
+            method: methodIndex,
+            ...(Object.keys(oauthInputs).length > 0 ? { inputs: oauthInputs } : {}),
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error ? error.message : `Failed to start OAuth for ${providerId}`,
+          )
+        }
+        const authorizationUrl = normalizeOAuthAuthorizationUrl(authorization.url)
+        if (
+          !authorizationUrl ||
+          (authorization.method !== 'auto' && authorization.method !== 'code')
+        ) {
+          return providerManagementError(
+            'auth-failed',
+            'OpenCode returned an invalid OAuth authorization response',
+          )
+        }
+
+        let observerResult: { code?: string | null } | void
+        try {
+          observerResult = await observer.authorizationReady({
+            operationId,
+            providerId,
+            displayName,
+            authOptionId: authOption.id,
+            methodIndex,
+            authorizationUrl,
+            instructions:
+              authorization.instructions?.trim() || 'Complete authorization in your browser.',
+            completionMethod: authorization.method,
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error ? error.message : 'OAuth authorization was interrupted',
+          )
+        }
+        const authorizationCode =
+          observerResult && 'code' in observerResult ? (observerResult.code?.trim() ?? '') : ''
+        if (authorization.method === 'code' && !authorizationCode) {
+          return providerManagementError('auth-required', 'OAuth authorization code is required')
+        }
+
+        const callbackOutcomePromise = Promise.resolve()
+          .then(() =>
+            client.completeProviderOAuth!(providerId, {
+              method: methodIndex,
+              ...(authorizationCode ? { code: authorizationCode } : {}),
+            }),
+          )
+          .then(
+            completed => ({ kind: 'callback' as const, completed }),
+            error => ({ kind: 'callback-error' as const, error }),
+          )
+
+        let oauthCredential: OpenCodeAuthCredential | null = null
+        let callbackOutcome:
+          | Awaited<typeof callbackOutcomePromise>
+          | { kind: 'credential'; credential: OpenCodeAuthCredential }
+        if (providerId === 'github-copilot' && authorization.method === 'auto') {
+          const credentialWatcher = new AbortController()
+          callbackOutcome = await Promise.race([
+            callbackOutcomePromise,
+            this.waitForNewOAuthCredential({
+              authPath: managedAuthPath,
+              providerId,
+              previousCredentials,
+              signal: credentialWatcher.signal,
+            }).then(credential =>
+              credential
+                ? { kind: 'credential' as const, credential }
+                : { kind: 'callback-error' as const, error: new Error('OAuth recovery stopped') },
+            ),
+          ])
+          credentialWatcher.abort()
+          if (callbackOutcome.kind === 'credential') {
+            oauthCredential = callbackOutcome.credential
+          }
+        } else {
+          callbackOutcome = await callbackOutcomePromise
+        }
+
+        if (callbackOutcome.kind === 'callback-error') {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            callbackOutcome.error instanceof Error
+              ? callbackOutcome.error.message
+              : `OAuth callback failed for ${providerId}`,
+          )
+        }
+        if (callbackOutcome.kind === 'callback' && callbackOutcome.completed !== true) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            `OpenCode did not complete OAuth for ${providerId}`,
+          )
+        }
+
+        const authStore = this.getAuthStore()
+        if (!oauthCredential) {
+          try {
+            oauthCredential = await authStore.readCredential({
+              authPath: managedAuthPath,
+              providerId,
+            })
+          } catch (error) {
+            await this.rollbackProviderAuth({
+              client,
+              providerId,
+              authPaths: Array.from(authPaths),
+              canDeleteProviderAuth: capabilities.deleteAuth,
+              previousCredentials,
+            })
+            return providerManagementError(
+              'auth-failed',
+              error instanceof Error
+                ? `OpenCode OAuth credential could not be read: ${error.message}`
+                : 'OpenCode OAuth credential could not be read',
+            )
+          }
+        }
+        if (!this.isNewOAuthCredential(oauthCredential, previousCredentials)) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            `OpenCode completed OAuth but did not persist a new OAuth credential for ${providerId}`,
+          )
+        }
+
+        try {
+          for (const authPath of authPaths) {
+            await authStore.upsertCredential({
+              authPath,
+              providerId,
+              credential: oauthCredential,
+            })
+          }
+        } catch (error) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error ? error.message : 'OpenCode OAuth credential mirror failed',
+          )
+        }
+
+        this.invalidateDirectoryCache()
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          fallbackInventory => addManagedProviderToInventory(fallbackInventory, providerId),
+        )
+        const view = appendViewDiagnostics(
+          await readLiveView({
+            inventory: refresh.inventory,
+            host,
+            client,
+            diagnostics: refresh.inventory.diagnostics,
+          }),
+          refresh.postViewDiagnostics,
+        )
+        const provider = findProviderConnection(view, providerId)
+        if (
+          !provider ||
+          provider.state !== 'connected' ||
+          !provider.ownership.includes('managed')
+        ) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return providerManagementError(
+            'auth-failed',
+            `OpenCode completed OAuth but did not report provider ${providerId} as connected`,
+          )
+        }
+        const executionProof = await this.verifyConnectedProviderExecution({
+          providerId,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
+        })
+        if (!executionProof.ok) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: Array.from(authPaths),
+            canDeleteProviderAuth: capabilities.deleteAuth,
+            previousCredentials,
+          })
+          return executionProof
+        }
+        return { ok: true, value: provider }
+      },
+      {
+        failureCode: 'auth-failed',
+        hostLifetime: 'process',
+      },
+    )
+  }
+
   async connectProvider(
     input: ConnectProviderInput,
+    observer?: ProviderOAuthFlowObserver,
   ): Promise<ProviderManagementResult<ProviderConnection>> {
     const providerId = normalizeProviderId(input.providerId)
     if (!providerId) {
       return providerManagementError('provider-missing', 'Provider id is invalid')
+    }
+
+    if (input.method === 'oauth') {
+      return this.connectProviderWithOAuth(input, observer)
     }
 
     if (input.method !== 'api') {
@@ -2847,9 +3661,12 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
     if (!apiKey) {
       return providerManagementError('auth-required', 'API key is required')
     }
-    const xiaomiTokenPlanApiKeyError = getXiaomiTokenPlanApiKeyError(providerId, apiKey)
-    if (xiaomiTokenPlanApiKeyError) {
-      return providerManagementError('auth-required', xiaomiTokenPlanApiKeyError)
+    const curatedSubscriptionKeyError = validateOpenCodeCuratedSubscriptionKey(
+      providerId,
+      apiKey,
+    )
+    if (curatedSubscriptionKeyError) {
+      return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
 
     return this.withManagedOpenCodeClient(
@@ -2879,24 +3696,22 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
         const serverDocRead = client.getServerDoc
           ? safeRead(() => client.getServerDoc!())
-          : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeServerDocResponse | null>)
-        const [
-          configProvidersResult,
-          providersResult,
-          providerAuthResult,
-          serverDocResult,
-        ] = await Promise.all([
-          safeRead(() => client.getConfigProviders()),
-          safeRead(() => client.getProviders()),
-          safeRead(() => client.getProviderAuth()),
-          serverDocRead,
-        ])
+          : Promise.resolve({
+              ok: true,
+              value: null,
+            } as SafeValue<OpenCodeServerDocResponse | null>)
+        const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
+          await Promise.all([
+            safeRead(() => client.getConfigProviders()),
+            safeRead(() => client.getProviders()),
+            safeRead(() => client.getProviderAuth()),
+            serverDocRead,
+          ])
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
         const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
-        const canDeleteProviderAuth = getCapabilities(
-          serverDocResult.ok ? serverDocResult.value : null,
-        ).deleteAuth
+        const capabilities = getCapabilities(serverDocResult.ok ? serverDocResult.value : null)
+        const canDeleteProviderAuth = capabilities.deleteAuth
         const liveProviderIds = getLiveProviderIds({
           inventory,
           configProviders,
@@ -2915,18 +3730,29 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           displayName: getProviderDisplayName(providerId, entries.get(providerId)),
           knownProviderIds: liveProviderIds,
           methods: getProviderAuthMethods(providerAuth, providerId),
+          capabilities,
         })
-        if (!setupForm.supported || setupForm.method !== 'api' || !setupForm.secret) {
+        const requestedMethodIndex = normalizeOAuthMethodIndex(input.authMethodIndex)
+        const authOption = setupForm.authOptions.find(
+          option =>
+            option.method === 'api' &&
+            (requestedMethodIndex === null || option.methodIndex === requestedMethodIndex),
+        )
+        if (
+          !authOption?.supported ||
+          !authOption.secret ||
+          (input.authOptionId?.trim() && input.authOptionId.trim() !== authOption.id)
+        ) {
           return providerManagementError(
             'unsupported-auth-method',
-            setupForm.disabledReason ??
+            authOption?.disabledReason ??
               `OpenCode did not expose app-managed API-key auth for provider ${providerId}`,
           )
         }
 
         let metadata: Record<string, string>
         try {
-          metadata = normalizeSetupMetadata(setupForm, input.metadata)
+          metadata = normalizeSetupPromptMetadata(authOption.prompts, input.metadata)
         } catch (error) {
           return providerManagementError(
             'auth-required',
@@ -2939,10 +3765,45 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         }
 
-        const authApplied = await client.setProviderAuth(providerId, {
-          ...authBody,
-        })
+        let previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+        try {
+          previousCredentials = await this.captureProviderAuthSnapshot({
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+          })
+        } catch (error) {
+          return providerManagementError(
+            'auth-failed',
+            error instanceof Error
+              ? `Unable to preserve the existing ${providerId} credential: ${error.message}`
+              : `Unable to preserve the existing ${providerId} credential`,
+          )
+        }
+
+        let authApplied: boolean
+        try {
+          authApplied = await client.setProviderAuth(providerId, { ...authBody })
+        } catch (error) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
+          })
+          const message = error instanceof Error
+            ? redactSecret(error.message, apiKey)
+            : `OpenCode failed to apply API-key auth for provider ${providerId}`
+          return providerManagementError('auth-failed', message)
+        }
         if (authApplied !== true) {
+          await this.rollbackProviderAuth({
+            client,
+            providerId,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
+          })
           return providerManagementError(
             'auth-failed',
             `OpenCode did not apply API-key auth for provider ${providerId}`,
@@ -2969,6 +3830,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
               providerId,
               authPaths: [globalAuthPath, managedAuthPath],
               canDeleteProviderAuth,
+              previousCredentials,
             })
             return providerManagementError(
               'provider-missing',
@@ -2984,6 +3846,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
               providerId,
               authPaths: [globalAuthPath, managedAuthPath],
               canDeleteProviderAuth,
+              previousCredentials,
             })
             return providerManagementError(
               'auth-failed',
@@ -2994,14 +3857,23 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
 
         const authStore = this.getAuthStore()
         try {
-          await authStore.upsertApiAuth({ authPath: globalAuthPath, providerId, auth: authBody })
-          await authStore.upsertApiAuth({ authPath: managedAuthPath, providerId, auth: authBody })
+          await authStore.upsertApiAuth({
+            authPath: globalAuthPath,
+            providerId,
+            auth: authBody,
+          })
+          await authStore.upsertApiAuth({
+            authPath: managedAuthPath,
+            providerId,
+            auth: authBody,
+          })
         } catch (error) {
           await this.rollbackProviderAuth({
             client,
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
@@ -3009,9 +3881,13 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           )
         }
         this.invalidateDirectoryCache()
-        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
-          bypassCache: true,
-        })
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
         const refresh = useActionRefreshInventory(
           inventory,
           refreshedInventory,
@@ -3023,10 +3899,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           client,
           diagnostics: refresh.inventory.diagnostics,
         })
-        const viewWithRefreshDiagnostics = appendViewDiagnostics(
-          view,
-          refresh.postViewDiagnostics,
-        )
+        const viewWithRefreshDiagnostics = appendViewDiagnostics(view, refresh.postViewDiagnostics)
         const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           await this.rollbackProviderAuth({
@@ -3034,6 +3907,7 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'provider-missing',
@@ -3046,61 +3920,29 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
             providerId,
             authPaths: [globalAuthPath, managedAuthPath],
             canDeleteProviderAuth,
+            previousCredentials,
           })
           return providerManagementError(
             'auth-failed',
             `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
           )
         }
-        if (requiresConnectExecutionProof(providerId)) {
-          const validationModelId = getProviderCredentialValidationModelId({
+        const executionProof = await this.verifyConnectedProviderExecution({
+          providerId,
+          inventory: refresh.inventory,
+          configProviders,
+          providers,
+          secretToRedact: apiKey,
+        })
+        if (!executionProof.ok) {
+          await this.rollbackProviderAuth({
+            client,
             providerId,
-            inventory: refresh.inventory,
-            configProviders,
-            providers,
+            authPaths: [globalAuthPath, managedAuthPath],
+            canDeleteProviderAuth,
+            previousCredentials,
           })
-          if (!validationModelId) {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-            })
-            return providerManagementError(
-              'model-missing',
-              `OpenCode did not expose a probeable model for provider ${providerId}`,
-            )
-          }
-
-          const probeResult = await this.getExecutionProbe().probeModel({
-            selectedModel: validationModelId,
-            projectPath: refresh.inventory.projectPath,
-            bypassCache: true,
-          })
-          if (probeResult.outcome !== 'available') {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-            })
-            const probeReason = redactSecret(
-              probeResult.reason ?? `Model probe failed for ${validationModelId}`,
-              apiKey,
-            )
-            if (probeResult.outcome === 'not_authenticated') {
-              return providerManagementError(
-                'auth-failed',
-                probeResult.reason
-                  ? probeReason
-                  : `Provider authentication failed for ${validationModelId}`,
-              )
-            }
-            return providerManagementError(
-              'model-test-failed',
-              probeReason,
-            )
-          }
+          return executionProof
         }
         return { ok: true, value: provider }
       },
@@ -3151,35 +3993,40 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           await authStore.removeCredential({ authPath, providerId })
         }
         this.invalidateDirectoryCache()
-        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
-          bypassCache: true,
-        })
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
         const refresh = useActionRefreshInventory(
           inventory,
           refreshedInventory,
           fallbackInventory => removeManagedProviderFromInventory(fallbackInventory, providerId),
         )
-        const viewWithRefreshDiagnostics = refresh.postViewDiagnostics.length > 0
-          ? buildView({
-              inventory: refresh.inventory,
-              host,
-              configProviders: null,
-              providers: null,
-              providerAuth: null,
-              diagnostics: [
-                ...refresh.inventory.diagnostics,
-                ...redactDiagnostics(refresh.postViewDiagnostics),
-              ],
-            })
-          : appendViewDiagnostics(
-              await readLiveView({
+        const viewWithRefreshDiagnostics =
+          refresh.postViewDiagnostics.length > 0
+            ? buildView({
                 inventory: refresh.inventory,
                 host,
-                client,
-                diagnostics: refresh.inventory.diagnostics,
-              }),
-              refresh.postViewDiagnostics,
-            )
+                configProviders: null,
+                providers: null,
+                providerAuth: null,
+                diagnostics: [
+                  ...refresh.inventory.diagnostics,
+                  ...redactDiagnostics(refresh.postViewDiagnostics),
+                ],
+              })
+            : appendViewDiagnostics(
+                await readLiveView({
+                  inventory: refresh.inventory,
+                  host,
+                  client,
+                  diagnostics: refresh.inventory.diagnostics,
+                }),
+                refresh.postViewDiagnostics,
+              )
         const provider = findProviderConnection(viewWithRefreshDiagnostics, providerId)
         if (!provider) {
           return providerManagementError(
@@ -3264,8 +4111,9 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
           return accessError
         }
 
-        const mustProbe = input.probe !== false
-          || (access.kind === 'configured_authless' && access.requiresExecutionProof)
+        const mustProbe =
+          input.probe !== false ||
+          (access.kind === 'configured_authless' && access.requiresExecutionProof)
         if (mustProbe) {
           const probeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
@@ -3311,16 +4159,21 @@ export class OpenCodeProviderManagementAdapter implements ProviderManagementQuer
         this.invalidateDirectoryCache()
         inventoryService.clearCache?.()
 
-        const refreshedInventory = await this.probeInventory(inventoryService, inventory.projectPath, {
-          bypassCache: true,
-        })
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+          },
+        )
         const refresh = useActionRefreshInventory(
           inventory,
           refreshedInventory,
-          fallbackInventory => applyManagedDefaultToInventory(fallbackInventory, {
-            modelId,
-            scope,
-          }),
+          fallbackInventory =>
+            applyManagedDefaultToInventory(fallbackInventory, {
+              modelId,
+              scope,
+            }),
         )
         const view = await readLiveView({
           inventory: refresh.inventory,

@@ -1,14 +1,121 @@
-import { readFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
-type OpenCodeAuthEntry = Record<string, unknown>
+export type OpenCodeAuthCredential = Record<string, unknown>
+type OpenCodeAuthEntry = OpenCodeAuthCredential
 type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 
 const authStoreWriteQueues = new Map<string, Promise<void>>()
+const AUTH_STORE_LOCK_TIMEOUT_MS = 5_000
+const AUTH_STORE_LOCK_STALE_MS = 30_000
+const AUTH_STORE_LOCK_RETRY_MS = 25
+
+type AuthStoreLockOwner = {
+  id: string
+  createdAtMs: number
+  pid: number
+}
+
+function resolveAuthStoreCoordinationPath(filePath: string): string {
+  const resolved = path.resolve(filePath)
+  const profileMarker = `${path.sep}opencode${path.sep}profiles${path.sep}`
+  const profileMarkerIndex = resolved.indexOf(profileMarker)
+  if (profileMarkerIndex < 0) {
+    return resolved
+  }
+  return path.join(resolved.slice(0, profileMarkerIndex), 'opencode', 'auth.json')
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === code)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function readAuthStoreLockOwner(lockPath: string): Promise<AuthStoreLockOwner | null> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, 'utf8')) as Partial<AuthStoreLockOwner>
+    return typeof parsed.id === 'string'
+      && typeof parsed.createdAtMs === 'number'
+      && Number.isFinite(parsed.createdAtMs)
+      && typeof parsed.pid === 'number'
+      ? {
+          id: parsed.id,
+          createdAtMs: parsed.createdAtMs,
+          pid: parsed.pid,
+        }
+      : null
+  } catch {
+    return null
+  }
+}
+
+async function removeStaleAuthStoreLock(lockPath: string, nowMs: number): Promise<boolean> {
+  try {
+    const [owner, lockStat] = await Promise.all([
+      readAuthStoreLockOwner(lockPath),
+      stat(lockPath),
+    ])
+    const createdAtMs = owner?.createdAtMs ?? lockStat.mtimeMs
+    if (nowMs - createdAtMs <= AUTH_STORE_LOCK_STALE_MS) {
+      return false
+    }
+    await unlink(lockPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function acquireAuthStoreFileLock(filePath: string): Promise<() => Promise<void>> {
+  const coordinationPath = resolveAuthStoreCoordinationPath(filePath)
+  const lockPath = `${coordinationPath}.agent-teams.lock`
+  await mkdir(path.dirname(lockPath), { recursive: true })
+  const deadlineMs = Date.now() + AUTH_STORE_LOCK_TIMEOUT_MS
+
+  for (;;) {
+    const owner: AuthStoreLockOwner = {
+      id: randomUUID(),
+      createdAtMs: Date.now(),
+      pid: process.pid,
+    }
+    try {
+      const handle = await open(lockPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(`${JSON.stringify(owner)}\n`, 'utf8')
+      } catch (error) {
+        await handle.close().catch(() => undefined)
+        await unlink(lockPath).catch(() => undefined)
+        throw error
+      }
+      return async () => {
+        await handle.close().catch(() => undefined)
+        const currentOwner = await readAuthStoreLockOwner(lockPath)
+        if (currentOwner?.id === owner.id) {
+          await unlink(lockPath).catch(() => undefined)
+        }
+      }
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, 'EEXIST')) {
+        throw error
+      }
+      if (await removeStaleAuthStoreLock(lockPath, Date.now())) {
+        continue
+      }
+      if (Date.now() >= deadlineMs) {
+        throw new Error(`Timed out waiting for OpenCode auth store lock: ${coordinationPath}`)
+      }
+      await delay(AUTH_STORE_LOCK_RETRY_MS)
+    }
+  }
+}
 
 async function withAuthStoreWriteLock<T>(
   filePath: string,
@@ -20,14 +127,21 @@ async function withAuthStoreWriteLock<T>(
   const current = new Promise<void>(resolve => {
     release = resolve
   })
-  authStoreWriteQueues.set(lockKey, previous.then(() => current, () => current))
+  const queued = previous.then(
+    () => current,
+    () => current,
+  )
+  authStoreWriteQueues.set(lockKey, queued)
 
   await previous.catch(() => undefined)
+  let releaseFileLock: (() => Promise<void>) | null = null
   try {
+    releaseFileLock = await acquireAuthStoreFileLock(filePath)
     return await operation()
   } finally {
+    await releaseFileLock?.()
     release()
-    if (authStoreWriteQueues.get(lockKey) === current) {
+    if (authStoreWriteQueues.get(lockKey) === queued) {
       authStoreWriteQueues.delete(lockKey)
     }
   }
@@ -35,7 +149,7 @@ async function withAuthStoreWriteLock<T>(
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : null
 }
 
@@ -82,7 +196,23 @@ export async function readOpenCodeAuthStore(filePath: string): Promise<OpenCodeA
   return authStore
 }
 
-async function writeOpenCodeAuthStore(filePath: string, authStore: OpenCodeAuthStore): Promise<void> {
+export async function readOpenCodeAuthCredential(input: {
+  authPath: string
+  providerId: string
+}): Promise<OpenCodeAuthCredential | null> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  const authStore = await readOpenCodeAuthStore(input.authPath)
+  const credential = authStore[providerId]
+  return credential ? { ...credential } : null
+}
+
+async function writeOpenCodeAuthStore(
+  filePath: string,
+  authStore: OpenCodeAuthStore,
+): Promise<void> {
   await writeJsonFileAtomic(filePath, authStore, { indent: 2 })
 }
 
@@ -94,6 +224,46 @@ export function mergeOpenCodeAuthStores(input: {
     ...input.managed,
     ...input.source,
   }
+}
+
+function getOpenCodeOAuthExpires(credential: OpenCodeAuthCredential | undefined): number | null {
+  if (credential?.type !== 'oauth') {
+    return null
+  }
+  const expires = credential.expires
+  return typeof expires === 'number' && Number.isFinite(expires) && expires >= 0
+    ? expires
+    : null
+}
+
+function pickFreshestOpenCodeOAuthCredential(
+  current: OpenCodeAuthCredential,
+  candidate: OpenCodeAuthCredential,
+  preferCandidateOnTie: boolean,
+): OpenCodeAuthCredential {
+  const currentExpires = getOpenCodeOAuthExpires(current)
+  const candidateExpires = getOpenCodeOAuthExpires(candidate)
+  if (currentExpires === null || candidateExpires === null) {
+    return preferCandidateOnTie ? candidate : current
+  }
+  if (candidateExpires === currentExpires) {
+    return preferCandidateOnTie ? candidate : current
+  }
+  return candidateExpires > currentExpires ? candidate : current
+}
+
+export function mergeOpenCodeAuthStoresWithFreshestOAuth(input: {
+  source: OpenCodeAuthStore
+  managed: OpenCodeAuthStore
+}): OpenCodeAuthStore {
+  const merged = { ...input.managed }
+  for (const [providerId, sourceCredential] of Object.entries(input.source)) {
+    const managedCredential = merged[providerId]
+    merged[providerId] = managedCredential?.type === 'oauth' && sourceCredential.type === 'oauth'
+      ? pickFreshestOpenCodeOAuthCredential(managedCredential, sourceCredential, true)
+      : sourceCredential
+  }
+  return merged
 }
 
 export function doesOpenCodeAuthStoreIncludeSource(input: {
@@ -144,6 +314,114 @@ export async function reconcileOpenCodeManagedAuthStore(input: {
   })
 }
 
+export async function reconcileOpenCodeManagedAuthStores(input: {
+  sourceAuthPaths: readonly string[]
+  globalAuthPath: string
+  managedAuthPath: string
+  peerManagedAuthPaths?: readonly string[]
+}): Promise<void> {
+  await withAuthStoreWriteLock(input.globalAuthPath, async () => {
+    const peerManagedAuthPaths = Array.from(new Set([
+      input.managedAuthPath,
+      ...(input.peerManagedAuthPaths ?? []),
+    ]))
+    const [sourceStores, peerStores] = await Promise.all([
+      Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore)),
+      Promise.all(peerManagedAuthPaths.map(readOpenCodeAuthStore)),
+    ])
+
+    let expected: OpenCodeAuthStore = {}
+    for (const source of sourceStores) {
+      expected = mergeOpenCodeAuthStoresWithFreshestOAuth({ source, managed: expected })
+    }
+
+    const oauthProviderIds = Object.entries(expected)
+      .filter(([, credential]) => credential.type === 'oauth')
+      .map(([providerId]) => providerId)
+    const recoveredProviderIds = new Set<string>()
+    for (const providerId of oauthProviderIds) {
+      let freshest = expected[providerId]
+      for (const peerStore of peerStores) {
+        const candidate = peerStore[providerId]
+        if (candidate?.type === 'oauth') {
+          freshest = pickFreshestOpenCodeOAuthCredential(freshest, candidate, false)
+        }
+      }
+      if (JSON.stringify(freshest) !== JSON.stringify(expected[providerId])) {
+        recoveredProviderIds.add(providerId)
+      }
+      expected[providerId] = freshest
+    }
+
+    const globalStore = await readOpenCodeAuthStore(input.globalAuthPath)
+    const nextGlobalStore = { ...globalStore }
+    for (const providerId of oauthProviderIds) {
+      nextGlobalStore[providerId] = expected[providerId]
+    }
+    if (JSON.stringify(nextGlobalStore) !== JSON.stringify(globalStore)) {
+      await writeOpenCodeAuthStore(input.globalAuthPath, nextGlobalStore)
+    }
+
+    for (let index = 0; index < peerManagedAuthPaths.length; index += 1) {
+      const authPath = peerManagedAuthPaths[index]
+      const peerStore = peerStores[index]
+      const nextPeerStore = authPath === input.managedAuthPath
+        ? { ...expected }
+        : { ...peerStore }
+      const providerIdsToFanOut = authPath === input.managedAuthPath
+        ? oauthProviderIds
+        : Array.from(recoveredProviderIds)
+      for (const providerId of providerIdsToFanOut) {
+        nextPeerStore[providerId] = expected[providerId]
+      }
+      if (JSON.stringify(nextPeerStore) !== JSON.stringify(peerStore)) {
+        await writeOpenCodeAuthStore(authPath, nextPeerStore)
+      }
+    }
+  })
+}
+
+export async function fanOutOpenCodeOAuthCredential(input: {
+  providerId: string
+  sourceAuthPath: string
+  targetAuthPaths: readonly string[]
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  const targetAuthPaths = Array.from(new Set(input.targetAuthPaths))
+  const coordinationPath = targetAuthPaths[0] ?? input.sourceAuthPath
+  await withAuthStoreWriteLock(coordinationPath, async () => {
+    const authPaths = Array.from(new Set([input.sourceAuthPath, ...targetAuthPaths]))
+    const stores = await Promise.all(authPaths.map(readOpenCodeAuthStore))
+    let freshest: OpenCodeAuthCredential | null = null
+    for (const store of stores) {
+      const candidate = store[providerId]
+      if (candidate?.type !== 'oauth') {
+        continue
+      }
+      freshest = freshest
+        ? pickFreshestOpenCodeOAuthCredential(freshest, candidate, false)
+        : candidate
+    }
+    if (!freshest) {
+      return
+    }
+
+    for (let index = 0; index < authPaths.length; index += 1) {
+      const authStore = stores[index]
+      if (JSON.stringify(authStore[providerId]) === JSON.stringify(freshest)) {
+        continue
+      }
+      await writeOpenCodeAuthStore(authPaths[index], {
+        ...authStore,
+        [providerId]: freshest,
+      })
+    }
+  })
+}
+
 export async function upsertOpenCodeApiAuthCredential(input: {
   authPath: string
   providerId: string
@@ -154,6 +432,28 @@ export async function upsertOpenCodeApiAuthCredential(input: {
     type: 'api',
     key: input.apiKey,
     ...(input.metadata ? { metadata: input.metadata } : {}),
+  })
+}
+
+export async function upsertOpenCodeAuthCredential(input: {
+  authPath: string
+  providerId: string
+  credential: OpenCodeAuthCredential
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) {
+    throw new Error('OpenCode provider id is invalid')
+  }
+  const credentialType =
+    typeof input.credential.type === 'string' ? input.credential.type.trim().toLowerCase() : ''
+  if (!credentialType) {
+    throw new Error('OpenCode auth credential type is required')
+  }
+
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    const authStore = await readOpenCodeAuthStore(input.authPath)
+    authStore[providerId] = { ...input.credential, type: credentialType }
+    await writeOpenCodeAuthStore(input.authPath, authStore)
   })
 }
 
@@ -223,9 +523,10 @@ export async function readOpenCodeAuthProviderSummaries(
   return Object.entries(authStore)
     .map(([providerId, entry]) => ({
       id: providerId,
-      authHint: typeof entry.type === 'string' && entry.type.trim()
-        ? entry.type.trim().toLowerCase()
-        : null,
+      authHint:
+        typeof entry.type === 'string' && entry.type.trim()
+          ? entry.type.trim().toLowerCase()
+          : null,
       source: 'credentials' as const,
       ...(credentialScopes ? { credentialScopes } : {}),
     }))

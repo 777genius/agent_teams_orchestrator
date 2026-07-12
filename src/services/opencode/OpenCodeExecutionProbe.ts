@@ -9,7 +9,10 @@ import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
-import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
+import {
+  OPEN_CODE_MODEL_PROBE_AGENT_NAME,
+  openCodeProfileManager,
+} from './OpenCodeProfileManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -22,11 +25,12 @@ const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
 const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 120_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
-const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 2 * 60_000
+const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 10 * 60_000
 const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
 const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
 const OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT = 512
 const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
+const OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT = 262_144
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
@@ -39,6 +43,10 @@ type OpenCodeExecutionProbeDeps = {
   pollIntervalMs?: number
   persistentCache?: boolean
   persistentCacheRoot?: string
+  fanOutOAuthCredential?: (input: {
+    providerId: string
+    sourceAuthPath: string
+  }) => Promise<void>
 }
 
 type ProbeCacheFile = {
@@ -75,6 +83,12 @@ function parseProviderScopedModel(selectedModel: string): {
     providerID: trimmed.slice(0, separatorIndex),
     modelID: trimmed.slice(separatorIndex + 1),
   }
+}
+
+export function resolveOpenCodeExecutionProbeContextTokens(selectedModel: string): number {
+  return selectedModel.startsWith('cursor-acp/') || selectedModel.startsWith('kiro/')
+    ? OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT
+    : OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT
 }
 
 function nowMs(): number {
@@ -147,7 +161,12 @@ function classifyProbeFailure(params: {
   if (
     lower.includes('token refresh failed')
     || lower.includes('authentication failed')
+    || lower.includes('authentication required')
     || lower.includes('auth failed')
+    || lower.includes('not logged in')
+    || lower.includes('please run \'agent login\'')
+    || lower.includes('please run `kiro-cli login`')
+    || lower.includes('cursor_api_key')
     || lower.includes('unauthorized')
     || lower.includes('forbidden')
     || /\b401\b/.test(lower)
@@ -170,6 +189,7 @@ function classifyProbeFailure(params: {
     || lower.includes('invalid model')
     || lower.includes('not available for your account')
     || lower.includes('rate limit')
+    || lower.includes('usage limit')
     || lower.includes('too many requests')
     || lower.includes('freeusagelimit')
     || /\b429\b/.test(lower)
@@ -237,6 +257,7 @@ function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number 
   const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
   if (
     lower.includes('rate limit')
+    || lower.includes('usage limit')
     || lower.includes('too many requests')
     || lower.includes('freeusagelimit')
     || /\b429\b/.test(lower)
@@ -251,13 +272,17 @@ function hashProbeCacheKey(value: string): string {
 }
 
 function buildPersistentProbeCacheKey(cacheKey: string, host: OpenCodeHostHandle): string {
+  // The resolved host config contains runtime-only values that can change when
+  // the app MCP attachment or a local provider proxy is refreshed. The managed
+  // config/auth fingerprints already cover durable launch inputs, so including
+  // the resolved fingerprint made a successful wizard probe invisible to the
+  // later teammate launch process.
   return [
     cacheKey,
     host.profile.profileRootKey,
     host.profile.projectBehaviorFingerprint,
     host.profile.managedAuthFingerprint ?? 'no-auth',
     host.profile.managedConfigFingerprint,
-    host.resolvedConfigFingerprint ?? 'no-resolved-config',
     host.version ?? 'unknown-version',
   ].join('\u0000')
 }
@@ -365,6 +390,17 @@ export class OpenCodeExecutionProbe {
     return this.deps.persistentCache ?? (this.deps.clientFactory == null)
   }
 
+  private async fanOutOAuthCredential(input: {
+    providerId: string
+    sourceAuthPath: string
+  }): Promise<void> {
+    if (this.deps.fanOutOAuthCredential) {
+      await this.deps.fanOutOAuthCredential(input)
+      return
+    }
+    await openCodeProfileManager.fanOutOAuthCredential(input.providerId, input.sourceAuthPath)
+  }
+
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const cacheKey = buildProbeCacheKey(params)
     if (!params.bypassCache) {
@@ -432,7 +468,7 @@ export class OpenCodeExecutionProbe {
           {
             modelId: params.selectedModel,
             outputTokens: OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
-            contextTokens: OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT,
+            contextTokens: resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
           },
         ],
       },
@@ -625,6 +661,16 @@ export class OpenCodeExecutionProbe {
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
+      if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
+        await this.fanOutOAuthCredential({
+          providerId: 'xai',
+          sourceAuthPath: host.profile.managedAuthPath,
+        }).catch(error => {
+          result.diagnostics.push(
+            `OpenCode xAI OAuth credential sync failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
+      }
       if (cacheFilePath) {
         await writePersistentProbeCache(
           cacheFilePath,

@@ -133,6 +133,26 @@ describe('OpenCodeModelAccessPolicy', () => {
     })
   })
 
+  test.each([
+    ['cursor-acp', 'auto'],
+    ['kiro', 'auto'],
+  ])('requires execution proof for managed CLI-session plugin %s', (providerId, modelId) => {
+    const selectedModel = `${providerId}/${modelId}`
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel,
+      catalog: {
+        connectedProviders: [],
+        models: [selectedModel],
+      },
+    })
+
+    expect(access).toMatchObject({
+      kind: 'configured_authless',
+      launchAllowed: false,
+      requiresExecutionProof: true,
+    })
+  })
+
   test('requires execution proof for configured authless local providers even when OpenCode reports them connected', () => {
     const localCatalog = catalog({
       connectedProviders: ['llama.cpp'],

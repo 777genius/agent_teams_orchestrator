@@ -484,7 +484,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         },
         reasoningEffort: {
           supported: true,
-          values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          values: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
           configPassthrough: true,
         },
       })
@@ -793,7 +793,11 @@ describe('runtime backend registry with agent_teams capabilities', () => {
               context: 1050000,
               limits: { context: 1050000 },
               free: false,
-              raw: { cost: { input: 1.25, output: 10 }, limit: { context: 1050000 } },
+              raw: {
+                cost: { input: 1.25, output: 10 },
+                limit: { context: 1050000 },
+                release_date: '2026-03-05',
+              },
             },
           ],
           agents: [
@@ -839,6 +843,10 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
           ?.badgeLabel,
       ).toBeNull()
+      expect(
+        opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
+          ?.metadata?.releaseDate,
+      ).toBe('2026-03-05')
       expect(opencode?.capabilities.teamLaunch).toBe(true)
       expect(opencode?.capabilities.extensions.plugins.status).toBe('read-only')
       expect(opencode?.backend?.kind).toBe('opencode-cli')
