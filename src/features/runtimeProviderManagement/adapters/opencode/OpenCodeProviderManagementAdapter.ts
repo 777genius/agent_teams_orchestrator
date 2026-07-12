@@ -221,11 +221,13 @@ const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
   'github-copilot',
   'kiro',
   'cursor-acp',
+  'xai',
   ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => definition.id),
 ])
 const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
   'atlascloud',
   'github-copilot',
+  'xai',
   ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
     .filter(definition => definition.requireConnectExecutionProof)
     .map(definition => definition.id),
@@ -4118,6 +4120,7 @@ export class OpenCodeProviderManagementAdapter
           const probeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
             projectPath: inventory.projectPath,
+            bypassCache: true,
           })
           if (probeResult.outcome !== 'available') {
             if (probeResult.outcome === 'not_authenticated') {
@@ -4251,6 +4254,7 @@ export class OpenCodeProviderManagementAdapter
         const probe = await this.getExecutionProbe().probeModel({
           selectedModel: modelId,
           projectPath: inventory.projectPath,
+          bypassCache: true,
         })
         return {
           ok: true,

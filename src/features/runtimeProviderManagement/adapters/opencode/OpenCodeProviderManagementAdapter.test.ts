@@ -524,8 +524,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probe: async () =>
           inventory({
             connectedProviders: [],
-            availableProviders: ['kiro', 'cursor-acp', 'github-copilot'],
-            models: ['kiro/auto', 'cursor-acp/auto', 'github-copilot/gpt-5-mini'],
+            availableProviders: ['kiro', 'cursor-acp', 'github-copilot', 'xai'],
+            models: [
+              'kiro/auto',
+              'cursor-acp/auto',
+              'github-copilot/gpt-5-mini',
+              'xai/grok-4.3',
+            ],
           }),
       },
       hostManager: {
@@ -543,6 +548,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
                 name: 'GitHub Copilot',
                 models: { 'gpt-5-mini': {} },
               },
+              { id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } },
             ],
             default: {},
           }),
@@ -551,14 +557,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
               { id: 'kiro', name: 'Kiro' },
               { id: 'cursor-acp', name: 'Cursor ACP' },
               { id: 'github-copilot', name: 'GitHub Copilot' },
+              { id: 'xai', name: 'xAI' },
             ],
-            connected: ['kiro', 'cursor-acp', 'github-copilot'],
+            connected: ['kiro', 'cursor-acp', 'github-copilot', 'xai'],
             default: {},
           }),
           getProviderAuth: async () => ({
             kiro: [{ type: 'oauth' }],
             'cursor-acp': [{ type: 'api' }],
             'github-copilot': [{ type: 'oauth' }],
+            xai: [{ type: 'oauth' }],
           }),
         }),
       },
@@ -568,7 +576,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    for (const providerId of ['kiro', 'cursor-acp', 'github-copilot']) {
+    for (const providerId of ['kiro', 'cursor-acp', 'github-copilot', 'xai']) {
       const provider = result.value.providers.find(entry => entry.providerId === providerId)
       expect(provider?.state).toBe('available')
       expect(provider?.ownership).toEqual([])
@@ -1424,6 +1432,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const authorizations: Array<Record<string, unknown>> = []
     const ensureHostCalls: Array<{ hostLifetime?: string }> = []
     const releaseHostCalls: Array<{ keepPersistentAlive?: boolean }> = []
+    const modelProbes: Array<{ selectedModel: string; bypassCache?: boolean }> = []
     const credentialWrites: Array<{
       authPath: string
       providerId: string
@@ -1507,6 +1516,15 @@ describe('OpenCodeProviderManagementAdapter', () => {
       profileManager: {
         listManagedAuthPaths: async () => ['/tmp/other-profile/data/opencode/auth.json'],
       },
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push({
+            selectedModel: input.selectedModel,
+            bypassCache: input.bypassCache,
+          })
+          return executionProbeResult(input.selectedModel)
+        },
+      },
     })
 
     const result = await adapter.connectProvider(
@@ -1544,6 +1562,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(authorizations).toEqual([{ method: 0 }])
     expect(ensureHostCalls).toEqual([expect.objectContaining({ hostLifetime: 'process' })])
     expect(releaseHostCalls).toEqual([{ keepPersistentAlive: false }])
+    expect(modelProbes).toEqual([{ selectedModel: 'xai/grok-4', bypassCache: true }])
     expect(credentialWrites.map(write => write.authPath).sort()).toEqual(
       [
         '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',

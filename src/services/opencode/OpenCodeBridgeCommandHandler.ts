@@ -2070,6 +2070,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
   const executionOutcome = await openCodeExecutionProbe.probeModel({
     selectedModel,
     projectPath: snapshot.projectPath,
+    bypassCache: true,
     disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
   }).catch(error =>
     buildOpenCodeExecutionOutcome(
@@ -2290,6 +2291,11 @@ async function runReadiness(envelope: BridgeEnvelope) {
     const executionOutcome = await openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: modelSnapshot.projectPath,
+      // Deep readiness is the final provider-auth gate before launch. A cached
+      // success can outlive an OAuth access token, so force a real request here.
+      // OpenCode then refreshes the token when possible and the execution probe
+      // fans the rotated credential out to every managed profile.
+      bypassCache: true,
       disposeHostOnRelease: disposeReadinessHostOnRelease,
     }).catch(error =>
       buildOpenCodeExecutionOutcome(
