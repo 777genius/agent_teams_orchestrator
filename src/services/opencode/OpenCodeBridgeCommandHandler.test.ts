@@ -1056,9 +1056,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     let probedModelId: string | null = null
     let probedDisposeHostOnRelease: boolean | undefined
+    let probedBypassCache: boolean | undefined
     openCodeExecutionProbe.probeModel = (async input => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
+      probedBypassCache = input.bypassCache
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -1091,6 +1093,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
     expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
+    expect(probedBypassCache).toBe(true)
     expect(provisioningOptions).toEqual([
       {
         disposeHostOnRelease: process.platform !== 'win32',
@@ -1617,9 +1620,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     openCodeProvisioningProbe.probe = async () => buildReadinessSnapshot()
     let probedModelId: string | null = null
     let probedDisposeHostOnRelease: boolean | undefined
+    let probedBypassCache: boolean | undefined
     openCodeExecutionProbe.probeModel = (async input => {
       probedModelId = input.selectedModel
       probedDisposeHostOnRelease = input.disposeHostOnRelease
+      probedBypassCache = input.bypassCache
       return {
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -1652,6 +1657,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(probedModelId).toBe('openrouter/minimax-m2.5-free')
     expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
+    expect(probedBypassCache).toBe(true)
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
   })
