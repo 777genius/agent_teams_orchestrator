@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import net from 'node:net'
-import { mkdir, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readlink, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
@@ -35,6 +35,24 @@ const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
 const OPENTUI_TEMP_DYLIB_RE = /^\.bbb[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
+
+export async function resolveOpenCodeBinaryHostIdentity(binaryPath: string): Promise<string> {
+  let resolvedPath = path.resolve(binaryPath)
+  try {
+    const target = await readlink(resolvedPath)
+    resolvedPath = path.resolve(path.dirname(resolvedPath), target)
+  } catch {
+    // The executable is not a symlink or cannot be resolved. Its absolute path
+    // remains a stable part of the identity.
+  }
+  const metadata = await stat(resolvedPath).catch(() => null)
+  const source = [
+    resolvedPath,
+    metadata?.size ?? 'unknown-size',
+    metadata?.mtimeMs ?? 'unknown-mtime',
+  ].join('\0')
+  return createHash('sha256').update(source).digest('hex').slice(0, 16)
+}
 
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
   retries: {
@@ -1083,12 +1101,16 @@ export class OpenCodeHostManager {
       }
     }
     const hostLifetime = params.hostLifetime ?? 'persistent'
-    const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}`
-    const hostKey =
-      params.hostKey?.trim() ||
-      (hostLifetime === 'process'
+    const explicitHostKey = params.hostKey?.trim()
+    const hostKey = explicitHostKey || await (async () => {
+      const binaryHostIdentity = binaryPath
+        ? await resolveOpenCodeBinaryHostIdentity(binaryPath)
+        : 'missing-binary'
+      const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+      return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
-        : baseHostKey)
+        : baseHostKey
+    })()
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
     const existing = this.hosts.get(hostKey)

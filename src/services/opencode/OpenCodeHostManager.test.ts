@@ -11,6 +11,7 @@ import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
   OpenCodeHostManager,
   buildOpenCodeHostSpawnOptions,
+  resolveOpenCodeBinaryHostIdentity,
   shouldUnrefOpenCodeHostProcess,
 } from './OpenCodeHostManager.js'
 
@@ -81,6 +82,21 @@ function createMockChildProcess(pid = 4242): {
     unrefCalls,
   }
 }
+
+test('changes the persistent host identity when the OpenCode binary changes', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-binary-identity-'))
+  const binaryPath = path.join(tempDir, 'opencode')
+  try {
+    await writeFile(binaryPath, 'version-one')
+    const first = await resolveOpenCodeBinaryHostIdentity(binaryPath)
+    expect(await resolveOpenCodeBinaryHostIdentity(binaryPath)).toBe(first)
+
+    await writeFile(binaryPath, 'version-two-with-a-different-size')
+    expect(await resolveOpenCodeBinaryHostIdentity(binaryPath)).not.toBe(first)
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
 
 function createDeferred<T = void>(): {
   promise: Promise<T>
