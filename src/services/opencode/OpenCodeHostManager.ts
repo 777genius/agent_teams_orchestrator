@@ -30,9 +30,13 @@ const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
+const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
-const OPENTUI_TEMP_DYLIB_RE = /^\.bbb[0-9a-f]+-[0-9a-f]+\.dylib$/i
+// Bun/OpenTUI temp dylib prefixes vary between builds (.bbb, .bbc, .b9dd, ...).
+// Keep the match constrained to hidden hexadecimal dylibs inside the app-owned
+// profile tmp directory so unrelated user files are never removed.
+const OPENTUI_TEMP_DYLIB_RE = /^\.b[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
 
@@ -466,6 +470,13 @@ export class OpenCodeHostManager {
       : this.deps.persistentRegistryPath
   }
 
+  private getPersistentProfileTmpPath(profileRootKey: string): string {
+    const registryPath = this.persistentRegistryPath
+    return registryPath
+      ? path.join(path.dirname(registryPath), 'profiles', profileRootKey, 'tmp')
+      : getOpenCodeProfileTmpPath(profileRootKey)
+  }
+
   private isProcessAlive(pid: number): boolean {
     return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
   }
@@ -531,6 +542,46 @@ export class OpenCodeHostManager {
       return
     }
     await cleanupOpenTuiTempDylibs(tempPath).catch(() => undefined)
+  }
+
+  private async cleanupStaleManagedProfileTempDylibs(
+    activeProfileRootKeys: ReadonlySet<string>,
+  ): Promise<{ removed: number; bytes: number }> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return { removed: 0, bytes: 0 }
+    }
+    const profilesRootPath = path.join(path.dirname(registryPath), 'profiles')
+    const profiles = await readdir(profilesRootPath, { withFileTypes: true }).catch(() => [])
+    const staleBeforeMs = this.nowMs() - OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS
+    let removed = 0
+    let bytes = 0
+
+    for (const profile of profiles) {
+      if (!profile.isDirectory() || activeProfileRootKeys.has(profile.name)) {
+        continue
+      }
+      const tmpPath = path.join(profilesRootPath, profile.name, 'tmp')
+      const entries = await readdir(tmpPath, { withFileTypes: true }).catch(() => [])
+      for (const entry of entries) {
+        if (!entry.isFile() || !OPENTUI_TEMP_DYLIB_RE.test(entry.name)) {
+          continue
+        }
+        const filePath = path.join(tmpPath, entry.name)
+        const metadata = await stat(filePath).catch(() => null)
+        if (!metadata || metadata.mtimeMs > staleBeforeMs) {
+          continue
+        }
+        await unlink(filePath).catch(() => undefined)
+        const stillExists = await stat(filePath).then(() => true).catch(() => false)
+        if (!stillExists) {
+          removed += 1
+          bytes += metadata.size
+        }
+      }
+    }
+
+    return { removed, bytes }
   }
 
   private async readPersistentRegistryUnlocked(): Promise<PersistentHostRegistryShape> {
@@ -802,6 +853,7 @@ export class OpenCodeHostManager {
     }
     const health = await this.checkHealthyHostOnce(record.baseUrl)
     if (!health) {
+      await this.terminatePersistentHostRecord(record, { force: true }).catch(() => undefined)
       await this.removePersistentHost(hostKey).catch(() => undefined)
       return null
     }
@@ -1230,7 +1282,7 @@ export class OpenCodeHostManager {
     this.hosts.delete(record.hostKey)
     this.pendingHosts.delete(record.hostKey)
     await this.cleanupOpenTuiTempArtifactsIfUnused(
-      entry?.handle.profile.tmpPath ?? getOpenCodeProfileTmpPath(record.profileRootKey),
+      entry?.handle.profile.tmpPath ?? this.getPersistentProfileTmpPath(record.profileRootKey),
       pid,
     )
   }
@@ -1382,6 +1434,10 @@ export class OpenCodeHostManager {
           delete registry.hosts[hostKey]
           cleaned += 1
           changed = true
+          await this.cleanupOpenTuiTempArtifactsIfUnused(
+            this.getPersistentProfileTmpPath(record.profileRootKey),
+            record.pid,
+          )
           hosts.push({
             hostKey,
             projectPath: record.projectPath,
@@ -1480,6 +1536,29 @@ export class OpenCodeHostManager {
           await unlink(registryPath).catch(() => undefined)
         } else {
           await this.writePersistentRegistryUnlocked(registry)
+        }
+      }
+
+      if (options.reason === 'startup') {
+        const activeProfileRootKeys = new Set(
+          Object.values(registry.hosts)
+            .filter(record => this.isProcessAlive(record.pid))
+            .map(record => record.profileRootKey),
+        )
+        const tempCleanup = await this.cleanupStaleManagedProfileTempDylibs(
+          activeProfileRootKeys,
+        ).catch(error => {
+          diagnostics.push(
+            `Failed to clean stale OpenCode profile temp dylibs: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          )
+          return { removed: 0, bytes: 0 }
+        })
+        if (tempCleanup.removed > 0) {
+          diagnostics.push(
+            `Removed ${tempCleanup.removed} stale OpenCode profile temp dylib(s) (${tempCleanup.bytes} bytes)`,
+          )
         }
       }
 

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -241,8 +241,13 @@ describe('OpenCodeHostManager', () => {
       profileRootPath: tempDir,
       tmpPath,
     }
-    const dylibPath = path.join(tmpPath, '.bbb6fbfdecfffefd-00000000.dylib')
+    const dylibPaths = [
+      path.join(tmpPath, '.bbb6fbfdecfffefd-00000000.dylib'),
+      path.join(tmpPath, '.bbc7fffde8b6fead-00000000.dylib'),
+      path.join(tmpPath, '.b9dd7ef5eafe1fea-00000000.dylib'),
+    ]
     const keepPath = path.join(tmpPath, 'keep.txt')
+    const keepDylibPath = path.join(tmpPath, '.plugin-cache.dylib')
     const spawned = createMockChildProcess(43139)
     let processAlive = true
 
@@ -282,13 +287,15 @@ describe('OpenCodeHostManager', () => {
 
     try {
       await manager.ensureHost({ hostKey: 'host-key' })
-      await writeFile(dylibPath, 'temp dylib', 'utf8')
+      await Promise.all(dylibPaths.map(dylibPath => writeFile(dylibPath, 'temp dylib', 'utf8')))
       await writeFile(keepPath, 'keep', 'utf8')
+      await writeFile(keepDylibPath, 'keep dylib', 'utf8')
 
       await manager.disposeHost('host-key')
 
-      expect(await pathExists(dylibPath)).toBe(false)
+      expect(await Promise.all(dylibPaths.map(pathExists))).toEqual([false, false, false])
       expect(await pathExists(keepPath)).toBe(true)
+      expect(await pathExists(keepDylibPath)).toBe(true)
       expect(spawned.killedSignals).toEqual(['SIGTERM'])
     } finally {
       await rm(tempDir, { recursive: true, force: true })
@@ -1392,6 +1399,90 @@ describe('OpenCodeHostManager', () => {
         'team-a::primary::alice',
         'team-a::primary::bob',
       ])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup cleanup removes temp dylibs left by a dead registered host', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const profileTmpPath = path.join(tempDir, 'profiles', 'profile-root', 'tmp')
+    const dylibPath = path.join(profileTmpPath, '.b9dd7ef5eafe1fea-00000000.dylib')
+    const keepPath = path.join(profileTmpPath, 'keep.txt')
+
+    try {
+      await mkdir(profileTmpPath, { recursive: true })
+      await writeFile(dylibPath, 'temp dylib', 'utf8')
+      await writeFile(keepPath, 'keep', 'utf8')
+      await writeFile(
+        registryPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          hosts: {
+            'host-key': {
+              hostKey: 'host-key',
+              profileRootKey: 'profile-root',
+              projectPath: '/tmp/project',
+              projectBehaviorFingerprint: 'behavior-v1',
+              baseUrl: 'http://127.0.0.1:43115',
+              port: 43115,
+              pid: 43115,
+              version: '1.4.0',
+              resolvedConfigFingerprint: null,
+              updatedAt: '2026-04-24T09:00:00.000Z',
+              leases: {},
+            },
+          },
+        }),
+        'utf8',
+      )
+      const manager = new OpenCodeHostManager({
+        isProcessAlive: () => false,
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
+
+      expect(result.hosts[0]?.action).toBe('removed_dead')
+      expect(await pathExists(dylibPath)).toBe(false)
+      expect(await pathExists(keepPath)).toBe(true)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup cleanup removes old temp dylibs from unregistered managed profiles', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
+    const registryPath = path.join(tempDir, 'host-registry.json')
+    const tmpPath = path.join(tempDir, 'profiles', 'orphaned-profile', 'tmp')
+    const staleDylibPath = path.join(tmpPath, '.bbc7fffde8b6fead-00000000.dylib')
+    const recentDylibPath = path.join(tmpPath, '.b9dd7ef5eafe1fea-00000000.dylib')
+    const keepPath = path.join(tmpPath, 'keep.txt')
+
+    try {
+      await mkdir(tmpPath, { recursive: true })
+      await writeFile(staleDylibPath, 'old temp dylib', 'utf8')
+      await writeFile(recentDylibPath, 'recent temp dylib', 'utf8')
+      await writeFile(keepPath, 'keep', 'utf8')
+      await utimes(
+        staleDylibPath,
+        new Date('2026-04-20T10:00:00.000Z'),
+        new Date('2026-04-20T10:00:00.000Z'),
+      )
+      const manager = new OpenCodeHostManager({
+        now: () => new Date('2026-04-24T10:00:00.000Z'),
+        persistentRegistryPath: registryPath,
+      })
+
+      const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
+
+      expect(await pathExists(staleDylibPath)).toBe(false)
+      expect(await pathExists(recentDylibPath)).toBe(true)
+      expect(await pathExists(keepPath)).toBe(true)
+      expect(result.diagnostics).toContain(
+        'Removed 1 stale OpenCode profile temp dylib(s) (14 bytes)',
+      )
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
