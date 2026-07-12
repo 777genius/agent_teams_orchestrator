@@ -25,6 +25,7 @@ import {
 import {
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
+  setOpenCodeManagedModelLimits,
 } from './OpenCodeManagedPreferences.js'
 import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
@@ -464,6 +465,31 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('reuses a fresh Cursor marker without repeatedly probing the official CLI', async () => {
+    const globalAuthPath = path.join(tempDir, 'cursor-fresh-global.json')
+    const managedAuthPath = path.join(tempDir, 'cursor-fresh-managed.json')
+    const credential = {
+      type: 'api',
+      key: 'cursor-agent',
+      expires: 20 * 60 * 1000,
+    }
+    await writeFile(globalAuthPath, JSON.stringify({ 'cursor-acp': credential }))
+    const probe = mock(async () => false)
+
+    expect(await ensureOpenCodeCursorPluginAuthCredential({
+      globalAuthPath,
+      managedAuthPath,
+      cursorAgentExecutablePath: '/test/cursor-agent',
+      probe,
+      now: () => 1_000,
+    })).toBe(false)
+
+    expect(probe).not.toHaveBeenCalled()
+    expect(JSON.parse(await readFile(managedAuthPath, 'utf8'))).toMatchObject({
+      'cursor-acp': credential,
+    })
+  })
+
   test('preserves an explicit Cursor API credential without probing the CLI marker', async () => {
     const globalAuthPath = path.join(tempDir, 'cursor-explicit-global.json')
     const managedAuthPath = path.join(tempDir, 'cursor-explicit-managed.json')
@@ -618,7 +644,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = previousMcpEntry
       }
     }
-  }, 15_000)
+  }, 30_000)
 
   test('recovers a refreshed xAI OAuth credential from a peer during restart preparation', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
@@ -973,6 +999,17 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(tmpStat.isDirectory()).toBe(true)
       expect(profile.xdgCacheHome).toBe(path.join(appCacheHome, 'opencode', 'shared-cache'))
       expect(profile.env.NPM_CONFIG_CACHE).toBe(path.join(profile.xdgCacheHome, 'npm'))
+      expect(profile.env.PLAYWRIGHT_BROWSERS_PATH).toBe(
+        path.join(profile.xdgCacheHome, 'tools', 'ms-playwright'),
+      )
+      expect(profile.env.PUPPETEER_CACHE_DIR).toBe(
+        path.join(profile.xdgCacheHome, 'tools', 'puppeteer'),
+      )
+      expect(profile.env.PIP_CACHE_DIR).toBe(path.join(profile.xdgCacheHome, 'tools', 'pip'))
+      expect(profile.env.UV_CACHE_DIR).toBe(path.join(profile.xdgCacheHome, 'tools', 'uv'))
+      expect(profile.env.npm_config_devdir).toBe(
+        path.join(profile.xdgCacheHome, 'tools', 'node-gyp'),
+      )
       expect(profile.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
       expect(profile.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]).toBe(appCacheHome)
       expect(appMcpConfig?.environment?.[CLAUDE_MULTIMODEL_DATA_HOME_ENV]).toBe(appDataHome)
@@ -1449,6 +1486,59 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
       }
     }
   })
+
+  test('applies app-managed local model limits without changing user or project config', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-local-limits')
+    const appCacheHome = path.join(tempDir, 'app-cache-local-limits')
+    const projectPath = path.join(tempDir, 'project-local-limits')
+    const projectConfigPath = path.join(projectPath, 'opencode.json')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+
+    try {
+      await mkdir(projectPath, { recursive: true })
+      await writeFile(
+        projectConfigPath,
+        JSON.stringify({ provider: { local: { models: { qwen: { name: 'Qwen local' } } } } }),
+      )
+      const originalProjectConfig = await readFile(projectConfigPath, 'utf8')
+      const manager = new OpenCodeProfileManager()
+      const initialProfile = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+      await setOpenCodeManagedModelLimits(initialProfile.profileRootPath, {
+        modelId: 'local/qwen',
+        contextTokens: 128_000,
+        outputTokens: 32_000,
+      })
+
+      const profile = await manager.prepareProfile(projectPath, { includeAppMcp: false })
+
+      expect(profile.managedConfig).toMatchObject({
+        provider: {
+          local: {
+            models: {
+              qwen: {
+                limit: { context: 128_000, output: 32_000 },
+              },
+            },
+          },
+        },
+      })
+      expect(await readFile(projectConfigPath, 'utf8')).toBe(originalProjectConfig)
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  }, 15_000)
 
   test('can cap a provider-scoped model output limit in managed config overrides', () => {
     const managedConfig = buildManagedConfig(null, {

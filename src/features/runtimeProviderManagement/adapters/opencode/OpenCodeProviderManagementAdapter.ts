@@ -16,7 +16,11 @@ import {
   withOpenCodeOAuthRefreshLock,
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
-import { openCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
+import {
+  OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+  openCodeHostManager,
+} from '../../../../services/opencode/OpenCodeHostManager.js'
+import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION,
@@ -35,8 +39,13 @@ import {
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import {
+  OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
+  readOpenCodeManagedRuntimePreferences,
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
+  setOpenCodeManagedModelLimits,
+  type OpenCodeManagedModelLimitOverride,
+  type OpenCodeManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
 import type {
@@ -59,6 +68,7 @@ import { isRecommendedProvider, sortProviderConnections } from '../../domain/pro
 import type {
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
+  ConfigureProviderModelLimitsInput,
   LoadProviderDirectoryInput,
   LoadProviderModelsInput,
   LoadProviderManagementViewInput,
@@ -76,6 +86,7 @@ import type {
   ProviderManagementResult,
   ProviderManagementRuntimeId,
   ProviderManagementView,
+  ProviderModelLimitsResult,
   ProviderModelAvailability,
   ProviderModelTestResult,
   ProviderOwnership,
@@ -106,7 +117,13 @@ type OpenCodeInventoryServiceLike = {
   clearCache?(): void
 }
 
-type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
+type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'> &
+  Partial<
+    Pick<
+      typeof openCodeHostManager,
+      'retainHostLease' | 'releaseHostLease' | 'reconcilePersistentHosts'
+    >
+  >
 
 type OpenCodeProviderManagementClient = {
   getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
@@ -165,12 +182,19 @@ type OpenCodeProviderManagementAdapterDeps = {
       projectPath?: string | null
       prompt?: string
       expectedOutput?: string
+      contextTokens?: number
+      outputTokens?: number
       bypassCache?: boolean
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
+    read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
     setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
+    setModelLimits?(
+      profileRootPath: string,
+      input: { modelId: string; contextTokens: number; outputTokens: number },
+    ): Promise<unknown>
   }
   inventoryTimeoutMs?: number
 }
@@ -285,6 +309,8 @@ const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 
 type ProviderDirectoryCacheEntry = {
@@ -434,6 +460,30 @@ function normalizePositiveLimit(value: number | null | undefined): number | null
   }
   const normalized = Math.floor(value)
   return normalized > 0 ? Math.min(normalized, 500) : null
+}
+
+function normalizeTokenLimit(value: number | null | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    return null
+  }
+  return value > 0 && value <= OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS ? value : null
+}
+
+function getCatalogModelLimits(
+  inventory: OpenCodeInventorySnapshot,
+  modelId: string,
+): { contextTokens: number | null; outputTokens: number | null } {
+  const metadata = inventory.modelMetadata?.find(candidate => candidate.id.trim() === modelId)
+  if (!metadata) {
+    return { contextTokens: null, outputTokens: null }
+  }
+  const limits = asRecord(metadata.limits)
+  return {
+    contextTokens: normalizeTokenLimit(
+      metadata.context ?? (limits?.context as number | undefined),
+    ),
+    outputTokens: normalizeTokenLimit(limits?.output as number | undefined),
+  }
 }
 
 function normalizeProviderScopedModelId(input: {
@@ -2355,6 +2405,7 @@ function buildRuntimeProviderModel(input: {
   availability?: ProviderModelAvailability
   inventory: OpenCodeInventorySnapshot
   accessCatalog: OpenCodeModelAccessCatalog
+  managedModelLimitOverrides?: Readonly<Record<string, OpenCodeManagedModelLimitOverride>>
 }): RuntimeProviderModel {
   const nestedModelId = input.modelId.slice(`${input.providerId}/`.length)
   const sourceLabel = getProviderDisplayName(input.providerId, input.providerEntry)
@@ -2363,6 +2414,8 @@ function buildRuntimeProviderModel(input: {
     catalog: input.accessCatalog,
     sourceLabel,
   })
+  const catalogLimits = getCatalogModelLimits(input.inventory, input.modelId)
+  const managedLimits = input.managedModelLimitOverrides?.[input.modelId] ?? null
   return {
     modelId: input.modelId,
     providerId: input.providerId,
@@ -2376,6 +2429,11 @@ function buildRuntimeProviderModel(input: {
     proofState: routeMetadata.proofState,
     requiresExecutionProof: routeMetadata.requiresExecutionProof,
     accessReason: routeMetadata.reason,
+    catalogContextTokens: catalogLimits.contextTokens,
+    catalogOutputTokens: catalogLimits.outputTokens,
+    managedContextTokens: managedLimits?.contextTokens ?? null,
+    managedOutputTokens: managedLimits?.outputTokens ?? null,
+    managedUpdatedAt: managedLimits?.updatedAt ?? null,
   }
 }
 
@@ -2387,6 +2445,7 @@ function buildProviderModelsView(input: {
   query?: string | null
   limit?: number | null
   diagnostics?: readonly string[]
+  managedModelLimitOverrides?: Readonly<Record<string, OpenCodeManagedModelLimitOverride>>
 }): RuntimeProviderModelsView {
   const entries = getProviderEntries(input.configProviders, input.providers)
   const defaultModelId = getDefaultModelForProvider(
@@ -2416,6 +2475,7 @@ function buildProviderModelsView(input: {
         defaultModelId,
         inventory: input.inventory,
         accessCatalog,
+        managedModelLimitOverrides: input.managedModelLimitOverrides,
       }),
     )
     .filter(model => providerModelMatchesQuery(model, query))
@@ -2581,8 +2641,50 @@ export class OpenCodeProviderManagementAdapter
     ProviderManagementCommandPort
 {
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
+  private hostLeaseSequence = 0
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
+
+  private async retainProviderManagementHost(
+    hostManager: OpenCodeHostManagerLike,
+    host: OpenCodeHostHandle,
+  ): Promise<OpenCodeHostLeaseInput | null> {
+    if (!hostManager.retainHostLease) {
+      return null
+    }
+    const lease: OpenCodeHostLeaseInput = {
+      teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+      laneId: 'provider-management',
+      memberName: `provider-management-${process.pid}-${++this.hostLeaseSequence}`,
+      runId: null,
+      sessionId: null,
+    }
+    try {
+      await hostManager.retainHostLease(host.hostKey, lease)
+      await hostManager.reconcilePersistentHosts?.({
+        mode: 'stale',
+        reason: 'provider-management-idle-eviction',
+        staleAgeMs: OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS,
+        leaseStaleAgeMs: null,
+        preflightLeaseStaleAgeMs: OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS,
+      })
+      return lease
+    } catch {
+      await hostManager.releaseHostLease?.(host.hostKey, lease).catch(() => undefined)
+      return null
+    }
+  }
+
+  private async releaseProviderManagementHost(
+    hostManager: OpenCodeHostManagerLike,
+    host: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput | null,
+  ): Promise<void> {
+    if (!lease || !hostManager.releaseHostLease) {
+      return
+    }
+    await hostManager.releaseHostLease(host.hostKey, lease).catch(() => undefined)
+  }
 
   private getDirectoryCacheKey(input: {
     runtimeId: ProviderManagementRuntimeId
@@ -2688,13 +2790,19 @@ export class OpenCodeProviderManagementAdapter
   }
 
   private getManagedPreferences() {
-    return (
-      this.deps.managedPreferences ?? {
+    const configured = this.deps.managedPreferences
+    return configured
+      ? {
+          ...configured,
+          read: configured.read ?? readOpenCodeManagedRuntimePreferences,
+        }
+      : {
+        read: readOpenCodeManagedRuntimePreferences,
         setDefaultModel: setOpenCodeManagedDefaultModel,
+        setModelLimits: setOpenCodeManagedModelLimits,
         setAllProjectsDefaultModel: (modelId: string) =>
           setOpenCodeManagedGlobalDefaultModel(resolveClaudeMultimodelPaths().data, modelId),
       }
-    )
   }
 
   private getProfileManager() {
@@ -2880,6 +2988,7 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = null
 
     try {
       host = await hostManager.ensureHost({
@@ -2887,6 +2996,9 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
       })
+      if (hostLifetime === 'persistent') {
+        hostLease = await this.retainProviderManagementHost(hostManager, host)
+      }
       const client = clientFactory.create(host.baseUrl)
       return await run({ inventory, inventoryService, host, client })
     } catch (error) {
@@ -2897,6 +3009,7 @@ export class OpenCodeProviderManagementAdapter
       )
     } finally {
       if (host) {
+        await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, {
             keepPersistentAlive: hostLifetime === 'persistent',
@@ -2954,6 +3067,7 @@ export class OpenCodeProviderManagementAdapter
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = null
 
     try {
       host = await hostManager.ensureHost({
@@ -2966,6 +3080,7 @@ export class OpenCodeProviderManagementAdapter
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
+      hostLease = await this.retainProviderManagementHost(hostManager, host)
       const client = clientFactory.create(host.baseUrl)
 
       return {
@@ -2993,6 +3108,7 @@ export class OpenCodeProviderManagementAdapter
       }
     } finally {
       if (host) {
+        await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, { keepPersistentAlive: true })
           .catch(() => undefined)
@@ -3052,6 +3168,7 @@ export class OpenCodeProviderManagementAdapter
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = null
 
     try {
       host = await hostManager.ensureHost({
@@ -3064,6 +3181,7 @@ export class OpenCodeProviderManagementAdapter
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
+      hostLease = await this.retainProviderManagementHost(hostManager, host)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
@@ -3100,15 +3218,31 @@ export class OpenCodeProviderManagementAdapter
           safeRead(() => client.getProviderAuth()),
           serverDocRead,
         ])
+      const directoryInventory = inventory.version || !host.version
+        ? inventory
+        : {
+            ...inventory,
+            version: host.version,
+            diagnostics: [
+              ...inventory.diagnostics.filter(
+                diagnostic => !diagnostic.startsWith('SuperGrok OAuth requires OpenCode '),
+              ),
+              ...(supportsOpenCodeSuperGrokOAuth(host.version)
+                ? []
+                : [
+                    `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${host.version}`,
+                  ]),
+            ],
+          }
       const diagnostics = [
-        ...inventory.diagnostics,
+        ...directoryInventory.diagnostics,
         ...safeReadDiagnostics(configProvidersResult),
         ...safeReadDiagnostics(providersResult),
         ...safeReadDiagnostics(providerAuthResult),
         ...safeReadDiagnostics(serverDocResult),
       ]
       const directorySource = {
-        inventory,
+        inventory: directoryInventory,
         configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
         providers: providersResult.ok ? providersResult.value : null,
         providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
@@ -3156,6 +3290,7 @@ export class OpenCodeProviderManagementAdapter
       }
     } finally {
       if (host) {
+        await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
           .releaseHost(host.hostKey, { keepPersistentAlive: true })
           .catch(() => undefined)
@@ -3248,9 +3383,13 @@ export class OpenCodeProviderManagementAdapter
       input.runtimeId,
       input.projectPath,
       async ({ inventory, client }) => {
-        const [configProvidersResult, providersResult] = await Promise.all([
+        const managedPreferencesResult = inventory.profile
+          ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
+          : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
+        const [configProvidersResult, providersResult, preferencesResult] = await Promise.all([
           safeRead(() => client.getConfigProviders()),
           safeRead(() => client.getProviders()),
+          managedPreferencesResult,
         ])
         const diagnostics = [
           ...inventory.diagnostics,
@@ -3265,6 +3404,10 @@ export class OpenCodeProviderManagementAdapter
           query: input.query,
           limit: input.limit,
           diagnostics,
+          managedModelLimitOverrides:
+            preferencesResult.ok && preferencesResult.value
+              ? preferencesResult.value.modelLimitOverrides
+              : undefined,
         })
 
         if (modelsView.models.length === 0) {
@@ -4338,6 +4481,146 @@ export class OpenCodeProviderManagementAdapter
             modelId,
             probe,
           }),
+        }
+      },
+      { failureCode: 'model-test-failed' },
+    )
+  }
+
+  async configureModelLimits(
+    input: ConfigureProviderModelLimitsInput,
+  ): Promise<ProviderManagementResult<ProviderModelLimitsResult>> {
+    const providerId = normalizeProviderId(input.providerId)
+    if (!providerId) {
+      return providerManagementError('provider-missing', 'Provider id is invalid')
+    }
+    const modelId = normalizeProviderScopedModelId({
+      providerId,
+      modelId: input.modelId,
+    })
+    if (!modelId) {
+      return providerManagementError(
+        'model-missing',
+        `Model id must be scoped to provider ${providerId}`,
+      )
+    }
+    const contextTokens = normalizeTokenLimit(input.contextTokens)
+    const outputTokens = normalizeTokenLimit(input.outputTokens)
+    if (!contextTokens || !outputTokens || outputTokens > contextTokens) {
+      return providerManagementError(
+        'model-test-failed',
+        'Context window and max output must be positive integers, and max output cannot exceed context window',
+      )
+    }
+
+    return this.withManagedOpenCodeClient(
+      input.runtimeId,
+      input.projectPath,
+      async ({ inventory, inventoryService, client }) => {
+        const [configProvidersResult, providersResult] = await Promise.all([
+          safeRead(() => client.getConfigProviders()),
+          safeRead(() => client.getProviders()),
+        ])
+        const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
+        const providers = providersResult.ok ? providersResult.value : null
+        const modelsView = buildProviderModelsView({
+          providerId,
+          inventory,
+          configProviders,
+          providers,
+        })
+        const model = modelsView.models.find(candidate => candidate.modelId === modelId)
+        if (!model) {
+          return providerManagementError(
+            'model-missing',
+            `Model ${modelId} was not found in the OpenCode live catalog`,
+          )
+        }
+        if (model.routeKind !== 'configured_local') {
+          return providerManagementError(
+            'unsupported-action',
+            'App-managed context limits are only available for configured local OpenCode models',
+          )
+        }
+
+        const access = evaluateOpenCodeModelAccess({
+          selectedModel: modelId,
+          catalog: buildProviderManagementAccessCatalog({
+            inventory,
+            configProviders,
+            providers,
+          }),
+        })
+        const accessError = getModelAccessError({ access, modelId, action: 'test' })
+        if (accessError) {
+          return accessError
+        }
+
+        const profile = inventory.profile
+        if (!profile) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode managed profile is unavailable',
+          )
+        }
+        const setModelLimits = this.getManagedPreferences().setModelLimits
+        if (!setModelLimits) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode managed model limit preferences are unavailable',
+          )
+        }
+        const probe = await this.getExecutionProbe().probeModel({
+          selectedModel: modelId,
+          projectPath: inventory.projectPath,
+          contextTokens,
+          outputTokens,
+          bypassCache: true,
+        })
+        const verified = probe.outcome === 'available'
+        if (!verified) {
+          return providerManagementError(
+            'model-test-failed',
+            `Model probe failed, so no limits were saved: ${probe.reason ?? 'unknown error'}`,
+          )
+        }
+
+        await setModelLimits(profile.profileRootPath, {
+          modelId,
+          contextTokens,
+          outputTokens,
+        })
+        const cacheDiagnostics: string[] = []
+        try {
+          this.invalidateDirectoryCache()
+        } catch (error) {
+          cacheDiagnostics.push(
+            `Directory cache refresh failed after limits were saved: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        try {
+          inventoryService.clearCache?.()
+        } catch (error) {
+          cacheDiagnostics.push(
+            `Inventory cache refresh failed after limits were saved: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+
+        return {
+          ok: true,
+          value: {
+            providerId,
+            modelId,
+            contextTokens,
+            outputTokens,
+            saved: true,
+            verified: true,
+            message:
+              cacheDiagnostics.length === 0
+                ? 'Context limits saved and model probe passed'
+                : 'Context limits saved and model probe passed; cached views will refresh later',
+            diagnostics: [...probe.diagnostics, ...redactDiagnostics(cacheDiagnostics)],
+          },
         }
       },
       { failureCode: 'model-test-failed' },

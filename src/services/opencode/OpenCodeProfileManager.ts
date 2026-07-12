@@ -270,9 +270,12 @@ async function ensureDirectorySymlink(linkPath: string, targetPath: string): Pro
     }
 
     await rm(linkPath, { recursive: true, force: true }).catch(error => {
-      if (getErrnoCode(error) !== 'ENOENT') {
+      const code = getErrnoCode(error)
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
         throw error
       }
+      // Another process may replace the directory with the desired symlink while
+      // rm is traversing it. Treat that shape change as a retryable race.
     })
   }
 
@@ -462,7 +465,22 @@ export function buildManagedConfig(
     config.model = defaultModelId
   }
 
-  for (const override of options.modelOutputLimitOverrides ?? []) {
+  applyOpenCodeModelLimitOverrides(config, options.modelOutputLimitOverrides)
+
+  if (appMcpConfig) {
+    config.mcp = {
+      [OPEN_CODE_APP_MCP_SERVER_NAME]: appMcpConfig,
+    }
+  }
+
+  return config
+}
+
+export function applyOpenCodeModelLimitOverrides(
+  config: Record<string, unknown>,
+  overrides: OpenCodePrepareProfileOptions['modelOutputLimitOverrides'],
+): void {
+  for (const override of overrides ?? []) {
     const parsedModel = parseProviderScopedModelId(override.modelId)
     const outputTokens = normalizePositiveInteger(override.outputTokens)
     if (!parsedModel || outputTokens === null) {
@@ -485,14 +503,6 @@ export function buildManagedConfig(
       [parsedModel.providerId]: providerConfig,
     }
   }
-
-  if (appMcpConfig) {
-    config.mcp = {
-      [OPEN_CODE_APP_MCP_SERVER_NAME]: appMcpConfig,
-    }
-  }
-
-  return config
 }
 
 function hasOwnRecordKeys(value: Record<string, unknown>): boolean {
@@ -595,6 +605,8 @@ type CursorAgentAuthProbe = (
 ) => Promise<boolean>
 
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
+const CURSOR_AGENT_AUTH_MARKER_TTL_MS = 30 * 60 * 1000
+const CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS = 60 * 1000
 
 const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
   await new Promise<boolean>(resolve => {
@@ -632,13 +644,26 @@ function isCursorAgentAuthMarker(credential: Record<string, unknown> | null): bo
   return credential?.type === 'api' && credential.key === CURSOR_AGENT_AUTH_MARKER
 }
 
+function isFreshCursorAgentAuthMarker(
+  credential: Record<string, unknown> | null,
+  now: number,
+): boolean {
+  return Boolean(
+    isCursorAgentAuthMarker(credential)
+      && typeof credential?.expires === 'number'
+      && credential.expires > now + CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS,
+  )
+}
+
 export async function ensureOpenCodeCursorPluginAuthCredential(input: {
   globalAuthPath: string
   managedAuthPath: string
   cursorAgentExecutablePath: string
   platform?: NodeJS.Platform
   probe?: CursorAgentAuthProbe
+  now?: () => number
 }): Promise<boolean> {
+  const now = (input.now ?? Date.now)()
   const [globalCredential, managedCredential] = await Promise.all([
     readOpenCodeAuthCredential({ authPath: input.globalAuthPath, providerId: 'cursor-acp' }),
     readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'cursor-acp' }),
@@ -666,6 +691,30 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
     return false
   }
 
+
+  const freshMarker = [globalCredential, managedCredential].find(credential =>
+    isFreshCursorAgentAuthMarker(credential, now)
+  )
+  if (freshMarker) {
+    await Promise.all([
+      JSON.stringify(globalCredential) === JSON.stringify(freshMarker)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'cursor-acp',
+            credential: freshMarker,
+          }),
+      JSON.stringify(managedCredential) === JSON.stringify(freshMarker)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'cursor-acp',
+            credential: freshMarker,
+          }),
+    ])
+    return false
+  }
+
   const authenticated = await (input.probe ?? probeCursorAgentAuth)(
     input.cursorAgentExecutablePath,
     input.platform ?? process.platform,
@@ -688,16 +737,20 @@ export async function ensureOpenCodeCursorPluginAuthCredential(input: {
     return false
   }
 
-  const credential = { type: 'api', key: CURSOR_AGENT_AUTH_MARKER }
+  const credential = {
+    type: 'api',
+    key: CURSOR_AGENT_AUTH_MARKER,
+    expires: now + CURSOR_AGENT_AUTH_MARKER_TTL_MS,
+  }
   await Promise.all([
-    isCursorAgentAuthMarker(globalCredential)
+    JSON.stringify(globalCredential) === JSON.stringify(credential)
       ? Promise.resolve()
       : upsertOpenCodeAuthCredential({
           authPath: input.globalAuthPath,
           providerId: 'cursor-acp',
           credential,
         }),
-    isCursorAgentAuthMarker(managedCredential)
+    JSON.stringify(managedCredential) === JSON.stringify(credential)
       ? Promise.resolve()
       : upsertOpenCodeAuthCredential({
           authPath: input.managedAuthPath,
@@ -1101,20 +1154,32 @@ export class OpenCodeProfileManager {
       : globalRuntimePreferences.defaultModelId
         ? 'all_projects' as const
         : null
+    const effectiveModelLimitOverrides = {
+      ...globalRuntimePreferences.modelLimitOverrides,
+      ...managedRuntimePreferences.modelLimitOverrides,
+    }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
     const appMcpConfig =
       options.includeAppMcp === false
         ? null
         : await this.resolveManagedAppMcpConfig()
+    const effectiveModelOutputLimitOverrides = [
+      ...Object.entries(effectiveModelLimitOverrides).map(([modelId, override]) => ({
+        modelId,
+        contextTokens: override.contextTokens,
+        outputTokens: override.outputTokens,
+      })),
+      ...(options.modelOutputLimitOverrides ?? []),
+    ]
     const managedConfig = deepMergeOpenCodeConfig(
       importedRuntimeConfig,
       buildManagedConfig(appMcpConfig, {
         allowAutoUpdate: isOpenCodeAutoUpdateAllowed(process.env),
         defaultModelId: effectiveManagedDefaultModelId,
-        modelOutputLimitOverrides: options.modelOutputLimitOverrides,
         toolApprovalMode: options.toolApprovalMode,
       }),
     )
+    applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
     if (options.includeManagedSubscriptionPlugins !== false) {
       applyOpenCodeManagedSubscriptionPlugins(managedConfig)
     }
@@ -1129,6 +1194,7 @@ export class OpenCodeProfileManager {
     const xdgDataHome = path.join(profileRootPath, 'data')
     const xdgCacheHome = path.join(this.paths.cache, 'opencode', 'shared-cache')
     const sharedNpmCachePath = path.join(xdgCacheHome, 'npm')
+    const sharedToolCachePath = path.join(xdgCacheHome, 'tools')
     const sharedOpenCodeNodeModulesPath = path.join(xdgCacheHome, 'config-node_modules')
     const profileOpenCodeNodeModulesPath = path.join(xdgConfigHome, 'opencode', 'node_modules')
     const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
@@ -1150,6 +1216,7 @@ export class OpenCodeProfileManager {
       mkdir(path.join(xdgDataHome, 'opencode'), { recursive: true }),
       mkdir(xdgCacheHome, { recursive: true }),
       mkdir(sharedNpmCachePath, { recursive: true }),
+      mkdir(sharedToolCachePath, { recursive: true }),
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
     if (options.includeManagedSubscriptionPlugins !== false) {
@@ -1230,6 +1297,11 @@ export class OpenCodeProfileManager {
       XDG_DATA_HOME: xdgDataHome,
       XDG_CACHE_HOME: xdgCacheHome,
       NPM_CONFIG_CACHE: sharedNpmCachePath,
+      PLAYWRIGHT_BROWSERS_PATH: path.join(sharedToolCachePath, 'ms-playwright'),
+      PUPPETEER_CACHE_DIR: path.join(sharedToolCachePath, 'puppeteer'),
+      PIP_CACHE_DIR: path.join(sharedToolCachePath, 'pip'),
+      UV_CACHE_DIR: path.join(sharedToolCachePath, 'uv'),
+      npm_config_devdir: path.join(sharedToolCachePath, 'node-gyp'),
       [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
       [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
       OPENCODE_DISABLE_CLAUDE_CODE: '1',

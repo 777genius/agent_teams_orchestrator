@@ -9,6 +9,7 @@ import {
 import {
   runtimeProvidersConnect,
   runtimeProvidersConnectApiKey,
+  runtimeProvidersConfigureModelLimits,
   runtimeProvidersView,
 } from './runtime.js'
 
@@ -409,4 +410,73 @@ describe('runtime provider stdout contract', () => {
       }
     })
   }
+
+  test('returns structured JSON and exit 1 when model-limit verification fails', async () => {
+    const originalConfigureModelLimits = openCodeProviderManagementAdapter.configureModelLimits
+    const originalStdoutWrite = process.stdout.write
+    const originalStderrWrite = process.stderr.write
+    const originalExit = process.exit
+    const originalExitCode = process.exitCode
+    const stdout: string[] = []
+
+    try {
+      process.exitCode = undefined
+      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        stdout.push(String(chunk))
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        writeCallback?.()
+        return true
+      }) as typeof process.stdout.write
+      process.stderr.write = (() => true) as typeof process.stderr.write
+      process.exit = ((code?: string | number | null | undefined) => {
+        throw new Error(`process.exit:${code ?? 0}`)
+      }) as typeof process.exit
+      openCodeProviderManagementAdapter.configureModelLimits = async () => ({
+        ok: false,
+        error: {
+          code: 'model-test-failed',
+          message: 'Model probe failed, so no limits were saved: endpoint unavailable',
+          recoverable: true,
+        },
+      })
+
+      await expectRuntimeCommandExit(
+        () =>
+          runtimeProvidersConfigureModelLimits({
+            runtime: 'opencode',
+            provider: 'local',
+            model: 'local/qwen',
+            contextTokens: 32_000,
+            outputTokens: 4_000,
+            json: true,
+          }),
+        1,
+      )
+
+      expect(stdout).toHaveLength(1)
+      const payload = JSON.parse(stdout.join('')) as {
+        runtimeId?: string
+        result?: unknown
+        error?: { code?: string; message?: string; recoverable?: boolean }
+      }
+      expect(payload.runtimeId).toBe('opencode')
+      expect(payload.result).toBeUndefined()
+      expect(payload.error).toEqual({
+        code: 'model-test-failed',
+        message: 'Model probe failed, so no limits were saved: endpoint unavailable',
+        recoverable: true,
+      })
+    } finally {
+      openCodeProviderManagementAdapter.configureModelLimits = originalConfigureModelLimits
+      process.stdout.write = originalStdoutWrite
+      process.stderr.write = originalStderrWrite
+      process.exit = originalExit
+      process.exitCode = originalExitCode
+    }
+  })
 })

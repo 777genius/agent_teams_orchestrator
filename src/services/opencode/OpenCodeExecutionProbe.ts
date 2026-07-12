@@ -67,6 +67,8 @@ type ProbeModelParams = {
   projectPath?: string | null
   prompt?: string
   expectedOutput?: string
+  contextTokens?: number
+  outputTokens?: number
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
 }
@@ -242,6 +244,8 @@ function buildProbeCacheKey(params: ProbeModelParams): string {
     params.selectedModel.trim(),
     params.prompt?.trim() || OPEN_CODE_EXECUTION_PROBE_PROMPT,
     params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT,
+    String(params.contextTokens ?? ''),
+    String(params.outputTokens ?? ''),
   ].join('\u0000')
 }
 
@@ -469,8 +473,10 @@ export class OpenCodeExecutionProbe {
         modelOutputLimitOverrides: [
           {
             modelId: params.selectedModel,
-            outputTokens: OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
-            contextTokens: resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
+            outputTokens: params.outputTokens ?? OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
+            contextTokens:
+              params.contextTokens ??
+              resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
           },
         ],
       },

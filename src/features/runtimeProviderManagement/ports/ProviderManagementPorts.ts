@@ -1,6 +1,7 @@
 import type {
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
+  ConfigureProviderModelLimitsInput,
   LoadProviderDirectoryInput,
   LoadProviderManagementViewInput,
   LoadProviderModelsInput,
@@ -10,6 +11,7 @@ import type {
   ProviderManagementResult,
   ProviderOAuthFlowObserver,
   ProviderManagementView,
+  ProviderModelLimitsResult,
   ProviderModelTestResult,
   ProviderSetupForm,
   ProviderSelectionInput,
@@ -56,4 +58,7 @@ export interface ProviderManagementCommandPort {
   testModel(
     input: TestProviderModelInput,
   ): Promise<ProviderManagementResult<ProviderModelTestResult>>
+  configureModelLimits(
+    input: ConfigureProviderModelLimitsInput,
+  ): Promise<ProviderManagementResult<ProviderModelLimitsResult>>
 }

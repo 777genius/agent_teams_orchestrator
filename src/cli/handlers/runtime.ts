@@ -11,6 +11,7 @@ import { openCodeLedgerBridgeService } from '../../services/opencode/OpenCodeLed
 import {
   connectProviderWithApiKey,
   connectProvider,
+  configureProviderModelLimits,
   forgetManagedProvider,
   loadProviderDirectory,
   loadProviderModels,
@@ -27,6 +28,7 @@ import {
   type ProviderManagementResult,
   type ProviderManagementRuntimeId,
   type ProviderManagementView,
+  type ProviderModelLimitsResult,
   type ProviderModelTestResult,
   type ProviderOAuthAuthorization,
   type ProviderOAuthFlowObserver,
@@ -1105,6 +1107,27 @@ async function writeProviderManagementModelTestResponse(
   )
 }
 
+async function writeProviderManagementModelLimitsResponse(
+  runtimeId: RuntimeProviderManagementTarget,
+  result: ProviderModelLimitsResult | null,
+  error: ProviderManagementError | null,
+  stdoutWrite?: RuntimeStdoutWrite,
+): Promise<void> {
+  await writeStdoutAndDrain(
+    jsonStringify(
+      {
+        schemaVersion: 1,
+        runtimeId,
+        ...(result ? { result } : {}),
+        ...(error ? { error } : {}),
+      },
+      null,
+      2,
+    ) + '\n',
+    stdoutWrite,
+  )
+}
+
 function authRequiredError(message: string): ProviderManagementError {
   return {
     code: 'auth-required',
@@ -1615,6 +1638,44 @@ export async function runtimeProvidersSetDefault(opts: {
       }
 
       await writeProviderManagementViewResponse(runtimeId, null, result.error, stdoutWrite)
+      return 1
+    },
+    recoverProviderManagementError(),
+  )
+}
+
+export async function runtimeProvidersConfigureModelLimits(opts: {
+  runtime?: string
+  provider: string
+  model: string
+  contextTokens: number
+  outputTokens: number
+  projectPath?: string
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  await withRuntimeJsonStdoutGuardedResponse(
+    () =>
+      configureProviderModelLimits(openCodeProviderManagementAdapter, {
+        runtimeId,
+        providerId: opts.provider?.trim(),
+        modelId: opts.model?.trim(),
+        contextTokens: opts.contextTokens,
+        outputTokens: opts.outputTokens,
+        projectPath: opts.projectPath?.trim() || null,
+      }),
+    async (result, stdoutWrite) => {
+      if (!('error' in result)) {
+        await writeProviderManagementModelLimitsResponse(
+          runtimeId,
+          result.value,
+          null,
+          stdoutWrite,
+        )
+        return 0
+      }
+
+      await writeProviderManagementModelLimitsResponse(runtimeId, null, result.error, stdoutWrite)
       return 1
     },
     recoverProviderManagementError(),

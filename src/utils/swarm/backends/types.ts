@@ -22,7 +22,10 @@ export type PaneBackendType = 'tmux' | 'iterm2'
  * For iTerm2, this is the session ID returned by it2.
  */
 export type PaneId = string
-export type TeammateProvider = 'anthropic' | 'codex' | 'gemini'
+export type TeammateProvider =
+  | 'anthropic'
+  | 'codex'
+  | 'gemini'
 
 /**
  * Result of creating a new teammate pane.

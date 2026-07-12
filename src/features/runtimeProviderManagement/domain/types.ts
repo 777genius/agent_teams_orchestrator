@@ -284,6 +284,11 @@ export type RuntimeProviderModel = {
   proofState: OpenCodeRuntimeModelProofState
   requiresExecutionProof: boolean
   accessReason: string | null
+  catalogContextTokens: number | null
+  catalogOutputTokens: number | null
+  managedContextTokens: number | null
+  managedOutputTokens: number | null
+  managedUpdatedAt: string | null
 }
 
 export type RuntimeProviderModelsView = {
@@ -343,11 +348,30 @@ export type TestProviderModelInput = {
   modelId: string
 } & ProjectScopedProviderManagementInput
 
+export type ConfigureProviderModelLimitsInput = {
+  runtimeId: ProviderManagementRuntimeId
+  providerId: string
+  modelId: string
+  contextTokens: number
+  outputTokens: number
+} & ProjectScopedProviderManagementInput
+
 export type ProviderModelTestResult = {
   providerId: string
   modelId: string
   ok: boolean
   availability: ProviderModelAvailability
+  message: string
+  diagnostics: readonly string[]
+}
+
+export type ProviderModelLimitsResult = {
+  providerId: string
+  modelId: string
+  contextTokens: number
+  outputTokens: number
+  saved: boolean
+  verified: boolean
   message: string
   diagnostics: readonly string[]
 }

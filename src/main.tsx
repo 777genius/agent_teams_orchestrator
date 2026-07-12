@@ -4411,6 +4411,20 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersSetDefault(opts);
   });
+  runtimeProviders.command('configure-model-limits').description('Save and verify app-managed context limits for a configured local OpenCode model').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').requiredOption('--context-tokens <count>', 'Model context window', Number).requiredOption('--output-tokens <count>', 'Maximum model output', Number).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    provider: string;
+    model: string;
+    contextTokens: number;
+    outputTokens: number;
+    projectPath?: string;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersConfigureModelLimits
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersConfigureModelLimits(opts);
+  });
   runtime.command('verify').description('Run a live runtime verification probe for provider-backed hosts').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
     json?: boolean;
     text?: boolean;

@@ -4,6 +4,7 @@ export {
 } from './application/featureGate.js'
 export { connectProviderWithApiKey } from './application/connectProviderWithApiKey.js'
 export { connectProvider } from './application/connectProvider.js'
+export { configureProviderModelLimits } from './application/configureProviderModelLimits.js'
 export { forgetManagedProvider } from './application/forgetManagedProvider.js'
 export { loadProviderDirectory } from './application/loadProviderDirectory.js'
 export { loadProviderModels } from './application/loadProviderModels.js'
@@ -19,6 +20,7 @@ export { ProviderManagementDialog } from './ui/ProviderManagementDialog.js'
 export type {
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
+  ConfigureProviderModelLimitsInput,
   LoadProviderSetupFormInput,
   LoadProviderDirectoryInput,
   LoadProviderModelsInput,
@@ -33,6 +35,7 @@ export type {
   ProviderManagementResult,
   ProviderManagementRuntimeId,
   ProviderManagementView,
+  ProviderModelLimitsResult,
   ProviderModelAvailability,
   ProviderModelTestResult,
   ProviderOAuthAuthorization,

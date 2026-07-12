@@ -7,6 +7,10 @@ import type {
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
 } from '../../../../services/opencode/types.js'
+import type {
+  OpenCodeHostLeaseInput,
+  OpenCodePersistentHostReconcileOptions,
+} from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { ProviderManagementError, ProviderManagementResult } from '../../domain/types.js'
 
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
@@ -301,6 +305,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       profileOptions?: { includeAppMcp?: boolean }
     }> = []
     const releasedHosts: string[] = []
+    const retainedHostLeases: Array<{ hostKey: string; lease: OpenCodeHostLeaseInput }> = []
+    const releasedHostLeases: Array<{ hostKey: string; lease: OpenCodeHostLeaseInput }> = []
+    const reconcileCalls: OpenCodePersistentHostReconcileOptions[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory(),
@@ -312,6 +319,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         releaseHost: async hostKey => {
           releasedHosts.push(hostKey)
+        },
+        retainHostLease: async (hostKey, lease) => {
+          retainedHostLeases.push({ hostKey, lease })
+        },
+        releaseHostLease: async (hostKey, lease) => {
+          releasedHostLeases.push({ hostKey, lease })
+        },
+        reconcilePersistentHosts: async options => {
+          reconcileCalls.push(options)
+          return { cleaned: 0, remaining: 1, hosts: [], diagnostics: [] }
         },
       },
       clientFactory: {
@@ -381,6 +398,109 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     ])
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
+    expect(retainedHostLeases).toHaveLength(3)
+    expect(releasedHostLeases).toEqual(retainedHostLeases)
+    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(3)
+    expect(
+      retainedHostLeases.every(
+        ({ hostKey, lease }) =>
+          hostKey === 'host-key' &&
+          lease.teamId === '__opencode_preflight__' &&
+          lease.laneId === 'provider-management',
+      ),
+    ).toBe(true)
+    expect(reconcileCalls).toHaveLength(3)
+    expect(
+      reconcileCalls.every(
+        options =>
+          options.reason === 'provider-management-idle-eviction' &&
+          options.staleAgeMs === 10 * 60_000 &&
+          options.leaseStaleAgeMs === null &&
+          options.preflightLeaseStaleAgeMs === 2 * 60 * 60_000,
+      ),
+    ).toBe(true)
+  })
+
+  test('does not leave a provider-management lease behind when idle eviction fails', async () => {
+    const retained: OpenCodeHostLeaseInput[] = []
+    const released: OpenCodeHostLeaseInput[] = []
+    const releasedHosts: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory(),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        retainHostLease: async (_hostKey, lease) => {
+          retained.push(lease)
+        },
+        releaseHostLease: async (_hostKey, lease) => {
+          released.push(lease)
+        },
+        reconcilePersistentHosts: async () => {
+          throw new Error('registry temporarily unavailable')
+        },
+        releaseHost: async hostKey => {
+          releasedHosts.push(hostKey)
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    expect(retained).toHaveLength(1)
+    expect(released).toEqual(retained)
+    expect(releasedHosts).toEqual(['host-key'])
+  })
+
+  test('uses the live host version for fast directory capability checks', async () => {
+    const liveHost = host()
+    liveHost.version = '1.17.18'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            version: null,
+            diagnostics: [
+              'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected an unknown version',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => liveHost,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: null,
+      filter: 'all',
+      limit: 50,
+      cursor: null,
+      refresh: true,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.diagnostics).not.toContain(
+      'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected an unknown version',
+    )
   })
 
   test('normalizes OpenCode provider catalog into the feature view model', async () => {
@@ -5504,5 +5624,199 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(wrote).toBe(false)
     const failure = expectFailure(result)
     expect(failure.code).toBe('model-test-failed')
+  })
+
+  test('saves and verifies app-managed limits only for configured local models', async () => {
+    let savedInput: unknown = null
+    let probeInput: unknown = null
+    let probeOutcome: 'available' | 'unavailable' = 'available'
+    let cacheClearThrows = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [],
+            availableProviders: ['local'],
+            models: ['local/qwen'],
+          }),
+        clearCache: () => {
+          if (cacheClearThrows) throw new Error('cache is temporarily busy')
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'local',
+                name: 'Local',
+                models: { qwen: {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probeInput = input
+          return executionProbeResult(
+            input.selectedModel,
+            probeOutcome,
+            probeOutcome === 'available' ? null : 'Local endpoint unavailable',
+          )
+        },
+      },
+      managedPreferences: {
+        setDefaultModel: async () => {},
+        setModelLimits: async (_profileRootPath, input) => {
+          savedInput = input
+        },
+      },
+    })
+
+    const result = await adapter.configureModelLimits({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      modelId: 'local/qwen',
+      contextTokens: 128_000,
+      outputTokens: 32_000,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(savedInput).toEqual({
+      modelId: 'local/qwen',
+      contextTokens: 128_000,
+      outputTokens: 32_000,
+    })
+    expect(probeInput).toMatchObject({
+      selectedModel: 'local/qwen',
+      contextTokens: 128_000,
+      outputTokens: 32_000,
+      bypassCache: true,
+    })
+    expect(result.value).toMatchObject({ saved: true, verified: true })
+
+    savedInput = null
+    probeOutcome = 'unavailable'
+    const failedProbe = await adapter.configureModelLimits({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      modelId: 'local/qwen',
+      contextTokens: 128_000,
+      outputTokens: 32_000,
+    })
+
+    expect(failedProbe.ok).toBe(false)
+    expect(savedInput).toBeNull()
+    expect(expectFailure(failedProbe)).toMatchObject({
+      code: 'model-test-failed',
+      recoverable: true,
+    })
+
+    probeOutcome = 'available'
+    cacheClearThrows = true
+    const cacheClearFailure = await adapter.configureModelLimits({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      modelId: 'local/qwen',
+      contextTokens: 128_000,
+      outputTokens: 32_000,
+    })
+
+    expect(cacheClearFailure.ok).toBe(true)
+    if (!cacheClearFailure.ok) return
+    expect(cacheClearFailure.value).toMatchObject({ saved: true, verified: true })
+    expect(cacheClearFailure.value.diagnostics.join('\n')).toContain(
+      'Inventory cache refresh failed after limits were saved',
+    )
+  })
+
+  test('loads catalog and project-managed context limits for the exact model', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async projectPath =>
+          inventory({
+            projectPath: projectPath ?? '/tmp/project',
+            connectedProviders: [],
+            availableProviders: ['local'],
+            models: ['local/qwen'],
+            modelMetadata: [
+              {
+                id: 'local/qwen',
+                cost: null,
+                context: 64_000,
+                limits: { context: 64_000, output: 8_000 },
+                free: false,
+                raw: {},
+              },
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'local', name: 'Local', models: { qwen: {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local' }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      managedPreferences: {
+        read: async profileRootPath => {
+          expect(profileRootPath).toBe('/tmp/profile')
+          return {
+            schemaVersion: 2,
+            defaultModelId: null,
+            modelLimitOverrides: {
+              'local/qwen': {
+                contextTokens: 128_000,
+                outputTokens: 16_000,
+                updatedAt: '2026-07-12T12:00:00.000Z',
+              },
+            },
+            updatedAt: '2026-07-12T12:00:00.000Z',
+          }
+        },
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'local',
+      projectPath: '/tmp/project-a',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models[0]).toMatchObject({
+      modelId: 'local/qwen',
+      catalogContextTokens: 64_000,
+      catalogOutputTokens: 8_000,
+      managedContextTokens: 128_000,
+      managedOutputTokens: 16_000,
+      managedUpdatedAt: '2026-07-12T12:00:00.000Z',
+    })
   })
 })
