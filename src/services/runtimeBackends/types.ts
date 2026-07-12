@@ -95,6 +95,7 @@ export type RuntimeProviderModelCatalogItem = {
     context?: number | null
     limits?: unknown | null
     free?: boolean
+    releaseDate?: string | null
     opencode?: OpenCodeModelRouteMetadata | null
   } | null
 }
