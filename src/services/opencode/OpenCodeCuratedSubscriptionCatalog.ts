@@ -129,6 +129,23 @@ const ZAI_CODING_PLAN_MODELS = {
       output: ['text'],
     },
   },
+  'glm-5': {
+    name: 'GLM-5',
+    reasoning: true,
+    tool_call: true,
+    structured_output: true,
+    interleaved: {
+      field: 'reasoning_content',
+    },
+    limit: {
+      context: 200_000,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text'],
+      output: ['text'],
+    },
+  },
   'glm-5-turbo': {
     name: 'GLM-5-Turbo',
     reasoning: true,
@@ -162,6 +179,23 @@ const ZAI_CODING_PLAN_MODELS = {
       output: ['text'],
     },
   },
+  'glm-4.5-air': {
+    name: 'GLM-4.5-Air',
+    reasoning: true,
+    tool_call: true,
+    structured_output: true,
+    interleaved: {
+      field: 'reasoning_content',
+    },
+    limit: {
+      context: 131_072,
+      output: 98_304,
+    },
+    modalities: {
+      input: ['text'],
+      output: ['text'],
+    },
+  },
 } as const
 
 // Temporary prerelease build containing the MCP tool readiness fix from
@@ -181,8 +215,8 @@ function xiaomiTokenPlanDefinition(input: {
     credentialKind: 'api-key',
     setup: {
       description:
-        'Use the Xiaomi Token Plan key from the Token Plan dashboard. After connect, select the Xiaomi MiMo model under the OpenCode runtime.',
-      secretLabel: 'Token Plan API key',
+        `Open Token Plan management and copy the tp-... value under Dedicated API Key. Use this provider only when Dedicated Base URL shows ${input.baseURL}. The key is shown once when created; reset it there if it was lost or exposed.`,
+      secretLabel: 'Token Plan API Key (tp-...)',
       secretPlaceholder: 'tp-xxxxx',
     },
     fastSetup: false,
@@ -282,8 +316,10 @@ export const OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS = [
     modelProbePreferences: [
       'zai-coding-plan/glm-5.2',
       'zai-coding-plan/glm-5.1',
+      'zai-coding-plan/glm-5',
       'zai-coding-plan/glm-5-turbo',
       'zai-coding-plan/glm-4.7',
+      'zai-coding-plan/glm-4.5-air',
     ],
     requireConnectExecutionProof: true,
     keyPolicy: null,

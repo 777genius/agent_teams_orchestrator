@@ -35,6 +35,15 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
     ).toContain('pay-as-you-go')
   })
 
+  test('explains the Xiaomi Token Plan key format and regional endpoint', () => {
+    const europe = getOpenCodeCuratedSubscriptionProvider('xiaomi-token-plan-ams')
+
+    expect(europe?.setup.secretLabel).toBe('Token Plan API Key (tp-...)')
+    expect(europe?.setup.secretPlaceholder).toBe('tp-xxxxx')
+    expect(europe?.setup.description).toContain('token-plan-ams.xiaomimimo.com/v1')
+    expect(europe?.setup.description).toContain('shown once')
+  })
+
   test('keeps the Z.AI Coding Plan fallback aligned with the official OpenCode contract', () => {
     const configs = getOpenCodeCuratedSubscriptionProviderConfigs()
 
@@ -48,10 +57,26 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
           reasoning: true,
           tool_call: true,
           interleaved: { field: 'reasoning_content' },
+          limit: { context: 1_000_000, output: 131_072 },
+        },
+        'glm-5.1': {
+          reasoning: true,
+          tool_call: true,
+          interleaved: { field: 'reasoning_content' },
+        },
+        'glm-5': {
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 200_000, output: 131_072 },
         },
         'glm-5-turbo': {
           reasoning: true,
           tool_call: true,
+        },
+        'glm-4.5-air': {
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 131_072, output: 98_304 },
         },
       },
     })
@@ -78,5 +103,39 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
         },
       },
     })
+  })
+
+  test('keeps every curated coding model capable of multi-turn tool execution', () => {
+    const configs = getOpenCodeCuratedSubscriptionProviderConfigs()
+    const providerIds = [
+      'zai-coding-plan',
+      'kimi-for-coding',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-sgp',
+      'xiaomi-token-plan-cn',
+    ] as const
+
+    for (const providerId of providerIds) {
+      const provider = configs[providerId] as {
+        models?: Record<string, {
+          reasoning?: boolean
+          tool_call?: boolean
+          interleaved?: { field?: string }
+          modalities?: { output?: readonly string[] }
+        }>
+      }
+      const models = Object.entries(provider.models ?? {})
+      expect(models.length).toBeGreaterThan(0)
+      for (const [modelId, model] of models) {
+        expect(model.reasoning, `${providerId}/${modelId} reasoning`).toBe(true)
+        expect(model.tool_call, `${providerId}/${modelId} tool_call`).toBe(true)
+        expect(model.interleaved?.field, `${providerId}/${modelId} reasoning field`).toBe(
+          'reasoning_content',
+        )
+        expect(model.modalities?.output, `${providerId}/${modelId} output modality`).toContain(
+          'text',
+        )
+      }
+    }
   })
 })
