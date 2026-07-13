@@ -4310,7 +4310,7 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersView(opts);
   });
-  runtimeProviders.command('directory').description('Return the full nested runtime provider directory').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--query <query>', 'Filter provider ids, labels, auth methods, and known model ids').addOption(new Option('--filter <filter>', 'Directory filter').choices(['all', 'connected', 'configured', 'connectable', 'manual', 'has-models'])).addOption(new Option('--limit <count>', 'Maximum providers to return').argParser(Number)).option('--cursor <cursor>', 'Pagination cursor').option('--refresh', 'Bypass provider directory cache').option('--json', 'Output as JSON (default)').action(async (opts: {
+  runtimeProviders.command('directory').description('Return the nested runtime provider directory').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--query <query>', 'Filter provider ids, labels, auth methods, and known model ids').addOption(new Option('--filter <filter>', 'Directory filter').choices(['all', 'connected', 'configured', 'connectable', 'manual', 'has-models'])).addOption(new Option('--limit <count>', 'Maximum providers to return').argParser(Number)).option('--cursor <cursor>', 'Pagination cursor').option('--refresh', 'Bypass provider directory cache').option('--summary', 'Return curated dashboard providers without starting the live OpenCode host').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     projectPath?: string;
     query?: string;
@@ -4318,6 +4318,7 @@ async function run(): Promise<CommanderCommand> {
     limit?: number;
     cursor?: string;
     refresh?: boolean;
+    summary?: boolean;
     json?: boolean;
   }) => {
     const {

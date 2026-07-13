@@ -142,6 +142,7 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
         limit: readNumberOption(providerArgs, '--limit'),
         cursor: readOption(providerArgs, '--cursor'),
         refresh: hasOption(providerArgs, '--refresh'),
+        summary: hasOption(providerArgs, '--summary'),
       })
       return true
     case 'setup-form':

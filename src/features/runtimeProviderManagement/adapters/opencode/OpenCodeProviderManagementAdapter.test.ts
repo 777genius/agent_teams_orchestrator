@@ -469,6 +469,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probe: async () =>
           inventory({
             version: null,
+            connectedProviders: [
+              { id: 'xai', authHint: 'oauth', source: 'credentials' },
+            ],
+            availableProviders: ['xai'],
+            models: ['xai/grok-4.3'],
             diagnostics: [
               'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected an unknown version',
             ],
@@ -480,9 +485,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       clientFactory: {
         create: () => ({
-          getConfigProviders: async () => ({ providers: [], default: {} }),
-          getProviders: async () => ({ all: [], connected: [], default: {} }),
-          getProviderAuth: async () => ({}),
+          getConfigProviders: async () => ({
+            providers: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            connected: ['xai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ xai: [{ type: 'oauth' }] }),
         }),
       },
     })
@@ -500,6 +512,66 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(result.value.diagnostics).not.toContain(
       'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected an unknown version',
+    )
+    expect(result.value.entries.find(entry => entry.providerId === 'xai')).toMatchObject({
+      state: 'connected',
+      ownership: ['managed'],
+    })
+  })
+
+  test('filters SuperGrok OAuth when the live host version is too old', async () => {
+    const liveHost = host()
+    liveHost.version = '1.15.6'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            version: null,
+            connectedProviders: [
+              { id: 'xai', authHint: 'oauth', source: 'credentials' },
+            ],
+            availableProviders: ['xai'],
+            models: ['xai/grok-4.3'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => liveHost,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'xai', name: 'xAI', models: { 'grok-4.3': {} } }],
+            connected: ['xai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ xai: [{ type: 'oauth' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: null,
+      filter: 'all',
+      limit: 50,
+      cursor: null,
+      refresh: true,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries.find(entry => entry.providerId === 'xai')).toMatchObject({
+      state: 'available',
+      ownership: [],
+      connectedAuthHint: null,
+    })
+    expect(result.value.diagnostics).toContain(
+      'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
     )
   })
 
@@ -1116,6 +1188,218 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(inventoryModes).toEqual(['profile'])
   })
 
+  test('loads dashboard provider summaries without starting a live OpenCode host', async () => {
+    const inventoryModes: Array<string | undefined> = []
+    let ensureHostCalls = 0
+    let clientFactoryCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          inventoryModes.push(options?.mode)
+          return inventory({
+            profile: {
+              ...inventory().profile!,
+              managedConfig: {
+                provider: {
+                  kiro: { name: 'Kiro', models: { auto: {} } },
+                  'cursor-acp': { name: 'Cursor ACP', models: { auto: {} } },
+                  'zai-coding-plan': {
+                    name: 'Z.AI Coding Plan',
+                    models: { 'glm-5.2': {} },
+                  },
+                  'kimi-for-coding': {
+                    name: 'Kimi Code Membership',
+                    models: { 'kimi-for-coding': {} },
+                  },
+                  'xiaomi-token-plan-ams': { models: { 'mimo-v2.5-pro': {} } },
+                  'xiaomi-token-plan-sgp': { models: { 'mimo-v2.5-pro': {} } },
+                  'xiaomi-token-plan-cn': { models: { 'mimo-v2.5-pro': {} } },
+                },
+              },
+            },
+            connectedProviders: [
+              {
+                id: 'xai',
+                authHint: 'oauth',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+              {
+                id: 'github-copilot',
+                authHint: 'oauth',
+                source: 'credentials',
+                credentialScopes: ['local'],
+              },
+              {
+                id: 'minimax-coding-plan',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+              {
+                id: 'xiaomi-token-plan-sgp',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+              {
+                id: 'kiro',
+                authHint: 'oauth',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+              {
+                id: 'cursor-acp',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: [],
+            models: [],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clientFactoryCalls += 1
+          throw new Error('Summary directory must not create a live client')
+        },
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      summary: true,
+      limit: 100,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(inventoryModes).toEqual(['summary'])
+    expect(ensureHostCalls).toBe(0)
+    expect(clientFactoryCalls).toBe(0)
+    expect(result.value.entries.map(entry => entry.providerId).sort()).toEqual([
+      'cursor-acp',
+      'github-copilot',
+      'kimi-for-coding',
+      'kiro',
+      'minimax-coding-plan',
+      'xai',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-cn',
+      'xiaomi-token-plan-sgp',
+      'zai-coding-plan',
+    ])
+
+    const entry = (providerId: string) =>
+      result.value.entries.find(candidate => candidate.providerId === providerId)
+    expect(entry('xai')).toMatchObject({
+      state: 'connected',
+      connectedAuthHint: 'oauth',
+      setupKind: 'connected',
+    })
+    expect(entry('github-copilot')).toMatchObject({
+      state: 'connected',
+      connectedAuthHint: 'oauth',
+      ownership: ['local'],
+    })
+    expect(entry('minimax-coding-plan')).toMatchObject({
+      state: 'connected',
+      connectedAuthHint: 'api',
+    })
+    expect(entry('xiaomi-token-plan-sgp')).toMatchObject({
+      state: 'connected',
+      connectedAuthHint: 'api',
+    })
+    expect(entry('zai-coding-plan')).toMatchObject({
+      state: 'available',
+      setupKind: 'connect-api-key',
+      modelCount: 1,
+    })
+    expect(entry('kimi-for-coding')).toMatchObject({
+      state: 'available',
+      setupKind: 'connect-api-key',
+      modelCount: 1,
+    })
+    expect(entry('kiro')).toMatchObject({
+      state: 'connected',
+      metadata: { configuredAuthless: true },
+    })
+    expect(entry('cursor-acp')).toMatchObject({
+      state: 'connected',
+      metadata: { configuredAuthless: true },
+    })
+  })
+
+  test('does not infer companion connectivity from summary config alone', async () => {
+    let ensureHostCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            profile: {
+              ...inventory().profile!,
+              managedConfig: {
+                provider: {
+                  kiro: { models: { auto: {} } },
+                  'cursor-acp': { models: { auto: {} } },
+                },
+              },
+            },
+            connectedProviders: [],
+            availableProviders: [],
+            models: [],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+    })
+
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', summary: true })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(ensureHostCalls).toBe(0)
+    for (const providerId of ['kiro', 'cursor-acp']) {
+      expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
+        state: 'available',
+        metadata: { configuredAuthless: true },
+      })
+    }
+    for (const providerId of ['xai', 'github-copilot']) {
+      expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
+        state: 'not-connected',
+        setupKind: 'connect-oauth',
+      })
+    }
+    for (const providerId of [
+      'minimax-coding-plan',
+      'zai-coding-plan',
+      'kimi-for-coding',
+      'xiaomi-token-plan-ams',
+      'xiaomi-token-plan-sgp',
+      'xiaomi-token-plan-cn',
+    ]) {
+      expect(result.value.entries.find(entry => entry.providerId === providerId)).toMatchObject({
+        state: 'not-connected',
+        setupKind: 'connect-api-key',
+      })
+    }
+  })
+
   test('directory exposes configured local providers as selectable without manual setup copy', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -1665,12 +1949,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     )
   })
 
-  test('connects a generic OAuth provider and mirrors the opaque credential without exposing tokens', async () => {
+  test('connects SuperGrok when auto OAuth persists the credential before its callback settles', async () => {
     let connected = false
     const authorizations: Array<Record<string, unknown>> = []
     const ensureHostCalls: Array<{ hostLifetime?: string }> = []
     const releaseHostCalls: Array<{ keepPersistentAlive?: boolean }> = []
     const modelProbes: Array<{ selectedModel: string; bypassCache?: boolean }> = []
+    const verificationEvents: Array<Record<string, unknown>> = []
     const credentialWrites: Array<{
       authPath: string
       providerId: string
@@ -1731,7 +2016,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           },
           completeProviderOAuth: async () => {
             connected = true
-            return true
+            return new Promise<boolean>(() => {})
           },
           deleteProviderAuth: async () => true,
         }),
@@ -1788,6 +2073,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
             completionMethod: 'auto',
           })
         },
+        authorizationCompleted: async verification => {
+          verificationEvents.push(verification)
+        },
       },
     )
 
@@ -1796,11 +2084,23 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value).toMatchObject({
       providerId: 'xai',
       state: 'connected',
+      connectedAuthHint: 'oauth',
+      verifiedModelId: 'xai/grok-4',
     })
     expect(authorizations).toEqual([{ method: 0 }])
     expect(ensureHostCalls).toEqual([expect.objectContaining({ hostLifetime: 'process' })])
     expect(releaseHostCalls).toEqual([{ keepPersistentAlive: false }])
     expect(modelProbes).toEqual([{ selectedModel: 'xai/grok-4', bypassCache: true }])
+    expect(verificationEvents).toEqual([
+      {
+        operationId: 'oauth-test-operation',
+        providerId: 'xai',
+        displayName: 'xAI',
+        authOptionId: 'oauth:0',
+        methodIndex: 0,
+        completionMethod: 'auto',
+      },
+    ])
     expect(credentialWrites.map(write => write.authPath).sort()).toEqual(
       [
         '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
@@ -3275,6 +3575,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         providerId,
         state: 'connected',
         ownership: ['managed'],
+        connectedAuthHint: 'api',
+        verifiedModelId: modelId,
       })
     },
   )

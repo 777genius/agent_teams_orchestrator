@@ -55,7 +55,8 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
   connectedProviders: OpenCodeConnectedProvider[]
   unsupportedSuperGrokOAuth: boolean
 } {
-  const unsupportedSuperGrokOAuth = input.providers.some(
+  const versionKnown = Boolean(input.version?.match(/\d+\.\d+\.\d+/))
+  const unsupportedSuperGrokOAuth = versionKnown && input.providers.some(
     provider =>
       provider.id === 'xai'
       && provider.authHint === 'oauth'

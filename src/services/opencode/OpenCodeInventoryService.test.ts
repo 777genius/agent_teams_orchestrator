@@ -88,6 +88,13 @@ describe('OpenCodeInventoryService parsers', () => {
       connectedProviders: providers,
       unsupportedSuperGrokOAuth: false,
     })
+    expect(filterOpenCodeConnectedProvidersForRuntime({
+      providers,
+      version: null,
+    })).toEqual({
+      connectedProviders: providers,
+      unsupportedSuperGrokOAuth: false,
+    })
   })
 
   test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {

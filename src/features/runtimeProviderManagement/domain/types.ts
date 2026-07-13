@@ -97,10 +97,23 @@ export type ProviderOAuthAuthorization = {
   completionMethod: ProviderOAuthCompletionMethod
 }
 
+export type ProviderOAuthVerification = Pick<
+  ProviderOAuthAuthorization,
+  | 'operationId'
+  | 'providerId'
+  | 'displayName'
+  | 'authOptionId'
+  | 'methodIndex'
+  | 'completionMethod'
+>
+
 export interface ProviderOAuthFlowObserver {
   authorizationReady(
     authorization: ProviderOAuthAuthorization,
   ): Promise<{ code?: string | null } | void>
+  authorizationCompleted?(
+    verification: ProviderOAuthVerification,
+  ): Promise<void>
 }
 
 export type ProviderActionId =
@@ -164,6 +177,10 @@ export type ProviderConnection = {
   authMethods: readonly ProviderAuthMethod[]
   actions: readonly ProviderActionDescriptor[]
   detail: string | null
+  /** Credential kind accepted by the successful connect operation. */
+  connectedAuthHint?: ProviderAuthMethod | null
+  /** Exact model already proven by the successful connect operation. */
+  verifiedModelId?: string | null
 }
 
 export type ProviderDirectoryFilter =
@@ -327,6 +344,7 @@ export type ConnectProviderInput = {
   authMethodIndex?: number | null
   authOptionId?: string | null
   oauthOperationId?: string | null
+  oauthProgressProtocol?: number | null
 } & ProjectScopedProviderManagementInput
 
 export type ProviderSelectionInput = {
@@ -390,4 +408,5 @@ export type LoadProviderDirectoryInput = {
   limit?: number | null
   cursor?: string | null
   refresh?: boolean | null
+  summary?: boolean | null
 } & ProjectScopedProviderManagementInput

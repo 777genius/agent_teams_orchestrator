@@ -3,6 +3,8 @@ import { Readable } from 'node:stream'
 
 import {
   openCodeProviderManagementAdapter,
+  type LoadProviderDirectoryInput,
+  type ProviderDirectoryView,
   type ProviderManagementResult,
   type ProviderManagementView,
 } from '../../features/runtimeProviderManagement/index.js'
@@ -10,6 +12,7 @@ import {
   runtimeProvidersConnect,
   runtimeProvidersConnectApiKey,
   runtimeProvidersConfigureModelLimits,
+  runtimeProvidersDirectory,
   runtimeProvidersView,
 } from './runtime.js'
 
@@ -39,7 +42,80 @@ function minimalProviderView(): ProviderManagementView {
   }
 }
 
+function minimalProviderDirectory(): ProviderDirectoryView {
+  return {
+    runtimeId: 'opencode',
+    totalCount: 0,
+    returnedCount: 0,
+    query: null,
+    filter: 'all',
+    limit: 100,
+    cursor: null,
+    nextCursor: null,
+    entries: [],
+    diagnostics: [],
+    fetchedAt: '2026-07-13T00:00:00.000Z',
+  }
+}
+
 describe('runtime provider stdout contract', () => {
+  test('passes summary directory mode to provider management', async () => {
+    const originalLoadDirectory = openCodeProviderManagementAdapter.loadDirectory
+    const originalStdoutWrite = process.stdout.write
+    const originalStderrWrite = process.stderr.write
+    const originalExit = process.exit
+    const originalExitCode = process.exitCode
+    const stdout: string[] = []
+    let receivedInput: LoadProviderDirectoryInput | null = null
+
+    try {
+      process.exitCode = undefined
+      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        stdout.push(String(chunk))
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        writeCallback?.()
+        return true
+      }) as typeof process.stdout.write
+      process.stderr.write = (() => true) as typeof process.stderr.write
+      process.exit = (() => undefined as never) as typeof process.exit
+      openCodeProviderManagementAdapter.loadDirectory = async input => {
+        receivedInput = input
+        return { ok: true, value: minimalProviderDirectory() }
+      }
+
+      await runtimeProvidersDirectory({
+        runtime: 'opencode',
+        projectPath: '/tmp/provider-summary-test',
+        limit: 100,
+        summary: true,
+        json: true,
+      })
+
+      expect(receivedInput).toMatchObject({
+        runtimeId: 'opencode',
+        projectPath: '/tmp/provider-summary-test',
+        limit: 100,
+        summary: true,
+      })
+      expect(stdout).toHaveLength(1)
+      expect(JSON.parse(stdout.join(''))).toMatchObject({
+        runtimeId: 'opencode',
+        directory: { runtimeId: 'opencode' },
+      })
+    } finally {
+      openCodeProviderManagementAdapter.loadDirectory = originalLoadDirectory
+      process.stdout.write = originalStdoutWrite
+      process.stderr.write = originalStderrWrite
+      process.exit = originalExit
+      process.exitCode = originalExitCode
+    }
+  })
+
   test('streams generic OAuth authorization and accepts a matching code over stdin JSON lines', async () => {
     const originalConnectProvider = openCodeProviderManagementAdapter.connectProvider
     const originalStdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin')

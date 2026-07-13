@@ -23,8 +23,10 @@ import {
 import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+  OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION,
   createOpenCodeInventoryProbeProgressTracker,
+  filterOpenCodeConnectedProvidersForRuntime,
   isOpenCodeInventoryTimeoutSnapshot,
   isOpenCodeModelFree,
   openCodeInventoryService,
@@ -243,6 +245,26 @@ const SEEDED_PROVIDER_IDS = [
   'atlascloud',
   ...SEEDED_SUBSCRIPTION_PROVIDER_IDS,
 ] as const
+const SUMMARY_PROVIDER_IDS = new Set<string>([
+  'xai',
+  'github-copilot',
+  ...CURATED_SUBSCRIPTION_PROVIDER_IDS,
+])
+const SUMMARY_PROVIDER_AUTH_METHODS: Record<string, OpenCodeProviderAuthMethod[]> = {
+  xai: [{ type: 'oauth' }, { type: 'api' }],
+  'github-copilot': [{ type: 'oauth' }],
+  ...Object.fromEntries(
+    OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => [
+      definition.id,
+      [{
+        type:
+          definition.credentialKind === 'api-key' || definition.id === 'cursor-acp'
+            ? 'api'
+            : 'oauth',
+      }],
+    ]),
+  ),
+}
 const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
   'atlascloud',
   'github-copilot',
@@ -311,7 +333,7 @@ const DIRECTORY_CACHE_TTL_MS = 30_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
-const COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
+const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -329,6 +351,12 @@ const EMPTY_CAPABILITIES: OpenCodeProviderManagementCapabilities = {
   deleteAuth: false,
   authorizeOAuth: false,
   completeOAuth: false,
+}
+
+const SUMMARY_CAPABILITIES: OpenCodeProviderManagementCapabilities = {
+  deleteAuth: false,
+  authorizeOAuth: true,
+  completeOAuth: true,
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -1985,6 +2013,90 @@ function sortProviderDirectoryEntries(
   })
 }
 
+function buildSummaryConfigProviders(
+  inventory: OpenCodeInventorySnapshot,
+): OpenCodeConfigProvidersResponse | null {
+  const managedProviders = asRecord(inventory.profile?.managedConfig.provider)
+  if (!managedProviders) {
+    return null
+  }
+
+  const providers = Object.entries(managedProviders).flatMap(([rawProviderId, rawConfig]) => {
+    const providerId = normalizeProviderId(rawProviderId)
+    const config = asRecord(rawConfig)
+    if (!providerId || !config || !SUMMARY_PROVIDER_IDS.has(providerId)) {
+      return []
+    }
+    const name = asString(config.name)
+    const npm = asString(config.npm)
+    const source = asString(config.source)
+    const options = asRecord(config.options)
+    const models = asRecord(config.models)
+    const provider: OpenCodeProviderListEntry = {
+      id: providerId,
+      ...(name ? { name } : {}),
+      ...(npm ? { npm } : {}),
+      ...(source ? { source } : {}),
+      ...(options ? { options } : {}),
+      ...(models ? { models } : {}),
+    }
+    return [provider]
+  })
+
+  return providers.length > 0 ? { providers } : null
+}
+
+function buildSummaryProviderDirectory(input: {
+  inventory: OpenCodeInventorySnapshot
+  query?: string | null
+  filter?: ProviderDirectoryFilter | null
+  limit?: number | null
+  cursor?: string | null
+}): ProviderDirectoryView {
+  const inventory: OpenCodeInventorySnapshot = {
+    ...input.inventory,
+    availableProviders: Array.from(new Set([
+      ...input.inventory.availableProviders,
+      ...SUMMARY_PROVIDER_IDS,
+    ])),
+  }
+  const configProviders = buildSummaryConfigProviders(inventory)
+  const source = {
+    inventory,
+    configProviders,
+    providers: null,
+    providerAuth: SUMMARY_PROVIDER_AUTH_METHODS,
+    capabilities: SUMMARY_CAPABILITIES,
+    diagnostics: inventory.diagnostics,
+  }
+  const unpagedDirectory = buildProviderDirectory({
+    ...source,
+    query: null,
+    filter: 'all',
+    limit: Number.MAX_SAFE_INTEGER,
+    cursor: null,
+  })
+  const entries = unpagedDirectory.entries.filter(entry =>
+    SUMMARY_PROVIDER_IDS.has(entry.providerId),
+  )
+  const summaryDirectory: ProviderDirectoryView = {
+    ...unpagedDirectory,
+    totalCount: entries.length,
+    returnedCount: entries.length,
+    nextCursor: null,
+    entries,
+  }
+
+  return filterAndPageProviderDirectory({
+    directory: summaryDirectory,
+    modelIdsByProviderId: buildProviderDirectoryModelSearchIndex(source),
+    query: input.query,
+    filter: input.filter,
+    limit: input.limit,
+    cursor: input.cursor,
+  })
+}
+
 function buildProviderDirectory(input: {
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
@@ -2747,7 +2859,11 @@ export class OpenCodeProviderManagementAdapter
       }),
       {
         projectPath,
-        timeoutMs: this.deps.inventoryTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+        timeoutMs:
+          this.deps.inventoryTimeoutMs ??
+          (options?.mode === 'summary'
+            ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS
+            : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
         progress,
         onTimeout: () => abortController.abort(),
       },
@@ -2888,7 +3004,7 @@ export class OpenCodeProviderManagementAdapter
       }
       if (
         !(await waitForAbortableDelay(
-          COPILOT_OAUTH_CREDENTIAL_POLL_INTERVAL_MS,
+          AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS,
           input.signal,
         ))
       ) {
@@ -2904,7 +3020,7 @@ export class OpenCodeProviderManagementAdapter
     configProviders: OpenCodeConfigProvidersResponse | null
     providers: OpenCodeProviderResponse | null
     secretToRedact?: string | null
-  }): Promise<ProviderManagementResult<null>> {
+  }): Promise<ProviderManagementResult<string | null>> {
     if (!requiresConnectExecutionProof(input.providerId)) {
       return { ok: true, value: null }
     }
@@ -2928,7 +3044,7 @@ export class OpenCodeProviderManagementAdapter
       bypassCache: true,
     })
     if (probeResult.outcome === 'available') {
-      return { ok: true, value: null }
+      return { ok: true, value: validationModelId }
     }
 
     const probeReason = redactSecret(
@@ -3063,7 +3179,6 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     }
-
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
@@ -3129,7 +3244,7 @@ export class OpenCodeProviderManagementAdapter
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, input.projectPath, {
-      mode: 'profile',
+      mode: input.summary ? 'summary' : 'profile',
     })
 
     if (!inventory.detected) {
@@ -3157,6 +3272,18 @@ export class OpenCodeProviderManagementAdapter
           providers: null,
           providerAuth: null,
           diagnostics: inventory.diagnostics,
+          query: input.query,
+          filter: input.filter,
+          limit: input.limit,
+          cursor: input.cursor,
+        }),
+      }
+    }
+    if (input.summary) {
+      return {
+        ok: true,
+        value: buildSummaryProviderDirectory({
+          inventory,
           query: input.query,
           filter: input.filter,
           limit: input.limit,
@@ -3218,22 +3345,29 @@ export class OpenCodeProviderManagementAdapter
           safeRead(() => client.getProviderAuth()),
           serverDocRead,
         ])
-      const directoryInventory = inventory.version || !host.version
-        ? inventory
-        : {
-            ...inventory,
-            version: host.version,
-            diagnostics: [
-              ...inventory.diagnostics.filter(
-                diagnostic => !diagnostic.startsWith('SuperGrok OAuth requires OpenCode '),
-              ),
-              ...(supportsOpenCodeSuperGrokOAuth(host.version)
-                ? []
-                : [
-                    `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${host.version}`,
-                  ]),
-            ],
-          }
+      const directoryVersion = inventory.version ?? host.version
+      const {
+        connectedProviders: directoryConnectedProviders,
+        unsupportedSuperGrokOAuth,
+      } = filterOpenCodeConnectedProvidersForRuntime({
+        providers: inventory.connectedProviders,
+        version: directoryVersion,
+      })
+      const directoryInventory = {
+        ...inventory,
+        version: directoryVersion,
+        connectedProviders: directoryConnectedProviders,
+        diagnostics: [
+          ...inventory.diagnostics.filter(
+            diagnostic => !diagnostic.startsWith('SuperGrok OAuth requires OpenCode '),
+          ),
+          ...(unsupportedSuperGrokOAuth
+            ? [
+                `SuperGrok OAuth requires OpenCode ${OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION} or newer; detected ${directoryVersion}`,
+              ]
+            : []),
+        ],
+      }
       const diagnostics = [
         ...directoryInventory.diagnostics,
         ...safeReadDiagnostics(configProvidersResult),
@@ -3681,7 +3815,13 @@ export class OpenCodeProviderManagementAdapter
         let callbackOutcome:
           | Awaited<typeof callbackOutcomePromise>
           | { kind: 'credential'; credential: OpenCodeAuthCredential }
-        if (providerId === 'github-copilot' && authorization.method === 'auto') {
+        // Device OAuth can persist a valid credential before OpenCode's callback
+        // request settles. Accept only a strictly new OAuth credential, then keep
+        // the normal inventory and execution-proof checks below.
+        if (
+          (providerId === 'github-copilot' || providerId === 'xai') &&
+          authorization.method === 'auto'
+        ) {
           const credentialWatcher = new AbortController()
           callbackOutcome = await Promise.race([
             callbackOutcomePromise,
@@ -3792,6 +3932,15 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
+        await observer.authorizationCompleted?.({
+          operationId,
+          providerId,
+          displayName,
+          authOptionId: authOption.id,
+          methodIndex,
+          completionMethod: authorization.method,
+        })
+
         this.invalidateDirectoryCache()
         const refreshedInventory = await this.probeInventory(
           inventoryService,
@@ -3848,7 +3997,14 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        return { ok: true, value: provider }
+        return {
+          ok: true,
+          value: {
+            ...provider,
+            connectedAuthHint: 'oauth',
+            verifiedModelId: executionProof.value,
+          },
+        }
       },
       {
         failureCode: 'auth-failed',
@@ -4164,7 +4320,14 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        return { ok: true, value: provider }
+        return {
+          ok: true,
+          value: {
+            ...provider,
+            connectedAuthHint: 'api',
+            verifiedModelId: executionProof.value,
+          },
+        }
       },
       {
         failureCode: 'auth-failed',

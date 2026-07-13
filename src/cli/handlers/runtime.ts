@@ -981,6 +981,22 @@ async function writeProviderOAuthAuthorizationEvent(
   )
 }
 
+async function writeProviderOAuthVerificationEvent(
+  verification: Parameters<
+    NonNullable<ProviderOAuthFlowObserver['authorizationCompleted']>
+  >[0],
+  stdoutWrite: RuntimeStdoutWrite,
+): Promise<void> {
+  await writeStdoutAndDrain(
+    `${RUNTIME_PROVIDER_OAUTH_EVENT_PREFIX}${jsonStringify({
+      schemaVersion: 1,
+      event: 'verification',
+      ...verification,
+    })}\n`,
+    stdoutWrite,
+  )
+}
+
 async function writeProviderManagementViewResponse(
   runtimeId: RuntimeProviderManagementTarget,
   view: ProviderManagementView | null,
@@ -1207,6 +1223,7 @@ export async function runtimeProvidersDirectory(opts: {
   limit?: number
   cursor?: string
   refresh?: boolean
+  summary?: boolean
   json?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
@@ -1220,6 +1237,7 @@ export async function runtimeProvidersDirectory(opts: {
         limit: opts.limit ?? null,
         cursor: opts.cursor?.trim() || null,
         refresh: opts.refresh === true,
+        summary: opts.summary === true,
       }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {
@@ -1300,6 +1318,7 @@ function normalizeConnectProviderPayload(input: {
     typeof input.payload.oauthOperationId === 'string'
       ? input.payload.oauthOperationId.trim() || null
       : null
+  const oauthProgressProtocol = input.payload.oauthProgressProtocol === 2 ? 2 : null
 
   return {
     runtimeId: input.runtimeId,
@@ -1310,6 +1329,7 @@ function normalizeConnectProviderPayload(input: {
     authMethodIndex,
     authOptionId,
     oauthOperationId,
+    oauthProgressProtocol,
     projectPath: input.projectPath,
   }
 }
@@ -1433,6 +1453,13 @@ export async function runtimeProvidersConnect(opts: {
               }
               return { code }
             },
+            ...(connectInput.oauthProgressProtocol === 2
+              ? {
+                  authorizationCompleted: async verification => {
+                    await writeProviderOAuthVerificationEvent(verification, stdoutWrite)
+                  },
+                }
+              : {}),
           }
         }
         return connectProvider(openCodeProviderManagementAdapter, connectInput, observer)
