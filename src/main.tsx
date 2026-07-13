@@ -4372,12 +4372,13 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersForget(opts);
   });
-  runtimeProviders.command('models').description('Return lazy nested provider models').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--query <query>', 'Filter model ids and labels').addOption(new Option('--limit <count>', 'Maximum models to return').argParser(Number)).option('--json', 'Output as JSON (default)').action(async (opts: {
+  runtimeProviders.command('models').description('Return lazy nested provider models').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--query <query>', 'Filter model ids and labels').addOption(new Option('--limit <count>', 'Maximum models to return').argParser(Number)).option('--cursor <cursor>', 'Pagination cursor').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     provider: string;
     projectPath?: string;
     query?: string;
     limit?: number;
+    cursor?: string;
     json?: boolean;
   }) => {
     const {

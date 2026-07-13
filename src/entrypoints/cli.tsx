@@ -178,6 +178,7 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
         provider,
         query: readOption(providerArgs, '--query'),
         limit: readNumberOption(providerArgs, '--limit'),
+        cursor: readOption(providerArgs, '--cursor'),
       })
       return true
     case 'test-model':

@@ -1578,6 +1578,7 @@ export async function runtimeProvidersModels(opts: {
   projectPath?: string
   query?: string
   limit?: number
+  cursor?: string
   json?: boolean
 }): Promise<void> {
   const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
@@ -1589,6 +1590,7 @@ export async function runtimeProvidersModels(opts: {
         projectPath: opts.projectPath?.trim() || null,
         query: opts.query?.trim() || null,
         limit: opts.limit ?? null,
+        cursor: opts.cursor?.trim() || null,
       }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {

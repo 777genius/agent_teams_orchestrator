@@ -312,6 +312,11 @@ export type RuntimeProviderModel = {
 export type RuntimeProviderModelsView = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
+  totalCount: number
+  returnedCount: number
+  limit: number | null
+  cursor: string | null
+  nextCursor: string | null
   models: readonly RuntimeProviderModel[]
   defaultModelId: string | null
   diagnostics: readonly string[]
@@ -400,6 +405,7 @@ export type LoadProviderModelsInput = {
   providerId: string
   query?: string | null
   limit?: number | null
+  cursor?: string | null
 } & ProjectScopedProviderManagementInput
 
 export type LoadProviderDirectoryInput = {

@@ -4,15 +4,18 @@ import { Readable } from 'node:stream'
 import {
   openCodeProviderManagementAdapter,
   type LoadProviderDirectoryInput,
+  type LoadProviderModelsInput,
   type ProviderDirectoryView,
   type ProviderManagementResult,
   type ProviderManagementView,
+  type RuntimeProviderModelsView,
 } from '../../features/runtimeProviderManagement/index.js'
 import {
   runtimeProvidersConnect,
   runtimeProvidersConnectApiKey,
   runtimeProvidersConfigureModelLimits,
   runtimeProvidersDirectory,
+  runtimeProvidersModels,
   runtimeProvidersView,
 } from './runtime.js'
 
@@ -58,7 +61,88 @@ function minimalProviderDirectory(): ProviderDirectoryView {
   }
 }
 
+function minimalProviderModels(): RuntimeProviderModelsView {
+  return {
+    runtimeId: 'opencode',
+    providerId: 'openrouter',
+    totalCount: 4,
+    returnedCount: 2,
+    limit: 2,
+    cursor: '1',
+    nextCursor: '3',
+    models: [],
+    defaultModelId: null,
+    diagnostics: [],
+  }
+}
+
 describe('runtime provider stdout contract', () => {
+  test('passes model pagination cursor and returns page metadata', async () => {
+    const originalLoadModels = openCodeProviderManagementAdapter.loadModels
+    const originalStdoutWrite = process.stdout.write
+    const originalStderrWrite = process.stderr.write
+    const originalExit = process.exit
+    const originalExitCode = process.exitCode
+    const stdout: string[] = []
+    let receivedInput: LoadProviderModelsInput | null = null
+
+    try {
+      process.exitCode = undefined
+      process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+        stdout.push(String(chunk))
+        const writeCallback =
+          typeof encodingOrCallback === 'function'
+            ? encodingOrCallback
+            : typeof callback === 'function'
+              ? callback
+              : null
+        writeCallback?.()
+        return true
+      }) as typeof process.stdout.write
+      process.stderr.write = (() => true) as typeof process.stderr.write
+      process.exit = (() => undefined as never) as typeof process.exit
+      openCodeProviderManagementAdapter.loadModels = async input => {
+        receivedInput = input
+        return { ok: true, value: minimalProviderModels() }
+      }
+
+      await runtimeProvidersModels({
+        runtime: 'opencode',
+        provider: 'openrouter',
+        projectPath: '/tmp/provider-model-page-test',
+        query: 'alpha',
+        limit: 2,
+        cursor: '1',
+        json: true,
+      })
+
+      expect(receivedInput).toMatchObject({
+        runtimeId: 'opencode',
+        providerId: 'openrouter',
+        projectPath: '/tmp/provider-model-page-test',
+        query: 'alpha',
+        limit: 2,
+        cursor: '1',
+      })
+      expect(JSON.parse(stdout.join(''))).toMatchObject({
+        runtimeId: 'opencode',
+        models: {
+          totalCount: 4,
+          returnedCount: 2,
+          limit: 2,
+          cursor: '1',
+          nextCursor: '3',
+        },
+      })
+    } finally {
+      openCodeProviderManagementAdapter.loadModels = originalLoadModels
+      process.stdout.write = originalStdoutWrite
+      process.stderr.write = originalStderrWrite
+      process.exit = originalExit
+      process.exitCode = originalExitCode
+    }
+  })
+
   test('passes summary directory mode to provider management', async () => {
     const originalLoadDirectory = openCodeProviderManagementAdapter.loadDirectory
     const originalStdoutWrite = process.stdout.write

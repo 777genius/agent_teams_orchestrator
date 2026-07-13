@@ -769,35 +769,50 @@ function getModelCounts(
   configProviders: OpenCodeConfigProvidersResponse | null,
   providers?: OpenCodeProviderResponse | null,
 ): Map<string, number> {
-  const counts = new Map<string, number>()
+  const modelIdsByProviderId = new Map<string, Set<string>>()
+
+  const addModel = (rawProviderId: string | null | undefined, rawModelId: string): void => {
+    const providerId = normalizeProviderId(rawProviderId)
+    const modelId = rawModelId.trim()
+    if (!providerId || !modelId) {
+      return
+    }
+    const modelIds = modelIdsByProviderId.get(providerId) ?? new Set<string>()
+    modelIds.add(`${providerId}/${modelId}`)
+    modelIdsByProviderId.set(providerId, modelIds)
+  }
 
   for (const model of inventory.models) {
-    const slashIndex = model.indexOf('/')
-    const providerId = normalizeProviderId(slashIndex > 0 ? model.slice(0, slashIndex) : null)
-    if (providerId) {
-      counts.set(providerId, (counts.get(providerId) ?? 0) + 1)
+    const normalizedModel = model.trim()
+    const slashIndex = normalizedModel.indexOf('/')
+    if (slashIndex > 0) {
+      addModel(normalizedModel.slice(0, slashIndex), normalizedModel.slice(slashIndex + 1))
     }
   }
 
   for (const provider of configProviders?.providers ?? []) {
-    const providerId = normalizeProviderId(provider.id)
     const models = asRecord(provider.models)
-    if (!providerId || !models) {
+    if (!models) {
       continue
     }
-    counts.set(providerId, Math.max(counts.get(providerId) ?? 0, Object.keys(models).length))
+    for (const modelId of Object.keys(models)) {
+      addModel(provider.id, modelId)
+    }
   }
 
   for (const provider of providers?.all ?? []) {
-    const providerId = normalizeProviderId(provider.id)
     const models = asRecord(provider.models)
-    if (!providerId || !models) {
+    if (!models) {
       continue
     }
-    counts.set(providerId, Math.max(counts.get(providerId) ?? 0, Object.keys(models).length))
+    for (const modelId of Object.keys(models)) {
+      addModel(provider.id, modelId)
+    }
   }
 
-  return counts
+  return new Map(
+    Array.from(modelIdsByProviderId, ([providerId, modelIds]) => [providerId, modelIds.size]),
+  )
 }
 
 function getProviderEntries(
@@ -2590,6 +2605,7 @@ function buildProviderModelsView(input: {
   providers: OpenCodeProviderResponse | null
   query?: string | null
   limit?: number | null
+  cursor?: string | null
   diagnostics?: readonly string[]
   managedModelLimitOverrides?: Readonly<Record<string, OpenCodeManagedModelLimitOverride>>
 }): RuntimeProviderModelsView {
@@ -2602,12 +2618,13 @@ function buildProviderModelsView(input: {
   )
   const query = normalizeQuery(input.query)
   const limit = normalizePositiveLimit(input.limit)
+  const offset = normalizeDirectoryCursor(input.cursor)
   const accessCatalog = buildProviderManagementAccessCatalog({
     inventory: input.inventory,
     configProviders: input.configProviders,
     providers: input.providers,
   })
-  const models = collectProviderModelIds({
+  const matchingModels = collectProviderModelIds({
     providerId: input.providerId,
     inventory: input.inventory,
     configProviders: input.configProviders,
@@ -2625,11 +2642,20 @@ function buildProviderModelsView(input: {
       }),
     )
     .filter(model => providerModelMatchesQuery(model, query))
+  const models = limit
+    ? matchingModels.slice(offset, offset + limit)
+    : matchingModels.slice(offset)
+  const nextOffset = offset + models.length
 
   return {
     runtimeId: 'opencode',
     providerId: input.providerId,
-    models: limit ? models.slice(0, limit) : models,
+    totalCount: matchingModels.length,
+    returnedCount: models.length,
+    limit,
+    cursor: input.cursor?.trim() || null,
+    nextCursor: nextOffset < matchingModels.length ? String(nextOffset) : null,
+    models,
     defaultModelId,
     diagnostics: input.diagnostics ?? [],
   }
@@ -3571,6 +3597,7 @@ export class OpenCodeProviderManagementAdapter
           providers: providersResult.ok ? providersResult.value : null,
           query: input.query,
           limit: input.limit,
+          cursor: input.cursor,
           diagnostics,
           managedModelLimitOverrides:
             preferencesResult.ok && preferencesResult.value

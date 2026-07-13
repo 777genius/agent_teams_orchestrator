@@ -4787,12 +4787,103 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.models.map(model => model.modelId)).toEqual([
       'openrouter/openai/gpt-oss-20b:free',
     ])
+    expect(result.value).toMatchObject({
+      totalCount: 1,
+      returnedCount: 1,
+      limit: 10,
+      cursor: null,
+      nextCursor: null,
+    })
     expect(result.value.models[0]).toMatchObject({
       providerId: 'openrouter',
       sourceLabel: 'OpenRouter',
       free: true,
       availability: 'untested',
     })
+  })
+
+  test('paginates the filtered union of inventory, config, and live provider models', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'openrouter',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/alpha-one', 'openrouter/alpha-two', 'openrouter/beta-one'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'alpha-two': {},
+                  'alpha-three': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'openrouter',
+                name: 'OpenRouter',
+                models: {
+                  'alpha-three': {},
+                  'alpha-four': {},
+                },
+              },
+            ],
+            connected: ['openrouter'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openrouter: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'openrouter',
+      query: 'alpha',
+      limit: 2,
+      cursor: '1',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value).toMatchObject({
+      totalCount: 4,
+      returnedCount: 2,
+      limit: 2,
+      cursor: '1',
+      nextCursor: '3',
+    })
+    expect(result.value.models.map(model => model.modelId)).toEqual([
+      'openrouter/alpha-one',
+      'openrouter/alpha-three',
+    ])
+
+    const viewResult = await adapter.loadView('opencode')
+    expect(viewResult.ok).toBe(true)
+    if (!viewResult.ok) return
+    expect(viewResult.value.providers.find(provider => provider.providerId === 'openrouter'))
+      .toMatchObject({ modelCount: 5 })
   })
 
   test('marks provider-scoped zero-cost OpenRouter models as free', async () => {
