@@ -3130,6 +3130,96 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(openai?.actions.find(action => action.id === 'forget')?.enabled).toBe(true)
   })
 
+  test('offers transactional reauthorization separately from managed credential removal', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => inventory(),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [],
+            connected: ['openai'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ openai: [{ type: 'oauth' }] }),
+          getServerDoc: async () => ({
+            paths: {
+              '/auth/{providerID}': { delete: {}, put: {} },
+              '/provider/{providerID}/oauth/authorize': { post: {} },
+              '/provider/{providerID}/oauth/callback': { post: {} },
+            },
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const openai = result.value.providers.find(provider => provider.providerId === 'openai')
+    expect(openai?.connectedAuthHint).toBe('oauth')
+    expect(openai?.actions.find(action => action.id === 'reconnect')).toMatchObject({
+      label: 'Sign in again',
+      requiresSecret: false,
+      ownershipScope: 'managed',
+    })
+    expect(openai?.actions.find(action => action.id === 'forget')?.label).toBe(
+      'Remove managed credential',
+    )
+  })
+
+  test('offers credential replacement for a connected curated subscription plan', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'zai-coding-plan',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['zai-coding-plan'],
+            models: ['zai-coding-plan/glm-5'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'zai-coding-plan', name: 'Z.AI Coding Plan' }],
+            connected: ['zai-coding-plan'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+    })
+
+    const result = await adapter.loadView('opencode')
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const zai = result.value.providers.find(provider => provider.providerId === 'zai-coding-plan')
+    expect(zai?.actions.find(action => action.id === 'reconnect')).toMatchObject({
+      label: 'Replace credential',
+      requiresSecret: true,
+    })
+  })
+
   test('connects providers through OpenCode auth set on the managed host', async () => {
     const authWrites: Array<{ providerId: string; key: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({

@@ -76,6 +76,7 @@ const OWNERSHIP_LABELS: Record<ProviderOwnership, string> = {
 
 const ACTION_PRIORITY: ProviderActionId[] = [
   'connect',
+  'reconnect',
   'use',
   'forget',
   'test',
@@ -186,6 +187,16 @@ export function getProviderAction(
   actionId: ProviderActionId,
 ): ProviderActionDescriptor | null {
   return provider.actions.find(action => action.id === actionId) ?? null
+}
+
+export function getProviderConnectAction(
+  provider: ProviderConnection,
+): ProviderActionDescriptor | null {
+  return provider.actions.find(
+    action => (action.id === 'connect' || action.id === 'reconnect') && action.enabled,
+  ) ?? provider.actions.find(
+    action => action.id === 'connect' || action.id === 'reconnect',
+  ) ?? null
 }
 
 export function getPreferredProviderAction(
@@ -469,7 +480,7 @@ export function ProviderManagementDialog({
   }
 
   const startConnect = (provider: ProviderConnection) => {
-    const action = getProviderAction(provider, 'connect')
+    const action = getProviderConnectAction(provider)
     if (!action?.enabled) {
       dispatch({
         type: 'submit-failed',
@@ -551,7 +562,7 @@ export function ProviderManagementDialog({
     if (!selectedProvider || state.status === 'submitting') return
     const action = getPreferredProviderAction(selectedProvider)
     if (!action) return
-    if (action.id === 'connect') {
+    if (action.id === 'connect' || action.id === 'reconnect') {
       startConnect(selectedProvider)
       return
     }

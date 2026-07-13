@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  getProviderConnectAction,
   getPreferredProviderAction,
   getProviderManagementInputGuide,
   reduceProviderManagementDialogState,
@@ -62,6 +63,22 @@ describe('ProviderManagementDialog state', () => {
     })
 
     expect(getPreferredProviderAction(selected)?.id).toBe('connect')
+  })
+
+  test('uses reconnect when a connected provider no longer exposes connect', () => {
+    const selected = provider({
+      state: 'connected',
+      actions: [{
+        id: 'reconnect',
+        label: 'Replace credential',
+        enabled: true,
+        disabledReason: null,
+        requiresSecret: true,
+        ownershipScope: 'managed',
+      }],
+    })
+
+    expect(getProviderConnectAction(selected)?.id).toBe('reconnect')
   })
 
   test('clears secret state when connect is cancelled or finished', () => {

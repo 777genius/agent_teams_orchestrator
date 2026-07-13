@@ -1526,6 +1526,7 @@ function providerAction(
 function buildProviderActions(input: {
   providerId: string
   connected: boolean
+  connectedAuthHint?: ProviderAuthMethod | null
   modelCount: number | null
   authMethods: readonly ProviderAuthMethod[]
   ownership: readonly ProviderOwnership[]
@@ -1644,11 +1645,40 @@ function buildProviderActions(input: {
     }),
   )
 
+  const canReconnectWithOAuth = canConnectWithOAuth(input.authMethods, input.capabilities)
+  const canReconnectWithApiKey = canConnectWithApiKey(input.providerId, input.authMethods)
+  if (
+    input.ownership.includes('managed') &&
+    (canReconnectWithOAuth || canReconnectWithApiKey)
+  ) {
+    const effectiveAuthMethod =
+      input.connectedAuthHint ??
+      (canReconnectWithOAuth && !canReconnectWithApiKey
+        ? 'oauth'
+        : canReconnectWithApiKey && !canReconnectWithOAuth
+          ? 'api'
+          : null)
+    actions.push(
+      providerAction({
+        id: 'reconnect',
+        label:
+          effectiveAuthMethod === 'api'
+            ? 'Replace credential'
+            : effectiveAuthMethod === 'oauth'
+              ? 'Sign in again'
+              : 'Reconnect',
+        enabled: true,
+        requiresSecret: effectiveAuthMethod === 'api',
+        ownershipScope: 'managed',
+      }),
+    )
+  }
+
   if (input.ownership.includes('managed') && input.capabilities.deleteAuth) {
     actions.push(
       providerAction({
         id: 'forget',
-        label: 'Forget',
+        label: 'Remove managed credential',
         enabled: true,
         requiresSecret: false,
         ownershipScope: 'managed',
@@ -1722,6 +1752,7 @@ function buildProviderConnections(input: {
         input.providers,
       ),
       authMethods,
+      connectedAuthHint: displayConnected ? (connectedProvider?.authHint ?? null) : null,
       actions: superGrokRuntimeUpdateRequired
         ? [providerAction({
             id: 'configure',
@@ -1735,6 +1766,7 @@ function buildProviderConnections(input: {
         : buildProviderActions({
             providerId,
             connected: displayConnected,
+            connectedAuthHint: connectedProvider?.authHint ?? null,
             modelCount,
             authMethods,
             ownership,
@@ -1867,6 +1899,7 @@ function getProviderSetupKind(input: {
 function buildProviderDirectoryActions(input: {
   providerId: string
   connected: boolean
+  connectedAuthHint?: ProviderAuthMethod | null
   modelCount: number | null
   authMethods: readonly ProviderAuthMethod[]
   ownership: readonly ProviderOwnership[]
@@ -2202,6 +2235,7 @@ function buildProviderDirectory(input: {
       actions: buildProviderDirectoryActions({
         providerId,
         connected: displayConnected,
+        connectedAuthHint: connectedProvider?.authHint ?? null,
         modelCount,
         authMethods,
         ownership,

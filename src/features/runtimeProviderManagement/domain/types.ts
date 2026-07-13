@@ -118,6 +118,7 @@ export interface ProviderOAuthFlowObserver {
 
 export type ProviderActionId =
   | 'connect'
+  | 'reconnect'
   | 'use'
   | 'test'
   | 'set-default'
