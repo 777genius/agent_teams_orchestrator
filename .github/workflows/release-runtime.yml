@@ -49,6 +49,7 @@ jobs:
       source_ref: ${{ steps.meta.outputs.source_ref }}
       source_commit: ${{ steps.meta.outputs.source_commit }}
       already_published: ${{ steps.release-state.outputs.already_published }}
+      draft_release_id: ${{ steps.release-state.outputs.draft_release_id }}
 
     steps:
       - name: Checkout source ref
@@ -103,32 +104,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_json="$(
-            gh release view "$TARGET_RELEASE_TAG" \
-              --repo "$TARGET_RELEASE_REPO" \
-              --json isDraft,isPrerelease \
-              2>/dev/null || true
-          )"
+          releases_json="$(gh api "repos/${TARGET_RELEASE_REPO}/releases?per_page=100")"
+          matches="$(jq --arg tag "$TARGET_RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' <<<"$releases_json")"
+          match_count="$(jq 'length' <<<"$matches")"
+          if [[ "$match_count" -gt 1 ]]; then
+            echo "Found multiple releases for $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG" >&2
+            exit 1
+          fi
 
-          if [[ -z "$release_json" ]]; then
-            gh release create "$TARGET_RELEASE_TAG" \
-              --repo "$TARGET_RELEASE_REPO" \
-              --title "$TARGET_RELEASE_TAG" \
-              --notes "Runtime assets for $TARGET_RELEASE_TAG" \
-              --draft \
-              --latest=false
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          if [[ "$match_count" -eq 0 ]]; then
+            {
+              echo "already_published=false"
+              echo "draft_release_id="
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]]; then
-            echo "Continuing existing draft release $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG"
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          release_id="$(jq -r '.[0].id' <<<"$matches")"
+          if [[ "$(jq -r '.[0].draft' <<<"$matches")" == "true" ]]; then
+            echo "Continuing existing draft release ID $release_id"
+            {
+              echo "already_published=false"
+              echo "draft_release_id=$release_id"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "Release $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG is already published; build will be skipped"
-          echo "already_published=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "already_published=true"
+            echo "draft_release_id="
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -274,16 +280,13 @@ jobs:
           mv "release/$ARCHIVE_NAME" "release/$versioned_archive_name"
           echo "archive_name=$versioned_archive_name" >> "$GITHUB_OUTPUT"
 
-      - name: Upload runtime archive to target release
-        env:
-          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
-          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
-          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
-          ARCHIVE_NAME: ${{ steps.versioned-archive.outputs.archive_name }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release upload "$TARGET_RELEASE_TAG" "release/$ARCHIVE_NAME" --repo "$TARGET_RELEASE_REPO" --clobber
+      - name: Stage runtime archive for atomic publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.platform }}
+          path: release/${{ steps.versioned-archive.outputs.archive_name }}
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish runtime assets
@@ -304,21 +307,12 @@ jobs:
         with:
           bun-version: 1.3.11
 
-      - name: Download runtime assets from target release
-        env:
-          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
-          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
-          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
-          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf release-flat
-          mkdir -p release-flat
-          gh release download "$TARGET_RELEASE_TAG" \
-            --repo "$TARGET_RELEASE_REPO" \
-            --pattern "agent-teams-runtime-*-v${RUNTIME_VERSION}.*" \
-            --dir release-flat
+      - name: Download staged runtime archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: runtime-*
+          path: release-flat
+          merge-multiple: true
 
       - name: Generate manifest and checksums
         env:
@@ -331,39 +325,89 @@ jobs:
           set -euo pipefail
           bun run ./scripts/generate-release-manifest.ts
 
-      - name: Upload runtime assets to target release
+      - name: Upload by release ID and publish atomically
         env:
           GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release upload "$TARGET_RELEASE_TAG" release-flat/agent-teams-runtime-* --repo "$TARGET_RELEASE_REPO" --clobber
-
-      - name: Verify draft assets and publish atomically
-        env:
-          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
-          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
-          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+          EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
         shell: bash
         run: |
           set -euo pipefail
 
           find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
             | sort > expected-assets.txt
-          gh release view "$TARGET_RELEASE_TAG" \
-            --repo "$TARGET_RELEASE_REPO" \
-            --json assets \
-            --jq '.assets[].name' \
-            | sort > actual-assets.txt
-          diff -u expected-assets.txt actual-assets.txt
+          if [[ "$(wc -l < expected-assets.txt)" -ne 6 ]]; then
+            echo "Expected exactly six runtime release assets" >&2
+            cat expected-assets.txt >&2
+            exit 1
+          fi
 
-          gh release edit "$TARGET_RELEASE_TAG" \
-            --repo "$TARGET_RELEASE_REPO" \
-            --draft=false \
-            --prerelease=false \
-            --latest=false
+          release_id="$EXISTING_DRAFT_RELEASE_ID"
+          if [[ -z "$release_id" ]]; then
+            release_json="$(gh api \
+              --method POST \
+              "repos/${TARGET_RELEASE_REPO}/releases" \
+              -f tag_name="$TARGET_RELEASE_TAG" \
+              -f name="$TARGET_RELEASE_TAG" \
+              -f body="Runtime assets for $TARGET_RELEASE_TAG" \
+              -F draft=true \
+              -F prerelease=false \
+              -f make_latest=false)"
+            release_id="$(jq -r '.id' <<<"$release_json")"
+          else
+            while IFS= read -r asset_id; do
+              [[ -n "$asset_id" ]] || continue
+              gh api --method DELETE \
+                "repos/${TARGET_RELEASE_REPO}/releases/assets/${asset_id}"
+            done < <(
+              gh api "repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?per_page=100" \
+                --jq '.[].id'
+            )
+          fi
+
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Invalid draft release ID: ${release_id:-<empty>}" >&2
+            exit 1
+          fi
+
+          while IFS= read -r asset_name; do
+            asset_path="release-flat/$asset_name"
+            upload_json="$(curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'Content-Type: application/octet-stream' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --data-binary "@$asset_path" \
+              "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}")"
+            if [[ "$(jq -r '.state' <<<"$upload_json")" != "uploaded" ]]; then
+              echo "Runtime asset upload was not committed: $asset_name" >&2
+              exit 1
+            fi
+          done < expected-assets.txt
+
+          for attempt in $(seq 1 10); do
+            gh api "repos/${TARGET_RELEASE_REPO}/releases?per_page=100" \
+              --jq ".[] | select(.id == ${release_id}) | .assets[].name" \
+              | sort > actual-assets.txt
+            if diff -u expected-assets.txt actual-assets.txt; then
+              break
+            fi
+            if [[ "$attempt" -eq 10 ]]; then
+              echo "Timed out waiting for the complete draft asset set" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          gh api \
+            --method PATCH \
+            "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=false \
+            >/dev/null
 
   verify-public-release:
     name: Verify public anonymous downloads
