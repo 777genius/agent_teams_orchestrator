@@ -1,7 +1,10 @@
 name: Release Runtime
-run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent_teams_orchestrator' }}@${{ inputs.target_release_tag || github.ref_name }}
+run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent_teams_orchestrator_binaries' }}@${{ inputs.target_release_tag || format('runtime-{0}', github.ref_name) }}
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       source_ref:
@@ -13,20 +16,24 @@ on:
         required: false
         type: string
       target_release_repo:
-        description: Repository that should receive the runtime assets
+        description: Public repository that should receive the runtime assets
         required: false
-        default: 777genius/agent_teams_orchestrator
+        default: 777genius/agent_teams_orchestrator_binaries
         type: string
       target_release_tag:
-        description: Release tag in the public repo, for example v1.4.0
+        description: Namespaced release tag in the public repo, for example runtime-v0.0.65
         required: false
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: runtime-release-${{ inputs.runtime_version || github.ref_name }}
+  cancel-in-progress: false
+
 env:
-  DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator
+  DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
 
 jobs:
   prepare-release:
@@ -41,6 +48,7 @@ jobs:
       runtime_version: ${{ steps.meta.outputs.runtime_version }}
       source_ref: ${{ steps.meta.outputs.source_ref }}
       source_commit: ${{ steps.meta.outputs.source_commit }}
+      already_published: ${{ steps.release-state.outputs.already_published }}
 
     steps:
       - name: Checkout source ref
@@ -61,16 +69,33 @@ jobs:
           source_ref="${INPUT_SOURCE_REF:-${GITHUB_REF_NAME}}"
           source_commit="$(git rev-parse HEAD)"
           target_repo="${INPUT_TARGET_RELEASE_REPO:-${DEFAULT_TARGET_RELEASE_REPO}}"
-          target_tag="${INPUT_TARGET_RELEASE_TAG:-${GITHUB_REF_NAME}}"
           runtime_version="${INPUT_RUNTIME_VERSION:-${GITHUB_REF_NAME}}"
           runtime_version="${runtime_version#v}"
-          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
-          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
-          echo "target_repo=$target_repo" >> "$GITHUB_OUTPUT"
-          echo "target_tag=$target_tag" >> "$GITHUB_OUTPUT"
-          echo "runtime_version=$runtime_version" >> "$GITHUB_OUTPUT"
+          target_tag="${INPUT_TARGET_RELEASE_TAG:-runtime-v${runtime_version}}"
 
-      - name: Create target release if needed
+          if [[ "$source_ref" != "v${runtime_version}" ]]; then
+            echo "Source ref must match runtime version: expected v${runtime_version}, got ${source_ref}" >&2
+            exit 1
+          fi
+          if [[ "$target_repo" != "$DEFAULT_TARGET_RELEASE_REPO" ]]; then
+            echo "Runtime assets must be published to ${DEFAULT_TARGET_RELEASE_REPO}, got ${target_repo}" >&2
+            exit 1
+          fi
+          if [[ "$target_tag" != "runtime-v${runtime_version}" ]]; then
+            echo "Public runtime tag must be runtime-v${runtime_version}, got ${target_tag}" >&2
+            exit 1
+          fi
+
+          {
+            echo "source_ref=$source_ref"
+            echo "source_commit=$source_commit"
+            echo "target_repo=$target_repo"
+            echo "target_tag=$target_tag"
+            echo "runtime_version=$runtime_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare atomic target release
+        id: release-state
         env:
           GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
           TARGET_RELEASE_REPO: ${{ steps.meta.outputs.target_repo }}
@@ -78,15 +103,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release view "$TARGET_RELEASE_TAG" --repo "$TARGET_RELEASE_REPO" >/dev/null 2>&1 || \
+          release_json="$(
+            gh release view "$TARGET_RELEASE_TAG" \
+              --repo "$TARGET_RELEASE_REPO" \
+              --json isDraft,isPrerelease \
+              2>/dev/null || true
+          )"
+
+          if [[ -z "$release_json" ]]; then
             gh release create "$TARGET_RELEASE_TAG" \
               --repo "$TARGET_RELEASE_REPO" \
               --title "$TARGET_RELEASE_TAG" \
-              --notes "Release assets for $TARGET_RELEASE_TAG"
+              --notes "Runtime assets for $TARGET_RELEASE_TAG" \
+              --draft \
+              --latest=false
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]]; then
+            echo "Continuing existing draft release $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG"
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG is already published; build will be skipped"
+          echo "already_published=true" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
     needs: prepare-release
+    if: needs.prepare-release.outputs.already_published != 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -156,7 +203,7 @@ jobs:
       - name: Package runtime archive
         if: runner.os != 'Windows'
         env:
-          RAW_RUNTIME_VERSION: ${{ github.event.inputs.runtime_version || github.ref_name }}
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -182,7 +229,7 @@ jobs:
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
         env:
-          RAW_RUNTIME_VERSION: ${{ github.event.inputs.runtime_version || github.ref_name }}
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -242,6 +289,7 @@ jobs:
     name: Publish runtime assets
     runs-on: ubuntu-latest
     needs: [prepare-release, build]
+    if: needs.prepare-release.outputs.already_published != 'true'
     permissions:
       contents: read
 
@@ -292,3 +340,88 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TARGET_RELEASE_TAG" release-flat/agent-teams-runtime-* --repo "$TARGET_RELEASE_REPO" --clobber
+
+      - name: Verify draft assets and publish atomically
+        env:
+          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
+          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
+            | sort > expected-assets.txt
+          gh release view "$TARGET_RELEASE_TAG" \
+            --repo "$TARGET_RELEASE_REPO" \
+            --json assets \
+            --jq '.assets[].name' \
+            | sort > actual-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+
+          gh release edit "$TARGET_RELEASE_TAG" \
+            --repo "$TARGET_RELEASE_REPO" \
+            --draft=false \
+            --prerelease=false \
+            --latest=false
+
+  verify-public-release:
+    name: Verify public anonymous downloads
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build, publish]
+    if: >-
+      always() &&
+      needs.prepare-release.result == 'success' &&
+      (needs.prepare-release.outputs.already_published == 'true' || needs.publish.result == 'success')
+
+    steps:
+      - name: Verify exact public release assets
+        env:
+          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_json="$(curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${TARGET_RELEASE_REPO}")"
+          if [[ "$(jq -r '.private' <<<"$repository_json")" != "false" ]]; then
+            echo "Runtime release repository must be publicly accessible: ${TARGET_RELEASE_REPO}" >&2
+            exit 1
+          fi
+
+          release_json="$(curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/tags/${TARGET_RELEASE_TAG}")"
+          if [[ "$(jq -r '.draft' <<<"$release_json")" != "false" ]]; then
+            echo "Runtime release is not public: ${TARGET_RELEASE_REPO}@${TARGET_RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          cat > expected-assets.txt <<EOF
+          agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}
+          agent-teams-runtime-darwin-arm64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json
+          agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip
+          EOF
+          jq -r '.assets[].name' <<<"$release_json" | sort > actual-assets.txt
+          sort -o expected-assets.txt expected-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+
+          while IFS= read -r asset; do
+            [[ -n "$asset" ]] || continue
+            url="https://github.com/${TARGET_RELEASE_REPO}/releases/download/${TARGET_RELEASE_TAG}/${asset}"
+            echo "Verifying anonymous download: $url"
+            status="$(curl --fail --silent --show-error --location \
+              --range 0-0 --output /dev/null --write-out '%{http_code}' \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              "$url")"
+            if [[ "$status" != "200" && "$status" != "206" ]]; then
+              echo "Anonymous download returned HTTP $status: $url" >&2
+              exit 1
+            fi
+          done < expected-assets.txt
