@@ -3352,7 +3352,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toEqual([{ providerId: 'openrouter', key: 'sk-test-secret' }])
     expect(modelProbes).toEqual([
-      { selectedModel: 'openrouter/moonshotai/kimi-k2', outputTokens: 16 },
+      { selectedModel: 'openrouter/moonshotai/kimi-k2', outputTokens: undefined },
     ])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
@@ -3615,7 +3615,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           key: apiKey,
         },
       ])
-      expect(modelProbes).toEqual([{ selectedModel: modelId, outputTokens: 16 }])
+      expect(modelProbes).toEqual([{ selectedModel: modelId, outputTokens: undefined }])
       expect(deleteProviderAuthCalled).toBe(false)
       expect(result.value).toMatchObject({
         providerId,

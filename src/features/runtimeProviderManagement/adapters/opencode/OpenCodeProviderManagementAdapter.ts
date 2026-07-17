@@ -3207,7 +3207,8 @@ export class OpenCodeProviderManagementAdapter
         probeResult = await this.getExecutionProbe().probeModel({
           selectedModel: validationModelId,
           projectPath: input.inventory.projectPath,
-          outputTokens: 16,
+          // Keep the probe's provider-safe output budget. Reasoning models can
+          // exhaust tiny overrides before emitting the verification response.
           bypassCache: true,
         })
       } catch (error) {
