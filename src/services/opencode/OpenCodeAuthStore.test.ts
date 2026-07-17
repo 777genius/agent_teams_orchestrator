@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -62,6 +62,22 @@ describe('OpenCodeAuthStore', () => {
       openrouter: { type: 'api', key: 'sk-managed' },
       openai: { type: 'oauth' },
     })
+  })
+
+  test('restricts rewritten credential stores to the current user', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'auth.json')
+    await mkdir(path.dirname(authPath), { recursive: true })
+    await writeFile(authPath, JSON.stringify({}), { encoding: 'utf8', mode: 0o644 })
+
+    await upsertOpenCodeApiAuthCredential({
+      authPath,
+      providerId: 'google',
+      apiKey: 'google-test-key',
+    })
+
+    if (process.platform !== 'win32') {
+      expect((await stat(authPath)).mode & 0o777).toBe(0o600)
+    }
   })
 
   test('serializes concurrent managed auth syncs without dropping providers', async () => {

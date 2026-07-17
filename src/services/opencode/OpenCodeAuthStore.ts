@@ -103,7 +103,7 @@ async function writeOpenCodeAuthStore(
   filePath: string,
   authStore: OpenCodeAuthStore,
 ): Promise<void> {
-  await writeJsonFileAtomic(filePath, authStore, { indent: 2 })
+  await writeJsonFileAtomic(filePath, authStore, { indent: 2, mode: 0o600 })
 }
 
 export function mergeOpenCodeAuthStores(input: {
