@@ -2290,7 +2290,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       throw new Error('Copilot callback did not start')
     }
     let deleteProviderAuthCalled = false
-    let probedModelId: string | null = null
+    const probedModelIds: string[] = []
     const removedCredentials: Array<{ authPath: string; providerId: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -2363,7 +2363,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       executionProbe: {
         probeModel: async input => {
-          probedModelId = input.selectedModel
+          probedModelIds.push(input.selectedModel)
           return executionProbeResult(
             input.selectedModel,
             'unavailable',
@@ -2393,7 +2393,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const failure = expectFailure(result)
     expect(failure.code).toBe('model-test-failed')
     expect(failure.message).toContain('unsupported for this Copilot account')
-    expect(probedModelId).toBe('github-copilot/gpt-4.1')
+    expect(probedModelIds).toEqual([
+      'github-copilot/gpt-4.1',
+      'github-copilot/gpt-5-mini',
+    ])
     expect(callbackStarted).toBe(true)
     rejectCallback(new Error('late callback shutdown'))
     await new Promise(resolve => setTimeout(resolve, 0))
@@ -3047,6 +3050,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         removeCredential: async () => {},
       },
+      executionProbe: {
+        probeModel: async input => executionProbeResult(input.selectedModel),
+      },
     })
 
     const result = await adapter.connectProvider({
@@ -3286,6 +3292,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('connects providers through OpenCode auth set on the managed host', async () => {
     const authWrites: Array<{ providerId: string; key: string }> = []
+    const modelProbes: Array<{ selectedModel: string; outputTokens?: number }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
@@ -3324,6 +3331,15 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       authStore: authStore(),
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push({
+            selectedModel: input.selectedModel,
+            outputTokens: input.outputTokens,
+          })
+          return executionProbeResult(input.selectedModel)
+        },
+      },
     })
 
     const result = await adapter.connectWithApiKey({
@@ -3335,12 +3351,391 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(authWrites).toEqual([{ providerId: 'openrouter', key: 'sk-test-secret' }])
+    expect(modelProbes).toEqual([
+      { selectedModel: 'openrouter/moonshotai/kimi-k2', outputTokens: 16 },
+    ])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       ownership: ['managed'],
+      verifiedModelId: 'openrouter/moonshotai/kimi-k2',
     })
   })
+
+  test('verifies every API-key provider instead of trusting an accepted auth write', async () => {
+    const modelProbes: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'anthropic',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['anthropic'],
+            models: ['anthropic/claude-haiku-4-5'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'anthropic',
+                name: 'Anthropic',
+                models: { 'claude-haiku-4-5': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'anthropic', name: 'Anthropic' }],
+            connected: ['anthropic'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ anthropic: [{ type: 'api' }] }),
+          setProviderAuth: async () => true,
+        }),
+      },
+      authStore: authStore(),
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'anthropic',
+      apiKey: 'anthropic-test-key',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(modelProbes).toEqual(['anthropic/claude-haiku-4-5'])
+    expect(result.value.verifiedModelId).toBe('anthropic/claude-haiku-4-5')
+  })
+
+  test('falls back to the next active model when the first connect probe is unavailable', async () => {
+    const modelProbes: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'google',
+                authHint: 'api',
+                source: 'credentials',
+                credentialScopes: ['managed'],
+              },
+            ],
+            availableProviders: ['google'],
+            models: [
+              'google/gemini-3.1-flash-lite',
+              'google/gemini-flash-lite-latest',
+              'google/gemini-3.5-flash',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'google',
+                name: 'Google',
+                models: {
+                  'gemini-3.1-flash-lite': {},
+                  'gemini-flash-lite-latest': {},
+                  'gemini-3.5-flash': {},
+                },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [{ id: 'google', name: 'Google' }],
+            connected: ['google'],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ google: [{ type: 'api' }] }),
+          setProviderAuth: async () => true,
+        }),
+      },
+      authStore: authStore(),
+      executionProbe: {
+        probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          return input.selectedModel === 'google/gemini-3.1-flash-lite'
+            ? executionProbeResult(input.selectedModel, 'unavailable', 'Model is unavailable')
+            : executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.connectWithApiKey({
+      runtimeId: 'opencode',
+      providerId: 'google',
+      apiKey: 'google-test-key',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(modelProbes).toEqual([
+      'google/gemini-3.1-flash-lite',
+      'google/gemini-flash-lite-latest',
+    ])
+    expect(result.value.verifiedModelId).toBe('google/gemini-flash-lite-latest')
+  })
+
+  test.each([
+    {
+      providerId: 'google',
+      displayName: 'Google',
+      apiKey: 'google-test-key',
+      modelId: 'google/gemini-3.1-flash-lite',
+    },
+    {
+      providerId: 'groq',
+      displayName: 'Groq',
+      apiKey: 'groq-test-key',
+      modelId: 'groq/llama-3.1-8b-instant',
+    },
+  ])(
+    'connects $providerId from fresh credential inventory when the current host snapshot stays stale',
+    async ({ providerId, displayName, apiKey, modelId }) => {
+      const authWrites: Array<{ authPath: string; providerId: string; key: string }> = []
+      const modelProbes: Array<{ selectedModel: string; outputTokens?: number }> = []
+      let deleteProviderAuthCalled = false
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async (_projectPath, options) =>
+            inventory({
+              connectedProviders: options?.bypassCache
+                ? [
+                    {
+                      id: providerId,
+                      authHint: 'api',
+                      source: 'credentials',
+                      credentialScopes: ['managed'],
+                    },
+                  ]
+                : [],
+              availableProviders: [providerId],
+              models: [modelId],
+            }),
+        },
+        hostManager: {
+          ensureHost: async () => host(),
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({
+              providers: [
+                {
+                  id: providerId,
+                  name: displayName,
+                  models: { [modelId.slice(providerId.length + 1)]: {} },
+                },
+              ],
+              default: { [providerId]: modelId.slice(providerId.length + 1) },
+            }),
+            getProviders: async () => ({
+              all: [{ id: providerId, name: displayName }],
+              connected: [],
+              default: { [providerId]: modelId.slice(providerId.length + 1) },
+            }),
+            getProviderAuth: async () => ({ [providerId]: [{ type: 'api' }] }),
+            getServerDoc: async () => ({
+              paths: { '/auth/{providerID}': { delete: {} } },
+            }),
+            setProviderAuth: async () => true,
+            deleteProviderAuth: async () => {
+              deleteProviderAuthCalled = true
+              return true
+            },
+          }),
+        },
+        authStore: {
+          readCredential: async () => null,
+          upsertApiAuth: async input => {
+            authWrites.push({
+              authPath: input.authPath,
+              providerId: input.providerId,
+              key: input.auth.key,
+            })
+          },
+          removeCredential: async () => {},
+        },
+        executionProbe: {
+          probeModel: async input => {
+            modelProbes.push({
+              selectedModel: input.selectedModel,
+              outputTokens: input.outputTokens,
+            })
+            return executionProbeResult(input.selectedModel)
+          },
+        },
+      })
+
+      const result = await adapter.connectWithApiKey({
+        runtimeId: 'opencode',
+        providerId,
+        apiKey,
+      })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(authWrites).toEqual([
+        {
+          authPath:
+            '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+          providerId,
+          key: apiKey,
+        },
+        {
+          authPath: '/tmp/profile/data/opencode/auth.json',
+          providerId,
+          key: apiKey,
+        },
+      ])
+      expect(modelProbes).toEqual([{ selectedModel: modelId, outputTokens: 16 }])
+      expect(deleteProviderAuthCalled).toBe(false)
+      expect(result.value).toMatchObject({
+        providerId,
+        state: 'connected',
+        ownership: ['managed'],
+        connectedAuthHint: 'api',
+        verifiedModelId: modelId,
+      })
+    },
+  )
+
+  test.each([
+    {
+      providerId: 'google',
+      displayName: 'Google',
+      apiKey: 'invalid-google-test-key',
+      modelId: 'google/gemini-3.1-flash-lite',
+    },
+    {
+      providerId: 'groq',
+      displayName: 'Groq',
+      apiKey: 'invalid-groq-test-key',
+      modelId: 'groq/llama-3.1-8b-instant',
+    },
+  ])(
+    'rolls back $providerId when its real model verification rejects the API key',
+    async ({ providerId, displayName, apiKey, modelId }) => {
+      const removedCredentials: Array<{ authPath: string; providerId: string }> = []
+      let deleteProviderAuthCalled = false
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async (_projectPath, options) =>
+            inventory({
+              connectedProviders: options?.bypassCache
+                ? [
+                    {
+                      id: providerId,
+                      authHint: 'api',
+                      source: 'credentials',
+                      credentialScopes: ['managed'],
+                    },
+                  ]
+                : [],
+              availableProviders: [providerId],
+              models: [modelId],
+            }),
+        },
+        hostManager: {
+          ensureHost: async () => host(),
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({
+              providers: [
+                {
+                  id: providerId,
+                  name: displayName,
+                  models: { [modelId.slice(providerId.length + 1)]: {} },
+                },
+              ],
+              default: {},
+            }),
+            getProviders: async () => ({
+              all: [{ id: providerId, name: displayName }],
+              connected: [],
+              default: {},
+            }),
+            getProviderAuth: async () => ({ [providerId]: [{ type: 'api' }] }),
+            getServerDoc: async () => ({
+              paths: { '/auth/{providerID}': { delete: {} } },
+            }),
+            setProviderAuth: async () => true,
+            deleteProviderAuth: async () => {
+              deleteProviderAuthCalled = true
+              return true
+            },
+          }),
+        },
+        authStore: {
+          readCredential: async () => null,
+          upsertApiAuth: async () => {},
+          removeCredential: async input => {
+            removedCredentials.push(input)
+          },
+        },
+        executionProbe: {
+          probeModel: async input =>
+            executionProbeResult(
+              input.selectedModel,
+              'not_authenticated',
+              `Unauthorized ${apiKey}`,
+            ),
+        },
+      })
+
+      const result = await adapter.connectWithApiKey({
+        runtimeId: 'opencode',
+        providerId,
+        apiKey,
+      })
+
+      const failure = expectFailure(result)
+      expect(failure.code).toBe('auth-failed')
+      expect(failure.message).toContain('Unauthorized')
+      expect(failure.message).not.toContain(apiKey)
+      expect(deleteProviderAuthCalled).toBe(true)
+      expect(removedCredentials).toEqual([
+        {
+          authPath:
+            '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+          providerId,
+        },
+        {
+          authPath: '/tmp/profile/data/opencode/auth.json',
+          providerId,
+        },
+      ])
+    },
+  )
 
   test('connects Atlas Cloud only after storing the user-provided API key', async () => {
     const authWrites: Array<{
@@ -4037,6 +4432,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
         removeCredential: async () => {},
       },
+      executionProbe: {
+        probeModel: async input => executionProbeResult(input.selectedModel),
+      },
     })
 
     const result = await adapter.connectWithApiKey({
@@ -4125,6 +4523,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         removeCredential: async input => {
           removedCredentials.push(input)
         },
+      },
+      executionProbe: {
+        probeModel: async input => executionProbeResult(input.selectedModel),
       },
     })
 
@@ -4333,13 +4734,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(authWrites).toEqual([])
   })
 
-  test('treats OpenCode auth writes without connected provider evidence as failures', async () => {
+  test('rolls back OpenCode auth writes when fresh inventory exposes no credential evidence', async () => {
     let deleteCalled = false
     const authWrites: Array<{
       authPath: string
       providerId: string
       apiKey: string
     }> = []
+    const removedCredentials: Array<{ authPath: string; providerId: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
@@ -4376,7 +4778,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         upsertApiKey: async input => {
           authWrites.push(input)
         },
-        removeCredential: async () => {},
+        removeCredential: async input => {
+          removedCredentials.push(input)
+        },
       },
     })
 
@@ -4390,16 +4794,18 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(failure.code).toBe('auth-failed')
     expect(failure.message).not.toContain('sk-test-secret')
     expect(deleteCalled).toBe(true)
-    expect(authWrites).toEqual([])
+    expect(authWrites).toHaveLength(2)
+    expect(removedCredentials).toHaveLength(2)
   })
 
-  test('does not persist API keys when OpenCode only reports environment-owned evidence', async () => {
+  test('does not retain API keys when fresh inventory only reports environment-owned evidence', async () => {
     let deleteCalled = false
     const authWrites: Array<{
       authPath: string
       providerId: string
       apiKey: string
     }> = []
+    const removedCredentials: Array<{ authPath: string; providerId: string }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () =>
@@ -4442,7 +4848,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         upsertApiKey: async input => {
           authWrites.push(input)
         },
-        removeCredential: async () => {},
+        removeCredential: async input => {
+          removedCredentials.push(input)
+        },
       },
     })
 
@@ -4455,7 +4863,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const failure = expectFailure(result)
     expect(failure.code).toBe('auth-failed')
     expect(deleteCalled).toBe(true)
-    expect(authWrites).toEqual([])
+    expect(authWrites).toHaveLength(2)
+    expect(removedCredentials).toHaveLength(2)
   })
 
   test('guards forget behind OpenCode auth delete capability', async () => {

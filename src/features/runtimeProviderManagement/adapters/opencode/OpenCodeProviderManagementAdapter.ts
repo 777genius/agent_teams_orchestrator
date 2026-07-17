@@ -275,7 +275,11 @@ const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
   ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => definition.id),
 ])
 const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
+  'opencode',
+  'openrouter',
   'atlascloud',
+  'google',
+  'groq',
   'github-copilot',
   'xai',
   ...OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
@@ -283,6 +287,23 @@ const PROVIDERS_REQUIRING_CONNECT_EXECUTION_PROOF = new Set<string>([
     .map(definition => definition.id),
 ])
 const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[]> = {
+  google: [
+    'google/gemini-3.1-flash-lite',
+    'google/gemini-flash-lite-latest',
+    'google/gemini-3.5-flash',
+  ],
+  groq: [
+    'groq/llama-3.1-8b-instant',
+    'groq/openai/gpt-oss-20b',
+    'groq/openai/gpt-oss-120b',
+  ],
+  opencode: [
+    'opencode/big-pickle',
+    'opencode/mimo-v2.5-free',
+    'opencode/nemotron-3-super-free',
+    'opencode/nemotron-3-ultra-free',
+  ],
+  openrouter: ['openrouter/openrouter/free'],
   xai: [
     'xai/grok-4.3',
     'xai/grok-4.5',
@@ -335,6 +356,7 @@ const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
+const CONNECT_EXECUTION_PROOF_MAX_CANDIDATES = 3
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -1333,10 +1355,6 @@ function getOwnership(input: {
   }
 
   return []
-}
-
-function requiresExplicitCredentialEvidence(providerId: string): boolean {
-  return PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE.has(providerId)
 }
 
 function requiresConnectExecutionProof(providerId: string): boolean {
@@ -2551,23 +2569,33 @@ function collectProviderModelIds(input: {
     .sort((left, right) => left.localeCompare(right))
 }
 
-function getProviderCredentialValidationModelId(input: {
+function getProviderCredentialValidationModelIds(input: {
   providerId: string
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
   providers: OpenCodeProviderResponse | null
-}): string | null {
+}): string[] {
   const modelIds = collectProviderModelIds(input)
   if (modelIds.length === 0) {
-    return null
+    return []
   }
 
-  const preferredModelId = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId]?.find(
-    modelId => modelIds.includes(modelId),
-  )
-  if (preferredModelId) {
-    return preferredModelId
+  const candidates: string[] = []
+  const appendCandidates = (candidateIds: readonly string[]): void => {
+    for (const modelId of candidateIds) {
+      if (modelIds.includes(modelId) && !candidates.includes(modelId)) {
+        candidates.push(modelId)
+      }
+    }
   }
+  const isFreeCandidate = (modelId: string): boolean =>
+    modelId === `${input.providerId}/openrouter/free`
+    || isOpenCodeModelFree(modelId, input.inventory.modelMetadata)
+  const preferredModelIds = CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES[input.providerId] ?? []
+
+  appendCandidates(preferredModelIds.filter(isFreeCandidate))
+  appendCandidates(modelIds.filter(isFreeCandidate))
+  appendCandidates(preferredModelIds)
 
   const defaultModelId = getDefaultModelForProvider(
     input.providerId,
@@ -2575,11 +2603,10 @@ function getProviderCredentialValidationModelId(input: {
     input.configProviders,
     input.providers,
   )
-  if (defaultModelId && modelIds.includes(defaultModelId)) {
-    return defaultModelId
-  }
+  if (defaultModelId) appendCandidates([defaultModelId])
+  appendCandidates(modelIds)
 
-  return modelIds[0] ?? null
+  return candidates.slice(0, CONNECT_EXECUTION_PROOF_MAX_CANDIDATES)
 }
 
 function buildProviderDirectoryModelSearchIndex(input: {
@@ -3154,45 +3181,67 @@ export class OpenCodeProviderManagementAdapter
     configProviders: OpenCodeConfigProvidersResponse | null
     providers: OpenCodeProviderResponse | null
     secretToRedact?: string | null
+    required?: boolean
   }): Promise<ProviderManagementResult<string | null>> {
-    if (!requiresConnectExecutionProof(input.providerId)) {
+    if (!input.required && !requiresConnectExecutionProof(input.providerId)) {
       return { ok: true, value: null }
     }
 
-    const validationModelId = getProviderCredentialValidationModelId({
+    const validationModelIds = getProviderCredentialValidationModelIds({
       providerId: input.providerId,
       inventory: input.inventory,
       configProviders: input.configProviders,
       providers: input.providers,
     })
-    if (!validationModelId) {
+    if (validationModelIds.length === 0) {
       return providerManagementError(
         'model-missing',
         `OpenCode did not expose a probeable model for provider ${input.providerId}`,
       )
     }
 
-    const probeResult = await this.getExecutionProbe().probeModel({
-      selectedModel: validationModelId,
-      projectPath: input.inventory.projectPath,
-      bypassCache: true,
-    })
-    if (probeResult.outcome === 'available') {
-      return { ok: true, value: validationModelId }
-    }
+    const failedCandidates: string[] = []
+    for (const validationModelId of validationModelIds) {
+      let probeResult: OpenCodeExecutionProbeResult
+      try {
+        probeResult = await this.getExecutionProbe().probeModel({
+          selectedModel: validationModelId,
+          projectPath: input.inventory.projectPath,
+          outputTokens: 16,
+          bypassCache: true,
+        })
+      } catch (error) {
+        const reason = redactSecret(
+          error instanceof Error ? error.message : String(error),
+          input.secretToRedact ?? '',
+        )
+        failedCandidates.push(`${validationModelId}: ${reason}`)
+        continue
+      }
 
-    const probeReason = redactSecret(
-      probeResult.reason ?? `Model probe failed for ${validationModelId}`,
-      input.secretToRedact ?? '',
-    )
-    return probeResult.outcome === 'not_authenticated'
-      ? providerManagementError(
+      if (probeResult.outcome === 'available') {
+        return { ok: true, value: validationModelId }
+      }
+
+      const probeReason = redactSecret(
+        probeResult.reason ?? `Model probe failed for ${validationModelId}`,
+        input.secretToRedact ?? '',
+      )
+      if (probeResult.outcome === 'not_authenticated') {
+        return providerManagementError(
           'auth-failed',
           probeResult.reason
             ? probeReason
             : `Provider authentication failed for ${validationModelId}`,
         )
-      : providerManagementError('model-test-failed', probeReason)
+      }
+      failedCandidates.push(`${validationModelId}: ${probeReason}`)
+    }
+
+    return providerManagementError(
+      'model-test-failed',
+      `OpenCode could not verify provider ${input.providerId} with ${validationModelIds.length} model candidate${validationModelIds.length === 1 ? '' : 's'}: ${failedCandidates.join('; ')}`,
+    )
   }
 
   private async withManagedOpenCodeClient<T>(
@@ -4125,7 +4174,7 @@ export class OpenCodeProviderManagementAdapter
           configProviders,
           providers,
         })
-        if (!executionProof.ok) {
+        if (executionProof.ok === false) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -4135,14 +4184,12 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        return {
-          ok: true,
-          value: {
-            ...provider,
-            connectedAuthHint: 'oauth',
-            verifiedModelId: executionProof.value,
-          },
+        const verifiedProvider: ProviderConnection = {
+          ...provider,
+          connectedAuthHint: 'oauth',
+          verifiedModelId: executionProof.value,
         }
+        return { ok: true, value: verifiedProvider }
       },
       {
         failureCode: 'auth-failed',
@@ -4324,50 +4371,12 @@ export class OpenCodeProviderManagementAdapter
           )
         }
 
-        if (!requiresExplicitCredentialEvidence(providerId)) {
-          const providerEvidenceView = await readLiveView({
-            inventory,
-            host,
-            client,
-            diagnostics: [
-              ...inventory.diagnostics,
-              ...safeReadDiagnostics(configProvidersResult),
-              ...safeReadDiagnostics(providersResult),
-              ...safeReadDiagnostics(providerAuthResult),
-              ...safeReadDiagnostics(serverDocResult),
-            ],
-          })
-          const providerEvidence = findProviderConnection(providerEvidenceView, providerId)
-          if (!providerEvidence) {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-              previousCredentials,
-            })
-            return providerManagementError(
-              'provider-missing',
-              `OpenCode did not return provider ${providerId} after connecting`,
-            )
-          }
-          if (
-            providerEvidence.state !== 'connected' ||
-            !providerEvidence.ownership.includes('managed')
-          ) {
-            await this.rollbackProviderAuth({
-              client,
-              providerId,
-              authPaths: [globalAuthPath, managedAuthPath],
-              canDeleteProviderAuth,
-              previousCredentials,
-            })
-            return providerManagementError(
-              'auth-failed',
-              `OpenCode accepted the auth request but did not report provider ${providerId} as connected`,
-            )
-          }
-        }
+        // OpenCode snapshots connected providers when an instance starts. The auth
+        // endpoint persists the credential but does not refresh that in-memory
+        // snapshot, so this host can legitimately remain stale after a successful
+        // write. Confirm against the bypass-cache inventory below, which starts
+        // from the updated managed auth store, and then prove the credential with
+        // a real model request.
 
         const authStore = this.getAuthStore()
         try {
@@ -4447,8 +4456,9 @@ export class OpenCodeProviderManagementAdapter
           configProviders,
           providers,
           secretToRedact: apiKey,
+          required: true,
         })
-        if (!executionProof.ok) {
+        if (executionProof.ok === false) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -4458,14 +4468,12 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        return {
-          ok: true,
-          value: {
-            ...provider,
-            connectedAuthHint: 'api',
-            verifiedModelId: executionProof.value,
-          },
+        const verifiedProvider: ProviderConnection = {
+          ...provider,
+          connectedAuthHint: 'api',
+          verifiedModelId: executionProof.value,
         }
+        return { ok: true, value: verifiedProvider }
       },
       {
         failureCode: 'auth-failed',
