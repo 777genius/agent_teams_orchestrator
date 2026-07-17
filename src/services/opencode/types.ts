@@ -15,6 +15,7 @@ export type OpenCodeModelOutputLimitOverride = {
 export type OpenCodeToolApprovalMode = 'auto' | 'manual'
 
 export type OpenCodePrepareProfileOptions = {
+  abortSignal?: AbortSignal
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean
@@ -55,6 +56,7 @@ export type OpenCodeHostHandle = {
   baseUrl: string
   port: number
   pid: number
+  processStartedAtMs?: number | null
   version: string | null
   state: OpenCodeHostState
   profile: OpenCodePreparedProfile

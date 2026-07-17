@@ -91,6 +91,11 @@ export type OpenCodeClient = {
   abortSession(id: string): Promise<boolean>
 }
 
+export type OpenCodeClientRequestContext = {
+  signal?: AbortSignal
+  remainingMs?: () => number
+}
+
 type OpenCodeClientFactoryDeps = {
   fetchImpl?: typeof fetch
 }
@@ -128,20 +133,52 @@ async function parseResponse<T>(response: Response): Promise<T> {
   return JSON.parse(text) as T
 }
 
+function resolveRequestTimeoutMs(
+  endpointTimeoutMs: number,
+  context: OpenCodeClientRequestContext,
+): number {
+  const remainingMs = context.remainingMs?.()
+  if (remainingMs === undefined || remainingMs === Number.POSITIVE_INFINITY) {
+    return endpointTimeoutMs
+  }
+  if (!Number.isFinite(remainingMs)) {
+    return 0
+  }
+  return Math.max(0, Math.min(endpointTimeoutMs, Math.floor(remainingMs)))
+}
+
+function resolveAbortReason(signal: AbortSignal, fallback: Error): unknown {
+  return signal.reason === undefined ? fallback : signal.reason
+}
+
 export class OpenCodeClientFactory {
   constructor(private readonly deps: OpenCodeClientFactoryDeps = {}) {}
 
-  create(baseUrl: string): OpenCodeClient {
+  create(baseUrl: string, context: OpenCodeClientRequestContext = {}): OpenCodeClient {
     const fetchImpl = this.deps.fetchImpl ?? fetch
 
     const request = async <T>(
       path: string,
       init?: RequestInit,
-      timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+      endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
     ): Promise<T> => {
+      const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
+      const timeoutError = new Error(
+        `OpenCode request timed out after ${timeoutMs}ms for ${path}`,
+      )
+      if (context.signal?.aborted) {
+        throw resolveAbortReason(context.signal, timeoutError)
+      }
+
       const controller = new AbortController()
+      const abortFromContext = () => {
+        if (!controller.signal.aborted && context.signal) {
+          controller.abort(resolveAbortReason(context.signal, timeoutError))
+        }
+      }
+      context.signal?.addEventListener('abort', abortFromContext, { once: true })
       const timeout = setTimeout(() => {
-        controller.abort(new Error(`OpenCode request timed out after ${timeoutMs}ms for ${path}`))
+        controller.abort(timeoutError)
       }, timeoutMs)
 
       try {
@@ -155,12 +192,16 @@ export class OpenCodeClientFactory {
         })
         return parseResponse<T>(response)
       } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
-          throw new Error(`OpenCode request timed out after ${timeoutMs}ms for ${path}`)
+        if (context.signal?.aborted) {
+          throw resolveAbortReason(context.signal, timeoutError)
+        }
+        if (controller.signal.aborted) {
+          throw resolveAbortReason(controller.signal, timeoutError)
         }
         throw error
       } finally {
         clearTimeout(timeout)
+        context.signal?.removeEventListener('abort', abortFromContext)
       }
     }
 

@@ -224,3 +224,93 @@ describe('OpenCodeClientFactory permissions API', () => {
     ])
   })
 })
+
+describe('OpenCodeClientFactory request context', () => {
+  test('limits an endpoint request to the remaining runtime budget', async () => {
+    const requestSignals: AbortSignal[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (_input, init) => {
+        const requestSignal = init?.signal as AbortSignal
+        requestSignals.push(requestSignal)
+        return await new Promise<Response>((_resolve, reject) => {
+          requestSignal.addEventListener('abort', () => reject(requestSignal.reason), {
+            once: true,
+          })
+        })
+      },
+    })
+
+    await expect(
+      factory
+        .create('http://127.0.0.1:4096', { remainingMs: () => 10 })
+        .promptSessionAsync('ses_123', { parts: [] }),
+    ).rejects.toThrow(
+      'OpenCode request timed out after 10ms for /session/ses_123/prompt_async',
+    )
+    expect(requestSignals[0]?.aborted).toBe(true)
+  })
+
+  test('propagates the external abort reason to an in-flight request', async () => {
+    const abortController = new AbortController()
+    const abortReason = new Error('readiness deadline expired during execution_submit')
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (_input, init) => {
+        const signal = init?.signal as AbortSignal
+        return await new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      },
+    })
+    const request = factory
+      .create('http://127.0.0.1:4096', {
+        signal: abortController.signal,
+        remainingMs: () => 30_000,
+      })
+      .getConfig()
+
+    abortController.abort(abortReason)
+
+    await expect(request).rejects.toBe(abortReason)
+  })
+
+  test('does not start fetch when the request context is already aborted', async () => {
+    const abortController = new AbortController()
+    const abortReason = new Error('readiness deadline already expired')
+    abortController.abort(abortReason)
+    let fetchCalls = 0
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => {
+        fetchCalls += 1
+        return new Response('{}')
+      },
+    })
+
+    await expect(
+      factory
+        .create('http://127.0.0.1:4096', { signal: abortController.signal })
+        .getConfig(),
+    ).rejects.toBe(abortReason)
+    expect(fetchCalls).toBe(0)
+  })
+
+  test('removes the external abort listener after a completed request', async () => {
+    const abortController = new AbortController()
+    const requestSignals: AbortSignal[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (_input, init) => {
+        requestSignals.push(init?.signal as AbortSignal)
+        return new Response('{}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+
+    await factory
+      .create('http://127.0.0.1:4096', { signal: abortController.signal })
+      .getConfig()
+    abortController.abort(new Error('late abort'))
+
+    expect(requestSignals[0]?.aborted).toBe(false)
+  })
+})
