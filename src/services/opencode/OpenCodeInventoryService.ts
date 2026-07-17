@@ -75,6 +75,8 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
+const OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS = 30_000
+const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
 const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = 45_000
@@ -93,6 +95,7 @@ type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
   mode?: OpenCodeInventoryProbeMode
+  refreshModels?: boolean
   includeAppMcp?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
   abortSignal?: AbortSignal
@@ -227,6 +230,31 @@ export function getOpenCodeVerboseModelsArgs(): string[] {
   return ['models', '--verbose']
 }
 
+export function getOpenCodeRefreshModelsArgs(): string[] {
+  // OpenCode refreshes the shared Models.dev cache before applying the optional
+  // provider filter. Filtering stdout keeps an explicit UI refresh fast and
+  // bounded instead of serializing every model from every provider.
+  return ['models', OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER, '--refresh']
+}
+
+function getOpenCodeCatalogRefreshProfile(
+  profile: OpenCodePreparedProfile,
+): OpenCodePreparedProfile {
+  return {
+    ...profile,
+    env: {
+      ...profile.env,
+      // Catalog refresh only needs OpenCode core and the shared XDG cache. Do
+      // not start every configured provider plugin just to update Models.dev.
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        autoupdate: false,
+        plugin: [],
+        mcp: {},
+      }),
+    },
+  }
+}
+
 const EMPTY_OPEN_CODE_COMMAND_RESULT: OpenCodeCommandResult = {
   stdout: '',
   stderr: '',
@@ -357,9 +385,10 @@ export async function collectOpenCodeInventoryCommandResults(input: {
   mode: OpenCodeInventoryProbeMode
   execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
   modelsResult?: OpenCodeCommandResult
+  refreshModels?: boolean
 }): Promise<OpenCodeInventoryCommandResults> {
   const versionResult =
-    input.mode === 'profile'
+    input.mode === 'profile' || input.refreshModels
       ? EMPTY_OPEN_CODE_COMMAND_RESULT
       : await input.execOpenCode(['--version'])
   const providersResult =
@@ -369,9 +398,11 @@ export async function collectOpenCodeInventoryCommandResults(input: {
   const modelsResult =
     input.mode !== 'full'
       ? EMPTY_OPEN_CODE_COMMAND_RESULT
-      : input.modelsResult ?? await input.execOpenCode(getOpenCodeVerboseModelsArgs())
+      : input.refreshModels
+        ? await input.execOpenCode(getOpenCodeRefreshModelsArgs())
+        : input.modelsResult ?? await input.execOpenCode(getOpenCodeVerboseModelsArgs())
   const agentsResult =
-    input.mode !== 'full'
+    input.mode !== 'full' || input.refreshModels
       ? EMPTY_OPEN_CODE_COMMAND_RESULT
       : await input.execOpenCode(['agent', 'list'])
 
@@ -621,12 +652,22 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
     try {
       const raw = JSON.parse(block) as Record<string, unknown>
       const limits = raw.limit ?? raw.limits ?? null
+      const rawStatus = typeof raw.status === 'string' ? raw.status.trim().toLowerCase() : ''
+      const catalogStatus =
+        raw.deprecated === true || rawStatus === 'deprecated'
+          ? 'deprecated'
+          : rawStatus === 'alpha'
+            ? 'alpha'
+            : rawStatus === 'beta'
+              ? 'beta'
+              : 'active'
       modelMetadata.push({
         id: modelRef.raw,
         cost: raw.cost ?? null,
         context: getModelContextLimit(limits),
         limits,
         free: isFreeCost(raw.cost),
+        catalogStatus,
         raw,
       })
       index = blockEnd
@@ -795,7 +836,8 @@ export class OpenCodeInventoryService {
     },
     fallback: string,
   ): string {
-    return result.error ?? (result.stderr.trim() || fallback)
+    const detail = result.error ?? result.stderr.trim()
+    return detail ? `${fallback}: ${detail}` : fallback
   }
 
   private async execOpenCode(
@@ -884,12 +926,23 @@ export class OpenCodeInventoryService {
     const collectCommandResults = () =>
       collectOpenCodeInventoryCommandResults({
         mode,
-        modelsResult: prewarmedModelsResult,
+        modelsResult: options.refreshModels ? undefined : prewarmedModelsResult,
+        refreshModels: options.refreshModels,
         execOpenCode: args =>
-          this.execOpenCode(binaryPath, args, profile, {
-            abortSignal: options.abortSignal,
-            progress: options.progress,
-          }),
+          this.execOpenCode(
+            binaryPath,
+            args,
+            options.refreshModels && args[0] === 'models'
+              ? getOpenCodeCatalogRefreshProfile(profile)
+              : profile,
+            {
+              abortSignal: options.abortSignal,
+              progress: options.progress,
+              ...(options.refreshModels && args[0] === 'models'
+                ? { timeoutMs: OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS }
+                : {}),
+            },
+          ),
       })
     const { versionResult, providersResult, modelsResult, agentsResult } =
       await collectCommandResults()
@@ -955,7 +1008,10 @@ export class OpenCodeInventoryService {
     let modelMetadata = verboseModels.modelMetadata
     let finalModelsResult = modelsResult
     if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, ['models'], profile, {
+      const fallbackModelsResult = await this.execOpenCode(binaryPath, [
+        'models',
+        ...(options.refreshModels ? ['--refresh'] : []),
+      ], profile, {
         abortSignal: options.abortSignal,
         progress: options.progress,
       })

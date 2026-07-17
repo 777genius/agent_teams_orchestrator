@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import {
+  classifyProbeFailure,
   OpenCodeExecutionProbe,
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
@@ -69,6 +70,27 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
 })
 
 describe('OpenCodeExecutionProbe', () => {
+  test.each([
+    'Invalid API key.',
+    'API key not valid. Please pass a valid API key.',
+    'API key is revoked',
+  ])('classifies provider auth failure %s as not authenticated', message => {
+    expect(classifyProbeFailure({ message })).toEqual({
+      outcome: 'not_authenticated',
+      reason: message,
+    })
+  })
+
+  test('classifies retired Google models as unavailable for the current account', () => {
+    const message =
+      'This model models/gemini-2.5-flash-lite is no longer available to new users.'
+
+    expect(classifyProbeFailure({ message })).toEqual({
+      outcome: 'unavailable',
+      reason: message,
+    })
+  })
+
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
     let promptAsyncCount = 0
     let sendMessageCount = 0

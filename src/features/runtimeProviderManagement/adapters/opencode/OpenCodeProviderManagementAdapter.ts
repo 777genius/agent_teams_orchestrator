@@ -90,6 +90,7 @@ import type {
   ProviderManagementView,
   ProviderModelLimitsResult,
   ProviderModelAvailability,
+  ProviderModelCatalogStatus,
   ProviderModelTestResult,
   ProviderOwnership,
   ProviderOAuthFlowObserver,
@@ -2453,11 +2454,59 @@ function findProviderConnection(
   return view.providers.find(provider => provider.providerId === providerId) ?? null
 }
 
+function getCatalogStatusFromModelValue(value: unknown): ProviderModelCatalogStatus {
+  const record = asRecord(value)
+  const rawStatus = asString(record?.status)?.trim().toLowerCase()
+  if (record?.deprecated === true || rawStatus === 'deprecated') return 'deprecated'
+  if (rawStatus === 'alpha') return 'alpha'
+  if (rawStatus === 'beta') return 'beta'
+  return 'active'
+}
+
+function getProviderModelCatalogStatus(input: {
+  providerId: string
+  modelId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): ProviderModelCatalogStatus {
+  const nestedModelId = input.modelId.startsWith(`${input.providerId}/`)
+    ? input.modelId.slice(input.providerId.length + 1)
+    : input.modelId
+  const statuses: ProviderModelCatalogStatus[] = []
+  const inventoryStatus = input.inventory.modelMetadata?.find(
+    metadata => metadata.id === input.modelId,
+  )?.catalogStatus
+  if (inventoryStatus) statuses.push(inventoryStatus)
+
+  const configProvider = input.configProviders?.providers?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )
+  const configModels = asRecord(configProvider?.models)
+  if (configModels && nestedModelId in configModels) {
+    statuses.push(getCatalogStatusFromModelValue(configModels[nestedModelId]))
+  }
+
+  const liveProvider = input.providers?.all?.find(
+    provider => normalizeProviderId(provider.id) === input.providerId,
+  )
+  const liveModels = asRecord(liveProvider?.models)
+  if (liveModels && nestedModelId in liveModels) {
+    statuses.push(getCatalogStatusFromModelValue(liveModels[nestedModelId]))
+  }
+
+  if (statuses.includes('deprecated')) return 'deprecated'
+  if (statuses.includes('alpha')) return 'alpha'
+  if (statuses.includes('beta')) return 'beta'
+  return 'active'
+}
+
 function collectProviderModelIds(input: {
   providerId: string
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
   providers: OpenCodeProviderResponse | null
+  includeDeprecatedModelIds?: ReadonlySet<string>
 }): string[] {
   const modelIds = new Set<string>()
   const prefix = `${input.providerId}/`
@@ -2491,7 +2540,15 @@ function collectProviderModelIds(input: {
     }
   }
 
-  return Array.from(modelIds).sort((left, right) => left.localeCompare(right))
+  return Array.from(modelIds)
+    .filter(modelId =>
+      input.includeDeprecatedModelIds?.has(modelId)
+      || getProviderModelCatalogStatus({
+        ...input,
+        modelId,
+      }) !== 'deprecated',
+    )
+    .sort((left, right) => left.localeCompare(right))
 }
 
 function getProviderCredentialValidationModelId(input: {
@@ -2553,6 +2610,7 @@ function providerModelMatchesQuery(model: RuntimeProviderModel, query: string): 
     model.routeKind,
     model.accessKind,
     model.proofState,
+    model.catalogStatus,
     model.free ? 'free' : '',
     model.requiresExecutionProof ? 'needs test' : '',
   ].some(value => value.toLowerCase().includes(query))
@@ -2565,6 +2623,8 @@ function buildRuntimeProviderModel(input: {
   defaultModelId: string | null
   availability?: ProviderModelAvailability
   inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
   accessCatalog: OpenCodeModelAccessCatalog
   managedModelLimitOverrides?: Readonly<Record<string, OpenCodeManagedModelLimitOverride>>
 }): RuntimeProviderModel {
@@ -2584,6 +2644,13 @@ function buildRuntimeProviderModel(input: {
     sourceLabel,
     free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
     default: input.defaultModelId === input.modelId,
+    catalogStatus: getProviderModelCatalogStatus({
+      providerId: input.providerId,
+      modelId: input.modelId,
+      inventory: input.inventory,
+      configProviders: input.configProviders,
+      providers: input.providers,
+    }),
     availability: input.availability ?? 'untested',
     accessKind: routeMetadata.accessKind,
     routeKind: routeMetadata.routeKind,
@@ -2629,6 +2696,7 @@ function buildProviderModelsView(input: {
     inventory: input.inventory,
     configProviders: input.configProviders,
     providers: input.providers,
+    includeDeprecatedModelIds: defaultModelId ? new Set([defaultModelId]) : undefined,
   })
     .map(modelId =>
       buildRuntimeProviderModel({
@@ -2637,6 +2705,8 @@ function buildProviderModelsView(input: {
         providerEntry: entries.get(input.providerId),
         defaultModelId,
         inventory: input.inventory,
+        configProviders: input.configProviders,
+        providers: input.providers,
         accessCatalog,
         managedModelLimitOverrides: input.managedModelLimitOverrides,
       }),
@@ -2690,6 +2760,8 @@ function buildConfiguredOpenCodeModels(input: {
         providerEntry: entries.get(providerId),
         defaultModelId,
         inventory: input.inventory,
+        configProviders: input.configProviders,
+        providers: input.providers,
         accessCatalog,
       })
       if (
@@ -2714,6 +2786,8 @@ function buildConfiguredOpenCodeModels(input: {
         providerEntry: entries.get(defaultModelRef.providerId),
         defaultModelId: defaultModelRef.modelId,
         inventory: input.inventory,
+        configProviders: input.configProviders,
+        providers: input.providers,
         accessCatalog,
       }),
       default: true,
@@ -3304,7 +3378,9 @@ export class OpenCodeProviderManagementAdapter
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, input.projectPath, {
-      mode: input.summary ? 'summary' : 'profile',
+      mode: input.summary ? 'summary' : input.refresh ? 'full' : 'profile',
+      bypassCache: input.refresh === true,
+      refreshModels: input.refresh === true && input.summary !== true,
     })
 
     if (!inventory.detected) {
@@ -3354,6 +3430,7 @@ export class OpenCodeProviderManagementAdapter
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
+    const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
 
@@ -3364,7 +3441,7 @@ export class OpenCodeProviderManagementAdapter
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime: 'persistent',
+        hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
@@ -3486,7 +3563,7 @@ export class OpenCodeProviderManagementAdapter
       if (host) {
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: true })
+          .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
           .catch(() => undefined)
       }
     }

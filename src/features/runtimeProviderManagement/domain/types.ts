@@ -271,6 +271,8 @@ export type ProviderModelAvailability =
   | 'unknown'
   | 'untested'
 
+export type ProviderModelCatalogStatus = 'active' | 'alpha' | 'beta' | 'deprecated'
+
 export type OpenCodeRuntimeModelAccessKind =
   | 'no_model'
   | 'unknown_model'
@@ -296,6 +298,7 @@ export type RuntimeProviderModel = {
   sourceLabel: string
   free: boolean
   default: boolean
+  catalogStatus: ProviderModelCatalogStatus
   availability: ProviderModelAvailability
   accessKind: OpenCodeRuntimeModelAccessKind
   routeKind: OpenCodeRuntimeModelRouteKind

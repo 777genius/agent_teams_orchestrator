@@ -74,12 +74,15 @@ export type OpenCodeAgentSummary = {
   mode: OpenCodeAgentMode
 }
 
+export type OpenCodeCatalogModelStatus = 'active' | 'alpha' | 'beta' | 'deprecated'
+
 export type OpenCodeModelMetadata = {
   id: string
   cost: unknown | null
   context: number | null
   limits: unknown | null
   free: boolean
+  catalogStatus?: OpenCodeCatalogModelStatus
   raw: Record<string, unknown>
 }
 

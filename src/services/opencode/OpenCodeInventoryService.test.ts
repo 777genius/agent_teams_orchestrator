@@ -8,6 +8,7 @@ import {
   createOpenCodeInventoryProbeProgressTracker,
   execOpenCodePortableCommand,
   filterOpenCodeConnectedProvidersForRuntime,
+  getOpenCodeRefreshModelsArgs,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
@@ -108,6 +109,25 @@ describe('OpenCodeInventoryService parsers', () => {
 
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
     expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
+    expect(getOpenCodeRefreshModelsArgs()).toEqual(['models', 'opencode', '--refresh'])
+  })
+
+  test('forces OpenCode to refresh models instead of reusing a prewarmed catalog result', async () => {
+    const calls: string[] = []
+    const result = await collectOpenCodeInventoryCommandResults({
+      mode: 'full',
+      refreshModels: true,
+      modelsResult: { stdout: 'stale/prewarmed-model', stderr: '', code: 0 },
+      execOpenCode: async args => {
+        calls.push(args.join(' '))
+        return { stdout: args.join(' '), stderr: '', code: 0 }
+      },
+    })
+
+    expect(calls).toEqual(['providers list', 'models opencode --refresh'])
+    expect(result.versionResult.stdout).toBe('')
+    expect(result.modelsResult.stdout).toBe('models opencode --refresh')
+    expect(result.agentsResult.stdout).toBe('')
   })
 
   test('collects inventory commands sequentially to avoid OpenCode profile contention', async () => {
@@ -477,6 +497,7 @@ describe('OpenCodeInventoryService parsers', () => {
     const parsed = parseOpenCodeModelsVerboseOutput(`
 opencode/big-pickle
 {
+  "status": "beta",
   "cost": {
     "input": 0,
     "output": 0,
@@ -486,6 +507,7 @@ opencode/big-pickle
 }
 openai/gpt-5.4
 {
+  "deprecated": true,
   "cost": {
     "input": 0.25,
     "output": 1
@@ -524,6 +546,9 @@ llama.cpp/qwen3-coder:a3b local
     ])
     expect(parsed.modelMetadata[0]?.context).toBe(200000)
     expect(parsed.modelMetadata[0]?.limits).toEqual({ context: 200000 })
+    expect(parsed.modelMetadata[0]?.catalogStatus).toBe('beta')
+    expect(parsed.modelMetadata[1]?.catalogStatus).toBe('deprecated')
+    expect(parsed.modelMetadata[2]?.catalogStatus).toBe('active')
     expect(isOpenCodeBuiltinFreeModelId('opencode/big-pickle', parsed.modelMetadata)).toBe(true)
     expect(isOpenCodeBuiltinFreeModelId(' openai/gpt-5.4 ', parsed.modelMetadata)).toBe(false)
     expect(isOpenCodeModelFree('opencode/big-pickle', parsed.modelMetadata)).toBe(true)

@@ -156,7 +156,7 @@ function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
   return null
 }
 
-function classifyProbeFailure(params: {
+export function classifyProbeFailure(params: {
   message: string
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
   const reason = normalizeFailureMessage(params.message)
@@ -171,6 +171,8 @@ function classifyProbeFailure(params: {
     || lower.includes('please run \'agent login\'')
     || lower.includes('please run `kiro-cli login`')
     || lower.includes('cursor_api_key')
+    || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
+    || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
     || lower.includes('unauthorized')
     || lower.includes('forbidden')
     || /\b401\b/.test(lower)
@@ -188,6 +190,8 @@ function classifyProbeFailure(params: {
     || lower.includes('unsupported model')
     || lower.includes('model not available')
     || lower.includes('model unavailable')
+    || lower.includes('model is no longer available')
+    || (lower.includes('model') && lower.includes('no longer available to new users'))
     || lower.includes('model not found')
     || lower.includes('unknown model')
     || lower.includes('invalid model')

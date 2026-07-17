@@ -384,7 +384,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
       {
         projectPath: '/tmp/project',
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         healthTimeoutMs: 10_000,
         preparedProfile: true,
         includeAppMcp: false,
@@ -1186,6 +1186,70 @@ describe('OpenCodeProviderManagementAdapter', () => {
     await adapter.loadDirectory({ runtimeId: 'opencode' })
 
     expect(inventoryModes).toEqual(['profile'])
+  })
+
+  test('forces a full catalog refresh and reads it through a fresh process host', async () => {
+    const probeCalls: Array<{
+      mode?: string
+      bypassCache?: boolean
+      refreshModels?: boolean
+      includeAppMcp?: boolean
+    }> = []
+    const hostLifetimes: Array<string | undefined> = []
+    const releaseOptions: Array<{ keepPersistentAlive?: boolean } | undefined> = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          probeCalls.push({
+            mode: options?.mode,
+            bypassCache: options?.bypassCache,
+            refreshModels: options?.refreshModels,
+            includeAppMcp: options?.includeAppMcp,
+          })
+          return inventory({
+            availableProviders: ['google'],
+            models: ['google/gemini-3.1-flash-lite'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async options => {
+          hostLifetimes.push(options?.hostLifetime)
+          return host()
+        },
+        releaseHost: async (_hostKey, options) => {
+          releaseOptions.push(options)
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'google', name: 'Google', models: { 'gemini-3.1-flash-lite': {} } }],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({ google: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      refresh: true,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probeCalls).toEqual([
+      {
+        mode: 'full',
+        bypassCache: true,
+        refreshModels: true,
+        includeAppMcp: false,
+      },
+    ])
+    expect(hostLifetimes).toEqual(['process'])
+    expect(releaseOptions).toEqual([{ keepPersistentAlive: false }])
   })
 
   test('loads dashboard provider summaries without starting a live OpenCode host', async () => {
@@ -4954,6 +5018,92 @@ describe('OpenCodeProviderManagementAdapter', () => {
       sourceLabel: 'OpenRouter',
       free: true,
     })
+  })
+
+  test('filters deprecated catalog models but keeps a persisted deprecated default visible', async () => {
+    let defaultModelId = 'active-model'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            availableProviders: ['google'],
+            models: [
+              'google/active-model',
+              'google/alpha-model',
+              'google/beta-model',
+              'google/old-model',
+            ],
+            modelMetadata: [
+              {
+                id: 'google/old-model',
+                cost: null,
+                context: null,
+                limits: null,
+                free: false,
+                catalogStatus: 'deprecated',
+                raw: { status: 'deprecated' },
+              },
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [{ id: 'google', name: 'Google' }],
+            default: { google: defaultModelId },
+          }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'google',
+                name: 'Google',
+                models: {
+                  'active-model': {},
+                  'alpha-model': { status: 'alpha' },
+                  'beta-model': { status: 'beta' },
+                  'old-model': { status: 'deprecated' },
+                },
+              },
+            ],
+            connected: [],
+            default: { google: defaultModelId },
+          }),
+          getProviderAuth: async () => ({ google: [{ type: 'api' }] }),
+        }),
+      },
+    })
+
+    const activeDefault = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'google',
+    })
+
+    expect(activeDefault.ok).toBe(true)
+    if (!activeDefault.ok) return
+    expect(activeDefault.value.models.map(model => model.modelId)).toEqual([
+      'google/active-model',
+      'google/alpha-model',
+      'google/beta-model',
+    ])
+    expect(activeDefault.value.models.find(model => model.modelId === 'google/alpha-model'))
+      .toMatchObject({ catalogStatus: 'alpha' })
+    expect(activeDefault.value.models.find(model => model.modelId === 'google/beta-model'))
+      .toMatchObject({ catalogStatus: 'beta' })
+
+    defaultModelId = 'old-model'
+    const deprecatedDefault = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'google',
+    })
+
+    expect(deprecatedDefault.ok).toBe(true)
+    if (!deprecatedDefault.ok) return
+    expect(deprecatedDefault.value.models.find(model => model.modelId === 'google/old-model'))
+      .toMatchObject({ catalogStatus: 'deprecated', default: true })
   })
 
   test('loads provider-scoped models reported only by the live provider catalog', async () => {
