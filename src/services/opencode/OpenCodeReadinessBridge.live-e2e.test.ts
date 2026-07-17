@@ -59,6 +59,13 @@ type BridgeResult = {
     requiredToolsPresent?: boolean
     missing?: string[]
     diagnostics?: string[]
+    cleaned?: number
+    remaining?: number
+    hosts?: Array<{
+      pid?: number
+      action?: string
+      reason?: string
+    }>
     teamLaunchState?: string
     stopped?: boolean
     members?: Record<string, {
@@ -882,6 +889,7 @@ describe('OpenCode readiness bridge live e2e', () => {
     const teamName = `local-launch-${process.pid}-${Date.now()}`
     const runId = `run-${teamName}`
     const laneId = 'primary'
+    let cleanupVerified = false
     try {
       await writeFakeLocalOpenCodeConfig({
         projectPath,
@@ -973,8 +981,8 @@ describe('OpenCode readiness bridge live e2e', () => {
       expect(stopResult.ok, stopDiagnosticContext).toBe(true)
       expect(stopResult.data?.stopped, stopDiagnosticContext).toBe(true)
       expect(stopResult.data?.members?.bob?.stopped, stopDiagnosticContext).toBe(true)
-    } finally {
-      await runBridgeCommand({
+
+      const cleanupResult = await runBridgeCommand({
         requestId: `cleanup-local-launch-${process.pid}-${Date.now()}`,
         command: 'opencode.cleanupHosts',
         projectPath,
@@ -984,7 +992,31 @@ describe('OpenCode readiness bridge live e2e', () => {
           leaseStaleAgeMs: 0,
           preflightLeaseStaleAgeMs: 0,
         },
-      }).catch(() => undefined)
+      })
+      const cleanupDiagnosticContext = [
+        cleanupResult.error?.message,
+        cleanupResult.data?.diagnostics?.join('\n'),
+        `cleaned: ${String(cleanupResult.data?.cleaned)}`,
+        `remaining: ${String(cleanupResult.data?.remaining)}`,
+        `hosts: ${JSON.stringify(cleanupResult.data?.hosts ?? [])}`,
+      ].filter(Boolean).join('\n')
+      expect(cleanupResult.ok, cleanupDiagnosticContext).toBe(true)
+      expect(cleanupResult.data?.remaining, cleanupDiagnosticContext).toBe(0)
+      cleanupVerified = true
+    } finally {
+      if (!cleanupVerified) {
+        await runBridgeCommand({
+          requestId: `cleanup-local-launch-fallback-${process.pid}-${Date.now()}`,
+          command: 'opencode.cleanupHosts',
+          projectPath,
+          body: {
+            mode: 'force',
+            staleAgeMs: 0,
+            leaseStaleAgeMs: 0,
+            preflightLeaseStaleAgeMs: 0,
+          },
+        }).catch(() => undefined)
+      }
       await restoreMcpEnv()
       await fakeServer.close().catch(() => undefined)
       await rm(projectPath, { recursive: true, force: true }).catch(() => undefined)

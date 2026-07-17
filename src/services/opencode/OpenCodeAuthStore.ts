@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { withOpenCodeAuthCoordinationLock } from './OpenCodeAuthCoordinationLock.js'
+import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js'
 
@@ -12,11 +13,13 @@ type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 async function withAuthStoreWriteLock<T>(
   filePath: string,
   operation: () => Promise<T>,
+  abortSignal?: AbortSignal,
 ): Promise<T> {
   return withOpenCodeAuthCoordinationLock({
     authPath: filePath,
     operation,
     description: 'OpenCode auth store coordination lock',
+    abortSignal,
   })
 }
 
@@ -35,6 +38,7 @@ export async function withOpenCodeOAuthRefreshLock<T>(input: {
   authPath: string
   providerId: string
   operation: () => Promise<T>
+  abortSignal?: AbortSignal
 }): Promise<T> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -45,6 +49,7 @@ export async function withOpenCodeOAuthRefreshLock<T>(input: {
     authPath: input.authPath,
     operation: input.operation,
     description: `OpenCode ${providerId} OAuth refresh coordination lock`,
+    abortSignal: input.abortSignal,
   })
 }
 
@@ -209,6 +214,7 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
   globalAuthPath: string
   managedAuthPath: string
   peerManagedAuthPaths?: readonly string[]
+  abortSignal?: AbortSignal
 }): Promise<void> {
   await withAuthStoreWriteLock(input.globalAuthPath, async () => {
     const peerManagedAuthPaths = Array.from(new Set([
@@ -219,6 +225,7 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
       Promise.all(input.sourceAuthPaths.map(readOpenCodeAuthStore)),
       Promise.all(peerManagedAuthPaths.map(readOpenCodeAuthStore)),
     ])
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
 
     let expected: OpenCodeAuthStore = {}
     for (const source of sourceStores) {
@@ -248,11 +255,13 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
     for (const providerId of oauthProviderIds) {
       nextGlobalStore[providerId] = expected[providerId]
     }
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     if (JSON.stringify(nextGlobalStore) !== JSON.stringify(globalStore)) {
       await writeOpenCodeAuthStore(input.globalAuthPath, nextGlobalStore)
     }
 
     for (let index = 0; index < peerManagedAuthPaths.length; index += 1) {
+      if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
       const authPath = peerManagedAuthPaths[index]
       const peerStore = peerStores[index]
       const nextPeerStore = authPath === input.managedAuthPath
@@ -268,7 +277,7 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
         await writeOpenCodeAuthStore(authPath, nextPeerStore)
       }
     }
-  })
+  }, input.abortSignal)
 }
 
 export async function fanOutOpenCodeOAuthCredential(input: {

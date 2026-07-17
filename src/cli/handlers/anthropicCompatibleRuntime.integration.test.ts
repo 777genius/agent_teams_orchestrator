@@ -4,6 +4,7 @@ import {
   resetAnthropicRuntimeCatalogCache,
 } from '../../services/runtimeBackends/anthropicCatalog.js'
 import { getUnifiedRuntimeStatusPayload } from '../../services/runtimeBackends/registry.js'
+import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../../utils/anthropicConnectionMode.js'
 import { getProviderModels } from './model.js'
 
 const runtimeGlobal = globalThis as typeof globalThis & {
@@ -84,6 +85,7 @@ async function withAnthropicCompatibleEnv<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   const envKeys = [
+    AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
@@ -103,6 +105,7 @@ async function withAnthropicCompatibleEnv<T>(
 
   process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
   process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+  process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
   process.env.ANTHROPIC_BASE_URL = baseUrl
   process.env.ANTHROPIC_AUTH_TOKEN = 'ollama'
   process.env.ANTHROPIC_API_KEY = ''

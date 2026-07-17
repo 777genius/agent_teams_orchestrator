@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test'
 
 import {
   buildManagedConfig,
@@ -31,6 +31,8 @@ import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
 } from './OpenCodeManagedPaths.js'
+
+setDefaultTimeout(30_000)
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
@@ -266,6 +268,31 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           'glm-5-turbo': {
             reasoning: true,
             tool_call: true,
+          },
+        },
+      },
+    })
+  })
+
+  test('keeps Copilot Free and Student usable when live discovery returns no selectable models', () => {
+    const managedConfig = buildManagedConfig()
+
+    expect(managedConfig.provider).toMatchObject({
+      'github-copilot': {
+        name: 'GitHub Copilot',
+        npm: '@ai-sdk/github-copilot',
+        api: 'https://api.githubcopilot.com',
+        models: {
+          'gpt-4.1': {
+            name: 'GPT-4.1',
+            family: 'gpt',
+            tool_call: true,
+            structured_output: true,
+            limit: {
+              context: 128_000,
+              input: 128_000,
+              output: 16_384,
+            },
           },
         },
       },
@@ -1219,6 +1246,61 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   }, 15_000)
 
+  test('keeps later profile preparation queued when an earlier waiter is aborted', async () => {
+    const manager = new OpenCodeProfileManager() as unknown as {
+      withProfilePreparationLock<T>(
+        profileRootKey: string,
+        operation: () => Promise<T>,
+        abortSignal?: AbortSignal,
+      ): Promise<T>
+    }
+    let markFirstStarted!: () => void
+    let releaseFirst!: () => void
+    const firstStarted = new Promise<void>(resolve => {
+      markFirstStarted = resolve
+    })
+    const firstRelease = new Promise<void>(resolve => {
+      releaseFirst = resolve
+    })
+    let firstActive = false
+    const first = manager.withProfilePreparationLock('abort-queue', async () => {
+      firstActive = true
+      markFirstStarted()
+      try {
+        await firstRelease
+      } finally {
+        firstActive = false
+      }
+    })
+    await firstStarted
+
+    const controller = new AbortController()
+    const timeout = new Error('profile preparation deadline expired')
+    let abortedOperationCalled = false
+    const aborted = manager.withProfilePreparationLock('abort-queue', async () => {
+      abortedOperationCalled = true
+    }, controller.signal)
+    controller.abort(timeout)
+    await expect(aborted).rejects.toBe(timeout)
+
+    let laterOperationCalled = false
+    const later = manager.withProfilePreparationLock('abort-queue', async () => {
+      laterOperationCalled = true
+      expect(firstActive).toBe(false)
+    })
+
+    try {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(abortedOperationCalled).toBe(false)
+      expect(laterOperationCalled).toBe(false)
+    } finally {
+      releaseFirst()
+      await first
+      await later
+    }
+    expect(laterOperationCalled).toBe(true)
+  })
+
   test('handles profile node_modules repair across separate process preparation races', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
     const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
@@ -1247,6 +1329,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       await writeFile(
         scriptPath,
         `const { OpenCodeProfileManager } = await import(${JSON.stringify(profileManagerUrl)});
+const startAt = Number(process.argv[3]);
+while (Date.now() < startAt) {
+  await Bun.sleep(5);
+}
 await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppMcp: false });
 `,
         'utf8',
@@ -1257,9 +1343,11 @@ await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppM
         [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: appCacheHome,
       }
 
-      await Promise.all(
-        Array.from({ length: 8 }, () => runBunScript(scriptPath, [projectPath], childEnv)),
-      )
+      const startAt = String(Date.now() + 750)
+      await Promise.all(Array.from(
+        { length: 12 },
+        () => runBunScript(scriptPath, [projectPath, startAt], childEnv),
+      ))
 
       const repairedStat = await lstat(profileNodeModulesPath)
       const repairedTarget = await readlink(profileNodeModulesPath)

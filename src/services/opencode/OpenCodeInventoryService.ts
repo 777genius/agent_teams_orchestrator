@@ -8,10 +8,10 @@ import { killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { gte } from '../../utils/semver.js'
 import {
-  normalizeOpenCodeProviderId,
   parseFirstOpenCodeModelToken,
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import {
@@ -23,6 +23,11 @@ import {
   openCodeProfileManager,
   repairEmptyOpenCodeManagedPluginCaches,
 } from './OpenCodeProfileManager.js'
+import {
+  raceOpenCodeAbortSignal,
+  throwOpenCodeAbortReason,
+  waitForOpenCodeAbortableDelay,
+} from './OpenCodeRuntimeDeadline.js'
 
 import type {
   OpenCodeAgentMode,
@@ -88,6 +93,43 @@ const OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS = {
     minTimeout: 50,
     maxTimeout: 250,
   },
+}
+const OPEN_CODE_INVENTORY_COMMAND_LOCK_OPTIONS = {
+  stale: OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS * 2,
+  update: 5_000,
+  realpath: false,
+  retries: {
+    retries: 240,
+    minTimeout: 25,
+    maxTimeout: 250,
+  },
+}
+
+type OpenCodeProperLockOptions = NonNullable<Parameters<typeof lockfile.lock>[1]>
+
+async function acquireOpenCodeLock(
+  lockPath: string,
+  options: OpenCodeProperLockOptions,
+  abortSignal?: AbortSignal,
+): Promise<() => Promise<void>> {
+  if (!abortSignal) {
+    return lockfile.lock(lockPath, options)
+  }
+
+  for (;;) {
+    if (abortSignal.aborted) throwOpenCodeAbortReason(abortSignal)
+    try {
+      return await lockfile.lock(lockPath, {
+        ...options,
+        retries: 0,
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ELOCKED') {
+        throw error
+      }
+    }
+    await waitForOpenCodeAbortableDelay(50, abortSignal)
+  }
 }
 
 type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
@@ -173,10 +215,7 @@ type CacheEntry = {
 }
 
 function normalizeProviderId(value: string): string {
-  return (
-    normalizeOpenCodeProviderId(value.replace(/\s+/g, '-')) ??
-    value.trim().toLowerCase().replace(/\s+/g, '-')
-  )
+  return canonicalizeOpenCodeProviderId(value)
 }
 
 function getTrimmedNonEmptyLines(output: string): string[] {
@@ -417,6 +456,7 @@ export async function collectOpenCodeInventoryCommandResults(input: {
 async function withManagedPluginInstallLock<T>(
   profile: OpenCodePreparedProfile,
   callback: () => Promise<T>,
+  abortSignal?: AbortSignal,
 ): Promise<T> {
   const lockPath = path.join(
     profile.xdgCacheHome,
@@ -428,13 +468,40 @@ async function withManagedPluginInstallLock<T>(
 
   let release: (() => Promise<void>) | undefined
   try {
-    release = await lockfile.lock(lockPath, OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS)
+    release = await acquireOpenCodeLock(
+      lockPath,
+      OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS,
+      abortSignal,
+    )
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     await repairEmptyOpenCodeManagedPluginCaches(profile.xdgCacheHome)
     return await callback()
   } finally {
     if (release) {
       await release()
     }
+  }
+}
+
+async function withOpenCodeInventoryCommandLock<T>(
+  profile: OpenCodePreparedProfile,
+  callback: () => Promise<T>,
+  abortSignal?: AbortSignal,
+): Promise<T> {
+  const lockPath = path.join(profile.profileRootPath, 'inventory-command.lock')
+  await mkdir(path.dirname(lockPath), { recursive: true })
+  await writeFile(lockPath, '', { flag: 'a' })
+
+  const release = await acquireOpenCodeLock(
+    lockPath,
+    OPEN_CODE_INVENTORY_COMMAND_LOCK_OPTIONS,
+    abortSignal,
+  )
+  try {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    return await callback()
+  } finally {
+    await release()
   }
 }
 
@@ -471,7 +538,7 @@ export async function prewarmOpenCodeManagedSubscriptionPlugins(input: {
     } finally {
       leaveStep?.()
     }
-  })
+  }, input.abortSignal)
 }
 
 export function isOpenCodeInventoryTimeoutMessage(message: string | null | undefined): boolean {
@@ -905,15 +972,53 @@ export class OpenCodeInventoryService {
     }
 
     const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
-    const profile = await openCodeProfileManager
-      .prepareProfile(resolvedProjectPath, {
+    const profile = await raceOpenCodeAbortSignal(
+      openCodeProfileManager.prepareProfile(resolvedProjectPath, {
+        abortSignal: options.abortSignal,
         includeAppMcp: options.includeAppMcp !== false,
         includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
-      })
+      }),
+      options.abortSignal,
+    )
       .finally(() => {
         leaveProfileStep?.()
       })
+    return withOpenCodeInventoryCommandLock(profile, () =>
+      this.probePreparedProfile({
+        mode,
+        resolvedProjectPath,
+        options,
+        cacheKey,
+        cacheEnabled,
+        binaryPath,
+        profile,
+      }), options.abortSignal,
+    )
+  }
+
+  private async probePreparedProfile(input: {
+    mode: OpenCodeInventoryProbeMode
+    resolvedProjectPath: string
+    options: OpenCodeInventoryProbeOptions
+    cacheKey: string
+    cacheEnabled: boolean
+    binaryPath: string
+    profile: OpenCodePreparedProfile
+  }): Promise<OpenCodeInventorySnapshot> {
+    const {
+      mode,
+      resolvedProjectPath,
+      options,
+      cacheKey,
+      cacheEnabled,
+      binaryPath,
+      profile,
+    } = input
+    const refreshedCached = cacheEnabled ? this.cache.get(cacheKey) : undefined
+    if (refreshedCached && refreshedCached.expiresAt > Date.now()) {
+      return refreshedCached.snapshot
+    }
     const prewarmedModelsResult =
       mode === 'full'
         ? await prewarmOpenCodeManagedSubscriptionPlugins({

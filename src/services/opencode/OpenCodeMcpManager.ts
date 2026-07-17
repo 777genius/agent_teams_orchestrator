@@ -9,6 +9,9 @@ import {
 } from './OpenCodeManagedPaths.js'
 
 import type {
+  OpenCodeClientRequestContext,
+} from './OpenCodeClientFactory.js'
+import type {
   OpenCodeAppMcpLaunchSource,
   OpenCodeAppMcpSummary,
   OpenCodeMcpResponse,
@@ -68,7 +71,7 @@ type OpenCodeMcpClient = {
 
 type OpenCodeMcpManagerDeps = {
   clientFactory?: {
-    create(baseUrl: string): OpenCodeMcpClient
+    create(baseUrl: string, context?: OpenCodeClientRequestContext): OpenCodeMcpClient
   }
   resolveLaunchConfig?: () => Promise<ResolvedAppMcpLaunchConfig>
   pathExists?: (targetPath: string) => Promise<boolean>
@@ -740,7 +743,11 @@ export class OpenCodeMcpManager {
   async ensureAppMcp(params: {
     baseUrl: string
     attachIfMissing?: boolean
+    requestContext?: OpenCodeClientRequestContext
   }): Promise<EnsureAppMcpResult> {
+    if (params.requestContext) {
+      return this.ensureAppMcpOnce(params)
+    }
     const cacheKey = `${params.baseUrl}::${params.attachIfMissing === true ? 'attach' : 'read'}`
     const inFlight = this.ensureAppMcpInFlight.get(cacheKey)
     if (inFlight) {
@@ -759,8 +766,9 @@ export class OpenCodeMcpManager {
   private async ensureAppMcpOnce(params: {
     baseUrl: string
     attachIfMissing?: boolean
+    requestContext?: OpenCodeClientRequestContext
   }): Promise<EnsureAppMcpResult> {
-    const client = this.clientFactory.create(params.baseUrl)
+    const client = this.clientFactory.create(params.baseUrl, params.requestContext)
     const existingMcp = await client.getMcp()
     const existingMatch = getMatchedAppMcpEntry(existingMcp)
 

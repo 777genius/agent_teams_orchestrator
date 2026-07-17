@@ -655,6 +655,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       recommended: true,
     })
     expect(openrouter?.actions.map(action => action.id)).toEqual(['connect'])
+
+    const openCodeZen = result.value.providers.find(provider => provider.providerId === 'opencode')
+    expect(openCodeZen?.displayName).toBe('OpenCode Zen')
   })
 
   test('does not mark Atlas Cloud connected from config-only OpenCode provider state', async () => {
@@ -774,6 +777,82 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(provider?.ownership).toEqual([])
       expect(provider?.actions.some(action => action.id === 'forget')).toBe(false)
     }
+  })
+
+  test('does not report a saved Copilot credential as connected when the live host omits it', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: [
+              {
+                id: 'github-copilot',
+                authHint: 'oauth',
+                source: 'credentials',
+                credentialScopes: ['local'],
+              },
+            ],
+            availableProviders: ['github-copilot'],
+            models: ['github-copilot/gpt-4.1'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              {
+                id: 'github-copilot',
+                name: 'GitHub Copilot',
+                models: { 'gpt-4.1': {} },
+              },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [
+              {
+                id: 'github-copilot',
+                name: 'GitHub Copilot',
+                models: { 'gpt-4.1': {} },
+              },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'github-copilot': [{ type: 'oauth' }],
+          }),
+          getServerDoc: async () => ({
+            paths: {
+              '/auth/{providerID}': { delete: {} },
+              '/provider/{providerID}/oauth/authorize': { post: {} },
+              '/provider/{providerID}/oauth/callback': { post: {} },
+            },
+          }),
+        }),
+      },
+    })
+
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: 'github-copilot',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.entries[0]).toMatchObject({
+      providerId: 'github-copilot',
+      state: 'available',
+      connectedAuthHint: null,
+      setupKind: 'connect-oauth',
+      ownership: [],
+    })
+    expect(result.value.entries[0]?.actions.map(action => action.id)).toContain('connect')
+    expect(result.value.entries[0]?.actions.map(action => action.id)).not.toContain('forget')
   })
 
   test('reports saved SuperGrok OAuth as unusable when OpenCode is too old', async () => {
@@ -2191,7 +2270,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       credential: Record<string, unknown>
     }> = []
     const removedCredentials: Array<{ authPath: string; providerId: string }> = []
-    let oauthCompleted = false
+    let storedCredential: typeof previousCredential | typeof replacementCredential | null =
+      previousCredential
     let deleteProviderAuthCalled = false
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -2230,23 +2310,25 @@ describe('OpenCodeProviderManagementAdapter', () => {
             instructions: 'Complete authorization in your browser.',
           }),
           completeProviderOAuth: async () => {
-            oauthCompleted = true
+            storedCredential = replacementCredential
             return true
           },
           deleteProviderAuth: async () => {
             deleteProviderAuthCalled = true
+            storedCredential = null
             return true
           },
         }),
       },
       authStore: {
-        readCredential: async () =>
-          oauthCompleted ? replacementCredential : previousCredential,
+        readCredential: async () => storedCredential,
         upsertCredential: async input => {
           credentialWrites.push(input)
+          storedCredential = input.credential as typeof previousCredential
         },
         removeCredential: async input => {
           removedCredentials.push(input)
+          storedCredential = null
         },
       },
       profileManager: {
@@ -2270,7 +2352,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const failure = expectFailure(result)
     expect(failure.code).toBe('auth-failed')
     expect(deleteProviderAuthCalled).toBe(true)
-    expect(removedCredentials).toEqual([])
+    expect(removedCredentials.map(write => write.authPath).sort()).toEqual(
+      [
+        '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        '/tmp/other-profile/data/opencode/auth.json',
+        '/tmp/profile/data/opencode/auth.json',
+      ].sort(),
+    )
     const restoredWrites = credentialWrites.filter(
       write => write.credential.access === previousCredential.access,
     )
@@ -2420,6 +2508,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       access: 'stale-copilot-access',
       refresh: 'stale-copilot-refresh',
     }
+    let storedCredential: typeof previousCredential | null = previousCredential
     const restoredCredentials: Array<{
       authPath: string
       providerId: string
@@ -2464,16 +2553,21 @@ describe('OpenCodeProviderManagementAdapter', () => {
             instructions: 'Complete authorization in your browser.',
           }),
           completeProviderOAuth: async () => true,
-          deleteProviderAuth: async () => true,
+          deleteProviderAuth: async () => {
+            storedCredential = null
+            return true
+          },
         }),
       },
       authStore: {
-        readCredential: async () => previousCredential,
+        readCredential: async () => storedCredential,
         upsertCredential: async input => {
           restoredCredentials.push(input)
+          storedCredential = input.credential as typeof previousCredential
         },
         removeCredential: async input => {
           removedCredentials.push(input)
+          storedCredential = null
         },
       },
       profileManager: {
@@ -2504,13 +2598,125 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(failure.code).toBe('auth-failed')
     expect(failure.message).toContain('did not persist a new OAuth credential')
     expect(executionProbeCalled).toBe(false)
-    expect(removedCredentials).toEqual([])
+    expect(removedCredentials.map(write => write.authPath).sort()).toEqual(
+      [
+        '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
+        '/tmp/profile/data/opencode/auth.json',
+      ].sort(),
+    )
     expect(restoredCredentials.map(write => write.authPath).sort()).toEqual(
       [
         '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
         '/tmp/profile/data/opencode/auth.json',
       ].sort(),
     )
+  })
+
+  test('accepts an equivalent Copilot token only after transactional reconnect clears it first', async () => {
+    const credential = {
+      type: 'oauth' as const,
+      access: 'reused-copilot-access',
+      refresh: 'reused-copilot-refresh',
+    }
+    let storedCredential: typeof credential | null = credential
+    let connected = true
+    let deleteCalls = 0
+    let executionProbeCalled = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: connected
+              ? [
+                  {
+                    id: 'github-copilot',
+                    authHint: 'oauth',
+                    source: 'credentials',
+                    credentialScopes: ['managed'],
+                  },
+                ]
+              : [],
+            availableProviders: ['github-copilot'],
+            models: ['github-copilot/gpt-4.1'],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'github-copilot', name: 'GitHub Copilot' }],
+            connected: connected ? ['github-copilot'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'github-copilot': [{ type: 'oauth', label: 'Sign in with GitHub' }],
+          }),
+          getServerDoc: async () => ({
+            paths: {
+              '/auth/{providerID}': { delete: {} },
+              '/provider/{providerID}/oauth/authorize': { post: {} },
+              '/provider/{providerID}/oauth/callback': { post: {} },
+            },
+          }),
+          authorizeProviderOAuth: async () => ({
+            url: 'https://github.com/login/device',
+            method: 'auto',
+            instructions: 'Complete authorization in your browser.',
+          }),
+          completeProviderOAuth: async () => {
+            storedCredential = credential
+            connected = true
+            return true
+          },
+          deleteProviderAuth: async () => {
+            deleteCalls += 1
+            storedCredential = null
+            connected = false
+            return true
+          },
+        }),
+      },
+      authStore: {
+        readCredential: async () => storedCredential,
+        upsertCredential: async input => {
+          storedCredential = input.credential
+        },
+        removeCredential: async () => {
+          storedCredential = null
+        },
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+      },
+      executionProbe: {
+        probeModel: async input => {
+          executionProbeCalled = true
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+    })
+
+    const result = await adapter.connectProvider(
+      {
+        runtimeId: 'opencode',
+        providerId: 'github-copilot',
+        method: 'oauth',
+        authMethodIndex: 0,
+        authOptionId: 'oauth:0',
+        oauthOperationId: 'copilot-equivalent-token-test',
+        metadata: {},
+      },
+      { authorizationReady: async () => undefined },
+    )
+
+    expect(result.ok).toBe(true)
+    expect(deleteCalls).toBe(1)
+    expect(executionProbeCalled).toBe(true)
+    expect(storedCredential).toEqual(credential)
   })
 
   test('passes a future provider authorization code through the generic OAuth callback contract', async () => {
@@ -2698,6 +2904,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
       method: 'api',
       supported: true,
       source: 'curated',
+      verification: {
+        kind: 'model-request',
+        freeModelPreferred: true,
+        mayUseQuotaOrBalance: true,
+      },
       secret: {
         label: 'Token Plan subscription key',
         placeholder: 'sk-cp-...',
@@ -3313,7 +3524,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
               {
                 id: 'openrouter',
                 name: 'OpenRouter',
-                models: { 'moonshotai/kimi-k2': {} },
+                models: {
+                  'moonshotai/kimi-k2': {},
+                  'openrouter/free': {},
+                },
               },
             ],
             default: {},
@@ -3352,13 +3566,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toEqual([{ providerId: 'openrouter', key: 'sk-test-secret' }])
     expect(modelProbes).toEqual([
-      { selectedModel: 'openrouter/moonshotai/kimi-k2', outputTokens: undefined },
+      { selectedModel: 'openrouter/openrouter/free', outputTokens: undefined },
     ])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       ownership: ['managed'],
-      verifiedModelId: 'openrouter/moonshotai/kimi-k2',
+      verifiedModelId: 'openrouter/openrouter/free',
     })
   })
 
@@ -3995,6 +4209,20 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test.each([
     {
+      providerId: 'openrouter',
+      displayName: 'OpenRouter',
+      apiKey: 'sk-or-test-key',
+      modelId: 'openrouter/openrouter/free',
+      providerDefaultModelId: 'moonshotai/kimi-k2',
+    },
+    {
+      providerId: 'opencode',
+      displayName: 'OpenCode',
+      apiKey: 'opencode-test-key',
+      modelId: 'opencode/big-pickle',
+      providerDefaultModelId: 'gpt-5.4-mini',
+    },
+    {
       providerId: 'zai-coding-plan',
       displayName: 'Z.AI Coding Plan',
       apiKey: 'zai-coding-plan-test-key',
@@ -4131,6 +4359,18 @@ describe('OpenCodeProviderManagementAdapter', () => {
   )
 
   test.each([
+    {
+      providerId: 'openrouter',
+      displayName: 'OpenRouter',
+      replacementKey: 'sk-or-replacement-key',
+      modelId: 'openrouter/openrouter/free',
+    },
+    {
+      providerId: 'opencode',
+      displayName: 'OpenCode',
+      replacementKey: 'opencode-replacement-key',
+      modelId: 'opencode/big-pickle',
+    },
     {
       providerId: 'zai-coding-plan',
       displayName: 'Z.AI Coding Plan',
@@ -4380,6 +4620,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       apiKey: string
     }> = []
     const probeCalls: Array<{ bypassCache: boolean | undefined }> = []
+    const modelProbes: string[] = []
     let authApplied = false
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -4433,7 +4674,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         removeCredential: async () => {},
       },
       executionProbe: {
-        probeModel: async input => executionProbeResult(input.selectedModel),
+        probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          return executionProbeResult(input.selectedModel)
+        },
       },
     })
 
@@ -4458,11 +4702,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     ])
     expect(probeCalls).toEqual([{ bypassCache: undefined }, { bypassCache: true }])
+    expect(modelProbes).toEqual(['openrouter/moonshotai/kimi-k2:free'])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       modelCount: 1,
       ownership: ['managed'],
+      verifiedModelId: 'openrouter/moonshotai/kimi-k2:free',
     })
   })
 
@@ -4475,6 +4721,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const removedCredentials: Array<{ authPath: string; providerId: string }> = []
     let probeCallCount = 0
     let authApplied = false
+    const modelProbes: string[] = []
     const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
@@ -4525,7 +4772,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       executionProbe: {
-        probeModel: async input => executionProbeResult(input.selectedModel),
+        probeModel: async input => {
+          modelProbes.push(input.selectedModel)
+          return executionProbeResult(input.selectedModel)
+        },
       },
     })
 
@@ -4539,10 +4789,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(authWrites).toHaveLength(2)
     expect(removedCredentials).toEqual([])
+    expect(modelProbes).toEqual(['openrouter/moonshotai/kimi-k2:free'])
     expect(result.value).toMatchObject({
       providerId: 'openrouter',
       state: 'connected',
       ownership: ['managed'],
+      verifiedModelId: 'openrouter/moonshotai/kimi-k2:free',
     })
   })
 

@@ -38,6 +38,10 @@ import {
   getOAuthTokenFromFileDescriptor,
 } from './authFileDescriptor.js'
 import {
+  getAnthropicConnectionMode,
+  hasAppManagedAnthropicApiKeyHelper,
+} from './anthropicConnectionMode.js'
+import {
   maybeRemoveApiKeyFromMacOSKeychainThrows,
   normalizeApiKeyForConfig,
 } from './authPortable.js'
@@ -98,7 +102,20 @@ const DEFAULT_API_KEY_HELPER_TTL = 5 * 60 * 1000
 function isManagedOAuthContext(): boolean {
   return (
     isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) ||
-    process.env.CLAUDE_CODE_ENTRYPOINT === 'claude-desktop'
+    process.env.CLAUDE_CODE_ENTRYPOINT === 'claude-desktop' ||
+    (isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase() ===
+        'anthropic' &&
+      getAnthropicConnectionMode() === 'subscription')
+  )
+}
+
+function isHostManagedAnthropicApiKeyContext(): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase() ===
+      'anthropic' &&
+    getAnthropicConnectionMode() === 'api_key'
   )
 }
 
@@ -164,6 +181,16 @@ export function getAuthTokenSource() {
   // bearer-token-shaped source allowed. OAuth env vars, FD tokens, and
   // keychain are ignored.
   if (isBareMode()) {
+    if (getConfiguredApiKeyHelper()) {
+      return { source: 'apiKeyHelper' as const, hasToken: true }
+    }
+    return { source: 'none' as const, hasToken: false }
+  }
+
+  // In explicit host-managed API-key mode, only the desktop's marked helper is
+  // eligible. Ambient OAuth and user/project apiKeyHelper settings must not
+  // compete with the UI-selected credential.
+  if (isHostManagedAnthropicApiKeyContext()) {
     if (getConfiguredApiKeyHelper()) {
       return { source: 'apiKeyHelper' as const, hasToken: true }
     }
@@ -270,6 +297,21 @@ export function getAnthropicApiKeyWithSource(
     }
   }
 
+  // App-managed helper auth is fully specified by the host marker and flag
+  // settings. Resolve it before the generic CI/test branch so desktop-managed
+  // test and automation runtimes do not require a duplicate raw API-key env.
+  if (
+    isHostManagedAnthropicApiKeyContext() &&
+    getConfiguredApiKeyHelper()
+  ) {
+    return {
+      key: opts.skipRetrievingKeyFromApiKeyHelper
+        ? null
+        : getApiKeyFromApiKeyHelperCached(),
+      source: 'apiKeyHelper',
+    }
+  }
+
   // Always check for direct environment variable when the user ran claude --print.
   // This is useful for CI, etc.
   if (preferThirdPartyAuthentication() && apiKeyEnv) {
@@ -372,6 +414,11 @@ export function getAnthropicApiKeyWithSource(
 export function getConfiguredApiKeyHelper(): string | undefined {
   if (isBareMode()) {
     return getSettingsForSource('flagSettings')?.apiKeyHelper
+  }
+  if (isHostManagedAnthropicApiKeyContext()) {
+    return hasAppManagedAnthropicApiKeyHelper()
+      ? getSettingsForSource('flagSettings')?.apiKeyHelper
+      : undefined
   }
   const mergedSettings = getSettings_DEPRECATED() || {}
   return mergedSettings.apiKeyHelper

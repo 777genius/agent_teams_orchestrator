@@ -36,6 +36,11 @@ import {
   buildOpenCodeModelRouteMetadata,
   hasOpenCodeConfiguredAuthlessModel,
 } from '../opencode/OpenCodeModelAccessPolicy.js'
+import {
+  evaluateOpenCodeAgentModelCompatibility,
+  filterOpenCodeAgentModels,
+  getOpenCodeModelInputModalities,
+} from '../opencode/OpenCodeAgentModelCompatibility.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
@@ -606,6 +611,7 @@ async function buildOpenCodeStatus(
     },
   )
   const runtimeModels = snapshot.models
+  const agentModels = filterOpenCodeAgentModels(runtimeModels, snapshot.modelMetadata)
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
   const hasBuiltinFreeModel = hasOpenCodeBuiltinFreeModel(
     snapshot.models,
@@ -620,8 +626,8 @@ async function buildOpenCodeStatus(
     hasConnectedProvider || hasBuiltinFreeModel || hasConfiguredAuthlessModel
   const fetchedAt = new Date()
   const defaultModel =
-    runtimeModels.find((model) => model === 'opencode/big-pickle') ??
-    runtimeModels[0] ??
+    agentModels.find((model) => model === 'opencode/big-pickle') ??
+    agentModels[0] ??
     null
   const metadataByModelId = new Map(
     snapshot.modelMetadata?.map((metadata) => [metadata.id, metadata]) ?? [],
@@ -637,6 +643,7 @@ async function buildOpenCodeStatus(
     defaultLaunchModel: defaultModel,
     models: runtimeModels.map((model) => {
       const metadata = metadataByModelId.get(model) ?? null
+      const agentCompatibility = evaluateOpenCodeAgentModelCompatibility(model, metadata)
       const opencodeMetadata = buildOpenCodeModelRouteMetadata({
         selectedModel: model,
         catalog: accessCatalog,
@@ -645,10 +652,10 @@ async function buildOpenCodeStatus(
         id: model,
         launchModel: model,
         displayName: model,
-        hidden: false,
+        hidden: !agentCompatibility.compatible,
         supportedReasoningEfforts: [],
         defaultReasoningEffort: null,
-        inputModalities: ['text'],
+        inputModalities: getOpenCodeModelInputModalities(metadata),
         supportsPersonality: true,
         isDefault: model === defaultModel,
         upgrade: false,
@@ -656,7 +663,7 @@ async function buildOpenCodeStatus(
         badgeLabel: isOpenCodeModelFree(model, snapshot.modelMetadata)
           ? 'Free'
           : null,
-        statusMessage: null,
+        statusMessage: agentCompatibility.reason,
         metadata: metadata
           ? {
               cost: metadata.cost,
@@ -746,7 +753,7 @@ async function buildOpenCodeStatus(
         detailMessage: snapshot.binaryPath,
       },
     ],
-    models: runtimeModels,
+    models: agentModels,
     runtimeCapabilities: {
       modelCatalog: {
         dynamic: true,

@@ -15,6 +15,7 @@ import {
 } from './model.js';
 import { getAPIProvider } from './providers.js';
 import { getFastModeModel, isFastModeSupportedByModel } from '../fastMode.js';
+import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../anthropicConnectionMode.js';
 import { CODEX_MODELS, DEFAULT_CODEX_MODEL, isCodexModel } from './codex.js';
 
 function createCodexCapabilities(
@@ -73,6 +74,7 @@ afterEach(() => {
   delete process.env.ANTHROPIC_AWS_WORKSPACE_ID;
   delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   delete process.env.CLAUDE_CODE_ENTRY_PROVIDER;
+  delete process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV];
 });
 
 describe('model access fallback with agent_teams capabilities', () => {
@@ -84,6 +86,18 @@ describe('model access fallback with agent_teams capabilities', () => {
     expect(getAPIProvider()).toBe('bedrock');
     expect(getDefaultOpusModel()).toContain('opus-4-7');
   });
+
+  it.each(['api_key', 'subscription', 'compatible'] as const)(
+    'keeps explicit Anthropic %s mode on first-party provider despite Bedrock flags',
+    (connectionMode) => {
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic';
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = connectionMode;
+      process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+
+      expect(getAPIProvider()).toBe('firstParty');
+    },
+  );
 
   it('keeps Claude Platform on AWS as launch metadata without adding a new API provider', () => {
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';

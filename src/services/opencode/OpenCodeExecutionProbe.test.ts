@@ -15,9 +15,14 @@ import {
   readOpenCodeAuthCredential,
   upsertOpenCodeAuthCredential,
 } from './OpenCodeAuthStore.js'
+import {
+  OpenCodeRuntimeDeadline,
+  OpenCodeRuntimeDeadlineError,
+} from './OpenCodeRuntimeDeadline.js'
 
 import type {
   OpenCodeHostHandle,
+  OpenCodeMessage,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
 } from './types.js'
@@ -70,17 +75,6 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
 })
 
 describe('OpenCodeExecutionProbe', () => {
-  test.each([
-    'Invalid API key.',
-    'API key not valid. Please pass a valid API key.',
-    'API key is revoked',
-  ])('classifies provider auth failure %s as not authenticated', message => {
-    expect(classifyProbeFailure({ message })).toEqual({
-      outcome: 'not_authenticated',
-      reason: message,
-    })
-  })
-
   test('classifies retired Google models as unavailable for the current account', () => {
     const message =
       'This model models/gemini-2.5-flash-lite is no longer available to new users.'
@@ -206,6 +200,121 @@ describe('OpenCodeExecutionProbe', () => {
       },
       hostLifetime: 'process',
     })
+  })
+
+  test('fails fast and aborts when prompt_async never materializes a prompt', async () => {
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-empty' }),
+          getSession: async () => ({ id: 'session-empty' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getSessionMessage: async () => null,
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+      promptStartTimeoutMs: 1,
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'ollama/gemma4:12b',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      failureCode: 'prompt_start_failed',
+    })
+    expect(result.reason).toContain('did not create a user message or enter a running state')
+    expect(abortCount).toBeGreaterThanOrEqual(1)
+  })
+
+  test('bounds session cleanup when the abort request ignores cancellation', async () => {
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-cleanup-timeout' }),
+          getSession: async () => ({ id: 'session-cleanup-timeout' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getSessionMessage: async () => null,
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return new Promise<boolean>(() => {})
+          },
+        }),
+      },
+      promptStartTimeoutMs: 1,
+      sessionCleanupTimeoutMs: 10,
+    })
+
+    const result = probe.probeModel({
+      selectedModel: 'ollama/gemma4:12b',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+    const testGuard = new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('session cleanup did not settle')),
+        500,
+      )
+      timer.unref?.()
+    })
+
+    await expect(Promise.race([result, testGuard])).resolves.toMatchObject({
+      outcome: 'unknown',
+      failureCode: 'prompt_start_failed',
+    })
+    expect(abortCount).toBe(1)
   })
 
   test('fans out a potentially rotated xAI OAuth credential after a real model probe', async () => {
@@ -861,7 +970,12 @@ describe('OpenCodeExecutionProbe', () => {
     expect(releaseHostCount).toBe(0)
   })
 
-  test('marks model auth as invalid when OpenCode returns a token refresh failure', async () => {
+  test.each([
+    'Token refresh failed: 401',
+    'Invalid API key.',
+    'API key not valid. Please pass a valid API key.',
+    'API key is revoked',
+  ])('marks model auth as invalid when OpenCode returns %s', async authFailure => {
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -900,7 +1014,7 @@ describe('OpenCodeExecutionProbe', () => {
                 error: {
                   name: 'UnknownError',
                   data: {
-                    message: 'Token refresh failed: 401',
+                    message: authFailure,
                   },
                 },
               },
@@ -921,7 +1035,7 @@ describe('OpenCodeExecutionProbe', () => {
     })
 
     expect(result.outcome).toBe('not_authenticated')
-    expect(result.reason).toContain('Token refresh failed: 401')
+    expect(result.reason).toContain(authFailure)
     expect(result.durableState).toBe('error')
   })
 
@@ -1376,5 +1490,145 @@ describe('OpenCodeExecutionProbe', () => {
 
     expect(result.outcome).toBe('unknown')
     expect(result.reason).toBe('Model verification timed out')
+  })
+
+  test('uses the shared runtime deadline instead of the legacy local poll cap', async () => {
+    let statusCallCount = 0
+    let messageCallCount = 0
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(200)
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 1,
+      pollIntervalMs: 2,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-runtime-deadline' }),
+          getSession: async () => ({ id: 'session-runtime-deadline' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return {
+              'session-runtime-deadline': statusCallCount < 3 ? 'busy' : 'idle',
+            }
+          },
+          getSessionMessages: async () => {
+            messageCallCount += 1
+            const messages: OpenCodeMessage[] = [{
+              info: {
+                id: 'msg-user-runtime-deadline',
+                role: 'user',
+                sessionID: 'session-runtime-deadline',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            }]
+            if (messageCallCount >= 3) {
+              messages.push({
+                info: {
+                  id: 'msg-assistant-runtime-deadline',
+                  role: 'assistant',
+                  parentID: 'msg-user-runtime-deadline',
+                  sessionID: 'session-runtime-deadline',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              })
+            }
+            return messages
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    try {
+      const result = await probe.probeModel({
+        selectedModel: 'ollama/gemma4:12b',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+        runtimeDeadline,
+      })
+
+      expect(result.outcome).toBe('available')
+      expect(messageCallCount).toBeGreaterThanOrEqual(3)
+    } finally {
+      runtimeDeadline.dispose()
+    }
+  })
+
+  test('returns the runtime deadline when host startup ignores cancellation', async () => {
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(10)
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => new Promise<OpenCodeHostHandle>(() => {}),
+        releaseHost: async () => {},
+      },
+      hostStartupCleanupTimeoutMs: 10,
+    })
+
+    try {
+      const result = probe.probeModel({
+        selectedModel: 'ollama/gemma4:12b',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+        runtimeDeadline,
+      })
+      const testGuard = new Promise<never>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('host startup deadline did not settle')),
+          500,
+        )
+        timer.unref?.()
+      })
+
+      await expect(Promise.race([result, testGuard])).rejects.toBeInstanceOf(
+        OpenCodeRuntimeDeadlineError,
+      )
+    } finally {
+      runtimeDeadline.dispose()
+    }
+  })
+
+  test('releases a host that finishes startup after the runtime deadline', async () => {
+    let resolveHost: ((value: OpenCodeHostHandle) => void) | null = null
+    let releaseHostCount = 0
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(10)
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => new Promise<OpenCodeHostHandle>(resolve => {
+          resolveHost = resolve
+        }),
+        releaseHost: async () => {
+          releaseHostCount += 1
+        },
+      },
+      hostStartupCleanupTimeoutMs: 250,
+    })
+
+    try {
+      const result = probe.probeModel({
+        selectedModel: 'ollama/gemma4:12b',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+        runtimeDeadline,
+      })
+      setTimeout(() => resolveHost?.(host), 25)
+
+      await expect(result).rejects.toBeInstanceOf(OpenCodeRuntimeDeadlineError)
+      expect(releaseHostCount).toBe(1)
+    } finally {
+      runtimeDeadline.dispose()
+    }
   })
 })

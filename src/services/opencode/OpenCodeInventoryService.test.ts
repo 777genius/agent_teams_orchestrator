@@ -428,6 +428,12 @@ describe('OpenCodeInventoryService parsers', () => {
 │
 ●  Cloudflare Workers AI
 │
+●  MiniMax Token Plan (minimax.io) api
+│
+●  Xiaomi Token Plan (Singapore) api
+│
+●  Z.AI Coding Plan api
+│
 └  1 credentials
 
 ┌  Environment
@@ -454,6 +460,21 @@ describe('OpenCodeInventoryService parsers', () => {
       {
         id: 'cloudflare-workers-ai',
         authHint: null,
+        source: 'credentials',
+      },
+      {
+        id: 'minimax-coding-plan',
+        authHint: 'api',
+        source: 'credentials',
+      },
+      {
+        id: 'xiaomi-token-plan-sgp',
+        authHint: 'api',
+        source: 'credentials',
+      },
+      {
+        id: 'zai-coding-plan',
+        authHint: 'api',
         source: 'credentials',
       },
       {

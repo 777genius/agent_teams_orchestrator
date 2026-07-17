@@ -1,3 +1,8 @@
+import {
+  AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+  type AnthropicConnectionMode,
+} from './anthropicConnectionMode.js'
+
 /**
  * Environment variables that control inference routing: which provider to use,
  * which endpoint to hit, and which model IDs to send.
@@ -12,6 +17,7 @@
  * config vars (endpoint, project, region, auth) do.
  */
 const PROVIDER_MANAGED_ENV_VARS = new Set([
+  AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
   // The flag itself — settings can't unset it once the host set it
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
   // Provider selection
@@ -41,6 +47,7 @@ const PROVIDER_MANAGED_ENV_VARS = new Set([
   // Auth
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'ANTHROPIC_AWS_API_KEY',
   'AWS_BEARER_TOKEN_BEDROCK',
@@ -98,8 +105,13 @@ const ANTHROPIC_MODEL_ENV_VARS = new Set([
 const ANTHROPIC_FIRST_PARTY_ENV_VARS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
+])
+
+const ANTHROPIC_COMPATIBLE_SETTINGS_ENV_VARS = new Set([
+  'ANTHROPIC_CUSTOM_HEADERS',
 ])
 
 const BEDROCK_ENV_VARS = new Set([
@@ -161,13 +173,20 @@ function isAnthropicBackendEnvVar(upper: string): boolean {
 export function isAllowedHostManagedProviderSettingsEnvVar(
   key: string,
   entryProvider: string | null | undefined,
+  anthropicConnectionMode: AnthropicConnectionMode = 'auto',
 ): boolean {
   const upper = key.toUpperCase()
   const normalizedEntryProvider = entryProvider?.trim().toLowerCase()
 
   switch (normalizedEntryProvider) {
     case 'anthropic':
-      return isAnthropicBackendEnvVar(upper)
+      if (anthropicConnectionMode === 'auto') {
+        return isAnthropicBackendEnvVar(upper)
+      }
+      return (
+        anthropicConnectionMode === 'compatible' &&
+        ANTHROPIC_COMPATIBLE_SETTINGS_ENV_VARS.has(upper)
+      )
     case 'bedrock':
       return BEDROCK_ENV_VARS.has(upper) || isAnthropicModelEnvVar(upper)
     case 'claude-platform-aws':

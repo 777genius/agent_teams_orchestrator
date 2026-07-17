@@ -8,7 +8,13 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
+import {
+  buildOpenCodeExecutionProof,
+  parseOpenCodeExecutionProof,
+  validateOpenCodeExecutionProof,
+} from './OpenCodeExecutionProof.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
   type OpenCodeBridgeCommandEvidence,
   validateOpenCodeBridgeStateChangingPreconditions,
@@ -31,7 +37,15 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeRuntimeDeadlineError,
+  OpenCodeRuntimeDeadline,
+  raceOpenCodeAbortSignal,
+  type OpenCodePhaseContext,
+  throwOpenCodeAbortReason,
+} from './OpenCodeRuntimeDeadline.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
@@ -66,6 +80,7 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
   OpenCodeMessage,
+  OpenCodeExecutionProof,
   OpenCodePendingPermission,
   OpenCodeProvisioningSnapshot,
   OpenCodeNormalizedPermission,
@@ -873,7 +888,7 @@ function createRuntimeSnapshot(snapshot?: OpenCodeProvisioningSnapshot | null) {
   const capabilitySnapshotId = snapshot
     ? `opencode:${hashStable({
       version: snapshot.host?.version ?? null,
-      projectPath: snapshot.projectPath,
+      projectPath: normalizeOpenCodeProjectIdentity(snapshot.projectPath),
       // Keep the launch-gate snapshot stable across equivalent host restarts.
       // The live resolved fingerprint may include ephemeral host-specific MCP payloads,
       // so use stable project + managed-config identity here instead.
@@ -1042,8 +1057,7 @@ function shouldContinueMessageSendToolErrorFallbackGrace(
   if (!observation) return false
   if (isMessageSendToolErrorObservation(observation)) return true
   return observation.state === 'pending' ||
-    observation.state === 'empty_assistant_turn' ||
-    observation.state === 'prompt_delivered_no_assistant_message'
+    observation.state === 'empty_assistant_turn'
 }
 
 function messageSendToolErrorFallbackGraceMs(): number {
@@ -1151,6 +1165,7 @@ function failure(
   startedAtMs: number,
   retryable: boolean,
   diagnostics: BridgeDiagnosticEvent[] = [],
+  details?: Record<string, unknown>,
 ) {
   return {
     ok: false,
@@ -1163,6 +1178,7 @@ function failure(
       kind,
       message,
       retryable,
+      ...(details ? { details } : {}),
     },
     diagnostics,
   }
@@ -1187,13 +1203,18 @@ function validateEnvelope(input: unknown): BridgeEnvelope {
   if (!requestId || !cwd || !startedAt || !body) {
     throw new Error('Bridge envelope missing requestId, cwd, startedAt or body')
   }
+  if (typeof envelope.timeoutMs === 'number' && !Number.isFinite(envelope.timeoutMs)) {
+    throw new Error('Bridge envelope timeoutMs must be finite')
+  }
   return {
     schemaVersion: BRIDGE_SCHEMA_VERSION,
     requestId,
     command: command as BridgeCommandName,
     cwd,
     startedAt,
-    timeoutMs: typeof envelope.timeoutMs === 'number' ? envelope.timeoutMs : 0,
+    timeoutMs: typeof envelope.timeoutMs === 'number' && envelope.timeoutMs > 0
+      ? envelope.timeoutMs
+      : 0,
     body,
   }
 }
@@ -1433,6 +1454,7 @@ async function writePersistedAppMcpToolProof(
 
 async function proveAppMcpTools(
   snapshot: OpenCodeProvisioningSnapshot,
+  phaseContext?: OpenCodePhaseContext,
 ): Promise<AppMcpToolProof> {
   if (!snapshot.host) {
     return {
@@ -1444,10 +1466,12 @@ async function proveAppMcpTools(
     }
   }
 
-  return proveAppMcpToolsFromLaunchConfig()
+  return proveAppMcpToolsFromLaunchConfig(phaseContext)
 }
 
-async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
+async function proveAppMcpToolsFromLaunchConfig(
+  phaseContext?: OpenCodePhaseContext,
+): Promise<AppMcpToolProof> {
   const launchConfig = await resolveOpenCodeAppMcpLaunchConfig()
   const cacheKey = await createAppMcpToolProofCacheKey(launchConfig)
   const cached = appMcpToolProofCache.get(cacheKey)
@@ -1466,12 +1490,16 @@ async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
 
   const inFlight = appMcpToolProofInFlight.get(cacheKey)
   if (inFlight) {
-    return inFlight
+    return raceOpenCodeAbortSignal(inFlight, phaseContext?.signal)
   }
 
-  const proofPromise = (async () => {
+  let proofPromise: Promise<AppMcpToolProof>
+  proofPromise = (async () => {
     try {
-      const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig)
+      const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(
+        launchConfig,
+        phaseContext,
+      )
       const proof = matchAppMcpTools(observedTools, 'mcp:tools/list')
       if (proof.ok) {
         appMcpToolProofCache.set(cacheKey, {
@@ -1482,6 +1510,9 @@ async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
       }
       return proof
     } catch (error) {
+      if (phaseContext?.signal.aborted) {
+        throwOpenCodeAbortReason(phaseContext.signal)
+      }
       return {
         ok: false,
         observedTools: [],
@@ -1493,7 +1524,9 @@ async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
         route: 'mcp:tools/list',
       }
     } finally {
-      appMcpToolProofInFlight.delete(cacheKey)
+      if (appMcpToolProofInFlight.get(cacheKey) === proofPromise) {
+        appMcpToolProofInFlight.delete(cacheKey)
+      }
     }
   })()
 
@@ -1503,8 +1536,12 @@ async function proveAppMcpToolsFromLaunchConfig(): Promise<AppMcpToolProof> {
 
 async function listAppMcpToolsFromResolvedLaunchConfig(
   launchConfig: ResolvedAppMcpLaunchConfig,
+  phaseContext?: OpenCodePhaseContext,
 ): Promise<string[]> {
-  const preflightTimeoutMs = appMcpPreflightTimeoutMs(launchConfig)
+  const preflightTimeoutMs = Math.min(
+    appMcpPreflightTimeoutMs(launchConfig),
+    phaseContext?.remainingMs() ?? Number.POSITIVE_INFINITY,
+  )
   const remoteUrl = launchConfig.config.url
   if (launchConfig.config.type === 'remote' || remoteUrl) {
     if (!remoteUrl) {
@@ -1532,12 +1569,13 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
       })
       const transport = createTransport()
       try {
-        await withTimeout(client.connect(transport), preflightTimeoutMs)
-        const result = await withTimeout(client.listTools(), preflightTimeoutMs)
+        await withTimeout(client.connect(transport), preflightTimeoutMs, phaseContext?.signal)
+        const result = await withTimeout(client.listTools(), preflightTimeoutMs, phaseContext?.signal)
         return (result.tools ?? [])
           .map(tool => tool.name)
           .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
       } catch (error) {
+        if (phaseContext?.signal.aborted) throwOpenCodeAbortReason(phaseContext.signal)
         lastError = error
       } finally {
         await closeMcpClient(client)
@@ -1570,19 +1608,20 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
     stderr: 'pipe',
   })
   let stderr = ''
-  const stderrStream = transport.stderr as NodeJS.ReadableStream | null
+  const stderrStream = transport.stderr as unknown as NodeJS.ReadableStream | null
   stderrStream?.setEncoding('utf8')
   stderrStream?.on('data', chunk => {
     stderr += String(chunk)
   })
 
   try {
-    await withTimeout(client.connect(transport), preflightTimeoutMs)
-    const result = await withTimeout(client.listTools(), preflightTimeoutMs)
+    await withTimeout(client.connect(transport), preflightTimeoutMs, phaseContext?.signal)
+    const result = await withTimeout(client.listTools(), preflightTimeoutMs, phaseContext?.signal)
     return (result.tools ?? [])
       .map(tool => tool.name)
       .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
   } catch (error) {
+    if (phaseContext?.signal.aborted) throwOpenCodeAbortReason(phaseContext.signal)
     const detail = stderr.trim()
     if (detail) {
       const message = error instanceof Error ? error.message : String(error)
@@ -1612,16 +1651,39 @@ async function closeMcpClient(client: Client): Promise<void> {
   await withTimeout(client.close(), APP_MCP_PREFLIGHT_CLOSE_TIMEOUT_MS).catch(() => undefined)
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null
+  let removeAbortListener = () => {}
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs)
-      }),
+          timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs)
+        }),
+      ...(signal
+        ? [new Promise<never>((_, reject) => {
+            const rejectForAbort = () => {
+              try {
+                throwOpenCodeAbortReason(signal)
+              } catch (error) {
+                reject(error)
+              }
+            }
+            if (signal.aborted) {
+              rejectForAbort()
+              return
+            }
+            signal.addEventListener('abort', rejectForAbort, { once: true })
+            removeAbortListener = () => signal.removeEventListener('abort', rejectForAbort)
+          })]
+        : []),
     ])
   } finally {
+    removeAbortListener()
     if (timer) {
       clearTimeout(timer)
     }
@@ -1648,6 +1710,7 @@ function readinessData(
   executionOutcome: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined,
   toolProof: AppMcpToolProof,
   requireSelectedModel: boolean,
+  executionProof?: OpenCodeExecutionProof,
 ) {
   const connectedProviders = snapshot.providers?.connected ?? []
   const models = getOpenCodeAccessPolicyModels(snapshot)
@@ -1758,6 +1821,7 @@ function readinessData(
       observedMcpTools: toolProof.observedTools,
       runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
     },
+    ...(executionProof ? { executionProof } : {}),
   }
 }
 
@@ -2052,6 +2116,8 @@ function shouldDisposeBridgeProbeHostOnRelease(): boolean {
 async function assertOpenCodeSelectedModelLaunchAccess(
   selectedModel: string,
   snapshot: OpenCodeProvisioningSnapshot,
+  executionProof?: OpenCodeExecutionProof | null,
+  runtimeDeadline?: OpenCodeRuntimeDeadline,
 ): Promise<void> {
   const catalog = getOpenCodeAccessPolicyCatalog(snapshot)
   const access = evaluateOpenCodeModelAccess({
@@ -2067,18 +2133,36 @@ async function assertOpenCodeSelectedModelLaunchAccess(
     throw new Error(access.reason ?? 'OpenCode selected model provider is not connected')
   }
 
+  if (executionProof) {
+    const validateProof = () => validateOpenCodeExecutionProof({
+      proof: executionProof,
+      selectedModel,
+      projectPath: snapshot.projectPath,
+      snapshot,
+      capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId,
+    })
+    const proofValidation = runtimeDeadline
+      ? await runtimeDeadline.runPhase('execution_submit', validateProof)
+      : await validateProof()
+    if (proofValidation.valid) {
+      return
+    }
+  }
+
   const executionOutcome = await openCodeExecutionProbe.probeModel({
     selectedModel,
     projectPath: snapshot.projectPath,
     bypassCache: true,
     disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
-  }).catch(error =>
-    buildOpenCodeExecutionOutcome(
+    ...(runtimeDeadline ? { runtimeDeadline } : {}),
+  }).catch(error => {
+    if (isOpenCodeRuntimeDeadlineError(error)) throw error
+    return buildOpenCodeExecutionOutcome(
       selectedModel,
       'unknown',
       error instanceof Error ? error.message : String(error),
-    ),
-  )
+    )
+  })
   const verifiedAccess = evaluateOpenCodeModelAccess({
     selectedModel,
     catalog,
@@ -2093,6 +2177,20 @@ async function assertOpenCodeSelectedModelLaunchAccess(
       ?? executionOutcome.reason
       ?? 'OpenCode selected model execution is unavailable',
   )
+}
+
+async function shouldForceFreshOpenCodeExecutionProbe(
+  selectedModel: string,
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<boolean> {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  const authPath = snapshot.profile?.managedAuthPath
+  if (!parsed || !authPath) return false
+  const credential = await readOpenCodeAuthCredential({
+    authPath,
+    providerId: parsed.providerId,
+  }).catch(() => null)
+  return credential?.type === 'oauth'
 }
 
 function assertOpenCodeSelectedModelReconcilable(
@@ -2165,23 +2263,66 @@ function mcpUnavailableReadinessData(input: {
   }
 }
 
-async function runReadiness(envelope: BridgeEnvelope) {
+async function runReadiness(
+  envelope: BridgeEnvelope,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+) {
   const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
   const selectedModel = asString(envelope.body.selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
+  const runProvisioningPhase = async (
+    phase: 'host_start' | 'post_probe_refresh',
+    options: Parameters<typeof openCodeProvisioningProbe.probe>[1],
+  ): Promise<OpenCodeProvisioningSnapshot> => {
+    let pending: Promise<OpenCodeProvisioningSnapshot> | null = null
+    try {
+      return await runtimeDeadline.runPhase(phase, context => {
+        pending = openCodeProvisioningProbe.probe(projectPath, {
+          ...options,
+          phaseContext: context,
+        })
+        return pending
+      })
+    } catch (error) {
+      if (isOpenCodeRuntimeDeadlineError(error) && pending) {
+        await withTimeout(pending.catch(() => undefined), 5_000).catch(() => undefined)
+      }
+      throw error
+    }
+  }
+  const runDirectToolProof = async (): Promise<AppMcpToolProof> => {
+    let pending: Promise<AppMcpToolProof> | null = null
+    try {
+      return await runtimeDeadline.runPhase('mcp_preflight', context => {
+        context.throwIfExpired()
+        pending = proveAppMcpToolsFromLaunchConfig(context)
+        return pending.then(proof => {
+          context.throwIfExpired()
+          return proof
+        })
+      })
+    } catch (error) {
+      if (isOpenCodeRuntimeDeadlineError(error) && pending) {
+        await withTimeout(pending.catch(() => undefined), 5_000).catch(() => undefined)
+      }
+      throw error
+    }
+  }
+  let directToolProof: AppMcpToolProof | null = shouldProbeSelectedModel
+    ? await runDirectToolProof()
+    : null
   if (
     shouldProbeSelectedModel
     && shouldFastFailAuthlessModelWhenAppMcpUnavailable(selectedModel)
   ) {
-    const preflightToolProof = await proveAppMcpToolsFromLaunchConfig()
-    if (!preflightToolProof.ok) {
+    if (directToolProof && !directToolProof.ok) {
       return {
         snapshot: null,
         data: mcpUnavailableReadinessData({
           selectedModel,
-          toolProof: preflightToolProof,
+          toolProof: directToolProof,
           diagnostics: [
             'Skipped OpenCode host startup and model verification because Agent Teams MCP direct preflight failed.',
           ],
@@ -2190,14 +2331,11 @@ async function runReadiness(envelope: BridgeEnvelope) {
     }
   }
 
-  const modelSnapshot = await openCodeProvisioningProbe.probe(
-    projectPath,
-    {
-      disposeHostOnRelease: disposeReadinessHostOnRelease,
-      ensureAppMcp: !shouldProbeSelectedModel,
-      bypassCache: shouldProbeSelectedModel,
-    },
-  )
+  const modelSnapshot = await runProvisioningPhase('host_start', {
+    disposeHostOnRelease: disposeReadinessHostOnRelease,
+    ensureAppMcp: !shouldProbeSelectedModel,
+    bypassCache: shouldProbeSelectedModel,
+  })
   let snapshot = modelSnapshot
   let executionModel: string | null = null
   let executionOutcomePromise: Promise<Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined> =
@@ -2259,6 +2397,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
   }
 
   if (envelope.body.requireExecutionProbe === true && executionModel) {
+    directToolProof ??= await runDirectToolProof()
     const selectedModelAccess = evaluateOpenCodeModelAccess({
       selectedModel: executionModel,
       catalog: getOpenCodeAccessPolicyCatalog(snapshot),
@@ -2268,8 +2407,7 @@ async function runReadiness(envelope: BridgeEnvelope) {
       && selectedModelAccess.requiresExecutionProof
       && modelSnapshot.host
     ) {
-      const preflightToolProof = await proveAppMcpTools(modelSnapshot)
-      if (!preflightToolProof.ok) {
+      if (!directToolProof.ok) {
         const executionOutcome = buildOpenCodeExecutionOutcome(
           executionModel,
           'unknown',
@@ -2281,41 +2419,57 @@ async function runReadiness(envelope: BridgeEnvelope) {
             modelSnapshot,
             executionModel,
             executionOutcome,
-            preflightToolProof,
+            directToolProof,
             requireSelectedModel,
           ),
         }
       }
     }
 
+    const bypassCache = await shouldForceFreshOpenCodeExecutionProbe(
+      executionModel,
+      modelSnapshot,
+    )
     const executionOutcome = await openCodeExecutionProbe.probeModel({
       selectedModel: executionModel,
       projectPath: modelSnapshot.projectPath,
-      // Deep readiness is the final provider-auth gate before launch. A cached
-      // success can outlive an OAuth access token, so force a real request here.
-      // OpenCode then refreshes the token when possible and the execution probe
-      // fans the rotated credential out to every managed profile.
-      bypassCache: true,
+      // OAuth credentials can rotate or expire independently, so they always
+      // receive a fresh execution request. API-key and authless local models
+      // may reuse the exact short-lived execution result.
+      bypassCache,
       disposeHostOnRelease: disposeReadinessHostOnRelease,
-    }).catch(error =>
-      buildOpenCodeExecutionOutcome(
+      runtimeDeadline,
+    }).catch(error => {
+      if (isOpenCodeRuntimeDeadlineError(error)) throw error
+      return buildOpenCodeExecutionOutcome(
         executionModel,
         'unknown',
         error instanceof Error ? error.message : String(error),
-      ),
-    )
+      )
+    })
     executionOutcomePromise = Promise.resolve(executionOutcome)
-    snapshot = await openCodeProvisioningProbe.probe(projectPath, {
+    snapshot = await runProvisioningPhase('post_probe_refresh', {
       disposeHostOnRelease: disposeReadinessHostOnRelease,
       ensureAppMcp: true,
       bypassCache: true,
     })
   }
-  const toolProofPromise = proveAppMcpTools(snapshot)
-  const [executionOutcome, toolProof] = await Promise.all([
-    executionOutcomePromise,
-    toolProofPromise,
-  ])
+  directToolProof ??= await runDirectToolProof()
+  const executionOutcome = await executionOutcomePromise
+  let executionProof: OpenCodeExecutionProof | undefined
+  if (executionOutcome?.outcome === 'available' && executionOutcome.verifiedAt) {
+    executionProof = await buildOpenCodeExecutionProof({
+      selectedModel: executionModel ?? selectedModel ?? executionOutcome.modelId,
+      snapshot,
+      capabilitySnapshotId: createRuntimeSnapshot(snapshot).capabilitySnapshotId,
+      verifiedAt: executionOutcome.verifiedAt,
+    }).catch(error => {
+      executionOutcome.diagnostics.push(
+        `OpenCode execution proof could not be created: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return undefined
+    })
+  }
 
   return {
     snapshot,
@@ -2323,8 +2477,9 @@ async function runReadiness(envelope: BridgeEnvelope) {
       snapshot,
       executionModel ?? selectedModel,
       executionOutcome,
-      toolProof,
+      directToolProof,
       requireSelectedModel,
+      executionProof,
     ),
   }
 }
@@ -2373,8 +2528,12 @@ function assertOpenCodeLaunchRuntimeAvailable(
 
 async function assertOpenCodeLaunchMcpReady(
   snapshot: OpenCodeProvisioningSnapshot,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
 ): Promise<void> {
-  const toolProof = await proveAppMcpTools(snapshot)
+  const toolProof = await runtimeDeadline.runPhase(
+    'mcp_preflight',
+    context => proveAppMcpTools(snapshot, context),
+  )
   if (!isAppMcpConnected(snapshot) || !toolProof.ok) {
     throw new Error(
       toolProof.missingTools.length > 0
@@ -2458,7 +2617,10 @@ async function markStaleAndReleaseSession(
   return diagnostics
 }
 
-async function runLaunch(envelope: BridgeEnvelope) {
+async function runLaunch(
+  envelope: BridgeEnvelope,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+) {
   const body = envelope.body
   const runId = asString(body.runId)
   const laneId = asString(body.laneId)
@@ -2472,15 +2634,34 @@ async function runLaunch(envelope: BridgeEnvelope) {
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
 
   const probeStartedAt = Date.now()
-  const retainedProbe = await openCodeProvisioningProbe.probeRetainingHost(
-    asString(body.projectPath) ?? envelope.cwd,
-    { toolApprovalMode },
-  )
+  let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
+  let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
+  try {
+    retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
+      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+        asString(body.projectPath) ?? envelope.cwd,
+        { toolApprovalMode, phaseContext: context },
+      )
+      return pendingProbe
+    })
+  } catch (error) {
+    if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
+      const cleanup = pendingProbe
+        .then(probe => probe.release())
+        .catch(() => undefined)
+      void cleanup
+      await withTimeout(cleanup, 5_000).catch(() => undefined)
+    }
+    throw error
+  }
   const provisioningProbeMs = elapsedMs(probeStartedAt)
   try {
-    return await runLaunchWithProvisioningSnapshot(envelope, retainedProbe.snapshot, {
-      provisioningProbeMs,
-    })
+    return await runLaunchWithProvisioningSnapshot(
+      envelope,
+      retainedProbe.snapshot,
+      runtimeDeadline,
+      { provisioningProbeMs },
+    )
   } finally {
     await retainedProbe.release().catch(() => undefined)
   }
@@ -2489,6 +2670,7 @@ async function runLaunch(envelope: BridgeEnvelope) {
 async function runLaunchWithProvisioningSnapshot(
   envelope: BridgeEnvelope,
   snapshot: OpenCodeProvisioningSnapshot,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
   timings: { provisioningProbeMs?: number } = {},
 ) {
   const launchStartedAt = Date.now()
@@ -2520,8 +2702,17 @@ async function runLaunchWithProvisioningSnapshot(
   }
   assertOpenCodeLaunchRuntimeAvailable(snapshot)
   const apiSelectedModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)
-  await assertOpenCodeSelectedModelLaunchAccess(apiSelectedModel, snapshot)
-  await assertOpenCodeLaunchMcpReady(snapshot)
+  await assertOpenCodeSelectedModelLaunchAccess(
+    apiSelectedModel,
+    snapshot,
+    parseOpenCodeExecutionProof(body.executionProof),
+    runtimeDeadline,
+  )
+  await assertOpenCodeLaunchMcpReady(snapshot, runtimeDeadline)
+  runtimeDeadline.throwIfExpired('post_probe_refresh')
+  // From this point the command starts creating durable sessions. Keep the
+  // pre-launch deadline from turning a completed state change into a timeout.
+  runtimeDeadline.dispose()
   const members: Record<string, LaunchMemberDraft> = {}
   const memberTimings = new Map<string, {
     ensureSessionMs?: number
@@ -3283,13 +3474,11 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         data: finalData,
       }
     } else if (settlementMode === 'acceptance') {
-      const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
+      const prompted = await openCodeSessionBridge.promptAsyncUntilAccepted(deliveryRecord, {
         text: deliveryText,
         parts: fileParts,
         agent: deliveryAgent,
         noReply: false,
-        timeoutMs: OPENCODE_SEND_TURN_SETTLED_TIMEOUT_MS,
-        idleTimeoutMs: OPENCODE_SEND_TURN_SETTLED_IDLE_TIMEOUT_MS,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
             status: 'prompt_submitting',
@@ -3315,19 +3504,8 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
             ],
           })
         },
-        onTurnObserved: async ({ sessionId, runtimePromptMessageId }) => {
-          await markSendMessageOutcome(outcomeBase, {
-            status: 'turn_observed',
-            sessionId,
-            runtimePid: mcpRuntimePid ?? deliveryRecord.runtimePid ?? null,
-            prePromptCursor,
-            runtimePromptMessageId,
-            turnObservedAt: nowIso(),
-          })
-        },
       })
       runtimePromptMessageId = prompted.runtimePromptMessageId
-      turnSettled = prompted.turnSettled
       if (prompted.hookDiagnostics.length > 0) {
         mcpDiagnostics.push(
           ...prompted.hookDiagnostics.map(message =>
@@ -3414,7 +3592,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
         ...mcpDiagnostics,
         teamDiagnostic(
           'opencode_send_settlement_acceptance',
-          'OpenCode prompt_async accepted after a turn-settled guard; response observation remains delegated to durable app-side ledger reconciliation.',
+          'OpenCode prompt_async was accepted without waiting for the assistant turn; response observation remains delegated to durable app-side ledger reconciliation.',
           'info',
         ),
       ],
@@ -4038,7 +4216,10 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
   }
 }
 
-async function handleEnvelope(envelope: BridgeEnvelope) {
+async function handleEnvelope(
+  envelope: BridgeEnvelope,
+  runtimeDeadline?: OpenCodeRuntimeDeadline,
+) {
   switch (envelope.command) {
     case 'opencode.handshake': {
       const lightweightLaunchHandshake = shouldUseLightweightLaunchHandshake(envelope.body)
@@ -4069,11 +4250,17 @@ async function handleEnvelope(envelope: BridgeEnvelope) {
       return { snapshot, data: handshake }
     }
     case 'opencode.readiness':
-      return runReadiness(envelope)
+      if (!runtimeDeadline) {
+        throw new Error('OpenCode readiness deadline was not initialized')
+      }
+      return runReadiness(envelope, runtimeDeadline)
     case 'opencode.cleanupHosts':
       return runCleanupHosts(envelope)
     case 'opencode.launchTeam':
-      return runLaunch(envelope)
+      if (!runtimeDeadline) {
+        throw new Error('OpenCode launch preflight deadline was not initialized')
+      }
+      return runLaunch(envelope, runtimeDeadline)
     case 'opencode.reconcileTeam':
       return runReconcile(envelope)
     case 'opencode.stopTeam':
@@ -4145,17 +4332,30 @@ export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
     )
   }
 
+  const runtimeDeadline = (
+    envelope.command === 'opencode.readiness'
+    || envelope.command === 'opencode.launchTeam'
+  )
+    ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
+    : undefined
   try {
-    const result = await handleEnvelope(envelope)
+    const result = await handleEnvelope(envelope, runtimeDeadline)
+    if (envelope.command === 'opencode.readiness') {
+      runtimeDeadline?.throwIfExpired()
+    }
     return success(envelope, result.data, startedAtMs, result.snapshot)
   } catch (error) {
+    const deadlineError = isOpenCodeRuntimeDeadlineError(error) ? error : null
     return failure(
       envelope,
-      'provider_error',
+      deadlineError ? 'timeout' : 'provider_error',
       error instanceof Error ? error.message : String(error),
       startedAtMs,
       true,
       [diagnostic(error instanceof Error ? error.message : String(error), 'error')],
+      deadlineError?.toDetails(),
     )
+  } finally {
+    runtimeDeadline?.dispose()
   }
 }

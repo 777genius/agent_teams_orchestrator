@@ -17,6 +17,17 @@ import {
   getSessionBypassPermissionsMode,
   getStrictMcpConfig,
 } from '../../bootstrap/state.js'
+import {
+  AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+  ANTHROPIC_DIRECT_ROUTE_ENV_KEYS,
+  ANTHROPIC_EXTERNAL_ROUTE_ENV_KEYS,
+  APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER,
+  APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV,
+  APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV,
+  APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV,
+  getAnthropicConnectionMode,
+  hasAppManagedAnthropicApiKeyHelper,
+} from '../anthropicConnectionMode.js'
 import { normalizeApiKeyForConfig } from '../authPortable.js'
 import { writeFileAtomicSync } from '../atomicWrite.js'
 import { quote } from '../bash/shellQuote.js'
@@ -197,6 +208,10 @@ const TEAMMATE_ENV_VARS = [
   // Host-managed routing guard. When present, settings-sourced env must not
   // override the provider/env choice that the launcher made for this child.
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  // App-owned Anthropic connection intent. This is safe to carry through
+  // non-Anthropic parents so nested mixed-provider spawns can restore the
+  // intended Anthropic route without changing the current process provider.
+  AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
   // API provider selection — without these, teammates default to firstParty
   // and send requests to the wrong endpoint (GitHub issue #23561)
   'CLAUDE_CODE_USE_OPENAI',
@@ -215,6 +230,7 @@ const TEAMMATE_ENV_VARS = [
   'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH',
   // Custom API endpoint
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_API_KEY',
   'GEMINI_BASE_URL',
   'GEMINI_API_VERSION',
@@ -258,18 +274,35 @@ const TEAMMATE_ENV_VARS = [
   'CURL_CA_BUNDLE',
 ] as const
 
-const APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV = 'CLAUDE_TEAM_ANTHROPIC_AUTH_MODE'
-const APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER = 'api_key_helper'
-const APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV =
-  'CLAUDE_TEAM_ANTHROPIC_API_KEY_HELPER_SETTINGS_PATH'
-const APP_MANAGED_TEAM_RUNTIME_SETTINGS_PATH_ENV =
-  'CLAUDE_TEAM_RUNTIME_SETTINGS_PATH'
 const APP_MANAGED_ANTHROPIC_COMPETING_AUTH_ENV_VARS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+] as const
+
+const ANTHROPIC_AUTO_SPAWN_ENV_KEYS = [
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  ...ANTHROPIC_EXTERNAL_ROUTE_ENV_KEYS,
+  ...ANTHROPIC_DIRECT_ROUTE_ENV_KEYS,
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+  'AWS_PROFILE',
+  'AWS_REGION',
+  'AWS_DEFAULT_REGION',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_PROJECT_ID',
+  'GCLOUD_PROJECT',
 ] as const
 
 const PROVIDER_SELECTION_ENV_VARS = [
@@ -283,6 +316,48 @@ const PROVIDER_SELECTION_ENV_VARS = [
 
 function getExplicitEntryProvider(provider: TeammateProvider): string {
   return provider === 'codex' || provider === 'gemini' ? provider : 'anthropic'
+}
+
+function applyAnthropicTeammateConnectionPolicy(
+  envVars: Record<string, string>,
+  provider: TeammateProvider | undefined,
+): void {
+  if (provider !== 'anthropic') {
+    return
+  }
+  const connectionMode = getAnthropicConnectionMode(envVars)
+  if (connectionMode === 'auto') {
+    // Legacy/app-helper launches may predate the connection-mode carrier. The
+    // helper marker is still authoritative and must keep all competing auth
+    // carriers blank instead of restoring Auto-mode ambient credentials.
+    if (isAppManagedAnthropicApiKeyHelperTarget(provider)) {
+      return
+    }
+    for (const key of ANTHROPIC_AUTO_SPAWN_ENV_KEYS) {
+      const value = process.env[key]
+      if (value !== undefined && value !== '') {
+        envVars[key] = value
+      }
+    }
+    return
+  }
+
+  for (const key of ANTHROPIC_EXTERNAL_ROUTE_ENV_KEYS) {
+    envVars[key] = ''
+  }
+  if (connectionMode !== 'compatible') {
+    for (const key of ANTHROPIC_DIRECT_ROUTE_ENV_KEYS) {
+      envVars[key] = ''
+    }
+  }
+  if (connectionMode === 'subscription') {
+    envVars.ANTHROPIC_API_KEY = ''
+    envVars.ANTHROPIC_AUTH_TOKEN = ''
+  } else if (connectionMode === 'api_key') {
+    envVars.ANTHROPIC_AUTH_TOKEN = ''
+    envVars.CLAUDE_CODE_OAUTH_TOKEN = ''
+    envVars.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR = ''
+  }
 }
 
 const PROVIDER_SELECTION_ENV_VAR_SET = new Set<string>(
@@ -348,10 +423,7 @@ function isAppManagedAnthropicApiKeyHelperTarget(
 ): boolean {
   return (
     isHostManagedAnthropicTeammateTarget(provider) &&
-    process.env[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] ===
-      APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER &&
-    typeof process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] === 'string' &&
-    process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV]!.trim().length > 0
+    hasAppManagedAnthropicApiKeyHelper()
   )
 }
 
@@ -634,6 +706,11 @@ export function buildInheritedEnvObject(options?: {
       APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER
     envVars[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] =
       process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] ?? ''
+  }
+
+  applyAnthropicTeammateConnectionPolicy(envVars, provider)
+  if (clearAnthropicApiKey && !useAppManagedAnthropicHelper) {
+    envVars.ANTHROPIC_API_KEY = ''
   }
 
   return envVars

@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
+import { withTimeout } from '../../utils/sleep.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import {
@@ -10,25 +11,40 @@ import {
   openCodeHostManager,
 } from './OpenCodeHostManager.js'
 import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
+import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import {
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
+import {
+  type OpenCodePhaseContext,
+  type OpenCodeRuntimeDeadline,
+  isOpenCodeRuntimeDeadlineError,
+  throwOpenCodeAbortReason,
+} from './OpenCodeRuntimeDeadline.js'
 
+import type {
+  OpenCodeClient,
+} from './OpenCodeClientFactory.js'
 import type {
   OpenCodeExecutionProbeResult,
   OpenCodeHostHandle,
   OpenCodeMessage,
   OpenCodePreparedProfile,
+  OpenCodeSessionStatusInput,
 } from './types.js'
 
 const OPEN_CODE_EXECUTION_PROBE_PROMPT = 'Output only the single word PONG.'
 const OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT = 'PONG'
 const OPEN_CODE_EXECUTION_PROBE_TIMEOUT_MS = 120_000
 const OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS = 500
-const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 10 * 60_000
+const OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS = 40_000
 const OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS = 60_000
 const OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS = 15_000
+const OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS = 300_000
+const OPEN_CODE_EXECUTION_PROMPT_START_TIMEOUT_MS = 5_000
+const OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS = 5_000
+const OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS = 150
 const OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT = 512
 const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
 const OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT = 262_144
@@ -42,6 +58,9 @@ type OpenCodeExecutionProbeDeps = {
   sleep?: (ms: number) => Promise<void>
   probeTimeoutMs?: number
   pollIntervalMs?: number
+  promptStartTimeoutMs?: number
+  hostStartupCleanupTimeoutMs?: number
+  sessionCleanupTimeoutMs?: number
   persistentCache?: boolean
   persistentCacheRoot?: string
   fanOutOAuthCredential?: (input: {
@@ -71,6 +90,26 @@ type ProbeModelParams = {
   outputTokens?: number
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
+  runtimeDeadline?: OpenCodeRuntimeDeadline
+}
+
+function messageMatchesPrompt(message: OpenCodeMessage | null, messageID: string): boolean {
+  return Boolean(
+    message
+    && message.info
+    && message.info.id === messageID
+    && message.info.role === 'user',
+  )
+}
+
+function statusIsRunning(value: unknown): boolean {
+  if (value === 'busy' || value === 'retry') return true
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return record.type === 'busy'
+    || record.type === 'retry'
+    || record.status === 'busy'
+    || record.status === 'retry'
 }
 
 function parseProviderScopedModel(selectedModel: string): {
@@ -400,6 +439,113 @@ export class OpenCodeExecutionProbe {
     return this.deps.persistentCache ?? (this.deps.clientFactory == null)
   }
 
+  private runPhase<T>(
+    deadline: OpenCodeRuntimeDeadline | undefined,
+    phase: OpenCodePhaseContext['phase'],
+    operation: (context?: OpenCodePhaseContext) => Promise<T>,
+  ): Promise<T> {
+    return deadline
+      ? deadline.runPhase(phase, context => operation(context))
+      : operation(undefined)
+  }
+
+  private createClient(host: OpenCodeHostHandle, context?: OpenCodePhaseContext): OpenCodeClient {
+    return this.clientFactory.create(
+      host.baseUrl,
+      context
+        ? {
+            signal: context.signal,
+            remainingMs: context.remainingMs,
+          }
+        : undefined,
+    )
+  }
+
+  private async verifyPromptStarted(input: {
+    client: OpenCodeClient
+    sessionId: string
+    messageID: string
+    context?: OpenCodePhaseContext
+  }): Promise<boolean> {
+    const startedAt = nowMs()
+    const promptStartTimeoutMs = Math.max(
+      1,
+      this.deps.promptStartTimeoutMs ?? OPEN_CODE_EXECUTION_PROMPT_START_TIMEOUT_MS,
+    )
+    const supportsExactMessageLookup = Boolean(input.client.getSessionMessage)
+    for (;;) {
+      input.context?.throwIfExpired()
+      const [message, statusMap] = await Promise.all([
+        input.client.getSessionMessage
+          ? input.client.getSessionMessage(input.sessionId, input.messageID).catch(error => {
+              if (input.context?.signal.aborted) throwOpenCodeAbortReason(input.context.signal)
+              return null
+            })
+          : input.client.getSessionMessages(input.sessionId).then(messages => messages[0] ?? null),
+        input.client.getSessionStatus(),
+      ])
+      if (
+        messageMatchesPrompt(message, input.messageID)
+        || (!supportsExactMessageLookup && message !== null)
+        || statusIsRunning(statusMap[input.sessionId])
+      ) {
+        return true
+      }
+
+      const localRemaining = promptStartTimeoutMs - (nowMs() - startedAt)
+      const remainingMs = Math.min(localRemaining, input.context?.remainingMs() ?? localRemaining)
+      if (remainingMs <= 0) {
+        return false
+      }
+      await this.sleep(Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, remainingMs))
+    }
+  }
+
+  private async cleanupProbeSession(host: OpenCodeHostHandle, sessionId: string): Promise<void> {
+    const controller = new AbortController()
+    const cleanupStartedAt = nowMs()
+    const cleanupTimeoutMs = Math.max(
+      1,
+      this.deps.sessionCleanupTimeoutMs ?? OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS,
+    )
+    const remainingMs = () => Math.max(
+      1,
+      cleanupTimeoutMs - (nowMs() - cleanupStartedAt),
+    )
+    const timer = setTimeout(() => {
+      controller.abort(new Error('OpenCode execution probe cleanup timed out'))
+    }, cleanupTimeoutMs)
+    timer.unref?.()
+    const client = this.clientFactory.create(host.baseUrl, {
+      signal: controller.signal,
+      remainingMs,
+    })
+
+    try {
+      await withTimeout(
+        (async () => {
+          await client.abortSession(sessionId).catch(() => false)
+          if (controller.signal.aborted) return
+          await this.sleep(Math.min(OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS, remainingMs()))
+          if (controller.signal.aborted) return
+          const status: Record<string, OpenCodeSessionStatusInput> = await client
+            .getSessionStatus()
+            .catch(() => ({}))
+          if (statusIsRunning(status[sessionId])) {
+            await client.abortSession(sessionId).catch(() => false)
+          }
+        })(),
+        cleanupTimeoutMs,
+        'OpenCode execution probe session cleanup timed out',
+      )
+    } finally {
+      clearTimeout(timer)
+      if (!controller.signal.aborted) {
+        controller.abort(new Error('OpenCode execution probe cleanup finished'))
+      }
+    }
+  }
+
   private async fanOutOAuthCredential(input: {
     providerId: string
     sourceAuthPath: string
@@ -470,22 +616,58 @@ export class OpenCodeExecutionProbe {
       this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS,
     )
 
-    const host = await this.hostManager.ensureHost({
-      projectPath: params.projectPath,
-      profileOptions: {
-        includeAppMcp: false,
-        modelOutputLimitOverrides: [
-          {
-            modelId: params.selectedModel,
-            outputTokens: params.outputTokens ?? OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
-            contextTokens:
-              params.contextTokens ??
-              resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
-          },
-        ],
-      },
-      hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
-    })
+    const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
+      promise: null,
+    }
+    let host: OpenCodeHostHandle
+    try {
+      host = await this.runPhase(params.runtimeDeadline, 'host_start', async context => {
+        hostStartupState.promise = (async () => {
+          const ensuredHost = await this.hostManager.ensureHost({
+            projectPath: params.projectPath,
+            profileOptions: {
+              includeAppMcp: false,
+              modelOutputLimitOverrides: [
+                {
+                  modelId: params.selectedModel,
+                  outputTokens: params.outputTokens ?? OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
+                  contextTokens:
+                    params.contextTokens ??
+                    resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
+                },
+              ],
+            },
+            ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
+            ...(context ? { abortSignal: context.signal } : {}),
+            hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
+          })
+          if (context?.signal.aborted) {
+            await this.hostManager.releaseHost(ensuredHost.hostKey).catch(() => undefined)
+            throwOpenCodeAbortReason(context.signal)
+          }
+          return ensuredHost
+        })()
+        return hostStartupState.promise
+      })
+    } catch (error) {
+      const hostStartup = hostStartupState.promise
+      if (isOpenCodeRuntimeDeadlineError(error) && hostStartup) {
+        const startupCleanup = hostStartup.then(
+          lateHost => this.hostManager.releaseHost(lateHost.hostKey).catch(() => undefined),
+          () => undefined,
+        )
+        void startupCleanup
+        await withTimeout(
+          startupCleanup,
+          Math.max(
+            1,
+            this.deps.hostStartupCleanupTimeoutMs ?? OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS,
+          ),
+          'OpenCode execution probe host startup cleanup timed out',
+        ).catch(() => undefined)
+      }
+      throw error
+    }
     const preflightLease = createOpenCodePreflightHostLeaseInput(
       `model-probe-${params.selectedModel}`,
     )
@@ -500,15 +682,29 @@ export class OpenCodeExecutionProbe {
         })
         : null
       if (cachePaths) {
+        params.runtimeDeadline?.throwIfExpired('execution_submit')
         const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
         if (cached) {
           return cached
         }
 
-        const lockStaleMs = probeTimeoutMs + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS
+        const lockStaleMs = Math.max(
+          probeTimeoutMs,
+          OPEN_CODE_EXECUTION_PROBE_MAX_SHARED_WORK_MS,
+          params.runtimeDeadline?.commandBudgetMs ?? 0,
+        ) + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS
+        const lockWaitMs = Math.min(
+          lockStaleMs,
+          params.runtimeDeadline?.remainingMs()
+            ?? probeTimeoutMs + OPEN_CODE_EXECUTION_PROBE_LOCK_STALE_GRACE_MS,
+        )
         const acquiredLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
         if (!acquiredLock) {
-          const sharedResult = await this.waitForPersistentProbeResult(cachePaths, lockStaleMs)
+          const sharedResult = await this.waitForPersistentProbeResult(
+            cachePaths,
+            lockWaitMs,
+            params.runtimeDeadline,
+          )
           if (sharedResult) {
             return sharedResult
           }
@@ -624,9 +820,15 @@ export class OpenCodeExecutionProbe {
   private async waitForPersistentProbeResult(
     cachePaths: PersistentProbeCachePaths,
     timeoutMs: number,
+    runtimeDeadline?: OpenCodeRuntimeDeadline,
   ): Promise<OpenCodeExecutionProbeResult | null> {
-    const deadlineMs = nowMs() + timeoutMs
+    runtimeDeadline?.throwIfExpired('execution_submit')
+    const deadlineMs = nowMs() + Math.min(
+      timeoutMs,
+      runtimeDeadline?.remainingMs() ?? timeoutMs,
+    )
     while (nowMs() < deadlineMs) {
+      runtimeDeadline?.throwIfExpired('execution_submit')
       const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
       if (cached) {
         return cached
@@ -640,16 +842,12 @@ export class OpenCodeExecutionProbe {
         Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, Math.max(0, deadlineMs - nowMs())),
       )
     }
+    runtimeDeadline?.throwIfExpired('execution_submit')
     return readPersistentProbeCache(cachePaths.cacheFilePath)
   }
 
   private async runProbeModelWithHost(input: {
-    params: {
-      selectedModel: string
-      projectPath?: string | null
-      prompt?: string
-      expectedOutput?: string
-    }
+    params: ProbeModelParams
     host: OpenCodeHostHandle
     startedAtMs: number
     prompt: string
@@ -666,20 +864,17 @@ export class OpenCodeExecutionProbe {
 
     const withOAuthRefreshLock = this.deps.withOAuthRefreshLock
       ?? withOpenCodeOAuthRefreshLock
+    input.params.runtimeDeadline?.throwIfExpired('execution_submit')
     return withOAuthRefreshLock({
       authPath: input.host.profile.managedAuthPath,
       providerId,
+      abortSignal: input.params.runtimeDeadline?.signal,
       operation: () => this.runProbeModelWithHostUnlocked(input),
     })
   }
 
   private async runProbeModelWithHostUnlocked(input: {
-    params: {
-      selectedModel: string
-      projectPath?: string | null
-      prompt?: string
-      expectedOutput?: string
-    }
+    params: ProbeModelParams
     host: OpenCodeHostHandle
     startedAtMs: number
     prompt: string
@@ -723,124 +918,115 @@ export class OpenCodeExecutionProbe {
       return result
     }
 
-    {
-      const client = this.clientFactory.create(host.baseUrl)
-      const session = await client.createSession({
-        title: `probe:${params.selectedModel}`,
-      })
-      const probeMessage = {
-        agent: OPEN_CODE_MODEL_PROBE_AGENT_NAME,
-        model: parseProviderScopedModel(params.selectedModel),
-        parts: [{ type: 'text', text: prompt }],
-      }
+    let sessionId: string | null = null
+    let sessionRequiresCleanup = false
+    try {
+      const submitted = await this.runPhase(
+        params.runtimeDeadline,
+        'execution_submit',
+        async context => {
+          const client = this.createClient(host, context)
+          const session = await client.createSession({
+            title: `probe:${params.selectedModel}`,
+          })
+          sessionId = session.id
+          sessionRequiresCleanup = true
+          const messageID = buildOpenCodeRuntimePromptMessageId()
+          const probeMessage = {
+            messageID,
+            agent: OPEN_CODE_MODEL_PROBE_AGENT_NAME,
+            model: parseProviderScopedModel(params.selectedModel),
+            parts: [{ type: 'text', text: prompt }],
+          }
 
-      try {
-        await client.promptSessionAsync(session.id, probeMessage)
-      } catch (error) {
-        const classified = classifyProbeFailure({
-          message: error instanceof Error ? error.message : String(error),
-        })
+          try {
+            await client.promptSessionAsync(session.id, probeMessage)
+          } catch (error) {
+            if (context?.signal.aborted) throwOpenCodeAbortReason(context.signal)
+            return {
+              started: false as const,
+              classified: classifyProbeFailure({
+                message: error instanceof Error ? error.message : String(error),
+              }),
+            }
+          }
+
+          return {
+            started: await this.verifyPromptStarted({
+              client,
+              sessionId: session.id,
+              messageID,
+              context,
+            }),
+            classified: null,
+          }
+        },
+      )
+
+      if (!submitted.started) {
+        const reason = submitted.classified?.reason
+          ?? 'OpenCode accepted prompt_async but did not create a user message or enter a running state'
+        diagnostics.add(reason)
         return finish({
           providerId: 'opencode',
           modelId: params.selectedModel,
           probePrompt: prompt,
           expectedOutput,
-          outcome: classified.outcome,
-          reason: classified.reason,
+          outcome: submitted.classified?.outcome ?? 'unknown',
+          reason,
           durationMs: buildDurationMs(startedAtMs),
           rawStatus: null,
           durableState: 'unknown',
           latestAssistantText: null,
           latestAssistantPreview: null,
           toolCallCount: 0,
-          errorCount: 0,
+          errorCount: submitted.classified ? 0 : 1,
           diagnostics: Array.from(diagnostics),
+          failureCode: submitted.classified ? undefined : 'prompt_start_failed',
         })
       }
 
-      const deadlineMs = nowMs() + probeTimeoutMs
-      let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
-      let latestDurableState: OpenCodeExecutionProbeResult['durableState'] = 'unknown'
-      let latestAssistantText: string | null = null
-      let latestAssistantPreview: string | null = null
-      let latestToolCallCount = 0
-      let latestErrorCount = 0
+      return await this.runPhase(params.runtimeDeadline, 'execution_poll', async context => {
+        const client = this.createClient(host, context)
+        const localDeadlineMs = nowMs() + (
+          context?.remainingMs() ?? probeTimeoutMs
+        )
+        let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
+        let latestDurableState: OpenCodeExecutionProbeResult['durableState'] = 'unknown'
+        let latestAssistantText: string | null = null
+        let latestAssistantPreview: string | null = null
+        let latestToolCallCount = 0
+        let latestErrorCount = 0
 
-      for (;;) {
-        const [statusMap, messages] = await Promise.all([
-          client.getSessionStatus(),
-          client.getSessionMessages(session.id),
-        ])
+        for (;;) {
+          context?.throwIfExpired()
+          const [statusMap, messages] = await Promise.all([
+            client.getSessionStatus(),
+            client.getSessionMessages(sessionId!),
+          ])
 
-        const rawStatus = statusMap[session.id] ?? null
-        const summary = this.eventTranslator.reconcileSessionMessages({
-          sessionId: session.id,
-          rawStatus,
-          messages,
-        })
-        for (const diagnostic of summary.diagnostics) {
-          diagnostics.add(diagnostic)
-        }
-        latestRawStatus = summary.rawStatus
-        latestDurableState = summary.durableState
-        latestAssistantText = summary.latestAssistantText
-        latestAssistantPreview = summary.latestAssistantPreview
-        latestToolCallCount = summary.toolCallCount
-        latestErrorCount = summary.errorCount
-
-        if (
-          summary.durableState === 'idle'
-          && (isProbeSuccessOutput(summary.latestAssistantText) || isProbeSuccessOutput(summary.latestAssistantPreview))
-        ) {
-          return finish({
-            providerId: 'opencode',
-            modelId: params.selectedModel,
-            probePrompt: prompt,
-            expectedOutput,
-            outcome: 'available',
-            reason: null,
-            durationMs: buildDurationMs(startedAtMs),
-            rawStatus: summary.rawStatus,
-            durableState: summary.durableState,
-            latestAssistantText: summary.latestAssistantText,
-            latestAssistantPreview: summary.latestAssistantPreview,
-            toolCallCount: summary.toolCallCount,
-            errorCount: summary.errorCount,
-            diagnostics: Array.from(diagnostics),
+          const rawStatus = statusMap[sessionId!] ?? null
+          const summary = this.eventTranslator.reconcileSessionMessages({
+            sessionId: sessionId!,
+            rawStatus,
+            messages,
           })
-        }
-
-        const failureMessage =
-          getLatestAssistantMessageError(Array.from(diagnostics), messages)
-          ?? summary.latestAssistantPreview
-          ?? summary.latestAssistantText
-          ?? null
-        const shouldContinuePolling =
-          (summary.durableState === 'running'
-            || summary.durableState === 'retrying'
-            || summary.durableState === 'reply_pending'
-            || (summary.durableState === 'idle' && !failureMessage)
-            || (summary.durableState === 'unknown' && !failureMessage))
-          && nowMs() < deadlineMs
-
-        if (shouldContinuePolling) {
-          await this.sleep(Math.min(pollIntervalMs, Math.max(0, deadlineMs - nowMs())))
-          continue
-        }
-
-        if (!shouldContinuePolling && failureMessage) {
-          const classified = classifyProbeFailure({
-            message: failureMessage,
-          })
+          for (const diagnostic of summary.diagnostics) diagnostics.add(diagnostic)
+          latestRawStatus = summary.rawStatus
+          latestDurableState = summary.durableState
+          latestAssistantText = summary.latestAssistantText
+          latestAssistantPreview = summary.latestAssistantPreview
+          latestToolCallCount = summary.toolCallCount
+          latestErrorCount = summary.errorCount
 
           if (
             summary.durableState === 'idle'
-            && classified.outcome === 'unknown'
-            && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
-          ) {
-            diagnostics.add(
-              'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
+            && (
+              isProbeSuccessOutput(summary.latestAssistantText)
+              || isProbeSuccessOutput(summary.latestAssistantPreview)
             )
+          ) {
+            sessionRequiresCleanup = false
             return finish({
               providerId: 'opencode',
               modelId: params.selectedModel,
@@ -856,44 +1042,100 @@ export class OpenCodeExecutionProbe {
               toolCallCount: summary.toolCallCount,
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
+              verifiedAt: new Date().toISOString(),
             })
           }
 
+          const failureMessage =
+            getLatestAssistantMessageError(Array.from(diagnostics), messages)
+            ?? summary.latestAssistantPreview
+            ?? summary.latestAssistantText
+            ?? null
+          const shouldContinuePolling =
+            (summary.durableState === 'running'
+              || summary.durableState === 'retrying'
+              || summary.durableState === 'reply_pending'
+              || (summary.durableState === 'idle' && !failureMessage)
+              || (summary.durableState === 'unknown' && !failureMessage))
+            && nowMs() < localDeadlineMs
+
+          if (shouldContinuePolling) {
+            await this.sleep(Math.min(pollIntervalMs, Math.max(0, localDeadlineMs - nowMs())))
+            continue
+          }
+
+          if (failureMessage) {
+            const classified = classifyProbeFailure({ message: failureMessage })
+            if (
+              summary.durableState === 'idle'
+              && classified.outcome === 'unknown'
+              && (summary.latestAssistantText?.trim() || summary.latestAssistantPreview?.trim())
+            ) {
+              sessionRequiresCleanup = false
+              diagnostics.add(
+                'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
+              )
+              return finish({
+                providerId: 'opencode',
+                modelId: params.selectedModel,
+                probePrompt: prompt,
+                expectedOutput,
+                outcome: 'available',
+                reason: null,
+                durationMs: buildDurationMs(startedAtMs),
+                rawStatus: summary.rawStatus,
+                durableState: summary.durableState,
+                latestAssistantText: summary.latestAssistantText,
+                latestAssistantPreview: summary.latestAssistantPreview,
+                toolCallCount: summary.toolCallCount,
+                errorCount: summary.errorCount,
+                diagnostics: Array.from(diagnostics),
+                verifiedAt: new Date().toISOString(),
+              })
+            }
+
+            if (summary.durableState === 'idle') sessionRequiresCleanup = false
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: classified.outcome,
+              reason: classified.reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: summary.rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: summary.errorCount,
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+
+          diagnostics.add('Model verification timed out')
           return finish({
             providerId: 'opencode',
             modelId: params.selectedModel,
             probePrompt: prompt,
             expectedOutput,
-            outcome: classified.outcome,
-            reason: classified.reason,
+            outcome: 'unknown',
+            reason: 'Model verification timed out',
             durationMs: buildDurationMs(startedAtMs),
-            rawStatus: summary.rawStatus,
-            durableState: summary.durableState,
-            latestAssistantText: summary.latestAssistantText,
-            latestAssistantPreview: summary.latestAssistantPreview,
-            toolCallCount: summary.toolCallCount,
-            errorCount: summary.errorCount,
+            rawStatus: latestRawStatus,
+            durableState: latestDurableState,
+            latestAssistantText,
+            latestAssistantPreview,
+            toolCallCount: latestToolCallCount,
+            errorCount: latestErrorCount,
             diagnostics: Array.from(diagnostics),
+            failureCode: 'execution_timeout',
           })
         }
-
-        diagnostics.add('Model verification timed out')
-        return finish({
-          providerId: 'opencode',
-          modelId: params.selectedModel,
-          probePrompt: prompt,
-          expectedOutput,
-          outcome: 'unknown',
-          reason: 'Model verification timed out',
-          durationMs: buildDurationMs(startedAtMs),
-          rawStatus: latestRawStatus,
-          durableState: latestDurableState,
-          latestAssistantText,
-          latestAssistantPreview,
-          toolCallCount: latestToolCallCount,
-          errorCount: latestErrorCount,
-          diagnostics: Array.from(diagnostics),
-        })
+      })
+    } finally {
+      if (sessionId && sessionRequiresCleanup) {
+        await this.cleanupProbeSession(host, sessionId).catch(() => undefined)
       }
     }
   }

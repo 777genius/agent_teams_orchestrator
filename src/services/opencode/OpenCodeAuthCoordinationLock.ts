@@ -5,9 +5,15 @@ import path from 'node:path'
 
 import { Database } from 'bun:sqlite'
 
+import {
+  throwOpenCodeAbortReason,
+  waitForOpenCodeAbortableDelay,
+} from './OpenCodeRuntimeDeadline.js'
+
 const AUTH_COORDINATION_LOCK_KEY = 'auth-store'
 const AUTH_COORDINATION_LOCK_TIMEOUT_MS = 300_000
 const AUTH_COORDINATION_LOCK_RETRY_MS = 25
+const AUTH_COORDINATION_LOCK_RELEASE_TIMEOUT_MS = 10_000
 
 type AuthCoordinationLockRow = {
   ownerId: string
@@ -173,10 +179,13 @@ export async function withOpenCodeAuthCoordinationLock<T>(input: {
   operation: () => Promise<T>
   timeoutMs?: number
   description?: string
+  abortSignal?: AbortSignal
 }): Promise<T> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const databasePath = getCoordinationDatabasePath(input.authPath)
   const inheritedLocks = heldCoordinationLocks.getStore()
   if (inheritedLocks?.get(databasePath)?.active) {
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     return input.operation()
   }
 
@@ -187,26 +196,31 @@ export async function withOpenCodeAuthCoordinationLock<T>(input: {
   const ownerId = randomUUID()
 
   for (;;) {
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     if (tryAcquireCoordinationLock({ databasePath, ownerId })) {
       break
     }
     if (Date.now() >= deadlineMs) {
       throw new Error(`Timed out waiting for ${description}`)
     }
-    await delay(AUTH_COORDINATION_LOCK_RETRY_MS)
+    await waitForOpenCodeAbortableDelay(
+      AUTH_COORDINATION_LOCK_RETRY_MS,
+      input.abortSignal,
+    )
   }
 
   const lease: AuthCoordinationLease = { active: true }
   const activeLocks = new Map(inheritedLocks)
   activeLocks.set(databasePath, lease)
   try {
+    if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
     return await heldCoordinationLocks.run(activeLocks, input.operation)
   } finally {
     lease.active = false
     await releaseCoordinationLock({
       databasePath,
       ownerId,
-      deadlineMs: Date.now() + timeoutMs,
+      deadlineMs: Date.now() + Math.min(timeoutMs, AUTH_COORDINATION_LOCK_RELEASE_TIMEOUT_MS),
       description,
     })
   }

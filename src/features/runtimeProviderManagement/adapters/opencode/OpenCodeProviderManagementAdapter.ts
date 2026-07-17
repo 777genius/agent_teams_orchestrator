@@ -40,6 +40,7 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
   readOpenCodeManagedRuntimePreferences,
@@ -188,6 +189,7 @@ type OpenCodeProviderManagementAdapterDeps = {
       contextTokens?: number
       outputTokens?: number
       bypassCache?: boolean
+      runtimeDeadline?: OpenCodeRuntimeDeadline
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
@@ -357,6 +359,7 @@ const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
 const CONNECT_EXECUTION_PROOF_MAX_CANDIDATES = 3
+const CONNECT_EXECUTION_PROOF_CANDIDATE_TIMEOUT_MS = 45_000
 
 type ProviderDirectoryCacheEntry = {
   expiresAt: number
@@ -619,6 +622,9 @@ function appendViewDiagnostics(
 }
 
 function getProviderDisplayName(providerId: string, entry?: OpenCodeProviderListEntry): string {
+  if (providerId === 'opencode') {
+    return KNOWN_PROVIDER_LABELS.opencode ?? 'OpenCode Zen'
+  }
   const name = asString(entry?.name)
   return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? providerId
 }
@@ -643,10 +649,19 @@ function getConnectedProviderMap(
   providers: OpenCodeProviderResponse | null,
 ): Map<string, OpenCodeConnectedProvider | null> {
   const connected = new Map<string, OpenCodeConnectedProvider | null>()
+  const liveConnectedProviderIds = new Set(
+    (providers?.connected ?? [])
+      .map(providerId => normalizeProviderId(providerId))
+      .filter((providerId): providerId is string => Boolean(providerId)),
+  )
 
   for (const provider of inventory.connectedProviders) {
     const providerId = normalizeProviderId(provider.id)
-    if (providerId) {
+    const requiresLiveEvidence =
+      providers !== null
+      && providerId !== null
+      && PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE.has(providerId)
+    if (providerId && (!requiresLiveEvidence || liveConnectedProviderIds.has(providerId))) {
       connected.set(providerId, provider)
     }
   }
@@ -1311,6 +1326,13 @@ function buildProviderSetupForm(input: {
       prompts: selectedOption.prompts,
       authOptions,
       defaultAuthOptionId: selectedOption.id,
+      verification: selectedOption.method === 'api' || requiresConnectExecutionProof(input.providerId)
+        ? {
+            kind: 'model-request',
+            freeModelPreferred: true,
+            mayUseQuotaOrBalance: true,
+          }
+        : null,
     }
   }
 
@@ -1355,6 +1377,10 @@ function getOwnership(input: {
   }
 
   return []
+}
+
+function requiresExplicitCredentialEvidence(providerId: string): boolean {
+  return PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE.has(providerId)
 }
 
 function requiresConnectExecutionProof(providerId: string): boolean {
@@ -3135,19 +3161,77 @@ export class OpenCodeProviderManagementAdapter
   private isNewOAuthCredential(
     credential: OpenCodeAuthCredential | null,
     previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>,
+    acceptEquivalentCredential = false,
   ): credential is OpenCodeAuthCredential {
     if (credential?.type !== 'oauth') {
       return false
+    }
+    if (acceptEquivalentCredential) {
+      return true
     }
     return !Array.from(previousCredentials.values()).some(
       previous => previous !== null && credentialsEqual(credential, previous),
     )
   }
 
+  private async clearOAuthCredentialBaseline(input: {
+    client: OpenCodeProviderManagementClient
+    providerId: string
+    authPaths: readonly string[]
+    canDeleteProviderAuth: boolean
+    previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+  }): Promise<ProviderManagementResult<boolean>> {
+    const hadCredential = Array.from(input.previousCredentials.values()).some(Boolean)
+    if (!hadCredential) {
+      return { ok: true, value: false }
+    }
+    if (!input.canDeleteProviderAuth || !input.client.deleteProviderAuth) {
+      // Older OpenCode versions cannot prove that an equivalent token was
+      // written by this reconnect attempt, so retain the stricter comparison.
+      return { ok: true, value: false }
+    }
+
+    const authStore = this.getAuthStore()
+    try {
+      const deleted = await input.client.deleteProviderAuth(input.providerId)
+      if (deleted !== true) {
+        throw new Error('OpenCode did not confirm credential removal')
+      }
+      await Promise.all(
+        input.authPaths.map(authPath =>
+          authStore.removeCredential({ authPath, providerId: input.providerId }),
+        ),
+      )
+      const cleared = await this.captureProviderAuthSnapshot({
+        providerId: input.providerId,
+        authPaths: input.authPaths,
+      })
+      if (Array.from(cleared.values()).some(Boolean)) {
+        throw new Error('OpenCode credential remained after removal')
+      }
+      return { ok: true, value: true }
+    } catch (error) {
+      await this.rollbackProviderAuth({
+        client: input.client,
+        providerId: input.providerId,
+        authPaths: input.authPaths,
+        canDeleteProviderAuth: input.canDeleteProviderAuth,
+        previousCredentials: input.previousCredentials,
+      })
+      return providerManagementError(
+        'auth-failed',
+        error instanceof Error
+          ? `Unable to prepare ${input.providerId} for reconnect: ${error.message}`
+          : `Unable to prepare ${input.providerId} for reconnect`,
+      )
+    }
+  }
+
   private async waitForNewOAuthCredential(input: {
     authPath: string
     providerId: string
     previousCredentials: ReadonlyMap<string, OpenCodeAuthCredential | null>
+    acceptEquivalentCredential?: boolean
     signal: AbortSignal
   }): Promise<OpenCodeAuthCredential | null> {
     const authStore = this.getAuthStore()
@@ -3157,7 +3241,13 @@ export class OpenCodeProviderManagementAdapter
           authPath: input.authPath,
           providerId: input.providerId,
         })
-        if (this.isNewOAuthCredential(credential, input.previousCredentials)) {
+        if (
+          this.isNewOAuthCredential(
+            credential,
+            input.previousCredentials,
+            input.acceptEquivalentCredential,
+          )
+        ) {
           return credential
         }
       } catch {
@@ -3202,6 +3292,9 @@ export class OpenCodeProviderManagementAdapter
 
     const failedCandidates: string[] = []
     for (const validationModelId of validationModelIds) {
+      const runtimeDeadline = new OpenCodeRuntimeDeadline(
+        CONNECT_EXECUTION_PROOF_CANDIDATE_TIMEOUT_MS,
+      )
       let probeResult: OpenCodeExecutionProbeResult
       try {
         probeResult = await this.getExecutionProbe().probeModel({
@@ -3210,6 +3303,7 @@ export class OpenCodeProviderManagementAdapter
           // Keep the probe's provider-safe output budget. Reasoning models can
           // exhaust tiny overrides before emitting the verification response.
           bypassCache: true,
+          runtimeDeadline,
         })
       } catch (error) {
         const reason = redactSecret(
@@ -3218,6 +3312,8 @@ export class OpenCodeProviderManagementAdapter
         )
         failedCandidates.push(`${validationModelId}: ${reason}`)
         continue
+      } finally {
+        runtimeDeadline.dispose()
       }
 
       if (probeResult.outcome === 'available') {
@@ -3987,6 +4083,18 @@ export class OpenCodeProviderManagementAdapter
           return providerManagementError('auth-required', 'OAuth authorization code is required')
         }
 
+        const credentialBaselineResult = await this.clearOAuthCredentialBaseline({
+          client,
+          providerId,
+          authPaths: Array.from(authPaths),
+          canDeleteProviderAuth: capabilities.deleteAuth,
+          previousCredentials,
+        })
+        if (!credentialBaselineResult.ok) {
+          return credentialBaselineResult
+        }
+        const credentialBaselineCleared = credentialBaselineResult.value
+
         const callbackOutcomePromise = Promise.resolve()
           .then(() =>
             client.completeProviderOAuth!(providerId, {
@@ -4017,6 +4125,7 @@ export class OpenCodeProviderManagementAdapter
               authPath: managedAuthPath,
               providerId,
               previousCredentials,
+              acceptEquivalentCredential: credentialBaselineCleared,
               signal: credentialWatcher.signal,
             }).then(credential =>
               credential
@@ -4084,7 +4193,13 @@ export class OpenCodeProviderManagementAdapter
             )
           }
         }
-        if (!this.isNewOAuthCredential(oauthCredential, previousCredentials)) {
+        if (
+          !this.isNewOAuthCredential(
+            oauthCredential,
+            previousCredentials,
+            credentialBaselineCleared,
+          )
+        ) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -4175,7 +4290,7 @@ export class OpenCodeProviderManagementAdapter
           configProviders,
           providers,
         })
-        if (executionProof.ok === false) {
+        if (!executionProof.ok) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -4185,12 +4300,14 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        const verifiedProvider: ProviderConnection = {
-          ...provider,
-          connectedAuthHint: 'oauth',
-          verifiedModelId: executionProof.value,
+        return {
+          ok: true,
+          value: {
+            ...provider,
+            connectedAuthHint: 'oauth',
+            verifiedModelId: executionProof.value,
+          },
         }
-        return { ok: true, value: verifiedProvider }
       },
       {
         failureCode: 'auth-failed',
@@ -4376,8 +4493,8 @@ export class OpenCodeProviderManagementAdapter
         // endpoint persists the credential but does not refresh that in-memory
         // snapshot, so this host can legitimately remain stale after a successful
         // write. Confirm against the bypass-cache inventory below, which starts
-        // from the updated managed auth store, and then prove the credential with
-        // a real model request.
+        // from the updated managed auth store, and then prove providers that need
+        // credential validation with a real model request.
 
         const authStore = this.getAuthStore()
         try {
@@ -4459,7 +4576,7 @@ export class OpenCodeProviderManagementAdapter
           secretToRedact: apiKey,
           required: true,
         })
-        if (executionProof.ok === false) {
+        if (!executionProof.ok) {
           await this.rollbackProviderAuth({
             client,
             providerId,
@@ -4469,12 +4586,14 @@ export class OpenCodeProviderManagementAdapter
           })
           return executionProof
         }
-        const verifiedProvider: ProviderConnection = {
-          ...provider,
-          connectedAuthHint: 'api',
-          verifiedModelId: executionProof.value,
+        return {
+          ok: true,
+          value: {
+            ...provider,
+            connectedAuthHint: 'api',
+            verifiedModelId: executionProof.value,
+          },
         }
-        return { ok: true, value: verifiedProvider }
       },
       {
         failureCode: 'auth-failed',

@@ -590,6 +590,96 @@ await writeFile(process.argv[4], 'finished', 'utf8')
     expect(await readOpenCodeAuthCredential({ authPath, providerId: 'xai' })).toEqual(credential)
   })
 
+  test('does not enter OAuth refresh work after the readiness deadline aborts', async () => {
+    const controller = new AbortController()
+    const timeout = new Error('readiness deadline expired')
+    controller.abort(timeout)
+    let operationCalled = false
+
+    await expect(withOpenCodeOAuthRefreshLock({
+      authPath: path.join(tempDir, 'managed', 'auth.json'),
+      providerId: 'xai',
+      abortSignal: controller.signal,
+      operation: async () => {
+        operationCalled = true
+      },
+    })).rejects.toBe(timeout)
+    expect(operationCalled).toBe(false)
+  })
+
+  test('does not enter a reentrant auth operation after its deadline aborts', async () => {
+    const authPath = path.join(tempDir, 'opencode', 'auth.json')
+    const controller = new AbortController()
+    const timeout = new Error('nested readiness deadline expired')
+    let nestedOperationCalled = false
+
+    await withOpenCodeOAuthRefreshLock({
+      authPath,
+      providerId: 'xai',
+      operation: async () => {
+        controller.abort(timeout)
+        await expect(withOpenCodeOAuthRefreshLock({
+          authPath,
+          providerId: 'xai',
+          abortSignal: controller.signal,
+          operation: async () => {
+            nestedOperationCalled = true
+          },
+        })).rejects.toBe(timeout)
+      },
+    })
+
+    expect(nestedOperationCalled).toBe(false)
+  })
+
+  test('cancels managed auth reconciliation while an OAuth refresh owns coordination', async () => {
+    const managedAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'project',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    let markRefreshStarted!: () => void
+    let releaseRefresh!: () => void
+    const refreshStarted = new Promise<void>(resolve => {
+      markRefreshStarted = resolve
+    })
+    const refreshRelease = new Promise<void>(resolve => {
+      releaseRefresh = resolve
+    })
+    const refresh = withOpenCodeOAuthRefreshLock({
+      authPath: managedAuthPath,
+      providerId: 'xai',
+      operation: async () => {
+        markRefreshStarted()
+        await refreshRelease
+      },
+    })
+    await refreshStarted
+
+    const controller = new AbortController()
+    const timeout = new Error('profile preparation deadline expired')
+    const reconciliation = reconcileOpenCodeManagedAuthStores({
+      sourceAuthPaths: [],
+      globalAuthPath,
+      managedAuthPath,
+      abortSignal: controller.signal,
+    })
+
+    try {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      controller.abort(timeout)
+      await expect(reconciliation).rejects.toBe(timeout)
+    } finally {
+      releaseRefresh()
+      await refresh
+    }
+  })
+
   test('reports whether managed auth includes all local source entries', () => {
     expect(
       doesOpenCodeAuthStoreIncludeSource({

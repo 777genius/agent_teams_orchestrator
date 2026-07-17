@@ -105,7 +105,10 @@ const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
 const PROVIDER_OAUTH_AUTHORIZE_TIMEOUT_MS = 30_000
-const PROVIDER_OAUTH_CALLBACK_TIMEOUT_MS = 330_000
+// GitHub device authorization codes can remain valid for up to 15 minutes.
+// Keep the transport alive slightly longer so Agent Teams does not abort a
+// still-valid browser flow before the provider finishes polling.
+const PROVIDER_OAUTH_CALLBACK_TIMEOUT_MS = 16 * 60_000
 
 function buildQueryPath(path: string, query: Record<string, string | null | undefined>): string {
   const params = new URLSearchParams()

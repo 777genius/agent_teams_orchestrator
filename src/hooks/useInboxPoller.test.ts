@@ -22,6 +22,7 @@ import {
   getQueuedMailboxMetaPrompt,
   resolveOrdinaryUserDirectReplyProtocol,
   buildAgentErrorNotificationText,
+  buildOrdinaryAgentErrorMetadata,
   buildMailboxExecutionFailureLeadNotificationText,
   isBootstrapMemberBriefingCallableNow,
   isBootstrapMailboxInstructionText,
@@ -124,6 +125,28 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     expect(text).toBe(
       'alice failed bootstrap after teammate startup. API Error: provider rejected the request',
     )
+  })
+
+  test('builds structured terminal metadata for outer runtime recovery', () => {
+    expect(
+      buildOrdinaryAgentErrorMetadata({
+        reason: 'execution_failed',
+        detail: 'API Error: 529 overloaded_error',
+        failedMessageId: 'recovery-message-1',
+        runtimeSessionId: 'runtime-session-1',
+        bootstrapRunId: 'bootstrap-run-1',
+        innerRecoveryAttempts: 3,
+      }),
+    ).toEqual({
+      schemaVersion: 1,
+      type: 'api_error',
+      phase: 'terminal',
+      detail: 'API Error: 529 overloaded_error',
+      failedMessageId: 'recovery-message-1',
+      runtimeSessionId: 'runtime-session-1',
+      bootstrapRunId: 'bootstrap-run-1',
+      innerRecoveryAttempts: 3,
+    })
   })
 
   test('finds the actionable bootstrap row for teammate sessions', () => {

@@ -278,4 +278,40 @@ describe('resolveOpenCodeProviderScopedModel', () => {
       ),
     ).toThrow(/ambiguous/)
   })
+
+  test('rejects non-agent image models before runtime execution', () => {
+    const imageModel = 'xai/grok-imagine-image-quality'
+    expect(() =>
+      resolveOpenCodeProviderScopedModel(
+        imageModel,
+        snapshot({
+          models: [imageModel],
+          modelMetadata: [
+            {
+              id: imageModel,
+              cost: null,
+              context: null,
+              limits: null,
+              free: false,
+              raw: {
+                capabilities: {
+                  output: { text: false, image: true },
+                  toolcall: false,
+                },
+              },
+            },
+          ],
+        }),
+      ),
+    ).toThrow(/does not produce text responses/)
+  })
+
+  test('rejects known image-only model ids when metadata is unavailable', () => {
+    expect(() =>
+      resolveOpenCodeProviderScopedModel(
+        'xai/grok-imagine-video',
+        snapshot({ models: ['xai/grok-imagine-video'] }),
+      ),
+    ).toThrow(/cannot be used by Agent Teams/)
+  })
 })

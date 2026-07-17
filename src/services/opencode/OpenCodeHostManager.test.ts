@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -282,6 +282,51 @@ describe('OpenCodeHostManager', () => {
       }
       await rm(tempDir, { recursive: true, force: true })
     }
+  })
+
+  test('captures process identity before releasing a process-scoped host', async () => {
+    const spawned = createMockChildProcess(43140)
+    const killedSignals: NodeJS.Signals[] = []
+    let processAlive = true
+    let identityReadCalls = 0
+
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43140,
+      spawnHostProcess: () => spawned.child,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) {
+          return { status: 200, data: { healthy: true, version: '1.4.0' } }
+        }
+        if (url.endsWith('/config')) {
+          return { status: 200, data: { default_agent: 'teammate' } }
+        }
+        if (url.endsWith('/global/dispose')) {
+          return { status: 200, data: { ok: true } }
+        }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      isProcessAlive: pid => pid === spawned.child.pid && processAlive,
+      readProcessStartTimeMs: async pid => {
+        identityReadCalls += 1
+        return pid === spawned.child.pid && identityReadCalls >= 3 ? 1_000 : null
+      },
+      killProcess: (_pid, signal) => {
+        killedSignals.push(signal)
+        processAlive = false
+      },
+      sleepMs: async () => {},
+      persistentRegistryPath: null,
+    })
+
+    const handle = await manager.ensureHost({ hostLifetime: 'process' })
+    expect(handle.processStartedAtMs).toBe(1_000)
+    expect(identityReadCalls).toBe(3)
+
+    await manager.releaseHost(handle.hostKey)
+
+    expect(killedSignals).toEqual(['SIGTERM'])
+    expect(manager.getHost(handle.hostKey)).toBeNull()
   })
 
   test('cleans OpenTUI temp dylibs after disposing an owned host', async () => {
@@ -852,6 +897,69 @@ describe('OpenCodeHostManager', () => {
       await rm(tempDir, { recursive: true, force: true })
     }
   })
+
+  const symlinkProjectFilterTest = process.platform === 'win32' ? test.skip : test
+  symlinkProjectFilterTest(
+    'matches cleanup project filters through filesystem path aliases',
+    async () => {
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-project-alias-'))
+      const projectPath = path.join(tempDir, 'project')
+      const projectAlias = path.join(tempDir, 'project-alias')
+      const registryPath = path.join(tempDir, 'host-registry.json')
+      let processAlive = true
+
+      try {
+        await mkdir(projectPath)
+        await symlink(projectPath, projectAlias, 'dir')
+        await writeFile(
+          registryPath,
+          JSON.stringify({
+            schemaVersion: 1,
+            hosts: {
+              'host-key': {
+                hostKey: 'host-key',
+                profileRootKey: 'profile-root',
+                projectPath,
+                projectBehaviorFingerprint: 'behavior-v1',
+                managedConfigFingerprint: 'managed-config-v1',
+                baseUrl: 'http://127.0.0.1:43141',
+                port: 43141,
+                pid: 43141,
+                processStartedAtMs: 1_000,
+                version: '1.4.0',
+                resolvedConfigFingerprint: 'resolved-v1',
+                updatedAt: '2026-04-24T09:00:00.000Z',
+                leases: {},
+              },
+            },
+          }),
+          'utf8',
+        )
+
+        const manager = new OpenCodeHostManager({
+          fetchJson: async () => ({ status: 200, data: { ok: true } }),
+          isProcessAlive: pid => pid === 43141 && processAlive,
+          readProcessStartTimeMs: async () => 1_000,
+          killProcess: () => {
+            processAlive = false
+          },
+          sleepMs: async () => {},
+          persistentRegistryPath: registryPath,
+        })
+
+        const result = await manager.reconcilePersistentHosts({
+          mode: 'force',
+          projectPath: projectAlias,
+        })
+
+        expect(result.cleaned).toBe(1)
+        expect(result.hosts[0]?.action).toBe('disposed')
+        await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      } finally {
+        await rm(tempDir, { recursive: true, force: true })
+      }
+    },
+  )
 
   test('refuses adoption when a registered pid is reused during the health probe', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))

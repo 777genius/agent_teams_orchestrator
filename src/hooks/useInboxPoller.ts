@@ -730,13 +730,38 @@ export function buildMailboxExecutionFailureLeadNotificationText({
   })
 }
 
+export function buildOrdinaryAgentErrorMetadata(input: {
+  reason: 'execution_failed' | 'timeout_recovery_failed'
+  detail: string
+  failedMessageId: string
+  runtimeSessionId: string
+  bootstrapRunId?: string
+  innerRecoveryAttempts: number
+}): NonNullable<TeammateMessage['agentError']> {
+  return {
+    schemaVersion: 1,
+    type:
+      input.reason === 'execution_failed'
+        ? 'api_error'
+        : 'codex_native_timeout',
+    phase: 'terminal',
+    detail: input.detail,
+    failedMessageId: input.failedMessageId,
+    runtimeSessionId: input.runtimeSessionId,
+    ...(input.bootstrapRunId ? { bootstrapRunId: input.bootstrapRunId } : {}),
+    innerRecoveryAttempts: input.innerRecoveryAttempts,
+  }
+}
+
 async function writeAgentErrorLeadNotification({
   agentName,
+  agentError,
   teamName,
   text,
   summary,
 }: {
   agentName: string
+  agentError?: TeammateMessage['agentError']
   teamName?: string
   text: string
   summary: string
@@ -753,6 +778,7 @@ async function writeAgentErrorLeadNotification({
         timestamp,
         color: getTeammateColor(),
         messageKind: 'agent_error' as const,
+        ...(agentError ? { agentError } : {}),
       },
       teamName,
     )
@@ -3182,6 +3208,9 @@ export function useInboxPoller({
         if (attempt.timer) {
           clearTimeout(attempt.timer)
         }
+        const innerRecoveryAttempts =
+          ordinaryRecoveryRef.current.get(processingOrdinaryMessage.messageId)
+            ?.attemptCount ?? 0
         ordinaryTerminalFailureRef.current.add(processingOrdinaryMessage.messageId)
         ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId)
         ordinaryRecoveryRef.current.delete(processingOrdinaryMessage.messageId)
@@ -3195,6 +3224,16 @@ export function useInboxPoller({
               try {
                 await writeAgentErrorLeadNotification({
                   agentName,
+                  agentError: buildOrdinaryAgentErrorMetadata({
+                    reason: processingAction.reason,
+                    detail: processingAction.detail,
+                    failedMessageId: processingOrdinaryMessage.messageId,
+                    runtimeSessionId: sessionId,
+                    bootstrapRunId:
+                      process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim() ||
+                      undefined,
+                    innerRecoveryAttempts,
+                  }),
                   teamName,
                   text:
                     processingAction.reason === 'execution_failed'

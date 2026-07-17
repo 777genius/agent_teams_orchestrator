@@ -1,4 +1,5 @@
 import { isRemoteManagedSettingsEligible } from '../services/remoteManagedSettings/syncCache.js'
+import { getAnthropicConnectionMode } from './anthropicConnectionMode.js'
 import { clearCACertsCache } from './caCerts.js'
 import { getGlobalConfig } from './config.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -57,6 +58,7 @@ function withoutHostManagedProviderVars(
       isAllowedHostManagedProviderSettingsEnvVar(
         key,
         process.env.CLAUDE_CODE_ENTRY_PROVIDER,
+        getAnthropicConnectionMode(),
       )
     ) {
       out[key] = value

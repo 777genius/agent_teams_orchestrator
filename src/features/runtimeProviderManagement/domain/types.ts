@@ -62,6 +62,12 @@ export type ProviderSetupAuthOption = {
 
 export type ProviderSetupFormSource = 'opencode-auth' | 'curated' | 'oauth' | 'manual'
 
+export type ProviderSetupVerification = {
+  kind: 'model-request'
+  freeModelPreferred: boolean
+  mayUseQuotaOrBalance: boolean
+}
+
 export type ProviderSetupForm = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
@@ -82,6 +88,7 @@ export type ProviderSetupForm = {
   prompts: readonly ProviderSetupPrompt[]
   authOptions: readonly ProviderSetupAuthOption[]
   defaultAuthOptionId: string | null
+  verification?: ProviderSetupVerification | null
 }
 
 export type ProviderOAuthCompletionMethod = 'auto' | 'code'

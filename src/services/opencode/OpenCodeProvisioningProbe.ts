@@ -5,9 +5,15 @@ import {
 } from './OpenCodeHostManager.js'
 import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  type OpenCodePhaseContext,
+  throwOpenCodeAbortReason,
+} from './OpenCodeRuntimeDeadline.js'
 
 import type {
   OpenCodeAgentResponse,
+  OpenCodeHostHandle,
   OpenCodeProvisioningSnapshot,
   OpenCodeToolApprovalMode,
 } from './types.js'
@@ -35,6 +41,7 @@ type OpenCodeProvisioningProbeOptions = {
   ensureAppMcp?: boolean
   bypassCache?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
+  phaseContext?: OpenCodePhaseContext
 }
 
 type RetainedProvisioningProbe = {
@@ -80,18 +87,20 @@ export class OpenCodeProvisioningProbe {
       disposeHostOnRelease: options.disposeHostOnRelease,
       ensureAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
+      phaseContext: options.phaseContext,
     })
     return result.snapshot
   }
 
   async probeRetainingHost(
     projectPath?: string | null,
-    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode'> = {},
+    options: Pick<OpenCodeProvisioningProbeOptions, 'toolApprovalMode' | 'phaseContext'> = {},
   ): Promise<RetainedProvisioningProbe> {
     return this.probeWithHost(projectPath, {
       retainHost: true,
       useCache: false,
       toolApprovalMode: options.toolApprovalMode,
+      phaseContext: options.phaseContext,
     })
   }
 
@@ -103,6 +112,7 @@ export class OpenCodeProvisioningProbe {
       disposeHostOnRelease?: boolean
       ensureAppMcp?: boolean
       toolApprovalMode?: OpenCodeToolApprovalMode
+      phaseContext?: OpenCodePhaseContext
     },
   ): Promise<RetainedProvisioningProbe> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
@@ -110,6 +120,7 @@ export class OpenCodeProvisioningProbe {
       bypassCache: !options.useCache,
       includeAppMcp: options.ensureAppMcp !== false,
       toolApprovalMode: options.toolApprovalMode,
+      abortSignal: options.phaseContext?.signal,
     })
     const cacheKey = [
       inventory.projectPath,
@@ -160,7 +171,7 @@ export class OpenCodeProvisioningProbe {
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const mcpManager = this.deps.mcpManager ?? openCodeMcpManager
 
-    let host
+    let host: OpenCodeHostHandle | undefined
     const preflightLease = createOpenCodePreflightHostLeaseInput('readiness')
     let released = false
     const release = async () => {
@@ -174,15 +185,28 @@ export class OpenCodeProvisioningProbe {
       }
     }
     try {
-      host = await hostManager.ensureHost({
+      const ensurePromise = hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
+        ...(options.phaseContext
+          ? { healthTimeoutMs: options.phaseContext.remainingMs() }
+          : {}),
+        ...(options.phaseContext ? { abortSignal: options.phaseContext.signal } : {}),
         hostLifetime: options.retainHost || options.disposeHostOnRelease === false
           ? 'persistent'
           : 'process',
       })
+      host = await ensurePromise
+      if (options.phaseContext?.signal.aborted) {
+        await hostManager.releaseHost(host.hostKey).catch(() => undefined)
+        host = undefined
+        throwOpenCodeAbortReason(options.phaseContext.signal)
+      }
       await hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
     } catch (error) {
+      if (options.phaseContext?.signal.aborted) {
+        throwOpenCodeAbortReason(options.phaseContext.signal)
+      }
       const diagnostics = [
         ...inventory.diagnostics,
         error instanceof Error ? error.message : String(error),
@@ -215,7 +239,13 @@ export class OpenCodeProvisioningProbe {
       }
     }
 
-    const client = clientFactory.create(host.baseUrl)
+    const requestContext = options.phaseContext
+      ? {
+          signal: options.phaseContext.signal,
+          remainingMs: options.phaseContext.remainingMs,
+        }
+      : undefined
+    const client = clientFactory.create(host.baseUrl, requestContext)
 
     try {
       const [config, configProviders, providers, providerAuth, agents] = await Promise.all([
@@ -230,8 +260,12 @@ export class OpenCodeProvisioningProbe {
         : await mcpManager.ensureAppMcp({
           baseUrl: host.baseUrl,
           attachIfMissing: true,
+          requestContext,
         })
-      if (appMcp?.summary.status === 'attached') {
+      if (
+        appMcp?.summary.status === 'attached'
+        || appMcp?.summary.status === 'present'
+      ) {
         host.resolvedConfigFingerprint =
           (await hostManager.refreshResolvedConfigFingerprint?.(host.hostKey))
           ?? host.resolvedConfigFingerprint
@@ -239,13 +273,11 @@ export class OpenCodeProvisioningProbe {
 
       const diagnostics = [...inventory.diagnostics]
       const inventoryConnectedProviders = uniqueSorted(
-        inventory.connectedProviders.map(provider => provider.id),
+        inventory.connectedProviders.map(provider => canonicalizeOpenCodeProviderId(provider.id)),
       )
-      const hostConnectedProviders = uniqueSorted(providers.connected ?? [])
-      const connectedProviders = uniqueSorted([
-        ...hostConnectedProviders,
-        ...inventoryConnectedProviders,
-      ])
+      const hostConnectedProviders = uniqueSorted(
+        (providers.connected ?? []).map(canonicalizeOpenCodeProviderId),
+      )
 
       if (host.state !== 'healthy') {
         diagnostics.push(`OpenCode host state is ${host.state}`)
@@ -302,7 +334,7 @@ export class OpenCodeProvisioningProbe {
         configProviders,
         providers: {
           ...providers,
-          connected: connectedProviders,
+          connected: hostConnectedProviders,
         },
         providerAuth,
         agents,
@@ -321,6 +353,9 @@ export class OpenCodeProvisioningProbe {
         release,
       }
     } catch (error) {
+      if (options.phaseContext?.signal.aborted) {
+        throwOpenCodeAbortReason(options.phaseContext.signal)
+      }
       const diagnostics = [
         ...inventory.diagnostics,
         error instanceof Error ? error.message : String(error),

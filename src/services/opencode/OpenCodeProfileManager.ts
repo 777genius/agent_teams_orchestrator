@@ -7,6 +7,7 @@ import type { Dirent } from 'node:fs'
 
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
+import * as lockfile from '../../utils/lockfile.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -38,6 +39,10 @@ import {
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
   resolveClaudeMultimodelPaths,
 } from './OpenCodeManagedPaths.js'
+import {
+  raceOpenCodeAbortSignal,
+  throwOpenCodeAbortReason,
+} from './OpenCodeRuntimeDeadline.js'
 import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
@@ -50,6 +55,39 @@ export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
 export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
+const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
+
+// Copilot Free and Student can expose only GitHub's Auto picker. In that mode the
+// live /models response currently contains no entries accepted by OpenCode 1.17+
+// and OpenCode removes the otherwise authenticated provider. Seed one conservative
+// model so the built-in Copilot auth/transport remains usable. Paid accounts still
+// receive their additional account-specific models from OpenCode live discovery.
+const GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG = {
+  name: 'GitHub Copilot',
+  npm: '@ai-sdk/github-copilot',
+  api: 'https://api.githubcopilot.com',
+  models: {
+    'gpt-4.1': {
+      name: 'GPT-4.1',
+      family: 'gpt',
+      attachment: true,
+      reasoning: false,
+      tool_call: true,
+      structured_output: true,
+      temperature: true,
+      limit: {
+        context: 128_000,
+        input: 128_000,
+        output: 16_384,
+      },
+      modalities: {
+        input: ['text', 'image'],
+        output: ['text'],
+      },
+    },
+  },
+} as const
+
 const atlasCloudModel = (
   name: string,
   context: number,
@@ -248,10 +286,36 @@ async function isDirectorySymlinkTo(linkPath: string, targetPath: string): Promi
   }
 }
 
+const OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS = {
+  stale: 30_000,
+  update: 5_000,
+  realpath: false,
+  retries: {
+    retries: 120,
+    minTimeout: 25,
+    maxTimeout: 250,
+  },
+}
+
 async function ensureDirectorySymlink(linkPath: string, targetPath: string): Promise<void> {
   await mkdir(targetPath, { recursive: true })
   await mkdir(path.dirname(linkPath), { recursive: true })
 
+  const lockPath = `${linkPath}.prepare-lock`
+  await writeFile(lockPath, '', { flag: 'a' })
+  const release = await lockfile.lock(lockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+
+  try {
+    await ensureDirectorySymlinkUnlocked(linkPath, targetPath)
+  } finally {
+    await release()
+  }
+}
+
+async function ensureDirectorySymlinkUnlocked(
+  linkPath: string,
+  targetPath: string,
+): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     if (await isDirectorySymlinkTo(linkPath, targetPath)) {
       return
@@ -415,6 +479,7 @@ export function buildManagedConfig(
     snapshot: true,
     provider: {
       [ATLAS_CLOUD_PROVIDER_ID]: ATLAS_CLOUD_PROVIDER_CONFIG,
+      [GITHUB_COPILOT_PROVIDER_ID]: GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG,
       ...getOpenCodeCuratedSubscriptionProviderConfigs(),
     },
     agent: {
@@ -1109,6 +1174,7 @@ export class OpenCodeProfileManager {
   private async withProfilePreparationLock<T>(
     profileRootKey: string,
     operation: () => Promise<T>,
+    abortSignal?: AbortSignal,
   ): Promise<T> {
     const previous = OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey)
     let release!: () => void
@@ -1117,13 +1183,30 @@ export class OpenCodeProfileManager {
     })
     OpenCodeProfileManager.profilePreparationLocks.set(profileRootKey, current)
 
-    await runAfterSettled(previous)
+    let waitCompleted = false
+    let releaseDeferredUntilPrevious = false
     try {
+      await raceOpenCodeAbortSignal(runAfterSettled(previous), abortSignal)
+      waitCompleted = true
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
       return await operation()
+    } catch (error) {
+      if (!waitCompleted && previous) {
+        releaseDeferredUntilPrevious = true
+        void runAfterSettled(previous).then(() => {
+          release()
+          if (OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey) === current) {
+            OpenCodeProfileManager.profilePreparationLocks.delete(profileRootKey)
+          }
+        })
+      }
+      throw error
     } finally {
-      release()
-      if (OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey) === current) {
-        OpenCodeProfileManager.profilePreparationLocks.delete(profileRootKey)
+      if (!releaseDeferredUntilPrevious) {
+        release()
+        if (OpenCodeProfileManager.profilePreparationLocks.get(profileRootKey) === current) {
+          OpenCodeProfileManager.profilePreparationLocks.delete(profileRootKey)
+        }
       }
     }
   }
@@ -1135,6 +1218,7 @@ export class OpenCodeProfileManager {
     const resolvedProjectPath = this.getProjectPath(projectPath)
     const profileRootKey = this.getProfileRootKey(resolvedProjectPath)
     return this.withProfilePreparationLock(profileRootKey, async () => {
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const profileRootPath = path.join(
       this.paths.data,
       'opencode',
@@ -1163,6 +1247,7 @@ export class OpenCodeProfileManager {
       options.includeAppMcp === false
         ? null
         : await this.resolveManagedAppMcpConfig()
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
     const effectiveModelOutputLimitOverrides = [
       ...Object.entries(effectiveModelLimitOverrides).map(([modelId, override]) => ({
         modelId,
@@ -1208,6 +1293,7 @@ export class OpenCodeProfileManager {
         }
       }),
     )
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     await Promise.all([
       mkdir(homePath, { recursive: true }),
@@ -1224,6 +1310,7 @@ export class OpenCodeProfileManager {
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(profileRootPath)
     }
     await ensureDirectorySymlink(profileOpenCodeNodeModulesPath, sharedOpenCodeNodeModulesPath)
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     const globalAuthExists = await fileExists(globalAuthPath)
     const globalAuthFingerprint = globalAuthExists
@@ -1245,6 +1332,7 @@ export class OpenCodeProfileManager {
       globalAuthPath,
       managedAuthPath,
       peerManagedAuthPaths: await this.listManagedAuthPaths(),
+      abortSignal: options.abortSignal,
     })
     if (nativeCliCredentialBridge) {
       await Promise.all([
@@ -1260,6 +1348,7 @@ export class OpenCodeProfileManager {
         }),
       ])
     }
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     const managedAuthFingerprint = await readFingerprint(managedAuthPath)
     const authState = await (async () => {
@@ -1318,6 +1407,7 @@ export class OpenCodeProfileManager {
         || nativeCliCredentialBridge.cursorAgentExecutablePath
     }
     delete env.OPENCODE_CONFIG
+    if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     return {
       projectPath: resolvedProjectPath,
@@ -1344,7 +1434,7 @@ export class OpenCodeProfileManager {
       authState,
       env: applyOpenCodeAutoUpdatePolicy(env),
     }
-    })
+    }, options.abortSignal)
   }
 }
 

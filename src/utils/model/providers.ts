@@ -1,4 +1,5 @@
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
+import { hasExplicitAnthropicConnectionMode } from '../anthropicConnectionMode.js'
 import { isEnvTruthy } from '../envUtils.js'
 
 export type APIProvider =
@@ -20,7 +21,9 @@ function getEntryProviderOverride():
   const raw = process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase()
   switch (raw) {
     case 'anthropic':
-      return getAnthropicProviderFromEnv() ?? 'firstParty'
+      return hasExplicitAnthropicConnectionMode()
+        ? 'firstParty'
+        : getAnthropicProviderFromEnv() ?? 'firstParty'
     case 'codex':
     case 'openai':
       return 'openai'

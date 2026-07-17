@@ -3,6 +3,7 @@ import {
   normalizeOpenCodeProviderId,
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
+import { evaluateOpenCodeAgentModelCompatibility } from './OpenCodeAgentModelCompatibility.js'
 
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
@@ -195,6 +196,20 @@ function formatScopedModel(providerId: string, modelId: string): string {
   return formatOpenCodeModelRef(providerId, modelId)
 }
 
+function assertAgentCompatibleModel(
+  resolvedModel: string,
+  snapshot: OpenCodeProvisioningSnapshot,
+): string {
+  const metadata = snapshot.modelMetadata?.find(item => item.id === resolvedModel)
+  const compatibility = evaluateOpenCodeAgentModelCompatibility(resolvedModel, metadata)
+  if (!compatibility.compatible) {
+    throw new Error(
+      `OpenCode model "${resolvedModel}" cannot be used by Agent Teams: ${compatibility.reason}`,
+    )
+  }
+  return resolvedModel
+}
+
 export function resolveOpenCodeProviderScopedModel(
   selectedModel: string,
   snapshot: OpenCodeProvisioningSnapshot,
@@ -207,12 +222,15 @@ export function resolveOpenCodeProviderScopedModel(
         `OpenCode provider-scoped model "${trimmed}" was not found in the live provider catalog`,
       )
     }
-    return scoped.raw
+    return assertAgentCompatibleModel(scoped.raw, snapshot)
   }
 
   const defaultMatch = getDefaultProviderMatch(snapshot, trimmed)
   if (defaultMatch) {
-    return formatScopedModel(defaultMatch.providerId, defaultMatch.modelId)
+    return assertAgentCompatibleModel(
+      formatScopedModel(defaultMatch.providerId, defaultMatch.modelId),
+      snapshot,
+    )
   }
 
   const matches = dedupeModelMatches([
@@ -220,7 +238,10 @@ export function resolveOpenCodeProviderScopedModel(
     ...getLiveProviderModelMatches(snapshot, trimmed),
   ])
   if (matches.length === 1 && matches[0]) {
-    return formatScopedModel(matches[0].providerId, matches[0].modelId)
+    return assertAgentCompatibleModel(
+      formatScopedModel(matches[0].providerId, matches[0].modelId),
+      snapshot,
+    )
   }
 
   const connectedProviders = new Set(
@@ -230,7 +251,10 @@ export function resolveOpenCodeProviderScopedModel(
   )
   const connectedMatches = matches.filter(match => connectedProviders.has(match.providerId))
   if (connectedMatches.length === 1 && connectedMatches[0]) {
-    return formatScopedModel(connectedMatches[0].providerId, connectedMatches[0].modelId)
+    return assertAgentCompatibleModel(
+      formatScopedModel(connectedMatches[0].providerId, connectedMatches[0].modelId),
+      snapshot,
+    )
   }
 
   if (matches.length > 1) {

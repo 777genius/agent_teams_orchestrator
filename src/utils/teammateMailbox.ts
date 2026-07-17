@@ -45,7 +45,28 @@ const LOCK_OPTIONS = {
 export type TeammateMessageKind =
   | 'agent_error'
   | 'member_work_sync_nudge'
+  | 'runtime_recovery_nudge'
   | 'task_comment_notification'
+
+export type AgentErrorMetadataV1 = {
+  schemaVersion: 1
+  type: 'api_error' | 'codex_native_timeout'
+  phase: 'terminal'
+  detail: string
+  failedMessageId: string
+  runtimeSessionId?: string
+  bootstrapRunId?: string
+  innerRecoveryAttempts: number
+}
+
+export type RuntimeRecoveryNudgeMetadataV1 = {
+  schemaVersion: 1
+  recoveryId: string
+  sourceFailureId: string
+  attempt: number
+  reasonCode: string
+  payloadHash: string
+}
 
 export type TeammateMessage = {
   messageId: string
@@ -58,6 +79,8 @@ export type TeammateMessage = {
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
   messageKind?: TeammateMessageKind
+  agentError?: AgentErrorMetadataV1
+  runtimeRecovery?: RuntimeRecoveryNudgeMetadataV1
 }
 
 export function isAgentErrorNotificationMessage(

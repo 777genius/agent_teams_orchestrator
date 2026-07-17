@@ -1,6 +1,139 @@
 import { describe, expect, test } from 'bun:test'
 
+import {
+  getFlagSettingsInline,
+  setFlagSettingsInline,
+} from '../../bootstrap/state.js'
+import {
+  AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+  APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV,
+  APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV,
+} from '../../utils/anthropicConnectionMode.js'
+import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
+import { resetAnthropicRuntimeCatalogCache } from './anthropicCatalog.js'
+
 describe('runtime backend registry with agent_teams capabilities', () => {
+  test('explicit Anthropic API-key mode ignores inherited Bedrock routing end to end', async () => {
+    const envKeys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'ANTHROPIC_BASE_URL',
+      'AWS_PROFILE',
+      'AWS_REGION',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_USE_VERTEX',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+
+    process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+    process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'api_key'
+    process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-direct'
+    process.env.AWS_PROFILE = 'should-not-route-to-bedrock'
+    process.env.AWS_REGION = 'us-east-1'
+    delete process.env.ANTHROPIC_AUTH_TOKEN
+    delete process.env.ANTHROPIC_AWS_WORKSPACE_ID
+    delete process.env.ANTHROPIC_BASE_URL
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+
+    try {
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'anthropic',
+        undefined,
+        { detailLevel: 'summary' },
+      )
+      const anthropic = payload.providers.anthropic
+
+      expect(anthropic?.authenticated).toBe(true)
+      expect(anthropic?.authMethod).toBe('api_key')
+      expect(anthropic?.selectedBackendId).toBeNull()
+      expect(anthropic?.resolvedBackendId).toBeNull()
+      expect(anthropic?.backend).toBeNull()
+    } finally {
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  test('app-managed Anthropic helper is reported as verified API-key helper auth', async () => {
+    const envKeys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV,
+      APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV,
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'CI',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+    ] as const
+    const originalEnv = new Map<string, string | undefined>(
+      envKeys.map(key => [key, process.env[key]]),
+    )
+    const originalFlagSettings = getFlagSettingsInline()
+
+    try {
+      for (const key of envKeys) delete process.env[key]
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'api_key'
+      process.env[APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV] = 'api_key_helper'
+      process.env[APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV] =
+        '/tmp/runtime-settings-anthropic.json'
+      setFlagSettingsInline({
+        apiKeyHelper: "'/tmp/app-managed-anthropic-helper.sh'",
+      })
+      resetSettingsCache()
+      resetAnthropicRuntimeCatalogCache()
+
+      const registryModulePath = new URL('./registry.js', import.meta.url).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+      const payload = await getUnifiedRuntimeStatusPayload(
+        'anthropic',
+        undefined,
+        { detailLevel: 'summary' },
+      )
+
+      expect(payload.providers.anthropic).toMatchObject({
+        authenticated: true,
+        authMethod: 'api_key_helper',
+        selectedBackendId: null,
+        resolvedBackendId: null,
+      })
+    } finally {
+      setFlagSettingsInline(originalFlagSettings)
+      resetSettingsCache()
+      resetAnthropicRuntimeCatalogCache()
+      for (const key of envKeys) {
+        const value = originalEnv.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
   test(
     'anthropic runtime status treats Bedrock as external runtime auth',
     async () => {
@@ -774,7 +907,12 @@ describe('runtime backend registry with agent_teams capabilities', () => {
             { id: 'openai', authHint: 'oauth', source: 'credentials' },
           ],
           availableProviders: ['openai', 'opencode'],
-          models: ['opencode/big-pickle', 'openai/gpt-5.4', 'openai/gpt-5.4-mini'],
+          models: [
+            'opencode/big-pickle',
+            'openai/gpt-5.4',
+            'openai/gpt-5.4-mini',
+            'xai/grok-imagine-image-quality',
+          ],
           modelMetadata: [
             {
               id: 'opencode/big-pickle',
@@ -797,6 +935,25 @@ describe('runtime backend registry with agent_teams capabilities', () => {
                 cost: { input: 1.25, output: 10 },
                 limit: { context: 1050000 },
                 release_date: '2026-03-05',
+                capabilities: {
+                  toolcall: true,
+                  input: { text: true, image: true },
+                  output: { text: true, image: false },
+                },
+              },
+            },
+            {
+              id: 'xai/grok-imagine-image-quality',
+              cost: null,
+              context: 8000,
+              limits: { context: 8000, output: 0 },
+              free: false,
+              raw: {
+                capabilities: {
+                  toolcall: false,
+                  input: { text: true, image: true },
+                  output: { text: false, image: true },
+                },
               },
             },
           ],
@@ -847,6 +1004,19 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
           ?.metadata?.releaseDate,
       ).toBe('2026-03-05')
+      expect(
+        opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
+          ?.inputModalities,
+      ).toEqual(['text', 'image'])
+      expect(
+        opencode?.modelCatalog?.models.find(
+          model => model.id === 'xai/grok-imagine-image-quality',
+        ),
+      ).toMatchObject({
+        hidden: true,
+        statusMessage:
+          'This model does not produce text responses and cannot run as an Agent Teams member.',
+      })
       expect(opencode?.capabilities.teamLaunch).toBe(true)
       expect(opencode?.capabilities.extensions.plugins.status).toBe('read-only')
       expect(opencode?.backend?.kind).toBe('opencode-cli')

@@ -79,7 +79,17 @@ describe('OpenCodeProvisioningProbe', () => {
 
     const probe = new OpenCodeProvisioningProbe({
       inventoryService: {
-        probe: async () => inventory,
+        probe: async () => ({
+          ...inventory,
+          connectedProviders: [
+            ...inventory.connectedProviders,
+            {
+              id: 'Z.AI Coding Plan',
+              authHint: 'api',
+              source: 'credentials' as const,
+            },
+          ],
+        }),
       },
       hostManager: {
         ensureHost: async () => host,
@@ -122,7 +132,7 @@ describe('OpenCodeProvisioningProbe', () => {
               ({
                 all: [{ id: 'openai', name: 'OpenAI' }],
                 default: { openai: 'gpt-5.4-mini' },
-                connected: ['openai'],
+                connected: ['openai', 'zai-coding-plan'],
               }) satisfies OpenCodeProviderResponse,
             getProviderAuth: async () =>
               ({
@@ -180,12 +190,13 @@ describe('OpenCodeProvisioningProbe', () => {
 
     expect(snapshot.hostHealthy).toBe(true)
     expect(snapshot.config?.username).toBe('belief')
-    expect(snapshot.providers?.connected).toEqual(['openai'])
+    expect(snapshot.providers?.connected).toEqual(['openai', 'zai-coding-plan'])
+    expect(snapshot.diagnostics.some(item => item.includes('missing from live host'))).toBe(false)
     expect(snapshot.agents.map(agent => agent.name)).toEqual(['teammate'])
     expect(Object.keys(snapshot.mcp ?? {})).toEqual(['agent-teams'])
     expect(snapshot.appMcp?.status).toBe('present')
     expect(createCalls).toBe(1)
-    expect(refreshCalls).toBe(0)
+    expect(refreshCalls).toBe(1)
     expect(retainedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releasedLeaseTeamIds).toEqual([OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID])
     expect(releaseCalls).toBe(1)
@@ -488,7 +499,7 @@ describe('OpenCodeProvisioningProbe', () => {
 
     const snapshot = await probe.probe('/tmp/project')
     expect(snapshot.diagnostics.some(item => item.includes('missing from live host'))).toBe(true)
-    expect(snapshot.providers?.connected).toEqual(['anthropic', 'openai'])
+    expect(snapshot.providers?.connected).toEqual(['anthropic'])
     expect(snapshot.diagnostics.some(item => item.includes('Managed default agent mismatch'))).toBe(true)
     expect(snapshot.diagnostics.some(item => item.includes('Managed teammate primary agent is missing'))).toBe(true)
     expect(snapshot.diagnostics.some(item => item.includes('agent-teams MCP attach failed'))).toBe(true)
@@ -575,5 +586,87 @@ describe('OpenCodeProvisioningProbe', () => {
     expect(refreshCalls).toBe(1)
     expect(snapshot.host?.resolvedConfigFingerprint).toBe('after-attach')
     expect(snapshot.appMcp?.status).toBe('attached')
+  })
+
+  test('refreshes resolved host fingerprint after verifying an existing app MCP server', async () => {
+    let refreshCalls = 0
+
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: {
+        probe: async () => inventory,
+      },
+      hostManager: {
+        ensureHost: async () => ({ ...host, resolvedConfigFingerprint: 'before-present' }),
+        refreshResolvedConfigFingerprint: async () => {
+          refreshCalls += 1
+          return 'after-present'
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => ({
+            default_agent: 'teammate',
+            share: 'disabled',
+            autoupdate: false,
+            snapshot: true,
+          }),
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], default: {}, connected: ['openai'] }),
+          getProviderAuth: async () => ({}),
+          listAgents: async () => [{ name: 'teammate', mode: 'primary' }],
+          getMcp: async () => ({}),
+          addMcp: async () => {
+            throw new Error('not used')
+          },
+          createSession: async () => {
+            throw new Error('not used')
+          },
+          getSession: async () => {
+            throw new Error('not used')
+          },
+          getSessionStatus: async () => {
+            throw new Error('not used')
+          },
+          getSessionMessages: async () => {
+            throw new Error('not used')
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => {
+            throw new Error('not used')
+          },
+          promptSessionAsync: async () => {
+            throw new Error('not used')
+          },
+          abortSession: async () => {
+            throw new Error('not used')
+          },
+        }),
+      },
+      mcpManager: {
+        ensureAppMcp: async () => ({
+          mcp: {
+            'agent-teams': {
+              connected: true,
+            },
+          },
+          summary: {
+            serverName: 'agent-teams',
+            matchedServerName: 'agent-teams',
+            status: 'present',
+            connected: true,
+            launchSource: 'workspace-dist',
+            availableServerNames: ['agent-teams'],
+            diagnostics: [],
+          },
+        }),
+      },
+    })
+
+    const snapshot = await probe.probe('/tmp/project')
+
+    expect(refreshCalls).toBe(1)
+    expect(snapshot.host?.resolvedConfigFingerprint).toBe('after-present')
+    expect(snapshot.appMcp?.status).toBe('present')
   })
 })

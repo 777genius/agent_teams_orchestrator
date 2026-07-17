@@ -7,9 +7,12 @@ import {
 } from '../../utils/model/gemini.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { openCodeInventoryService } from '../../services/opencode/OpenCodeInventoryService.js'
+import { filterOpenCodeAgentModels } from '../../services/opencode/OpenCodeAgentModelCompatibility.js'
 import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/anthropicCatalog.js'
 import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+
+import type { OpenCodeInventorySnapshot } from '../../services/opencode/types.js'
 
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
 
@@ -24,6 +27,7 @@ type ModelSummary = {
 
 type ModelListDeps = {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
+  getOpenCodeInventorySnapshot?: () => Promise<OpenCodeInventorySnapshot>
 }
 
 function getDefaultProvider(): InternalModelProvider {
@@ -76,11 +80,14 @@ export async function getProviderModels(
         })),
       }
     case 'opencode': {
-      const snapshot = await openCodeInventoryService.probe()
+      const snapshot = await (
+        deps.getOpenCodeInventorySnapshot ?? (() => openCodeInventoryService.probe())
+      )()
+      const models = filterOpenCodeAgentModels(snapshot.models, snapshot.modelMetadata)
       return {
-        defaultModel: snapshot.models[0] ?? '',
+        defaultModel: models[0] ?? '',
         displayName: 'OpenCode',
-        models: snapshot.models.map(model => ({
+        models: models.map(model => ({
           id: model,
           label: model,
           description: 'Discovered from the managed OpenCode inventory probe.',

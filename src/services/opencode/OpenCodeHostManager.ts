@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import net from 'node:net'
-import { mkdir, readlink, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readlink, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
@@ -40,6 +40,8 @@ const OPEN_CODE_HOST_DISPOSE_TIMEOUT_MS = 2_000
 const OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS = 60_000
 const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
+const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS = 5
+const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS = 50
 const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
@@ -199,6 +201,13 @@ function hashJson(value: unknown): string {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+async function normalizeProjectPathForComparison(projectPath: string): Promise<string> {
+  const resolved = path.resolve(projectPath)
+  const canonical = await realpath(resolved).catch(() => resolved)
+  const normalized = path.normalize(canonical)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
 function normalizeResolvedFingerprintValue(
@@ -539,6 +548,38 @@ export class OpenCodeHostManager {
       return this.deps.readProcessCommandLine(pid)
     }
     return readProcessCommandLine(pid)
+  }
+
+  private async captureProcessStartTimeMs(
+    pid: number,
+    abortSignal?: AbortSignal,
+  ): Promise<number | null> {
+    if (this.deps.spawnHostProcess && !this.deps.readProcessStartTimeMs) {
+      return null
+    }
+    for (
+      let attempt = 0;
+      attempt < OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS;
+      attempt += 1
+    ) {
+      if (abortSignal?.aborted) {
+        throwOpenCodeAbortReason(abortSignal)
+      }
+      const startedAtMs = await this.readProcessStartTimeMs(pid).catch(() => null)
+      if (Number.isFinite(startedAtMs) && startedAtMs !== null) {
+        return startedAtMs
+      }
+      if (!this.isProcessAlive(pid)) {
+        return null
+      }
+      if (attempt + 1 < OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS) {
+        await waitForOpenCodeAbortableDelay(
+          OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS,
+          abortSignal,
+        )
+      }
+    }
+    return null
   }
 
   private async verifyLegacyPersistentHostIdentity(
@@ -1327,8 +1368,13 @@ export class OpenCodeHostManager {
         ? await this.getResolvedConfigFingerprint(baseUrl)
         : profile.managedConfigFingerprint
       handle.state = 'healthy'
+      handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
+      if (handle.processStartedAtMs === null && !this.deps.spawnHostProcess) {
+        throw new Error(
+          `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
+        )
+      }
       if (lifetime === 'persistent') {
-        handle.processStartedAtMs = await this.readProcessStartTimeMs(handle.pid).catch(() => null)
         await this.upsertPersistentHost(handle)
       }
       return handle
@@ -1642,6 +1688,10 @@ export class OpenCodeHostManager {
       const mode = options.mode ?? 'stale'
       const force = mode === 'force'
       const nowMs = this.now().getTime()
+      const projectPathFilter = options.projectPath?.trim()
+      const normalizedProjectPathFilter = projectPathFilter
+        ? await normalizeProjectPathForComparison(projectPathFilter)
+        : null
 
       for (const [hostKey, record] of Object.entries(registry.hosts)) {
         const leases = normalizePersistentHostLeases(record.leases)
@@ -1691,15 +1741,20 @@ export class OpenCodeHostManager {
         }
         const leaseCount = Object.keys(leases).length
         const entry = this.hosts.get(hostKey)
-        const projectPath = options.projectPath?.trim()
-        if (projectPath && record.projectPath !== projectPath) {
+        const normalizedRecordProjectPath = normalizedProjectPathFilter
+          ? await normalizeProjectPathForComparison(record.projectPath)
+          : null
+        if (
+          normalizedProjectPathFilter
+          && normalizedRecordProjectPath !== normalizedProjectPathFilter
+        ) {
           hosts.push({
             hostKey,
             projectPath: record.projectPath,
             pid: record.pid,
             port: record.port,
             action: 'kept_filtered',
-            reason: `project path does not match ${projectPath}`,
+            reason: `project path does not match ${projectPathFilter}`,
             leaseCount,
           })
           continue

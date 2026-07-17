@@ -1033,9 +1033,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   test('deep readiness verifies configured authless local models with execution probe', async () => {
     mockRequiredMcpTools()
-    const provisioningOptions: unknown[] = []
+    const provisioningOptions: Array<
+      NonNullable<Parameters<typeof openCodeProvisioningProbe.probe>[1]>
+    > = []
     openCodeProvisioningProbe.probe = async (_projectPath, options) => {
-      provisioningOptions.push(options)
+      provisioningOptions.push(options ?? {})
       return buildReadinessSnapshot({
         configProviders: {
           providers: [
@@ -1093,8 +1095,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(probedModelId).toBe('llama.cpp/qwen-test:0.5b')
     expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
-    expect(probedBypassCache).toBe(true)
-    expect(provisioningOptions).toEqual([
+    expect(probedBypassCache).toBe(false)
+    expect(provisioningOptions.map(({ phaseContext: _phaseContext, ...options }) => options)).toEqual([
       {
         disposeHostOnRelease: process.platform !== 'win32',
         ensureAppMcp: false,
@@ -1105,6 +1107,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
         ensureAppMcp: true,
         bypassCache: true,
       },
+    ])
+    expect(provisioningOptions.map(options => options.phaseContext?.phase)).toEqual([
+      'host_start',
+      'post_probe_refresh',
     ])
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
@@ -1657,7 +1663,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
     expect(probedModelId).toBe('openrouter/minimax-m2.5-free')
     expect(probedDisposeHostOnRelease).toBe(process.platform !== 'win32')
-    expect(probedBypassCache).toBe(true)
+    expect(probedBypassCache).toBe(false)
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
   })
@@ -3966,6 +3972,66 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.teamLaunchState).toBe('launching')
   })
 
+  test('bounds the cross-version launch execution fallback with the command deadline', async () => {
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        configProviders: {
+          providers: [
+            {
+              id: 'llama.cpp',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: 'http://127.0.0.1:8080/v1' },
+              models: { 'qwen-test:0.5b': {} },
+            },
+          ],
+          default: {},
+        },
+        providers: {
+          connected: [],
+          default: {},
+        },
+      })
+    let receivedRuntimeDeadline = false
+    let ensureSessionCalls = 0
+    openCodeExecutionProbe.probeModel = (async input => {
+      receivedRuntimeDeadline = input.runtimeDeadline !== undefined
+      return input.runtimeDeadline!.runPhase(
+        'execution_poll',
+        () => new Promise(() => {}),
+      )
+    }) as typeof openCodeExecutionProbe.probeModel
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensureSessionCalls += 1
+      return buildRecord({
+        laneId: input.laneId,
+        memberName: input.memberName,
+        selectedModel: input.selectedModel,
+      })
+    }) as typeof openCodeSessionBridge.ensureSession
+    const envelope = buildEnvelope('opencode.launchTeam', {
+      runId: 'run-local-authless-timeout',
+      laneId: 'secondary:opencode:bob',
+      teamId: 'team-a',
+      teamName: 'team-a',
+      projectPath: '/tmp/project',
+      selectedModel: 'llama.cpp/qwen-test:0.5b',
+      members: [{ name: 'bob', role: 'Developer', prompt: 'Bob side lane join' }],
+    })
+    envelope.timeoutMs = 20
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+
+    expect(receivedRuntimeDeadline).toBe(true)
+    expect(ensureSessionCalls).toBe(0)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe('timeout')
+    expect(result.error.details).toMatchObject({
+      phase: 'execution_poll',
+      commandBudgetMs: 20,
+    })
+  })
+
   test('allows launch for built-in free OpenCode models without connected providers', async () => {
     openCodeProvisioningProbe.probe = async () =>
       buildReadinessSnapshot({
@@ -6178,7 +6244,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
-  test('keeps acceptance settlement mode alive through turn-settled guard without reconciling inline', async () => {
+  test('returns acceptance settlement mode immediately without turn-settled observation', async () => {
     const record = buildRecord({
       laneId: 'secondary:opencode:bob',
       memberName: 'bob',
@@ -6187,12 +6253,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
     let reconcileCalls = 0
     let postAcceptanceReconcileCalls = 0
     let promptAccepted = false
-    let turnObserved = false
     try {
       openCodeProvisioningProbe.probe = async () => snapshot
       openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
       openCodeSessionBridge.promptAsync = (async () => undefined) as typeof openCodeSessionBridge.promptAsync
-      openCodeSessionBridge.promptAsyncWithTurnSettled = (async (_record, input) => {
+      openCodeSessionBridge.promptAsyncUntilAccepted = (async (_record, input) => {
         const runtimePromptMessageId = 'msg_test_acceptance'
         await input.onPromptSubmitting?.({
           sessionId: record.opencodeSessionId,
@@ -6204,28 +6269,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
           runtimePromptMessageId,
         })
         promptAccepted = true
-        const turnSettled: OpenCodeTurnSettledSummary = {
-          outcome: 'success',
-          sessionId: record.opencodeSessionId,
-          runtimePromptMessageId,
-          turnId: runtimePromptMessageId,
-          endpoint: '/event',
-          streamConnected: true,
-          observedEventCount: 2,
-          matchedEventCount: 2,
-          assistantActivityCount: 1,
-          promptPersisted: true,
-          latestEventType: 'session.status',
-          latestAssistantMessageId: 'msg-assistant-acceptance',
-          diagnostics: [],
-        }
-        await input.onTurnObserved?.({
-          sessionId: record.opencodeSessionId,
-          runtimePromptMessageId,
-          turnSettled,
-        })
-        turnObserved = true
-        return { runtimePromptMessageId, turnSettled, hookDiagnostics: [] }
+        return { runtimePromptMessageId, hookDiagnostics: [] }
+      }) as typeof openCodeSessionBridge.promptAsyncUntilAccepted
+      openCodeSessionBridge.promptAsyncWithTurnSettled = (async () => {
+        throw new Error('acceptance mode must not wait for turn-settled observation')
       }) as typeof openCodeSessionBridge.promptAsyncWithTurnSettled
       openCodeSessionBridge.reconcileSession = (async () => {
         reconcileCalls += 1
@@ -6265,12 +6312,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.responseObservation).toBeUndefined()
       expect(reconcileCalls).toBe(0)
       expect(postAcceptanceReconcileCalls).toBe(0)
-      expect(turnObserved).toBe(true)
       const diagnosticCodes = result.data.diagnostics.map(diagnostic => diagnostic.code)
       expect(diagnosticCodes).toContain('opencode_send_settlement_acceptance')
     } finally {
       openCodeSessionBridge.reconcileSession = originalReconcileSession
       openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
+      openCodeSessionBridge.promptAsyncUntilAccepted = originalPromptAsyncUntilAccepted
     }
   })
 

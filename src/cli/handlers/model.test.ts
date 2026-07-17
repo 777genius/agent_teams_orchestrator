@@ -57,6 +57,43 @@ describe('model list handler', () => {
     expect(details.models.map(model => model.id)).toEqual(['gpt-5.4', 'gpt-5.5'])
   })
 
+  test('excludes non-agent OpenCode models from the CLI catalog', async () => {
+    const details = await getProviderModels('opencode', {
+      getOpenCodeInventorySnapshot: async () => ({
+        detected: true,
+        binaryPath: '/tmp/opencode',
+        version: '1.17.18',
+        projectPath: '/tmp/project',
+        profile: null,
+        connectedProviders: [],
+        availableProviders: ['xai'],
+        models: ['xai/grok-code-fast-1', 'xai/grok-imagine-image-quality'],
+        modelMetadata: [
+          {
+            id: 'xai/grok-imagine-image-quality',
+            cost: null,
+            context: null,
+            limits: null,
+            free: false,
+            raw: {
+              capabilities: {
+                output: { text: false, image: true },
+                toolcall: false,
+              },
+            },
+          },
+        ],
+        agents: [],
+        authStorePath: null,
+        probeError: null,
+        diagnostics: [],
+      }),
+    })
+
+    expect(details.defaultModel).toBe('xai/grok-code-fast-1')
+    expect(details.models.map(model => model.id)).toEqual(['xai/grok-code-fast-1'])
+  })
+
   test('waits for JSON stdout to flush before exiting', async () => {
     const originalWrite = process.stdout.write
     const originalExit = process.exit

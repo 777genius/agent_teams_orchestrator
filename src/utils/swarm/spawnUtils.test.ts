@@ -10,6 +10,7 @@ import {
   setFlagSettingsPath,
   setStrictMcpConfig,
 } from '../../bootstrap/state.js'
+import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../anthropicConnectionMode.js'
 import { parseArguments } from '../argumentSubstitution.js'
 
 import {
@@ -274,6 +275,141 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     expect(env).toContain('CLAUDE_CODE_ENTRY_PROVIDER=anthropic')
     expect(env).toContain("CLAUDE_CODE_USE_OPENAI=''")
     expect(env).toContain("CLAUDE_CODE_USE_GEMINI=''")
+  })
+
+  it('forwards Anthropic connection intent through Anthropic and non-Anthropic teammates', () => {
+    const original = process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV]
+    process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'subscription'
+
+    try {
+      expect(buildInheritedEnvVars({ provider: 'anthropic' })).toContain(
+        `${AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV}=subscription`,
+      )
+      expect(buildInheritedEnvVars({ provider: 'codex' })).toContain(
+        `${AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV}=subscription`,
+      )
+    } finally {
+      if (original === undefined) {
+        delete process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV]
+      } else {
+        process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = original
+      }
+    }
+  })
+
+  it('scrubs inherited gateway routing for explicit direct Anthropic teammates', () => {
+    const keys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+    ] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+
+    try {
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'api_key'
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-direct'
+      process.env.ANTHROPIC_AUTH_TOKEN = 'ambient-token'
+      process.env.ANTHROPIC_BASE_URL = 'https://gateway.example/anthropic'
+      process.env.ANTHROPIC_CUSTOM_HEADERS =
+        'Authorization: Bearer ambient-token'
+      process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'bedrock-model-id'
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-oauth-token'
+
+      const env = buildInheritedEnvObject({ provider: 'anthropic' })
+
+      expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-direct')
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('')
+      expect(env.ANTHROPIC_BASE_URL).toBe('')
+      expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('')
+      expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe('')
+      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('')
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it('preserves compatible endpoint auth while clearing external model aliases', () => {
+    const keys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    ] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+
+    try {
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
+      process.env.ANTHROPIC_AUTH_TOKEN = 'local-token'
+      process.env.ANTHROPIC_BASE_URL = 'http://localhost:1234'
+      process.env.ANTHROPIC_CUSTOM_HEADERS = 'X-Gateway-Tenant: team-1'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'bedrock-opus-id'
+
+      const env = buildInheritedEnvObject({ provider: 'anthropic' })
+
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('local-token')
+      expect(env.ANTHROPIC_BASE_URL).toBe('http://localhost:1234')
+      expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('X-Gateway-Tenant: team-1')
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('')
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it('restores Auto Bedrock routing for a dynamic Anthropic teammate', () => {
+    const keys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+      'CLAUDE_CODE_ENTRY_PROVIDER',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'AWS_PROFILE',
+      'AWS_REGION',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    ] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+
+    try {
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'auto'
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+      process.env.CLAUDE_CODE_USE_BEDROCK = '1'
+      process.env.AWS_PROFILE = 'bedrock-profile'
+      process.env.AWS_REGION = 'us-east-1'
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'bedrock-sonnet-id'
+
+      const env = buildInheritedEnvObject({ provider: 'anthropic' })
+
+      expect(env.CLAUDE_CODE_ENTRY_PROVIDER).toBe('anthropic')
+      expect(env.CLAUDE_CODE_USE_BEDROCK).toBe('1')
+      expect(env.AWS_PROFILE).toBe('bedrock-profile')
+      expect(env.AWS_REGION).toBe('us-east-1')
+      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(
+        'bedrock-sonnet-id',
+      )
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 
   it('pins codex teammate overrides explicitly instead of relying on inherited host defaults', () => {
