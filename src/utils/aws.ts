@@ -1,4 +1,5 @@
 import { logForDebugging } from './debug.js'
+import { clearAWSRegionCache } from './envUtils.js'
 
 /** AWS short-term credentials format. */
 export type AwsCredentials = {
@@ -70,5 +71,9 @@ export async function clearAwsIniCache(): Promise<void> {
     logForDebugging(
       'Failed to clear AWS credential cache (this is expected if no credentials are configured)',
     )
+  } finally {
+    // Clear this only after the SDK has reloaded its shared INI files. Clearing
+    // it first lets a concurrent request resolve and re-cache the old region.
+    clearAWSRegionCache()
   }
 }

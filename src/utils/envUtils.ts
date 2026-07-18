@@ -89,12 +89,95 @@ export function parseEnvVars(
   return parsedEnv
 }
 
+const DEFAULT_AWS_REGION = 'us-east-1'
+
+interface AWSProfileRegionCache {
+  key: string
+  promise: Promise<string>
+  resolved?: string
+}
+
+let awsProfileRegionCache: AWSProfileRegionCache | null = null
+
+function getAWSProfileRegionCacheKey(): string {
+  return [
+    process.env.AWS_PROFILE,
+    process.env.AWS_SHARED_CREDENTIALS_FILE,
+    process.env.AWS_CONFIG_FILE,
+    process.env.HOME,
+    process.env.USERPROFILE,
+  ]
+    .map(value => value ?? '')
+    .join('\0')
+}
+
+function getExplicitAWSRegion(): string | null {
+  return (
+    process.env.AWS_REGION?.trim() ||
+    process.env.AWS_DEFAULT_REGION?.trim() ||
+    null
+  )
+}
+
+export function clearAWSRegionCache(): void {
+  awsProfileRegionCache = null
+}
+
 /**
- * Get the AWS region with fallback to default
- * Matches the Anthropic Bedrock SDK's region behavior
+ * Synchronous best effort for status rendering. Request paths should use
+ * resolveAWSRegion() so an active AWS profile can supply its configured region.
  */
 export function getAWSRegion(): string {
-  return process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1'
+  const explicitRegion = getExplicitAWSRegion()
+  if (explicitRegion) return explicitRegion
+
+  const cacheKey = getAWSProfileRegionCacheKey()
+  return awsProfileRegionCache?.key === cacheKey
+    ? awsProfileRegionCache.resolved ?? DEFAULT_AWS_REGION
+    : DEFAULT_AWS_REGION
+}
+
+/**
+ * Match current Claude Code region precedence without reimplementing AWS INI
+ * parsing: env overrides, then the active profile through the installed AWS
+ * SDK, then the Bedrock default region.
+ */
+export async function resolveAWSRegion(): Promise<string> {
+  const explicitRegion = getExplicitAWSRegion()
+  if (explicitRegion) return explicitRegion
+
+  const cacheKey = getAWSProfileRegionCacheKey()
+  if (awsProfileRegionCache?.key === cacheKey) {
+    return awsProfileRegionCache.promise
+  }
+
+  const cacheEntry: AWSProfileRegionCache = {
+    key: cacheKey,
+    promise: Promise.resolve(DEFAULT_AWS_REGION),
+  }
+  cacheEntry.promise = (async () => {
+    let destroyClient: (() => void) | undefined
+    try {
+      const { BedrockRuntimeClient } = await import(
+        '@aws-sdk/client-bedrock-runtime'
+      )
+      const client = new BedrockRuntimeClient({})
+      destroyClient = () => client.destroy()
+      const profileRegion = (await client.config.region()).trim()
+      return profileRegion || DEFAULT_AWS_REGION
+    } catch {
+      return DEFAULT_AWS_REGION
+    } finally {
+      destroyClient?.()
+    }
+  })().then(region => {
+    if (awsProfileRegionCache === cacheEntry) {
+      cacheEntry.resolved = region
+    }
+    return region
+  })
+  awsProfileRegionCache = cacheEntry
+  return cacheEntry.promise
 }
 
 /**

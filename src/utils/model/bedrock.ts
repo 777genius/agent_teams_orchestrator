@@ -1,6 +1,6 @@
 import memoize from 'lodash-es/memoize.js'
 import { refreshAndGetAwsCredentials } from '../auth.js'
-import { getAWSRegion, isEnvTruthy } from '../envUtils.js'
+import { isEnvTruthy, resolveAWSRegion } from '../envUtils.js'
 import { logError } from '../log.js'
 import { getAWSClientProxyConfig } from '../proxy.js'
 
@@ -49,11 +49,8 @@ export function findFirstMatch(
 
 async function createBedrockClient() {
   const { BedrockClient } = await import('@aws-sdk/client-bedrock')
-  // Match the Anthropic Bedrock SDK's region behavior exactly:
-  // - Reads AWS_REGION or AWS_DEFAULT_REGION env vars (not AWS config files)
-  // - Falls back to 'us-east-1' if neither is set
-  // This ensures we query profiles from the same region the client will use
-  const region = getAWSRegion()
+  // Query profiles from the same env/profile/default region used for requests.
+  const region = await resolveAWSRegion()
 
   const skipAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH)
 
@@ -97,7 +94,7 @@ export async function createBedrockRuntimeClient() {
   const { BedrockRuntimeClient } = await import(
     '@aws-sdk/client-bedrock-runtime'
   )
-  const region = getAWSRegion()
+  const region = await resolveAWSRegion()
   const skipAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH)
 
   const clientConfig: ConstructorParameters<typeof BedrockRuntimeClient>[0] = {

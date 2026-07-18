@@ -25,9 +25,9 @@ import {
 import { getOauthConfig } from '../../constants/oauth.js'
 import { isDebugToStdErr, logForDebugging } from '../../utils/debug.js'
 import {
-  getAWSRegion,
   getVertexRegionForModel,
   isEnvTruthy,
+  resolveAWSRegion,
 } from '../../utils/envUtils.js'
 import {
   getCodexApiKey,
@@ -164,7 +164,7 @@ export async function getAnthropicClient({
       model === getSmallFastModel() &&
       process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
         ? process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
-        : getAWSRegion()
+        : await resolveAWSRegion()
 
     const bedrockArgs: Record<string, unknown> = {
       ...ARGS,
