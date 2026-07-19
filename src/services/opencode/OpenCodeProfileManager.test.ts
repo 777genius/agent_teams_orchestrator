@@ -13,6 +13,7 @@ import {
   ensureOpenCodeCursorPluginAuthCredential,
   ensureOpenCodeKiroPluginAuthCredential,
   ensureOpenCodeNativeCliCredentialBridge,
+  isKiroCliWhoamiAuthenticated,
   OpenCodeProfileManager,
   orderOpenCodeAuthSyncSources,
 } from './OpenCodeProfileManager.js'
@@ -105,6 +106,26 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('parses the first balanced Kiro whoami JSON object before its Profile trailer', () => {
+    expect(isKiroCliWhoamiAuthenticated({
+      stdout: '{"accountType":"IamIdentityCenter","email":"user@example.com"}\n\nProfile:\nKiroProfile',
+    })).toBe(true)
+  })
+
+  test('treats logged-out and malformed Kiro whoami payloads as unauthenticated', () => {
+    expect(isKiroCliWhoamiAuthenticated({ stdout: '{"account":null}' })).toBe(false)
+    expect(isKiroCliWhoamiAuthenticated({ stdout: '{not valid json' })).toBe(false)
+    expect(isKiroCliWhoamiAuthenticated({ stdout: '{"accountType":"   "}' })).toBe(false)
+  })
+
+  test('accepts authenticated Kiro whoami JSON from stderr despite a non-zero exit', () => {
+    expect(isKiroCliWhoamiAuthenticated({
+      error: Object.assign(new Error('exit 1'), { code: 1 }),
+      stdout: '',
+      stderr: '{"accountType":"BuilderId"}',
+    })).toBe(true)
   })
 
   test('tracks project plugin sources without shadowing plugin config in managed overrides', async () => {
@@ -629,6 +650,35 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test('rechecks and removes a fresh Kiro marker after CLI logout', async () => {
+    const globalAuthPath = path.join(tempDir, 'kiro-fresh-logged-out-global.json')
+    const managedAuthPath = path.join(tempDir, 'kiro-fresh-logged-out-managed.json')
+    const freshStore = JSON.stringify({
+      kiro: { type: 'oauth', access: 'authenticated', refresh: '', expires: 30_000_000 },
+      openai: { type: 'oauth', access: 'keep-me' },
+    })
+    await Promise.all([
+      writeFile(globalAuthPath, freshStore),
+      writeFile(managedAuthPath, freshStore),
+    ])
+    const probe = mock(async () => false)
+
+    expect(await ensureOpenCodeKiroPluginAuthCredential({
+      globalAuthPath,
+      managedAuthPath,
+      kiroCliExecutablePath: '/test/kiro-cli',
+      probe,
+      now: () => 1_000,
+    })).toBe(false)
+
+    expect(probe).toHaveBeenCalledTimes(1)
+    for (const authPath of [globalAuthPath, managedAuthPath]) {
+      expect(JSON.parse(await readFile(authPath, 'utf8'))).toEqual({
+        openai: { type: 'oauth', access: 'keep-me' },
+      })
+    }
+  })
+
   test('can prepare a managed profile without the app MCP overlay for model-only probes', async () => {
     const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
     const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
@@ -826,7 +876,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(managedConfig.model).toBe('ollama/qwen2.5-coder:0.5b')
       expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
       expect(managedConfig.plugin).toEqual([
-        'opencode-kiro@0.3.6',
+        'opencode-kiro@0.4.0',
         '@rama_nigg/open-cursor@2.5.2',
       ])
       expect(managedConfig).not.toHaveProperty('permission')
@@ -1175,7 +1225,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         firstProfile.xdgCacheHome,
         'opencode',
         'packages',
-        'opencode-kiro@0.3.6',
+        'opencode-kiro@0.4.0',
       )
       await mkdir(interruptedCachePath, { recursive: true })
 
