@@ -202,7 +202,7 @@ const ZAI_CODING_PLAN_MODELS = {
 // https://github.com/NachoFLizaur/kiro-acp-ai-provider/pull/4.
 // Switch back to the registry package after upstream publishes the fix.
 const KIRO_ACP_PROVIDER_PACKAGE =
-  'kiro-acp-ai-provider@https://github.com/777genius/kiro-acp-ai-provider/releases/download/agent-teams-mcp-readiness-v11/kiro-acp-ai-provider-2.1.2.tgz'
+  'kiro-acp-ai-provider@https://github.com/777genius/kiro-acp-ai-provider/releases/download/agent-teams-mcp-readiness-v12/kiro-acp-ai-provider-3.0.0.tgz'
 
 function xiaomiTokenPlanDefinition(input: {
   id: string
