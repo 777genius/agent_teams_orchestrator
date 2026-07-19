@@ -1173,8 +1173,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
   for (const outcome of ['unavailable', 'unknown'] as const) {
     test(`deep readiness reports ${outcome} configured authless local model probes as model unavailable`, async () => {
       mockRequiredMcpTools()
-      openCodeProvisioningProbe.probe = async () =>
-        buildReadinessSnapshot({
+      let provisioningProbeCalls = 0
+      openCodeProvisioningProbe.probe = async () => {
+        provisioningProbeCalls += 1
+        if (outcome === 'unavailable' && provisioningProbeCalls > 1) {
+          throw new Error('Terminal model failures must not wait for post-probe refresh')
+        }
+        return buildReadinessSnapshot({
           configProviders: {
             providers: [
               {
@@ -1191,6 +1196,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
             default: {},
           },
         })
+      }
       openCodeExecutionProbe.probeModel = (async input => ({
         providerId: 'opencode' as const,
         modelId: input.selectedModel,
@@ -1223,6 +1229,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(result.data.state).toBe('model_unavailable')
       expect(result.data.launchAllowed).toBe(false)
       expect(result.data.missing[0]).toBe(`Local model probe ended as ${outcome}`)
+      expect(provisioningProbeCalls).toBe(outcome === 'unavailable' ? 1 : 2)
     })
   }
 
@@ -1666,6 +1673,121 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(probedBypassCache).toBe(false)
     expect(result.data.state).toBe('ready')
     expect(result.data.launchAllowed).toBe(true)
+  })
+
+  test('returns terminal Cursor native preflight before provisioning an OpenCode host', async () => {
+    mockRequiredMcpTools()
+    const previousBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+    let provisioningCalls = 0
+    let executionProbeCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      provisioningCalls += 1
+      return buildReadinessSnapshot()
+    }
+    openCodeExecutionProbe.probeModel = (async input => {
+      executionProbeCalls += 1
+      expect(input.selectedModel).toBe('cursor-acp/auto')
+      expect(input.cursorNativePreflightBeforeHost).toBe(true)
+      expect(input.cursorNativePreflightOnly).toBe(true)
+      expect(input.bypassCache).toBeUndefined()
+      return {
+        providerId: 'opencode' as const,
+        modelId: input.selectedModel,
+        probePrompt: 'Output only the single word PONG.',
+        expectedOutput: 'PONG',
+        outcome: 'unavailable' as const,
+        reason: "You've hit your Cursor usage limit",
+        durationMs: 31,
+        rawStatus: null,
+        durableState: 'unknown' as const,
+        latestAssistantText: null,
+        latestAssistantPreview: null,
+        toolCallCount: 0,
+        errorCount: 1,
+        diagnostics: ['Cursor native failure probe confirmed a terminal provider error'],
+      }
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    try {
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.readiness', {
+          projectPath: '/tmp/project',
+          selectedModel: 'cursor-acp/auto',
+          requireExecutionProbe: true,
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.state).toBe('model_unavailable')
+      expect(result.data.launchAllowed).toBe(false)
+      expect(result.data.hostHealthy).toBe(false)
+      expect(result.data.appMcpConnected).toBe(false)
+      expect(result.data.missing).toEqual(["You've hit your Cursor usage limit"])
+      expect(result.data.diagnostics.join('\n')).toContain('Skipped OpenCode host startup')
+      expect(executionProbeCalls).toBe(1)
+      expect(provisioningCalls).toBe(0)
+    } finally {
+      if (previousBinaryPath == null) {
+        delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      } else {
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = previousBinaryPath
+      }
+    }
+  })
+
+  test('does not fall back to OpenCode after bounded Cursor native preflight timeout', async () => {
+    const previousBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+    let provisioningCalls = 0
+    openCodeProvisioningProbe.probe = async () => {
+      provisioningCalls += 1
+      return buildReadinessSnapshot()
+    }
+    openCodeExecutionProbe.probeModel = (async input => ({
+      providerId: 'opencode' as const,
+      modelId: input.selectedModel,
+      probePrompt: 'Output only the single word PONG.',
+      expectedOutput: 'PONG',
+      outcome: 'unknown' as const,
+      reason: 'Cursor native execution preflight timed out after 65000ms',
+      durationMs: 65_000,
+      rawStatus: null,
+      durableState: 'unknown' as const,
+      latestAssistantText: null,
+      latestAssistantPreview: null,
+      toolCallCount: 0,
+      errorCount: 1,
+      diagnostics: ['Cursor native execution preflight timed out after 65000ms'],
+      failureCode: 'execution_timeout' as const,
+    })) as typeof openCodeExecutionProbe.probeModel
+
+    try {
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.readiness', {
+          projectPath: '/tmp/project',
+          selectedModel: 'cursor-acp/auto',
+          requireExecutionProbe: true,
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.data.state).toBe('model_unavailable')
+      expect(result.data.launchAllowed).toBe(false)
+      expect(result.data.missing).toEqual([
+        'Cursor native execution preflight timed out after 65000ms',
+      ])
+      expect(result.data.diagnostics.join('\n')).toContain('native preflight timed out')
+      expect(provisioningCalls).toBe(0)
+    } finally {
+      if (previousBinaryPath == null) {
+        delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+      } else {
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = previousBinaryPath
+      }
+    }
   })
 
   test('readiness fails when app MCP message_send is missing', async () => {

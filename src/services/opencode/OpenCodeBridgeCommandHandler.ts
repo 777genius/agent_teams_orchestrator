@@ -13,6 +13,7 @@ import {
   parseOpenCodeExecutionProof,
   validateOpenCodeExecutionProof,
 } from './OpenCodeExecutionProof.js'
+import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { readOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import {
@@ -2263,6 +2264,48 @@ function mcpUnavailableReadinessData(input: {
   }
 }
 
+function preHostCursorFailureReadinessData(input: {
+  selectedModel: string
+  binaryPath: string
+  executionOutcome: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>>
+  toolProof: AppMcpToolProof
+}) {
+  const reason = input.executionOutcome.reason
+    ?? 'Cursor selected model execution is unavailable'
+  const appMcpProven = input.toolProof.route !== null && input.toolProof.ok
+  return {
+    state: input.executionOutcome.outcome === 'not_authenticated'
+      ? 'not_authenticated'
+      : 'model_unavailable',
+    launchAllowed: false,
+    modelId: input.selectedModel,
+    availableModels: [],
+    opencodeVersion: null,
+    installMethod: 'unknown',
+    binaryPath: input.binaryPath,
+    hostHealthy: false,
+    appMcpConnected: appMcpProven,
+    requiredToolsPresent: appMcpProven,
+    permissionBridgeReady: true,
+    runtimeStoresReady: true,
+    supportLevel: null,
+    missing: [reason],
+    diagnostics: uniqueSortedStrings([
+      ...input.executionOutcome.diagnostics,
+      ...input.toolProof.diagnostics,
+      input.executionOutcome.failureCode === 'execution_timeout'
+        ? 'Skipped OpenCode host startup and Agent Teams MCP direct preflight because Cursor native preflight timed out.'
+        : 'Skipped OpenCode host startup and Agent Teams MCP direct preflight because Cursor native preflight returned a terminal provider failure.',
+    ]),
+    evidence: {
+      capabilitiesReady: true,
+      mcpToolProofRoute: input.toolProof.route,
+      observedMcpTools: input.toolProof.observedTools,
+      runtimeStoreReadinessReason: 'runtime_store_manifest_valid',
+    },
+  }
+}
+
 async function runReadiness(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
@@ -2310,6 +2353,55 @@ async function runReadiness(
       throw error
     }
   }
+  let earlyCursorExecutionOutcome: Awaited<ReturnType<
+    typeof openCodeExecutionProbe.probeModel
+  >> | undefined
+  const parsedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
+  const openCodeBinaryPath = shouldProbeSelectedModel
+    && parsedSelectedModel?.providerId === 'cursor-acp'
+    ? resolveOpenCodeBinaryPath()
+    : null
+  if (
+    shouldProbeSelectedModel
+    && selectedModel !== null
+    && parsedSelectedModel?.providerId === 'cursor-acp'
+    && openCodeBinaryPath
+  ) {
+    earlyCursorExecutionOutcome = await openCodeExecutionProbe.probeModel({
+      selectedModel,
+      projectPath,
+      disposeHostOnRelease: disposeReadinessHostOnRelease,
+      runtimeDeadline,
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
+    }).catch(error => {
+      if (isOpenCodeRuntimeDeadlineError(error)) throw error
+      return buildOpenCodeExecutionOutcome(
+        selectedModel,
+        'unknown',
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+    if (
+      earlyCursorExecutionOutcome.outcome === 'unavailable'
+      || earlyCursorExecutionOutcome.outcome === 'not_authenticated'
+      || earlyCursorExecutionOutcome.failureCode === 'execution_timeout'
+    ) {
+      return {
+        snapshot: null,
+        data: preHostCursorFailureReadinessData({
+          selectedModel,
+          binaryPath: openCodeBinaryPath,
+          executionOutcome: earlyCursorExecutionOutcome,
+          toolProof: skippedAppMcpToolProof(),
+        }),
+      }
+    }
+    if (earlyCursorExecutionOutcome.outcome !== 'available') {
+      earlyCursorExecutionOutcome = undefined
+    }
+  }
+
   let directToolProof: AppMcpToolProof | null = shouldProbeSelectedModel
     ? await runDirectToolProof()
     : null
@@ -2430,24 +2522,45 @@ async function runReadiness(
       executionModel,
       modelSnapshot,
     )
-    const executionOutcome = await openCodeExecutionProbe.probeModel({
-      selectedModel: executionModel,
-      projectPath: modelSnapshot.projectPath,
-      // OAuth credentials can rotate or expire independently, so they always
-      // receive a fresh execution request. API-key and authless local models
-      // may reuse the exact short-lived execution result.
-      bypassCache,
-      disposeHostOnRelease: disposeReadinessHostOnRelease,
-      runtimeDeadline,
-    }).catch(error => {
-      if (isOpenCodeRuntimeDeadlineError(error)) throw error
-      return buildOpenCodeExecutionOutcome(
-        executionModel,
-        'unknown',
-        error instanceof Error ? error.message : String(error),
-      )
-    })
+    const executionOutcome = earlyCursorExecutionOutcome
+      ?? await openCodeExecutionProbe.probeModel({
+        selectedModel: executionModel,
+        projectPath: modelSnapshot.projectPath,
+        // OAuth credentials can rotate or expire independently, so they always
+        // receive a fresh execution request. API-key and authless local models
+        // may reuse the exact short-lived execution result.
+        bypassCache,
+        disposeHostOnRelease: disposeReadinessHostOnRelease,
+        runtimeDeadline,
+      }).catch(error => {
+        if (isOpenCodeRuntimeDeadlineError(error)) throw error
+        return buildOpenCodeExecutionOutcome(
+          executionModel,
+          'unknown',
+          error instanceof Error ? error.message : String(error),
+        )
+      })
     executionOutcomePromise = Promise.resolve(executionOutcome)
+    if (executionOutcome.outcome === 'unavailable') {
+      const terminalReadiness = readinessData(
+        modelSnapshot,
+        executionModel,
+        executionOutcome,
+        directToolProof,
+        requireSelectedModel,
+      )
+      return {
+        snapshot: modelSnapshot,
+        data: {
+          ...terminalReadiness,
+          state: 'model_unavailable',
+          launchAllowed: false,
+          missing: [
+            executionOutcome.reason ?? 'OpenCode selected model execution is unavailable',
+          ],
+        },
+      }
+    }
     snapshot = await runProvisioningPhase('post_probe_refresh', {
       disposeHostOnRelease: disposeReadinessHostOnRelease,
       ensureAppMcp: true,

@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { withTimeout } from '../../utils/sleep.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import {
+  openCodeCursorNativeFailureProbe,
+  type OpenCodeCursorNativeProbeResult,
+} from './OpenCodeCursorNativeFailureProbe.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import {
   createOpenCodePreflightHostLeaseInput,
@@ -13,6 +18,7 @@ import {
 import { withOpenCodeOAuthRefreshLock } from './OpenCodeAuthStore.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 import {
+  ensureOpenCodeNativeCliCredentialBridge,
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
@@ -30,6 +36,7 @@ import type {
   OpenCodeExecutionProbeResult,
   OpenCodeHostHandle,
   OpenCodeMessage,
+  OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionStatusInput,
 } from './types.js'
@@ -48,13 +55,20 @@ const OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS = 150
 const OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT = 512
 const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
 const OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT = 262_144
+const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_DISABLED_ENV =
+  'AGENT_TEAMS_OPENCODE_CURSOR_NATIVE_FAILURE_PROBE_DISABLED'
+const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
+const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
-  prepareProfile?: (projectPath?: string | null) => Promise<OpenCodePreparedProfile>
+  prepareProfile?: (
+    projectPath?: string | null,
+    options?: OpenCodePrepareProfileOptions,
+  ) => Promise<OpenCodePreparedProfile>
   sleep?: (ms: number) => Promise<void>
   probeTimeoutMs?: number
   pollIntervalMs?: number
@@ -68,6 +82,7 @@ type OpenCodeExecutionProbeDeps = {
     sourceAuthPath: string
   }) => Promise<void>
   withOAuthRefreshLock?: typeof withOpenCodeOAuthRefreshLock
+  cursorNativeFailureProbe?: Pick<typeof openCodeCursorNativeFailureProbe, 'probe'>
 }
 
 type ProbeCacheFile = {
@@ -91,6 +106,14 @@ type ProbeModelParams = {
   bypassCache?: boolean
   disposeHostOnRelease?: boolean
   runtimeDeadline?: OpenCodeRuntimeDeadline
+  cursorNativePreflightBeforeHost?: boolean
+  cursorNativePreflightOnly?: boolean
+}
+
+type CursorNativeProbeContext = {
+  projectPath: string
+  env: NodeJS.ProcessEnv
+  cleanup?: () => Promise<void>
 }
 
 function messageMatchesPrompt(message: OpenCodeMessage | null, messageID: string): boolean {
@@ -110,6 +133,29 @@ function statusIsRunning(value: unknown): boolean {
     || record.type === 'retry'
     || record.status === 'busy'
     || record.status === 'retry'
+}
+
+function getRetryStatusMessage(value: OpenCodeSessionStatusInput | null): string | null {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  if (record.type !== 'retry' && record.status !== 'retry') return null
+  return extractNestedKnownFailureMessage(record) ?? extractNestedErrorMessage(record)
+}
+
+function statusIsRetrying(value: OpenCodeSessionStatusInput | null): boolean {
+  if (value === 'retry') return true
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return record.type === 'retry' || record.status === 'retry'
+}
+
+function classifyRetryStatusFailure(
+  value: OpenCodeSessionStatusInput | null,
+): ReturnType<typeof classifyProbeFailure> | null {
+  const message = getRetryStatusMessage(value)
+  if (!message) return null
+  const classified = classifyProbeFailure({ message })
+  return classified.outcome === 'unknown' ? null : classified
 }
 
 function parseProviderScopedModel(selectedModel: string): {
@@ -158,6 +204,18 @@ function normalizeFailureMessage(value: string): string {
   return trimmed
 }
 
+function isUsageLimitFailureMessage(lower: string): boolean {
+  return lower.includes('too many requests')
+    || /\b(?:rate|usage)[\s_-]*limit(?:error)?\b/.test(lower)
+    || /\bresource[\s_-]*exhausted(?:error)?\b/.test(lower)
+    || /\bfree[\s_-]*usage[\s_-]*(?:limit|exceeded)(?:error)?\b/.test(lower)
+    || /\bquota[\s_-]*exceeded(?:error)?\b/.test(lower)
+    || /\bgrpc[\s_-]*code["']?\s*[:=]\s*["']?8\b/.test(lower)
+    || /^\s*(?:error\s*[:=-]?\s*)?429\b/m.test(lower)
+    || /\b(?:http(?:[\s_-]*status)?|status(?:[\s_-]*code)?|error(?:[\s_-]*code)?|code)["']?\s*(?::|=|is|of)?\s*["']?429\b/.test(lower)
+    || /\b429\s+(?:too many requests|rate limit(?:ed)?|resource exhausted)\b/.test(lower)
+}
+
 function extractJsonMessage(value: string): string | null {
   try {
     return extractNestedErrorMessage(JSON.parse(value))
@@ -185,7 +243,7 @@ function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
       return candidate.trim()
     }
   }
-  for (const key of ['error', 'data', 'responseBody', 'body']) {
+  for (const key of ['error', 'cause', 'data', 'responseBody', 'body', 'response']) {
     const candidate = extractNestedErrorMessage(record[key], depth + 1)
     if (candidate) {
       return candidate
@@ -200,6 +258,15 @@ export function classifyProbeFailure(params: {
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
   const reason = normalizeFailureMessage(params.message)
   const lower = reason.toLowerCase()
+
+  // Provider quota markers are more specific than an accompanying HTTP 401/403.
+  // Some gateways wrap RESOURCE_EXHAUSTED in a generic forbidden response.
+  if (isUsageLimitFailureMessage(lower)) {
+    return {
+      outcome: 'unavailable',
+      reason,
+    }
+  }
 
   if (
     lower.includes('token refresh failed')
@@ -235,11 +302,6 @@ export function classifyProbeFailure(params: {
     || lower.includes('unknown model')
     || lower.includes('invalid model')
     || lower.includes('not available for your account')
-    || lower.includes('rate limit')
-    || lower.includes('usage limit')
-    || lower.includes('too many requests')
-    || lower.includes('freeusagelimit')
-    || /\b429\b/.test(lower)
   ) {
     return {
       outcome: 'unavailable',
@@ -253,6 +315,160 @@ export function classifyProbeFailure(params: {
   }
 }
 
+function buildCursorNativeExecutionOutcome(input: {
+  nativeResult: OpenCodeCursorNativeProbeResult | null
+  selectedModel: string
+  prompt: string
+  expectedOutput: string
+  startedAtMs: number
+  diagnostics: Set<string>
+}): OpenCodeExecutionProbeResult | null {
+  const { nativeResult, diagnostics } = input
+  if (nativeResult?.outcome === 'available') {
+    diagnostics.add(
+      `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
+    )
+    return {
+      providerId: 'opencode',
+      modelId: input.selectedModel,
+      probePrompt: input.prompt,
+      expectedOutput: input.expectedOutput,
+      outcome: 'available',
+      reason: null,
+      durationMs: buildDurationMs(input.startedAtMs),
+      rawStatus: null,
+      durableState: 'idle',
+      latestAssistantText: null,
+      latestAssistantPreview: null,
+      toolCallCount: 0,
+      errorCount: 0,
+      diagnostics: Array.from(diagnostics),
+      verifiedAt: new Date().toISOString(),
+    }
+  }
+
+  if (nativeResult?.outcome !== 'failure') return null
+  const classified = classifyProbeFailure({ message: nativeResult.message ?? '' })
+  if (classified.outcome === 'unknown') return null
+  diagnostics.add(classified.reason)
+  diagnostics.add(
+    `Cursor native failure probe confirmed a terminal provider error in ${nativeResult.durationMs}ms`,
+  )
+  return {
+    providerId: 'opencode',
+    modelId: input.selectedModel,
+    probePrompt: input.prompt,
+    expectedOutput: input.expectedOutput,
+    outcome: classified.outcome,
+    reason: classified.reason,
+    durationMs: buildDurationMs(input.startedAtMs),
+    rawStatus: null,
+    durableState: 'unknown',
+    latestAssistantText: null,
+    latestAssistantPreview: null,
+    toolCallCount: 0,
+    errorCount: 1,
+    diagnostics: Array.from(diagnostics),
+  }
+}
+
+function knownFailureMessagePriority(message: string | null): number {
+  if (!message) return 0
+  if (isUsageLimitFailureMessage(message.toLowerCase())) return 3
+  const classified = classifyProbeFailure({ message })
+  if (classified.outcome === 'not_authenticated') return 2
+  if (classified.outcome === 'unavailable') return 1
+  return 0
+}
+
+function extractNestedKnownFailureMessage(value: unknown, depth = 0): string | null {
+  if (depth > 10) return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    let nested: string | null = null
+    try {
+      nested = extractNestedKnownFailureMessage(JSON.parse(trimmed), depth + 1)
+    } catch {
+      // Plain provider error text.
+    }
+    const direct = classifyProbeFailure({ message: trimmed }).outcome === 'unknown'
+      ? null
+      : trimmed
+    return knownFailureMessagePriority(nested) >= knownFailureMessagePriority(direct)
+      ? nested
+      : direct
+  }
+  if (!value || typeof value !== 'object') return null
+  let bestMessage: string | null = null
+  let bestPriority = 0
+  const consider = (candidate: string | null) => {
+    const priority = knownFailureMessagePriority(candidate)
+    if (priority > bestPriority) {
+      bestMessage = candidate
+      bestPriority = priority
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      consider(extractNestedKnownFailureMessage(item, depth + 1))
+    }
+    return bestMessage
+  }
+
+  const record = value as Record<string, unknown>
+  for (const key of [
+    'message',
+    'reason',
+    'detail',
+    'title',
+    'name',
+    'type',
+    'code',
+    'errorCode',
+    'error_code',
+  ]) {
+    consider(extractNestedKnownFailureMessage(record[key], depth + 1))
+  }
+  for (const key of [
+    'error',
+    'errors',
+    'cause',
+    'data',
+    'details',
+    'innerError',
+    'inner_error',
+    'metadata',
+    'responseBody',
+    'body',
+    'response',
+  ]) {
+    consider(extractNestedKnownFailureMessage(record[key], depth + 1))
+  }
+  for (const key of ['grpcCode', 'grpc_code']) {
+    const candidate = record[key]
+    if (candidate === 8 || candidate === '8') {
+      consider('grpc_code=8')
+    } else {
+      consider(extractNestedKnownFailureMessage(candidate, depth + 1))
+    }
+  }
+  for (const key of ['statusCode', 'status_code', 'httpStatus', 'http_status']) {
+    const candidate = record[key]
+    if (candidate === 429 || candidate === '429') {
+      consider('HTTP 429')
+    } else {
+      consider(extractNestedKnownFailureMessage(candidate, depth + 1))
+    }
+  }
+  return bestMessage
+}
+
+function failureMessageFromUnknown(value: unknown): string {
+  return extractNestedKnownFailureMessage(value)
+    ?? (value instanceof Error ? value.message : String(value))
+}
+
 function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['diagnostics'], rawMessages: OpenCodeMessage[]): string | null {
   for (let index = rawMessages.length - 1; index >= 0; index -= 1) {
     const candidate = rawMessages[index]
@@ -260,13 +476,15 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
     if (!info || info.role !== 'assistant' || typeof info !== 'object') {
       continue
     }
-    const error = typeof info.error === 'object' && info.error !== null
-      ? info.error as Record<string, unknown>
+    const error = info.error ?? null
+    const errorRecord = error && typeof error === 'object' && !Array.isArray(error)
+      ? error as Record<string, unknown>
       : null
-    const data = error && typeof error.data === 'object' && error.data !== null
-      ? error.data as Record<string, unknown>
-      : null
-    const message = extractNestedErrorMessage(error) ?? extractNestedErrorMessage(data)
+    const data = errorRecord?.data ?? null
+    const message = extractNestedKnownFailureMessage(error)
+      ?? extractNestedKnownFailureMessage(data)
+      ?? extractNestedErrorMessage(error)
+      ?? extractNestedErrorMessage(data)
     if (message) {
       return message
     }
@@ -289,6 +507,8 @@ function buildProbeCacheKey(params: ProbeModelParams): string {
     params.expectedOutput?.trim() || OPEN_CODE_EXECUTION_PROBE_EXPECTED_OUTPUT,
     String(params.contextTokens ?? ''),
     String(params.outputTokens ?? ''),
+    params.cursorNativePreflightBeforeHost === true ? 'native-before-host' : 'host-first',
+    params.cursorNativePreflightOnly === true ? 'native-only' : 'opencode-fallback',
   ].join('\u0000')
 }
 
@@ -304,13 +524,7 @@ function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number 
     return OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS
   }
   const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
-  if (
-    lower.includes('rate limit')
-    || lower.includes('usage limit')
-    || lower.includes('too many requests')
-    || lower.includes('freeusagelimit')
-    || /\b429\b/.test(lower)
-  ) {
+  if (result.outcome === 'unavailable' && isUsageLimitFailureMessage(lower)) {
     return OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS
   }
   return 0
@@ -411,13 +625,104 @@ async function writePersistentProbeCache(
 }
 
 export class OpenCodeExecutionProbe {
-  private readonly inFlightProbes = new Map<string, Promise<OpenCodeExecutionProbeResult>>()
+  private readonly inFlightProbes = new Map<string, {
+    promise: Promise<OpenCodeExecutionProbeResult>
+    deadlineAtMs: number | null
+  }>()
   private readonly probeCache = new Map<
     string,
     { expiresAtMs: number, result: OpenCodeExecutionProbeResult }
   >()
 
   constructor(private readonly deps: OpenCodeExecutionProbeDeps = {}) {}
+
+  private async prepareProbeProfile(
+    params: ProbeModelParams,
+    context?: OpenCodePhaseContext,
+  ): Promise<OpenCodePreparedProfile> {
+    const options: OpenCodePrepareProfileOptions = {
+      includeAppMcp: false,
+      modelOutputLimitOverrides: [
+        {
+          modelId: params.selectedModel,
+          outputTokens: params.outputTokens ?? OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT,
+          contextTokens:
+            params.contextTokens
+            ?? resolveOpenCodeExecutionProbeContextTokens(params.selectedModel),
+        },
+      ],
+      ...(context ? { abortSignal: context.signal } : {}),
+    }
+    return this.deps.prepareProfile
+      ? this.deps.prepareProfile(params.projectPath, options)
+      : openCodeProfileManager.prepareProfile(params.projectPath, options)
+  }
+
+  private async prepareInitialCursorNativeProbeContext(
+    params: ProbeModelParams,
+    context?: OpenCodePhaseContext,
+  ): Promise<CursorNativeProbeContext> {
+    if (this.deps.prepareProfile) {
+      const profile = await this.prepareProbeProfile(params, context)
+      return {
+        projectPath: profile.tmpPath,
+        env: profile.env,
+      }
+    }
+
+    const probeRoot = await mkdtemp(path.join(os.tmpdir(), 'agent-teams-cursor-native-'))
+    try {
+      const projectPath = path.join(probeRoot, 'workspace')
+      await mkdir(projectPath, { recursive: true })
+      const bridge = await ensureOpenCodeNativeCliCredentialBridge(probeRoot)
+      context?.throwIfExpired()
+      return {
+        projectPath,
+        env: {
+          ...process.env,
+          PATH: [bridge.binPath, process.env.PATH]
+            .filter((value): value is string => Boolean(value))
+            .join(path.delimiter),
+          CURSOR_ACP_HOME_DIR:
+            process.env.CURSOR_ACP_HOME_DIR?.trim() || bridge.hostHomePath,
+          CURSOR_AGENT_EXECUTABLE:
+            bridge.cursorAgentExecutablePath,
+        },
+        cleanup: () => rm(probeRoot, { recursive: true, force: true }),
+      }
+    } catch (error) {
+      await rm(probeRoot, { recursive: true, force: true }).catch(() => undefined)
+      throw error
+    }
+  }
+
+  private async runInitialCursorNativeProbe(input: {
+    params: ProbeModelParams
+    context: CursorNativeProbeContext
+    diagnostics: Set<string>
+  }): Promise<OpenCodeCursorNativeProbeResult | null> {
+    const nativeFailureProbe = this.cursorNativeFailureProbe
+    if (!nativeFailureProbe) return null
+    try {
+      return await this.runPhase(
+        input.params.runtimeDeadline,
+        'execution_poll',
+        context => nativeFailureProbe.probe({
+          selectedModel: input.params.selectedModel,
+          projectPath: input.context.projectPath,
+          env: input.context.env,
+          signal: context?.signal,
+          delayMs: 0,
+        }),
+      )
+    } catch (error) {
+      if (isOpenCodeRuntimeDeadlineError(error)) throw error
+      input.diagnostics.add(
+        `Cursor native failure probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return null
+    }
+  }
 
   private get hostManager() {
     return this.deps.hostManager ?? openCodeHostManager
@@ -429,6 +734,14 @@ export class OpenCodeExecutionProbe {
 
   private get eventTranslator() {
     return this.deps.eventTranslator ?? openCodeEventTranslator
+  }
+
+  private get cursorNativeFailureProbe() {
+    // Custom clients are hermetic unit/fixture probes. The production singleton
+    // gets the native Cursor fallback unless a test explicitly injects one.
+    if (this.deps.cursorNativeFailureProbe) return this.deps.cursorNativeFailureProbe
+    if (process.env[OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_DISABLED_ENV] === '1') return null
+    return this.deps.clientFactory == null ? openCodeCursorNativeFailureProbe : null
   }
 
   private get sleep() {
@@ -466,7 +779,11 @@ export class OpenCodeExecutionProbe {
     sessionId: string
     messageID: string
     context?: OpenCodePhaseContext
-  }): Promise<boolean> {
+  }): Promise<{
+    started: boolean
+    classified: ReturnType<typeof classifyProbeFailure> | null
+    retrying: boolean
+  }> {
     const startedAt = nowMs()
     const promptStartTimeoutMs = Math.max(
       1,
@@ -475,27 +792,39 @@ export class OpenCodeExecutionProbe {
     const supportsExactMessageLookup = Boolean(input.client.getSessionMessage)
     for (;;) {
       input.context?.throwIfExpired()
-      const [message, statusMap] = await Promise.all([
-        input.client.getSessionMessage
-          ? input.client.getSessionMessage(input.sessionId, input.messageID).catch(error => {
-              if (input.context?.signal.aborted) throwOpenCodeAbortReason(input.context.signal)
-              return null
+      const statusMap = await input.client.getSessionStatus()
+      const rawStatus = statusMap[input.sessionId] ?? null
+      const classified = classifyRetryStatusFailure(rawStatus)
+      if (classified) {
+        return { started: true, classified, retrying: true }
+      }
+      if (statusIsRunning(rawStatus)) {
+        return {
+          started: true,
+          classified: null,
+          retrying: statusIsRetrying(rawStatus),
+        }
+      }
+
+      const message = input.client.getSessionMessage
+        ? await input.client.getSessionMessage(input.sessionId, input.messageID).catch(error => {
+            if (input.context?.signal.aborted) throwOpenCodeAbortReason(input.context.signal)
+            const classified = classifyProbeFailure({
+              message: failureMessageFromUnknown(error),
             })
-          : input.client.getSessionMessages(input.sessionId).then(messages => messages[0] ?? null),
-        input.client.getSessionStatus(),
-      ])
-      if (
-        messageMatchesPrompt(message, input.messageID)
-        || (!supportsExactMessageLookup && message !== null)
-        || statusIsRunning(statusMap[input.sessionId])
-      ) {
-        return true
+            if (classified.outcome !== 'unknown') throw error
+            return null
+          })
+        : (await input.client.getSessionMessages(input.sessionId))[0] ?? null
+      if (messageMatchesPrompt(message, input.messageID)
+        || (!supportsExactMessageLookup && message !== null)) {
+        return { started: true, classified: null, retrying: false }
       }
 
       const localRemaining = promptStartTimeoutMs - (nowMs() - startedAt)
       const remainingMs = Math.min(localRemaining, input.context?.remainingMs() ?? localRemaining)
       if (remainingMs <= 0) {
-        return false
+        return { started: false, classified: null, retrying: false }
       }
       await this.sleep(Math.min(OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS, remainingMs))
     }
@@ -559,6 +888,7 @@ export class OpenCodeExecutionProbe {
 
   async probeModel(params: ProbeModelParams): Promise<OpenCodeExecutionProbeResult> {
     const cacheKey = buildProbeCacheKey(params)
+    let shouldRegisterInFlight = !params.bypassCache
     if (!params.bypassCache) {
       const cached = this.probeCache.get(cacheKey)
       if (cached && cached.expiresAtMs > nowMs()) {
@@ -570,7 +900,23 @@ export class OpenCodeExecutionProbe {
 
       const inFlight = this.inFlightProbes.get(cacheKey)
       if (inFlight) {
-        return cloneProbeResult(await inFlight)
+        const callerDeadlineAtMs = params.runtimeDeadline
+          ? performance.now() + params.runtimeDeadline.remainingMs()
+          : null
+        const ownerDeadlineCoversCaller = inFlight.deadlineAtMs === null
+          || (
+            callerDeadlineAtMs !== null
+            && inFlight.deadlineAtMs + 5 >= callerDeadlineAtMs
+          )
+        if (ownerDeadlineCoversCaller) {
+          const joined = params.runtimeDeadline
+            ? this.runPhase(params.runtimeDeadline, 'execution_poll', () => inFlight.promise)
+            : inFlight.promise
+          return cloneProbeResult(await joined)
+        }
+        // A shorter owner deadline must not abort a caller with a longer (or
+        // unbounded) budget. Run independently without replacing the owner.
+        shouldRegisterInFlight = false
       }
     }
 
@@ -588,13 +934,21 @@ export class OpenCodeExecutionProbe {
         return result
       })
       .finally(() => {
-        if (!params.bypassCache && this.inFlightProbes.get(cacheKey) === request) {
+        if (
+          shouldRegisterInFlight
+          && this.inFlightProbes.get(cacheKey)?.promise === request
+        ) {
           this.inFlightProbes.delete(cacheKey)
         }
       })
 
-    if (!params.bypassCache) {
-      this.inFlightProbes.set(cacheKey, request)
+    if (shouldRegisterInFlight) {
+      this.inFlightProbes.set(cacheKey, {
+        promise: request,
+        deadlineAtMs: params.runtimeDeadline
+          ? performance.now() + params.runtimeDeadline.remainingMs()
+          : null,
+      })
     }
     return cloneProbeResult(await request)
   }
@@ -615,6 +969,66 @@ export class OpenCodeExecutionProbe {
       0,
       this.deps.pollIntervalMs ?? OPEN_CODE_EXECUTION_PROBE_POLL_INTERVAL_MS,
     )
+
+    if (
+      params.cursorNativePreflightBeforeHost === true
+      && parseProviderScopedModel(params.selectedModel).providerID === 'cursor-acp'
+      && this.cursorNativeFailureProbe
+    ) {
+      const nativeContext = await this.runPhase(
+        params.runtimeDeadline,
+        'host_start',
+        context => this.prepareInitialCursorNativeProbeContext(params, context),
+      )
+      let nativeResult: OpenCodeCursorNativeProbeResult | null
+      try {
+        nativeResult = await this.runInitialCursorNativeProbe({
+          params,
+          context: nativeContext,
+          diagnostics,
+        })
+      } finally {
+        await nativeContext.cleanup?.().catch(() => undefined)
+      }
+      const nativeOutcome = buildCursorNativeExecutionOutcome({
+        nativeResult,
+        selectedModel: params.selectedModel,
+        prompt,
+        expectedOutput,
+        startedAtMs,
+        diagnostics,
+      })
+      if (nativeOutcome) return nativeOutcome
+      const inconclusiveDiagnostic = nativeResult?.outcome === 'retryable'
+        ? 'Cursor native execution preflight hit a transient failure before OpenCode startup'
+        : 'Cursor native execution preflight was inconclusive before OpenCode startup'
+      diagnostics.add(
+        params.cursorNativePreflightOnly === true
+          ? inconclusiveDiagnostic
+          : `${inconclusiveDiagnostic}; falling back to the OpenCode execution probe`,
+      )
+      if (params.cursorNativePreflightOnly === true) {
+        return {
+          providerId: 'opencode',
+          modelId: params.selectedModel,
+          probePrompt: prompt,
+          expectedOutput,
+          outcome: 'unknown',
+          reason: nativeResult?.message ?? inconclusiveDiagnostic,
+          durationMs: buildDurationMs(startedAtMs),
+          rawStatus: null,
+          durableState: 'unknown',
+          latestAssistantText: null,
+          latestAssistantPreview: null,
+          toolCallCount: 0,
+          errorCount: nativeResult?.message ? 1 : 0,
+          diagnostics: Array.from(diagnostics),
+          ...(nativeResult?.outcome === 'timeout'
+            ? { failureCode: 'execution_timeout' as const }
+            : {}),
+        }
+      }
+    }
 
     const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
       promise: null,
@@ -918,9 +1332,42 @@ export class OpenCodeExecutionProbe {
       return result
     }
 
+    const nativeFailureProbe = this.cursorNativeFailureProbe
+    if (
+      params.cursorNativePreflightBeforeHost !== true
+      &&
+      parseProviderScopedModel(params.selectedModel).providerID === 'cursor-acp'
+      && nativeFailureProbe
+    ) {
+      const nativeResult = await this.runInitialCursorNativeProbe({
+        params,
+        context: {
+          projectPath: host.profile.tmpPath,
+          env: host.profile.env,
+        },
+        diagnostics,
+      })
+      const nativeOutcome = buildCursorNativeExecutionOutcome({
+        nativeResult,
+        selectedModel: params.selectedModel,
+        prompt,
+        expectedOutput,
+        startedAtMs,
+        diagnostics,
+      })
+      if (nativeOutcome) return finish(nativeOutcome)
+
+      diagnostics.add(
+        nativeResult?.outcome === 'retryable'
+          ? 'Cursor native execution preflight hit a transient failure; falling back to the OpenCode execution probe'
+          : 'Cursor native execution preflight was inconclusive; falling back to the OpenCode execution probe',
+      )
+    }
+
     let sessionId: string | null = null
     let sessionRequiresCleanup = false
     try {
+      const executionSubmitStartedAtMs = nowMs()
       const submitted = await this.runPhase(
         params.runtimeDeadline,
         'execution_submit',
@@ -946,27 +1393,45 @@ export class OpenCodeExecutionProbe {
             return {
               started: false as const,
               classified: classifyProbeFailure({
-                message: error instanceof Error ? error.message : String(error),
+                message: failureMessageFromUnknown(error),
               }),
+              retrying: false,
             }
           }
 
-          return {
-            started: await this.verifyPromptStarted({
+          try {
+            return await this.verifyPromptStarted({
               client,
               sessionId: session.id,
               messageID,
               context,
-            }),
-            classified: null,
+            })
+          } catch (error) {
+            if (context?.signal.aborted) throwOpenCodeAbortReason(context.signal)
+            const classified = classifyProbeFailure({
+              message: failureMessageFromUnknown(error),
+            })
+            if (classified.outcome === 'unknown') throw error
+            return {
+              started: false as const,
+              classified,
+              retrying: false,
+            }
           }
         },
       )
 
       if (!submitted.started) {
+        const hasTerminalClassification = submitted.classified != null
+          && submitted.classified.outcome !== 'unknown'
         const reason = submitted.classified?.reason
           ?? 'OpenCode accepted prompt_async but did not create a user message or enter a running state'
         diagnostics.add(reason)
+        if (hasTerminalClassification) {
+          diagnostics.add(
+            `OpenCode prompt start exposed a terminal provider error in ${Math.max(0, nowMs() - executionSubmitStartedAtMs)}ms`,
+          )
+        }
         return finish({
           providerId: 'opencode',
           modelId: params.selectedModel,
@@ -980,32 +1445,385 @@ export class OpenCodeExecutionProbe {
           latestAssistantText: null,
           latestAssistantPreview: null,
           toolCallCount: 0,
-          errorCount: submitted.classified ? 0 : 1,
+          errorCount: 1,
           diagnostics: Array.from(diagnostics),
-          failureCode: submitted.classified ? undefined : 'prompt_start_failed',
+          failureCode: hasTerminalClassification ? undefined : 'prompt_start_failed',
         })
       }
 
+      if (submitted.classified) {
+        diagnostics.add(
+          `OpenCode retry status exposed a terminal provider error during prompt start in ${Math.max(0, nowMs() - executionSubmitStartedAtMs)}ms`,
+        )
+        return finish({
+          providerId: 'opencode',
+          modelId: params.selectedModel,
+          probePrompt: prompt,
+          expectedOutput,
+          outcome: submitted.classified.outcome,
+          reason: submitted.classified.reason,
+          durationMs: buildDurationMs(startedAtMs),
+          rawStatus: 'retry',
+          durableState: 'retrying',
+          latestAssistantText: null,
+          latestAssistantPreview: null,
+          toolCallCount: 0,
+          errorCount: 1,
+          diagnostics: Array.from(diagnostics),
+        })
+      }
+
+      const nativeFailureController =
+        parseProviderScopedModel(params.selectedModel).providerID === 'cursor-acp'
+        && nativeFailureProbe
+          ? new AbortController()
+          : null
+      let nativeTerminalFailure: {
+        classified: ReturnType<typeof classifyProbeFailure>
+        durationMs: number
+      } | null = null
+      let nativeFailureAttempts = 0
+      let nativeProbeConclusive = false
+      let nativeFailurePending: Promise<void> | null = null
+      const startNativeFailureProbe = () => {
+        if (
+          nativeProbeConclusive
+          || nativeFailurePending
+          || nativeFailureAttempts >= OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS
+          || !nativeFailureController
+          || !nativeFailureProbe
+        ) return
+        nativeFailureAttempts += 1
+        nativeFailurePending = nativeFailureProbe.probe({
+          selectedModel: params.selectedModel,
+          // Quota/auth is account-scoped. Keep this auxiliary request out of
+          // the user project so project rules and tools cannot affect it.
+          projectPath: host.profile.tmpPath,
+          env: host.profile.env,
+          signal: nativeFailureController.signal,
+        }).then(result => {
+          if (!result) return
+          if (result.outcome === 'available') {
+            nativeProbeConclusive = true
+            return
+          }
+          if (result.outcome === 'retryable') {
+            diagnostics.add(
+              `Cursor native failure probe will retry after a transient failure in ${result.durationMs}ms`,
+            )
+            return
+          }
+          const classified = classifyProbeFailure({ message: result.message ?? '' })
+          if (classified.outcome !== 'unknown') {
+            nativeProbeConclusive = true
+            nativeTerminalFailure = {
+              classified,
+              durationMs: result.durationMs,
+            }
+          }
+        }).catch(error => {
+          diagnostics.add(
+            `Cursor native failure probe failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }).finally(() => {
+          nativeFailurePending = null
+        })
+      }
+      if (submitted.retrying) {
+        startNativeFailureProbe()
+      }
+
+      const executionPollStartedAtMs = nowMs()
       return await this.runPhase(params.runtimeDeadline, 'execution_poll', async context => {
-        const client = this.createClient(host, context)
         const localDeadlineMs = nowMs() + (
           context?.remainingMs() ?? probeTimeoutMs
         )
-        let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] = null
-        let latestDurableState: OpenCodeExecutionProbeResult['durableState'] = 'unknown'
+        let latestRawStatus: OpenCodeExecutionProbeResult['rawStatus'] =
+          submitted.retrying ? 'retry' : null
+        let latestDurableState: OpenCodeExecutionProbeResult['durableState'] =
+          submitted.retrying ? 'retrying' : 'unknown'
         let latestAssistantText: string | null = null
         let latestAssistantPreview: string | null = null
         let latestToolCallCount = 0
         let latestErrorCount = 0
+        const finishPollRequestFailure = (
+          error: unknown,
+          source: 'status' | 'messages',
+        ): Promise<OpenCodeExecutionProbeResult> | null => {
+          const classified = classifyProbeFailure({
+            message: failureMessageFromUnknown(error),
+          })
+          if (classified.outcome === 'unknown') return null
+          diagnostics.add(
+            `OpenCode session ${source} request exposed a terminal provider error in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
+          )
+          return finish({
+            providerId: 'opencode',
+            modelId: params.selectedModel,
+            probePrompt: prompt,
+            expectedOutput,
+            outcome: classified.outcome,
+            reason: classified.reason,
+            durationMs: buildDurationMs(startedAtMs),
+            rawStatus: latestRawStatus,
+            durableState: latestDurableState,
+            latestAssistantText,
+            latestAssistantPreview,
+            toolCallCount: latestToolCallCount,
+            errorCount: Math.max(1, latestErrorCount),
+            diagnostics: Array.from(diagnostics),
+          })
+        }
+        const checkOriginalProbeRecovered = async () => {
+          const remainingMs = context?.remainingMs() ?? Number.POSITIVE_INFINITY
+          if (remainingMs <= OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS) {
+            return null
+          }
 
-        for (;;) {
+          const controller = new AbortController()
+          const abortFromContext = () => {
+            if (!controller.signal.aborted && context) {
+              controller.abort(context.signal.reason)
+            }
+          }
+          context?.signal.addEventListener('abort', abortFromContext, { once: true })
+          const recoveryStartedAtMs = nowMs()
+          const recoveryClient = this.clientFactory.create(host.baseUrl, {
+            signal: controller.signal,
+            remainingMs: () => Math.max(
+              1,
+              Math.min(
+                context?.remainingMs() ?? OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS,
+                OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS
+                  - (nowMs() - recoveryStartedAtMs),
+              ),
+            ),
+          })
+
+          let timeout: ReturnType<typeof setTimeout> | null = null
+          try {
+            const observation = Promise.resolve()
+              .then(() => Promise.all([
+                recoveryClient.getSessionStatus(),
+                recoveryClient.getSessionMessages(sessionId!),
+              ]))
+              .then(([statusMap, messages]) => {
+                const summary = this.eventTranslator.reconcileSessionMessages({
+                  sessionId: sessionId!,
+                  rawStatus: statusMap[sessionId!] ?? null,
+                  messages,
+                })
+                if (summary.durableState !== 'idle') return null
+                const responseText = summary.latestAssistantText?.trim()
+                  || summary.latestAssistantPreview?.trim()
+                  || null
+                if (!responseText) return null
+                return classifyProbeFailure({ message: responseText }).outcome === 'unknown'
+                  ? summary
+                  : null
+              })
+              .catch(() => null)
+            const timedOut = new Promise<null>(resolve => {
+              timeout = setTimeout(() => {
+                if (!controller.signal.aborted) {
+                  controller.abort(
+                    new Error('OpenCode native failure recovery check timed out'),
+                  )
+                }
+                resolve(null)
+              }, OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS)
+            })
+            return await Promise.race([observation, timedOut])
+          } finally {
+            if (timeout) clearTimeout(timeout)
+            context?.signal.removeEventListener('abort', abortFromContext)
+            if (!controller.signal.aborted) {
+              controller.abort(new Error('OpenCode native failure recovery check finished'))
+            }
+          }
+        }
+
+        pollLoop: for (;;) {
           context?.throwIfExpired()
-          const [statusMap, messages] = await Promise.all([
-            client.getSessionStatus(),
-            client.getSessionMessages(sessionId!),
-          ])
+          if (nativeTerminalFailure) {
+            const recovered = await checkOriginalProbeRecovered()
+            if (recovered) {
+              sessionRequiresCleanup = false
+              diagnostics.add(
+                'OpenCode original probe recovered before the auxiliary Cursor failure was applied',
+              )
+              return finish({
+                providerId: 'opencode',
+                modelId: params.selectedModel,
+                probePrompt: prompt,
+                expectedOutput,
+                outcome: 'available',
+                reason: null,
+                durationMs: buildDurationMs(startedAtMs),
+                rawStatus: recovered.rawStatus,
+                durableState: recovered.durableState,
+                latestAssistantText: recovered.latestAssistantText,
+                latestAssistantPreview: recovered.latestAssistantPreview,
+                toolCallCount: recovered.toolCallCount,
+                errorCount: recovered.errorCount,
+                diagnostics: Array.from(diagnostics),
+                verifiedAt: new Date().toISOString(),
+              })
+            }
+            diagnostics.add(
+              `Cursor native failure probe confirmed a terminal provider error in ${nativeTerminalFailure.durationMs}ms`,
+            )
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: nativeTerminalFailure.classified.outcome,
+              reason: nativeTerminalFailure.classified.reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: latestRawStatus,
+              durableState: latestDurableState,
+              latestAssistantText,
+              latestAssistantPreview,
+              toolCallCount: latestToolCallCount,
+              errorCount: Math.max(1, latestErrorCount),
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+          const pollRequestsController = new AbortController()
+          const abortPollRequestsFromContext = () => {
+            if (!pollRequestsController.signal.aborted && context) {
+              pollRequestsController.abort(context.signal.reason)
+            }
+          }
+          context?.signal.addEventListener('abort', abortPollRequestsFromContext, { once: true })
+          const pollClient = this.clientFactory.create(host.baseUrl, {
+            signal: pollRequestsController.signal,
+            ...(context ? { remainingMs: context.remainingMs } : {}),
+          })
+          let messagesRequest: Promise<
+            | { kind: 'messages'; messages: OpenCodeMessage[] }
+            | { kind: 'error'; error: unknown }
+          > | null = null
+          let rawStatus: OpenCodeSessionStatusInput | null = null
+          let messages: OpenCodeMessage[]
 
-          const rawStatus = statusMap[sessionId!] ?? null
+          try {
+            for (;;) {
+              if (nativeTerminalFailure) {
+                continue pollLoop
+              }
+              context?.throwIfExpired()
+              const statusRequest = pollClient.getSessionStatus().then(
+                statusMap => ({ kind: 'status' as const, statusMap }),
+                error => ({ kind: 'error' as const, error }),
+              )
+              const nativeAtStatusRead = nativeFailurePending
+              let statusResult = await Promise.race([
+                statusRequest,
+                ...(nativeAtStatusRead
+                  ? [nativeAtStatusRead.then(() => ({ kind: 'native' as const }))]
+                  : []),
+              ])
+              if (statusResult.kind === 'native') {
+                if (nativeTerminalFailure) {
+                  continue pollLoop
+                }
+                statusResult = await statusRequest
+              }
+              if (statusResult.kind === 'error') {
+                const terminalFailure = finishPollRequestFailure(
+                  statusResult.error,
+                  'status',
+                )
+                if (terminalFailure) return terminalFailure
+                throw statusResult.error
+              }
+              const statusMap = statusResult.statusMap
+              rawStatus = statusMap[sessionId!] ?? null
+              const retryFailure = classifyRetryStatusFailure(rawStatus)
+              if (retryFailure) {
+                diagnostics.add(
+                  `OpenCode retry status exposed a terminal provider error in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
+                )
+                return finish({
+                  providerId: 'opencode',
+                  modelId: params.selectedModel,
+                  probePrompt: prompt,
+                  expectedOutput,
+                  outcome: retryFailure.outcome,
+                  reason: retryFailure.reason,
+                  durationMs: buildDurationMs(startedAtMs),
+                  rawStatus: 'retry',
+                  durableState: 'retrying',
+                  latestAssistantText,
+                  latestAssistantPreview,
+                  toolCallCount: latestToolCallCount,
+                  errorCount: Math.max(1, latestErrorCount),
+                  diagnostics: Array.from(diagnostics),
+                })
+              }
+
+              // A retry means the original OpenCode request already failed. Starting
+              // the native probe here cannot duplicate a healthy in-flight request.
+              if (statusIsRetrying(rawStatus)) {
+                latestRawStatus = 'retry'
+                latestDurableState = 'retrying'
+                startNativeFailureProbe()
+              }
+
+              if (nativeTerminalFailure) {
+                continue pollLoop
+              }
+
+              messagesRequest ??= pollClient.getSessionMessages(sessionId!).then(
+                messages => ({ kind: 'messages' as const, messages }),
+                error => ({ kind: 'error' as const, error }),
+              )
+
+              const statusRefreshDelay = nowMs() < localDeadlineMs
+                ? this.sleep(
+                    Math.min(pollIntervalMs, Math.max(0, localDeadlineMs - nowMs())),
+                  ).then(() => ({ kind: 'status_refresh' as const }))
+                : null
+              const nativePending = nativeFailurePending
+              const next = await Promise.race([
+                messagesRequest,
+                ...(statusRefreshDelay ? [statusRefreshDelay] : []),
+                ...(nativePending
+                  ? [nativePending.then(() => ({ kind: 'native' as const }))]
+                  : []),
+              ])
+
+              if (next.kind === 'status_refresh') {
+                continue
+              }
+              if (next.kind === 'native') {
+                if (nativeTerminalFailure) {
+                  continue pollLoop
+                }
+                continue
+              }
+              if (next.kind === 'error') {
+                const terminalFailure = finishPollRequestFailure(
+                  next.error,
+                  'messages',
+                )
+                if (terminalFailure) return terminalFailure
+                throw next.error
+              }
+              messages = next.messages
+              break
+            }
+          } finally {
+            context?.signal.removeEventListener('abort', abortPollRequestsFromContext)
+            if (!pollRequestsController.signal.aborted) {
+              pollRequestsController.abort(
+                new Error('OpenCode execution probe poll requests finished'),
+              )
+            }
+          }
+
           const summary = this.eventTranslator.reconcileSessionMessages({
             sessionId: sessionId!,
             rawStatus,
@@ -1018,6 +1836,12 @@ export class OpenCodeExecutionProbe {
           latestAssistantPreview = summary.latestAssistantPreview
           latestToolCallCount = summary.toolCallCount
           latestErrorCount = summary.errorCount
+
+          // Message reconciliation can infer retrying from provider payloads even
+          // when the status endpoint returns a legacy or incomplete value.
+          if (summary.durableState === 'retrying') {
+            startNativeFailureProbe()
+          }
 
           if (
             summary.durableState === 'idle'
@@ -1046,11 +1870,41 @@ export class OpenCodeExecutionProbe {
             })
           }
 
+          const latestAssistantError = getLatestAssistantMessageError(
+            Array.from(diagnostics),
+            messages,
+          )
           const failureMessage =
-            getLatestAssistantMessageError(Array.from(diagnostics), messages)
+            latestAssistantError
             ?? summary.latestAssistantPreview
             ?? summary.latestAssistantText
             ?? null
+          const eagerFailure = failureMessage
+            && (latestAssistantError || summary.durableState === 'retrying')
+            ? classifyProbeFailure({ message: failureMessage })
+            : null
+          if (eagerFailure && eagerFailure.outcome !== 'unknown') {
+            if (summary.durableState === 'idle') sessionRequiresCleanup = false
+            diagnostics.add(
+              `OpenCode retry/error payload exposed a terminal provider failure before polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
+            )
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: eagerFailure.outcome,
+              reason: eagerFailure.reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: summary.rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: Math.max(1, summary.errorCount),
+              diagnostics: Array.from(diagnostics),
+            })
+          }
           const shouldContinuePolling =
             (summary.durableState === 'running'
               || summary.durableState === 'retrying'
@@ -1060,12 +1914,22 @@ export class OpenCodeExecutionProbe {
             && nowMs() < localDeadlineMs
 
           if (shouldContinuePolling) {
-            await this.sleep(Math.min(pollIntervalMs, Math.max(0, localDeadlineMs - nowMs())))
+            const pollDelay = this.sleep(
+              Math.min(pollIntervalMs, Math.max(0, localDeadlineMs - nowMs())),
+            )
+            await (nativeFailurePending
+              ? Promise.race([pollDelay, nativeFailurePending])
+              : pollDelay)
             continue
           }
 
           if (failureMessage) {
             const classified = classifyProbeFailure({ message: failureMessage })
+            if (classified.outcome !== 'unknown') {
+              diagnostics.add(
+                `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
+              )
+            }
             if (
               summary.durableState === 'idle'
               && classified.outcome === 'unknown'
@@ -1132,6 +1996,8 @@ export class OpenCodeExecutionProbe {
             failureCode: 'execution_timeout',
           })
         }
+      }).finally(() => {
+        nativeFailureController?.abort()
       })
     } finally {
       if (sessionId && sessionRequiresCleanup) {

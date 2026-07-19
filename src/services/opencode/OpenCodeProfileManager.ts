@@ -43,6 +43,10 @@ import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  buildCursorAgentResourceExhaustedPreloadScript,
+  CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
+} from './OpenCodeCursorResourceExhaustedPatch.js'
 import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
@@ -664,6 +668,12 @@ type KiroCliAuthProbe = (
   platform: NodeJS.Platform,
 ) => Promise<boolean>
 
+interface KiroCliWhoamiResult {
+  error?: unknown
+  stdout?: Buffer | string | null
+  stderr?: Buffer | string | null
+}
+
 type CursorAgentAuthProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
@@ -672,6 +682,64 @@ type CursorAgentAuthProbe = (
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
 const CURSOR_AGENT_AUTH_MARKER_TTL_MS = 30 * 60 * 1000
 const CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS = 60 * 1000
+
+function extractFirstBalancedJsonObject(value: string): string | null {
+  const start = value.indexOf('{')
+  if (start < 0) {
+    return null
+  }
+
+  let depth = 0
+  let escaped = false
+  let inString = false
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (character === '\\') {
+        escaped = true
+      } else if (character === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (character === '"') {
+      inString = true
+    } else if (character === '{') {
+      depth += 1
+    } else if (character === '}') {
+      depth -= 1
+      if (depth === 0) {
+        return value.slice(start, index + 1)
+      }
+    }
+  }
+
+  return null
+}
+
+function hasAuthenticatedKiroAccount(value: Buffer | string | null | undefined): boolean {
+  const json = extractFirstBalancedJsonObject(value?.toString() ?? '')
+  if (!json) {
+    return false
+  }
+
+  try {
+    const parsed = JSON.parse(json) as { accountType?: unknown }
+    return typeof parsed.accountType === 'string' && parsed.accountType.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+export function isKiroCliWhoamiAuthenticated(result: KiroCliWhoamiResult): boolean {
+  // whoami can emit valid account JSON even when the process reports a non-zero
+  // status. The account payload, not the exit status, is the auth authority.
+  return hasAuthenticatedKiroAccount(result.stdout)
+    || hasAuthenticatedKiroAccount(result.stderr)
+}
 
 const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
   await new Promise<boolean>(resolve => {
@@ -699,8 +767,8 @@ const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
         windowsHide: true,
         shell: platform === 'win32',
       },
-      (error, stdout) => {
-        resolve(!error && stdout.trim().length > 0)
+      (error, stdout, stderr) => {
+        resolve(isKiroCliWhoamiAuthenticated({ error, stdout, stderr }))
       },
     )
   })
@@ -840,32 +908,6 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
     readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
   ])
   const existingCredential = globalCredential ?? managedCredential
-  const existingExpiry =
-    typeof existingCredential?.expires === 'number' ? existingCredential.expires : null
-  const existingCredentialIsFresh = Boolean(
-    existingCredential
-      && (existingExpiry === null || existingExpiry > now + 5 * 60 * 1000),
-  )
-  if (existingCredential && existingCredentialIsFresh) {
-    await Promise.all([
-      globalCredential
-        ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
-            authPath: input.globalAuthPath,
-            providerId: 'kiro',
-            credential: existingCredential,
-          }),
-      managedCredential
-        ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
-            authPath: input.managedAuthPath,
-            providerId: 'kiro',
-            credential: existingCredential,
-          }),
-    ])
-    return false
-  }
-
   const authenticated = await (input.probe ?? probeKiroCliAuth)(
     input.kiroCliExecutablePath,
     input.platform ?? process.platform,
@@ -877,6 +919,33 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
         removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
       ])
     }
+    return false
+  }
+
+  const existingExpiry =
+    typeof existingCredential?.expires === 'number' ? existingCredential.expires : null
+  const existingCredentialIsFresh = Boolean(
+    existingCredential
+      && existingExpiry !== null
+      && existingExpiry > now + 5 * 60 * 1000,
+  )
+  if (existingCredential && existingCredentialIsFresh) {
+    await Promise.all([
+      JSON.stringify(globalCredential) === JSON.stringify(existingCredential)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+      JSON.stringify(managedCredential) === JSON.stringify(existingCredential)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+    ])
     return false
   }
 
@@ -922,10 +991,21 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       : hostEnv.HOME?.trim() || hostEnv.USERPROFILE?.trim()
   ) || os.homedir()
   const hostPath = hostEnv.PATH ?? ''
+  const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
   await mkdir(binPath, { recursive: true })
+  const cursorResourceExhaustedPreloadPath = path.join(
+    binPath,
+    'cursor-resource-exhausted-preload.cjs',
+  )
+  await writeFile(
+    cursorResourceExhaustedPreloadPath,
+    buildCursorAgentResourceExhaustedPreloadScript(),
+    { encoding: 'utf8', mode: 0o600 },
+  )
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
+    const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
     if (platform === 'win32') {
       const bridgePath = path.join(binPath, `${command}.cmd`)
       const content = [
@@ -936,7 +1016,13 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'set "XDG_DATA_HOME="',
         'set "XDG_CACHE_HOME="',
         `set "PATH=${escapeWindowsBatchValue(hostPath)}"`,
-        `${command}.cmd %*`,
+        ...(command === 'cursor-agent'
+          ? [
+              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS=%NODE_OPTIONS%"`,
+              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "NODE_OPTIONS=--require="${escapeWindowsBatchValue(cursorResourceExhaustedPreloadPath)}" %NODE_OPTIONS%"`,
+            ]
+          : []),
+        `call "${escapeWindowsBatchValue(hostCommand)}" %*`,
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
@@ -951,7 +1037,15 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
       'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
       `export PATH=${quotePosixShellValue(hostPath)}`,
-      `exec ${command} "$@"`,
+      ...(command === 'cursor-agent'
+          ? [
+            `if [ "\${${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}:-}" != "1" ]; then`,
+            '  export AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS="${NODE_OPTIONS:-}"',
+            `  export NODE_OPTIONS=${quotePosixShellValue(`--require="${cursorResourceExhaustedPreloadPath}"`)}" \${NODE_OPTIONS:-}"`,
+            'fi',
+          ]
+        : []),
+      `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
     await writeFile(bridgePath, content, 'utf8')
@@ -990,10 +1084,12 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
 function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
   const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
   const candidates = [
-    path.join(xdgConfigHome, 'opencode', 'opencode.json'),
-    path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
+    // An explicit XDG config is closer to the invoking runtime than the
+    // canonical user config and must win model/provider conflicts.
+    path.join(xdgConfigHome, 'opencode', 'opencode.json'),
+    path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
   ]
   const explicitConfigPath = env.OPENCODE_CONFIG?.trim()
   if (explicitConfigPath) {
@@ -1403,8 +1499,7 @@ export class OpenCodeProfileManager {
       env.CURSOR_ACP_HOME_DIR =
         process.env.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
-        process.env.CURSOR_AGENT_EXECUTABLE?.trim()
-        || nativeCliCredentialBridge.cursorAgentExecutablePath
+        nativeCliCredentialBridge.cursorAgentExecutablePath
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)

@@ -21,6 +21,15 @@ const ollamaE2ETest =
   process.env.OPENCODE_READINESS_BRIDGE_OLLAMA_E2E === '1'
     ? test
     : test.skip
+const fakeResourceExhaustionE2ETest =
+  process.env.OPENCODE_READINESS_BRIDGE_FAKE_RESOURCE_EXHAUSTED_E2E === '1'
+    || process.env.OPENCODE_READINESS_BRIDGE_FAKE_CURSOR_QUOTA_E2E === '1'
+    ? test
+    : test.skip
+const cursorQuotaLiveE2ETest =
+  process.env.OPENCODE_READINESS_BRIDGE_CURSOR_QUOTA_LIVE_E2E === '1'
+    ? test
+    : test.skip
 
 const LIVE_MODEL = process.env.OPENCODE_READINESS_BRIDGE_MODEL ?? 'big-pickle'
 const OLLAMA_MODEL = process.env.OPENCODE_READINESS_BRIDGE_OLLAMA_MODEL ?? 'qwen2.5-coder:0.5b'
@@ -30,6 +39,24 @@ const OLLAMA_BASE_URL =
 const SEQUENTIAL_ATTEMPTS = Number(process.env.OPENCODE_READINESS_BRIDGE_SEQUENTIAL_ATTEMPTS ?? '3')
 const PARALLEL_ATTEMPTS = Number(process.env.OPENCODE_READINESS_BRIDGE_PARALLEL_ATTEMPTS ?? '2')
 const BRIDGE_TIMEOUT_MS = Number(process.env.OPENCODE_READINESS_BRIDGE_TIMEOUT_MS ?? '180000')
+const FAKE_RESOURCE_EXHAUSTED_MAX_DURATION_MS = Number(
+  process.env.OPENCODE_READINESS_BRIDGE_FAKE_RESOURCE_EXHAUSTED_MAX_DURATION_MS
+    ?? process.env.OPENCODE_READINESS_BRIDGE_FAKE_CURSOR_QUOTA_MAX_DURATION_MS
+    ?? '15000',
+)
+const FAKE_RESOURCE_EXHAUSTED_SHARED_CACHE_HOME =
+  process.env.OPENCODE_READINESS_BRIDGE_FAKE_RESOURCE_EXHAUSTED_SHARED_CACHE_HOME?.trim()
+  || process.env.OPENCODE_READINESS_BRIDGE_FAKE_CURSOR_QUOTA_SHARED_CACHE_HOME?.trim()
+  || null
+const CURSOR_QUOTA_LIVE_MAX_DURATION_MS = Number(
+  process.env.OPENCODE_READINESS_BRIDGE_CURSOR_QUOTA_LIVE_MAX_DURATION_MS ?? '80000',
+)
+const CURSOR_QUOTA_LIVE_FAST_TERMINAL_MAX_DURATION_MS = Number(
+  process.env.OPENCODE_READINESS_BRIDGE_CURSOR_QUOTA_LIVE_FAST_TERMINAL_MAX_DURATION_MS
+    ?? '70000',
+)
+const CURSOR_QUOTA_LIVE_SHARED_CACHE_HOME =
+  process.env.OPENCODE_READINESS_BRIDGE_CURSOR_QUOTA_LIVE_SHARED_CACHE_HOME?.trim() || null
 const ALLOW_WINDOWS_LOCAL_MCP =
   process.env.OPENCODE_READINESS_BRIDGE_ALLOW_WINDOWS_LOCAL_MCP === '1'
 const CLAUDE_TEAM_ROOT =
@@ -84,7 +111,9 @@ function runtimeCliPath(): string {
   if (override?.trim()) {
     return override.trim()
   }
-  return path.join(process.cwd(), 'dist', process.platform === 'win32' ? 'cli.exe' : 'cli')
+  return process.platform === 'win32'
+    ? path.join(process.cwd(), 'dist', 'cli.exe')
+    : path.join(process.cwd(), 'cli-source')
 }
 
 function buildEnvelope(input: {
@@ -114,7 +143,7 @@ async function runBridgeCommand(input: {
   body?: Record<string, unknown>
 }): Promise<BridgeResult> {
   const cliPath = runtimeCliPath()
-  expect(existsSync(cliPath), `Compile the runtime before this live E2E: ${cliPath}`).toBe(true)
+  expect(existsSync(cliPath), `OpenCode live E2E runtime was not found: ${cliPath}`).toBe(true)
 
   const inputDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-bridge-input-'))
   try {
@@ -164,7 +193,7 @@ async function runBridgeCommandAsync(input: {
   body?: Record<string, unknown>
 }): Promise<BridgeResult> {
   const cliPath = runtimeCliPath()
-  expect(existsSync(cliPath), `Compile the runtime before this live E2E: ${cliPath}`).toBe(true)
+  expect(existsSync(cliPath), `OpenCode live E2E runtime was not found: ${cliPath}`).toBe(true)
 
   const inputDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-bridge-input-'))
   try {
@@ -240,19 +269,25 @@ async function runBridgeCommandAsync(input: {
 async function startFakeOpenAiCompatibleServer(options: {
   chatStatus?: number
   chatErrorMessage?: string
+  modelId?: string
 } = {}): Promise<{
   baseUrl: string
   requests: string[]
+  requestRecords: Array<{ request: string; atMs: number }>
   close: () => Promise<void>
 }> {
   const requests: string[] = []
+  const requestRecords: Array<{ request: string; atMs: number }> = []
+  const modelId = options.modelId ?? 'qwen-test:0.5b'
   const server = createServer(async (request, response) => {
-    requests.push(`${request.method ?? 'GET'} ${request.url ?? '/'}`)
+    const requestLabel = `${request.method ?? 'GET'} ${request.url ?? '/'}`
+    requests.push(requestLabel)
+    requestRecords.push({ request: requestLabel, atMs: Date.now() })
     if (request.url === '/v1/models') {
       response.writeHead(200, { 'content-type': 'application/json' })
       response.end(JSON.stringify({
         object: 'list',
-        data: [{ id: 'qwen-test:0.5b', object: 'model' }],
+        data: [{ id: modelId, object: 'model' }],
       }))
       return
     }
@@ -284,7 +319,7 @@ async function startFakeOpenAiCompatibleServer(options: {
           id: 'chatcmpl-test',
           object: 'chat.completion.chunk',
           created,
-          model: 'qwen-test:0.5b',
+          model: modelId,
           choices: [
             {
               index: 0,
@@ -297,7 +332,7 @@ async function startFakeOpenAiCompatibleServer(options: {
           id: 'chatcmpl-test',
           object: 'chat.completion.chunk',
           created,
-          model: 'qwen-test:0.5b',
+          model: modelId,
           choices: [
             {
               index: 0,
@@ -340,6 +375,7 @@ async function startFakeOpenAiCompatibleServer(options: {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     requests,
+    requestRecords,
     close: () => closeServer(server),
   }
 }
@@ -528,7 +564,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function configureLocalMcpEnv(): Promise<() => Promise<void>> {
+async function configureLocalMcpEnv(options: {
+  sharedCacheHome?: string | null
+} = {}): Promise<() => Promise<void>> {
   const previousCommand = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
   const previousEntry = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY
   const previousArgsJson = process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
@@ -539,7 +577,10 @@ async function configureLocalMcpEnv(): Promise<() => Promise<void>> {
   const previousMcpProofCacheDisabled =
     process.env.AGENT_TEAMS_OPENCODE_MCP_TOOL_PROOF_CACHE_DISABLED
   const dataHome = await mkdtemp(path.join(os.tmpdir(), 'opencode-readiness-fake-data-'))
-  const cacheHome = await mkdtemp(path.join(os.tmpdir(), 'opencode-readiness-fake-cache-'))
+  const ownedCacheHome = options.sharedCacheHome
+    ? null
+    : await mkdtemp(path.join(os.tmpdir(), 'opencode-readiness-fake-cache-'))
+  const cacheHome = options.sharedCacheHome ?? ownedCacheHome!
   const claudeConfigDir =
     await mkdtemp(path.join(os.tmpdir(), 'opencode-readiness-fake-claude-config-'))
   const tsxPath = path.join(CLAUDE_TEAM_ROOT, 'node_modules', '.bin', 'tsx')
@@ -599,7 +640,9 @@ async function configureLocalMcpEnv(): Promise<() => Promise<void>> {
     }
     await Promise.all([
       rm(dataHome, { recursive: true, force: true }),
-      rm(cacheHome, { recursive: true, force: true }),
+      ownedCacheHome
+        ? rm(ownedCacheHome, { recursive: true, force: true })
+        : Promise.resolve(),
       rm(claudeConfigDir, { recursive: true, force: true }),
     ])
   }
@@ -749,6 +792,152 @@ describe('OpenCode readiness bridge live e2e', () => {
       ),
     )
   }, (SEQUENTIAL_ATTEMPTS + PARALLEL_ATTEMPTS) * (BRIDGE_TIMEOUT_MS + 60_000))
+
+  fakeResourceExhaustionE2ETest(
+    'surfaces resource exhaustion without waiting for probe timeout',
+    async () => {
+      const restoreMcpEnv = await configureLocalMcpEnv({
+        sharedCacheHome: FAKE_RESOURCE_EXHAUSTED_SHARED_CACHE_HOME,
+      })
+      const projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-resource-exhausted-'))
+      const modelId = 'quota-test-model'
+      const fakeServer = await startFakeOpenAiCompatibleServer({
+        modelId,
+        chatStatus: 429,
+        chatErrorMessage: 'grpc_code=resource_exhausted error_code=upgrade',
+      })
+      const startedAt = Date.now()
+      try {
+        await writeFakeLocalOpenCodeConfig({
+          projectPath,
+          baseUrl: fakeServer.baseUrl,
+          model: modelId,
+        })
+        const result = await runBridgeCommandAsync({
+          requestId: `readiness-resource-exhausted-${process.pid}-${Date.now()}`,
+          command: 'opencode.readiness',
+          projectPath,
+          body: {
+            selectedModel: `llama.cpp/${modelId}`,
+            requireExecutionProbe: true,
+          },
+        }).catch(error => {
+          throw new Error([
+            error instanceof Error ? error.message : String(error),
+            `duration: ${Date.now() - startedAt}ms`,
+            `requests:\n${fakeServer.requests.join('\n') || 'none'}`,
+          ].join('\n'))
+        })
+        const durationMs = Date.now() - startedAt
+        const chatRequests = fakeServer.requestRecords.filter(
+          request => request.request === 'POST /v1/chat/completions',
+        )
+        const quotaSurfaceDurationMs = chatRequests[0]
+          ? Math.max(0, Date.now() - chatRequests[0].atMs)
+          : durationMs
+        const diagnosticContext = [
+          result.error?.message,
+          result.data?.diagnostics?.join('\n'),
+          result.data?.missing?.join('\n'),
+          `state: ${result.data?.state ?? 'none'}`,
+          `duration: ${durationMs}ms`,
+          `quota surface duration: ${quotaSurfaceDurationMs}ms`,
+          `requests:\n${fakeServer.requests.join('\n') || 'none'}`,
+        ].filter(Boolean).join('\n')
+
+        expect(result.ok, diagnosticContext).toBe(true)
+        expect(result.data?.state, diagnosticContext).toBe('model_unavailable')
+        expect(result.data?.launchAllowed, diagnosticContext).toBe(false)
+        expect(diagnosticContext, diagnosticContext).toMatch(/resource_exhausted/i)
+        expect(chatRequests, diagnosticContext).toHaveLength(1)
+        expect(quotaSurfaceDurationMs, diagnosticContext).toBeLessThan(
+          FAKE_RESOURCE_EXHAUSTED_MAX_DURATION_MS,
+        )
+      } finally {
+        await runBridgeCommand({
+          requestId: `cleanup-resource-exhausted-${process.pid}-${Date.now()}`,
+          command: 'opencode.cleanupHosts',
+          projectPath,
+          body: {
+            mode: 'force',
+            staleAgeMs: 0,
+            leaseStaleAgeMs: 0,
+            preflightLeaseStaleAgeMs: 0,
+          },
+        }).catch(() => undefined)
+        await fakeServer.close().catch(() => undefined)
+        await restoreMcpEnv()
+        await rm(projectPath, { recursive: true, force: true }).catch(() => undefined)
+      }
+    },
+    BRIDGE_TIMEOUT_MS + 60_000,
+  )
+
+  cursorQuotaLiveE2ETest(
+    'surfaces the real Cursor account usage limit before the readiness timeout',
+    async () => {
+      const restoreMcpEnv = await configureLocalMcpEnv({
+        sharedCacheHome: CURSOR_QUOTA_LIVE_SHARED_CACHE_HOME,
+      })
+      const projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-cursor-quota-live-'))
+      const startedAt = Date.now()
+      try {
+        const result = await runBridgeCommandAsync({
+          requestId: `readiness-cursor-quota-live-${process.pid}-${Date.now()}`,
+          command: 'opencode.readiness',
+          projectPath,
+          body: {
+            selectedModel: 'cursor-acp/auto',
+            requireExecutionProbe: true,
+          },
+        })
+        const durationMs = Date.now() - startedAt
+        const diagnosticContext = [
+          result.error?.message,
+          result.data?.diagnostics?.join('\n'),
+          result.data?.missing?.join('\n'),
+          `state: ${result.data?.state ?? 'none'}`,
+          `duration: ${durationMs}ms`,
+        ].filter(Boolean).join('\n')
+
+        expect(result.ok, diagnosticContext).toBe(true)
+        expect(result.data?.state, diagnosticContext).toBe('model_unavailable')
+        expect(result.data?.launchAllowed, diagnosticContext).toBe(false)
+        const hasQuotaMarker =
+          /(?:rate|usage)[\s_-]*limit|resource[\s_-]*exhausted|quota[\s_-]*exceeded|grpc[\s_-]*code\s*[:=]\s*8|\b429\b/i
+            .test(diagnosticContext)
+        const hasBoundedNativeTimeout =
+          /Cursor native execution preflight timed out after \d+ms/i.test(diagnosticContext)
+        expect(hasQuotaMarker || hasBoundedNativeTimeout, diagnosticContext).toBe(true)
+        const fastTerminalDuration =
+          /(?:Cursor native failure probe confirmed|OpenCode [^\n]*?exposed) a terminal provider (?:error|failure)[^\n]*?\bin (\d+)ms/i
+            .exec(diagnosticContext)?.[1]
+        if (fastTerminalDuration) {
+          expect(Number(fastTerminalDuration), diagnosticContext).toBeLessThan(
+            CURSOR_QUOTA_LIVE_FAST_TERMINAL_MAX_DURATION_MS,
+          )
+        } else {
+          expect(hasBoundedNativeTimeout, diagnosticContext).toBe(true)
+        }
+        expect(durationMs, diagnosticContext).toBeLessThan(CURSOR_QUOTA_LIVE_MAX_DURATION_MS)
+      } finally {
+        await runBridgeCommand({
+          requestId: `cleanup-cursor-quota-live-${process.pid}-${Date.now()}`,
+          command: 'opencode.cleanupHosts',
+          projectPath,
+          body: {
+            mode: 'force',
+            staleAgeMs: 0,
+            leaseStaleAgeMs: 0,
+            preflightLeaseStaleAgeMs: 0,
+          },
+        }).catch(() => undefined)
+        await restoreMcpEnv()
+        await rm(projectPath, { recursive: true, force: true }).catch(() => undefined)
+      }
+    },
+    BRIDGE_TIMEOUT_MS + 60_000,
+  )
 
   fakeLocalE2ETest('returns ready for configured local OpenAI-compatible provider', async () => {
     const restoreMcpEnv = await configureLocalMcpEnv()
