@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -25,6 +25,7 @@ import type {
   OpenCodeMessage,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeSessionStatusInput,
 } from './types.js'
 
 const profile: OpenCodePreparedProfile = {
@@ -83,6 +84,35 @@ describe('OpenCodeExecutionProbe', () => {
       outcome: 'unavailable',
       reason: message,
     })
+  })
+
+  test('classifies Cursor resource exhaustion as model unavailable', () => {
+    for (const message of [
+      'grpc_code=resource_exhausted error_code=upgrade',
+      'grpc_code=resource-exhausted error_code=upgrade',
+      'usage-limit reached',
+      'quota_exceeded',
+      'FreeUsageLimit',
+      'ResourceExhaustedError',
+      'RateLimitError',
+      'grpc_code=8 error_code=upgrade',
+      '{"grpcCode":8}',
+      '{"statusCode":429}',
+      'HTTP 429 Too Many Requests',
+      'HTTP 403 Forbidden: grpc_code=RESOURCE_EXHAUSTED',
+    ]) {
+      expect(classifyProbeFailure({ message })).toEqual({
+        outcome: 'unavailable',
+        reason: message,
+      })
+    }
+    expect(classifyProbeFailure({ message: 'error_code=upgrade' }).outcome).toBe('unknown')
+    expect(classifyProbeFailure({ message: '{"usage":{"input_tokens":429}}' }).outcome).toBe(
+      'unknown',
+    )
+    expect(classifyProbeFailure({ message: 'HTTP 403 Forbidden' }).outcome).toBe(
+      'not_authenticated',
+    )
   })
 
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
@@ -255,6 +285,74 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toContain('did not create a user message or enter a running state')
     expect(abortCount).toBeGreaterThanOrEqual(1)
   })
+
+  for (const source of ['status', 'messages'] as const) {
+    test(`classifies resource exhaustion thrown by ${source} while confirming prompt start`, async () => {
+      const terminalError = () => {
+        const error = new Error('OpenCode transport failed') as Error & { cause?: unknown }
+        error.cause = {
+          data: {
+            error: {
+              type: 'ResourceExhaustedError',
+              message: 'grpc_code=RESOURCE_EXHAUSTED',
+            },
+          },
+        }
+        return error
+      }
+      const probe = new OpenCodeExecutionProbe({
+        hostManager: {
+          ensureHost: async () => host,
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfig: async () => { throw new Error('not used') },
+            getConfigProviders: async () => { throw new Error('not used') },
+            getProviders: async () => { throw new Error('not used') },
+            getProviderAuth: async () => { throw new Error('not used') },
+            getServerDoc: async () => { throw new Error('not used') },
+            authorizeProviderOAuth: async () => { throw new Error('not used') },
+            completeProviderOAuth: async () => { throw new Error('not used') },
+            setProviderAuth: async () => { throw new Error('not used') },
+            deleteProviderAuth: async () => { throw new Error('not used') },
+            listAgents: async () => { throw new Error('not used') },
+            getMcp: async () => { throw new Error('not used') },
+            createSession: async () => ({ id: 'session-1' }),
+            getSession: async () => ({ id: 'session-1' }),
+            getSessionStatus: async () => {
+              if (source === 'status') {
+                throw terminalError()
+              }
+              return { 'session-1': 'idle' }
+            },
+            getSessionMessages: async () => {
+              throw terminalError()
+            },
+            getPermissions: async () => [],
+            listExperimentalToolIds: async () => [],
+            listExperimentalTools: async () => [],
+            answerPermission: async () => ({}),
+            sendSessionMessage: async () => ({ info: {}, parts: [] }),
+            promptSessionAsync: async () => {},
+            abortSession: async () => true,
+          }),
+        },
+        sessionCleanupTimeoutMs: 5,
+      })
+
+      const result = await probe.probeModel({
+        selectedModel: 'cursor-acp/auto',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+      })
+
+      expect(result.outcome).toBe('unavailable')
+      expect(result.reason).toContain('RESOURCE_EXHAUSTED')
+      expect(result.failureCode).toBeUndefined()
+      expect(result.errorCount).toBe(1)
+    })
+  }
 
   test('bounds session cleanup when the abort request ignores cancellation', async () => {
     let abortCount = 0
@@ -731,6 +829,929 @@ describe('OpenCodeExecutionProbe', () => {
 
     expect(result.outcome).toBe('unavailable')
     expect(result.reason).toContain('Cursor usage limit')
+    expect(result.diagnostics.join('\n')).toContain(
+      'assistant payload exposed a terminal provider failure',
+    )
+  })
+
+  test('uses the native Cursor probe to stop a stuck OpenCode retry on resource exhaustion', async () => {
+    let nativeProbeCalls = 0
+    let abortCalls = 0
+    let messageCalls = 0
+    let statusCalls = 0
+    let nativeProbeEnv: NodeJS.ProcessEnv | undefined
+    let nativeProbeProjectPath: string | undefined
+    let nativeProbeDelayMs: number | undefined
+    let hungStatusSignal: AbortSignal | undefined
+    let resolveNativeFailure!: (failure: {
+      outcome: 'failure'
+      message: string
+      durationMs: number
+      exitCode: number
+    }) => void
+    const nativeFailure = new Promise<{
+      outcome: 'failure'
+      message: string
+      durationMs: number
+      exitCode: number
+    }>(resolve => {
+      resolveNativeFailure = resolve
+    })
+    const profileEnv = {
+      CURSOR_AGENT_EXECUTABLE: '/managed/profile/cursor-agent',
+      PATH: '/managed/profile/bin',
+    }
+    const managedHost: OpenCodeHostHandle = {
+      ...host,
+      profile: {
+        ...host.profile,
+        env: profileEnv,
+      },
+    }
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => managedHost,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: (_baseUrl, requestContext) => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            if (statusCalls === 2) {
+              hungStatusSignal = requestContext?.signal
+              resolveNativeFailure({
+                outcome: 'failure',
+                message: 'grpc_code=resource_exhausted error_code=upgrade',
+                durationMs: 12,
+                exitCode: 1,
+              })
+              return await new Promise<Record<string, OpenCodeSessionStatusInput>>(() => {})
+            }
+            return { 'session-1': 'retry' }
+          },
+          getSessionMessages: async () => {
+            messageCalls += 1
+            return await new Promise<OpenCodeMessage[]>(() => {})
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCalls += 1
+            return true
+          },
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async input => {
+          nativeProbeCalls += 1
+          nativeProbeEnv = input.env
+          nativeProbeProjectPath = input.projectPath
+          if (nativeProbeCalls === 1) nativeProbeDelayMs = input.delayMs
+          return nativeProbeCalls === 1 ? null : nativeFailure
+        },
+      },
+      sleep: async () => {},
+      probeTimeoutMs: 1_000,
+    })
+
+    const runtimeDeadline = new OpenCodeRuntimeDeadline(250)
+    const result = await (async () => {
+      try {
+        return await probe.probeModel({
+          selectedModel: 'cursor-acp/auto',
+          projectPath: '/tmp/project',
+          runtimeDeadline,
+        })
+      } finally {
+        runtimeDeadline.dispose()
+      }
+    })()
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('resource_exhausted')
+    expect(result.durableState).toBe('retrying')
+    expect(result.diagnostics.join('\n')).toContain('native failure probe confirmed')
+    expect(nativeProbeCalls).toBe(2)
+    expect(nativeProbeEnv).toBe(profileEnv)
+    expect(nativeProbeProjectPath).toBe(managedHost.profile.tmpPath)
+    expect(nativeProbeDelayMs).toBe(0)
+    expect(messageCalls).toBe(0)
+    expect(statusCalls).toBeGreaterThanOrEqual(2)
+    expect(hungStatusSignal?.aborted).toBe(true)
+    expect(abortCalls).toBeGreaterThan(0)
+
+    const cachedResult = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+    expect(cachedResult.outcome).toBe('unavailable')
+    expect(nativeProbeCalls).toBe(2)
+  })
+
+  test('uses a nested terminal OpenCode retry error without a second Cursor request', async () => {
+    let nativeProbeCalls = 0
+    let messageCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({
+            'session-1': {
+              type: 'retry',
+              attempt: 1,
+              message: 'HTTP 403 Forbidden',
+              data: {
+                metadata: {
+                  code: 'RESOURCE_EXHAUSTED',
+                },
+              },
+            } as OpenCodeSessionStatusInput & { data: Record<string, unknown> },
+          }),
+          getSessionMessages: async () => {
+            messageCalls += 1
+            return await new Promise<OpenCodeMessage[]>(() => {})
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeProbeCalls += 1
+          return null
+        },
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('RESOURCE_EXHAUSTED')
+    expect(result.diagnostics.join('\n')).toContain('retry status exposed')
+    expect(nativeProbeCalls).toBe(1)
+    expect(messageCalls).toBe(0)
+  })
+
+  test('rechecks retry status while the session messages request is pending', async () => {
+    let statusCalls = 0
+    let messageCalls = 0
+    let pendingMessagesSignal: AbortSignal | undefined
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: (_baseUrl, requestContext) => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return {
+              'session-1': statusCalls < 3
+                ? 'busy'
+                : {
+                    type: 'retry',
+                    attempt: 1,
+                    message: 'grpc_code=resource_exhausted error_code=upgrade',
+                  },
+            }
+          },
+          getSessionMessages: async () => {
+            messageCalls += 1
+            pendingMessagesSignal = requestContext?.signal
+            return await new Promise<OpenCodeMessage[]>((_resolve, reject) => {
+              requestContext?.signal?.addEventListener(
+                'abort',
+                () => reject(requestContext.signal?.reason),
+                { once: true },
+              )
+            })
+          },
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('resource_exhausted')
+    expect(result.durableState).toBe('retrying')
+    expect(statusCalls).toBeGreaterThanOrEqual(3)
+    expect(messageCalls).toBe(1)
+    expect(pendingMessagesSignal?.aborted).toBe(true)
+  })
+
+  for (const source of ['status', 'messages'] as const) {
+    test(`classifies resource exhaustion thrown by the session ${source} request`, async () => {
+      let statusCalls = 0
+      const probe = new OpenCodeExecutionProbe({
+        hostManager: {
+          ensureHost: async () => host,
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfig: async () => { throw new Error('not used') },
+            getConfigProviders: async () => { throw new Error('not used') },
+            getProviders: async () => { throw new Error('not used') },
+            getProviderAuth: async () => { throw new Error('not used') },
+            listAgents: async () => { throw new Error('not used') },
+            getMcp: async () => { throw new Error('not used') },
+            createSession: async () => ({ id: 'session-1' }),
+            getSession: async () => ({ id: 'session-1' }),
+            getSessionStatus: async () => {
+              statusCalls += 1
+              if (source === 'status' && statusCalls > 1) {
+                throw new Error('HTTP 403: grpc_code=RESOURCE_EXHAUSTED')
+              }
+              return { 'session-1': 'busy' }
+            },
+            getSessionMessages: async () => {
+              if (source === 'messages') {
+                throw new Error('HTTP 403: grpc_code=RESOURCE_EXHAUSTED')
+              }
+              return []
+            },
+            getPermissions: async () => [],
+            sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+            promptSessionAsync: async () => {},
+            abortSession: async () => true,
+          }),
+        },
+      })
+
+      const result = await probe.probeModel({
+        selectedModel: 'cursor-acp/auto',
+        projectPath: '/tmp/project',
+        bypassCache: true,
+      })
+
+      expect(result.outcome).toBe('unavailable')
+      expect(result.reason).toContain('RESOURCE_EXHAUSTED')
+      expect(result.diagnostics.join('\n')).toContain(`session ${source} request`)
+    })
+  }
+
+  test('continues the OpenCode probe after bounded native fallback rejections', async () => {
+    let statusCalls = 0
+    let nativeProbeCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return {
+              'session-1': statusCalls === 1
+                ? 'busy'
+                : statusCalls === 2
+                  ? 'retry'
+                  : 'idle',
+            }
+          },
+          getSessionMessages: async () => statusCalls < 3
+            ? []
+            : [{
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeProbeCalls += 1
+          throw new Error('native probe crashed')
+        },
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(nativeProbeCalls).toBe(3)
+  })
+
+  test('retries one inconclusive native fallback and uses a terminal second result', async () => {
+    let nativeProbeCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'retry' }),
+          getSessionMessages: async () => await new Promise<OpenCodeMessage[]>(() => {}),
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeProbeCalls += 1
+          return nativeProbeCalls === 1
+            ? {
+                outcome: 'failure',
+                message: 'Connection reset by server',
+                durationMs: 10,
+                exitCode: 1,
+              }
+            : {
+                outcome: 'failure',
+                message: 'grpc_code=resource_exhausted error_code=upgrade',
+                durationMs: 12,
+                exitCode: 1,
+              }
+        },
+      },
+      sleep: async () => {},
+      probeTimeoutMs: 1_000,
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('resource_exhausted')
+    expect(nativeProbeCalls).toBe(2)
+  })
+
+  test('does not repeat the native fallback after a successful PONG result', async () => {
+    let statusCalls = 0
+    let nativeProbeCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return { 'session-1': statusCalls < 3 ? 'retry' : 'idle' }
+          },
+          getSessionMessages: async () => statusCalls < 3
+            ? []
+            : [{
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeProbeCalls += 1
+          if (nativeProbeCalls === 1) return null
+          return {
+            outcome: 'available',
+            message: null,
+            durationMs: 8,
+            exitCode: 0,
+          }
+        },
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(nativeProbeCalls).toBe(2)
+  })
+
+  test('prefers a recovered original OpenCode PONG over an auxiliary native failure', async () => {
+    let statusCalls = 0
+    let nativeProbeCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return { 'session-1': statusCalls === 1 ? 'retry' : 'idle' }
+          },
+          getSessionMessages: async () => [{
+            info: {
+              id: 'msg-assistant-1',
+              role: 'assistant',
+              sessionID: 'session-1',
+              time: { created: 101, completed: 110 },
+            },
+            parts: [{ type: 'text', text: 'PONG' }],
+          }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeProbeCalls += 1
+          if (nativeProbeCalls === 1) return null
+          return {
+            outcome: 'failure',
+            message: 'grpc_code=resource_exhausted error_code=upgrade',
+            durationMs: 8,
+            exitCode: 1,
+          }
+        },
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.latestAssistantText).toBe('PONG')
+    expect(result.diagnostics.join('\n')).toContain('original probe recovered')
+    expect(nativeProbeCalls).toBe(2)
+  })
+
+  test('does not repeat an inconclusive native preflight while OpenCode is busy', async () => {
+    let statusCalls = 0
+    let nativeFallbackCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            return { 'session-1': statusCalls < 3 ? 'busy' : 'idle' }
+          },
+          getSessionMessages: async () => statusCalls < 3
+            ? []
+            : [{
+                info: {
+                  id: 'msg-assistant-1',
+                  role: 'assistant',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
+              }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeFallbackCalls += 1
+          return null
+        },
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(statusCalls).toBe(3)
+    expect(nativeFallbackCalls).toBe(1)
+  })
+
+  test('surfaces terminal native Cursor preflight before creating an OpenCode session', async () => {
+    let nativeFallbackCalls = 0
+    let createSessionCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => {
+            createSessionCalls += 1
+            return { id: 'session-1' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'busy' }),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeFallbackCalls += 1
+          return {
+            outcome: 'failure',
+            message: "cursor-acp error: You've hit your Cursor usage limit",
+            durationMs: 12,
+            exitCode: 1,
+          }
+        },
+      },
+      sleep: async () => {},
+      probeTimeoutMs: 1_000,
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('Cursor usage limit')
+    expect(result.diagnostics.join('\n')).toContain('native failure probe confirmed')
+    expect(nativeFallbackCalls).toBe(1)
+    expect(createSessionCalls).toBe(0)
+  })
+
+  test('surfaces terminal native Cursor preflight before starting an OpenCode host', async () => {
+    let prepareProfileCalls = 0
+    let ensureHostCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      prepareProfile: async (_projectPath, options) => {
+        prepareProfileCalls += 1
+        expect(options?.includeAppMcp).toBe(false)
+        return profile
+      },
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          throw new Error('OpenCode client must not be created after terminal native preflight')
+        },
+      },
+      cursorNativeFailureProbe: {
+        probe: async input => {
+          expect(input.projectPath).toBe(profile.tmpPath)
+          expect(input.delayMs).toBe(0)
+          return {
+            outcome: 'failure',
+            message: 'RESOURCE_EXHAUSTED: Cursor usage limit reached',
+            durationMs: 9,
+            exitCode: 1,
+          }
+        },
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      cursorNativePreflightBeforeHost: true,
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(result.reason).toContain('RESOURCE_EXHAUSTED')
+    expect(prepareProfileCalls).toBe(1)
+    expect(ensureHostCalls).toBe(0)
+  })
+
+  test('uses and cleans a lightweight sandbox profile for production native preflight', async () => {
+    let nativeProjectPath: string | null = null
+    let ensureHostCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      cursorNativeFailureProbe: {
+        probe: async input => {
+          nativeProjectPath = input.projectPath
+          expect((await stat(input.projectPath)).isDirectory()).toBe(true)
+          expect(input.env?.CURSOR_AGENT_EXECUTABLE).toContain(
+            'native-subscription-cli-bin',
+          )
+          return {
+            outcome: 'failure',
+            message: 'RESOURCE_EXHAUSTED: Cursor usage limit reached',
+            durationMs: 8,
+            exitCode: 1,
+          }
+        },
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
+    })
+
+    expect(result.outcome).toBe('unavailable')
+    expect(ensureHostCalls).toBe(0)
+    expect(nativeProjectPath).not.toBeNull()
+    await expect(stat(nativeProjectPath!)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('keeps an inconclusive native-only Cursor preflight from starting an OpenCode host', async () => {
+    let ensureHostCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => null,
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
+    })
+
+    expect(result.outcome).toBe('unknown')
+    expect(result.diagnostics.join('\n')).toContain('was inconclusive before OpenCode startup')
+    expect(ensureHostCalls).toBe(0)
+  })
+
+  test('returns a bounded failure code when native-only Cursor preflight times out', async () => {
+    let ensureHostCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => {
+          ensureHostCalls += 1
+          return host
+        },
+        releaseHost: async () => {},
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => ({
+          outcome: 'timeout',
+          message: 'Cursor native execution preflight timed out after 65000ms',
+          durationMs: 65_000,
+          exitCode: null,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+      cursorNativePreflightBeforeHost: true,
+      cursorNativePreflightOnly: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      failureCode: 'execution_timeout',
+      reason: 'Cursor native execution preflight timed out after 65000ms',
+    })
+    expect(ensureHostCalls).toBe(0)
+  })
+
+  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+    let createSessionCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => {
+            createSessionCalls += 1
+            return { id: 'session-1' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'busy' }),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => ({
+          outcome: 'available',
+          message: null,
+          durationMs: 14,
+          exitCode: 0,
+        }),
+      },
+      sleep: async () => {},
+      probeTimeoutMs: 1_000,
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(result.verifiedAt).toBeTruthy()
+    expect(result.diagnostics.join('\n')).toContain(
+      'native execution probe confirmed model availability',
+    )
+    expect(createSessionCalls).toBe(0)
+  })
+
+  test('uses one inconclusive native preflight before a successful OpenCode response', async () => {
+    let nativeFallbackCalls = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => {
+          nativeFallbackCalls += 1
+          return null
+        },
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe('available')
+    expect(nativeFallbackCalls).toBe(1)
   })
 
   test('can release execution probe lease without disposing the live host', async () => {
@@ -1013,6 +2034,7 @@ describe('OpenCodeExecutionProbe', () => {
                 time: { created: 101, completed: 110 },
                 error: {
                   name: 'UnknownError',
+                  message: 'Model unavailable',
                   data: {
                     message: authFailure,
                   },
@@ -1039,7 +2061,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.durableState).toBe('error')
   })
 
-  test('surfaces nested provider rate-limit errors from assistant message metadata', async () => {
+  test('surfaces stringified nested provider rate-limit errors while the session is retrying', async () => {
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -1067,7 +2089,12 @@ describe('OpenCodeExecutionProbe', () => {
           },
           createSession: async () => ({ id: 'session-1' }),
           getSession: async () => ({ id: 'session-1' }),
-          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionStatus: async () => ({
+            'session-1': {
+              type: 'retry',
+              attempt: 1,
+            },
+          }),
           getSessionMessages: async () => [
             {
               info: {
@@ -1075,16 +2102,21 @@ describe('OpenCodeExecutionProbe', () => {
                 role: 'assistant',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
-                error: {
+                error: JSON.stringify({
                   name: 'AI_APICallError',
-                  data: {
-                    error: {
-                      type: 'FreeUsageLimitError',
-                      message: 'Rate limit exceeded. Please try again later.',
+                  message: 'Provider request failed',
+                  errors: [
+                    {
+                      data: {
+                        error: {
+                          type: 'FreeUsageLimitError',
+                          message: 'Rate limit exceeded. Please try again later.',
+                        },
+                      },
                     },
-                    statusCode: 429,
-                  },
-                },
+                  ],
+                  statusCode: 429,
+                }),
               },
               parts: [],
             },
@@ -1104,7 +2136,10 @@ describe('OpenCodeExecutionProbe', () => {
 
     expect(result.outcome).toBe('unavailable')
     expect(result.reason).toBe('Rate limit exceeded. Please try again later.')
-    expect(result.durableState).toBe('error')
+    expect(result.durableState).toBe('retrying')
+    expect(result.diagnostics.join('\n')).toContain(
+      'retry/error payload exposed a terminal provider failure',
+    )
   })
 
   test('deduplicates concurrent probes and reuses a short-lived successful result', async () => {
@@ -1174,6 +2209,148 @@ describe('OpenCodeExecutionProbe', () => {
     expect(second.outcome).toBe('available')
     expect(third.outcome).toBe('available')
     expect(createSessionCount).toBe(1)
+  })
+
+  test('bounds an in-memory deduplicated caller by its own runtime deadline', async () => {
+    let createSessionCount = 0
+    let releaseCreateSession!: () => void
+    let markCreateSessionStarted!: () => void
+    const createSessionStarted = new Promise<void>(resolve => {
+      markCreateSessionStarted = resolve
+    })
+    const createSessionGate = new Promise<void>(resolve => {
+      releaseCreateSession = resolve
+    })
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => {
+            createSessionCount += 1
+            markCreateSessionStarted()
+            await createSessionGate
+            return { id: 'session-1' }
+          },
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-1',
+                role: 'assistant',
+                parentID: 'msg-user-1',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+              },
+              parts: [{ type: 'text', text: 'PONG' }],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+    const input = {
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    }
+    const sharedProbe = probe.probeModel(input)
+    await createSessionStarted
+    const deadline = new OpenCodeRuntimeDeadline(20)
+    try {
+      await expect(probe.probeModel({
+        ...input,
+        runtimeDeadline: deadline,
+      })).rejects.toMatchObject({
+        name: 'OpenCodeRuntimeDeadlineError',
+        phase: 'execution_poll',
+      })
+    } finally {
+      deadline.dispose()
+      releaseCreateSession()
+    }
+
+    await expect(sharedProbe).resolves.toMatchObject({ outcome: 'available' })
+    expect(createSessionCount).toBe(1)
+  })
+
+  test('does not let a short in-flight owner deadline abort a longer caller', async () => {
+    let createSessionCount = 0
+    let markFirstCreateStarted!: () => void
+    const firstCreateStarted = new Promise<void>(resolve => {
+      markFirstCreateStarted = resolve
+    })
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => {
+            createSessionCount += 1
+            if (createSessionCount === 1) {
+              markFirstCreateStarted()
+              return await new Promise<{ id: string }>(() => {})
+            }
+            return { id: `session-${createSessionCount}` }
+          },
+          getSession: async id => ({ id }),
+          getSessionStatus: async () => ({ [`session-${createSessionCount}`]: 'idle' }),
+          getSessionMessages: async () => [{
+            info: {
+              id: 'msg-assistant-1',
+              role: 'assistant',
+              sessionID: `session-${createSessionCount}`,
+              time: { created: 101, completed: 110 },
+            },
+            parts: [{ type: 'text', text: 'PONG' }],
+          }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+    const input = {
+      selectedModel: 'opencode/minimax-m2.5-free',
+      projectPath: '/tmp/project',
+    }
+    const shortDeadline = new OpenCodeRuntimeDeadline(30)
+    try {
+      const shortOwner = probe.probeModel({
+        ...input,
+        runtimeDeadline: shortDeadline,
+      })
+      await firstCreateStarted
+      const longerCaller = probe.probeModel(input)
+
+      await expect(shortOwner).rejects.toMatchObject({
+        name: 'OpenCodeRuntimeDeadlineError',
+      })
+      await expect(longerCaller).resolves.toMatchObject({ outcome: 'available' })
+    } finally {
+      shortDeadline.dispose()
+    }
+    expect(createSessionCount).toBe(2)
   })
 
   test('bypasses in-memory probe cache when requested', async () => {
