@@ -443,6 +443,98 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       .toBe(`cursor:${hostHomePath}`)
     expect(await runCommandCapture(path.join(bridge.binPath, 'kiro-cli'), [], managedEnv))
       .toBe(`kiro:${hostHomePath}`)
+    const cursorBridgeSource = await readFile(bridge.cursorAgentExecutablePath, 'utf8')
+    expect(cursorBridgeSource).toContain('AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED')
+    expect(cursorBridgeSource).toContain('AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS')
+    expect(cursorBridgeSource).toContain('cursor-resource-exhausted-preload.cjs')
+    expect(await readFile(
+      path.join(bridge.binPath, 'cursor-resource-exhausted-preload.cjs'),
+      'utf8',
+    )).toContain('RESOURCE_EXHAUSTED')
+  })
+
+  test('applies the Cursor resource exhaustion override by default with a kill switch', async () => {
+    if (process.platform === 'win32') return
+
+    const nodePath = Bun.which('node')
+    expect(nodePath).toBeTruthy()
+    if (!nodePath) return
+    const hostBinPath = path.join(tempDir, 'host-bin')
+    const profileRootPath = path.join(tempDir, 'profile-root')
+    const fixturePath = path.join(tempDir, 'cursor-agent-fixture.js')
+    const cursorAgentOverridePath = path.join(tempDir, 'custom cursor-agent')
+    await mkdir(hostBinPath, { recursive: true })
+    await writeFile(
+      fixturePath,
+      [
+        "const c={yM:{FREE_USER_USAGE_LIMIT:'free',GENERIC_RATE_LIMIT_EXCEEDED:'generic',RESOURCE_EXHAUSTED:'resource'}};",
+        'R=new Set([c.yM.FREE_USER_USAGE_LIMIT,c.yM.GENERIC_RATE_LIMIT_EXCEEDED]);',
+        'process.stdout.write(JSON.stringify({patched:R.has(c.yM.RESOURCE_EXHAUSTED),nodeOptions:process.env.NODE_OPTIONS||null}))',
+      ].join(''),
+      'utf8',
+    )
+    const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`
+    await writeFile(
+      path.join(hostBinPath, 'cursor-agent'),
+      '#!/bin/sh\nprintf "wrong cursor-agent target"\n',
+      { encoding: 'utf8', mode: 0o700 },
+    )
+    await writeFile(
+      cursorAgentOverridePath,
+      `#!/bin/sh\nexec ${shellQuote(nodePath)} ${shellQuote(fixturePath)} "$@"\n`,
+      { encoding: 'utf8', mode: 0o700 },
+    )
+    await writeFile(
+      path.join(hostBinPath, 'kiro-cli'),
+      '#!/bin/sh\nexit 0\n',
+      { encoding: 'utf8', mode: 0o700 },
+    )
+    const bridge = await ensureOpenCodeNativeCliCredentialBridge(
+      profileRootPath,
+      {
+        HOME: tempDir,
+        PATH: hostBinPath,
+        CURSOR_AGENT_EXECUTABLE: cursorAgentOverridePath,
+      },
+      process.platform,
+    )
+    const baseEnv = {
+      HOME: path.join(profileRootPath, 'home'),
+      PATH: `${bridge.binPath}${path.delimiter}${hostBinPath}`,
+    }
+
+    expect(JSON.parse(await runCommandCapture(
+      bridge.cursorAgentExecutablePath,
+      [],
+      baseEnv,
+    ))).toEqual({ patched: true, nodeOptions: null })
+    expect(JSON.parse(await runCommandCapture(
+      bridge.cursorAgentExecutablePath,
+      [],
+      {
+        ...baseEnv,
+        AGENT_TEAMS_CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED: '1',
+      },
+    ))).toEqual({ patched: false, nodeOptions: null })
+  })
+
+  test('writes cmd-safe Cursor preload and preserves an explicit Windows executable', async () => {
+    const profileRootPath = path.join(tempDir, 'profile-root')
+    const cursorAgentExecutable = 'C:\\Cursor Tools\\cursor-agent.cmd'
+    const bridge = await ensureOpenCodeNativeCliCredentialBridge(
+      profileRootPath,
+      {
+        USERPROFILE: 'C:\\Users\\Test User',
+        PATH: 'C:\\Windows\\System32',
+        CURSOR_AGENT_EXECUTABLE: cursorAgentExecutable,
+      },
+      'win32',
+    )
+
+    const cursorBridgeSource = await readFile(bridge.cursorAgentExecutablePath, 'utf8')
+    expect(cursorBridgeSource).toContain('NODE_OPTIONS=--require="')
+    expect(cursorBridgeSource).not.toContain('NODE_OPTIONS=--require=\\"')
+    expect(cursorBridgeSource).toContain(`call "${cursorAgentExecutable}" %*`)
   })
 
   test('seeds the Cursor plugin marker after the official CLI reports authenticated', async () => {

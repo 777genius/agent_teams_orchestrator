@@ -43,6 +43,10 @@ import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  buildCursorAgentResourceExhaustedPreloadScript,
+  CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
+} from './OpenCodeCursorResourceExhaustedPatch.js'
 import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
@@ -922,10 +926,21 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       : hostEnv.HOME?.trim() || hostEnv.USERPROFILE?.trim()
   ) || os.homedir()
   const hostPath = hostEnv.PATH ?? ''
+  const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
   await mkdir(binPath, { recursive: true })
+  const cursorResourceExhaustedPreloadPath = path.join(
+    binPath,
+    'cursor-resource-exhausted-preload.cjs',
+  )
+  await writeFile(
+    cursorResourceExhaustedPreloadPath,
+    buildCursorAgentResourceExhaustedPreloadScript(),
+    { encoding: 'utf8', mode: 0o600 },
+  )
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
+    const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
     if (platform === 'win32') {
       const bridgePath = path.join(binPath, `${command}.cmd`)
       const content = [
@@ -936,7 +951,13 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'set "XDG_DATA_HOME="',
         'set "XDG_CACHE_HOME="',
         `set "PATH=${escapeWindowsBatchValue(hostPath)}"`,
-        `${command}.cmd %*`,
+        ...(command === 'cursor-agent'
+          ? [
+              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS=%NODE_OPTIONS%"`,
+              `if not "%${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}%"=="1" set "NODE_OPTIONS=--require="${escapeWindowsBatchValue(cursorResourceExhaustedPreloadPath)}" %NODE_OPTIONS%"`,
+            ]
+          : []),
+        `call "${escapeWindowsBatchValue(hostCommand)}" %*`,
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
@@ -951,7 +972,15 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `export USERPROFILE=${quotePosixShellValue(hostHomePath)}`,
       'unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME',
       `export PATH=${quotePosixShellValue(hostPath)}`,
-      `exec ${command} "$@"`,
+      ...(command === 'cursor-agent'
+          ? [
+            `if [ "\${${CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV}:-}" != "1" ]; then`,
+            '  export AGENT_TEAMS_CURSOR_ORIGINAL_NODE_OPTIONS="${NODE_OPTIONS:-}"',
+            `  export NODE_OPTIONS=${quotePosixShellValue(`--require="${cursorResourceExhaustedPreloadPath}"`)}" \${NODE_OPTIONS:-}"`,
+            'fi',
+          ]
+        : []),
+      `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
     await writeFile(bridgePath, content, 'utf8')
@@ -990,10 +1019,12 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
 function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
   const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
   const candidates = [
-    path.join(xdgConfigHome, 'opencode', 'opencode.json'),
-    path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
     path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
+    // An explicit XDG config is closer to the invoking runtime than the
+    // canonical user config and must win model/provider conflicts.
+    path.join(xdgConfigHome, 'opencode', 'opencode.json'),
+    path.join(xdgConfigHome, 'opencode', 'opencode.jsonc'),
   ]
   const explicitConfigPath = env.OPENCODE_CONFIG?.trim()
   if (explicitConfigPath) {
@@ -1403,8 +1434,7 @@ export class OpenCodeProfileManager {
       env.CURSOR_ACP_HOME_DIR =
         process.env.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
-        process.env.CURSOR_AGENT_EXECUTABLE?.trim()
-        || nativeCliCredentialBridge.cursorAgentExecutablePath
+        nativeCliCredentialBridge.cursorAgentExecutablePath
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
