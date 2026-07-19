@@ -65,7 +65,7 @@ export type OpenCodeClient = {
       agent?: string
       noReply?: boolean
       system?: string
-      tools?: unknown[]
+      tools?: Record<string, boolean>
       model?: {
         providerID: string
         modelID: string
@@ -80,7 +80,7 @@ export type OpenCodeClient = {
       agent?: string
       noReply?: boolean
       system?: string
-      tools?: unknown[]
+      tools?: Record<string, boolean>
       model?: {
         providerID: string
         modelID: string

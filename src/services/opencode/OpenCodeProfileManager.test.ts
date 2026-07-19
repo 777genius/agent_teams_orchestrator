@@ -381,7 +381,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       kiro: {
         name: 'Amazon Q Developer / Kiro',
         npm:
-          'kiro-acp-ai-provider@https://github.com/777genius/kiro-acp-ai-provider/releases/download/agent-teams-mcp-readiness-v1/kiro-acp-ai-provider-2.1.2.tgz',
+          'kiro-acp-ai-provider@https://github.com/777genius/kiro-acp-ai-provider/releases/download/agent-teams-mcp-readiness-v11/kiro-acp-ai-provider-2.1.2.tgz',
         models: {
           auto: {
             name: 'Auto',
