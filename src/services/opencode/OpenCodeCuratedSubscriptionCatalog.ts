@@ -417,7 +417,7 @@ export const OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS = [
 ] as const satisfies readonly OpenCodeCuratedSubscriptionProviderDefinition[]
 
 export const OPEN_CODE_MANAGED_SUBSCRIPTION_PLUGIN_PACKAGES = [
-  'opencode-kiro@0.3.6',
+  'opencode-kiro@0.4.0',
   '@rama_nigg/open-cursor@2.5.2',
 ] as const
 

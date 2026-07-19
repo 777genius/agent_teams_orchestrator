@@ -668,6 +668,12 @@ type KiroCliAuthProbe = (
   platform: NodeJS.Platform,
 ) => Promise<boolean>
 
+interface KiroCliWhoamiResult {
+  error?: unknown
+  stdout?: Buffer | string | null
+  stderr?: Buffer | string | null
+}
+
 type CursorAgentAuthProbe = (
   executablePath: string,
   platform: NodeJS.Platform,
@@ -676,6 +682,64 @@ type CursorAgentAuthProbe = (
 const CURSOR_AGENT_AUTH_MARKER = 'cursor-agent'
 const CURSOR_AGENT_AUTH_MARKER_TTL_MS = 30 * 60 * 1000
 const CURSOR_AGENT_AUTH_MARKER_REFRESH_SKEW_MS = 60 * 1000
+
+function extractFirstBalancedJsonObject(value: string): string | null {
+  const start = value.indexOf('{')
+  if (start < 0) {
+    return null
+  }
+
+  let depth = 0
+  let escaped = false
+  let inString = false
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (character === '\\') {
+        escaped = true
+      } else if (character === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (character === '"') {
+      inString = true
+    } else if (character === '{') {
+      depth += 1
+    } else if (character === '}') {
+      depth -= 1
+      if (depth === 0) {
+        return value.slice(start, index + 1)
+      }
+    }
+  }
+
+  return null
+}
+
+function hasAuthenticatedKiroAccount(value: Buffer | string | null | undefined): boolean {
+  const json = extractFirstBalancedJsonObject(value?.toString() ?? '')
+  if (!json) {
+    return false
+  }
+
+  try {
+    const parsed = JSON.parse(json) as { accountType?: unknown }
+    return typeof parsed.accountType === 'string' && parsed.accountType.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+export function isKiroCliWhoamiAuthenticated(result: KiroCliWhoamiResult): boolean {
+  // whoami can emit valid account JSON even when the process reports a non-zero
+  // status. The account payload, not the exit status, is the auth authority.
+  return hasAuthenticatedKiroAccount(result.stdout)
+    || hasAuthenticatedKiroAccount(result.stderr)
+}
 
 const probeCursorAgentAuth: CursorAgentAuthProbe = async (executablePath, platform) =>
   await new Promise<boolean>(resolve => {
@@ -703,8 +767,8 @@ const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
         windowsHide: true,
         shell: platform === 'win32',
       },
-      (error, stdout) => {
-        resolve(!error && stdout.trim().length > 0)
+      (error, stdout, stderr) => {
+        resolve(isKiroCliWhoamiAuthenticated({ error, stdout, stderr }))
       },
     )
   })
@@ -844,32 +908,6 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
     readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
   ])
   const existingCredential = globalCredential ?? managedCredential
-  const existingExpiry =
-    typeof existingCredential?.expires === 'number' ? existingCredential.expires : null
-  const existingCredentialIsFresh = Boolean(
-    existingCredential
-      && (existingExpiry === null || existingExpiry > now + 5 * 60 * 1000),
-  )
-  if (existingCredential && existingCredentialIsFresh) {
-    await Promise.all([
-      globalCredential
-        ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
-            authPath: input.globalAuthPath,
-            providerId: 'kiro',
-            credential: existingCredential,
-          }),
-      managedCredential
-        ? Promise.resolve()
-        : upsertOpenCodeAuthCredential({
-            authPath: input.managedAuthPath,
-            providerId: 'kiro',
-            credential: existingCredential,
-          }),
-    ])
-    return false
-  }
-
   const authenticated = await (input.probe ?? probeKiroCliAuth)(
     input.kiroCliExecutablePath,
     input.platform ?? process.platform,
@@ -881,6 +919,33 @@ export async function ensureOpenCodeKiroPluginAuthCredential(input: {
         removeOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId: 'kiro' }),
       ])
     }
+    return false
+  }
+
+  const existingExpiry =
+    typeof existingCredential?.expires === 'number' ? existingCredential.expires : null
+  const existingCredentialIsFresh = Boolean(
+    existingCredential
+      && existingExpiry !== null
+      && existingExpiry > now + 5 * 60 * 1000,
+  )
+  if (existingCredential && existingCredentialIsFresh) {
+    await Promise.all([
+      JSON.stringify(globalCredential) === JSON.stringify(existingCredential)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.globalAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+      JSON.stringify(managedCredential) === JSON.stringify(existingCredential)
+        ? Promise.resolve()
+        : upsertOpenCodeAuthCredential({
+            authPath: input.managedAuthPath,
+            providerId: 'kiro',
+            credential: existingCredential,
+          }),
+    ])
     return false
   }
 
