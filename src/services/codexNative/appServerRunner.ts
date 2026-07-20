@@ -467,8 +467,20 @@ function mapNotificationToEvents(
       const event = mapThreadItemToToolCompleted(asRecord(params.item))
       return event ? [event] : []
     }
-    case 'turn/completed':
-      return [{ type: 'turn_completed' }]
+    case 'turn/completed': {
+      const turn = asRecord(params.turn)
+      const status = stringValue(turn.status)
+      const error = asRecord(turn.error)
+      const errorMessage =
+        stringValue(error.message) ??
+        stringValue(error.additionalDetails) ??
+        (status === 'failed'
+          ? 'Codex app-server turn failed without an error message.'
+          : status === 'interrupted'
+            ? 'Codex app-server turn was interrupted.'
+            : null)
+      return [{ type: 'turn_completed', errorMessage }]
+    }
     case 'warning':
     case 'error': {
       const text =
@@ -789,6 +801,14 @@ export async function* runCodexNativeAppServer(
         }
         if (observation.type === 'binary_identity') {
           continue
+        }
+        if (
+          observation.event.type === 'turn_completed' &&
+          observation.event.errorMessage
+        ) {
+          throw new Error(
+            `Codex app-server turn failed: ${observation.event.errorMessage}`,
+          )
         }
         yield observation
         if (observation.event.type === 'turn_completed') {

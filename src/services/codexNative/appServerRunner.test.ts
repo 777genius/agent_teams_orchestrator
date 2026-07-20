@@ -265,4 +265,80 @@ describe('runCodexNativeAppServer', () => {
       finalHistoryCompleteness: 'explicit-hydration-required',
     })
   })
+
+  test('surfaces a failed turn error instead of completing without an assistant message', async () => {
+    const fake = createFakeCodexAppServer()
+
+    fake.stdin.on('data', chunk => {
+      for (const line of String(chunk).split('\n')) {
+        if (!line.trim()) continue
+        const message = JSON.parse(line) as {
+          id?: number | string
+          method?: string
+        }
+
+        if (message.method === 'initialize') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {},
+          })
+          continue
+        }
+
+        if (message.method === 'thread/start') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { thread: { id: 'thread-1' } },
+          })
+          continue
+        }
+
+        if (message.method === 'turn/start') {
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { turn: { id: 'turn-1', status: 'inProgress' } },
+          })
+          writeJson(fake.stdout, {
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: {
+              threadId: 'thread-1',
+              turn: {
+                id: 'turn-1',
+                status: 'failed',
+                error: {
+                  message: "You've hit your usage limit.",
+                  codexErrorInfo: null,
+                  additionalDetails: null,
+                },
+              },
+            },
+          })
+        }
+      }
+    })
+
+    await expect(
+      collect(
+        runCodexNativeAppServer(
+          {
+            prompt: 'Reply PONG',
+            cwd: '/tmp/demo',
+            model: 'gpt-5.6-sol',
+            requestApproval: async () => ({ allow: true }),
+          },
+          {
+            which: () => '/usr/local/bin/codex',
+            resolveVersion: () => 'codex-cli 0.144.1',
+            spawnProcess: () => fake.child as never,
+          },
+        ),
+      ),
+    ).rejects.toThrow(
+      "Codex app-server turn failed: You've hit your usage limit.",
+    )
+  })
 })

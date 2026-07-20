@@ -45,6 +45,7 @@ export type CodexNativeNormalizedEvent =
     }
   | {
       type: 'turn_completed'
+      errorMessage?: string | null
     }
   | {
       type: 'warning'
