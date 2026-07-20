@@ -184,6 +184,14 @@ function sanitizeOpenCodeVerifyValue(value: unknown, keyHint?: string): unknown 
     return value
   }
 
+  // OpenCode model catalog entries can carry the provider's full raw model
+  // descriptor. Re-emitting hundreds of those descriptors makes `runtime
+  // verify --json` exceed multi-megabyte IPC buffers even though verification
+  // consumers only need the normalized snapshot fields.
+  if (keyHint === 'raw') {
+    return '[omitted from CLI verification output]'
+  }
+
   if (Array.isArray(value)) {
     return value.map(item => sanitizeOpenCodeVerifyValue(item))
   }
@@ -211,6 +219,67 @@ function sanitizeOpenCodeVerifyValue(value: unknown, keyHint?: string): unknown 
     result[key] = sanitizeOpenCodeVerifyValue(entryValue, key)
   }
   return result
+}
+
+function summarizeOpenCodeVerifyProvider(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value
+  }
+  const provider = value as Record<string, unknown>
+  const models = provider.models
+  const modelCount = Array.isArray(models)
+    ? models.length
+    : models && typeof models === 'object'
+      ? Object.keys(models).length
+      : 0
+  return {
+    id: provider.id ?? null,
+    name: provider.name ?? null,
+    source: provider.source ?? null,
+    modelCount,
+  }
+}
+
+function buildOpenCodeVerifyJsonSnapshot(value: unknown): unknown {
+  const sanitized = sanitizeOpenCodeVerifyValue(value)
+  if (!sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) {
+    return sanitized
+  }
+
+  const snapshot = sanitized as Record<string, unknown>
+  const providers =
+    snapshot.providers && typeof snapshot.providers === 'object'
+      ? (snapshot.providers as Record<string, unknown>)
+      : null
+  const configProviders =
+    snapshot.configProviders && typeof snapshot.configProviders === 'object'
+      ? (snapshot.configProviders as Record<string, unknown>)
+      : null
+
+  return {
+    ...snapshot,
+    ...(providers
+      ? {
+          providers: {
+            connected: Array.isArray(providers.connected) ? providers.connected : [],
+            default: summarizeOpenCodeVerifyProvider(providers.default),
+            all: Array.isArray(providers.all)
+              ? providers.all.map(summarizeOpenCodeVerifyProvider)
+              : [],
+          },
+        }
+      : {}),
+    ...(configProviders
+      ? {
+          configProviders: {
+            default: summarizeOpenCodeVerifyProvider(configProviders.default),
+            providers: Array.isArray(configProviders.providers)
+              ? configProviders.providers.map(summarizeOpenCodeVerifyProvider)
+              : [],
+          },
+        }
+      : {}),
+  }
 }
 
 function printProviderStatus(provider: RuntimeProviderStatus): void {
@@ -395,21 +464,29 @@ export async function runtimeVerify(opts: {
     )
   }
 
-  const snapshot = await openCodeProvisioningProbe.probe()
   if (opts.text) {
+    const snapshot = await openCodeProvisioningProbe.probe()
     printOpenCodeVerification(snapshot)
   } else {
-    process.stdout.write(
-      jsonStringify(
-        {
-          schemaVersion: 1,
-          providerId: 'opencode',
-          snapshot: sanitizeOpenCodeVerifyValue(snapshot),
-        },
-        null,
-        2,
-      ) + '\n',
+    await withRuntimeJsonStdoutGuardedResponse(
+      () => openCodeProvisioningProbe.probe(),
+      async (snapshot, stdoutWrite) => {
+        await writeStdoutAndDrain(
+          jsonStringify(
+            {
+              schemaVersion: 1,
+              providerId: 'opencode',
+              snapshot: buildOpenCodeVerifyJsonSnapshot(snapshot),
+            },
+            null,
+            2,
+          ) + '\n',
+          stdoutWrite,
+        )
+        return 0
+      },
     )
+    return
   }
 
   process.exit(0)
@@ -429,24 +506,34 @@ export async function runtimeVerifyModel(opts: {
     )
   }
 
-  const result = await openCodeExecutionProbe.probeModel({
-    selectedModel: opts.model,
-  })
-
   if (opts.text) {
+    const result = await openCodeExecutionProbe.probeModel({
+      selectedModel: opts.model,
+    })
     printOpenCodeModelProbe(result)
   } else {
-    process.stdout.write(
-      jsonStringify(
-        {
-          schemaVersion: 1,
-          providerId: 'opencode',
-          result,
-        },
-        null,
-        2,
-      ) + '\n',
+    await withRuntimeJsonStdoutGuardedResponse(
+      () =>
+        openCodeExecutionProbe.probeModel({
+          selectedModel: opts.model,
+        }),
+      async (result, stdoutWrite) => {
+        await writeStdoutAndDrain(
+          jsonStringify(
+            {
+              schemaVersion: 1,
+              providerId: 'opencode',
+              result,
+            },
+            null,
+            2,
+          ) + '\n',
+          stdoutWrite,
+        )
+        return 0
+      },
     )
+    return
   }
 
   process.exit(0)
