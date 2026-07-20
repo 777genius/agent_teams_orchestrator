@@ -5,6 +5,21 @@ import {
 
 export const CODEX_MODELS = [
   {
+    id: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol',
+    description: 'Latest frontier agentic coding model',
+  },
+  {
+    id: 'gpt-5.6-terra',
+    label: 'GPT-5.6 Terra',
+    description: 'Balanced agentic coding model',
+  },
+  {
+    id: 'gpt-5.6-luna',
+    label: 'GPT-5.6 Luna',
+    description: 'General-purpose GPT-5.6 model',
+  },
+  {
     id: 'gpt-5.4',
     label: 'GPT-5.4',
     description: 'Current flagship GPT model',
@@ -51,10 +66,14 @@ export const CODEX_MODELS = [
   },
 ] as const
 
-export const DEFAULT_CODEX_MODEL = 'gpt-5.4'
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol'
 
 export function isCodexModel(model: string): boolean {
-  return CODEX_MODELS.some(candidate => candidate.id === model)
+  const normalized = model.trim().toLowerCase()
+  return (
+    CODEX_MODELS.some(candidate => candidate.id === normalized) ||
+    /^gpt-[a-z0-9][a-z0-9._-]*$/.test(normalized)
+  )
 }
 
 export function getCodexDisplayName(model: string): string | undefined {

@@ -391,6 +391,15 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
     return 'claude-3-haiku'
   }
   // OpenAI GPT models
+  if (name.includes('gpt-5.6-sol')) {
+    return 'gpt-5.6-sol'
+  }
+  if (name.includes('gpt-5.6-terra')) {
+    return 'gpt-5.6-terra'
+  }
+  if (name.includes('gpt-5.6-luna')) {
+    return 'gpt-5.6-luna'
+  }
   if (name.includes('gpt-5.4-mini')) {
     return 'gpt-5.4-mini'
   }
@@ -862,6 +871,15 @@ export function getMarketingNameForModel(
     return 'Claude 3.5 Haiku'
   }
   // OpenAI Codex models
+  if (canonical.includes('gpt-5.6-sol')) {
+    return 'GPT-5.6 Sol'
+  }
+  if (canonical.includes('gpt-5.6-terra')) {
+    return 'GPT-5.6 Terra'
+  }
+  if (canonical.includes('gpt-5.6-luna')) {
+    return 'GPT-5.6 Luna'
+  }
   if (canonical.includes('gpt-5.4-mini')) {
     return 'GPT-5.4 Mini'
   }

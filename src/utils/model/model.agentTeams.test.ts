@@ -128,6 +128,9 @@ describe('model access fallback with agent_teams capabilities', () => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1';
     setAgentTeamsCapabilitiesForTesting(
       createCodexCapabilities('guest', {
+        'gpt-5.6-sol': false,
+        'gpt-5.6-terra': false,
+        'gpt-5.6-luna': false,
         'gpt-5.4': false,
         'gpt-5.5': false,
         'gpt-5.4-mini': false,
@@ -174,16 +177,20 @@ describe('model access fallback with agent_teams capabilities', () => {
       },
     });
 
-    expect(getMainLoopModel()).toBe('gpt-5.4');
+    expect(getMainLoopModel()).toBe('gpt-5.6-sol');
     setFlagSettingsInline(previousSettings);
   });
 });
 
 describe('Opus 4.8 defaults', () => {
-  it('recognizes GPT-5.5 without making it the static Codex default', () => {
+  it('recognizes current and future GPT models with GPT-5.6 Sol as the default', () => {
     expect(isCodexModel('gpt-5.5')).toBe(true);
+    expect(isCodexModel('gpt-5.6-sol')).toBe(true);
+    expect(isCodexModel('gpt-5.7-future')).toBe(true);
     expect(CODEX_MODELS.map((model) => model.id)).toContain('gpt-5.5');
-    expect(DEFAULT_CODEX_MODEL).toBe('gpt-5.4');
+    expect(DEFAULT_CODEX_MODEL).toBe('gpt-5.6-sol');
+    expect(getPublicModelDisplayName('gpt-5.6-sol')).toBe('GPT-5.6 Sol');
+    expect(getMarketingNameForModel('gpt-5.6-sol')).toBe('GPT-5.6 Sol');
     expect(getPublicModelDisplayName('gpt-5.5')).toBe('GPT-5.5');
     expect(getMarketingNameForModel('gpt-5.5')).toBe('GPT-5.5');
   });
