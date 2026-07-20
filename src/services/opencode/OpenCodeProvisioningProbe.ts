@@ -207,9 +207,10 @@ export class OpenCodeProvisioningProbe {
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
+      const probeFailure = error instanceof Error ? error.message : String(error)
       const diagnostics = [
         ...inventory.diagnostics,
-        error instanceof Error ? error.message : String(error),
+        probeFailure,
       ]
       const snapshot: OpenCodeProvisioningSnapshot = {
         detected: true,
@@ -226,7 +227,7 @@ export class OpenCodeProvisioningProbe {
         agents: [],
         mcp: null,
         appMcp: null,
-        probeError: diagnostics[0] ?? 'OpenCode host start failed',
+        probeError: probeFailure || 'OpenCode host start failed',
         diagnostics,
       }
       this.cache.set(cacheKey, {
@@ -340,7 +341,7 @@ export class OpenCodeProvisioningProbe {
         agents,
         mcp: appMcp?.mcp ?? null,
         appMcp: appMcp?.summary ?? null,
-        probeError: diagnostics[0] ?? null,
+        probeError: host.state === 'healthy' ? null : `OpenCode host state is ${host.state}`,
         diagnostics,
       }
 
@@ -356,9 +357,10 @@ export class OpenCodeProvisioningProbe {
       if (options.phaseContext?.signal.aborted) {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
+      const probeFailure = error instanceof Error ? error.message : String(error)
       const diagnostics = [
         ...inventory.diagnostics,
-        error instanceof Error ? error.message : String(error),
+        probeFailure,
       ]
 
       const snapshot: OpenCodeProvisioningSnapshot = {
@@ -376,7 +378,7 @@ export class OpenCodeProvisioningProbe {
         agents: [],
         mcp: null,
         appMcp: null,
-        probeError: diagnostics[0] ?? 'OpenCode verification failed',
+        probeError: probeFailure || 'OpenCode verification failed',
         diagnostics,
       }
 

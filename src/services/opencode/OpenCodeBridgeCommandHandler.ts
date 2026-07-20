@@ -2433,6 +2433,23 @@ async function runReadiness(
   let executionOutcomePromise: Promise<Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>> | undefined> =
     Promise.resolve(undefined)
 
+  // A failed host/config probe cannot authoritatively say whether a selected
+  // model exists. Preserve the provider-level transport failure so callers can
+  // retry it instead of misclassifying an empty timeout snapshot as a terminal
+  // `model_unavailable` result.
+  if (!modelSnapshot.detected || !modelSnapshot.hostHealthy) {
+    return {
+      snapshot: modelSnapshot,
+      data: readinessData(
+        modelSnapshot,
+        selectedModel,
+        undefined,
+        skippedAppMcpToolProof(),
+        requireSelectedModel,
+      ),
+    }
+  }
+
   if (selectedModel) {
     try {
       executionModel = resolveOpenCodeProviderScopedModel(selectedModel, snapshot)

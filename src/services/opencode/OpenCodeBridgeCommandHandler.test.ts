@@ -389,6 +389,7 @@ const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistent
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
+const originalRefreshSessionEnvironment = openCodeSessionBridge.refreshSessionEnvironment
 const originalPromptAsync = openCodeSessionBridge.promptAsync
 const originalPromptAsyncWithTurnSettled = openCodeSessionBridge.promptAsyncWithTurnSettled
 const originalPromptAsyncUntilAccepted = openCodeSessionBridge.promptAsyncUntilAccepted
@@ -575,6 +576,8 @@ beforeEach(async () => {
     connected: true,
     diagnostics: [],
   })) as typeof openCodeSessionBridge.ensureSessionAppMcpReady
+  openCodeSessionBridge.refreshSessionEnvironment = (async record =>
+    record) as typeof openCodeSessionBridge.refreshSessionEnvironment
   openCodeSessionStore.upsert = (async () => 'updated') as typeof openCodeSessionStore.upsert
   openCodeSessionStore.delete = (async () => true) as typeof openCodeSessionStore.delete
 })
@@ -625,6 +628,7 @@ afterEach(async () => {
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
+  openCodeSessionBridge.refreshSessionEnvironment = originalRefreshSessionEnvironment
   openCodeSessionBridge.promptAsync = originalPromptAsync
   openCodeSessionBridge.promptAsyncWithTurnSettled = originalPromptAsyncWithTurnSettled
   openCodeSessionBridge.promptAsyncUntilAccepted = originalPromptAsyncUntilAccepted
@@ -879,6 +883,46 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.state).toBe('model_unavailable')
     expect(result.data.launchAllowed).toBe(false)
     expect(result.data.missing[0]).toContain('was not found in the live provider catalog')
+    expect(executionProbeCalled).toBe(false)
+  })
+
+  test('keeps an unhealthy host timeout provider-scoped instead of reporting the model missing', async () => {
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        hostHealthy: false,
+        host: null,
+        configProviders: null,
+        providers: null,
+        probeError: '/config request failed: request timed out after 15000ms',
+        diagnostics: [
+          'Failed to query OpenCode agents: OpenCode command timed out after 10000ms',
+          'Failed to query OpenCode models: OpenCode command timed out after 10000ms',
+          '/config request failed: request timed out after 15000ms',
+        ],
+      })
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run while the host is unhealthy')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'zai-coding-plan/glm-5.1',
+        requireExecutionProbe: true,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.data.state).toBe('unknown_error')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing).toEqual([
+      '/config request failed: request timed out after 15000ms',
+    ])
+    expect(result.data.diagnostics.join('\n')).toContain('OpenCode command timed out')
+    expect(result.data.diagnostics.join('\n')).not.toContain('not found')
     expect(executionProbeCalled).toBe(false)
   })
 

@@ -70,6 +70,35 @@ const host: OpenCodeHostHandle = {
 }
 
 describe('OpenCodeProvisioningProbe', () => {
+  test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: {
+        probe: async () => ({
+          ...inventory,
+          probeError: 'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
+          diagnostics: [
+            'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
+          ],
+        }),
+      },
+      hostManager: {
+        ensureHost: async () => {
+          throw new Error('OpenCode request timed out after 15000ms for /config')
+        },
+        releaseHost: async () => {},
+      },
+    })
+
+    const snapshot = await probe.probe('/tmp/project')
+
+    expect(snapshot.hostHealthy).toBe(false)
+    expect(snapshot.probeError).toBe('OpenCode request timed out after 15000ms for /config')
+    expect(snapshot.diagnostics).toEqual([
+      'SuperGrok OAuth requires OpenCode 1.15.7 or newer; detected 1.15.6',
+      'OpenCode request timed out after 15000ms for /config',
+    ])
+  })
+
   test('collects live host verification details', async () => {
     let releaseCalls = 0
     const retainedLeaseTeamIds: string[] = []
