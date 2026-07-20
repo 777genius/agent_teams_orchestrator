@@ -2482,8 +2482,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(failure.code).toBe('model-test-failed')
     expect(failure.message).toContain('unsupported for this Copilot account')
     expect(probedModelIds).toEqual([
-      'github-copilot/gpt-4.1',
       'github-copilot/gpt-5-mini',
+      'github-copilot/gpt-4.1',
     ])
     expect(callbackStarted).toBe(true)
     rejectCallback(new Error('late callback shutdown'))

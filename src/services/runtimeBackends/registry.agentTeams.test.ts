@@ -911,6 +911,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
             'opencode/big-pickle',
             'openai/gpt-5.4',
             'openai/gpt-5.4-mini',
+            'kimi-for-coding/k3',
             'xai/grok-imagine-image-quality',
           ],
           modelMetadata: [
@@ -939,6 +940,21 @@ describe('runtime backend registry with agent_teams capabilities', () => {
                   toolcall: true,
                   input: { text: true, image: true },
                   output: { text: true, image: false },
+                },
+              },
+            },
+            {
+              id: 'kimi-for-coding/k3',
+              cost: null,
+              context: 262144,
+              limits: { context: 262144, output: 32768 },
+              free: false,
+              raw: {
+                limit: { context: 262144, output: 32768 },
+                capabilities: {
+                  toolcall: true,
+                  input: { text: true, image: true, video: true },
+                  output: { text: true },
                 },
               },
             },
@@ -976,6 +992,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         'opencode/big-pickle',
         'openai/gpt-5.4',
         'openai/gpt-5.4-mini',
+        'kimi-for-coding/k3',
       ])
       expect(
         opencode?.modelCatalog?.models.find(model => model.id === 'opencode/big-pickle')
@@ -1008,6 +1025,13 @@ describe('runtime backend registry with agent_teams capabilities', () => {
         opencode?.modelCatalog?.models.find(model => model.id === 'openai/gpt-5.4')
           ?.inputModalities,
       ).toEqual(['text', 'image'])
+      expect(
+        opencode?.modelCatalog?.models.find(model => model.id === 'kimi-for-coding/k3'),
+      ).toMatchObject({
+        supportedReasoningEfforts: ['low', 'high', 'max'],
+        defaultReasoningEffort: 'high',
+        inputModalities: ['text', 'image', 'video'],
+      })
       expect(
         opencode?.modelCatalog?.models.find(
           model => model.id === 'xai/grok-imagine-image-quality',

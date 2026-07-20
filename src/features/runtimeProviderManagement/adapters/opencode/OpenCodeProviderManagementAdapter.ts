@@ -307,8 +307,8 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
   ],
   openrouter: ['openrouter/openrouter/free'],
   xai: [
-    'xai/grok-4.3',
     'xai/grok-4.5',
+    'xai/grok-4.3',
     'xai/grok-4.20-0309-reasoning',
     'xai/grok-4.20-0309-non-reasoning',
   ],
@@ -318,9 +318,10 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/zai-org/glm-5.1',
   ],
   'github-copilot': [
-    'github-copilot/gpt-4.1',
     'github-copilot/gpt-5-mini',
-    'github-copilot/gpt-5',
+    'github-copilot/gpt-5.6-luna',
+    'github-copilot/gpt-5.5',
+    'github-copilot/claude-sonnet-5',
   ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS

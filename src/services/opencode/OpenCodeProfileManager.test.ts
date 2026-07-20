@@ -304,15 +304,16 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         npm: '@ai-sdk/github-copilot',
         api: 'https://api.githubcopilot.com',
         models: {
-          'gpt-4.1': {
-            name: 'GPT-4.1',
-            family: 'gpt',
+          'gpt-5-mini': {
+            name: 'GPT-5 Mini',
+            family: 'gpt-mini',
+            reasoning: true,
             tool_call: true,
             structured_output: true,
             limit: {
-              context: 128_000,
+              context: 264_000,
               input: 128_000,
-              output: 16_384,
+              output: 64_000,
             },
           },
         },
@@ -344,7 +345,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           },
           'mimo-v2.5': {
             modalities: {
-              input: ['text', 'image'],
+              input: ['text', 'image', 'audio', 'video'],
               output: ['text'],
             },
           },
@@ -374,6 +375,25 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           baseURL: 'https://api.kimi.com/coding/v1',
         },
         models: {
+          k3: {
+            name: 'Kimi K3',
+            reasoning: true,
+            tool_call: true,
+            variants: {
+              low: { reasoningEffort: 'low' },
+              medium: { disabled: true },
+              high: { reasoningEffort: 'high' },
+              max: { reasoningEffort: 'max' },
+            },
+            limit: {
+              context: 262_144,
+              output: 32_768,
+            },
+            modalities: {
+              input: ['text', 'image', 'video'],
+              output: ['text'],
+            },
+          },
           'kimi-for-coding': {
             name: 'Kimi Code',
             reasoning: true,
@@ -383,7 +403,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
               output: 32_768,
             },
             modalities: {
-              input: ['text', 'image'],
+              input: ['text', 'image', 'video'],
               output: ['text'],
             },
           },
@@ -393,6 +413,71 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         },
       },
     })
+  })
+
+  test('refreshes imported K3 variant definitions with the managed catalog', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousConfigContent = process.env.OPENCODE_CONFIG_CONTENT
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(tempDir, 'app-data-k3-refresh')
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(tempDir, 'app-cache-k3-refresh')
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      provider: {
+        'kimi-for-coding': {
+          models: {
+            k3: {
+              variants: {
+                medium: { reasoningEffort: 'medium' },
+                max: { reasoningEffort: 'stale-max' },
+                custom: { reasoningEffort: 'custom' },
+              },
+            },
+          },
+        },
+      },
+    })
+
+    try {
+      const projectPath = path.join(tempDir, 'project-k3-refresh')
+      await mkdir(projectPath, { recursive: true })
+      const profile = await new OpenCodeProfileManager().prepareProfile(
+        projectPath,
+        { includeAppMcp: false },
+      )
+      expect(profile.managedConfig).toMatchObject({
+        provider: {
+          'kimi-for-coding': {
+            models: {
+              k3: {
+                variants: {
+                  low: { reasoningEffort: 'low' },
+                  medium: { disabled: true },
+                  high: { reasoningEffort: 'high' },
+                  max: { reasoningEffort: 'max' },
+                  custom: { reasoningEffort: 'custom' },
+                },
+              },
+            },
+          },
+        },
+      })
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+      if (previousConfigContent === undefined) {
+        delete process.env.OPENCODE_CONFIG_CONTENT
+      } else {
+        process.env.OPENCODE_CONFIG_CONTENT = previousConfigContent
+      }
+    }
   })
 
   test('seeds plugin-backed Cursor and Kiro providers even when models.dev lags', () => {

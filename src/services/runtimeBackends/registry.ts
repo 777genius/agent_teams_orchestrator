@@ -76,6 +76,7 @@ import type {
   RuntimeBackendOptionStatus,
   RuntimeProviderModelCatalog,
   RuntimeProviderId,
+  RuntimeReasoningEffort,
   RuntimeProviderStatus,
   RuntimeProviderSubscriptionRateLimitSnapshot,
   RuntimeStatusDetailLevel,
@@ -574,6 +575,22 @@ function filterCodexModelCatalog(
   }
 }
 
+function getOpenCodeModelReasoningProfile(modelId: string): {
+  supportedReasoningEfforts: RuntimeReasoningEffort[]
+  defaultReasoningEffort: RuntimeReasoningEffort | null
+} {
+  if (modelId.trim().toLowerCase() === 'kimi-for-coding/k3') {
+    return {
+      supportedReasoningEfforts: ['low', 'high', 'max'],
+      defaultReasoningEffort: 'high',
+    }
+  }
+  return {
+    supportedReasoningEfforts: [],
+    defaultReasoningEffort: null,
+  }
+}
+
 async function buildOpenCodeStatus(
   deps: RuntimeStatusRegistryDeps = {},
   options: { detailLevel?: RuntimeStatusDetailLevel } = {},
@@ -644,6 +661,7 @@ async function buildOpenCodeStatus(
     models: runtimeModels.map((model) => {
       const metadata = metadataByModelId.get(model) ?? null
       const agentCompatibility = evaluateOpenCodeAgentModelCompatibility(model, metadata)
+      const reasoningProfile = getOpenCodeModelReasoningProfile(model)
       const opencodeMetadata = buildOpenCodeModelRouteMetadata({
         selectedModel: model,
         catalog: accessCatalog,
@@ -653,8 +671,8 @@ async function buildOpenCodeStatus(
         launchModel: model,
         displayName: model,
         hidden: !agentCompatibility.compatible,
-        supportedReasoningEfforts: [],
-        defaultReasoningEffort: null,
+        supportedReasoningEfforts: reasoningProfile.supportedReasoningEfforts,
+        defaultReasoningEffort: reasoningProfile.defaultReasoningEffort,
         inputModalities: getOpenCodeModelInputModalities(metadata),
         supportsPersonality: true,
         isDefault: model === defaultModel,

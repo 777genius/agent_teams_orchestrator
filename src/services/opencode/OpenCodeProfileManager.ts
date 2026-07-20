@@ -71,18 +71,18 @@ const GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG = {
   npm: '@ai-sdk/github-copilot',
   api: 'https://api.githubcopilot.com',
   models: {
-    'gpt-4.1': {
-      name: 'GPT-4.1',
-      family: 'gpt',
+    'gpt-5-mini': {
+      name: 'GPT-5 Mini',
+      family: 'gpt-mini',
       attachment: true,
-      reasoning: false,
+      reasoning: true,
       tool_call: true,
       structured_output: true,
-      temperature: true,
+      temperature: false,
       limit: {
-        context: 128_000,
+        context: 264_000,
         input: 128_000,
-        output: 16_384,
+        output: 64_000,
       },
       modalities: {
         input: ['text', 'image'],

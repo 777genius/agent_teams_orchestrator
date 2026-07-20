@@ -53,13 +53,86 @@ const XIAOMI_MIMO_TOKEN_PLAN_MODELS = {
       output: 131_072,
     },
     modalities: {
-      input: ['text', 'image'],
+      input: ['text', 'image', 'audio', 'video'],
+      output: ['text'],
+    },
+  },
+} as const
+
+const MINIMAX_TOKEN_PLAN_MODELS = {
+  'MiniMax-M3': {
+    name: 'MiniMax-M3',
+    reasoning: true,
+    tool_call: true,
+    limit: {
+      context: 1_000_000,
+      output: 128_000,
+    },
+    modalities: {
+      input: ['text', 'image', 'video'],
+      output: ['text'],
+    },
+  },
+  'MiniMax-M2.7-highspeed': {
+    name: 'MiniMax-M2.7-highspeed',
+    reasoning: true,
+    tool_call: true,
+    limit: {
+      context: 204_800,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text'],
+      output: ['text'],
+    },
+  },
+  'MiniMax-M2.7': {
+    name: 'MiniMax-M2.7',
+    reasoning: true,
+    tool_call: true,
+    limit: {
+      context: 204_800,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text'],
       output: ['text'],
     },
   },
 } as const
 
 const KIMI_CODE_MEMBERSHIP_MODELS = {
+  k3: {
+    name: 'Kimi K3',
+    reasoning: true,
+    tool_call: true,
+    interleaved: {
+      field: 'reasoning_content',
+    },
+    limit: {
+      // Moderato supports 256K; higher plans can raise this through future entitlement discovery.
+      context: 262_144,
+      output: 32_768,
+    },
+    modalities: {
+      input: ['text', 'image', 'video'],
+      output: ['text'],
+    },
+    variants: {
+      low: {
+        reasoningEffort: 'low',
+      },
+      medium: {
+        disabled: true,
+      },
+      high: {
+        reasoningEffort: 'high',
+      },
+      max: {
+        reasoningEffort: 'max',
+      },
+    },
+  },
   'kimi-for-coding': {
     name: 'Kimi Code',
     reasoning: true,
@@ -72,7 +145,7 @@ const KIMI_CODE_MEMBERSHIP_MODELS = {
       output: 32_768,
     },
     modalities: {
-      input: ['text', 'image'],
+      input: ['text', 'image', 'video'],
       output: ['text'],
     },
   },
@@ -88,7 +161,7 @@ const KIMI_CODE_MEMBERSHIP_MODELS = {
       output: 32_768,
     },
     modalities: {
-      input: ['text', 'image'],
+      input: ['text', 'image', 'video'],
       output: ['text'],
     },
   },
@@ -126,6 +199,22 @@ const ZAI_CODING_PLAN_MODELS = {
     },
     modalities: {
       input: ['text'],
+      output: ['text'],
+    },
+  },
+  'glm-5v-turbo': {
+    name: 'GLM-5V-Turbo',
+    reasoning: true,
+    tool_call: true,
+    interleaved: {
+      field: 'reasoning_content',
+    },
+    limit: {
+      context: 200_000,
+      output: 131_072,
+    },
+    modalities: {
+      input: ['text', 'image', 'video', 'pdf'],
       output: ['text'],
     },
   },
@@ -273,7 +362,17 @@ export const OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS = [
     },
     fastSetup: true,
     seedDirectory: false,
-    config: null,
+    // Keep the current Token Plan models usable when the remote models.dev
+    // catalog is unavailable or briefly behind a MiniMax release. OpenCode
+    // merges these entries with newer remote metadata instead of replacing it.
+    config: {
+      npm: '@ai-sdk/anthropic',
+      name: 'MiniMax Token Plan',
+      options: {
+        baseURL: 'https://api.minimax.io/anthropic/v1',
+      },
+      models: MINIMAX_TOKEN_PLAN_MODELS,
+    },
     modelProbePreferences: [
       'minimax-coding-plan/MiniMax-M3',
       'minimax-coding-plan/MiniMax-M2.7-highspeed',
@@ -316,6 +415,7 @@ export const OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS = [
     modelProbePreferences: [
       'zai-coding-plan/glm-5.2',
       'zai-coding-plan/glm-5.1',
+      'zai-coding-plan/glm-5v-turbo',
       'zai-coding-plan/glm-5',
       'zai-coding-plan/glm-5-turbo',
       'zai-coding-plan/glm-4.7',
@@ -344,7 +444,11 @@ export const OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS = [
       },
       models: KIMI_CODE_MEMBERSHIP_MODELS,
     },
-    modelProbePreferences: ['kimi-for-coding/kimi-for-coding'],
+    modelProbePreferences: [
+      'kimi-for-coding/kimi-for-coding',
+      'kimi-for-coding/k3',
+      'kimi-for-coding/kimi-for-coding-highspeed',
+    ],
     requireConnectExecutionProof: true,
     keyPolicy: null,
   },

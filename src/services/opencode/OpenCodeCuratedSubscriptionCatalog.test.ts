@@ -64,6 +64,16 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
           tool_call: true,
           interleaved: { field: 'reasoning_content' },
         },
+        'glm-5v-turbo': {
+          reasoning: true,
+          tool_call: true,
+          interleaved: { field: 'reasoning_content' },
+          limit: { context: 200_000, output: 131_072 },
+          modalities: {
+            input: ['text', 'image', 'video', 'pdf'],
+            output: ['text'],
+          },
+        },
         'glm-5': {
           reasoning: true,
           tool_call: true,
@@ -82,12 +92,51 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
     })
   })
 
+  test('keeps a MiniMax Token Plan fallback without replacing newer remote models', () => {
+    const configs = getOpenCodeCuratedSubscriptionProviderConfigs()
+
+    expect(configs['minimax-coding-plan']).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      options: { baseURL: 'https://api.minimax.io/anthropic/v1' },
+      models: {
+        'MiniMax-M3': {
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 1_000_000, output: 128_000 },
+          modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+        },
+        'MiniMax-M2.7-highspeed': {
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 204_800, output: 131_072 },
+        },
+        'MiniMax-M2.7': {
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 204_800, output: 131_072 },
+        },
+      },
+    })
+  })
+
   test('preserves reasoning content across Kimi and MiMo tool-call turns', () => {
     const configs = getOpenCodeCuratedSubscriptionProviderConfigs()
 
     expect(configs['kimi-for-coding']).toMatchObject({
       options: { baseURL: 'https://api.kimi.com/coding/v1' },
       models: {
+        k3: {
+          tool_call: true,
+          interleaved: { field: 'reasoning_content' },
+          limit: { context: 262_144, output: 32_768 },
+          modalities: { input: ['text', 'image', 'video'], output: ['text'] },
+          variants: {
+            low: { reasoningEffort: 'low' },
+            medium: { disabled: true },
+            high: { reasoningEffort: 'high' },
+            max: { reasoningEffort: 'max' },
+          },
+        },
         'kimi-for-coding': {
           tool_call: true,
           interleaved: { field: 'reasoning_content' },
@@ -101,6 +150,12 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
           tool_call: true,
           interleaved: { field: 'reasoning_content' },
         },
+        'mimo-v2.5': {
+          modalities: {
+            input: ['text', 'image', 'audio', 'video'],
+            output: ['text'],
+          },
+        },
       },
     })
   })
@@ -109,6 +164,7 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
     const configs = getOpenCodeCuratedSubscriptionProviderConfigs()
     const providerIds = [
       'zai-coding-plan',
+      'minimax-coding-plan',
       'kimi-for-coding',
       'xiaomi-token-plan-ams',
       'xiaomi-token-plan-sgp',
@@ -117,6 +173,7 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
 
     for (const providerId of providerIds) {
       const provider = configs[providerId] as {
+        npm?: string
         models?: Record<string, {
           reasoning?: boolean
           tool_call?: boolean
@@ -129,9 +186,11 @@ describe('OpenCodeCuratedSubscriptionCatalog', () => {
       for (const [modelId, model] of models) {
         expect(model.reasoning, `${providerId}/${modelId} reasoning`).toBe(true)
         expect(model.tool_call, `${providerId}/${modelId} tool_call`).toBe(true)
-        expect(model.interleaved?.field, `${providerId}/${modelId} reasoning field`).toBe(
-          'reasoning_content',
-        )
+        if (provider.npm === '@ai-sdk/openai-compatible') {
+          expect(model.interleaved?.field, `${providerId}/${modelId} reasoning field`).toBe(
+            'reasoning_content',
+          )
+        }
         expect(model.modalities?.output, `${providerId}/${modelId} output modality`).toContain(
           'text',
         )
