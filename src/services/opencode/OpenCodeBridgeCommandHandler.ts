@@ -1995,6 +1995,7 @@ async function recreateSessionAfterBootstrapMcpFailure(params: {
     laneId: params.record.laneId,
     memberName: params.record.memberName,
     selectedModel: params.record.selectedModel,
+    selectedVariant: params.record.selectedVariant,
     projectPath: params.record.projectPath,
     runId: params.runId,
     toolApprovalMode: params.record.toolApprovalMode,
@@ -2809,6 +2810,7 @@ async function runLaunchWithProvisioningSnapshot(
   const laneId = asString(body.laneId)
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const selectedModel = asString(body.selectedModel)
+  const selectedVariant = asString(body.effort)
   const membersRaw = Array.isArray(body.members) ? body.members : []
   if (!runId || !laneId || !teamId || !selectedModel || membersRaw.length === 0) {
     throw new Error('opencode.launchTeam requires runId, laneId, teamId/teamName, selectedModel and members')
@@ -2855,6 +2857,7 @@ async function runLaunchWithProvisioningSnapshot(
     if (!name) continue
     const prompt = asString(member?.prompt)
       ?? `Join OpenCode team ${teamId} as ${name}. Wait for app MCP task delivery.`
+    const memberVariant = asString(member?.effort) ?? selectedVariant ?? undefined
     let record: OpenCodeSessionRecord | null = null
     const memberTiming = memberTimings.get(name) ?? {}
     memberTimings.set(name, memberTiming)
@@ -2865,6 +2868,7 @@ async function runLaunchWithProvisioningSnapshot(
         laneId,
         memberName: name,
         selectedModel: apiSelectedModel,
+        selectedVariant: memberVariant,
         title: `${teamId} - ${name}`,
         projectPath: snapshot.projectPath,
         preparedProfile: snapshot.profile,
@@ -2906,6 +2910,7 @@ async function runLaunchWithProvisioningSnapshot(
           laneId,
           memberName: name,
           selectedModel: apiSelectedModel,
+          selectedVariant: memberVariant,
           title: `${teamId} - ${name}`,
           projectPath: snapshot.projectPath,
           preparedProfile: snapshot.profile,
@@ -3365,6 +3370,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       laneId,
       memberName,
       selectedModel: record.selectedModel,
+      selectedVariant: record.selectedVariant,
       projectPath: record.projectPath,
       runId,
       toolApprovalMode: record.toolApprovalMode,
@@ -3384,6 +3390,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       laneId,
       memberName,
       selectedModel: record.selectedModel,
+      selectedVariant: record.selectedVariant,
       projectPath: record.projectPath,
       runId,
       toolApprovalMode: record.toolApprovalMode,
@@ -3455,6 +3462,7 @@ async function runSendMessage(envelope: BridgeEnvelope): Promise<{
       laneId,
       memberName,
       selectedModel: record.selectedModel,
+      selectedVariant: record.selectedVariant,
       projectPath: record.projectPath,
       runId: asString(body.runId),
       toolApprovalMode: record.toolApprovalMode,

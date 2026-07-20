@@ -582,6 +582,7 @@ describe('OpenCodeSessionBridge', () => {
       laneId: 'secondary:opencode:tom',
       memberName: 'tom',
       selectedModel: 'opencode/big-pickle',
+      selectedVariant: 'max',
       projectPath: '/tmp/project',
       runId: 'run-1',
       fresh: true,
@@ -589,7 +590,9 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(createSessionCalls).toBe(2)
     expect(record.opencodeSessionId).toBe('session-new')
+    expect(record.selectedVariant).toBe('max')
     expect(upserts).toHaveLength(1)
+    expect(upserts[0]?.selectedVariant).toBe('max')
     expect(releaseHostCalls).toBe(0)
     expect(retainedLeases).toEqual([{
       teamId: 'team-a',
@@ -1284,6 +1287,7 @@ describe('OpenCodeSessionBridge', () => {
     const observationMarks: string[] = []
     const hookEvents: string[] = []
     const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -1367,7 +1371,10 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
 
-    const result = await bridge.promptAsyncWithTurnSettled(buildRecord(), {
+    const result = await bridge.promptAsyncWithTurnSettled(buildRecord({
+      selectedModel: 'kimi-for-coding/k3',
+      selectedVariant: 'max',
+    }), {
       text: 'Continue task',
       agent: 'teammate',
       timeoutMs: 500,
@@ -1392,9 +1399,10 @@ describe('OpenCodeSessionBridge', () => {
         agent: 'teammate',
         noReply: undefined,
         system: undefined,
+        variant: 'max',
         model: {
-          providerID: 'openai',
-          modelID: 'gpt-5.4-mini',
+          providerID: 'kimi-for-coding',
+          modelID: 'k3',
         },
         parts: [{ type: 'text', text: 'Continue task' }],
       },

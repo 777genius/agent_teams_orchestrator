@@ -2320,17 +2320,23 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('launches provider-scoped OpenCode model ids that contain nested slashes', async () => {
-    const ensureInputs: Array<{ memberName: string; selectedModel: string }> = []
+    const ensureInputs: Array<{
+      memberName: string
+      selectedModel: string
+      selectedVariant?: string
+    }> = []
     openCodeProvisioningProbe.probe = async () => snapshot
     openCodeSessionBridge.ensureSession = (async input => {
       ensureInputs.push({
         memberName: input.memberName,
         selectedModel: input.selectedModel,
+        selectedVariant: input.selectedVariant,
       })
       return buildRecord({
         laneId: input.laneId,
         memberName: input.memberName,
         selectedModel: input.selectedModel,
+        selectedVariant: input.selectedVariant,
         opencodeSessionId: `session-${input.memberName}`,
       })
     }) as typeof openCodeSessionBridge.ensureSession
@@ -2351,6 +2357,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
         teamName: 'team-a',
         projectPath: '/tmp/project',
         selectedModel: 'openrouter/moonshotai/kimi-k2',
+        effort: 'max',
         members: [{ name: 'alice', role: 'Developer', prompt: 'Alice join' }],
       }),
     )
@@ -2363,6 +2370,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       {
         memberName: 'alice',
         selectedModel: 'openrouter/moonshotai/kimi-k2',
+        selectedVariant: 'max',
       },
     ])
     expect(result.data.teamLaunchState).toBe('launching')

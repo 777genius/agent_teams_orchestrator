@@ -608,6 +608,7 @@ export type OpenCodeSessionRecord = {
   memberName: string
   providerId: 'opencode'
   selectedModel: string
+  selectedVariant?: string
   projectPath: string
   profileRootKey: string
   hostKey: string

@@ -375,6 +375,7 @@ export class OpenCodeSessionBridge {
     identity: SessionIdentity
     profile: OpenCodePreparedProfile
     selectedModel: string
+    selectedVariant?: string
     title?: string | null
     runId?: string | null
     toolApprovalMode?: OpenCodeToolApprovalMode
@@ -418,6 +419,7 @@ export class OpenCodeSessionBridge {
         memberName: params.identity.memberName,
         providerId: 'opencode',
         selectedModel: params.selectedModel,
+        ...(params.selectedVariant ? { selectedVariant: params.selectedVariant } : {}),
         projectPath: host.projectPath,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
@@ -739,6 +741,7 @@ export class OpenCodeSessionBridge {
     laneId?: string
     memberName: string
     selectedModel: string
+    selectedVariant?: string
     title?: string | null
     projectPath?: string | null
     preparedProfile?: OpenCodePreparedProfile | null
@@ -747,6 +750,7 @@ export class OpenCodeSessionBridge {
     toolApprovalMode?: OpenCodeToolApprovalMode
   }): Promise<OpenCodeSessionRecord> {
     const laneId = params.laneId?.trim() || 'primary'
+    const selectedVariant = params.selectedVariant?.trim() || undefined
     const existing = await this.sessionStore.get(params.teamId, laneId, params.memberName)
     const requestedProfile: PreparedSessionProfile = params.preparedProfile
       ? {
@@ -775,6 +779,7 @@ export class OpenCodeSessionBridge {
     if (
       existing &&
       existing.selectedModel === params.selectedModel &&
+      existing.selectedVariant === selectedVariant &&
       existing.projectPath === profile.projectPath &&
       existing.projectBehaviorFingerprint === profile.projectBehaviorFingerprint &&
       existing.managedAuthFingerprint === profile.managedAuthFingerprint &&
@@ -796,6 +801,8 @@ export class OpenCodeSessionBridge {
           ? 'fresh_launch_requested'
           : existing.selectedModel !== params.selectedModel
           ? `model_changed:${existing.selectedModel}->${params.selectedModel}`
+          : existing.selectedVariant !== selectedVariant
+            ? `variant_changed:${existing.selectedVariant ?? 'default'}->${selectedVariant ?? 'default'}`
           : existing.projectPath !== profile.projectPath
             ? 'project_path_changed'
             : existing.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
@@ -823,6 +830,7 @@ export class OpenCodeSessionBridge {
       },
       profile,
       selectedModel: params.selectedModel,
+      selectedVariant,
       title: params.title,
       runId: params.runId ?? null,
       toolApprovalMode: requestedProfile.toolApprovalMode,
@@ -963,6 +971,7 @@ export class OpenCodeSessionBridge {
           agent: params.agent,
           noReply: params.noReply,
           system: params.system,
+          ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
           model: parseProviderScopedModel(record.selectedModel),
           parts: buildOpenCodePromptParts({
             text: params.text,
@@ -1038,6 +1047,7 @@ export class OpenCodeSessionBridge {
         messageID: params.messageID,
         ...(params.agent ? { agent: params.agent } : {}),
         noReply: true,
+        ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
         model: parseProviderScopedModel(record.selectedModel),
         parts: [{ type: 'text', text: params.text }],
       })
@@ -1101,6 +1111,7 @@ export class OpenCodeSessionBridge {
           agent: params.agent,
           noReply: params.noReply,
           system: params.system,
+          ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
           model: parseProviderScopedModel(record.selectedModel),
           parts: buildOpenCodePromptParts({
             text: params.text,
@@ -1157,6 +1168,7 @@ export class OpenCodeSessionBridge {
           agent: params.agent,
           noReply: params.noReply,
           system: params.system,
+          ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
           model: parseProviderScopedModel(record.selectedModel),
           parts: buildOpenCodePromptParts({
             text: params.text,
@@ -1275,6 +1287,7 @@ export class OpenCodeSessionBridge {
           agent: params.agent,
           noReply: false,
           system: params.system,
+          ...(record.selectedVariant ? { variant: record.selectedVariant } : {}),
           model: parseProviderScopedModel(record.selectedModel),
           parts: buildOpenCodePromptParts({
             text: params.text,
