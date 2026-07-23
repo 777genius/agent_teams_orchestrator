@@ -10,6 +10,7 @@ import {
   fanOutOpenCodeOAuthCredential,
   mergeOpenCodeAuthStores,
   mergeOpenCodeAuthStoresWithFreshestOAuth,
+  mergeOpenCodeManagedAuthSources,
   readOpenCodeAuthProviderSummaries,
   readOpenCodeAuthCredential,
   reconcileOpenCodeManagedAuthStore,
@@ -404,6 +405,80 @@ await writeFile(process.argv[4], 'finished', 'utf8')
         expires: 2_000,
       },
       openrouter: { type: 'api', key: 'new-source-key' },
+    })
+  })
+
+  test('keeps an app-managed API key ahead of a stale local OpenCode key', async () => {
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    const localAuthPath = path.join(tempDir, 'local-opencode', 'auth.json')
+    const managedAuthPath = path.join(
+      tempDir,
+      'opencode',
+      'profiles',
+      'active',
+      'data',
+      'opencode',
+      'auth.json',
+    )
+    const freshCredential = { type: 'api', key: 'llmgtwy-new-valid-key' }
+    const staleCredential = { type: 'api', key: 'llmgtwy-deleted-old-key' }
+
+    await Promise.all([
+      upsertOpenCodeAuthCredential({
+        authPath: globalAuthPath,
+        providerId: 'llmgateway',
+        credential: freshCredential,
+      }),
+      upsertOpenCodeAuthCredential({
+        authPath: localAuthPath,
+        providerId: 'llmgateway',
+        credential: staleCredential,
+      }),
+    ])
+
+    await reconcileOpenCodeManagedAuthStores({
+      sourceAuthPaths: [globalAuthPath, localAuthPath],
+      globalAuthPath,
+      managedAuthPath,
+    })
+
+    await expect(
+      readOpenCodeAuthCredential({ authPath: managedAuthPath, providerId: 'llmgateway' }),
+    ).resolves.toEqual(freshCredential)
+    await expect(
+      readOpenCodeAuthCredential({ authPath: localAuthPath, providerId: 'llmgateway' }),
+    ).resolves.toEqual(staleCredential)
+
+    await removeOpenCodeAuthCredential({
+      authPath: globalAuthPath,
+      providerId: 'llmgateway',
+    })
+    await reconcileOpenCodeManagedAuthStores({
+      sourceAuthPaths: [globalAuthPath, localAuthPath],
+      globalAuthPath,
+      managedAuthPath,
+    })
+
+    await expect(
+      readOpenCodeAuthCredential({ authPath: managedAuthPath, providerId: 'llmgateway' }),
+    ).resolves.toEqual(staleCredential)
+  })
+
+  test('does not give app-global precedence to unknown credential types', () => {
+    const globalAuthPath = path.join(tempDir, 'opencode', 'auth.json')
+    const localAuthPath = path.join(tempDir, 'local-opencode', 'auth.json')
+
+    expect(
+      mergeOpenCodeManagedAuthSources({
+        sourceAuthPaths: [globalAuthPath, localAuthPath],
+        sourceStores: [
+          { future: { type: 'future-auth', token: 'global-token' } },
+          { future: { type: 'future-auth', token: 'local-token' } },
+        ],
+        globalAuthPath,
+      }),
+    ).toEqual({
+      future: { type: 'future-auth', token: 'local-token' },
     })
   })
 

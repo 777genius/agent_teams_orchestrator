@@ -295,7 +295,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
   })
 
-  test('keeps Copilot Free and Student usable when live discovery returns no selectable models', () => {
+  test('keeps Copilot discoverable for explicit-model capability diagnostics', () => {
     const managedConfig = buildManagedConfig()
 
     expect(managedConfig.provider).toMatchObject({
@@ -958,6 +958,69 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         readOpenCodeAuthCredential({ authPath: activeProfile.managedAuthPath, providerId: 'xai' }),
         readOpenCodeAuthCredential({ authPath: restartedProfile.managedAuthPath, providerId: 'xai' }),
       ])).resolves.toEqual([rotated, rotated, rotated])
+    } finally {
+      if (previousDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      if (previousCacheHome === undefined) delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      else process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousXdgDataHome
+      if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousXdgConfigHome
+    }
+  }, 15_000)
+
+  test('keeps app-managed LLM Gateway auth active when local OpenCode has a stale key', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const previousHome = process.env.HOME
+    const previousXdgDataHome = process.env.XDG_DATA_HOME
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME
+    const appDataHome = path.join(tempDir, 'app-data-llmgateway')
+    const appCacheHome = path.join(tempDir, 'app-cache-llmgateway')
+    const homePath = path.join(tempDir, 'home-llmgateway')
+    const localAuthPath = path.join(homePath, '.local', 'share', 'opencode', 'auth.json')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    process.env.HOME = homePath
+    process.env.XDG_DATA_HOME = path.join(homePath, '.local', 'share')
+    process.env.XDG_CONFIG_HOME = path.join(homePath, '.config')
+
+    const freshCredential = { type: 'api', key: 'llmgateway-new-valid-key' }
+    const staleCredential = { type: 'api', key: 'llmgateway-deleted-old-key' }
+
+    try {
+      const manager = new OpenCodeProfileManager()
+      await Promise.all([
+        upsertOpenCodeAuthCredential({
+          authPath: manager.getGlobalAuthPath(),
+          providerId: 'llmgateway',
+          credential: freshCredential,
+        }),
+        upsertOpenCodeAuthCredential({
+          authPath: localAuthPath,
+          providerId: 'llmgateway',
+          credential: staleCredential,
+        }),
+      ])
+
+      const profile = await manager.prepareProfile(path.join(tempDir, 'llmgateway-project'), {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      })
+
+      expect(profile.authState).toBe('ok')
+      await expect(
+        readOpenCodeAuthCredential({
+          authPath: profile.managedAuthPath,
+          providerId: 'llmgateway',
+        }),
+      ).resolves.toEqual(freshCredential)
+      await expect(
+        readOpenCodeAuthCredential({ authPath: localAuthPath, providerId: 'llmgateway' }),
+      ).resolves.toEqual(staleCredential)
     } finally {
       if (previousDataHome === undefined) delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
       else process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome

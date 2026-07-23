@@ -2371,7 +2371,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     )
   })
 
-  test('recovers a changed Copilot credential from a hanging callback and returns the real unsupported-plan error', async () => {
+  test('recovers a changed Copilot credential and explains the OpenCode Auto-only limitation', async () => {
     let connected = false
     let callbackStarted = false
     let rejectCallback: (reason?: unknown) => void = () => {
@@ -2395,7 +2395,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
                 ]
               : [],
             availableProviders: ['github-copilot'],
-            models: ['github-copilot/gpt-5-mini', 'github-copilot/gpt-4.1'],
+            models: [
+              'github-copilot/gpt-5-mini',
+              'github-copilot/gpt-5.6-luna',
+              'github-copilot/gpt-5.5',
+              'github-copilot/claude-haiku-4.5',
+            ],
           }),
       },
       hostManager: {
@@ -2455,7 +2460,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           return executionProbeResult(
             input.selectedModel,
             'unavailable',
-            'The selected model is unsupported for this Copilot account',
+            'The requested model is not supported',
           )
         },
       },
@@ -2480,10 +2485,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     const failure = expectFailure(result)
     expect(failure.code).toBe('model-test-failed')
-    expect(failure.message).toContain('unsupported for this Copilot account')
+    expect(failure.message).toBe(
+      'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.',
+    )
     expect(probedModelIds).toEqual([
       'github-copilot/gpt-5-mini',
-      'github-copilot/gpt-4.1',
+      'github-copilot/gpt-5.5',
+      'github-copilot/claude-haiku-4.5',
     ])
     expect(callbackStarted).toBe(true)
     rejectCallback(new Error('late callback shutdown'))
@@ -2499,6 +2507,115 @@ describe('OpenCodeProviderManagementAdapter', () => {
           '/Users/test/Library/Application Support/claude-multimodel/opencode/auth.json',
         providerId: 'github-copilot',
       },
+    ])
+  })
+
+  test('keeps a paid Copilot connection when a cross-family fallback is available', async () => {
+    let connected = false
+    const probedModelIds: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () =>
+          inventory({
+            connectedProviders: connected
+              ? [
+                  {
+                    id: 'github-copilot',
+                    authHint: 'oauth',
+                    source: 'credentials',
+                    credentialScopes: ['managed'],
+                  },
+                ]
+              : [],
+            availableProviders: ['github-copilot'],
+            models: [
+              'github-copilot/gpt-5-mini',
+              'github-copilot/gpt-5.5',
+              'github-copilot/gpt-5.6-luna',
+              'github-copilot/claude-haiku-4.5',
+            ],
+          }),
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({
+            all: [{ id: 'github-copilot', name: 'GitHub Copilot' }],
+            connected: connected ? ['github-copilot'] : [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({
+            'github-copilot': [{ type: 'oauth', label: 'Sign in with GitHub' }],
+          }),
+          getServerDoc: async () => ({
+            paths: {
+              '/auth/{providerID}': { delete: {} },
+              '/provider/{providerID}/oauth/authorize': { post: {} },
+              '/provider/{providerID}/oauth/callback': { post: {} },
+            },
+          }),
+          authorizeProviderOAuth: async () => ({
+            url: 'https://github.com/login/device',
+            method: 'auto',
+            instructions: 'Complete authorization in your browser.',
+          }),
+          completeProviderOAuth: async () => {
+            connected = true
+            return true
+          },
+          deleteProviderAuth: async () => {
+            connected = false
+            return true
+          },
+        }),
+      },
+      authStore: {
+        readCredential: async () =>
+          connected ? { type: 'oauth', access: 'copilot-paid-token' } : null,
+        upsertCredential: async () => {},
+        removeCredential: async () => {},
+      },
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModelIds.push(input.selectedModel)
+          return input.selectedModel === 'github-copilot/claude-haiku-4.5'
+            ? executionProbeResult(input.selectedModel)
+            : executionProbeResult(
+                input.selectedModel,
+                'unavailable',
+                'The requested model is not supported',
+              )
+        },
+      },
+    })
+
+    const result = await adapter.connectProvider(
+      {
+        runtimeId: 'opencode',
+        providerId: 'github-copilot',
+        method: 'oauth',
+        authMethodIndex: 0,
+        authOptionId: 'oauth:0',
+        oauthOperationId: 'copilot-cross-family-test',
+        metadata: {},
+      },
+      { authorizationReady: async () => undefined },
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.verifiedModelId).toBe('github-copilot/claude-haiku-4.5')
+    expect(probedModelIds).toEqual([
+      'github-copilot/gpt-5-mini',
+      'github-copilot/gpt-5.5',
+      'github-copilot/claude-haiku-4.5',
     ])
   })
 

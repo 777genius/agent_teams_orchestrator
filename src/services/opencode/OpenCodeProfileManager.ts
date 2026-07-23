@@ -23,7 +23,7 @@ import {
 import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
-  mergeOpenCodeAuthStoresWithFreshestOAuth,
+  mergeOpenCodeManagedAuthSources,
   reconcileOpenCodeManagedAuthStores,
   readOpenCodeAuthCredential,
   readOpenCodeAuthStore,
@@ -61,11 +61,11 @@ export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
 const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
 
-// Copilot Free and Student can expose only GitHub's Auto picker. In that mode the
-// live /models response currently contains no entries accepted by OpenCode 1.17+
-// and OpenCode removes the otherwise authenticated provider. Seed one conservative
-// model so the built-in Copilot auth/transport remains usable. Paid accounts still
-// receive their additional account-specific models from OpenCode live discovery.
+// Copilot Free and Student can expose only GitHub's Auto picker, which OpenCode
+// cannot currently execute through an explicit model id. Seed one conservative
+// explicit model so provider discovery and verification can return an actionable
+// limitation instead of hiding the authenticated provider. Paid accounts still
+// receive their account-specific models from OpenCode live discovery.
 const GITHUB_COPILOT_FALLBACK_PROVIDER_CONFIG = {
   name: 'GitHub Copilot',
   npm: '@ai-sdk/github-copilot',
@@ -1456,13 +1456,12 @@ export class OpenCodeProfileManager {
       }
       try {
         const managed = await readOpenCodeAuthStore(managedAuthPath)
-        let expectedAuth: Awaited<ReturnType<typeof readOpenCodeAuthStore>> = {}
-        for (const authSourcePath of authSourcePaths) {
-          expectedAuth = mergeOpenCodeAuthStoresWithFreshestOAuth({
-            source: await readOpenCodeAuthStore(authSourcePath),
-            managed: expectedAuth,
-          })
-        }
+        const sourceStores = await Promise.all(authSourcePaths.map(readOpenCodeAuthStore))
+        const expectedAuth = mergeOpenCodeManagedAuthSources({
+          sourceAuthPaths: authSourcePaths,
+          sourceStores,
+          globalAuthPath,
+        })
         return doesOpenCodeAuthStoreIncludeSource({ source: expectedAuth, managed })
           ? 'ok' as const
           : 'stale' as const
