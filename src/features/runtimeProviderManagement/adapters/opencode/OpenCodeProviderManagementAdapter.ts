@@ -2645,7 +2645,10 @@ function getProviderCredentialValidationModelIds(input: {
   if (defaultModelId) appendCandidates([defaultModelId])
   appendCandidates(modelIds)
 
-  return candidates.slice(0, CONNECT_EXECUTION_PROOF_MAX_CANDIDATES)
+  const maxCandidates = input.providerId === 'github-copilot'
+    ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
+    : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
+  return candidates.slice(0, maxCandidates)
 }
 
 function buildProviderDirectoryModelSearchIndex(input: {
@@ -3344,6 +3347,13 @@ export class OpenCodeProviderManagementAdapter
         probeResult.reason ?? `Model probe failed for ${validationModelId}`,
         input.secretToRedact ?? '',
       )
+      const copilotExplicitModelUnsupported = input.providerId === 'github-copilot'
+        && isCopilotExplicitModelUnsupported(probeReason)
+      if (copilotExplicitModelUnsupported) {
+        failedCandidates.push(`${validationModelId}: ${probeReason}`)
+        copilotUnsupportedCandidateCount += 1
+        continue
+      }
       if (probeResult.outcome === 'not_authenticated') {
         return providerManagementError(
           'auth-failed',
@@ -3353,12 +3363,6 @@ export class OpenCodeProviderManagementAdapter
         )
       }
       failedCandidates.push(`${validationModelId}: ${probeReason}`)
-      if (
-        input.providerId === 'github-copilot'
-        && isCopilotExplicitModelUnsupported(probeReason)
-      ) {
-        copilotUnsupportedCandidateCount += 1
-      }
     }
 
     if (

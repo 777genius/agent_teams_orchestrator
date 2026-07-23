@@ -2400,6 +2400,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
               'github-copilot/gpt-5.6-luna',
               'github-copilot/gpt-5.5',
               'github-copilot/claude-haiku-4.5',
+              'github-copilot/claude-sonnet-4.6',
             ],
           }),
       },
@@ -2459,7 +2460,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           probedModelIds.push(input.selectedModel)
           return executionProbeResult(
             input.selectedModel,
-            'unavailable',
+            'not_authenticated',
             'The requested model is not supported',
           )
         },
@@ -2492,6 +2493,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       'github-copilot/gpt-5-mini',
       'github-copilot/gpt-5.5',
       'github-copilot/claude-haiku-4.5',
+      'github-copilot/claude-sonnet-4.6',
+      'github-copilot/gpt-5.6-luna',
     ])
     expect(callbackStarted).toBe(true)
     rejectCallback(new Error('late callback shutdown'))
@@ -2510,7 +2513,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
   })
 
-  test('keeps a paid Copilot connection when a cross-family fallback is available', async () => {
+  test('keeps a paid Copilot connection when a later policy fallback is available', async () => {
     let connected = false
     const probedModelIds: string[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -2533,6 +2536,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
               'github-copilot/gpt-5.5',
               'github-copilot/gpt-5.6-luna',
               'github-copilot/claude-haiku-4.5',
+              'github-copilot/claude-sonnet-4.6',
             ],
           }),
       },
@@ -2585,7 +2589,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       executionProbe: {
         probeModel: async input => {
           probedModelIds.push(input.selectedModel)
-          return input.selectedModel === 'github-copilot/claude-haiku-4.5'
+          return input.selectedModel === 'github-copilot/gpt-5.6-luna'
             ? executionProbeResult(input.selectedModel)
             : executionProbeResult(
                 input.selectedModel,
@@ -2611,11 +2615,13 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.value.verifiedModelId).toBe('github-copilot/claude-haiku-4.5')
+    expect(result.value.verifiedModelId).toBe('github-copilot/gpt-5.6-luna')
     expect(probedModelIds).toEqual([
       'github-copilot/gpt-5-mini',
       'github-copilot/gpt-5.5',
       'github-copilot/claude-haiku-4.5',
+      'github-copilot/claude-sonnet-4.6',
+      'github-copilot/gpt-5.6-luna',
     ])
   })
 
