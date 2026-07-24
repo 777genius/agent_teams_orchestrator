@@ -8,7 +8,7 @@ import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider } from './types.js
 
 export type OpenCodeAuthCredential = Record<string, unknown>
 type OpenCodeAuthEntry = OpenCodeAuthCredential
-type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
+export type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
 
 async function withAuthStoreWriteLock<T>(
   filePath: string,
@@ -161,6 +161,30 @@ export function mergeOpenCodeAuthStoresWithFreshestOAuth(input: {
   return merged
 }
 
+export function mergeOpenCodeManagedAuthSources(input: {
+  sourceAuthPaths: readonly string[]
+  sourceStores: readonly OpenCodeAuthStore[]
+  globalAuthPath: string
+}): OpenCodeAuthStore {
+  let expected: OpenCodeAuthStore = {}
+  for (const source of input.sourceStores) {
+    expected = mergeOpenCodeAuthStoresWithFreshestOAuth({ source, managed: expected })
+  }
+
+  const globalSourceIndex = input.sourceAuthPaths.indexOf(input.globalAuthPath)
+  const globalSourceStore = globalSourceIndex >= 0 ? input.sourceStores[globalSourceIndex] : {}
+  // API credentials explicitly saved through Agent Teams belong to the app-global
+  // store and must shadow stale credentials imported from the user's OpenCode store.
+  // OAuth remains freshness-based because OpenCode may refresh it outside the app.
+  for (const [providerId, credential] of Object.entries(globalSourceStore)) {
+    if (credential.type === 'api') {
+      expected[providerId] = credential
+    }
+  }
+
+  return expected
+}
+
 export function doesOpenCodeAuthStoreIncludeSource(input: {
   source: OpenCodeAuthStore
   managed: OpenCodeAuthStore
@@ -227,10 +251,11 @@ export async function reconcileOpenCodeManagedAuthStores(input: {
     ])
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
 
-    let expected: OpenCodeAuthStore = {}
-    for (const source of sourceStores) {
-      expected = mergeOpenCodeAuthStoresWithFreshestOAuth({ source, managed: expected })
-    }
+    const expected = mergeOpenCodeManagedAuthSources({
+      sourceAuthPaths: input.sourceAuthPaths,
+      sourceStores,
+      globalAuthPath: input.globalAuthPath,
+    })
 
     const oauthProviderIds = Object.entries(expected)
       .filter(([, credential]) => credential.type === 'oauth')

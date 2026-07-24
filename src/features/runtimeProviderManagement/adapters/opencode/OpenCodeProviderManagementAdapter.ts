@@ -299,6 +299,7 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'groq/openai/gpt-oss-20b',
     'groq/openai/gpt-oss-120b',
   ],
+  llmgateway: ['llmgateway/claude-haiku-4-5-free'],
   opencode: [
     'opencode/big-pickle',
     'opencode/mimo-v2.5-free',
@@ -319,9 +320,10 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
   ],
   'github-copilot': [
     'github-copilot/gpt-5-mini',
-    'github-copilot/gpt-5.6-luna',
     'github-copilot/gpt-5.5',
-    'github-copilot/claude-sonnet-5',
+    'github-copilot/claude-haiku-4.5',
+    'github-copilot/claude-sonnet-4.6',
+    'github-copilot/gpt-5.6-luna',
   ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
@@ -352,6 +354,16 @@ const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   'zai',
   'zenmux',
 ])
+const COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE =
+  'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.'
+
+function isCopilotExplicitModelUnsupported(reason: string): boolean {
+  const normalized = reason.trim().toLowerCase()
+  return normalized.includes('requested model is not supported')
+    || normalized.includes('selected model is not supported')
+    || normalized.includes('model is unsupported for this copilot account')
+    || normalized.includes('model is not supported for this copilot account')
+}
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
@@ -2633,7 +2645,10 @@ function getProviderCredentialValidationModelIds(input: {
   if (defaultModelId) appendCandidates([defaultModelId])
   appendCandidates(modelIds)
 
-  return candidates.slice(0, CONNECT_EXECUTION_PROOF_MAX_CANDIDATES)
+  const maxCandidates = input.providerId === 'github-copilot'
+    ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
+    : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
+  return candidates.slice(0, maxCandidates)
 }
 
 function buildProviderDirectoryModelSearchIndex(input: {
@@ -3292,6 +3307,7 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const failedCandidates: string[] = []
+    let copilotUnsupportedCandidateCount = 0
     for (const validationModelId of validationModelIds) {
       const runtimeDeadline = new OpenCodeRuntimeDeadline(
         CONNECT_EXECUTION_PROOF_CANDIDATE_TIMEOUT_MS,
@@ -3312,6 +3328,12 @@ export class OpenCodeProviderManagementAdapter
           input.secretToRedact ?? '',
         )
         failedCandidates.push(`${validationModelId}: ${reason}`)
+        if (
+          input.providerId === 'github-copilot'
+          && isCopilotExplicitModelUnsupported(reason)
+        ) {
+          copilotUnsupportedCandidateCount += 1
+        }
         continue
       } finally {
         runtimeDeadline.dispose()
@@ -3325,6 +3347,13 @@ export class OpenCodeProviderManagementAdapter
         probeResult.reason ?? `Model probe failed for ${validationModelId}`,
         input.secretToRedact ?? '',
       )
+      const copilotExplicitModelUnsupported = input.providerId === 'github-copilot'
+        && isCopilotExplicitModelUnsupported(probeReason)
+      if (copilotExplicitModelUnsupported) {
+        failedCandidates.push(`${validationModelId}: ${probeReason}`)
+        copilotUnsupportedCandidateCount += 1
+        continue
+      }
       if (probeResult.outcome === 'not_authenticated') {
         return providerManagementError(
           'auth-failed',
@@ -3334,6 +3363,16 @@ export class OpenCodeProviderManagementAdapter
         )
       }
       failedCandidates.push(`${validationModelId}: ${probeReason}`)
+    }
+
+    if (
+      input.providerId === 'github-copilot'
+      && copilotUnsupportedCandidateCount === validationModelIds.length
+    ) {
+      return providerManagementError(
+        'model-test-failed',
+        COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE,
+      )
     }
 
     return providerManagementError(
