@@ -39,7 +39,8 @@ import { consumeEarlyInput } from '../utils/earlyInput.js';
 import { setMemberActive } from '../utils/swarm/teamHelpers.js';
 import { isSwarmWorker, generateSandboxRequestId, sendSandboxPermissionRequestViaMailbox, sendSandboxPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js';
 import { registerSandboxPermissionCallback } from '../hooks/useSwarmPermissionPoller.js';
-import { getTeamName, getAgentName } from '../utils/teammate.js';
+import { getTeamName, getAgentName, isTeammate } from '../utils/teammate.js';
+import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV } from '../utils/swarm/teammateRuntimeEvents.js';
 import { WorkerPendingPermission } from '../components/permissions/WorkerPendingPermission.js';
 import { injectUserMessageToTeammate, getAllInProcessTeammateTasks } from '../tasks/InProcessTeammateTask/InProcessTeammateTask.js';
 import { isLocalAgentTask, queuePendingMessage, appendMessageToLocalAgent, type LocalAgentTaskState } from '../tasks/LocalAgentTask/LocalAgentTask.js';
@@ -916,6 +917,23 @@ export function REPL({
   // Subscribe to the guard — true during dispatching or running.
   // This is the single source of truth for "is a local query in flight".
   const isQueryActive = React.useSyncExternalStore(queryGuard.subscribe, queryGuard.getSnapshot);
+
+  // A launched process/tmux teammate must complete its private bootstrap turn
+  // before any ordinary prompt source can start work. The parent writes the
+  // bootstrap mailbox row only after runtime_ready, so mailbox/task/tick/bridge
+  // traffic can otherwise win that startup race and make bootstrap submission
+  // fail with query_active.
+  const requiresBootstrapAdmission =
+    isTeammate() &&
+    Boolean(process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim());
+  const bootstrapAdmissionPendingRef = useRef(requiresBootstrapAdmission);
+  const [isBootstrapAdmissionPending, setIsBootstrapAdmissionPending] =
+    useState(requiresBootstrapAdmission);
+  const confirmBootstrapAdmission = useCallback(() => {
+    if (!bootstrapAdmissionPendingRef.current) return;
+    bootstrapAdmissionPendingRef.current = false;
+    setIsBootstrapAdmissionPending(false);
+  }, []);
 
   // Separate loading flag for operations outside the local query guard:
   // remote sessions (useRemoteSession / useDirectConnect) and foregrounded
@@ -3062,7 +3080,12 @@ export function REPL({
   const initialMessageRef = useRef(false);
   useEffect(() => {
     const pending = initialMessage;
-    if (!pending || isLoading || initialMessageRef.current) return;
+    if (
+      !pending ||
+      isLoading ||
+      isBootstrapAdmissionPending ||
+      initialMessageRef.current
+    ) return;
 
     // Mark as processing to prevent re-entry
     initialMessageRef.current = true;
@@ -3172,7 +3195,7 @@ export function REPL({
       }, 100, initialMessageRef);
     }
     void processInitialMessage(pending);
-  }, [initialMessage, isLoading, setMessages, setAppState, onQuery, mainLoopModel, tools]);
+  }, [initialMessage, isLoading, isBootstrapAdmissionPending, setMessages, setAppState, onQuery, mainLoopModel, tools]);
   const onSubmit = useCallback(async (input: string, helpers: PromptInputHelpers, speculationAccept?: {
     state: ActiveSpeculationState;
     speculationSessionTimeSavedMs: number;
@@ -3923,6 +3946,7 @@ export function REPL({
   useQueueProcessor({
     executeQueuedInput,
     hasActiveLocalJsxUI: isShowingLocalJSXCommand,
+    isBootstrapAdmissionPending,
     queryGuard
   });
 
@@ -4036,10 +4060,11 @@ export function REPL({
     const commandQueueModes = Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown'))));
     const decision = decideIncomingPromptAdmission({
       submissionKind: options?.submissionKind ?? 'runtime_delivery',
+      bootstrapAdmissionPending: bootstrapAdmissionPendingRef.current,
       queryGuardStatus: queryGuard.status,
       blockingQueueModes: getBlockingIncomingPromptQueueModes(commandQueueModes),
     });
-    if (!decision.accepted) {
+    if (decision.accepted === false) {
       return {
         accepted: false,
         rejectionReason: decision.rejectionReason,
@@ -4107,6 +4132,7 @@ export function REPL({
     onSubmitMessage: handleIncomingPrompt,
     getNativeAppManagedBootstrapContextInjection,
     onAgentErrorNotification: handleAgentErrorNotification,
+    onBootstrapConfirmed: confirmBootstrapAdmission,
     transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
   });
   useTeammateStartupReadySentinel({
@@ -4115,7 +4141,7 @@ export function REPL({
     sessionId: getSessionId()
   });
   useMailboxBridge({
-    isLoading,
+    isLoading: isLoading || isBootstrapAdmissionPending,
     onSubmitMessage: handleIncomingPrompt
   });
 
@@ -4130,7 +4156,7 @@ export function REPL({
     const assistantMode = store.getState().kairosEnabled;
     // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
     useScheduledTasks!({
-      isLoading,
+      isLoading: isLoading || isBootstrapAdmissionPending,
       assistantMode,
       setMessages
     });
@@ -4146,7 +4172,7 @@ export function REPL({
     // biome-ignore lint/correctness/useHookAtTopLevel: conditional for dead code elimination in external builds
     useTaskListWatcher({
       taskListId,
-      isLoading,
+      isLoading: isLoading || isBootstrapAdmissionPending,
       onSubmitTask: (prompt: string) => handleIncomingPrompt(prompt, {
         submissionKind: 'task'
       })
@@ -4159,7 +4185,7 @@ export function REPL({
       // Suppress ticks while an initial message is pending — the initial
       // message will be processed asynchronously and a premature tick would
       // race with it, causing concurrent-query enqueue of expanded skill text.
-      isLoading: isLoading || initialMessage !== null,
+      isLoading: isLoading || isBootstrapAdmissionPending || initialMessage !== null,
       queuedCommandsLength: queuedCommands.length,
       hasActiveLocalJsxUI: isShowingLocalJSXCommand,
       isInPlanMode: toolPermissionContext.mode === 'plan',

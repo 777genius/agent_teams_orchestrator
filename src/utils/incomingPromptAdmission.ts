@@ -11,6 +11,7 @@ export type IncomingPromptQueryGuardStatus =
   | 'running'
 
 export type IncomingPromptRejectionReason =
+  | 'bootstrap_pending'
   | 'query_active'
   | 'command_queue_busy'
 
@@ -32,13 +33,23 @@ export function getBlockingIncomingPromptQueueModes(
 
 export function decideIncomingPromptAdmission({
   submissionKind,
+  bootstrapAdmissionPending,
   queryGuardStatus,
   blockingQueueModes,
 }: {
   submissionKind: IncomingPromptSubmissionKind
+  bootstrapAdmissionPending: boolean
   queryGuardStatus: IncomingPromptQueryGuardStatus
   blockingQueueModes: readonly string[]
 }): IncomingPromptAdmissionDecision {
+  if (bootstrapAdmissionPending && submissionKind !== 'bootstrap') {
+    return {
+      accepted: false,
+      rejectionReason: 'bootstrap_pending',
+      retryable: true,
+    }
+  }
+
   if (queryGuardStatus !== 'idle') {
     return {
       accepted: false,

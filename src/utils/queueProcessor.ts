@@ -8,6 +8,7 @@ import {
 
 type ProcessQueueParams = {
   executeInput: (commands: QueuedCommand[]) => Promise<void>
+  isBootstrapAdmissionPending: boolean
 }
 
 type ProcessQueueResult = {
@@ -51,7 +52,12 @@ function isSlashCommand(cmd: QueuedCommand): boolean {
  */
 export function processQueueIfReady({
   executeInput,
+  isBootstrapAdmissionPending,
 }: ProcessQueueParams): ProcessQueueResult {
+  if (isBootstrapAdmissionPending) {
+    return { processed: false }
+  }
+
   // This processor runs on the REPL main thread between turns. Skip anything
   // addressed to a subagent — an unfiltered peek() returning a subagent
   // notification would set targetMode, dequeueAllMatching would find nothing
