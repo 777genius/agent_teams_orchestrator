@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 
-import { handlePromptSubmit } from './handlePromptSubmit.js'
+import {
+  handlePromptSubmit,
+  isPromptSubmissionDeferred,
+} from './handlePromptSubmit.js'
 import {
   clearCommandQueue,
   getCommandQueue,
@@ -12,6 +15,12 @@ afterEach(() => {
 })
 
 describe('handlePromptSubmit bootstrap admission', () => {
+  test('treats bootstrap admission as a deferred submission state', () => {
+    expect(isPromptSubmissionDeferred(false, true)).toBe(true)
+    expect(isPromptSubmissionDeferred(true, false)).toBe(true)
+    expect(isPromptSubmissionDeferred(false, false)).toBe(false)
+  })
+
   test('queues interactive teammate input until bootstrap is confirmed', async () => {
     const queryGuard = new QueryGuard()
     let inputValue = 'ordinary interactive work'

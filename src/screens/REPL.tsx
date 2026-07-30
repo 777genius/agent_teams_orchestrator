@@ -140,7 +140,7 @@ import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_ST
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
-import { handlePromptSubmit, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
+import { handlePromptSubmit, isPromptSubmissionDeferred, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
 import { useQueueProcessor } from '../hooks/useQueueProcessor.js';
 import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
@@ -3382,22 +3382,25 @@ export function REPL({
       }
     }
 
-    // Restore stash if present, but NOT for slash commands or when loading.
+    // Restore stash if present, but NOT for slash commands or while submission
+    // is deferred by an active query/external load/bootstrap admission.
     // - Slash commands (especially interactive ones like /model, /context) hide
     //   the prompt and show a picker UI. Restoring the stash during a command would
     //   place the text in a hidden input, and the user would lose it by typing the
     //   next command. Instead, preserve the stash so it survives across command runs.
-    // - When loading, the submitted input will be queued and handlePromptSubmit
-    //   will clear the input field (onInputChange('')), which would clobber the
-    //   restored stash. Defer restoration to after handlePromptSubmit (below).
+    // - When deferred, the submitted input will be queued and
+    //   handlePromptSubmit will clear the input field (onInputChange('')),
+    //   which would clobber the restored stash. Defer restoration until after
+    //   handlePromptSubmit (below).
     //   Remote mode is exempt: it sends via WebSocket and returns early without
     //   calling handlePromptSubmit, so there's no clobbering risk — restore eagerly.
     // In both deferred cases, the stash is restored after await handlePromptSubmit.
     const isSlashCommand = !speculationAccept && input.trim().startsWith('/');
-    // Submit runs "now" (not queued) when not already loading, or when
-    // accepting speculation, or in remote mode (which sends via WS and
-    // returns early without calling handlePromptSubmit).
-    const submitsNow = !isLoading || speculationAccept || activeRemote.isRemoteMode;
+    const isSubmissionDeferred = isPromptSubmissionDeferred(isLoading, isBootstrapAdmissionPending);
+    // Submit runs "now" (not queued) when not deferred, or when accepting
+    // speculation, or in remote mode (which sends via WS and returns early
+    // without calling handlePromptSubmit).
+    const submitsNow = !isSubmissionDeferred || speculationAccept || activeRemote.isRemoteMode;
     if (stashedPrompt !== undefined && !isSlashCommand && submitsNow) {
       setInputValue(stashedPrompt.text);
       helpers.setCursorOffset(stashedPrompt.cursorOffset);
@@ -3580,9 +3583,9 @@ export function REPL({
     // - Slash command: handlePromptSubmit awaited the full command execution
     //   (including interactive pickers). Restoring now places the stash back in
     //   the visible input.
-    // - Loading (queued): handlePromptSubmit enqueued + cleared input, then
+    // - Deferred (queued): handlePromptSubmit enqueued + cleared input, then
     //   returned quickly. Restoring now places the stash back after the clear.
-    if ((isSlashCommand || isLoading) && stashedPrompt !== undefined) {
+    if ((isSlashCommand || isSubmissionDeferred) && stashedPrompt !== undefined) {
       setInputValue(stashedPrompt.text);
       helpers.setCursorOffset(stashedPrompt.cursorOffset);
       setPastedContents(stashedPrompt.pastedContents);

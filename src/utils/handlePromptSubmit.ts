@@ -128,6 +128,13 @@ export type HandlePromptSubmitParams = BaseExecutionParams & {
   skipSlashCommands?: boolean
 }
 
+export function isPromptSubmissionDeferred(
+  isLoading: boolean,
+  isBootstrapAdmissionPending: boolean,
+): boolean {
+  return isLoading || isBootstrapAdmissionPending
+}
+
 export async function handlePromptSubmit(
   params: HandlePromptSubmitParams,
 ): Promise<void> {
@@ -237,8 +244,10 @@ export async function handlePromptSubmit(
   logEvent('tengu_paste_text', { pastedTextCount, pastedTextBytes })
 
   const isPromptExecutionBusy = queryGuard.isActive || isExternalLoading
-  const shouldDeferPromptSubmission =
-    isPromptExecutionBusy || isBootstrapAdmissionPending
+  const shouldDeferPromptSubmission = isPromptSubmissionDeferred(
+    isPromptExecutionBusy,
+    isBootstrapAdmissionPending,
+  )
 
   // Handle local-jsx immediate commands (e.g., /config, /doctor)
   // Skip for remote bridge messages — slash commands from CCR clients are plain text
