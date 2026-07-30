@@ -3549,6 +3549,7 @@ export function REPL({
       helpers,
       queryGuard,
       isExternalLoading,
+      isBootstrapAdmissionPending,
       mode: inputMode,
       commands,
       onInputChange: setInputValue,
@@ -3591,7 +3592,7 @@ export function REPL({
   // isLoading is read at the !isLoading checks above for input-clearing
   // and submitCount gating. It's derived from isQueryActive || isExternalLoading,
   // so including it here ensures the closure captures the fresh value.
-  isLoading, isExternalLoading, inputMode, commands, setInputValue, setInputMode, setPastedContents, setSubmitCount, setIDESelection, setToolJSX, getToolUseContext,
+  isLoading, isExternalLoading, isBootstrapAdmissionPending, inputMode, commands, setInputValue, setInputMode, setPastedContents, setSubmitCount, setIDESelection, setToolJSX, getToolUseContext,
   // messages is read via messagesRef.current inside the callback to
   // keep onSubmit stable across message updates (see L2384/L2400/L2662).
   // Without this, each setMessages call (~30× per turn) recreates
