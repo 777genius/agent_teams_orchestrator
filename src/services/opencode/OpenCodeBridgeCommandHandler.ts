@@ -97,6 +97,7 @@ const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
 // or the candidate proof shape so the desktop app can reject stale evidence.
 const OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION = 1
 const OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION = 2
+const OPENCODE_FILE_PARTS_CONTRACT_VERSION = 2
 const OPENCODE_SEND_RECONCILE_TIMEOUT_MS = 5_000
 const OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS = 8_000
 // This is intentionally longer than the UI wait budget: the app can return
@@ -109,6 +110,14 @@ const OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_ENV =
 const OPEN_CODE_TEAMMATE_AGENT = 'teammate'
 const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT = 'teammate-bootstrap'
 const ELECTRON_RUN_AS_NODE_ENV = 'ELECTRON_RUN_AS_NODE'
+const SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+])
 
 function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
   return body.skipPermissions === false ? 'manual' : 'auto'
@@ -638,7 +647,7 @@ function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
     if (!mime || !url || !filename) {
       throw new Error(`OpenCode file part at index ${index} is missing mime, url, or filename.`)
     }
-    if (mime !== 'image/png' && mime !== 'image/jpeg' && mime !== 'image/webp') {
+    if (!SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES.has(mime)) {
       throw new Error(`OpenCode file part at index ${index} has unsupported MIME: ${mime}`)
     }
     if (!url.startsWith(`data:${mime};base64,`)) {
@@ -952,6 +961,7 @@ function createBridgeServerIdentity(
       opencodeTaskLedgerEvidenceContractVersion: OPENCODE_TASK_LEDGER_EVIDENCE_CONTRACT_VERSION,
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
       opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,
+      opencodeFilePartsContractVersion: OPENCODE_FILE_PARTS_CONTRACT_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
