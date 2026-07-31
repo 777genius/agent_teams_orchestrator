@@ -159,7 +159,7 @@ export function isMemberBriefingToolName(name: string): boolean {
 export type InboxPromptSubmitResult = {
   accepted: boolean
   userMessageUuid?: string
-  rejectionReason?: 'query_active' | 'command_queue_busy'
+  rejectionReason?: 'bootstrap_pending' | 'query_active' | 'command_queue_busy'
   queryGuardActive?: boolean
   queryGuardStatus?: 'idle' | 'dispatching' | 'running'
   commandQueueLength?: number
@@ -191,6 +191,7 @@ type Props = {
   ) => InboxPromptSubmitResult
   getNativeAppManagedBootstrapContextInjection?: GetNativeAppManagedBootstrapContextInjection
   onAgentErrorNotification: (message: AgentErrorUserNotification) => void
+  onBootstrapConfirmed: () => void
 }
 
 function formatPromptSubmitRejectionDetail(submitted: InboxPromptSubmitResult): string {
@@ -2079,6 +2080,7 @@ export function useInboxPoller({
   onSubmitMessage,
   getNativeAppManagedBootstrapContextInjection,
   onAgentErrorNotification,
+  onBootstrapConfirmed,
 }: Props): void {
   // Assign to original name for clarity within the function
   const onSubmitTeammateMessage = onSubmitMessage
@@ -3505,6 +3507,7 @@ export function useInboxPoller({
         observedBootstrapTransportRef.current.delete(
           processingBootstrapMessage.messageId,
         )
+        onBootstrapConfirmed()
         if (isTeammate()) {
           void writeChildOwnedTeammateRuntimeEvent({
             type: 'bootstrap_confirmed',
@@ -4142,6 +4145,7 @@ export function useInboxPoller({
     getMessages,
     onSubmitTeammateMessage,
     getNativeAppManagedBootstrapContextInjection,
+    onBootstrapConfirmed,
     setAppState,
     inboxStateSignature,
     store,

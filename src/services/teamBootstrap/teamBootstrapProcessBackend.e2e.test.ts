@@ -133,6 +133,8 @@ const configDir = process.env.CLAUDE_CONFIG_DIR
 const expectedPrompt = process.env.FAKE_TEAMMATE_EXPECTED_PROMPT || ''
 const markerPath = process.env.FAKE_TEAMMATE_SPAWN_MARKER
 const mode = process.env.FAKE_TEAMMATE_MODE || 'success'
+const admissionModuleUrl =
+  process.env.FAKE_TEAMMATE_ADMISSION_MODULE_URL || ''
 const runtimeReadyDelayMs = Number(
   process.env.FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS || '0',
 )
@@ -223,6 +225,9 @@ async function writeLeaderConfirmation() {
   await writeFile(inboxPath, JSON.stringify(messages, null, 2))
 }
 
+let decideIncomingPromptAdmission
+let deferredOrdinaryMessage
+
 try {
   if (markerPath) {
     await writeFile(markerPath, 'spawned:' + process.pid)
@@ -286,6 +291,42 @@ try {
     await sleep(runtimeReadyDelayMs)
   }
 
+  if (mode === 'prebootstrap-ordinary-barrier') {
+    const admissionModule = await import(admissionModuleUrl)
+    decideIncomingPromptAdmission =
+      admissionModule.decideIncomingPromptAdmission
+    const messagesBeforeRuntimeReady = await readMailboxMessages(agentName)
+    deferredOrdinaryMessage = messagesBeforeRuntimeReady.find(
+      message =>
+        message &&
+        !message.read &&
+        message.from === 'user' &&
+        !String(message.text || '').includes(expectedPrompt),
+    )
+    if (!deferredOrdinaryMessage) {
+      throw new Error('expected unread ordinary message before runtime_ready')
+    }
+    const ordinaryDecision = decideIncomingPromptAdmission({
+      submissionKind: 'mailbox',
+      bootstrapAdmissionPending: true,
+      queryGuardStatus: 'idle',
+      blockingQueueModes: [],
+    })
+    if (
+      ordinaryDecision.accepted ||
+      ordinaryDecision.rejectionReason !== 'bootstrap_pending'
+    ) {
+      throw new Error(
+        'ordinary message was not deferred by bootstrap admission barrier',
+      )
+    }
+    await writeEvent(
+      'heartbeat',
+      'ordinary prompt deferred by bootstrap barrier; reason=' +
+        ordinaryDecision.rejectionReason,
+    )
+  }
+
   await writeEvent('runtime_ready', 'inbox poller mounted')
   let wroteInboxPollerReadyBeforePrompt = false
   if (mode === 'ready-before-mailbox-bootstrap') {
@@ -333,6 +374,19 @@ try {
     'submitting bootstrap prompt',
     bootstrapMirror,
   )
+  if (mode === 'prebootstrap-ordinary-barrier') {
+    const bootstrapDecision = decideIncomingPromptAdmission({
+      submissionKind: 'bootstrap',
+      bootstrapAdmissionPending: true,
+      queryGuardStatus: 'idle',
+      blockingQueueModes: [],
+    })
+    if (!bootstrapDecision.accepted) {
+      throw new Error(
+        'bootstrap was rejected while its admission barrier was active',
+      )
+    }
+  }
   if (mode === 'skip-bootstrap-submit-after-inbox-ready') {
     await sleep(60_000)
     process.exit(0)
@@ -422,6 +476,24 @@ try {
   )
   await writeLeaderConfirmation()
   await writeEvent('bootstrap_confirmed', 'leader idle notification written', bootstrapMirror)
+  if (mode === 'prebootstrap-ordinary-barrier') {
+    const releasedDecision = decideIncomingPromptAdmission({
+      submissionKind: 'mailbox',
+      bootstrapAdmissionPending: false,
+      queryGuardStatus: 'idle',
+      blockingQueueModes: [],
+    })
+    if (!releasedDecision.accepted) {
+      throw new Error(
+        'ordinary message stayed blocked after bootstrap confirmation',
+      )
+    }
+    await writeEvent(
+      'heartbeat',
+      'deferred ordinary prompt admitted after bootstrap confirmation; messageId=' +
+        String(deferredOrdinaryMessage.messageId || 'missing'),
+    )
+  }
   if (mode === 'hold-child') {
     await writeEvent('heartbeat', 'holding parent open')
     await sleep(60_000)
@@ -457,6 +529,7 @@ beforeEach(() => {
     'CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES',
     TEAMMATE_COMMAND_ENV_VAR,
     'FAKE_TEAMMATE_EXPECTED_PROMPT',
+    'FAKE_TEAMMATE_ADMISSION_MODULE_URL',
     'FAKE_TEAMMATE_MODE',
     'FAKE_TEAMMATE_SPAWN_MARKER',
     'FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS',
@@ -648,6 +721,102 @@ describe('supervised process teammate backend e2e', () => {
       await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)
       runtimePids = runtimePids.filter(pid => pid !== alice.runtimePid)
     }
+  })
+
+  it('keeps pre-bootstrap ordinary work behind the bootstrap admission barrier', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'prebootstrap-ordinary-barrier',
+    })
+    await writeToMailbox(
+      'alice',
+      {
+        messageId: 'ordinary-before-bootstrap',
+        from: 'user',
+        text: 'Run this ordinary mailbox task after bootstrap.',
+        timestamp: '2026-07-30T14:59:30.000Z',
+      },
+      fixture.teamName,
+    )
+
+    const result = await __handleSpawnNativeProcessForTests(
+      {
+        name: 'alice',
+        prompt: BOOTSTRAP_PROMPT,
+        team_name: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        bootstrapTimeoutMs: 5_000,
+      },
+      fixture.context,
+    )
+
+    expect(result.data.backend_type).toBe('process')
+    expect(typeof result.data.runtime_pid).toBe('number')
+    runtimePids.push(result.data.runtime_pid!)
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    await waitForEvents(runtimePaths.eventsPath, [
+      'runtime_ready',
+      'mailbox_bootstrap_written',
+      'bootstrap_submitted',
+      'bootstrap_confirmed',
+    ])
+    await waitForCondition(async () => {
+      const latest = await readTeammateRuntimeEvents(runtimePaths.eventsPath)
+      return latest.some(
+        event =>
+          event.type === 'heartbeat' &&
+          event.detail?.includes(
+            'deferred ordinary prompt admitted after bootstrap confirmation',
+          ),
+      )
+    }, 5_000)
+    const completedEvents = await readTeammateRuntimeEvents(
+      runtimePaths.eventsPath,
+    )
+    const deferredIndex = completedEvents.findIndex(
+      event =>
+        event.type === 'heartbeat' &&
+        event.detail?.includes(
+          'ordinary prompt deferred by bootstrap barrier',
+        ),
+    )
+    const runtimeReadyIndex = completedEvents.findIndex(
+      event => event.type === 'runtime_ready',
+    )
+    const submittedIndex = completedEvents.findIndex(
+      event => event.type === 'bootstrap_submitted',
+    )
+    const confirmedIndex = completedEvents.findIndex(
+      event => event.type === 'bootstrap_confirmed',
+    )
+    const ordinaryAdmittedIndex = completedEvents.findIndex(
+      event =>
+        event.type === 'heartbeat' &&
+        event.detail?.includes(
+          'deferred ordinary prompt admitted after bootstrap confirmation',
+        ),
+    )
+
+    expect(deferredIndex).toBeGreaterThanOrEqual(0)
+    expect(deferredIndex).toBeLessThan(runtimeReadyIndex)
+    expect(runtimeReadyIndex).toBeLessThan(submittedIndex)
+    expect(submittedIndex).toBeLessThan(confirmedIndex)
+    expect(confirmedIndex).toBeLessThan(ordinaryAdmittedIndex)
+    expect(
+      completedEvents.some(
+        event => event.type === 'bootstrap_submit_rejected',
+      ),
+    ).toBe(false)
+
+    await waitForCondition(
+      () => !isProcessAlive(result.data.runtime_pid!),
+      5_000,
+    )
+    runtimePids = runtimePids.filter(pid => pid !== result.data.runtime_pid)
   })
 
   it('clears stale runtime events before starting a reused process teammate', async () => {
@@ -1796,6 +1965,7 @@ async function createFixture(options: {
     | 'exit-after-bootstrap-submit-attempt'
     | 'stale-submit-wrong-run-after-inbox-ready'
     | 'stale-mirror-current-proof-after-inbox-ready'
+    | 'prebootstrap-ordinary-barrier'
     | 'submit-rejected-then-accepted'
     | 'submit-rejected-terminal'
     | 'accepted-without-uuid'
@@ -1822,6 +1992,8 @@ async function createFixture(options: {
   process.env[TEAMMATE_COMMAND_ENV_VAR] =
     `${quoteShellArg(process.execPath)} ${quoteShellArg(scriptPath)}`
   process.env.FAKE_TEAMMATE_EXPECTED_PROMPT = BOOTSTRAP_PROMPT
+  process.env.FAKE_TEAMMATE_ADMISSION_MODULE_URL =
+    new URL('../../utils/incomingPromptAdmission.ts', import.meta.url).href
   process.env.FAKE_TEAMMATE_MODE = options.mode ?? 'success'
   process.env.FAKE_TEAMMATE_SPAWN_MARKER = markerPath
 

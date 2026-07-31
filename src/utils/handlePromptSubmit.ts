@@ -56,6 +56,12 @@ type BaseExecutionParams = {
    * (executeQueuedInput) — dequeued items were already queued past this check.
    */
   isExternalLoading?: boolean
+  /**
+   * True while a spawned teammate must finish its bootstrap turn before
+   * ordinary interactive input can execute. Direct submissions are queued
+   * through the same path as input received during an active query.
+   */
+  isBootstrapAdmissionPending?: boolean
   setToolJSX: SetToolJSXFn
   getToolUseContext: (
     messages: Message[],
@@ -122,6 +128,13 @@ export type HandlePromptSubmitParams = BaseExecutionParams & {
   skipSlashCommands?: boolean
 }
 
+export function isPromptSubmissionDeferred(
+  isLoading: boolean,
+  isBootstrapAdmissionPending: boolean,
+): boolean {
+  return isLoading || isBootstrapAdmissionPending
+}
+
 export async function handlePromptSubmit(
   params: HandlePromptSubmitParams,
 ): Promise<void> {
@@ -129,6 +142,7 @@ export async function handlePromptSubmit(
     helpers,
     queryGuard,
     isExternalLoading = false,
+    isBootstrapAdmissionPending = false,
     commands,
     onInputChange,
     setPastedContents,
@@ -229,6 +243,12 @@ export async function handlePromptSubmit(
   )
   logEvent('tengu_paste_text', { pastedTextCount, pastedTextBytes })
 
+  const isPromptExecutionBusy = queryGuard.isActive || isExternalLoading
+  const shouldDeferPromptSubmission = isPromptSubmissionDeferred(
+    isPromptExecutionBusy,
+    isBootstrapAdmissionPending,
+  )
+
   // Handle local-jsx immediate commands (e.g., /config, /doctor)
   // Skip for remote bridge messages — slash commands from CCR clients are plain text
   if (!skipSlashCommands && finalInput.trim().startsWith('/')) {
@@ -253,7 +273,7 @@ export async function handlePromptSubmit(
     if (
       immediateCommand &&
       immediateCommand.type === 'local-jsx' &&
-      (queryGuard.isActive || isExternalLoading)
+      shouldDeferPromptSubmission
     ) {
       logEvent('tengu_immediate_command_executed', {
         commandName:
@@ -315,7 +335,7 @@ export async function handlePromptSubmit(
     }
   }
 
-  if (queryGuard.isActive || isExternalLoading) {
+  if (shouldDeferPromptSubmission) {
     // Only allow prompt and bash mode commands to be queued
     if (mode !== 'prompt' && mode !== 'bash') {
       return
@@ -323,7 +343,7 @@ export async function handlePromptSubmit(
 
     // Interrupt the current turn when all executing tools have
     // interruptBehavior 'cancel' (e.g. SleepTool).
-    if (params.hasInterruptibleToolInProgress) {
+    if (isPromptExecutionBusy && params.hasInterruptibleToolInProgress) {
       logForDebugging(
         `[interrupt] Aborting current turn: streamMode=${params.streamMode}`,
       )
