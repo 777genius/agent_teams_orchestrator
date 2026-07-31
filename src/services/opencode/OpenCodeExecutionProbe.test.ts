@@ -232,6 +232,190 @@ describe('OpenCodeExecutionProbe', () => {
     })
   })
 
+  async function expectCompletedAssistantResponseWithoutTextFailsFast(
+    assistantParts: OpenCodeMessage['parts'],
+  ): Promise<void> {
+    let sleepCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 120_000,
+      pollIntervalMs: 500,
+      sleep: async () => {
+        sleepCount += 1
+        if (sleepCount > 1) {
+          throw new Error('completed empty response should not be polled again')
+        }
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-empty-assistant' }),
+          getSession: async () => ({ id: 'session-empty-assistant' }),
+          getSessionStatus: async () => ({ 'session-empty-assistant': 'idle' }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-user-empty-assistant',
+                role: 'user',
+                sessionID: 'session-empty-assistant',
+                time: { created: 100 },
+              },
+              parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+            },
+            {
+              info: {
+                id: 'msg-assistant-empty',
+                role: 'assistant',
+                parentID: 'msg-user-empty-assistant',
+                sessionID: 'session-empty-assistant',
+                time: { created: 101, completed: 110 },
+              },
+              parts: assistantParts,
+            },
+          ],
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-empty-assistant' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'OpenCode model verification completed without assistant output',
+      durableState: 'idle',
+      latestAssistantText: null,
+    })
+    expect(result.diagnostics).toContain(
+      'OpenCode model verification completed without assistant output',
+    )
+    expect(sleepCount).toBe(1)
+    expect(abortCount).toBe(0)
+  }
+
+  test('fails fast when OpenCode completes an empty assistant response', async () => {
+    await expectCompletedAssistantResponseWithoutTextFailsFast([])
+  })
+
+  test('fails fast when OpenCode completes a reasoning-only assistant response', async () => {
+    await expectCompletedAssistantResponseWithoutTextFailsFast([
+      { type: 'reasoning', text: 'Internal reasoning without a final answer' },
+    ])
+  })
+
+  test('fails fast after OpenCode stays idle without creating an assistant response', async () => {
+    let statusCallCount = 0
+    let messageCallCount = 0
+    let abortCount = 0
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      probeTimeoutMs: 120_000,
+      pollIntervalMs: 0,
+      sleep: async () => {},
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-no-assistant' }),
+          getSession: async () => ({ id: 'session-no-assistant' }),
+          getSessionStatus: async () => {
+            statusCallCount += 1
+            return { 'session-no-assistant': 'idle' as const }
+          },
+          getSessionMessages: async () => {
+            messageCallCount += 1
+            return [
+              {
+                info: {
+                  id: 'msg-user-no-assistant',
+                  role: 'user',
+                  sessionID: 'session-no-assistant',
+                  time: { created: 100 },
+                },
+                parts: [{ type: 'text', text: 'Output only the single word PONG.' }],
+              },
+            ]
+          },
+          getPermissions: async () => [],
+          listExperimentalToolIds: async () => [],
+          listExperimentalTools: async () => [],
+          answerPermission: async () => ({}),
+          sendSessionMessage: async () => ({
+            info: { id: 'msg-user-no-assistant' },
+            parts: [],
+          }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => {
+            abortCount += 1
+            return true
+          },
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      reason: 'OpenCode model verification became idle without producing an assistant response',
+      rawStatus: 'idle',
+      durableState: 'reply_pending',
+      latestAssistantText: null,
+    })
+    expect(result.diagnostics).toContain(
+      'OpenCode model verification became idle without producing an assistant response after 3 consecutive observations',
+    )
+    expect(statusCallCount).toBeGreaterThanOrEqual(4)
+    expect(messageCallCount).toBeGreaterThanOrEqual(4)
+    expect(abortCount).toBe(0)
+  })
+
   test('fails fast and aborts when prompt_async never materializes a prompt', async () => {
     let abortCount = 0
     const probe = new OpenCodeExecutionProbe({
@@ -2552,11 +2736,16 @@ describe('OpenCodeExecutionProbe', () => {
           getSession: async () => ({ id: 'session-1' }),
           getSessionStatus: async () => {
             statusCallCount += 1
-            return { 'session-1': statusCallCount < 2 ? 'busy' : 'idle' }
+            return {
+              'session-1':
+                statusCallCount === 4
+                  ? 'busy'
+                  : 'idle',
+            }
           },
           getSessionMessages: async () => {
             messageCallCount += 1
-            if (messageCallCount < 2) {
+            if (messageCallCount < 7) {
               return [
                 {
                   info: {
@@ -2605,8 +2794,8 @@ describe('OpenCodeExecutionProbe', () => {
     })
 
     expect(result.outcome).toBe('available')
-    expect(statusCallCount).toBeGreaterThanOrEqual(2)
-    expect(messageCallCount).toBeGreaterThanOrEqual(2)
+    expect(statusCallCount).toBeGreaterThanOrEqual(7)
+    expect(messageCallCount).toBeGreaterThanOrEqual(7)
   })
 
   test('returns a timeout when OpenCode never produces an assistant reply before the probe deadline', async () => {

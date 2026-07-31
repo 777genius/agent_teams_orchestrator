@@ -10,7 +10,10 @@ import {
   openCodeCursorNativeFailureProbe,
   type OpenCodeCursorNativeProbeResult,
 } from './OpenCodeCursorNativeFailureProbe.js'
-import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
+import {
+  hasCompletedOpenCodeAssistantTurn,
+  openCodeEventTranslator,
+} from './OpenCodeEventTranslator.js'
 import {
   createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
@@ -38,6 +41,7 @@ import type {
   OpenCodeMessage,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeSessionReconcileSummary,
   OpenCodeSessionStatusInput,
 } from './types.js'
 
@@ -55,6 +59,9 @@ const OPEN_CODE_EXECUTION_CLEANUP_SETTLE_MS = 150
 const OPEN_CODE_EXECUTION_PROBE_OUTPUT_TOKEN_LIMIT = 512
 const OPEN_CODE_EXECUTION_PROBE_CONTEXT_TOKEN_LIMIT = 32_000
 const OPEN_CODE_NATIVE_SUBSCRIPTION_PROBE_CONTEXT_TOKEN_LIMIT = 262_144
+// Status and transcript endpoints can settle a poll apart. Three matching idle
+// snapshots keep the normal 500ms poll fast while avoiding a one-snapshot race.
+const OPEN_CODE_EXECUTION_PROBE_IDLE_MISSING_ASSISTANT_CONFIRMATIONS = 3
 const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_DISABLED_ENV =
   'AGENT_TEAMS_OPENCODE_CURSOR_NATIVE_FAILURE_PROBE_DISABLED'
 const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
@@ -123,6 +130,43 @@ function messageMatchesPrompt(message: OpenCodeMessage | null, messageID: string
     && message.info.id === messageID
     && message.info.role === 'user',
   )
+}
+
+function hasCompletedAssistantResponseWithoutText(
+  summary: OpenCodeSessionReconcileSummary,
+): boolean {
+  if (
+    summary.durableState !== 'idle'
+    || !summary.latestAssistantMessageId
+    || summary.replyPendingSinceMessageId
+  ) {
+    return false
+  }
+
+  const latestAssistant = [...summary.messages]
+    .reverse()
+    .find(message => message.id === summary.latestAssistantMessageId)
+  if (!latestAssistant || latestAssistant.role !== 'assistant' || latestAssistant.hasError) {
+    return false
+  }
+
+  return (
+    hasCompletedOpenCodeAssistantTurn(latestAssistant)
+    && latestAssistant.text.trim().length === 0
+  )
+}
+
+function getIdleMissingAssistantMessageId(
+  summary: OpenCodeSessionReconcileSummary,
+): string | null {
+  if (
+    summary.rawStatus !== 'idle'
+    || summary.durableState !== 'reply_pending'
+    || !summary.replyPendingSinceMessageId
+  ) {
+    return null
+  }
+  return summary.replyPendingSinceMessageId
 }
 
 function statusIsRunning(value: unknown): boolean {
@@ -1546,6 +1590,8 @@ export class OpenCodeExecutionProbe {
         let latestAssistantPreview: string | null = null
         let latestToolCallCount = 0
         let latestErrorCount = 0
+        let idleMissingAssistantMessageId: string | null = null
+        let idleMissingAssistantConfirmations = 0
         const finishPollRequestFailure = (
           error: unknown,
           source: 'status' | 'messages',
@@ -1836,6 +1882,18 @@ export class OpenCodeExecutionProbe {
           latestAssistantPreview = summary.latestAssistantPreview
           latestToolCallCount = summary.toolCallCount
           latestErrorCount = summary.errorCount
+          const nextIdleMissingAssistantMessageId =
+            getIdleMissingAssistantMessageId(summary)
+          if (nextIdleMissingAssistantMessageId) {
+            idleMissingAssistantConfirmations =
+              idleMissingAssistantMessageId === nextIdleMissingAssistantMessageId
+                ? idleMissingAssistantConfirmations + 1
+                : 1
+            idleMissingAssistantMessageId = nextIdleMissingAssistantMessageId
+          } else {
+            idleMissingAssistantMessageId = null
+            idleMissingAssistantConfirmations = 0
+          }
 
           // Message reconciliation can infer retrying from provider payloads even
           // when the status endpoint returns a legacy or incomplete value.
@@ -1902,6 +1960,55 @@ export class OpenCodeExecutionProbe {
               latestAssistantPreview: summary.latestAssistantPreview,
               toolCallCount: summary.toolCallCount,
               errorCount: Math.max(1, summary.errorCount),
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+          if (!failureMessage && hasCompletedAssistantResponseWithoutText(summary)) {
+            sessionRequiresCleanup = false
+            const reason = 'OpenCode model verification completed without assistant output'
+            diagnostics.add(reason)
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: 'unknown',
+              reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: summary.rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: summary.errorCount,
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+          if (
+            !failureMessage
+            && idleMissingAssistantConfirmations
+              >= OPEN_CODE_EXECUTION_PROBE_IDLE_MISSING_ASSISTANT_CONFIRMATIONS
+          ) {
+            sessionRequiresCleanup = false
+            const reason =
+              'OpenCode model verification became idle without producing an assistant response'
+            diagnostics.add(
+              `${reason} after ${idleMissingAssistantConfirmations} consecutive observations`,
+            )
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: 'unknown',
+              reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: summary.rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
             })
           }

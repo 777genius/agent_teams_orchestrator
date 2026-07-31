@@ -1422,9 +1422,41 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         'opencode',
         'node_modules',
       )
+      const sharedNodeModulesPath = path.join(
+        firstProfile.xdgCacheHome,
+        'config-node_modules',
+      )
+      const sharedExistingPackagePath = path.join(
+        sharedNodeModulesPath,
+        'existing-shared-package',
+      )
+      await mkdir(sharedExistingPackagePath, { recursive: true })
+      await writeFile(
+        path.join(sharedExistingPackagePath, 'package.json'),
+        '{"source":"shared-cache"}\n',
+        'utf8',
+      )
       await rm(profileNodeModulesPath, { recursive: true, force: true })
-      await mkdir(profileNodeModulesPath, { recursive: true })
-      await writeFile(path.join(profileNodeModulesPath, 'stale.txt'), 'stale directory\n', 'utf8')
+      const manuallyInstalledPackagePath = path.join(
+        profileNodeModulesPath,
+        'manually-installed-package',
+      )
+      await mkdir(manuallyInstalledPackagePath, { recursive: true })
+      await writeFile(
+        path.join(manuallyInstalledPackagePath, 'package.json'),
+        '{"name":"manually-installed-package"}\n',
+        'utf8',
+      )
+      const conflictingProfilePackagePath = path.join(
+        profileNodeModulesPath,
+        'existing-shared-package',
+      )
+      await mkdir(conflictingProfilePackagePath, { recursive: true })
+      await writeFile(
+        path.join(conflictingProfilePackagePath, 'package.json'),
+        '{"source":"profile-directory"}\n',
+        'utf8',
+      )
 
       const repairedProfile = await manager.prepareProfile(projectPath)
       const repairedStat = await lstat(profileNodeModulesPath)
@@ -1433,7 +1465,75 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       expect(repairedProfile.profileRootKey).toBe(firstProfile.profileRootKey)
       expect(repairedStat.isSymbolicLink()).toBe(true)
       expect(path.resolve(path.dirname(profileNodeModulesPath), repairedTarget)).toBe(
-        path.join(repairedProfile.xdgCacheHome, 'config-node_modules'),
+        sharedNodeModulesPath,
+      )
+      expect(
+        await readFile(
+          path.join(sharedNodeModulesPath, 'manually-installed-package', 'package.json'),
+          'utf8',
+        ),
+      ).toBe(
+        '{"name":"manually-installed-package"}\n',
+      )
+      expect(
+        await readFile(
+          path.join(sharedNodeModulesPath, 'existing-shared-package', 'package.json'),
+          'utf8',
+        ),
+      ).toBe('{"source":"shared-cache"}\n')
+    } finally {
+      if (previousDataHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = previousDataHome
+      }
+      if (previousCacheHome === undefined) {
+        delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      } else {
+        process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = previousCacheHome
+      }
+    }
+  })
+
+  test('preserves populated shared config node_modules across profile preparation', async () => {
+    const previousDataHome = process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+    const previousCacheHome = process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+    const appDataHome = path.join(tempDir, 'app-data-preserve-config-modules')
+    const appCacheHome = path.join(tempDir, 'app-cache-preserve-config-modules')
+    const projectPath = path.join(tempDir, 'project-preserve-config-modules')
+    process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = appDataHome
+    process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = appCacheHome
+    try {
+      await mkdir(projectPath, { recursive: true })
+      const manager = new OpenCodeProfileManager()
+      const firstProfile = await manager.prepareProfile(projectPath, {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      })
+      const sharedNodeModulesPath = path.join(
+        firstProfile.xdgCacheHome,
+        'config-node_modules',
+      )
+      const profileNodeModulesPath = path.join(
+        firstProfile.xdgConfigHome,
+        'opencode',
+        'node_modules',
+      )
+      const markerPath = path.join(sharedNodeModulesPath, 'installed-package.marker')
+      await writeFile(markerPath, 'preserve me\n', 'utf8')
+
+      const secondProfile = await manager.prepareProfile(projectPath, {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      })
+      const nodeModulesStat = await lstat(profileNodeModulesPath)
+      const nodeModulesTarget = await readlink(profileNodeModulesPath)
+
+      expect(secondProfile.profileRootKey).toBe(firstProfile.profileRootKey)
+      expect(await readFile(markerPath, 'utf8')).toBe('preserve me\n')
+      expect(nodeModulesStat.isSymbolicLink()).toBe(true)
+      expect(path.resolve(path.dirname(profileNodeModulesPath), nodeModulesTarget)).toBe(
+        sharedNodeModulesPath,
       )
     } finally {
       if (previousDataHome === undefined) {

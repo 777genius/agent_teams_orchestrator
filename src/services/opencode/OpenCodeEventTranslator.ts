@@ -26,7 +26,9 @@ function getLastMessageId(
   return null
 }
 
-function hasCompletedAssistantTurn(message: OpenCodeCanonicalMessage): boolean {
+export function hasCompletedOpenCodeAssistantTurn(
+  message: OpenCodeCanonicalMessage,
+): boolean {
   if (message.role !== 'assistant') {
     return false
   }
@@ -51,7 +53,7 @@ function hasAssistantTurnEvidence(message: OpenCodeCanonicalMessage): boolean {
     return false
   }
   return (
-    hasCompletedAssistantTurn(message) ||
+    hasCompletedOpenCodeAssistantTurn(message) ||
     message.text.length > 0 ||
     message.reasoningText.length > 0 ||
     message.toolCalls.length > 0 ||
@@ -94,7 +96,11 @@ function hasCompletedAssistantResponseForLatestUser(
     return false
   }
 
-  return hasAssistantResponseAfterUser(messages, latestUserIndex, hasCompletedAssistantTurn)
+  return hasAssistantResponseAfterUser(
+    messages,
+    latestUserIndex,
+    hasCompletedOpenCodeAssistantTurn,
+  )
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

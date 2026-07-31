@@ -1,9 +1,21 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmod, lstat, mkdir, readlink, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { constants as fsConstants, type Dirent } from 'node:fs'
+import {
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  readlink,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import type { Dirent } from 'node:fs'
 
 import { getCwd } from '../../utils/cwd.js'
 import { safeParseJSONC } from '../../utils/json.js'
@@ -316,6 +328,77 @@ async function ensureDirectorySymlink(linkPath: string, targetPath: string): Pro
   }
 }
 
+async function copyDirectoryContentsPreservingExisting(
+  sourcePath: string,
+  targetPath: string,
+): Promise<void> {
+  const entries = await readdir(sourcePath, { withFileTypes: true })
+  for (const entry of entries) {
+    const sourceEntry = path.join(sourcePath, entry.name)
+    const targetEntry = path.join(targetPath, entry.name)
+
+    if (entry.isDirectory()) {
+      await mkdir(targetEntry, { recursive: true }).catch(error => {
+        if (getErrnoCode(error) !== 'EEXIST') {
+          throw error
+        }
+      })
+      const targetStat = await lstat(targetEntry).catch(error => {
+        if (getErrnoCode(error) === 'ENOENT') {
+          return null
+        }
+        throw error
+      })
+      if (targetStat?.isDirectory() && !targetStat.isSymbolicLink()) {
+        await copyDirectoryContentsPreservingExisting(sourceEntry, targetEntry)
+      }
+      continue
+    }
+
+    if (entry.isSymbolicLink()) {
+      const linkTarget = await readlink(sourceEntry)
+      await symlink(linkTarget, targetEntry).catch(error => {
+        if (getErrnoCode(error) !== 'EEXIST') {
+          throw error
+        }
+      })
+      continue
+    }
+
+    if (entry.isFile()) {
+      await copyFile(sourceEntry, targetEntry, fsConstants.COPYFILE_EXCL).catch(error => {
+        if (getErrnoCode(error) !== 'EEXIST') {
+          throw error
+        }
+      })
+    }
+  }
+}
+
+async function preserveRealDirectoryContents(
+  sourcePath: string,
+  targetPath: string,
+): Promise<void> {
+  const sourceStat = await lstat(sourcePath).catch(error => {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return null
+    }
+    throw error
+  })
+  if (!sourceStat?.isDirectory() || sourceStat.isSymbolicLink()) {
+    return
+  }
+
+  const migrationLockPath = `${targetPath}.migration-lock`
+  await writeFile(migrationLockPath, '', { flag: 'a' })
+  const release = await lockfile.lock(migrationLockPath, OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS)
+  try {
+    await copyDirectoryContentsPreservingExisting(sourcePath, targetPath)
+  } finally {
+    await release()
+  }
+}
+
 async function ensureDirectorySymlinkUnlocked(
   linkPath: string,
   targetPath: string,
@@ -337,6 +420,7 @@ async function ensureDirectorySymlinkUnlocked(
       }
     }
 
+    await preserveRealDirectoryContents(linkPath, targetPath)
     await rm(linkPath, { recursive: true, force: true }).catch(error => {
       const code = getErrnoCode(error)
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
