@@ -1600,7 +1600,11 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     try {
       await mkdir(projectPath, { recursive: true })
       const manager = new OpenCodeProfileManager()
-      const firstProfile = await manager.prepareProfile(projectPath)
+      const prepareOptions = {
+        includeAppMcp: false,
+        includeManagedSubscriptionPlugins: false,
+      } as const
+      const firstProfile = await manager.prepareProfile(projectPath, prepareOptions)
       const profileNodeModulesPath = path.join(
         firstProfile.xdgConfigHome,
         'opencode',
@@ -1610,7 +1614,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       await mkdir(profileNodeModulesPath, { recursive: true })
 
       const profiles = await Promise.all(
-        Array.from({ length: 8 }, () => manager.prepareProfile(projectPath)),
+        Array.from({ length: 8 }, () => manager.prepareProfile(projectPath, prepareOptions)),
       )
       const repairedStat = await lstat(profileNodeModulesPath)
       const repairedTarget = await readlink(profileNodeModulesPath)
