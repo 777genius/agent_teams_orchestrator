@@ -39,7 +39,8 @@ import { consumeEarlyInput } from '../utils/earlyInput.js';
 import { setMemberActive } from '../utils/swarm/teamHelpers.js';
 import { isSwarmWorker, generateSandboxRequestId, sendSandboxPermissionRequestViaMailbox, sendSandboxPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js';
 import { registerSandboxPermissionCallback } from '../hooks/useSwarmPermissionPoller.js';
-import { getTeamName, getAgentName } from '../utils/teammate.js';
+import { getTeamName, getAgentName, isTeammate } from '../utils/teammate.js';
+import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV } from '../utils/swarm/teammateRuntimeEvents.js';
 import { WorkerPendingPermission } from '../components/permissions/WorkerPendingPermission.js';
 import { injectUserMessageToTeammate, getAllInProcessTeammateTasks } from '../tasks/InProcessTeammateTask/InProcessTeammateTask.js';
 import { isLocalAgentTask, queuePendingMessage, appendMessageToLocalAgent, type LocalAgentTaskState } from '../tasks/LocalAgentTask/LocalAgentTask.js';
@@ -139,7 +140,7 @@ import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_ST
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
-import { handlePromptSubmit, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
+import { handlePromptSubmit, isPromptSubmissionDeferred, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
 import { useQueueProcessor } from '../hooks/useQueueProcessor.js';
 import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
@@ -916,6 +917,23 @@ export function REPL({
   // Subscribe to the guard — true during dispatching or running.
   // This is the single source of truth for "is a local query in flight".
   const isQueryActive = React.useSyncExternalStore(queryGuard.subscribe, queryGuard.getSnapshot);
+
+  // A launched process/tmux teammate must complete its private bootstrap turn
+  // before any ordinary prompt source can start work. The parent writes the
+  // bootstrap mailbox row only after runtime_ready, so mailbox/task/tick/bridge
+  // traffic can otherwise win that startup race and make bootstrap submission
+  // fail with query_active.
+  const requiresBootstrapAdmission =
+    isTeammate() &&
+    Boolean(process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim());
+  const bootstrapAdmissionPendingRef = useRef(requiresBootstrapAdmission);
+  const [isBootstrapAdmissionPending, setIsBootstrapAdmissionPending] =
+    useState(requiresBootstrapAdmission);
+  const confirmBootstrapAdmission = useCallback(() => {
+    if (!bootstrapAdmissionPendingRef.current) return;
+    bootstrapAdmissionPendingRef.current = false;
+    setIsBootstrapAdmissionPending(false);
+  }, []);
 
   // Separate loading flag for operations outside the local query guard:
   // remote sessions (useRemoteSession / useDirectConnect) and foregrounded
@@ -3062,7 +3080,12 @@ export function REPL({
   const initialMessageRef = useRef(false);
   useEffect(() => {
     const pending = initialMessage;
-    if (!pending || isLoading || initialMessageRef.current) return;
+    if (
+      !pending ||
+      isLoading ||
+      isBootstrapAdmissionPending ||
+      initialMessageRef.current
+    ) return;
 
     // Mark as processing to prevent re-entry
     initialMessageRef.current = true;
@@ -3172,7 +3195,7 @@ export function REPL({
       }, 100, initialMessageRef);
     }
     void processInitialMessage(pending);
-  }, [initialMessage, isLoading, setMessages, setAppState, onQuery, mainLoopModel, tools]);
+  }, [initialMessage, isLoading, isBootstrapAdmissionPending, setMessages, setAppState, onQuery, mainLoopModel, tools]);
   const onSubmit = useCallback(async (input: string, helpers: PromptInputHelpers, speculationAccept?: {
     state: ActiveSpeculationState;
     speculationSessionTimeSavedMs: number;
@@ -3359,22 +3382,25 @@ export function REPL({
       }
     }
 
-    // Restore stash if present, but NOT for slash commands or when loading.
+    // Restore stash if present, but NOT for slash commands or while submission
+    // is deferred by an active query/external load/bootstrap admission.
     // - Slash commands (especially interactive ones like /model, /context) hide
     //   the prompt and show a picker UI. Restoring the stash during a command would
     //   place the text in a hidden input, and the user would lose it by typing the
     //   next command. Instead, preserve the stash so it survives across command runs.
-    // - When loading, the submitted input will be queued and handlePromptSubmit
-    //   will clear the input field (onInputChange('')), which would clobber the
-    //   restored stash. Defer restoration to after handlePromptSubmit (below).
+    // - When deferred, the submitted input will be queued and
+    //   handlePromptSubmit will clear the input field (onInputChange('')),
+    //   which would clobber the restored stash. Defer restoration until after
+    //   handlePromptSubmit (below).
     //   Remote mode is exempt: it sends via WebSocket and returns early without
     //   calling handlePromptSubmit, so there's no clobbering risk — restore eagerly.
     // In both deferred cases, the stash is restored after await handlePromptSubmit.
     const isSlashCommand = !speculationAccept && input.trim().startsWith('/');
-    // Submit runs "now" (not queued) when not already loading, or when
-    // accepting speculation, or in remote mode (which sends via WS and
-    // returns early without calling handlePromptSubmit).
-    const submitsNow = !isLoading || speculationAccept || activeRemote.isRemoteMode;
+    const isSubmissionDeferred = isPromptSubmissionDeferred(isLoading, isBootstrapAdmissionPending);
+    // Submit runs "now" (not queued) when not deferred, or when accepting
+    // speculation, or in remote mode (which sends via WS and returns early
+    // without calling handlePromptSubmit).
+    const submitsNow = !isSubmissionDeferred || speculationAccept || activeRemote.isRemoteMode;
     if (stashedPrompt !== undefined && !isSlashCommand && submitsNow) {
       setInputValue(stashedPrompt.text);
       helpers.setCursorOffset(stashedPrompt.cursorOffset);
@@ -3526,6 +3552,7 @@ export function REPL({
       helpers,
       queryGuard,
       isExternalLoading,
+      isBootstrapAdmissionPending,
       mode: inputMode,
       commands,
       onInputChange: setInputValue,
@@ -3556,9 +3583,9 @@ export function REPL({
     // - Slash command: handlePromptSubmit awaited the full command execution
     //   (including interactive pickers). Restoring now places the stash back in
     //   the visible input.
-    // - Loading (queued): handlePromptSubmit enqueued + cleared input, then
+    // - Deferred (queued): handlePromptSubmit enqueued + cleared input, then
     //   returned quickly. Restoring now places the stash back after the clear.
-    if ((isSlashCommand || isLoading) && stashedPrompt !== undefined) {
+    if ((isSlashCommand || isSubmissionDeferred) && stashedPrompt !== undefined) {
       setInputValue(stashedPrompt.text);
       helpers.setCursorOffset(stashedPrompt.cursorOffset);
       setPastedContents(stashedPrompt.pastedContents);
@@ -3568,7 +3595,7 @@ export function REPL({
   // isLoading is read at the !isLoading checks above for input-clearing
   // and submitCount gating. It's derived from isQueryActive || isExternalLoading,
   // so including it here ensures the closure captures the fresh value.
-  isLoading, isExternalLoading, inputMode, commands, setInputValue, setInputMode, setPastedContents, setSubmitCount, setIDESelection, setToolJSX, getToolUseContext,
+  isLoading, isExternalLoading, isBootstrapAdmissionPending, inputMode, commands, setInputValue, setInputMode, setPastedContents, setSubmitCount, setIDESelection, setToolJSX, getToolUseContext,
   // messages is read via messagesRef.current inside the callback to
   // keep onSubmit stable across message updates (see L2384/L2400/L2662).
   // Without this, each setMessages call (~30× per turn) recreates
@@ -3923,6 +3950,7 @@ export function REPL({
   useQueueProcessor({
     executeQueuedInput,
     hasActiveLocalJsxUI: isShowingLocalJSXCommand,
+    isBootstrapAdmissionPending,
     queryGuard
   });
 
@@ -4036,10 +4064,11 @@ export function REPL({
     const commandQueueModes = Array.from(new Set(commandQueue.map(cmd => String(cmd.mode ?? 'unknown'))));
     const decision = decideIncomingPromptAdmission({
       submissionKind: options?.submissionKind ?? 'runtime_delivery',
+      bootstrapAdmissionPending: bootstrapAdmissionPendingRef.current,
       queryGuardStatus: queryGuard.status,
       blockingQueueModes: getBlockingIncomingPromptQueueModes(commandQueueModes),
     });
-    if (!decision.accepted) {
+    if (decision.accepted === false) {
       return {
         accepted: false,
         rejectionReason: decision.rejectionReason,
@@ -4107,6 +4136,7 @@ export function REPL({
     onSubmitMessage: handleIncomingPrompt,
     getNativeAppManagedBootstrapContextInjection,
     onAgentErrorNotification: handleAgentErrorNotification,
+    onBootstrapConfirmed: confirmBootstrapAdmission,
     transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
   });
   useTeammateStartupReadySentinel({
@@ -4115,7 +4145,7 @@ export function REPL({
     sessionId: getSessionId()
   });
   useMailboxBridge({
-    isLoading,
+    isLoading: isLoading || isBootstrapAdmissionPending,
     onSubmitMessage: handleIncomingPrompt
   });
 
@@ -4130,7 +4160,7 @@ export function REPL({
     const assistantMode = store.getState().kairosEnabled;
     // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
     useScheduledTasks!({
-      isLoading,
+      isLoading: isLoading || isBootstrapAdmissionPending,
       assistantMode,
       setMessages
     });
@@ -4146,7 +4176,7 @@ export function REPL({
     // biome-ignore lint/correctness/useHookAtTopLevel: conditional for dead code elimination in external builds
     useTaskListWatcher({
       taskListId,
-      isLoading,
+      isLoading: isLoading || isBootstrapAdmissionPending,
       onSubmitTask: (prompt: string) => handleIncomingPrompt(prompt, {
         submissionKind: 'task'
       })
@@ -4159,7 +4189,7 @@ export function REPL({
       // Suppress ticks while an initial message is pending — the initial
       // message will be processed asynchronously and a premature tick would
       // race with it, causing concurrent-query enqueue of expanded skill text.
-      isLoading: isLoading || initialMessage !== null,
+      isLoading: isLoading || isBootstrapAdmissionPending || initialMessage !== null,
       queuedCommandsLength: queuedCommands.length,
       hasActiveLocalJsxUI: isShowingLocalJSXCommand,
       isInPlanMode: toolPermissionContext.mode === 'plan',

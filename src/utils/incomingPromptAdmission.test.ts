@@ -10,6 +10,7 @@ describe('incoming prompt admission', () => {
     expect(
       decideIncomingPromptAdmission({
         submissionKind: 'bootstrap',
+        bootstrapAdmissionPending: true,
         queryGuardStatus: 'idle',
         blockingQueueModes: ['prompt'],
       }),
@@ -20,6 +21,7 @@ describe('incoming prompt admission', () => {
     expect(
       decideIncomingPromptAdmission({
         submissionKind: 'bootstrap',
+        bootstrapAdmissionPending: true,
         queryGuardStatus: 'idle',
         blockingQueueModes: ['bash'],
       }),
@@ -30,6 +32,7 @@ describe('incoming prompt admission', () => {
     expect(
       decideIncomingPromptAdmission({
         submissionKind: 'bootstrap',
+        bootstrapAdmissionPending: true,
         queryGuardStatus: 'running',
         blockingQueueModes: [],
       }),
@@ -44,6 +47,7 @@ describe('incoming prompt admission', () => {
     expect(
       decideIncomingPromptAdmission({
         submissionKind: 'bootstrap',
+        bootstrapAdmissionPending: true,
         queryGuardStatus: 'dispatching',
         blockingQueueModes: [],
       }),
@@ -59,6 +63,7 @@ describe('incoming prompt admission', () => {
       expect(
         decideIncomingPromptAdmission({
           submissionKind,
+          bootstrapAdmissionPending: false,
           queryGuardStatus: 'idle',
           blockingQueueModes: ['prompt', 'bash'],
         }),
@@ -74,6 +79,7 @@ describe('incoming prompt admission', () => {
     expect(
       decideIncomingPromptAdmission({
         submissionKind: 'runtime_delivery',
+        bootstrapAdmissionPending: false,
         queryGuardStatus: 'idle',
         blockingQueueModes: [],
       }),
@@ -89,5 +95,37 @@ describe('incoming prompt admission', () => {
         'bash',
       ]),
     ).toEqual(['prompt', 'bash'])
+  })
+
+  test('blocks every non-bootstrap prompt source while bootstrap admission is pending', () => {
+    for (const submissionKind of ['runtime_delivery', 'mailbox', 'task', 'tick'] as const) {
+      expect(
+        decideIncomingPromptAdmission({
+          submissionKind,
+          bootstrapAdmissionPending: true,
+          queryGuardStatus: 'idle',
+          blockingQueueModes: [],
+        }),
+      ).toEqual({
+        accepted: false,
+        rejectionReason: 'bootstrap_pending',
+        retryable: true,
+      })
+    }
+  })
+
+  test('reports bootstrap_pending before transient query or queue state', () => {
+    expect(
+      decideIncomingPromptAdmission({
+        submissionKind: 'mailbox',
+        bootstrapAdmissionPending: true,
+        queryGuardStatus: 'running',
+        blockingQueueModes: ['prompt'],
+      }),
+    ).toEqual({
+      accepted: false,
+      rejectionReason: 'bootstrap_pending',
+      retryable: true,
+    })
   })
 })

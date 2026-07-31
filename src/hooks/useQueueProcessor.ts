@@ -10,6 +10,7 @@ import { processQueueIfReady } from '../utils/queueProcessor.js'
 type UseQueueProcessorParams = {
   executeQueuedInput: (commands: QueuedCommand[]) => Promise<void>
   hasActiveLocalJsxUI: boolean
+  isBootstrapAdmissionPending: boolean
   queryGuard: QueryGuard
 }
 
@@ -21,6 +22,7 @@ type UseQueueProcessorParams = {
  * The dequeue() function handles priority ordering automatically.
  *
  * Processing triggers when:
+ * - Bootstrap admission is no longer pending
  * - No query active (queryGuard — reactive via useSyncExternalStore)
  * - Queue has items
  * - No active local JSX UI blocking input
@@ -28,6 +30,7 @@ type UseQueueProcessorParams = {
 export function useQueueProcessor({
   executeQueuedInput,
   hasActiveLocalJsxUI,
+  isBootstrapAdmissionPending,
   queryGuard,
 }: UseQueueProcessorParams): void {
   // Subscribe to the query guard. Re-renders when a query starts or ends
@@ -57,9 +60,13 @@ export function useQueueProcessor({
     // snapshot change), isQueryActive is already true (dispatching) and the
     // guard above returns early. handlePromptSubmit's finally releases the
     // reservation via cancelReservation() (no-op if onQuery already ran end()).
-    processQueueIfReady({ executeInput: executeQueuedInput })
+    processQueueIfReady({
+      executeInput: executeQueuedInput,
+      isBootstrapAdmissionPending,
+    })
   }, [
     queueSnapshot,
+    isBootstrapAdmissionPending,
     isQueryActive,
     executeQueuedInput,
     hasActiveLocalJsxUI,
