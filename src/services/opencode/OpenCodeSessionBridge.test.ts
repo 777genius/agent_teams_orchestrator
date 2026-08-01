@@ -1794,7 +1794,7 @@ describe('OpenCodeSessionBridge', () => {
           getSessionStatus: async () => ({}),
           getSessionMessages: async () => [
             {
-              info: { id: 'msg_fabc1234fabc1234fabc1234fabc1234', role: 'user' },
+              info: { id: 'msg_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', role: 'user' },
               parts: [],
             },
           ],

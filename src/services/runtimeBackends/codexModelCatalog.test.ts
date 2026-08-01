@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events'
 import readline from 'node:readline'
 import { PassThrough } from 'node:stream'
 
+import { DEFAULT_CODEX_MODEL } from '../../utils/model/codex.js'
 import {
   clearCodexRuntimeModelCatalogCacheForTesting,
   getCodexRuntimeModelCatalog,
@@ -157,7 +158,7 @@ describe('Codex app-server model catalog loader', () => {
     expect(catalog.status).toBe('unavailable')
     expect(catalog.diagnostics.appServerState).toBe('runtime-missing')
     expect(catalog.models.map(model => model.id)).toContain('gpt-5.5')
-    expect(catalog.defaultLaunchModel).toBe('gpt-5.4')
+    expect(catalog.defaultLaunchModel).toBe(DEFAULT_CODEX_MODEL)
   })
 
   test('falls back when model/list is not supported by the installed app-server', async () => {
