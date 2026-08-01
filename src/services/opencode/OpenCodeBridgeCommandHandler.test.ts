@@ -687,6 +687,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.ok).toBe(true)
     expect(result.data.server.bridgeProtocol.opencodeTaskLedgerEvidenceContractVersion).toBe(1)
     expect(result.data.server.bridgeProtocol.opencodeDeliveryAcceptanceContractVersion).toBe(2)
+    expect(result.data.server.bridgeProtocol.opencodeFilePartsContractVersion).toBe(2)
   })
 
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
@@ -6156,6 +6157,105 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(result.data.accepted).toBe(true)
     expect(result.data.sessionId).toBe('session-bob')
     expect(result.data.runtimePid).toBe(789)
+  })
+
+  test.each([
+    ['video/mp4', 'clip.mp4'],
+    ['video/webm', 'clip.webm'],
+    ['video/quicktime', 'clip.mov'],
+  ])('accepts %s file parts and forwards them to OpenCode', async (mime, filename) => {
+    const promptParts: unknown[] = []
+    const record = buildRecord({
+      laneId: 'secondary:opencode:bob',
+      memberName: 'bob',
+      opencodeSessionId: 'session-bob',
+      runtimePid: 456,
+    })
+    openCodeSessionStore.get = (async () => record) as typeof openCodeSessionStore.get
+    openCodeSessionBridge.promptAsync = (async (_sessionRecord, input) => {
+      promptParts.push(input.parts)
+    }) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async sessionRecord => ({
+      record: sessionRecord,
+      summary: buildReconcileSummary(),
+    })) as typeof openCodeSessionBridge.reconcileSession
+
+    const filePart = {
+      type: 'file',
+      mime,
+      url: `data:${mime};base64,AAAA`,
+      filename,
+    }
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'review this video',
+        fileParts: [filePart],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(promptParts).toEqual([[filePart]])
+  })
+
+  test('rejects unsupported video file parts before OpenCode delivery', async () => {
+    let promptCalled = false
+    openCodeSessionBridge.promptAsync = (async () => {
+      promptCalled = true
+    }) as typeof openCodeSessionBridge.promptAsync
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'review this video',
+        fileParts: [{
+          type: 'file',
+          mime: 'video/mp2t',
+          url: 'data:video/mp2t;base64,AAAA',
+          filename: 'clip.ts',
+        }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('unsupported MIME: video/mp2t')
+    expect(promptCalled).toBe(false)
+  })
+
+  test('requires video file parts to use a matching data URL', async () => {
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.sendMessage', {
+        teamId: 'team-a',
+        teamName: 'team-a',
+        laneId: 'secondary:opencode:bob',
+        memberName: 'bob',
+        projectPath: '/tmp/project',
+        text: 'review this video',
+        fileParts: [{
+          type: 'file',
+          mime: 'video/mp4',
+          url: 'data:video/webm;base64,AAAA',
+          filename: 'clip.mp4',
+        }],
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      return
+    }
+    expect(result.error.message).toContain('must use a matching data URL')
   })
 
   test('sends a message without provisioning a readiness host first', async () => {

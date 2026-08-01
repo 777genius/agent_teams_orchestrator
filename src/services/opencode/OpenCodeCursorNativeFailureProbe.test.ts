@@ -79,12 +79,23 @@ describe('OpenCodeCursorNativeFailureProbe', () => {
     })
 
     expect(spawnedCommand).toBe(env.CURSOR_AGENT_EXECUTABLE)
-    expect(spawnedArgs).toContain('--print')
-    expect(spawnedArgs).toContain('--trust')
-    expect(spawnedArgs).toContain('ask')
-    expect(spawnedArgs).toContain('auto')
+    expect(spawnedArgs).toEqual([
+      '--print',
+      '--output-format',
+      'stream-json',
+      '--stream-partial-output',
+      '--trust',
+      '--mode',
+      'ask',
+      '--workspace',
+      '/sandbox/project',
+      '--model',
+      'auto',
+    ])
     expect(spawnedOptions?.cwd).toBe('/sandbox/project')
     expect(spawnedOptions?.env).toBe(env)
+    expect(spawnedOptions?.windowsHide).toBe(true)
+    expect(spawnedOptions?.stdio).toEqual(['pipe', 'pipe', 'pipe'])
     expect(prompt).toBe('Output only the single word PONG.')
     expect(result).toEqual({
       outcome: 'failure',

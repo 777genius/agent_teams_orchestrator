@@ -580,6 +580,24 @@ describe('OpenCodeMcpManager', () => {
     expect(result.config.environment?.OPENCODE_SERVER_PASSWORD).toBeUndefined()
   })
 
+  test('uses the runtime Node fallback when the app forwards only a packaged MCP entry', async () => {
+    const entry = path.resolve('/tmp/agent-teams-mcp.js')
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: entry,
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.source).toBe('env-override')
+    expect(result.config).toMatchObject({
+      type: 'local',
+      command: [Bun.which('node') ?? 'node', entry],
+      enabled: true,
+      timeout: 30000,
+    })
+  })
+
   test('adds the real user Claude root to local MCP launch config when env omits it', async () => {
     const userHome = path.join(path.parse(process.cwd()).root, 'opencode-test-home')
     const result = await resolveOpenCodeAppMcpLaunchConfig({
