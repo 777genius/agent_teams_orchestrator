@@ -153,6 +153,11 @@ jobs:
             platform: win32-x64
             archive_name: agent-teams-runtime-win32-x64.zip
             binary_name: claude-multimodel.exe
+          - runner: windows-2022
+            platform: win32-arm64
+            archive_name: agent-teams-runtime-win32-arm64.zip
+            binary_name: claude-multimodel.exe
+            compile_target: bun-windows-arm64
           - runner: macos-14
             platform: darwin-arm64
             archive_name: agent-teams-runtime-darwin-arm64.tar.gz
@@ -174,9 +179,16 @@ jobs:
           bun-version: 1.3.11
 
       - name: Install dependencies
+        if: matrix.platform != 'win32-arm64'
         run: bun install --frozen-lockfile
 
+      - name: Install Windows ARM64 dependencies
+        if: matrix.platform == 'win32-arm64'
+        run: bun install --frozen-lockfile --os=win32 --cpu=arm64
+
       - name: Compile runtime
+        env:
+          BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
         run: bun run compile
 
       - name: Verify compiled runtime
@@ -194,7 +206,7 @@ jobs:
           ./dist/cli --version
 
       - name: Verify compiled runtime (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         env:
           EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: pwsh
@@ -205,6 +217,26 @@ jobs:
           }
           .\dist\cli.exe --version
           node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
+
+      - name: Verify compiled Windows architecture
+        if: runner.os == 'Windows'
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = @("dist/cli.exe", "dist/cli") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $binary) {
+            throw "Compiled runtime binary not found"
+          }
+
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expectedMachine = if ($env:EXPECTED_PLATFORM -eq "win32-arm64") { 0xaa64 } else { 0x8664 }
+          if ($machine -ne $expectedMachine) {
+            throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
+          }
 
       - name: Package runtime archive
         if: runner.os != 'Windows'
@@ -337,8 +369,8 @@ jobs:
 
           find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
             | sort > expected-assets.txt
-          if [[ "$(wc -l < expected-assets.txt)" -ne 6 ]]; then
-            echo "Expected exactly six runtime release assets" >&2
+          if [[ "$(wc -l < expected-assets.txt)" -ne 7 ]]; then
+            echo "Expected exactly seven runtime release assets" >&2
             cat expected-assets.txt >&2
             exit 1
           fi
@@ -450,6 +482,7 @@ jobs:
           agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz
           agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz
           agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json
+          agent-teams-runtime-win32-arm64-v${RUNTIME_VERSION}.zip
           agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip
           EOF
           jq -r '.assets[].name' <<<"$release_json" | sort > actual-assets.txt

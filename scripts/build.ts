@@ -19,6 +19,21 @@ const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() a
 const args = process.argv.slice(2)
 const compile = args.includes('--compile')
 const dev = args.includes('--dev')
+const compileTarget = process.env.BUN_COMPILE_TARGET?.trim() || 'bun'
+
+const supportedCompileTargets = new Set([
+  'bun',
+  'bun-darwin-arm64',
+  'bun-darwin-x64',
+  'bun-linux-arm64',
+  'bun-linux-x64',
+  'bun-windows-arm64',
+  'bun-windows-x64',
+])
+
+if (!supportedCompileTargets.has(compileTarget)) {
+  throw new Error(`Unsupported BUN_COMPILE_TARGET: ${compileTarget}`)
+}
 
 const fullExperimentalFeatures = [
   'AGENT_MEMORY_SNAPSHOT',
@@ -384,7 +399,7 @@ if (compile) {
     './src/entrypoints/cli.tsx',
     '--compile',
     '--target',
-    'bun',
+    compileTarget,
     '--format',
     'esm',
     '--outfile',

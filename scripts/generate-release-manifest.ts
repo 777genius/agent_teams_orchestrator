@@ -44,6 +44,12 @@ const assets: AssetDescriptor[] = [
     binaryName: 'claude-multimodel',
   },
   {
+    platform: 'win32-arm64',
+    file: `agent-teams-runtime-win32-arm64-v${runtimeVersion}.zip`,
+    archiveKind: 'zip',
+    binaryName: 'claude-multimodel.exe',
+  },
+  {
     platform: 'win32-x64',
     file: `agent-teams-runtime-win32-x64-v${runtimeVersion}.zip`,
     archiveKind: 'zip',
