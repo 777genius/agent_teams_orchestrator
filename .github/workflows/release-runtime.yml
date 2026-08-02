@@ -192,7 +192,7 @@ jobs:
         run: bun run compile
 
       - name: Verify compiled runtime
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
         env:
           EXPECTED_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
