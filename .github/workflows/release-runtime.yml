@@ -153,7 +153,7 @@ jobs:
             platform: win32-x64
             archive_name: agent-teams-runtime-win32-x64.zip
             binary_name: claude-multimodel.exe
-          - runner: windows-2022
+          - runner: ubuntu-24.04
             platform: win32-arm64
             archive_name: agent-teams-runtime-win32-arm64.zip
             binary_name: claude-multimodel.exe
@@ -219,7 +219,7 @@ jobs:
           node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe
 
       - name: Verify compiled Windows architecture
-        if: runner.os == 'Windows'
+        if: matrix.platform == 'win32-x64'
         env:
           EXPECTED_PLATFORM: ${{ matrix.platform }}
         shell: pwsh
@@ -238,8 +238,17 @@ jobs:
             throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
           }
 
+      - name: Verify cross-compiled Windows ARM64 architecture
+        if: matrix.platform == 'win32-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_metadata="$(file dist/cli.exe)"
+          echo "$binary_metadata"
+          grep -Fq 'Aarch64' <<<"$binary_metadata"
+
       - name: Package runtime archive
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
         env:
           RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
         shell: bash
@@ -263,6 +272,23 @@ jobs:
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
+
+      - name: Package cross-compiled Windows ARM64 runtime archive
+        if: matrix.platform == 'win32-arm64'
+        env:
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_version="${RAW_RUNTIME_VERSION#v}"
+          runtime_commit="$(git rev-parse HEAD)"
+
+          rm -rf release
+          mkdir -p release/runtime
+          cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
+          printf '%s\n' "$runtime_version" > release/runtime/VERSION
+          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
