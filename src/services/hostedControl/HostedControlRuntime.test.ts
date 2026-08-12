@@ -2,9 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { connect, type Socket } from 'node:net'
 import { join } from 'node:path'
-import { createHostedControlProof, createHostedDomainProof } from './ownerProof.js'
+import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
 import { fingerprintHostedTaskCommand, type HostedTaskMutationCommand } from './protocol.js'
 import { HostedControlRuntime, type HostedControlRuntimePortFactoryContext } from './HostedControlRuntime.js'
+import { createHostedLifecycleOwnerIdentityChecksum } from './HostedControlDispatcher.js'
 import {
   HOSTED_LIFECYCLE_PROOF_DOMAIN,
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
@@ -158,6 +159,10 @@ describe('HostedControlRuntime', () => {
       bootId: 'wrong-boot',
     })).toBe(false)
 
+    const ownerEffectFence = {
+      grantRevision: '1'.repeat(64),
+      identityChecksum: createHostedLifecycleOwnerIdentityChecksum(ownerBinding, portContext.authority),
+    }
     const lifecyclePayload = {
       request: { schemaVersion: 1, workspaceId: 'workspace_test', teamId },
       context: {
@@ -177,16 +182,24 @@ describe('HostedControlRuntime', () => {
         restoreGeneration: 0,
         bootId: 'boot_test',
         resourceRevision: null,
+        mountGeneration: 1,
+        ownerEffectFence,
       },
     }
     const lifecycleUnsigned = {
       schemaVersion: 2,
       exchangeId: `lifecycle-request_${'d'.repeat(32)}`,
       operation: 'control_state',
+      provenance: {
+        from: { kind: 'controller', deploymentId: 'deployment_test', bootId: 'boot_test', actorId: 'actor_lifecycle', sessionId: 'session_test' },
+        to: { kind: 'owner', ownerAuthority: ownerBinding.ownerAuthority, ownerGeneration: ownerBinding.ownerGeneration, ownerSessionId: ownerBinding.ownerSessionId },
+        target: { capability: 'hosted-lifecycle-command', exchangeId: `lifecycle-request_${'d'.repeat(32)}`, operation: 'control_state', workspaceId: 'workspace_test', teamId },
+      },
       ownerBinding,
+      ownerEffectFence,
       payload: lifecyclePayload,
     }
-    const lifecycleLine = await exchange(socketPath, signedDomainLine(
+    const lifecycleLine = await exchange(socketPath, signedRawDomainLine(
       secret,
       HOSTED_LIFECYCLE_PROOF_DOMAIN,
       lifecycleUnsigned,
@@ -270,7 +283,7 @@ describe('HostedControlRuntime', () => {
     }
     expect(await server.hasActiveLease()).toBe(false)
     expect(await portContext.isCurrentAuthority({ actorId: 'actor-context', ...portContext.authority })).toBe(false)
-    expect(await exchange(socketPath, signedDomainLine(
+    expect(await exchange(socketPath, signedRawDomainLine(
       secret,
       HOSTED_LIFECYCLE_PROOF_DOMAIN,
       lifecycleUnsigned,
@@ -307,6 +320,16 @@ function signedDomainLine(
     ...unsigned,
     ownerProof: createHostedDomainProof(secret, domain, 'request', unsigned),
   })}\n`
+}
+
+function signedRawDomainLine(
+  secret: Uint8Array,
+  domain: string,
+  unsigned: Record<string, unknown>,
+): string {
+  const serialized = JSON.stringify(unsigned)
+  const proof = createHostedRawDomainProof(secret, domain, 'request', serialized)
+  return `${serialized.slice(0, -1)},"ownerProof":"${proof}"}\n`
 }
 
 function openReadiness(

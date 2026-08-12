@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   HostedLifecycleCommandService,
   type HostedLifecycleAuthorityEffectPort,
@@ -13,6 +14,8 @@ const authority: HostedLifecycleAuthority = {
   restoreGeneration: 2,
   bootId: 'boot-a',
   resourceRevision: 'revision_1',
+  mountGeneration: 1,
+  ownerEffectFence: { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) },
 }
 const command = {
   schemaVersion: 1,
@@ -42,6 +45,22 @@ const authorization = {
   workspaceId: authority.workspaceId,
   teamId: authority.teamId,
   restoreGeneration: authority.restoreGeneration,
+  mountGeneration: authority.mountGeneration,
+  ownerEffectFence: authority.ownerEffectFence,
+}
+const durableCommand = {
+  schemaVersion: 1,
+  commandFingerprint: {
+    algorithm: 'sha256', version: 1,
+    digest: createHash('sha256').update(JSON.stringify([
+      'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+      command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+      command.expectedRevision, null, authority.ownerEffectFence.grantRevision,
+      authority.ownerEffectFence.identityChecksum,
+    ])).digest('hex'),
+  },
+  idempotency: { deploymentId: authority.deploymentId, actorId: authority.actorId, action: command.action, idempotencyKey: command.idempotencyKey },
+  resource: { bootId: authority.bootId, workspaceId: authority.workspaceId, teamId: authority.teamId, runId: null, expectedRevision: command.expectedRevision, restoreGeneration: authority.restoreGeneration, mountGeneration: authority.mountGeneration, ownerEffectFence: authority.ownerEffectFence },
 }
 
 function effects(overrides: Partial<HostedLifecycleAuthorityEffectPort> = {}) {
@@ -107,6 +126,36 @@ describe('HostedLifecycleCommandService', () => {
     })
   })
 
+  test('supports canonical prepare and get_status while retaining prototype aliases', async () => {
+    const fixture = effects({
+      prepareProvisioning: async () => ({
+        schemaVersion: 1, kind: 'prepared', workspaceId: authority.workspaceId, teamId: authority.teamId,
+        deploymentId: authority.deploymentId, bootId: authority.bootId, runId: null,
+        resourceRevision: 'revision_1', availableActions: ['launch'],
+        lanes: [{ laneKey: `owner:${authority.teamId}`, backend: 'opencode', status: 'ready' }],
+      }),
+      getProvisioningStatus: async () => ({
+        schemaVersion: 1, kind: 'provisioning_status', workspaceId: authority.workspaceId, teamId: authority.teamId,
+        deploymentId: authority.deploymentId, bootId: authority.bootId, runId: null,
+        resourceRevision: 'revision_1', availableActions: ['launch'], recentCommands: [],
+      }),
+    })
+    const service = new HostedLifecycleCommandService(fixture.value, { isCurrent: () => true }, () => 1)
+    const payload = {
+      request: { schemaVersion: 1, workspaceId: authority.workspaceId, teamId: authority.teamId },
+      context, authority,
+    }
+    await expect(service.dispatch({ operation: 'prepare', payload, authority })).resolves.toMatchObject({
+      payload: { kind: 'prepared' }, resourceRevision: 'revision_1',
+    })
+    await expect(service.dispatch({ operation: 'get_status', payload, authority })).resolves.toMatchObject({
+      payload: { kind: 'status', recentCommands: [] }, resourceRevision: 'revision_1',
+    })
+    await expect(service.dispatch({ operation: 'get_provisioning_status', payload, authority })).resolves.toMatchObject({
+      payload: { kind: 'provisioning_status' }, resourceRevision: 'revision_1',
+    })
+  })
+
   test('revalidates immediately before execute and performs no effect for a stale grant', async () => {
     const fixture = effects({
       revalidate: async () => ({
@@ -116,7 +165,7 @@ describe('HostedLifecycleCommandService', () => {
     const service = new HostedLifecycleCommandService(fixture.value, { isCurrent: () => true }, () => 1)
     await expect(service.dispatch({
       operation: 'execute',
-      payload: { command, authorization, context, authority },
+      payload: { command, authorization, durableCommand, context, authority },
       authority,
     })).resolves.toEqual({
       payload: { schemaVersion: 2, kind: 'unavailable', retryAfterMs: null },
@@ -130,10 +179,10 @@ describe('HostedLifecycleCommandService', () => {
     const service = new HostedLifecycleCommandService(fixture.value, { isCurrent: () => true }, () => 1)
     const result = await service.dispatch({
       operation: 'execute',
-      payload: { command, authorization, context, authority },
+      payload: { command, authorization, durableCommand, context, authority },
       authority,
     })
-    expect(result.payload.kind).toBe('result')
+    expect(result.payload).toMatchObject({ kind: 'settled', durableCommand })
     expect(result.resourceRevision).toBe('revision_1')
     expect(fixture.executions()).toBe(1)
   })
@@ -146,8 +195,8 @@ describe('HostedLifecycleCommandService', () => {
       payload: { command, authorization, context, authority },
       authority,
     })).resolves.toEqual({
-      payload: { schemaVersion: 2, kind: 'released' },
-      resourceRevision: null,
+      payload: { schemaVersion: 2, kind: 'released', authorization },
+      resourceRevision: 'revision_1',
     })
     expect(fixture.releases()).toBe(1)
   })
@@ -221,12 +270,12 @@ describe('HostedLifecycleCommandService', () => {
 
   test('preserves conflict and idempotent result decisions from the sole authority', async () => {
     const conflictFixture = effects({
-      authorize: async () => ({ kind: 'conflict', reason: 'idempotency_conflict', currentRevision: 'revision_1' }),
+      authorize: async () => ({ kind: 'conflict', reason: 'idempotency_mismatch', currentRevision: 'revision_1' }),
     })
     const service = new HostedLifecycleCommandService(conflictFixture.value, { isCurrent: () => true }, () => 1)
     const result = await service.dispatch({ operation: 'authorize', payload: { command, context, authority }, authority })
     expect(result).toEqual({
-      payload: { schemaVersion: 2, kind: 'conflict', reason: 'idempotency_conflict', currentRevision: 'revision_1' },
+      payload: { schemaVersion: 2, kind: 'conflict', reason: 'idempotency_mismatch', currentRevision: 'revision_1' },
       resourceRevision: 'revision_1',
     })
   })

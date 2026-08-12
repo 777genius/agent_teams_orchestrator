@@ -1,9 +1,16 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { constants, chmod, lstat, mkdir, open, unlink } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
-import { createHostedControlProof, createHostedDomainProof, verifyHostedControlProof } from './ownerProof.js'
+import {
+  createHostedControlProof,
+  createHostedDomainProof,
+  createHostedRawDomainProof,
+  parseStrictHostedProofLastJsonFrame,
+  verifyHostedControlProof,
+} from './ownerProof.js'
 import {
   decodeHostedTaskMutationRequest,
   decodeHostedTaskMutationTerminalResult,
@@ -34,8 +41,12 @@ export type HostedControlServerOptions = {
   authority: HostedControlStableAuthority
   service: HostedTaskMutationPort
   readDeadlineMs?: number
-  dispatchCoexistingOperation?: (message: Record<string, unknown>) => Promise<Record<string, unknown> | null>
+  dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
 }
+
+export type HostedReadinessAdmission =
+  | { protocol: 'legacy'; challenge: string }
+  | { protocol: 'canonical'; challenge: string; bootstrapDigest: string }
 
 export class HostedControlServer {
   readonly #options: HostedControlServerOptions
@@ -69,11 +80,11 @@ export class HostedControlServer {
     this.#stopping = false
     const parentIdentity = await prepareSocketPath(this.#options.socketPath)
     const server = createServer(socket => this.#handleConnection(socket))
-    this.#server = server
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject)
       server.listen(this.#options.socketPath, () => {
         server.off('error', reject)
+        this.#server = server
         resolve()
       })
     })
@@ -200,7 +211,7 @@ export class HostedControlServer {
       }
       const response = await this.#mutationLease.run(
         leaseSocket,
-        () => this.#options.dispatchCoexistingOperation!(message),
+        () => this.#options.dispatchCoexistingOperation!(message, line),
       )
       if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
         !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
@@ -252,13 +263,28 @@ export class HostedControlServer {
 
   async #handleReadiness(socket: Socket, line: string, message: Record<string, unknown>): Promise<void> {
     if (Buffer.byteLength(line) > HOSTED_READINESS_MAX_LINE_BYTES || this.#leaseConsumed || this.#leaseSocket || !this.#options.dispatchCoexistingOperation) { socket.destroy(); return }
-    const keys = Object.keys(message).sort(); const expected = ['schemaVersion', 'operation', 'capability', 'socketIdentity', 'challenge', 'ownerProof'].sort()
-    const identity = message.socketIdentity as Record<string, unknown> | undefined; const ownerBinding = this.#ownerBinding
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index]) || message.schemaVersion !== 2 || message.operation !== 'readiness' || message.capability !== 'hosted-lifecycle-command' || typeof message.challenge !== 'string' || !/^[0-9a-f]{64}$/.test(message.challenge) || !identity || typeof identity !== 'object' || Array.isArray(identity) || Object.keys(identity).sort().join(',') !== 'device,gid,inode,mode,uid' || !ownerBinding || !isDeepStrictEqual(identity, ownerBinding.socketIdentity) || typeof message.ownerProof !== 'string' || !verifyExactDomainLine(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', line, message.ownerProof)) { socket.destroy(); return }
+    const ownerBinding = this.#ownerBinding
+    if (!ownerBinding) { socket.destroy(); return }
+    let admission: HostedReadinessAdmission
+    try {
+      admission = decodeHostedReadinessRequest({
+        secret: this.#options.secret,
+        authority: this.#options.authority,
+        ownerBinding,
+        line,
+        message,
+      })
+    } catch { socket.destroy(); return }
     this.#leaseConsumed = true
-    this.#leaseSocket = socket; socket.once('close', () => { if (this.#leaseSocket === socket) this.#leaseSocket = null })
-    const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: message.challenge, ownerBinding }
-    const response = { ...unsigned, ownerProof: createHostedDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned) }
+    this.#leaseSocket = socket
+    socket.once('close', () => { if (this.#leaseSocket === socket) this.#leaseSocket = null })
+    if (admission.protocol === 'legacy') {
+      const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, ownerBinding }
+      socket.write(`${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned) })}\n`)
+      return
+    }
+    const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, bootstrapDigest: admission.bootstrapDigest, ownerBinding }
+    const response = { ...unsigned, ownerProof: createHostedRawDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(unsigned)) }
     socket.write(`${JSON.stringify(response)}\n`)
   }
 
@@ -270,13 +296,91 @@ export class HostedControlServer {
   }
 }
 
-function verifyExactDomainLine(secret: Uint8Array, domain: string, direction: string, line: string, proof: string): boolean {
-  if (!/^[0-9a-f]{64}$/.test(proof)) return false
+export function decodeHostedReadinessRequest(input: {
+  secret: Uint8Array
+  authority: HostedControlStableAuthority
+  ownerBinding: HostedControlOwnerBinding
+  line: string
+  message: Record<string, unknown>
+}): HostedReadinessAdmission {
+  if (Buffer.byteLength(input.line) > HOSTED_READINESS_MAX_LINE_BYTES) {
+    throw new TypeError('Invalid hosted readiness frame size')
+  }
+  if (isLegacyReadiness(input.message)) {
+    if (!isDeepStrictEqual(input.message.socketIdentity, input.ownerBinding.socketIdentity) ||
+      !verifyLegacyReadiness(input.secret, input.line, input.message)) {
+      throw new TypeError('Invalid legacy hosted readiness proof')
+    }
+    return { protocol: 'legacy', challenge: String(input.message.challenge) }
+  }
+  const signed = parseStrictHostedProofLastJsonFrame(input.line, 'controllerProof')
+  if (!isDeepStrictEqual(signed.value, input.message)) throw new TypeError('Invalid hosted readiness raw frame')
+  const expectedKeys = ['schemaVersion', 'operation', 'capability', 'socketIdentity', 'challenge', 'bootstrapBinding', 'expectedOwnerBinding', 'controllerProof'].sort()
+  const keys = Object.keys(input.message).sort()
+  const identity = input.message.socketIdentity
+  const bootstrap = input.message.bootstrapBinding
+  const expectedOwner = input.message.expectedOwnerBinding
+  const proofKeyId = createHash('sha256').update(input.secret).digest('hex')
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index]) ||
+    input.message.schemaVersion !== 2 || input.message.operation !== 'readiness' ||
+    input.message.capability !== 'hosted-lifecycle-command' || typeof input.message.challenge !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(input.message.challenge) || !identity || typeof identity !== 'object' ||
+    Array.isArray(identity) || Object.keys(identity).sort().join(',') !== 'device,gid,inode,mode,uid' ||
+    !isDeepStrictEqual(identity, input.ownerBinding.socketIdentity) || !expectedOwner ||
+    !isDeepStrictEqual(expectedOwner, input.ownerBinding) || !bootstrap || typeof bootstrap !== 'object' ||
+    Array.isArray(bootstrap) || !validBootstrapBinding(bootstrap as Record<string, unknown>, input.authority, proofKeyId) ||
+    !verifyRawReadiness(input.secret, signed.serializedUnsignedEnvelope, signed.proof)) {
+    throw new TypeError('Invalid canonical hosted readiness proof')
+  }
+  return {
+    protocol: 'canonical',
+    challenge: input.message.challenge,
+    bootstrapDigest: (bootstrap as Record<string, unknown>).bootstrapDigest as string,
+  }
+}
+
+function isLegacyReadiness(message: Record<string, unknown>): boolean {
+  return Object.keys(message).sort().join(',') ===
+    'capability,challenge,operation,ownerProof,schemaVersion,socketIdentity' &&
+    message.schemaVersion === 2 && message.operation === 'readiness' &&
+    message.capability === 'hosted-lifecycle-command' &&
+    typeof message.challenge === 'string' && /^[0-9a-f]{64}$/.test(message.challenge)
+}
+
+function verifyLegacyReadiness(
+  secret: Uint8Array,
+  line: string,
+  message: Record<string, unknown>,
+): boolean {
+  const proof = message.ownerProof
+  if (typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof)) return false
   const suffix = `,"ownerProof":${JSON.stringify(proof)}}`
   if (!line.endsWith(suffix)) return false
-  const unsignedLine = `${line.slice(0, -suffix.length)}}`
-  return createHostedDomainProof(secret, domain, direction, JSON.parse(unsignedLine)) === proof &&
-    JSON.stringify(JSON.parse(unsignedLine)) === unsignedLine
+  const serialized = `${line.slice(0, -suffix.length)}}`
+  let unsigned: unknown
+  try { unsigned = JSON.parse(serialized) } catch { return false }
+  if (!unsigned || typeof unsigned !== 'object' || Array.isArray(unsigned) || JSON.stringify(unsigned) !== serialized) return false
+  const expected = createHostedDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', unsigned)
+  return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))
+}
+
+function verifyRawReadiness(secret: Uint8Array, serialized: string, proof: string): boolean {
+  const expected = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
+  return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))
+}
+
+function validBootstrapBinding(
+  value: Record<string, unknown>,
+  authority: HostedControlStableAuthority,
+  proofKeyId: string,
+): boolean {
+  const keys = Object.keys(value).sort().join(',')
+  return keys === 'bootId,bootstrapDigest,deploymentId,mountGeneration,ownerArtifactDigest,proofKeyId,workspaceId' &&
+    value.deploymentId === authority.deploymentId && value.bootId === authority.bootId &&
+    value.workspaceId === authority.workspaceId && value.mountGeneration === authority.mountBinding.mountGeneration &&
+    typeof value.bootstrapDigest === 'string' && /^[0-9a-f]{64}$/.test(value.bootstrapDigest) &&
+    typeof value.ownerArtifactDigest === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.ownerArtifactDigest) &&
+    value.proofKeyId === proofKeyId
 }
 
 function taskResultMatchesRequest(

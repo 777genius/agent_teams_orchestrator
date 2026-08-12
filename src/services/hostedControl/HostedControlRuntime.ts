@@ -135,7 +135,7 @@ export class HostedControlRuntime {
       ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
       authority,
       service: taskService,
-      dispatchCoexistingOperation: message => dispatcher.dispatch(message),
+      dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
     })
     if (!(await validateHostedControlOwnerBinding({
       claudeRoot: config.claudeRoot,
@@ -211,7 +211,8 @@ function authorityMatches(
   if (candidate.workspaceId !== expected.workspaceId || candidate.teamId !== expected.teamId ||
     candidate.deploymentId !== expected.deploymentId || candidate.restoreGeneration !== expected.restoreGeneration ||
     candidate.bootId !== expected.bootId) return false
-  return !('mountBinding' in candidate) ||
-    candidate.mountBinding.mountGeneration === expected.mountBinding.mountGeneration &&
-    candidate.mountBinding.declaredRootHash === expected.mountBinding.declaredRootHash
+  return 'mountBinding' in candidate
+    ? candidate.mountBinding.mountGeneration === expected.mountBinding.mountGeneration &&
+      candidate.mountBinding.declaredRootHash === expected.mountBinding.declaredRootHash
+    : candidate.mountGeneration === expected.mountBinding.mountGeneration
 }

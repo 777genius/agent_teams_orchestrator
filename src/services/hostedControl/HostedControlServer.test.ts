@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm, unlink } from 'node:fs/promises'
 import { connect, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHostedControlProof, createHostedDomainProof, verifyHostedControlProof } from './ownerProof.js'
+import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
 
@@ -59,6 +60,31 @@ describe('HostedControlServer', () => {
     const response = JSON.parse(line) as HostedTaskMutationResponse
     expect(response.payload).toEqual({ kind: 'unavailable' })
     expect(verifyHostedControlProof(secret, 'response', response)).toBe(true)
+  })
+
+  test('binds canonical readiness to bootstrap, controller, active owner and mount generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-canonical-readiness-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
+    const fixture = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: fixture.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => null })
+    servers.push(server); await server.start()
+    const ownerBinding = server.ownerBinding!
+    const bootstrapBinding = {
+      deploymentId: fixture.authority.deploymentId,
+      bootId: fixture.authority.bootId,
+      workspaceId: fixture.authority.workspaceId,
+      mountGeneration: fixture.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64),
+      ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
+      proofKeyId: createHash('sha256').update(secret).digest('hex'),
+    }
+    const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: ownerBinding.socketIdentity, challenge: '5'.repeat(64), bootstrapBinding, expectedOwnerBinding: ownerBinding }
+    const serialized = JSON.stringify(unsigned)
+    const controllerProof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
+    const line = await exchange(socketPath, `${serialized.slice(0, -1)},"controllerProof":"${controllerProof}"}\n`)
+    const ready = JSON.parse(line) as Record<string, unknown>; const { ownerProof, ...readyUnsigned } = ready
+    expect(ready).toMatchObject({ kind: 'ready', challenge: unsigned.challenge, bootstrapDigest: bootstrapBinding.bootstrapDigest, ownerBinding })
+    expect(ownerProof).toBe(createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(readyUnsigned)))
   })
 
   test('does not consume the sole readiness lease for an unauthenticated first client', async () => {

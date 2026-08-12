@@ -12,7 +12,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
+import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import {
+  createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
   HOSTED_LIFECYCLE_EXECUTION_STATE_FILE,
   HOSTED_LIFECYCLE_PLAN_FILE,
@@ -38,6 +40,8 @@ const lifecycleAuthority: HostedLifecycleAuthority = {
   bootId: stableAuthority.bootId,
   restoreGeneration: stableAuthority.restoreGeneration,
   resourceRevision: null,
+  mountGeneration: stableAuthority.mountBinding.mountGeneration,
+  ownerEffectFence: { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) },
 }
 
 afterEach(async () => {
@@ -53,7 +57,7 @@ describe('createHostedControlProductionPorts', () => {
     const ports = await createHostedControlProductionPorts(context(teamRoot))
 
     const state = await ports.lifecycle.dispatch(controlStateInput())
-    expect(state.payload.kind).toBe('unavailable')
+    expect(state.payload).toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
 
     const persisted = await ports.messages.dispatch({
       operation: 'message_persist',
@@ -88,6 +92,14 @@ describe('createHostedControlProductionPorts', () => {
       (await missing.lifecycle.dispatch(controlStateInput())).payload.kind,
     ).toBe('unavailable')
     expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_PLAN_FILE)
+  })
+
+  test('keeps an admitted OpenCode plan unavailable when its live owner capability is absent', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-opencode-unavailable-')
+    await writePlan(teamRoot, 'opencode')
+    const createPorts = createHostedControlProductionPortFactory(() => new OpenCodeTeamLifecycleLane())
+    const ports = await createPorts(context(teamRoot))
+    expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
   })
 })
 

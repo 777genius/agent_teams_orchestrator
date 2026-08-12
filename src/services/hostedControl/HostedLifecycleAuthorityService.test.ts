@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { HostedLifecycleAuthorityService } from './HostedLifecycleAuthorityService.js'
-import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
+import { HostedLifecycleAuthorityWal, type HostedLifecycleDurableCommand } from './HostedLifecycleAuthorityWal.js'
 import {
   HostedLifecycleProviderRegistry,
   type HostedLifecycleProviderAdapter,
@@ -23,6 +24,7 @@ const context = {
   actorId: 'actor-a', sessionId: 'session-a', deploymentId: 'deployment-a', bootId: 'boot-a',
   requestId: 'request-a', authorizedScope: 'scope_team-lifecycle.write', deadlineAtMs: 10_000,
 }
+const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) }
 
 class MutableProvider implements HostedLifecycleProviderAdapter {
   readonly providerId = 'test-provider'
@@ -65,7 +67,10 @@ function expectedRevision(provider: MutableProvider): string {
   return createHostedLifecycleSnapshot({ ...incarnation, provider: provider.snapshot }).resourceRevision
 }
 function authority(provider: MutableProvider): HostedLifecycleAuthority {
-  return { actorId: 'actor-a', ...incarnation, resourceRevision: expectedRevision(provider) }
+  return {
+    actorId: 'actor-a', ...incarnation, resourceRevision: expectedRevision(provider),
+    mountGeneration: 1, ownerEffectFence,
+  }
 }
 function launchCommand(provider: MutableProvider, patch: Record<string, unknown> = {}) {
   return {
@@ -79,6 +84,23 @@ function launchCommand(provider: MutableProvider, patch: Record<string, unknown>
     ...patch,
   }
 }
+function durableCommand(command: HostedLifecycleDurableCommand, authorization: {
+  deploymentId: string; actorId: string; bootId: string; restoreGeneration: number; mountGeneration: number
+  ownerEffectFence: typeof ownerEffectFence
+}) {
+  const digest = createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+    command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+    command.expectedRevision, command.action === 'launch' ? null : (command as { runId?: string }).runId,
+    authorization.ownerEffectFence.grantRevision, authorization.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+  return {
+    schemaVersion: 1,
+    commandFingerprint: { algorithm: 'sha256', version: 1, digest },
+    idempotency: { deploymentId: authorization.deploymentId, actorId: authorization.actorId, action: command.action, idempotencyKey: command.idempotencyKey },
+    resource: { bootId: authorization.bootId, workspaceId: command.workspaceId, teamId: command.teamId, runId: command.action === 'launch' ? null : (command as { runId?: string }).runId, expectedRevision: command.expectedRevision, restoreGeneration: authorization.restoreGeneration, mountGeneration: authorization.mountGeneration, ownerEffectFence: authorization.ownerEffectFence },
+  }
+}
 
 describe('HostedLifecycleAuthorityService', () => {
   test('computes a canonical revision and exposes only phase-valid actions', async () => {
@@ -90,6 +112,14 @@ describe('HostedLifecycleAuthorityService', () => {
       deploymentId: incarnation.deploymentId, bootId: incarnation.bootId, runId: null,
       resourceRevision: expectedRevision(provider), availableActions: ['launch'],
     })
+    await expect(service.prepareProvisioning({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: authority(provider),
+    })).resolves.toMatchObject({
+      kind: 'prepared', lanes: [{ laneKey: `owner:${teamId}`, backend: 'opencode', status: 'ready' }],
+    })
+    await expect(service.getProvisioningStatus({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: authority(provider),
+    })).resolves.toMatchObject({ kind: 'provisioning_status', recentCommands: [] })
   })
 
   test('authorizes, revalidates, compare-and-commits and replays without a second effect', async () => {
@@ -102,19 +132,24 @@ describe('HostedLifecycleAuthorityService', () => {
     const admittedRevision = authorized.authorization.resourceRevision
     await expect(service.revalidate({ command, authorization: authorized.authorization, context, authority: originalAuthority }))
       .resolves.toEqual({ kind: 'valid', authorization: authorized.authorization })
-    const executed = await service.execute({ command, authorization: authorized.authorization, context, authority: originalAuthority })
-    expect(executed.kind).toBe('result')
-    if (executed.kind !== 'result') throw new Error('expected result')
+    const durable = durableCommand(command, authorized.authorization)
+    await expect(service.replayLookup({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority }))
+      .resolves.toEqual({ kind: 'not_started', durableCommand: durable })
+    const executed = await service.execute({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority })
+    expect(executed.kind).toBe('settled')
+    if (executed.kind !== 'settled') throw new Error('expected settled result')
     expect(executed.result).toMatchObject({ kind: 'accepted', action: 'launch', runId: 'run_test01' })
     expect(executed.result.resourceRevision).toBe(admittedRevision)
 
     const replayAuthorization = await service.authorize({ command, context, authority: originalAuthority })
     expect(replayAuthorization).toEqual(authorized)
-    const replay = await service.execute({ command, authorization: authorized.authorization, context, authority: originalAuthority })
+    const replay = await service.execute({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority })
     expect(replay).toEqual({
-      kind: 'result', authorization: authorized.authorization,
+      kind: 'settled', durableCommand: durable, authorization: authorized.authorization,
       result: { ...executed.result, kind: 'idempotent_replay' },
     })
+    await expect(service.replayLookup({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority }))
+      .resolves.toEqual(replay)
     expect(provider.executions).toBe(1)
     expect(provider.expectedProviderGenerations).toEqual(['generation-1'])
   })
@@ -129,10 +164,11 @@ describe('HostedLifecycleAuthorityService', () => {
     const executed = await service.execute({
       command,
       authorization: admitted.authorization,
+      durableCommand: durableCommand(command, admitted.authorization),
       context,
       authority: originalAuthority,
     })
-    if (executed.kind !== 'result') throw new Error('expected result')
+    if (executed.kind !== 'settled') throw new Error('expected settled result')
     const currentRevision = expectedRevision(provider)
     expect(currentRevision).not.toBe(admitted.authorization.resourceRevision)
     expect(executed.result.resourceRevision).toBe(admitted.authorization.resourceRevision)
@@ -149,11 +185,13 @@ describe('HostedLifecycleAuthorityService', () => {
     const replay = await service.execute({
       command,
       authorization: admitted.authorization,
+      durableCommand: durableCommand(command, admitted.authorization),
       context,
       authority: originalAuthority,
     })
     expect(replay).toEqual({
-      kind: 'result',
+      kind: 'settled',
+      durableCommand: durableCommand(command, admitted.authorization),
       authorization: admitted.authorization,
       result: { ...executed.result, kind: 'idempotent_replay' },
     })
@@ -189,10 +227,11 @@ describe('HostedLifecycleAuthorityService', () => {
     const executed = await service.execute({
       command,
       authorization: admitted.authorization,
+      durableCommand: durableCommand(command, admitted.authorization),
       context,
       authority: currentAuthority,
     })
-    if (executed.kind !== 'result') throw new Error('expected result')
+    if (executed.kind !== 'settled') throw new Error('expected settled result')
     expect(executed.result).toMatchObject({
       kind: 'accepted',
       action: 'recover',
@@ -216,7 +255,7 @@ describe('HostedLifecycleAuthorityService', () => {
     await service.authorize({ command, context, authority: originalAuthority })
     await expect(service.authorize({
       command: { ...command, commandId: 'lifecycle-command_changed01' }, context, authority: originalAuthority,
-    })).resolves.toMatchObject({ kind: 'conflict', reason: 'idempotency_conflict' })
+    })).resolves.toMatchObject({ kind: 'conflict', reason: 'idempotency_mismatch' })
 
     const other = await fixture()
     const stale = { ...authority(other.provider), resourceRevision: `revision_${'0'.repeat(64)}` }
@@ -224,6 +263,25 @@ describe('HostedLifecycleAuthorityService', () => {
       command: { ...launchCommand(other.provider), expectedRevision: stale.resourceRevision! }, context, authority: stale,
     })).resolves.toMatchObject({ kind: 'conflict', reason: 'stale_revision' })
     expect(other.provider.executions).toBe(0)
+  })
+
+  test('treats reordered canonical command fields as the same durable authorization', async () => {
+    const { service, provider } = await fixture()
+    const currentAuthority = authority(provider); const command = launchCommand(provider)
+    const authorized = await service.authorize({ command, context, authority: currentAuthority })
+    if (authorized.kind !== 'authorized') throw new Error('expected authorization')
+    const reordered = {
+      expectedRevision: command.expectedRevision,
+      teamId: command.teamId,
+      workspaceId: command.workspaceId,
+      idempotencyKey: command.idempotencyKey,
+      commandId: command.commandId,
+      action: command.action,
+      schemaVersion: command.schemaVersion,
+    }
+    await expect(service.revalidate({
+      command: reordered, authorization: authorized.authorization, context, authority: currentAuthority,
+    })).resolves.toEqual({ kind: 'valid', authorization: authorized.authorization })
   })
 
   test('binds grants to actor, session, deployment, boot and restore generation', async () => {
@@ -238,7 +296,7 @@ describe('HostedLifecycleAuthorityService', () => {
     expect(sessionGrant).toMatchObject({ kind: 'authorized' })
     await expect(service.authorize({
       command: launchCommand(provider), context, authority: currentAuthority,
-    })).resolves.toMatchObject({ kind: 'conflict', reason: 'idempotency_conflict' })
+    })).resolves.toMatchObject({ kind: 'conflict', reason: 'idempotency_mismatch' })
     await expect(service.authorize({
       command: launchCommand(provider), context, authority: { ...currentAuthority, restoreGeneration: 4 },
     })).resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
@@ -250,7 +308,8 @@ describe('HostedLifecycleAuthorityService', () => {
     const authorized = await service.authorize({ command, context, authority: originalAuthority })
     if (authorized.kind !== 'authorized') throw new Error('expected authorization')
     provider.failAfterEffect = true
-    await expect(service.execute({ command, authorization: authorized.authorization, context, authority: originalAuthority }))
+    const durable = durableCommand(command, authorized.authorization)
+    await expect(service.execute({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority }))
       .resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
     expect(provider.executions).toBe(1)
 
@@ -259,11 +318,19 @@ describe('HostedLifecycleAuthorityService', () => {
       wal: new HostedLifecycleAuthorityWal(root, teamId),
       providers: new HostedLifecycleProviderRegistry([provider]),
     })
-    await expect(restarted.execute({ command, authorization: authorized.authorization, context, authority: originalAuthority }))
-      .resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
+    await expect(restarted.execute({ command, authorization: authorized.authorization, durableCommand: durable, context, authority: originalAuthority }))
+      .resolves.toEqual({ kind: 'started', durableCommand: durable })
+    await expect(restarted.release({ command, authorization: authorized.authorization, context, authority: originalAuthority }))
+      .resolves.toEqual({ kind: 'operator_required', authorization: authorized.authorization })
     await expect(restarted.getControlState({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: originalAuthority,
     })).resolves.toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
+    await expect(restarted.getProvisioningStatus({
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: originalAuthority,
+    })).resolves.toMatchObject({
+      kind: 'provisioning_status', availableActions: [],
+      recentCommands: [{ action: 'launch', commandId: command.commandId, idempotencyKey: command.idempotencyKey, status: 'operator_required' }],
+    })
     expect(provider.executions).toBe(1)
   })
 
@@ -273,10 +340,69 @@ describe('HostedLifecycleAuthorityService', () => {
     const authorized = await service.authorize({ command, context, authority: currentAuthority })
     if (authorized.kind !== 'authorized') throw new Error('expected authorization')
     await expect(service.release({ command, authorization: authorized.authorization, context, authority: currentAuthority }))
-      .resolves.toEqual({ kind: 'released' })
+      .resolves.toEqual({ kind: 'released', authorization: authorized.authorization })
+    await expect(service.release({ command, authorization: authorized.authorization, context, authority: currentAuthority }))
+      .resolves.toEqual({ kind: 'already_released', authorization: authorized.authorization })
     await expect(service.revalidate({ command, authorization: authorized.authorization, context, authority: currentAuthority }))
       .resolves.toMatchObject({ kind: 'conflict', reason: 'grant_revoked' })
+    await expect(service.authorize({ command, context, authority: currentAuthority }))
+      .resolves.toMatchObject({ kind: 'conflict', reason: 'grant_revoked' })
     expect(provider.executions).toBe(0)
+  })
+
+  test('retires an unstarted grant when the mount generation or owner fence changes', async () => {
+    const { service, provider } = await fixture()
+    const firstAuthority = authority(provider); const firstCommand = launchCommand(provider)
+    const first = await service.authorize({ command: firstCommand, context, authority: firstAuthority })
+    if (first.kind !== 'authorized') throw new Error('expected authorization')
+
+    const nextAuthority = {
+      ...firstAuthority,
+      mountGeneration: 2,
+      ownerEffectFence: { grantRevision: '3'.repeat(64), identityChecksum: '4'.repeat(64) },
+    }
+    const nextCommand = launchCommand(provider, {
+      commandId: 'lifecycle-command_command02',
+      idempotencyKey: 'idempotency_command02',
+    })
+    await expect(service.authorize({ command: nextCommand, context, authority: nextAuthority }))
+      .resolves.toMatchObject({
+        kind: 'authorized',
+        authorization: { mountGeneration: 2, ownerEffectFence: nextAuthority.ownerEffectFence },
+      })
+    await expect(service.revalidate({
+      command: firstCommand, authorization: first.authorization, context, authority: firstAuthority,
+    })).resolves.toMatchObject({ kind: 'conflict', reason: 'grant_revoked' })
+  })
+
+  test('scopes durable idempotency to deployment, actor and action across owner incarnations', async () => {
+    const { root, service, provider } = await fixture()
+    const firstAuthority = authority(provider); const firstCommand = launchCommand(provider)
+    const first = await service.authorize({ command: firstCommand, context, authority: firstAuthority })
+    if (first.kind !== 'authorized') throw new Error('expected authorization')
+    await expect(service.release({
+      command: firstCommand, authorization: first.authorization, context, authority: firstAuthority,
+    })).resolves.toMatchObject({ kind: 'released' })
+
+    const nextIncarnation = { ...incarnation, deploymentId: 'deployment-b', bootId: 'boot-b' }
+    const nextRevision = createHostedLifecycleSnapshot({ ...nextIncarnation, provider: provider.snapshot }).resourceRevision
+    const nextAuthority: HostedLifecycleAuthority = {
+      actorId: 'actor-a', ...nextIncarnation, resourceRevision: nextRevision,
+      mountGeneration: 1, ownerEffectFence,
+    }
+    const nextContext = { ...context, deploymentId: 'deployment-b', bootId: 'boot-b' }
+    const nextCommand = { ...firstCommand, expectedRevision: nextRevision }
+    const restarted = new HostedLifecycleAuthorityService({
+      ...nextIncarnation,
+      wal: new HostedLifecycleAuthorityWal(root, teamId),
+      providers: new HostedLifecycleProviderRegistry([provider]),
+      createId: () => 'nexttoken01',
+    })
+    await expect(restarted.authorize({
+      command: nextCommand, context: nextContext, authority: nextAuthority,
+    })).resolves.toMatchObject({
+      kind: 'authorized', authorization: { deploymentId: 'deployment-b', bootId: 'boot-b' },
+    })
   })
 
   test('returns unavailable when release cannot durably append its WAL record', async () => {
