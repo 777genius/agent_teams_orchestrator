@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util'
 import type {
   HostedLifecycleAuthority,
   HostedLifecycleCommandPort,
+  HostedLifecycleOwnerEffectFence,
   HostedLifecycleOperation,
 } from './HostedControlDispatcher.js'
 
@@ -12,6 +13,7 @@ const CONFLICT_REASONS = [
   'command_in_progress',
   'grant_revoked',
   'idempotency_conflict',
+  'idempotency_mismatch',
   'stale_revision',
   'stale_run',
 ] as const
@@ -47,6 +49,8 @@ type LifecycleAuthorization = {
   workspaceId: string
   teamId: string
   restoreGeneration: number
+  mountGeneration: number
+  ownerEffectFence: HostedLifecycleOwnerEffectFence
 }
 
 export type HostedLifecycleAuthorizationDecision =
@@ -66,9 +70,11 @@ export type HostedLifecycleExecutionDecision =
       result: Record<string, unknown>
     }
   | { kind: 'unavailable'; retryAfterMs: number | null }
+  | { kind: 'not_started' | 'started' | 'operator_required' | 'idempotency_mismatch'; durableCommand: Record<string, unknown> }
+  | { kind: 'settled'; durableCommand: Record<string, unknown>; result: Record<string, unknown>; authorization: LifecycleAuthorization }
 
 export type HostedLifecycleReleaseDecision =
-  | { kind: 'released' }
+  | { kind: 'released' | 'already_released' | 'operator_required'; authorization?: LifecycleAuthorization }
   | { kind: 'unavailable'; retryAfterMs: number | null }
 
 /**
@@ -77,6 +83,16 @@ export type HostedLifecycleReleaseDecision =
  */
 export interface HostedLifecycleAuthorityEffectPort {
   getControlState(input: {
+    request: { schemaVersion: 1; workspaceId: string; teamId: string }
+    context: LifecycleContext
+    authority: HostedLifecycleAuthority
+  }): Promise<Record<string, unknown>>
+  prepareProvisioning?(input: {
+    request: { schemaVersion: 1; workspaceId: string; teamId: string }
+    context: LifecycleContext
+    authority: HostedLifecycleAuthority
+  }): Promise<Record<string, unknown>>
+  getProvisioningStatus?(input: {
     request: { schemaVersion: 1; workspaceId: string; teamId: string }
     context: LifecycleContext
     authority: HostedLifecycleAuthority
@@ -95,6 +111,14 @@ export interface HostedLifecycleAuthorityEffectPort {
   execute(input: {
     command: LifecycleCommand
     authorization: LifecycleAuthorization
+    durableCommand: Record<string, unknown>
+    context: LifecycleContext
+    authority: HostedLifecycleAuthority
+  }): Promise<HostedLifecycleExecutionDecision>
+  replayLookup?(input: {
+    command: LifecycleCommand
+    authorization: LifecycleAuthorization
+    durableCommand: Record<string, unknown>
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleExecutionDecision>
@@ -133,9 +157,16 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
     if (!(await this.#requestCurrent(context, input.authority))) {
       return unavailable(input.operation)
     }
-    if (input.operation === 'control_state') {
+    if (isQueryOperation(input.operation)) {
       const request = controlStateRequest(input.payload.request, input.authority)
-      const payload = await this.effects.getControlState({ request, context, authority: input.authority })
+      const method = input.operation === 'control_state' ? this.effects.getControlState :
+        input.operation === 'prepare' || input.operation === 'prepare_provisioning' ? this.effects.prepareProvisioning :
+          this.effects.getProvisioningStatus
+      let payload = method ? await method.call(this.effects, { request, context, authority: input.authority }) :
+        { schemaVersion: 1, kind: 'unavailable', retryAfterMs: null }
+      if (input.operation === 'get_status' && payload.kind === 'provisioning_status') {
+        payload = { ...payload, kind: 'status' }
+      }
       if (!(await this.#requestCurrent(context, input.authority))) return unavailable(input.operation)
       return { payload, resourceRevision: revisionFrom(payload) }
     }
@@ -155,9 +186,21 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
     }
     if (input.operation === 'release') {
       const decision = await this.effects.release({ command, authorization, context, authority: input.authority })
-      if (decision.kind !== 'released' || !(await this.#requestCurrent(context, input.authority))) {
+      if ((decision.kind !== 'released' && decision.kind !== 'already_released' &&
+        decision.kind !== 'operator_required') || !(await this.#requestCurrent(context, input.authority))) {
         return unavailable(input.operation)
       }
+      return decisionResult({ ...decision, authorization })
+    }
+
+    const durableCommand = exactRecord(input.payload.durableCommand,
+      ['schemaVersion', 'commandFingerprint', 'idempotency', 'resource'], 'durable command')
+    if (input.operation === 'replay_lookup') {
+      const lookup = this.effects.replayLookup
+      const decision = lookup ? await lookup.call(this.effects, {
+        command, authorization, durableCommand, context, authority: input.authority,
+      }) : { kind: 'not_started' as const, durableCommand }
+      if (!(await this.#requestCurrent(context, input.authority))) return unavailable(input.operation)
       return decisionResult(decision)
     }
 
@@ -167,9 +210,13 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
       !(await this.#requestCurrent(context, input.authority))) {
       return unavailable(input.operation)
     }
-    const decision = await this.effects.execute({ command, authorization, context, authority: input.authority })
+    const decision = await this.effects.execute({ command, authorization, durableCommand, context, authority: input.authority })
     if (!(await this.#requestCurrent(context, input.authority))) return unavailable(input.operation)
-    return decisionResult(decision)
+    // Older owner adapters returned `result`; preserve that in-process port while
+    // emitting only the canonical durable `settled` wire shape.
+    return decisionResult(decision.kind === 'result'
+      ? { ...decision, kind: 'settled', durableCommand }
+      : decision)
   }
 
   async #requestCurrent(context: LifecycleContext, authority: HostedLifecycleAuthority): Promise<boolean> {
@@ -179,20 +226,35 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
 
 function unavailable(operation: HostedLifecycleOperation): { payload: Record<string, unknown>; resourceRevision: null } {
   return {
-    payload: { schemaVersion: operation === 'control_state' ? 1 : 2, kind: 'unavailable', retryAfterMs: null },
+    payload: { schemaVersion: isQueryOperation(operation) ? 1 : 2, kind: 'unavailable', retryAfterMs: null },
     resourceRevision: null,
   }
 }
 
+function isQueryOperation(operation: HostedLifecycleOperation): boolean {
+  return operation === 'control_state' || operation === 'prepare' || operation === 'get_status' ||
+    operation === 'prepare_provisioning' || operation === 'get_provisioning_status'
+}
+
 function decisionResult(
   decision: HostedLifecycleAuthorizationDecision | HostedLifecycleRevalidationDecision |
-    HostedLifecycleExecutionDecision | HostedLifecycleReleaseDecision,
+    HostedLifecycleExecutionDecision | HostedLifecycleReleaseDecision | Record<string, unknown>,
 ): { payload: Record<string, unknown>; resourceRevision: string | null } {
-  const payload = { schemaVersion: 2, ...decision }
+  const payload = { schemaVersion: 2, ...decision } as Record<string, unknown>
   const authorization = 'authorization' in decision ? decision.authorization : null
-  const resourceRevision = authorization?.resourceRevision ??
-    ('currentRevision' in decision ? decision.currentRevision : null)
+  const resourceRevision = authorization && typeof authorization === 'object' && 'resourceRevision' in authorization ?
+    authorization.resourceRevision as string :
+    ('currentRevision' in decision &&
+      (typeof decision.currentRevision === 'string' || decision.currentRevision === null)
+      ? decision.currentRevision : durableDecisionRevision(decision))
   return { payload, resourceRevision }
+}
+
+function durableDecisionRevision(decision: Record<string, unknown>): string | null {
+  if (!('durableCommand' in decision)) return null
+  const durableCommand = objectRecord(decision.durableCommand, 'durable command')
+  const resource = objectRecord(durableCommand.resource, 'durable resource')
+  return pattern(resource.expectedRevision, /^revision_[A-Za-z0-9][A-Za-z0-9._-]{0,246}$/, 'expectedRevision')
 }
 
 function lifecycleContext(value: unknown): LifecycleContext {
@@ -249,7 +311,7 @@ function lifecycleAuthorization(
 ): LifecycleAuthorization {
   const record = exactRecord(value, [
     'grantId', 'authorizationGeneration', 'deploymentId', 'bootId', 'resourceRevision',
-    'actorId', 'workspaceId', 'teamId', 'restoreGeneration',
+    'actorId', 'workspaceId', 'teamId', 'restoreGeneration', 'mountGeneration', 'ownerEffectFence',
   ], 'authorization')
   const parsed = {
     grantId: pattern(record.grantId, /^grant_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'grantId'),
@@ -261,10 +323,14 @@ function lifecycleAuthorization(
     workspaceId: nonEmpty(record.workspaceId, 'workspaceId'),
     teamId: nonEmpty(record.teamId, 'teamId'),
     restoreGeneration: nonNegativeInteger(record.restoreGeneration, 'restoreGeneration'),
+    mountGeneration: positiveInteger(record.mountGeneration, 'mountGeneration'),
+    ownerEffectFence: ownerEffectFence(record.ownerEffectFence),
   }
   if (parsed.actorId !== authority.actorId || parsed.workspaceId !== command.workspaceId ||
     parsed.teamId !== command.teamId || parsed.deploymentId !== authority.deploymentId ||
     parsed.bootId !== authority.bootId || parsed.restoreGeneration !== authority.restoreGeneration ||
+    parsed.mountGeneration !== authority.mountGeneration ||
+    !isDeepStrictEqual(parsed.ownerEffectFence, authority.ownerEffectFence) ||
     parsed.resourceRevision !== command.expectedRevision) {
     throw new TypeError('Invalid hosted lifecycle authorization scope')
   }
@@ -303,4 +369,16 @@ function pattern(value: unknown, regex: RegExp, field: string): string {
 function nonNegativeInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) throw new TypeError(`Invalid ${field}`)
   return value as number
+}
+function positiveInteger(value: unknown, field: string): number {
+  const parsed = nonNegativeInteger(value, field)
+  if (parsed < 1) throw new TypeError(`Invalid ${field}`)
+  return parsed
+}
+function ownerEffectFence(value: unknown): HostedLifecycleOwnerEffectFence {
+  const record = exactRecord(value, ['grantRevision', 'identityChecksum'], 'owner effect fence')
+  return {
+    grantRevision: pattern(record.grantRevision, /^[0-9a-f]{64}$/, 'grantRevision'),
+    identityChecksum: pattern(record.identityChecksum, /^[0-9a-f]{64}$/, 'identityChecksum'),
+  }
 }

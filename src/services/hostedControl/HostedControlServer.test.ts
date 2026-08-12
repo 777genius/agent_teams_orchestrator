@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm, unlink } from 'node:fs/promises'
 import { connect, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHostedControlProof, createHostedDomainProof, verifyHostedControlProof } from './ownerProof.js'
+import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
 
@@ -61,6 +62,31 @@ describe('HostedControlServer', () => {
     expect(verifyHostedControlProof(secret, 'response', response)).toBe(true)
   })
 
+  test('binds canonical readiness to bootstrap, controller, active owner and mount generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-canonical-readiness-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
+    const fixture = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: fixture.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => null })
+    servers.push(server); await server.start()
+    const ownerBinding = server.ownerBinding!
+    const bootstrapBinding = {
+      deploymentId: fixture.authority.deploymentId,
+      bootId: fixture.authority.bootId,
+      workspaceId: fixture.authority.workspaceId,
+      mountGeneration: fixture.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64),
+      ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
+      proofKeyId: createHash('sha256').update(secret).digest('hex'),
+    }
+    const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: ownerBinding.socketIdentity, challenge: '5'.repeat(64), bootstrapBinding, expectedOwnerBinding: ownerBinding }
+    const serialized = JSON.stringify(unsigned)
+    const controllerProof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
+    const line = await exchange(socketPath, `${serialized.slice(0, -1)},"controllerProof":"${controllerProof}"}\n`)
+    const ready = JSON.parse(line) as Record<string, unknown>; const { ownerProof, ...readyUnsigned } = ready
+    expect(ready).toMatchObject({ kind: 'ready', challenge: unsigned.challenge, bootstrapDigest: bootstrapBinding.bootstrapDigest, ownerBinding })
+    expect(ownerProof).toBe(createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(readyUnsigned)))
+  })
+
   test('does not consume the sole readiness lease for an unauthenticated first client', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-readiness-dos-')); roots.push(root)
     const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
@@ -87,6 +113,37 @@ describe('HostedControlServer', () => {
     const requestUnsigned = { ...unsigned, ownerBinding: server.ownerBinding! }
     const request = { ...requestUnsigned, ownerProof: createHostedControlProof(secret, 'request', requestUnsigned) }
     expect(await exchange(socketPath, `${JSON.stringify(request)}\n{}\n`)).toBe('')
+  })
+
+  test('rejects malformed UTF-8 without conflating it with a literal replacement character', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-utf8-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    let values: unknown[] = []
+    const server = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async message => { values.push(message.value); return { kind: 'ok' } },
+    })
+    servers.push(server); await server.start()
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    const literal = Buffer.from(`${JSON.stringify({ operation: 'utf8_probe', value: '\uFFFD' })}\n`, 'utf8')
+    expect(await exchangeBytes(socketPath, literal)).not.toBe('')
+    expect(values).toEqual(['\uFFFD'])
+
+    values = []
+    const malformed = Buffer.from(literal)
+    const replacement = Buffer.from('\uFFFD', 'utf8')
+    const offset = malformed.indexOf(replacement)
+    expect(offset).toBeGreaterThanOrEqual(0)
+    malformed.set([0xc3, 0x28, 0x20], offset)
+    expect(await exchangeBytes(socketPath, malformed)).toBe('')
+    expect(values).toEqual([])
+
+    const bomPrefixed = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), literal])
+    expect(await exchangeBytes(socketPath, bomPrefixed)).toBe('')
+    expect(values).toEqual([])
+    lease.socket.destroy()
   })
 
   test('does not return a mutation receipt after the readiness lease closes', async () => {
@@ -297,6 +354,10 @@ function openReadiness(socketPath: string, ownerBinding: NonNullable<HostedContr
 }
 
 function exchange(socketPath: string, input: string): Promise<string> {
+  return exchangeBytes(socketPath, Buffer.from(input))
+}
+
+function exchangeBytes(socketPath: string, input: Uint8Array): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath)
     let output = ''

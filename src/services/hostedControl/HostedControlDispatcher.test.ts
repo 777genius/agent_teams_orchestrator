@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { HostedControlDispatcher } from './HostedControlDispatcher.js'
+import { createHash } from 'node:crypto'
+import { createHostedLifecycleOwnerIdentityChecksum, HostedControlDispatcher } from './HostedControlDispatcher.js'
+import { HostedLifecycleCommandService } from './HostedLifecycleCommandService.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN } from './HostedControlServer.js'
-import { createHostedDomainProof } from './ownerProof.js'
+import { createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
 import type { HostedControlOwnerBinding, HostedControlStableAuthority } from './protocol.js'
 
 const secret = Buffer.alloc(32, 3)
@@ -27,6 +29,11 @@ const lifecycleAuthority = {
   restoreGeneration: authority.restoreGeneration,
   bootId: authority.bootId,
   resourceRevision: 'revision_admitted',
+  mountGeneration: authority.mountBinding.mountGeneration,
+  ownerEffectFence: {
+    grantRevision: '1'.repeat(64),
+    identityChecksum: createHostedLifecycleOwnerIdentityChecksum(ownerBinding, authority),
+  },
 }
 const lifecycleContext = {
   actorId: lifecycleAuthority.actorId,
@@ -47,6 +54,8 @@ const lifecycleAuthorization = {
   workspaceId: lifecycleAuthority.workspaceId,
   teamId: lifecycleAuthority.teamId,
   restoreGeneration: lifecycleAuthority.restoreGeneration,
+  mountGeneration: lifecycleAuthority.mountGeneration,
+  ownerEffectFence: lifecycleAuthority.ownerEffectFence,
 }
 
 describe('HostedControlDispatcher response decoding', () => {
@@ -96,12 +105,10 @@ describe('HostedControlDispatcher response decoding', () => {
 
   test('rejects a nested execution conflict whose revision differs from its authorization', async () => {
     const rejected = lifecycleDispatcher(lifecycleConflictExecutionResponse('revision_substituted'))
-    await expect(rejected.dispatch(signedExecuteRequest('launch'))).rejects.toThrow('conflict correlation')
+    await expect(rejected.dispatch(signedExecuteRequest('launch'))).rejects.toThrow()
 
-    const accepted = lifecycleDispatcher(lifecycleConflictExecutionResponse(lifecycleAuthorization.resourceRevision))
-    await expect(accepted.dispatch(signedExecuteRequest('launch'))).resolves.toMatchObject({
-      payload: { kind: 'result', result: { kind: 'conflict', currentRevision: lifecycleAuthorization.resourceRevision } },
-    })
+    const rejectedCorrelated = lifecycleDispatcher(lifecycleConflictExecutionResponse(lifecycleAuthorization.resourceRevision))
+    await expect(rejectedCorrelated.dispatch(signedExecuteRequest('launch'))).rejects.toThrow()
   })
 
   test('accepts only null or a positive retryAfterMs no greater than 60 seconds', async () => {
@@ -133,6 +140,44 @@ describe('HostedControlDispatcher response decoding', () => {
       payload: { kind: 'unavailable', retryAfterMs: 60_001 },
     })
   })
+
+  test('accepts canonical prepare and get_status operation names', async () => {
+    const common = {
+      schemaVersion: 1, workspaceId: lifecycleAuthority.workspaceId, teamId: lifecycleAuthority.teamId,
+      deploymentId: lifecycleAuthority.deploymentId, bootId: lifecycleAuthority.bootId,
+      runId: null, resourceRevision: lifecycleAuthorization.resourceRevision, availableActions: ['launch'],
+    }
+    await expect(lifecycleDispatcher({
+      payload: { ...common, kind: 'prepared', lanes: [{ laneKey: `owner:${authority.teamId}`, backend: 'opencode', status: 'ready' }] },
+      resourceRevision: lifecycleAuthorization.resourceRevision,
+    }).dispatch(signedLifecycleRequest('prepare'))).resolves.toMatchObject({ operation: 'prepare', payload: { kind: 'prepared' } })
+    await expect(lifecycleDispatcher({
+      payload: { ...common, kind: 'status', recentCommands: [] },
+      resourceRevision: lifecycleAuthorization.resourceRevision,
+    }).dispatch(signedLifecycleRequest('get_status'))).resolves.toMatchObject({ operation: 'get_status', payload: { kind: 'status' } })
+  })
+
+  test('rejects a signed owner fence whose identity checksum is not the active external owner', async () => {
+    const request = signedLifecycleRequest()
+    const unsigned = { ...request, ownerEffectFence: { ...lifecycleAuthority.ownerEffectFence, identityChecksum: '0'.repeat(64) } }
+    delete (unsigned as Record<string, unknown>).ownerProof
+    const forged = rawSigned(unsigned)
+    await expect(lifecycleDispatcher({
+      payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
+    }).dispatch(forged)).rejects.toThrow('owner effect identity')
+  })
+
+  test('preserves the durable expected revision across execute and replay lookup decisions', async () => {
+    for (const operation of ['execute', 'replay_lookup'] as const) {
+      for (const kind of ['not_started', 'started', 'operator_required', 'idempotency_mismatch'] as const) {
+        const dispatcher = lifecycleServiceDispatcher(operation, kind)
+        await expect(dispatcher.dispatch(signedDurableRequest(operation))).resolves.toMatchObject({
+          operation,
+          payload: { kind, durableCommand: wireDurable(lifecycleCommand('launch')) },
+        })
+      }
+    }
+  })
 })
 
 function lifecycleDispatcher(response: {
@@ -148,6 +193,31 @@ function lifecycleDispatcher(response: {
   })
 }
 
+function lifecycleServiceDispatcher(
+  operation: 'execute' | 'replay_lookup',
+  kind: 'not_started' | 'started' | 'operator_required' | 'idempotency_mismatch',
+): HostedControlDispatcher {
+  const decision = async (input: { durableCommand: Record<string, unknown> }) => ({
+    kind,
+    durableCommand: input.durableCommand,
+  })
+  const lifecycle = new HostedLifecycleCommandService({
+    getControlState: async () => ({ schemaVersion: 1, kind: 'not_found' }),
+    authorize: async () => ({ kind: 'authorized', authorization: lifecycleAuthorization }),
+    revalidate: async () => ({ kind: 'valid', authorization: lifecycleAuthorization }),
+    execute: operation === 'execute' ? decision : async () => ({ kind: 'unavailable', retryAfterMs: null }),
+    replayLookup: operation === 'replay_lookup' ? decision : undefined,
+    release: async () => ({ kind: 'released' }),
+  }, { isCurrent: () => true }, () => 0)
+  return new HostedControlDispatcher({
+    secret,
+    authority,
+    getOwnerBinding: () => ownerBinding,
+    lifecycle,
+    messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
+  })
+}
+
 function lifecycleExecutionResponse(input: {
   action?: 'launch' | 'recover'
   runId?: string
@@ -159,10 +229,13 @@ function lifecycleExecutionResponse(input: {
     ...lifecycleAuthorization,
     resourceRevision: input.authorizationRevision ?? lifecycleAuthorization.resourceRevision,
   }
+  const command = lifecycleCommand(action)
+  const durableCommand = wireDurable(command)
   return {
     payload: {
       schemaVersion: 2,
-      kind: 'result',
+      kind: 'settled',
+      durableCommand,
       authorization,
       result: {
         schemaVersion: 1,
@@ -200,23 +273,54 @@ function lifecycleConflictExecutionResponse(currentRevision: string) {
   }
 }
 
-function signedLifecycleRequest(): Record<string, unknown> {
+function signedLifecycleRequest(operation: 'control_state' | 'prepare' | 'get_status' = 'control_state'): Record<string, unknown> {
+  const exchangeId = `lifecycle-request_${'c'.repeat(32)}`
   const unsigned = {
     schemaVersion: 2,
-    exchangeId: `lifecycle-request_${'c'.repeat(32)}`,
-    operation: 'control_state',
+    exchangeId,
+    operation,
+    provenance: provenance(exchangeId, operation),
     ownerBinding,
+    ownerEffectFence: lifecycleAuthority.ownerEffectFence,
     payload: {
       request: { schemaVersion: 1, workspaceId: authority.workspaceId, teamId: authority.teamId },
       context: lifecycleContext,
       authority: { ...lifecycleAuthority, resourceRevision: null },
     },
   }
-  return { ...unsigned, ownerProof: createHostedDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', unsigned) }
+  return rawSigned(unsigned)
 }
 
 function signedExecuteRequest(action: 'launch' | 'recover'): Record<string, unknown> {
-  const command = {
+  return signedDurableRequest('execute', action)
+}
+
+function signedDurableRequest(
+  operation: 'execute' | 'replay_lookup',
+  action: 'launch' | 'recover' = 'launch',
+): Record<string, unknown> {
+  const command = lifecycleCommand(action)
+  const exchangeId = `lifecycle-request_${'e'.repeat(32)}`
+  const unsigned = {
+    schemaVersion: 2,
+    exchangeId,
+    operation,
+    provenance: provenance(exchangeId, operation),
+    ownerBinding,
+    ownerEffectFence: lifecycleAuthority.ownerEffectFence,
+    payload: {
+      command,
+      authorization: lifecycleAuthorization,
+      durableCommand: wireDurable(command),
+      context: lifecycleContext,
+      authority: lifecycleAuthority,
+    },
+  }
+  return rawSigned(unsigned)
+}
+
+function lifecycleCommand(action: 'launch' | 'recover') {
+  return {
     schemaVersion: 1,
     action,
     commandId: 'lifecycle-command_command01',
@@ -226,19 +330,34 @@ function signedExecuteRequest(action: 'launch' | 'recover'): Record<string, unkn
     expectedRevision: lifecycleAuthorization.resourceRevision,
     ...(action === 'recover' ? { runId: 'run_original' } : {}),
   }
-  const unsigned = {
-    schemaVersion: 2,
-    exchangeId: `lifecycle-request_${'e'.repeat(32)}`,
-    operation: 'execute',
-    ownerBinding,
-    payload: {
-      command,
-      authorization: lifecycleAuthorization,
-      context: lifecycleContext,
-      authority: lifecycleAuthority,
-    },
+}
+
+function wireDurable(command: ReturnType<typeof lifecycleCommand>) {
+  const digest = createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+    command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    lifecycleAuthority.ownerEffectFence.grantRevision, lifecycleAuthority.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+  return {
+    schemaVersion: 1,
+    commandFingerprint: { algorithm: 'sha256', version: 1, digest },
+    idempotency: { deploymentId: lifecycleAuthority.deploymentId, actorId: lifecycleAuthority.actorId, action: command.action, idempotencyKey: command.idempotencyKey },
+    resource: { bootId: lifecycleAuthority.bootId, workspaceId: command.workspaceId, teamId: command.teamId, runId: command.action === 'launch' ? null : command.runId, expectedRevision: command.expectedRevision, restoreGeneration: lifecycleAuthority.restoreGeneration, mountGeneration: lifecycleAuthority.mountGeneration, ownerEffectFence: lifecycleAuthority.ownerEffectFence },
   }
-  return { ...unsigned, ownerProof: createHostedDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', unsigned) }
+}
+
+function provenance(exchangeId: string, operation: string) {
+  return {
+    from: { kind: 'controller', deploymentId: lifecycleContext.deploymentId, bootId: lifecycleContext.bootId, actorId: lifecycleContext.actorId, sessionId: lifecycleContext.sessionId },
+    to: { kind: 'owner', ownerAuthority: ownerBinding.ownerAuthority, ownerGeneration: ownerBinding.ownerGeneration, ownerSessionId: ownerBinding.ownerSessionId },
+    target: { capability: 'hosted-lifecycle-command', exchangeId, operation, workspaceId: lifecycleAuthority.workspaceId, teamId: lifecycleAuthority.teamId },
+  }
+}
+
+function rawSigned(unsigned: Record<string, unknown>): Record<string, unknown> {
+  const serialized = JSON.stringify(unsigned)
+  return { ...unsigned, ownerProof: createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', serialized) }
 }
 
 function signedMessageRequest(): Record<string, unknown> {

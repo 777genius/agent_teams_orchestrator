@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { appendFile, mkdtemp, open, readFile, rm } from 'node:fs/promises'
+import { appendFile, chmod, link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  createHostedLifecycleGrantFingerprint,
   HostedLifecycleAuthorityWal,
   type HostedLifecycleDurableBinding,
   type HostedLifecycleDurableCommand,
@@ -30,11 +31,13 @@ const binding: HostedLifecycleDurableBinding = {
   bootId: 'boot-a',
   authorizedScope: 'scope_team-lifecycle.write',
   restoreGeneration: 1,
+  mountGeneration: 1,
+  ownerEffectFence: { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) },
 }
 const grant: HostedLifecycleWalEntry = {
   schemaVersion: 1,
   kind: 'grant',
-  fingerprint: createHash('sha256').update(JSON.stringify({ command, binding })).digest('hex'),
+  fingerprint: createHostedLifecycleGrantFingerprint(command, binding),
   command,
   binding,
   authorization: {
@@ -47,7 +50,36 @@ const grant: HostedLifecycleWalEntry = {
     workspaceId: command.workspaceId,
     teamId,
     restoreGeneration: binding.restoreGeneration,
+    mountGeneration: binding.mountGeneration,
+    ownerEffectFence: binding.ownerEffectFence,
   },
+}
+const durableCommand = {
+  schemaVersion: 1,
+  commandFingerprint: {
+    algorithm: 'sha256', version: 1,
+    digest: createHash('sha256').update(JSON.stringify([
+      'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+      command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+      command.expectedRevision, null, binding.ownerEffectFence.grantRevision,
+      binding.ownerEffectFence.identityChecksum,
+    ])).digest('hex'),
+  },
+  idempotency: {
+    deploymentId: grant.authorization.deploymentId, actorId: grant.authorization.actorId,
+    action: command.action, idempotencyKey: command.idempotencyKey,
+  },
+  resource: {
+    bootId: grant.authorization.bootId, workspaceId: command.workspaceId, teamId,
+    runId: null, expectedRevision: command.expectedRevision,
+    restoreGeneration: grant.authorization.restoreGeneration,
+    mountGeneration: grant.authorization.mountGeneration,
+    ownerEffectFence: grant.authorization.ownerEffectFence,
+  },
+}
+const started: HostedLifecycleWalEntry = {
+  schemaVersion: 1, kind: 'started', fingerprint: durableCommand.commandFingerprint.digest,
+  command, durableCommand, authorization: grant.authorization,
 }
 
 describe('HostedLifecycleAuthorityWal append durability', () => {
@@ -98,6 +130,83 @@ describe('HostedLifecycleAuthorityWal append durability', () => {
     const afterRestart = await new HostedLifecycleAuthorityWal(root, teamId).load()
     expect(afterRestart.grants.has(grant.authorization.grantId)).toBe(true)
     expect(afterRestart.released.has(grant.authorization.grantId)).toBe(true)
+  })
+
+  test('rejects command and release records without their required durable predecessors', async () => {
+    const startedRoot = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-orphan-start-')); roots.push(startedRoot)
+    const startedWal = new HostedLifecycleAuthorityWal(startedRoot, teamId)
+    await startedWal.withLock(() => startedWal.append(started))
+    await expect(startedWal.load()).rejects.toThrow('ordering')
+
+    const releaseRoot = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-orphan-release-')); roots.push(releaseRoot)
+    const releaseWal = new HostedLifecycleAuthorityWal(releaseRoot, teamId)
+    await releaseWal.withLock(() => releaseWal.append({
+      schemaVersion: 1, kind: 'released', grantId: grant.authorization.grantId,
+    }))
+    await expect(releaseWal.load()).rejects.toThrow('ordering')
+  })
+
+  test('rejects a same-uid path substitution after opening the append handle', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-substitution-')); roots.push(root)
+    const initial = new HostedLifecycleAuthorityWal(root, teamId)
+    await initial.withLock(() => initial.append(grant))
+    const replacement = `${initial.path}.replacement`
+    const wal = new HostedLifecycleAuthorityWal(root, teamId, {
+      openAppend: async (path, flags, mode) => {
+        const handle = await open(path, flags, mode)
+        await rename(path, replacement)
+        await writeFile(path, '', { mode: 0o600 })
+        return handle
+      },
+    })
+
+    await expect(wal.withLock(() => wal.append(started))).rejects.toThrow('path-handle correlation')
+    const current = await new HostedLifecycleAuthorityWal(root, teamId).load()
+    expect(current.grants.size).toBe(0)
+    expect(current.commands.size).toBe(0)
+  })
+
+  test('rejects a private mode substitution after capturing the append handle identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-mode-substitution-')); roots.push(root)
+    const wal = new HostedLifecycleAuthorityWal(root, teamId, {
+      openAppend: async (path, flags, mode) => {
+        const handle = await open(path, flags, mode)
+        return {
+          stat: async () => { const stat = await handle.stat(); await chmod(path, 0o400); return stat },
+          write: (buffer, offset, length) => handle.write(buffer, offset, length),
+          truncate: length => handle.truncate(length),
+          sync: () => handle.sync(),
+          close: () => handle.close(),
+        }
+      },
+    })
+    await expect(wal.withLock(() => wal.append(grant))).rejects.toThrow('path-handle correlation')
+  })
+
+  test('rejects parent substitution during directory sync even when the WAL inode is hardlinked', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-parent-substitution-')); roots.push(parent)
+    const root = join(parent, 'team'); await mkdir(root, { mode: 0o700 })
+    const displaced = join(parent, 'displaced-team')
+    let substitute = true
+    const wal = new HostedLifecycleAuthorityWal(root, teamId, {
+      openDirectory: async (path, flags) => {
+        const handle = await open(path, flags)
+        return {
+          stat: () => handle.stat(),
+          sync: async () => {
+            await handle.sync()
+            if (!substitute) return
+            substitute = false
+            await rename(root, displaced)
+            await mkdir(root, { mode: 0o700 })
+            await link(join(displaced, 'hosted-lifecycle-authority.wal.v1.jsonl'), wal.path)
+          },
+          close: () => handle.close(),
+        }
+      },
+    })
+    await expect(wal.withLock(() => wal.append(grant))).rejects.toThrow()
+    expect((await lstat(wal.path)).nlink).toBe(2)
   })
 })
 

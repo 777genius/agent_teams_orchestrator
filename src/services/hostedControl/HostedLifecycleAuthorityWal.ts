@@ -1,22 +1,28 @@
 import { createHash } from 'node:crypto'
 import { constants, lstat, mkdir, open } from 'node:fs/promises'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import * as lockfile from '../../utils/lockfile.js'
-import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
 
 const MAX_WAL_BYTES = 8 * 1024 * 1024
 const LOCK_OPTIONS = { realpath: false, retries: { retries: 10, minTimeout: 5, maxTimeout: 100 } } as const
 
 type HostedLifecycleWalAppendHandle = {
-  stat(): Promise<{ isFile(): boolean; mode: number; size: number }>
+  stat(): Promise<{ isFile(): boolean; mode: number; size: number; dev: number | bigint; ino: number | bigint; uid: number }>
   write(buffer: Uint8Array, offset: number, length: number): Promise<{ bytesWritten: number }>
   truncate(length: number): Promise<void>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+type HostedLifecycleWalDirectoryHandle = {
+  stat(): Promise<{ isDirectory(): boolean; mode: number; dev: number | bigint; ino: number | bigint; uid: number }>
   sync(): Promise<void>
   close(): Promise<void>
 }
 
 export type HostedLifecycleAuthorityWalOptions = {
   openAppend?: (path: string, flags: number, mode: number) => Promise<HostedLifecycleWalAppendHandle>
+  openDirectory?: (path: string, flags: number) => Promise<HostedLifecycleWalDirectoryHandle>
 }
 
 export type HostedLifecycleDurableAuthorization = {
@@ -29,6 +35,8 @@ export type HostedLifecycleDurableAuthorization = {
   workspaceId: string
   teamId: string
   restoreGeneration: number
+  mountGeneration: number
+  ownerEffectFence: { grantRevision: string; identityChecksum: string }
 }
 export type HostedLifecycleDurableCommand = {
   schemaVersion: 1
@@ -47,12 +55,15 @@ export type HostedLifecycleDurableBinding = {
   bootId: string
   authorizedScope: string
   restoreGeneration: number
+  mountGeneration: number
+  ownerEffectFence: { grantRevision: string; identityChecksum: string }
 }
 export type HostedLifecyclePublicResult = Record<string, unknown>
+export type HostedLifecycleWireDurableCommand = Record<string, unknown>
 export type HostedLifecycleWalEntry =
   | { schemaVersion: 1; kind: 'grant'; fingerprint: string; command: HostedLifecycleDurableCommand; binding: HostedLifecycleDurableBinding; authorization: HostedLifecycleDurableAuthorization }
-  | { schemaVersion: 1; kind: 'started'; fingerprint: string; command: HostedLifecycleDurableCommand; authorization: HostedLifecycleDurableAuthorization }
-  | { schemaVersion: 1; kind: 'completed'; fingerprint: string; command: HostedLifecycleDurableCommand; authorization: HostedLifecycleDurableAuthorization; result: HostedLifecyclePublicResult }
+  | { schemaVersion: 1; kind: 'started'; fingerprint: string; command: HostedLifecycleDurableCommand; durableCommand: HostedLifecycleWireDurableCommand; authorization: HostedLifecycleDurableAuthorization }
+  | { schemaVersion: 1; kind: 'completed'; fingerprint: string; command: HostedLifecycleDurableCommand; durableCommand: HostedLifecycleWireDurableCommand; authorization: HostedLifecycleDurableAuthorization; result: HostedLifecyclePublicResult }
   | { schemaVersion: 1; kind: 'released'; grantId: string }
 
 export type HostedLifecycleWalState = {
@@ -61,10 +72,37 @@ export type HostedLifecycleWalState = {
   released: Set<string>
 }
 
+export function createHostedLifecycleGrantFingerprint(
+  command: HostedLifecycleDurableCommand,
+  binding: HostedLifecycleDurableBinding,
+): string {
+  return createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-authorization/v1',
+    command.schemaVersion,
+    command.action,
+    command.commandId,
+    command.idempotencyKey,
+    command.workspaceId,
+    command.teamId,
+    command.expectedRevision,
+    command.action === 'launch' ? null : command.runId,
+    binding.actorId,
+    binding.sessionId,
+    binding.deploymentId,
+    binding.bootId,
+    binding.authorizedScope,
+    binding.restoreGeneration,
+    binding.mountGeneration,
+    binding.ownerEffectFence.grantRevision,
+    binding.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+}
+
 export class HostedLifecycleAuthorityWal {
   readonly path: string
   readonly lockPath: string
   readonly #openAppend: NonNullable<HostedLifecycleAuthorityWalOptions['openAppend']>
+  readonly #openDirectory: NonNullable<HostedLifecycleAuthorityWalOptions['openDirectory']>
   #lockHeld = false
   constructor(
     private readonly directory: string,
@@ -75,6 +113,7 @@ export class HostedLifecycleAuthorityWal {
     this.path = join(directory, 'hosted-lifecycle-authority.wal.v1.jsonl')
     this.lockPath = join(directory, 'hosted-lifecycle-authority.lock')
     this.#openAppend = options.openAppend ?? (async (path, flags, mode) => open(path, flags, mode))
+    this.#openDirectory = options.openDirectory ?? (async (path, flags) => open(path, flags))
   }
 
   async withLock<T>(operation: () => Promise<T>): Promise<T | undefined> {
@@ -118,9 +157,7 @@ export class HostedLifecycleAuthorityWal {
       for (const line of lines) {
         if (!line) continue
         const entry = decodeEntry(JSON.parse(line), this.teamId)
-        if (entry.kind === 'grant') state.grants.set(entry.authorization.grantId, entry)
-        else if (entry.kind === 'released') state.released.add(entry.grantId)
-        else state.commands.set(entry.command.idempotencyKey, entry)
+        applyEntry(state, entry)
       }
       return state
     } finally { await handle.close() }
@@ -138,7 +175,8 @@ export class HostedLifecycleAuthorityWal {
     try {
       const stat = await handle.stat()
       originalSize = stat.size
-      if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size + line.byteLength > MAX_WAL_BYTES) {
+      await this.#assertCurrentWalHandle(stat)
+      if (stat.size + line.byteLength > MAX_WAL_BYTES) {
         throw new Error('Unsafe or oversized hosted lifecycle WAL')
       }
       try {
@@ -152,12 +190,48 @@ export class HostedLifecycleAuthorityWal {
           offset += bytesWritten
         }
         await handle.sync()
+        await this.#assertCurrentWalHandle(stat)
+        await this.#syncDirectory()
+        await this.#assertCurrentWalHandle(stat)
       } catch (error) {
         try { await handle.truncate(originalSize); await handle.sync() } catch {}
         throw error
       }
     } finally { await handle.close() }
-    await fsyncFileAndParent(this.path)
+  }
+
+  async #assertCurrentWalHandle(stat: Awaited<ReturnType<HostedLifecycleWalAppendHandle['stat']>>): Promise<void> {
+    const current = await lstat(this.path)
+    const uid = process.getuid?.()
+    if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
+      stat.ino !== current.ino || stat.uid !== current.uid || stat.mode !== current.mode || (stat.mode & 0o077) !== 0 ||
+      (current.mode & 0o077) !== 0 || (uid !== undefined && (stat.uid !== uid || current.uid !== uid))) {
+      throw new Error('Unsafe hosted lifecycle WAL path-handle correlation')
+    }
+  }
+
+  async #syncDirectory(): Promise<void> {
+    const handle = await this.#openDirectory(
+      this.directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0),
+    )
+    try {
+      const stat = await handle.stat()
+      await this.#assertCurrentDirectoryHandle(stat)
+      await handle.sync()
+      await this.#assertCurrentDirectoryHandle(stat)
+    } finally { await handle.close() }
+  }
+
+  async #assertCurrentDirectoryHandle(
+    stat: Awaited<ReturnType<HostedLifecycleWalDirectoryHandle['stat']>>,
+  ): Promise<void> {
+    const current = await lstat(this.directory)
+    if (!stat.isDirectory() || !current.isDirectory() || current.isSymbolicLink() || stat.dev !== current.dev ||
+      stat.ino !== current.ino || stat.uid !== current.uid || stat.mode !== current.mode || (stat.mode & 0o022) !== 0 ||
+      (process.getuid?.() !== undefined && stat.uid !== process.getuid())) {
+      throw new Error('Unsafe hosted lifecycle WAL directory sync')
+    }
   }
 
   async #prepareDirectory(): Promise<void> {
@@ -179,7 +253,6 @@ export class HostedLifecycleAuthorityWal {
       throw error
     })
     if (!handle) return
-    let repaired = false
     try {
       const stat = await handle.stat(); const current = await lstat(this.path)
       if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
@@ -192,10 +265,60 @@ export class HostedLifecycleAuthorityWal {
       const lastNewline = bytes.lastIndexOf(0x0a)
       await handle.truncate(lastNewline + 1)
       await handle.sync()
-      repaired = true
+      await this.#syncDirectory()
     } finally { await handle.close() }
-    if (repaired) await fsyncFileAndParent(this.path)
   }
+}
+
+function applyEntry(state: HostedLifecycleWalState, entry: HostedLifecycleWalEntry): void {
+  if (entry.kind === 'grant') {
+    if (state.grants.has(entry.authorization.grantId) || [...state.grants.values()].some(existing =>
+      walCommandKey(existing.command, existing.authorization) === walCommandKey(entry.command, entry.authorization))) {
+      throw new Error('Invalid duplicate hosted lifecycle WAL grant')
+    }
+    state.grants.set(entry.authorization.grantId, entry)
+    return
+  }
+  if (entry.kind === 'released') {
+    if (!state.grants.has(entry.grantId) || state.released.has(entry.grantId)) {
+      throw new Error('Invalid hosted lifecycle WAL release ordering')
+    }
+    const grant = state.grants.get(entry.grantId)!
+    if (state.commands.get(walCommandKey(grant.command, grant.authorization))?.kind === 'started') {
+      throw new Error('Invalid hosted lifecycle WAL ambiguous release')
+    }
+    state.released.add(entry.grantId)
+    return
+  }
+  const grant = state.grants.get(entry.authorization.grantId)
+  if (!grant || state.released.has(entry.authorization.grantId) ||
+    !isSameJson(grant.command, entry.command) || !isSameJson(grant.authorization, entry.authorization)) {
+    throw new Error('Invalid hosted lifecycle WAL command ordering')
+  }
+  const key = walCommandKey(entry.command, entry.authorization)
+  const prior = state.commands.get(key)
+  if (entry.kind === 'started') {
+    if (prior) throw new Error('Invalid duplicate hosted lifecycle WAL start')
+    state.commands.set(key, entry)
+    return
+  }
+  if (!prior || prior.kind !== 'started' || prior.fingerprint !== entry.fingerprint ||
+    !isSameJson(prior.durableCommand, entry.durableCommand) ||
+    !isSameJson(prior.authorization, entry.authorization)) {
+    throw new Error('Invalid hosted lifecycle WAL completion ordering')
+  }
+  state.commands.set(key, entry)
+}
+
+function isSameJson(left: unknown, right: unknown): boolean {
+  return isDeepStrictEqual(left, right)
+}
+
+function walCommandKey(
+  command: HostedLifecycleDurableCommand,
+  authorization: HostedLifecycleDurableAuthorization,
+): string {
+  return `${authorization.deploymentId}\0${authorization.actorId}\0${command.action}\0${command.idempotencyKey}`
 }
 
 function decodeEntry(value: unknown, teamId: string): HostedLifecycleWalEntry {
@@ -208,19 +331,24 @@ function decodeEntry(value: unknown, teamId: string): HostedLifecycleWalEntry {
     return entry
   }
   exact(raw, entry.kind === 'completed'
-    ? ['schemaVersion', 'kind', 'fingerprint', 'command', 'authorization', 'result']
+    ? ['schemaVersion', 'kind', 'fingerprint', 'command', 'durableCommand', 'authorization', 'result']
     : entry.kind === 'started'
-      ? ['schemaVersion', 'kind', 'fingerprint', 'command', 'authorization']
+      ? ['schemaVersion', 'kind', 'fingerprint', 'command', 'durableCommand', 'authorization']
       : ['schemaVersion', 'kind', 'fingerprint', 'command', 'binding', 'authorization'], entry.kind)
   const command = decodeCommand(entry.command, teamId)
   const authorization = decodeAuthorization(entry.authorization, command)
   pattern(entry.fingerprint, /^[0-9a-f]{64}$/, 'fingerprint')
+  if (entry.kind === 'started' || entry.kind === 'completed') {
+    decodeWireDurableCommand(entry.durableCommand, command, authorization)
+  }
   if (entry.kind === 'grant') {
     const binding = decodeBinding(entry.binding)
-    const expected = createHash('sha256').update(JSON.stringify({ command, binding })).digest('hex')
+    const expected = createHostedLifecycleGrantFingerprint(command, binding)
     if (entry.fingerprint !== expected || binding.actorId !== authorization.actorId ||
       binding.deploymentId !== authorization.deploymentId || binding.bootId !== authorization.bootId ||
-      binding.restoreGeneration !== authorization.restoreGeneration) {
+      binding.restoreGeneration !== authorization.restoreGeneration ||
+      binding.mountGeneration !== authorization.mountGeneration ||
+      !isDeepStrictEqual(binding.ownerEffectFence, authorization.ownerEffectFence)) {
       throw new Error('Invalid hosted lifecycle WAL grant binding')
     }
   }
@@ -246,12 +374,14 @@ function decodeCommand(value: unknown, teamId: string): HostedLifecycleDurableCo
 }
 function decodeAuthorization(value: unknown, command: HostedLifecycleDurableCommand): HostedLifecycleDurableAuthorization {
   const raw = object(value, 'authorization')
-  exact(raw, ['grantId', 'authorizationGeneration', 'deploymentId', 'bootId', 'resourceRevision', 'actorId', 'workspaceId', 'teamId', 'restoreGeneration'], 'authorization')
+  exact(raw, ['grantId', 'authorizationGeneration', 'deploymentId', 'bootId', 'resourceRevision', 'actorId', 'workspaceId', 'teamId', 'restoreGeneration', 'mountGeneration', 'ownerEffectFence'], 'authorization')
   pattern(raw.grantId, /^grant_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'grantId')
   pattern(raw.authorizationGeneration, /^authorization-generation_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'authorizationGeneration')
   for (const key of ['deploymentId', 'bootId', 'actorId', 'workspaceId', 'teamId'] as const) nonEmpty(raw[key], key)
   pattern(raw.resourceRevision, /^revision_[A-Za-z0-9][A-Za-z0-9._-]{0,246}$/, 'authorization revision')
+  decodeFence(raw.ownerEffectFence)
   if (!Number.isSafeInteger(raw.restoreGeneration) || (raw.restoreGeneration as number) < 0 ||
+    !Number.isSafeInteger(raw.mountGeneration) || (raw.mountGeneration as number) < 1 ||
     raw.workspaceId !== command.workspaceId || raw.teamId !== command.teamId || raw.resourceRevision !== command.expectedRevision) {
     throw new Error('Invalid hosted lifecycle WAL authorization scope')
   }
@@ -259,10 +389,54 @@ function decodeAuthorization(value: unknown, command: HostedLifecycleDurableComm
 }
 function decodeBinding(value: unknown): HostedLifecycleDurableBinding {
   const raw = object(value, 'binding')
-  exact(raw, ['actorId', 'sessionId', 'deploymentId', 'bootId', 'authorizedScope', 'restoreGeneration'], 'binding')
+  exact(raw, ['actorId', 'sessionId', 'deploymentId', 'bootId', 'authorizedScope', 'restoreGeneration', 'mountGeneration', 'ownerEffectFence'], 'binding')
   for (const key of ['actorId', 'sessionId', 'deploymentId', 'bootId', 'authorizedScope'] as const) nonEmpty(raw[key], key)
-  if (!Number.isSafeInteger(raw.restoreGeneration) || (raw.restoreGeneration as number) < 0) throw new Error('Invalid hosted lifecycle WAL binding')
+  decodeFence(raw.ownerEffectFence)
+  if (!Number.isSafeInteger(raw.restoreGeneration) || (raw.restoreGeneration as number) < 0 ||
+    !Number.isSafeInteger(raw.mountGeneration) || (raw.mountGeneration as number) < 1) throw new Error('Invalid hosted lifecycle WAL binding')
   return value as HostedLifecycleDurableBinding
+}
+function decodeFence(value: unknown): void {
+  const raw = object(value, 'ownerEffectFence')
+  exact(raw, ['grantRevision', 'identityChecksum'], 'ownerEffectFence')
+  pattern(raw.grantRevision, /^[0-9a-f]{64}$/, 'grantRevision')
+  pattern(raw.identityChecksum, /^[0-9a-f]{64}$/, 'identityChecksum')
+}
+function decodeWireDurableCommand(
+  value: unknown,
+  command: HostedLifecycleDurableCommand,
+  authorization: HostedLifecycleDurableAuthorization,
+): void {
+  const raw = object(value, 'durableCommand')
+  exact(raw, ['schemaVersion', 'commandFingerprint', 'idempotency', 'resource'], 'durableCommand')
+  if (raw.schemaVersion !== 1) throw new Error('Invalid hosted lifecycle durable command')
+  const fingerprint = object(raw.commandFingerprint, 'commandFingerprint')
+  exact(fingerprint, ['algorithm', 'version', 'digest'], 'commandFingerprint')
+  if (fingerprint.algorithm !== 'sha256' || fingerprint.version !== 1) throw new Error('Invalid hosted lifecycle command fingerprint')
+  pattern(fingerprint.digest, /^[0-9a-f]{64}$/, 'command fingerprint')
+  const idempotency = object(raw.idempotency, 'idempotency')
+  exact(idempotency, ['deploymentId', 'actorId', 'action', 'idempotencyKey'], 'idempotency')
+  const resource = object(raw.resource, 'resource')
+  exact(resource, ['bootId', 'workspaceId', 'teamId', 'runId', 'expectedRevision', 'restoreGeneration', 'mountGeneration', 'ownerEffectFence'], 'resource')
+  decodeFence(resource.ownerEffectFence)
+  if (idempotency.deploymentId !== authorization.deploymentId || idempotency.actorId !== authorization.actorId ||
+    idempotency.action !== command.action || idempotency.idempotencyKey !== command.idempotencyKey ||
+    resource.bootId !== authorization.bootId || resource.workspaceId !== command.workspaceId ||
+    resource.teamId !== command.teamId || resource.runId !== (command.action === 'launch' ? null : command.runId) ||
+    resource.expectedRevision !== command.expectedRevision || resource.restoreGeneration !== authorization.restoreGeneration ||
+    resource.mountGeneration !== authorization.mountGeneration ||
+    !isDeepStrictEqual(resource.ownerEffectFence, authorization.ownerEffectFence)) {
+    throw new Error('Invalid hosted lifecycle durable command scope')
+  }
+  const expectedFingerprint = createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+    command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    authorization.ownerEffectFence.grantRevision, authorization.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+  if (fingerprint.digest !== expectedFingerprint) {
+    throw new Error('Invalid hosted lifecycle durable command fingerprint')
+  }
 }
 function decodeResult(value: unknown, command: HostedLifecycleDurableCommand): void {
   const raw = object(value, 'result')

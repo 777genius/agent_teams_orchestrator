@@ -22,6 +22,11 @@ export interface TeamLifecycleLaneEffectPort {
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
 
+export function createProductionOpenCodeTeamLifecycleLane(): OpenCodeTeamLifecycleLane {
+  const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor()
+  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, () => true)
+}
+
 /** Existing OpenCode bridge is the sole production effect owner for OpenCode sessions. */
 export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const

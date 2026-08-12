@@ -15,6 +15,8 @@ const lifecycleAuthority: HostedLifecycleAuthority = {
   restoreGeneration: 1,
   bootId: 'boot-a',
   resourceRevision: 'revision_1',
+  mountGeneration: 1,
+  ownerEffectFence: { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) },
 }
 
 afterEach(async () => {

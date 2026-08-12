@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +15,7 @@ const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
 
 const teamId = `team_${'a'.repeat(32)}`
+const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) }
 const plan: TeamLifecycleLaunchPlan = {
   schemaVersion: 1,
   workspaceId: 'workspace-a',
@@ -23,6 +25,27 @@ const plan: TeamLifecycleLaunchPlan = {
     laneId: 'codex-primary', kind: 'native', provider: 'codex',
     members: [{ name: 'worker', prompt: 'Work on the admitted task.' }],
   }],
+}
+
+function durableLaunchCommand(command: {
+  schemaVersion: 1; action: 'launch'; commandId: string; idempotencyKey: string
+  workspaceId: string; teamId: string; expectedRevision: string
+}, authorization: {
+  deploymentId: string; actorId: string; bootId: string; restoreGeneration: number; mountGeneration: number
+  ownerEffectFence: typeof ownerEffectFence
+}) {
+  const digest = createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+    command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+    command.expectedRevision, null, authorization.ownerEffectFence.grantRevision,
+    authorization.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+  return {
+    schemaVersion: 1,
+    commandFingerprint: { algorithm: 'sha256', version: 1, digest },
+    idempotency: { deploymentId: authorization.deploymentId, actorId: authorization.actorId, action: command.action, idempotencyKey: command.idempotencyKey },
+    resource: { bootId: authorization.bootId, workspaceId: command.workspaceId, teamId: command.teamId, runId: null, expectedRevision: command.expectedRevision, restoreGeneration: authorization.restoreGeneration, mountGeneration: authorization.mountGeneration, ownerEffectFence: authorization.ownerEffectFence },
+  }
 }
 
 class Store implements TeamLifecycleLaunchPlanStore {
@@ -100,7 +123,9 @@ describe('createTeamLifecycleAuthorityComposition', () => {
       deploymentId: 'deployment-a',
       bootId: 'boot-a',
       restoreGeneration: 1,
+      mountGeneration: 1,
       resourceRevision: 'revision-before-read',
+      ownerEffectFence,
     }
     const state = await composition.authority.getControlState({
       request: { schemaVersion: 1, workspaceId: plan.workspaceId, teamId },
@@ -136,7 +161,7 @@ describe('createTeamLifecycleAuthorityComposition', () => {
     }
     const initialAuthority: HostedLifecycleAuthority = {
       actorId: 'actor-a', workspaceId: plan.workspaceId, teamId, deploymentId: 'deployment-a', bootId: 'boot-a',
-      restoreGeneration: 1, resourceRevision: 'revision-before-read',
+      restoreGeneration: 1, mountGeneration: 1, resourceRevision: 'revision-before-read', ownerEffectFence,
     }
     const state = await service.getControlState({
       request: { schemaVersion: 1, workspaceId: plan.workspaceId, teamId }, context, authority: initialAuthority,
@@ -158,7 +183,9 @@ describe('createTeamLifecycleAuthorityComposition', () => {
     // The authority resolve sees admission A, then the path atomically advances to B before adapter.execute.
     store.replaceAfterNextLoad = true
     await expect(service.execute({
-      command, authorization: authorized.authorization, context, authority: currentAuthority,
+      command, authorization: authorized.authorization,
+      durableCommand: durableLaunchCommand(command, authorized.authorization),
+      context, authority: currentAuthority,
     })).resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
     expect(execution.launches).toBe(0)
   })

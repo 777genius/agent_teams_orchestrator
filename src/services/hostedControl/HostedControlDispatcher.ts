@@ -1,6 +1,10 @@
-import { timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { createHostedDomainProof } from './ownerProof.js'
+import {
+  createHostedDomainProof,
+  createHostedRawDomainProof,
+  parseStrictHostedSignedJsonFrame,
+} from './ownerProof.js'
 import type {
   HostedControlAuthority,
   HostedControlOwnerBinding,
@@ -13,8 +17,14 @@ import {
 
 const LIFECYCLE_OPERATIONS = [
   'control_state',
+  'prepare',
+  'get_status',
+  // Compatibility spellings used by the first hosted-controller prototype.
+  'prepare_provisioning',
+  'get_provisioning_status',
   'authorize',
   'revalidate',
+  'replay_lookup',
   'execute',
   'release',
 ] as const
@@ -29,8 +39,15 @@ export type HostedLifecycleAuthority = {
   teamId: string
   deploymentId: string
   restoreGeneration: number
+  mountGeneration: number
   bootId: string
   resourceRevision: string | null
+  ownerEffectFence: HostedLifecycleOwnerEffectFence
+}
+
+export type HostedLifecycleOwnerEffectFence = {
+  grantRevision: string
+  identityChecksum: string
 }
 
 export type HostedLifecycleCommandPort = {
@@ -60,9 +77,9 @@ export type HostedControlDispatcherOptions = {
 export class HostedControlDispatcher {
   constructor(private readonly options: HostedControlDispatcherOptions) {}
 
-  async dispatch(message: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+  async dispatch(message: Record<string, unknown>, rawLine = JSON.stringify(message)): Promise<Record<string, unknown> | null> {
     if (isLifecycleOperation(message.operation)) {
-      return this.#dispatchLifecycle(message)
+      return this.#dispatchLifecycle(message, rawLine)
     }
     if (isMessageOperation(message.operation)) {
       return this.#dispatchMessage(message)
@@ -70,12 +87,16 @@ export class HostedControlDispatcher {
     return null
   }
 
-  async #dispatchLifecycle(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async #dispatchLifecycle(message: Record<string, unknown>, rawLine: string): Promise<Record<string, unknown>> {
+    const signed = parseStrictHostedSignedJsonFrame(rawLine)
+    if (!isDeepStrictEqual(signed.value, message)) throw new Error('Invalid hosted lifecycle raw frame')
     exactKeys(message, [
       'schemaVersion',
       'exchangeId',
       'operation',
+      'provenance',
       'ownerBinding',
+      'ownerEffectFence',
       'payload',
       'ownerProof',
     ], 'lifecycle request')
@@ -91,15 +112,35 @@ export class HostedControlDispatcher {
     if (!activeOwner || !isDeepStrictEqual(ownerBinding, activeOwner)) {
       throw new Error('Invalid hosted lifecycle owner binding')
     }
-    const payload = decodeLifecyclePayload(operation, message.payload, this.options.authority)
+    const ownerEffectFence = decodeOwnerEffectFence(message.ownerEffectFence)
+    const expectedIdentityChecksum = createHostedLifecycleOwnerIdentityChecksum(activeOwner, this.options.authority)
+    if (ownerEffectFence.identityChecksum !== expectedIdentityChecksum) {
+      throw new Error('Invalid hosted lifecycle owner effect identity')
+    }
+    const payload = decodeLifecyclePayload(operation, message.payload, this.options.authority, ownerEffectFence)
+    const provenance = decodeLifecycleRequestProvenance(
+      message.provenance,
+      payload,
+      activeOwner,
+      String(message.exchangeId),
+      operation,
+    )
     const unsigned = {
       schemaVersion: 2,
       exchangeId: message.exchangeId,
       operation,
+      provenance,
       ownerBinding: activeOwner,
+      ownerEffectFence,
       payload,
     }
-    verifyDomainProof(this.options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', message.ownerProof, unsigned)
+    verifyRawDomainProof(
+      this.options.secret,
+      HOSTED_LIFECYCLE_PROOF_DOMAIN,
+      'request',
+      signed.ownerProof,
+      signed.serializedUnsignedEnvelope,
+    )
     const result = await this.options.lifecycle.dispatch({
       operation,
       payload,
@@ -111,22 +152,21 @@ export class HostedControlDispatcher {
       throw new Error('Invalid hosted lifecycle response revision')
     }
     const responseAuthority = { ...payload.authority, resourceRevision }
+    const responseProvenance = reverseLifecycleProvenance(provenance)
     const envelope = {
       schemaVersion: 2,
       exchangeId: message.exchangeId,
       operation,
+      provenance: responseProvenance,
       ownerBinding: activeOwner,
+      ownerEffectFence,
       authority: responseAuthority,
       payload: responsePayload,
     }
     return {
       ...envelope,
-      ownerProof: createHostedDomainProof(
-        this.options.secret,
-        HOSTED_LIFECYCLE_PROOF_DOMAIN,
-        'response',
-        envelope,
-      ),
+      ownerProof: createHostedRawDomainProof(this.options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN,
+        'response', JSON.stringify(envelope)),
     }
   }
 
@@ -183,20 +223,48 @@ export class HostedControlDispatcher {
   }
 }
 
+export function createHostedLifecycleOwnerIdentityChecksum(
+  ownerBinding: HostedControlOwnerBinding,
+  authority: HostedControlStableAuthority,
+): string {
+  return createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-owner-effect-identity/v1',
+    ownerBinding.ownerAuthority,
+    ownerBinding.ownerGeneration,
+    ownerBinding.ownerSessionId,
+    ownerBinding.socketIdentity.device,
+    ownerBinding.socketIdentity.inode,
+    ownerBinding.socketIdentity.uid,
+    ownerBinding.socketIdentity.gid,
+    ownerBinding.socketIdentity.mode,
+    authority.deploymentId,
+    authority.bootId,
+    authority.restoreGeneration,
+    authority.workspaceId,
+    authority.mountBinding.mountGeneration,
+    authority.mountBinding.declaredRootHash,
+    authority.teamId,
+  ])).digest('hex')
+}
+
 function decodeLifecyclePayload(
   operation: HostedLifecycleOperation,
   value: unknown,
   expected: HostedControlStableAuthority,
+  expectedOwnerEffectFence: HostedLifecycleOwnerEffectFence,
 ): Record<string, unknown> & { authority: HostedLifecycleAuthority } {
   const payload = record(value, 'lifecycle payload')
-  const expectedKeys = operation === 'control_state'
+  const queryOperation = isLifecycleQueryOperation(operation)
+  const expectedKeys = queryOperation
     ? ['request', 'context', 'authority']
     : operation === 'authorize'
       ? ['command', 'context', 'authority']
-      : ['command', 'authorization', 'context', 'authority']
+      : operation === 'revalidate' || operation === 'release'
+        ? ['command', 'authorization', 'context', 'authority']
+        : ['command', 'authorization', 'durableCommand', 'context', 'authority']
   exactKeys(payload, expectedKeys, 'lifecycle payload')
-  record(payload[operation === 'control_state' ? 'request' : 'command'], 'lifecycle command')
-  if (operation !== 'control_state' && operation !== 'authorize') {
+  record(payload[queryOperation ? 'request' : 'command'], 'lifecycle command')
+  if (!queryOperation && operation !== 'authorize') {
     record(payload.authorization, 'lifecycle authorization')
   }
   const context = record(payload.context, 'lifecycle context')
@@ -224,8 +292,13 @@ function decodeLifecyclePayload(
     authority.teamId !== expected.teamId ||
     authority.deploymentId !== expected.deploymentId ||
     authority.restoreGeneration !== expected.restoreGeneration ||
+    authority.mountGeneration !== expected.mountBinding.mountGeneration ||
+    !isDeepStrictEqual(authority.ownerEffectFence, expectedOwnerEffectFence) ||
     authority.bootId !== expected.bootId) {
     throw new Error('Invalid hosted lifecycle authority')
+  }
+  if (operation === 'replay_lookup' || operation === 'execute') {
+    decodeDurableCommand(payload.durableCommand, payload.command, expectedOwnerEffectFence, expected, authority.actorId)
   }
   return { ...payload, authority }
 }
@@ -247,8 +320,10 @@ function decodeLifecycleAuthority(value: unknown): HostedLifecycleAuthority {
     'teamId',
     'deploymentId',
     'restoreGeneration',
+    'mountGeneration',
     'bootId',
     'resourceRevision',
+    'ownerEffectFence',
   ], 'lifecycle authority')
   return {
     actorId: nonEmptyString(authority.actorId, 'lifecycle authority.actorId'),
@@ -256,9 +331,100 @@ function decodeLifecycleAuthority(value: unknown): HostedLifecycleAuthority {
     teamId: nonEmptyString(authority.teamId, 'lifecycle authority.teamId'),
     deploymentId: nonEmptyString(authority.deploymentId, 'lifecycle authority.deploymentId'),
     restoreGeneration: nonNegativeInteger(authority.restoreGeneration, 'lifecycle authority.restoreGeneration'),
+    mountGeneration: positiveInteger(authority.mountGeneration, 'lifecycle authority.mountGeneration'),
     bootId: nonEmptyString(authority.bootId, 'lifecycle authority.bootId'),
     resourceRevision: nullableRevision(authority.resourceRevision),
+    ownerEffectFence: decodeOwnerEffectFence(authority.ownerEffectFence),
   }
+}
+
+function decodeOwnerEffectFence(value: unknown): HostedLifecycleOwnerEffectFence {
+  const fence = record(value, 'lifecycle owner effect fence')
+  exactKeys(fence, ['grantRevision', 'identityChecksum'], 'lifecycle owner effect fence')
+  return {
+    grantRevision: patternString(fence.grantRevision, /^[0-9a-f]{64}$/, 'grantRevision'),
+    identityChecksum: patternString(fence.identityChecksum, /^[0-9a-f]{64}$/, 'identityChecksum'),
+  }
+}
+
+function decodeDurableCommand(
+  value: unknown,
+  commandValue: unknown,
+  ownerEffectFence: HostedLifecycleOwnerEffectFence,
+  expected: HostedControlStableAuthority,
+  actorId: string,
+): void {
+  const durable = record(value, 'lifecycle durable command')
+  exactKeys(durable, ['schemaVersion', 'commandFingerprint', 'idempotency', 'resource'], 'lifecycle durable command')
+  if (durable.schemaVersion !== 1) throw new Error('Invalid durable command schema')
+  const fingerprint = record(durable.commandFingerprint, 'lifecycle command fingerprint')
+  exactKeys(fingerprint, ['algorithm', 'version', 'digest'], 'lifecycle command fingerprint')
+  if (fingerprint.algorithm !== 'sha256' || fingerprint.version !== 1) throw new Error('Invalid command fingerprint')
+  patternString(fingerprint.digest, /^[0-9a-f]{64}$/, 'command fingerprint digest')
+  const command = record(commandValue, 'lifecycle command')
+  const idempotency = record(durable.idempotency, 'lifecycle durable idempotency')
+  exactKeys(idempotency, ['deploymentId', 'actorId', 'action', 'idempotencyKey'], 'lifecycle durable idempotency')
+  const resource = record(durable.resource, 'lifecycle durable resource')
+  exactKeys(resource, [
+    'bootId', 'workspaceId', 'teamId', 'runId', 'expectedRevision', 'restoreGeneration',
+    'mountGeneration', 'ownerEffectFence',
+  ], 'lifecycle durable resource')
+  if (idempotency.deploymentId !== expected.deploymentId || idempotency.actorId !== actorId ||
+    idempotency.action !== command.action || idempotency.idempotencyKey !== command.idempotencyKey ||
+    resource.bootId !== expected.bootId || resource.restoreGeneration !== expected.restoreGeneration ||
+    resource.mountGeneration !== expected.mountBinding.mountGeneration ||
+    resource.workspaceId !== command.workspaceId || resource.teamId !== command.teamId ||
+    resource.expectedRevision !== command.expectedRevision ||
+    resource.runId !== (command.action === 'launch' ? null : command.runId) ||
+    !isDeepStrictEqual(decodeOwnerEffectFence(resource.ownerEffectFence), ownerEffectFence)) {
+    throw new Error('Invalid durable command correlation')
+  }
+  const preimage = [
+    'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
+    command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
+    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    ownerEffectFence.grantRevision, ownerEffectFence.identityChecksum,
+  ]
+  const expectedDigest = createHash('sha256').update(JSON.stringify(preimage)).digest('hex')
+  if (fingerprint.digest !== expectedDigest) throw new Error('Invalid durable command fingerprint')
+}
+
+type LifecycleWireProvenance = {
+  from: Record<string, unknown>
+  to: Record<string, unknown>
+  target: Record<string, unknown>
+}
+
+function decodeLifecycleRequestProvenance(
+  value: unknown,
+  payload: Record<string, unknown>,
+  owner: HostedControlOwnerBinding,
+  exchangeId: string,
+  operation: HostedLifecycleOperation,
+): LifecycleWireProvenance {
+  const provenance = record(value, 'lifecycle provenance')
+  exactKeys(provenance, ['from', 'to', 'target'], 'lifecycle provenance')
+  const from = record(provenance.from, 'lifecycle provenance.from')
+  exactKeys(from, ['kind', 'deploymentId', 'bootId', 'actorId', 'sessionId'], 'lifecycle provenance.from')
+  const to = record(provenance.to, 'lifecycle provenance.to')
+  exactKeys(to, ['kind', 'ownerAuthority', 'ownerGeneration', 'ownerSessionId'], 'lifecycle provenance.to')
+  const target = record(provenance.target, 'lifecycle provenance.target')
+  exactKeys(target, ['capability', 'exchangeId', 'operation', 'workspaceId', 'teamId'], 'lifecycle provenance.target')
+  const context = record(payload.context, 'lifecycle context')
+  const authority = payload.authority as HostedLifecycleAuthority
+  if (from.kind !== 'controller' || from.deploymentId !== context.deploymentId ||
+    from.bootId !== context.bootId || from.actorId !== context.actorId || from.sessionId !== context.sessionId ||
+    to.kind !== 'owner' || to.ownerAuthority !== owner.ownerAuthority ||
+    to.ownerGeneration !== owner.ownerGeneration || to.ownerSessionId !== owner.ownerSessionId ||
+    target.capability !== 'hosted-lifecycle-command' || target.exchangeId !== exchangeId ||
+    target.operation !== operation || target.workspaceId !== authority.workspaceId || target.teamId !== authority.teamId) {
+    throw new Error('Invalid hosted lifecycle provenance')
+  }
+  return { from, to, target }
+}
+
+function reverseLifecycleProvenance(value: LifecycleWireProvenance): LifecycleWireProvenance {
+  return { from: value.to, to: value.from, target: value.target }
 }
 
 function decodeMessageAuthority(value: unknown): HostedControlAuthority {
@@ -294,7 +460,8 @@ function decodeLifecycleResponsePayload(
   request: Record<string, unknown> & { authority: HostedLifecycleAuthority },
 ): Record<string, unknown> {
   const payload = record(value, 'lifecycle response payload')
-  if (payload.schemaVersion !== (operation === 'control_state' ? 1 : 2) || typeof payload.kind !== 'string') {
+  const queryOperation = isLifecycleQueryOperation(operation)
+  if (payload.schemaVersion !== (queryOperation ? 1 : 2) || typeof payload.kind !== 'string') {
     throw new Error('Invalid hosted lifecycle response payload')
   }
   if (payload.kind === 'unavailable') {
@@ -302,15 +469,20 @@ function decodeLifecycleResponsePayload(
     lifecycleRetryAfter(payload.retryAfterMs)
     return payload
   }
-  if (operation === 'control_state') {
+  if (queryOperation) {
     if (payload.kind === 'not_found') {
       exactKeys(payload, ['schemaVersion', 'kind'], 'lifecycle not found response')
       return payload
     }
-    if (payload.kind !== 'control_state') throw new Error('Invalid hosted lifecycle control state response')
+    const expectedKind = operation === 'control_state' ? 'control_state' :
+      operation === 'prepare' || operation === 'prepare_provisioning' ? 'prepared' :
+        operation === 'get_status' ? 'status' : 'provisioning_status'
+    if (payload.kind !== expectedKind) throw new Error('Invalid hosted lifecycle projection response')
+    const extension = operation === 'prepare' || operation === 'prepare_provisioning' ? ['lanes'] :
+      operation === 'get_status' || operation === 'get_provisioning_status' ? ['recentCommands'] : []
     exactKeys(payload, [
       'schemaVersion', 'kind', 'workspaceId', 'teamId', 'deploymentId', 'bootId',
-      'runId', 'resourceRevision', 'availableActions',
+      'runId', 'resourceRevision', 'availableActions', ...extension,
     ], 'lifecycle control state response')
     nonEmptyString(payload.workspaceId, 'control state workspaceId')
     nonEmptyString(payload.teamId, 'control state teamId')
@@ -327,11 +499,15 @@ function decodeLifecycleResponsePayload(
       new Set(payload.availableActions).size !== payload.availableActions.length) {
       throw new Error('Invalid hosted lifecycle available actions')
     }
+    if (operation === 'prepare' || operation === 'prepare_provisioning') decodePreparedLanes(payload.lanes)
+    if (operation === 'get_status' || operation === 'get_provisioning_status') decodeRecentCommands(payload.recentCommands)
     return payload
   }
   if (operation === 'release') {
-    exactKeys(payload, ['schemaVersion', 'kind'], 'lifecycle release response')
-    if (payload.kind !== 'released') throw new Error('Invalid hosted lifecycle release response')
+    exactKeys(payload, ['schemaVersion', 'kind', 'authorization'], 'lifecycle release response')
+    if (!['released', 'already_released', 'operator_required'].includes(String(payload.kind))) throw new Error('Invalid hosted lifecycle release response')
+    const authorization = decodeLifecycleAuthorization(payload.authorization, request.authority)
+    assertLifecycleAuthorizationCorrelation(authorization, request)
     return payload
   }
   if (payload.kind === 'not_found') {
@@ -341,7 +517,7 @@ function decodeLifecycleResponsePayload(
   if (payload.kind === 'conflict') {
     exactKeys(payload, ['schemaVersion', 'kind', 'reason', 'currentRevision'], 'lifecycle conflict response')
     if (!['authorization_changed', 'boot_changed', 'command_in_progress', 'grant_revoked',
-      'idempotency_conflict', 'stale_revision', 'stale_run'].includes(String(payload.reason))) {
+      'idempotency_conflict', 'idempotency_mismatch', 'stale_revision', 'stale_run'].includes(String(payload.reason))) {
       throw new Error('Invalid hosted lifecycle conflict reason')
     }
     nullableRevision(payload.currentRevision)
@@ -354,8 +530,15 @@ function decodeLifecycleResponsePayload(
     assertLifecycleAuthorizationCorrelation(authorization, request)
     return payload
   }
-  if (operation === 'execute' && payload.kind === 'result') {
-    exactKeys(payload, ['schemaVersion', 'kind', 'result', 'authorization'], 'lifecycle execution response')
+  if ((operation === 'execute' || operation === 'replay_lookup') &&
+    ['not_started', 'started', 'operator_required', 'idempotency_mismatch'].includes(String(payload.kind))) {
+    exactKeys(payload, ['schemaVersion', 'kind', 'durableCommand'], 'lifecycle durable response')
+    if (!isDeepStrictEqual(payload.durableCommand, request.durableCommand)) throw new Error('Invalid durable command echo')
+    return payload
+  }
+  if ((operation === 'execute' || operation === 'replay_lookup') && payload.kind === 'settled') {
+    exactKeys(payload, ['schemaVersion', 'kind', 'durableCommand', 'result', 'authorization'], 'lifecycle execution response')
+    if (!isDeepStrictEqual(payload.durableCommand, request.durableCommand)) throw new Error('Invalid durable command echo')
     const authorization = decodeLifecycleAuthorization(payload.authorization, request.authority)
     assertLifecycleAuthorizationCorrelation(authorization, request)
     decodeLifecyclePublicResult(payload.result, request, authorization)
@@ -371,7 +554,7 @@ function decodeLifecycleAuthorization(
   const authorization = record(value, 'lifecycle response authorization')
   exactKeys(authorization, [
     'grantId', 'authorizationGeneration', 'deploymentId', 'bootId', 'resourceRevision',
-    'actorId', 'workspaceId', 'teamId', 'restoreGeneration',
+    'actorId', 'workspaceId', 'teamId', 'restoreGeneration', 'mountGeneration', 'ownerEffectFence',
   ], 'lifecycle response authorization')
   patternString(authorization.grantId, /^grant_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'grantId')
   patternString(authorization.authorizationGeneration, /^authorization-generation_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'authorizationGeneration')
@@ -380,11 +563,15 @@ function decodeLifecycleAuthorization(
   }
   patternString(authorization.resourceRevision, /^revision_[A-Za-z0-9][A-Za-z0-9._-]{0,246}$/, 'authorization.resourceRevision')
   nonNegativeInteger(authorization.restoreGeneration, 'authorization.restoreGeneration')
+  positiveInteger(authorization.mountGeneration, 'authorization.mountGeneration')
+  const ownerEffectFence = decodeOwnerEffectFence(authorization.ownerEffectFence)
   if (authorization.actorId !== expected.actorId || authorization.workspaceId !== expected.workspaceId ||
     authorization.teamId !== expected.teamId || authorization.deploymentId !== expected.deploymentId ||
     authorization.bootId !== expected.bootId || authorization.restoreGeneration !== expected.restoreGeneration) {
     throw new Error('Invalid hosted lifecycle response authorization scope')
   }
+  if (authorization.mountGeneration !== expected.mountGeneration ||
+    !isDeepStrictEqual(ownerEffectFence, expected.ownerEffectFence)) throw new Error('Invalid hosted lifecycle authorization fence')
   return authorization
 }
 
@@ -422,7 +609,7 @@ function decodeLifecyclePublicResult(
   } else if (result.kind === 'conflict') {
     exactKeys(result, [...common, 'reason', 'currentRevision'], 'lifecycle conflict result')
     if (!['authorization_changed', 'boot_changed', 'command_in_progress', 'grant_revoked',
-      'idempotency_conflict', 'stale_revision', 'stale_run'].includes(String(result.reason))) {
+      'idempotency_conflict', 'idempotency_mismatch', 'stale_revision', 'stale_run'].includes(String(result.reason))) {
       throw new Error('Invalid lifecycle public conflict reason')
     }
     nullableRevision(result.currentRevision)
@@ -456,13 +643,61 @@ function lifecycleResponseRevision(
   operation: HostedLifecycleOperation,
   payload: Record<string, unknown>,
 ): string | null {
-  if (operation === 'release' || payload.kind === 'not_found' || payload.kind === 'unavailable') return null
-  if (payload.kind === 'control_state') return nullableRevision(payload.resourceRevision)
+  if (payload.kind === 'not_found' || payload.kind === 'unavailable') return null
+  if (payload.kind === 'control_state' || payload.kind === 'prepared' || payload.kind === 'status' ||
+    payload.kind === 'provisioning_status') return nullableRevision(payload.resourceRevision)
+  if (operation === 'release') return nullableRevision(record(payload.authorization, 'lifecycle authorization').resourceRevision)
+  if (['not_started', 'started', 'operator_required', 'idempotency_mismatch'].includes(String(payload.kind))) {
+    return nullableRevision(record(requestDurableResource(payload), 'durable resource').expectedRevision)
+  }
   if (payload.kind === 'conflict') return nullableRevision(payload.currentRevision)
   if ('authorization' in payload) {
     return nullableRevision(record(payload.authorization, 'lifecycle authorization').resourceRevision)
   }
   throw new Error('Invalid lifecycle response revision source')
+}
+
+function decodePreparedLanes(value: unknown): void {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new Error('Invalid hosted lifecycle prepared lanes')
+  }
+  const keys = new Set<string>()
+  for (const laneValue of value) {
+    const lane = record(laneValue, 'lifecycle prepared lane')
+    exactKeys(lane, ['laneKey', 'backend', 'status'], 'lifecycle prepared lane')
+    const laneKey = nonEmptyString(lane.laneKey, 'laneKey')
+    if (keys.has(laneKey)) throw new Error('Invalid duplicate hosted lifecycle lane')
+    keys.add(laneKey)
+    if (lane.backend !== 'opencode' || !['ready', 'pending', 'unavailable'].includes(String(lane.status))) {
+      throw new Error('Invalid hosted lifecycle prepared lane')
+    }
+  }
+}
+
+function decodeRecentCommands(value: unknown): void {
+  if (!Array.isArray(value) || value.length > 16) throw new Error('Invalid hosted lifecycle recent commands')
+  const seen = new Set<string>()
+  for (const entryValue of value) {
+    const entry = record(entryValue, 'lifecycle recent command')
+    exactKeys(entry, ['action', 'commandId', 'idempotencyKey', 'status'], 'lifecycle recent command')
+    if (!['launch', 'cancel', 'stop', 'recover'].includes(String(entry.action))) {
+      throw new Error('Invalid hosted lifecycle recent command action')
+    }
+    patternString(entry.commandId,
+      /^lifecycle-command_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'recent commandId')
+    const idempotencyKey = patternString(entry.idempotencyKey,
+      /^idempotency_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'recent idempotencyKey')
+    const scopedKey = `${entry.action}\0${idempotencyKey}`
+    if (seen.has(scopedKey)) throw new Error('Invalid duplicate hosted lifecycle recent command')
+    seen.add(scopedKey)
+    if (!['settled', 'operator_required'].includes(String(entry.status))) {
+      throw new Error('Invalid hosted lifecycle recent command status')
+    }
+  }
+}
+
+function requestDurableResource(payload: Record<string, unknown>): Record<string, unknown> {
+  return record(record(payload.durableCommand, 'durable command').resource, 'durable resource')
 }
 
 function decodeMessageResponsePayload(
@@ -535,8 +770,26 @@ function verifyDomainProof(
   }
 }
 
+function verifyRawDomainProof(
+  secret: Uint8Array,
+  domain: string,
+  direction: string,
+  proof: unknown,
+  serializedUnsignedEnvelope: string,
+): void {
+  const expected = createHostedRawDomainProof(secret, domain, direction, serializedUnsignedEnvelope)
+  if (typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof) ||
+    !timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))) {
+    throw new Error('Invalid hosted lifecycle raw proof')
+  }
+}
+
 function isLifecycleOperation(value: unknown): value is HostedLifecycleOperation {
   return LIFECYCLE_OPERATIONS.includes(value as HostedLifecycleOperation)
+}
+function isLifecycleQueryOperation(operation: HostedLifecycleOperation): boolean {
+  return operation === 'control_state' || operation === 'prepare' || operation === 'get_status' ||
+    operation === 'prepare_provisioning' || operation === 'get_provisioning_status'
 }
 function isMessageOperation(value: unknown): value is HostedTeamMessageOperation {
   return MESSAGE_OPERATIONS.includes(value as HostedTeamMessageOperation)
@@ -564,6 +817,11 @@ function patternString(value: unknown, pattern: RegExp, field: string): string {
 function nonNegativeInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`Invalid ${field}`)
   return value as number
+}
+function positiveInteger(value: unknown, field: string): number {
+  const parsed = nonNegativeInteger(value, field)
+  if (parsed < 1) throw new Error(`Invalid ${field}`)
+  return parsed
 }
 function nullableRevision(value: unknown): string | null {
   if (value === null) return null

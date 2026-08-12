@@ -1,7 +1,10 @@
 import { join } from 'node:path'
 
 import { DurableTeamLifecycleExecution } from '../teamLifecycleOwner/DurableTeamLifecycleExecution.js'
-import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import {
+  createProductionOpenCodeTeamLifecycleLane,
+  type TeamLifecycleLaneEffectPort,
+} from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { createTeamLifecycleAuthorityComposition } from '../teamLifecycleOwner/TeamLifecycleAuthorityComposition.js'
 import { PrivateFileTeamLifecycleLaunchPlanStore } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { createHostedControlEffectServices } from './HostedControlEffectServices.js'
@@ -23,11 +26,13 @@ export const HOSTED_MESSAGE_DIRECTORY = 'hosted-messages'
  * Only OpenCode owns production lifecycle effects; native lanes remain
  * capability-false because no native adapter is installed.
  */
-export const createHostedControlProductionPorts: HostedControlRuntimePortFactory =
-  (context: HostedControlRuntimePortFactoryContext) => {
+export function createHostedControlProductionPortFactory(
+  createOpenCodeLane: () => TeamLifecycleLaneEffectPort = createProductionOpenCodeTeamLifecycleLane,
+): HostedControlRuntimePortFactory {
+  return (context: HostedControlRuntimePortFactoryContext) => {
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
-      [new OpenCodeTeamLifecycleLane()],
+      [createOpenCodeLane()],
     )
     const lifecycle = createTeamLifecycleAuthorityComposition({
       workspaceId: context.authority.workspaceId,
@@ -68,3 +73,6 @@ export const createHostedControlProductionPorts: HostedControlRuntimePortFactory
       },
     }
   }
+}
+
+export const createHostedControlProductionPorts = createHostedControlProductionPortFactory()

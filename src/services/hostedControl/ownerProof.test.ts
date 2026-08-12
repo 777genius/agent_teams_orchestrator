@@ -2,12 +2,45 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readHostedControlSecret, resolveHostedControlOwnerBinding } from './ownerProof.js'
+import {
+  createHostedRawDomainProof,
+  parseStrictHostedProofLastJsonFrame,
+  readHostedControlSecret,
+  resolveHostedControlOwnerBinding,
+} from './ownerProof.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
 
 describe('hosted owner proof identity', () => {
+  test('retains canonical proof-last bytes and rejects alternate JSON spellings and duplicate keys', () => {
+    const secret = Buffer.alloc(32, 7)
+    const unsigned = JSON.stringify({ schemaVersion: 2, operation: 'control_state', payload: { teamId: 'team-a' } })
+    const proof = createHostedRawDomainProof(secret, 'test-domain', 'request', unsigned)
+    const line = `${unsigned.slice(0, -1)},"ownerProof":"${proof}"}`
+    expect(parseStrictHostedProofLastJsonFrame(line, 'ownerProof')).toEqual({
+      value: JSON.parse(line), serializedUnsignedEnvelope: unsigned, proof,
+    })
+
+    expect(() => parseStrictHostedProofLastJsonFrame(
+      `{ "schemaVersion":2,"operation":"control_state","payload":{"teamId":"team-a"},"ownerProof":"${proof}"}`,
+      'ownerProof',
+    )).toThrow('canonical')
+    expect(() => parseStrictHostedProofLastJsonFrame(
+      `{"schemaVersion":2,"schemaVersion":2,"ownerProof":"${proof}"}`,
+      'ownerProof',
+    )).toThrow()
+    expect(() => parseStrictHostedProofLastJsonFrame(
+      `{"ownerProof":"${proof}","schemaVersion":2}`,
+      'ownerProof',
+    )).toThrow('final')
+    for (const invalid of [
+      `{"value":tru,"ownerProof":"${proof}"}`,
+      `{"value":01,"ownerProof":"${proof}"}`,
+      `{"value":"\\x20","ownerProof":"${proof}"}`,
+    ]) expect(() => parseStrictHostedProofLastJsonFrame(invalid, 'ownerProof')).toThrow()
+  })
+
   test('binds descriptor identities and accepts only an owner-private secret', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-test-'))
     roots.push(root)
