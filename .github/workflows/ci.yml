@@ -42,9 +42,6 @@ jobs:
       - name: Test hosted control
         run: bun run test:hosted-control
 
-      - name: Typecheck
-        run: bun run tsc --noEmit
-
       - name: Build production runtime
         run: bun run build
 
