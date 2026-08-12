@@ -42,11 +42,11 @@ jobs:
       - name: Test hosted control
         run: bun run test:hosted-control
 
+      - name: Typecheck
+        run: bun run tsc --noEmit
+
       - name: Build production runtime
         run: bun run build
-
-      - name: Build complete development runtime
-        run: bun run build:dev:full
 
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
