@@ -590,6 +590,7 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(createSessionCalls).toBe(2)
     expect(record.opencodeSessionId).toBe('session-new')
+    expect(record.runId).toBe('run-1')
     expect(record.selectedVariant).toBe('max')
     expect(upserts).toHaveLength(1)
     expect(upserts[0]?.selectedVariant).toBe('max')

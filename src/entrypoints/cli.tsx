@@ -82,6 +82,19 @@ function readNumberOption(args: string[], name: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
+async function runHostedControlFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'hosted-control' || hasHelpOption(args)) return false
+  if (!feature('HOSTED_CONTROL')) {
+    throw new Error('Hosted control is not included in this build')
+  }
+  const configPath = readOption(args.slice(1), '--config')
+  if (!configPath) throw new Error('Missing required option --config <absolute-path>')
+  void configPath
+  throw new Error(
+    'Hosted control launch is blocked until config/secret bootstrap uses an isolated non-inherited descriptor boundary',
+  )
+}
+
 function parseOpenCodeCommandOptions(args: string[]): {
   input: string
   json?: boolean
@@ -217,6 +230,11 @@ async function main(): Promise<void> {
   // For all other paths, load the startup profiler
   const { profileCheckpoint } = await import('../utils/startupProfiler.js')
   profileCheckpoint('cli_entry')
+
+  if (await runHostedControlFastPath(args)) {
+    profileCheckpoint('cli_hosted_control_path')
+    return
+  }
 
   if (
     args[0] === 'runtime' &&

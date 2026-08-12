@@ -416,6 +416,7 @@ export class OpenCodeSessionBridge {
       const record: OpenCodeSessionRecord = {
         teamId: params.identity.teamId,
         laneId: params.identity.laneId,
+        runId: params.runId ?? null,
         memberName: params.identity.memberName,
         providerId: 'opencode',
         selectedModel: params.selectedModel,

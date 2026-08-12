@@ -10,7 +10,8 @@ import { errorMessage, getErrnoCode } from '../errors.js'
 import { lazySchema } from '../lazySchema.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { jsonParse, jsonStringify } from '../slowOperations.js'
-import { getTasksDir, notifyTasksUpdated } from '../tasks.js'
+import { removeTaskList } from '../tasks.js'
+import { withTaskMutationCoordination } from '../taskMutationCoordinator.js'
 import { getAgentName, getTeamName, isTeammate } from '../teammate.js'
 import { hasWorktreeChanges, removeAgentWorktree } from '../worktree.js'
 import { type BackendType, isPaneBackend } from './backends/types.js'
@@ -1067,27 +1068,19 @@ export async function cleanupTeamDirectories(teamName: string): Promise<void> {
     await cleanupTeamMemberWorktree(member)
   }
 
-  // Clean up team directory (~/.claude/teams/{team-name}/)
-  const teamDir = getTeamDir(teamName)
-  try {
-    await rm(teamDir, { recursive: true, force: true })
-    logForDebugging(`[TeammateTool] Cleaned up team directory: ${teamDir}`)
-  } catch (error) {
-    logForDebugging(
-      `[TeammateTool] Failed to clean up team directory ${teamDir}: ${errorMessage(error)}`,
-    )
-  }
-
-  // Clean up tasks directory (~/.claude/tasks/{taskListId}/)
-  // The leader and teammates all store tasks under the sanitized team name.
-  const tasksDir = getTasksDir(sanitizedName)
-  try {
-    await rm(tasksDir, { recursive: true, force: true })
-    logForDebugging(`[TeammateTool] Cleaned up tasks directory: ${tasksDir}`)
-    notifyTasksUpdated()
-  } catch (error) {
-    logForDebugging(
-      `[TeammateTool] Failed to clean up tasks directory ${tasksDir}: ${errorMessage(error)}`,
-    )
-  }
+  await withTaskMutationCoordination(sanitizedName, async () => {
+    const teamDir = getTeamDir(teamName)
+    try {
+      await rm(teamDir, { recursive: true, force: true })
+      logForDebugging(`[TeammateTool] Cleaned up team directory: ${teamDir}`)
+    } catch (error) {
+      logForDebugging(`[TeammateTool] Failed to clean up team directory ${teamDir}: ${errorMessage(error)}`)
+    }
+    try {
+      await removeTaskList(sanitizedName)
+      logForDebugging(`[TeammateTool] Cleaned up tasks directory for: ${sanitizedName}`)
+    } catch (error) {
+      logForDebugging(`[TeammateTool] Failed to clean up tasks directory for ${sanitizedName}: ${errorMessage(error)}`)
+    }
+  })
 }

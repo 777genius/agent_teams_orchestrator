@@ -605,6 +605,8 @@ export type OpenCodeSessionPreviewSummary = {
 export type OpenCodeSessionRecord = {
   teamId: string
   laneId?: string
+  /** Durable lifecycle incarnation; absent only on legacy persisted records. */
+  runId?: string | null
   memberName: string
   providerId: 'opencode'
   selectedModel: string

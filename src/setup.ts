@@ -85,6 +85,20 @@ export async function setup(
     switchSession(asSessionId(customSessionId))
   }
 
+  // Hosted control owns one UDS listener for readiness, lifecycle, messages,
+  // and task mutation. It is build-gated and inert unless an explicit private
+  // runtime config is supplied.
+  let hostedControlConfigured = false
+  if (feature('HOSTED_CONTROL')) {
+    const hosted = await import('./utils/udsMessaging.js')
+    hostedControlConfigured = !!process.env[hosted.HOSTED_CONTROL_CONFIG_ENV]?.trim()
+    if (hostedControlConfigured) {
+      await hosted.startProductionHostedControlFromEnvironment()
+      const { registerCleanup } = await import('./utils/cleanupRegistry.js')
+      registerCleanup(hosted.stopHostedControl)
+    }
+  }
+
   // --bare / SIMPLE: skip UDS messaging server and teammate snapshot.
   // Scripted calls don't receive injected messages and don't use swarm teammates.
   // Explicit --messaging-socket-path is the escape hatch (per #23222 gate pattern).
@@ -94,7 +108,7 @@ export async function setup(
     // --messaging-socket-path is passed. Awaited so the server is bound
     // and $CLAUDE_CODE_MESSAGING_SOCKET is exported before any hook
     // (SessionStart in particular) can spawn and snapshot process.env.
-    if (feature('UDS_INBOX')) {
+    if (feature('UDS_INBOX') && !hostedControlConfigured) {
       const m = await import('./utils/udsMessaging.js')
       await m.startUdsMessaging(
         messagingSocketPath ?? m.getDefaultUdsSocketPath(),
