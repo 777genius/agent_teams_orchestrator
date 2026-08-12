@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { chmod, constants, lstat, mkdir, open } from 'node:fs/promises'
+import { chmod, constants, lstat, mkdir, open, type FileHandle } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import * as lockfile from './lockfile.js'
@@ -41,6 +41,7 @@ export async function withTaskMutationCoordination<T>(
 
   await previous.catch(() => undefined)
   const token: LaneToken = { active: true }
+  let anchor: FileHandle | undefined
   let releaseFileLock: (() => Promise<void>) | undefined
   try {
     const claudeRoot = options.claudeRoot ?? getClaudeConfigHomeDir(); const tasksRoot = join(claudeRoot, 'tasks'); const uid = process.getuid?.()
@@ -55,8 +56,8 @@ export async function withTaskMutationCoordination<T>(
     await chmod(lockRoot, 0o700); rootStat = await lstat(lockRoot)
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || (rootStat.mode & 0o077) !== 0) throw new TaskMutationLockUnavailableError('Unsafe task mutation lock directory')
     const lockPath = join(lockRoot, `${safeWindowsPathSegment(teamId.replace(/[^a-zA-Z0-9_-]/g, '-'))}.lock`)
-    const anchor = await open(lockPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600)
-    const anchorStat = await anchor.stat(); await anchor.close()
+    anchor = await open(lockPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600)
+    const anchorStat = await anchor.stat()
     if (!anchorStat.isFile() || (uid !== undefined && anchorStat.uid !== uid) || (anchorStat.mode & 0o077) !== 0) throw new TaskMutationLockUnavailableError('Unsafe task mutation lock anchor')
     try { releaseFileLock = await lockfile.lock(lockPath, { ...CROSS_PROCESS_LOCK_OPTIONS, realpath: false }) } catch (error) { throw new TaskMutationLockUnavailableError(`Task mutation lock unavailable: ${String(error)}`) }
     const [lockedRootStat, lockedAnchorStat] = await Promise.all([lstat(lockRoot), lstat(lockPath)])
@@ -74,8 +75,10 @@ export async function withTaskMutationCoordination<T>(
   } finally {
     token.active = false
     try { await releaseFileLock?.() } finally {
-      release()
-      if (teamTails.get(teamId) === tail) teamTails.delete(teamId)
+      try { await anchor?.close() } finally {
+        release()
+        if (teamTails.get(teamId) === tail) teamTails.delete(teamId)
+      }
     }
   }
 }

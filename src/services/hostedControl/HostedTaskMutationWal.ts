@@ -112,13 +112,12 @@ export class HostedTaskMutationWal {
       const fenceStat = await handle.stat()
       if (!isPrivateOwnedFile(fenceStat)) throw new Error('Unsafe hosted fence')
       this.#activeFenceIdentity = { device: fenceStat.dev, inode: fenceStat.ino }
-      await handle.close(); handle = undefined
       await fsyncDirectoryPath(this.directory)
       this.#activeFenceToken = nonce
       return await action()
     } finally {
       this.#activeFenceToken = null
-      await handle?.close()
+      await handle?.close(); handle = undefined
       const identity = this.#activeFenceIdentity; this.#activeFenceIdentity = null
       const current = await readNoFollowFile(this.#fencePath).catch(() => null)
       let ownsPath = false
