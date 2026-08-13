@@ -19,9 +19,10 @@ import {
 
 const scope = { workspaceId: 'workspace_test', teamId: 'team_test' }
 const plan: TeamLifecycleLaunchPlan = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   ...scope,
   workspaceRoot: '/tmp/hosted-workspace',
+  toolApprovalMode: 'manual',
   lanes: [
     { laneId: 'anthropic_lane', kind: 'native', provider: 'anthropic', members: [{ name: 'a', prompt: 'A' }] },
     { laneId: 'codex_lane', kind: 'native', provider: 'codex', members: [{ name: 'c', prompt: 'C' }] },

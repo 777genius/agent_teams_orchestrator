@@ -17,10 +17,11 @@ afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursi
 const teamId = `team_${'a'.repeat(32)}`
 const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) }
 const plan: TeamLifecycleLaunchPlan = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   workspaceId: 'workspace-a',
   teamId,
   workspaceRoot: '/private/admitted/workspace',
+  toolApprovalMode: 'manual',
   lanes: [{
     laneId: 'codex-primary', kind: 'native', provider: 'codex',
     members: [{ name: 'worker', prompt: 'Work on the admitted task.' }],

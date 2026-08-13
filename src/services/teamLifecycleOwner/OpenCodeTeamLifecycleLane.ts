@@ -13,11 +13,18 @@ export type TeamLifecycleLaneObservation = {
 export interface TeamLifecycleLaneEffectPort {
   readonly kind: TeamLifecycleLaunchLane['kind']
   supports(action: 'launch' | 'cancel' | 'stop' | 'recover'): boolean
-  inspect(input: { planTeamId: string; workspaceRoot: string; lane: TeamLifecycleLaunchLane; runId: string | null }): Promise<TeamLifecycleLaneObservation>
-  launch(input: { planTeamId: string; workspaceRoot: string; lane: TeamLifecycleLaunchLane; runId: string }): Promise<TeamLifecycleLaneObservation>
-  cancel(input: { planTeamId: string; workspaceRoot: string; lane: TeamLifecycleLaunchLane; runId: string }): Promise<TeamLifecycleLaneObservation>
-  stop(input: { planTeamId: string; workspaceRoot: string; lane: TeamLifecycleLaunchLane; runId: string }): Promise<TeamLifecycleLaneObservation>
-  recover(input: { planTeamId: string; workspaceRoot: string; lane: TeamLifecycleLaunchLane; runId: string }): Promise<TeamLifecycleLaneObservation>
+  inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation>
+  launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
+  cancel(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
+  stop(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
+  recover(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
+}
+
+export type TeamLifecycleLaneInput = {
+  planTeamId: string
+  workspaceRoot: string
+  toolApprovalMode: 'manual' | 'auto'
+  lane: TeamLifecycleLaunchLane
 }
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
@@ -43,6 +50,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   async inspect(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string | null
   }): Promise<TeamLifecycleLaneObservation> {
@@ -64,6 +72,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   async launch(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
   }): Promise<TeamLifecycleLaneObservation> {
@@ -76,6 +85,8 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         teamId: input.planTeamId,
         projectPath: input.workspaceRoot,
         selectedModel: lane.selectedModel,
+        toolApprovalMode: input.toolApprovalMode,
+        skipPermissions: input.toolApprovalMode === 'manual' ? false : true,
         ...(lane.effort ? { effort: lane.effort } : {}),
         members: lane.members.map(member => ({
           name: member.name,
@@ -91,6 +102,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   cancel(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
   }): Promise<TeamLifecycleLaneObservation> {
@@ -100,6 +112,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   stop(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
   }): Promise<TeamLifecycleLaneObservation> {
@@ -109,6 +122,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   async recover(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
   }): Promise<TeamLifecycleLaneObservation> {
@@ -119,6 +133,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   async #stop(input: {
     planTeamId: string
     workspaceRoot: string
+    toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
   }): Promise<TeamLifecycleLaneObservation> {

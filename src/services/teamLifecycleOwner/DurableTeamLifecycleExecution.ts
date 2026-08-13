@@ -17,9 +17,10 @@ import type {
 } from './OpenCodeTeamLifecycleLane.js'
 
 type DurableState = {
-  schemaVersion: 1
+  schemaVersion: 2
   revision: number
   planFingerprint: string
+  toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
   phase: HostedLifecycleProviderSnapshot['phase']
   runId: string | null
   recoverable: boolean
@@ -28,6 +29,7 @@ type DurableState = {
 type LaneInput = {
   planTeamId: string
   workspaceRoot: string
+  toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
   lane: TeamLifecycleLaunchPlan['lanes'][number]
   runId: string
 }
@@ -234,7 +236,13 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   #inspectLanes(plan: TeamLifecycleLaunchPlan, runId: string): Promise<TeamLifecycleLaneObservation[]> {
     return Promise.all(plan.lanes.map(lane => {
       const adapter = this.#adapter(lane.kind)
-      return adapter.inspect({ planTeamId: plan.teamId, workspaceRoot: plan.workspaceRoot, lane, runId })
+      return adapter.inspect({
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        runId,
+      })
     }))
   }
 
@@ -249,6 +257,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       const laneInput: LaneInput = {
         planTeamId: plan.teamId,
         workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
         lane,
         runId,
       }
@@ -285,7 +294,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     })
-    if (!handle) return initialState(expectedPlan)
+    if (!handle) return initialState(plan)
     try {
       const [stat, current] = await Promise.all([handle.stat(), lstat(this.statePath)])
       if (!stat.isFile() || !current.isFile() || current.isSymbolicLink() || stat.dev !== current.dev ||
@@ -294,9 +303,12 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         throw new Error('Unsafe team lifecycle durable state')
       }
       const state = decodeState(JSON.parse(await handle.readFile('utf8')))
+      if (state.toolApprovalMode !== plan.toolApprovalMode) {
+        throw new Error('Team lifecycle durable approval mode changed')
+      }
       if (state.planFingerprint !== expectedPlan) {
         if (state.phase !== 'idle') throw new Error('Active team lifecycle plan changed')
-        return initialState(expectedPlan)
+        return initialState(plan)
       }
       return state
     } finally {
@@ -307,7 +319,8 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   async #write(input: DurableState, plan: TeamLifecycleLaunchPlan): Promise<DurableState> {
     const state: DurableState = {
       ...input,
-      schemaVersion: 1,
+      schemaVersion: 2,
+      toolApprovalMode: plan.toolApprovalMode,
       revision: input.revision + 1,
       planFingerprint: planFingerprint(plan),
     }
@@ -325,8 +338,16 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 }
 
-function initialState(plan: string): DurableState {
-  return { schemaVersion: 1, revision: 0, planFingerprint: plan, phase: 'idle', runId: null, recoverable: false }
+function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
+  return {
+    schemaVersion: 2,
+    revision: 0,
+    planFingerprint: planFingerprint(plan),
+    toolApprovalMode: plan.toolApprovalMode,
+    phase: 'idle',
+    runId: null,
+    recoverable: false,
+  }
 }
 
 function launchCompletion(
@@ -364,12 +385,13 @@ function planFingerprint(plan: TeamLifecycleLaunchPlan): string {
 function decodeState(value: unknown): DurableState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid team lifecycle state')
   const record = value as Record<string, unknown>
-  const keys = ['schemaVersion', 'revision', 'planFingerprint', 'phase', 'runId', 'recoverable']
+  const keys = ['schemaVersion', 'revision', 'planFingerprint', 'toolApprovalMode', 'phase', 'runId', 'recoverable']
   if (Object.keys(record).length !== keys.length || Object.keys(record).some(key => !keys.includes(key)) ||
-    record.schemaVersion !== 1 || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
+    record.schemaVersion !== 2 || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
     typeof record.planFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.planFingerprint) ||
     !['idle', 'launching', 'running', 'stopping', 'failed'].includes(String(record.phase)) ||
     !(record.runId === null || typeof record.runId === 'string' && /^run_[A-Za-z0-9][A-Za-z0-9._-]{0,250}$/.test(record.runId)) ||
+    !['manual', 'auto'].includes(String(record.toolApprovalMode)) ||
     typeof record.recoverable !== 'boolean') throw new Error('Invalid team lifecycle state')
   if (record.phase === 'idle' ? record.runId !== null : record.runId === null) {
     throw new Error('Invalid team lifecycle state/run binding')

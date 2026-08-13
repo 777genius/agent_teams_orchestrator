@@ -119,8 +119,22 @@ const SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES = new Set([
   'video/quicktime',
 ])
 
-function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
-  return body.skipPermissions === false ? 'manual' : 'auto'
+export function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
+  const explicit = body.toolApprovalMode
+  if (explicit !== undefined && explicit !== 'manual' && explicit !== 'auto') {
+    throw new Error('opencode.launchTeam toolApprovalMode must be manual or auto')
+  }
+  if (explicit === undefined) {
+    // Preserve the pre-explicit-wire bridge behavior for legacy callers only.
+    return body.skipPermissions === false ? 'manual' : 'auto'
+  }
+  if (explicit === 'manual' && body.skipPermissions !== false) {
+    throw new Error('opencode.launchTeam manual tool approval requires skipPermissions=false')
+  }
+  if (explicit === 'auto' && body.skipPermissions !== true) {
+    throw new Error('opencode.launchTeam auto tool approval requires skipPermissions=true')
+  }
+  return explicit
 }
 const SUPPORTED_COMMANDS = [
   'opencode.handshake',

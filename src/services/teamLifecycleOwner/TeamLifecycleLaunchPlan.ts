@@ -33,10 +33,11 @@ export type TeamLifecycleLaunchLane =
     }
 
 export type TeamLifecycleLaunchPlan = {
-  schemaVersion: 1
+  schemaVersion: 2
   workspaceId: string
   teamId: string
   workspaceRoot: string
+  toolApprovalMode: 'manual' | 'auto'
   lanes: readonly TeamLifecycleLaunchLane[]
 }
 
@@ -135,12 +136,19 @@ function decodePlan(raw: Uint8Array): string {
 
 export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunchPlan {
   const record = asRecord(value, 'launch plan')
-  assertExactKeys(record, ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'lanes'], 'launch plan')
-  if (record.schemaVersion !== 1) throw new TypeError('Unsupported team lifecycle launch-plan schema')
+  assertExactKeys(
+    record,
+    ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'toolApprovalMode', 'lanes'],
+    'launch plan',
+  )
+  if (record.schemaVersion !== 2) throw new TypeError('Unsupported team lifecycle launch-plan schema')
   const workspaceId = identifier(record.workspaceId, 'workspaceId')
   const teamId = identifier(record.teamId, 'teamId')
   if (typeof record.workspaceRoot !== 'string' || !path.isAbsolute(record.workspaceRoot) || record.workspaceRoot.includes('\0')) {
     throw new TypeError('Invalid launch-plan workspaceRoot')
+  }
+  if (record.toolApprovalMode !== 'manual' && record.toolApprovalMode !== 'auto') {
+    throw new TypeError('Invalid launch-plan toolApprovalMode')
   }
   if (!Array.isArray(record.lanes) || record.lanes.length === 0 || record.lanes.length > 64) {
     throw new TypeError('Launch plan requires 1-64 lanes')
@@ -180,7 +188,14 @@ export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunc
   if (new Set(lanes.map(lane => lane.laneId)).size !== lanes.length) {
     throw new TypeError('Duplicate launch-plan laneId')
   }
-  return { schemaVersion: 1, workspaceId, teamId, workspaceRoot: record.workspaceRoot, lanes }
+  return {
+    schemaVersion: 2,
+    workspaceId,
+    teamId,
+    workspaceRoot: record.workspaceRoot,
+    toolApprovalMode: record.toolApprovalMode,
+    lanes,
+  }
 }
 
 function parseMembers(value: unknown, laneIndex: number): readonly TeamLifecycleLaunchMember[] {

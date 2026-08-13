@@ -16,10 +16,11 @@ const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
 
 const plan: TeamLifecycleLaunchPlan = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   workspaceId: 'workspace-test',
   teamId: `team_${'a'.repeat(32)}`,
   workspaceRoot: '/sandbox/project',
+  toolApprovalMode: 'manual',
   lanes: [{
     laneId: 'opencode-lane',
     kind: 'opencode',
@@ -32,7 +33,7 @@ const plan: TeamLifecycleLaunchPlan = {
 
 class FakeLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const
-  launched: Array<{ runId: string; teamId: string }> = []
+  launched: Array<{ runId: string; teamId: string; toolApprovalMode: 'manual' | 'auto' }> = []
   actions: string[] = []
   launchResult: TeamLifecycleLaneObservation = { phase: 'running', recoverable: false }
   inspectResult: TeamLifecycleLaneObservation | null = null
@@ -41,9 +42,9 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
   async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
     return input.runId ? this.inspectResult ?? this.launchResult : { phase: 'idle', recoverable: false }
   }
-  async launch(input: { runId: string; planTeamId: string }): Promise<TeamLifecycleLaneObservation> {
+  async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
     this.actions.push('launch')
-    this.launched.push({ runId: input.runId, teamId: input.planTeamId })
+    this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
     return this.launchResult
   }
   async cancel(): Promise<TeamLifecycleLaneObservation> {
@@ -78,7 +79,11 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(launching.runId).toMatch(/^run_/)
 
     const running = await waitForPhase(execution, 'running')
-    expect(lane.launched).toEqual([{ runId: running.runId, teamId: plan.teamId }])
+    expect(lane.launched).toEqual([{
+      runId: running.runId,
+      teamId: plan.teamId,
+      toolApprovalMode: 'manual',
+    }])
     const stopping = await execution.stop({
       plan,
       commandId: 'command-stop',
@@ -176,9 +181,9 @@ describe('DurableTeamLifecycleExecution', () => {
     let releaseLaunch!: () => void
     const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve })
     class PendingLane extends FakeLane {
-      override async launch(input: { runId: string; planTeamId: string }): Promise<TeamLifecycleLaneObservation> {
+      override async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
         this.actions.push('launch')
-        this.launched.push({ runId: input.runId, teamId: input.planTeamId })
+        this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
         await launchGate
         return { phase: 'running', recoverable: false }
       }
@@ -211,9 +216,9 @@ describe('DurableTeamLifecycleExecution', () => {
         this.inspections += 1
         return super.inspect(input)
       }
-      override async launch(input: { runId: string; planTeamId: string }): Promise<TeamLifecycleLaneObservation> {
+      override async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
         this.actions.push('launch')
-        this.launched.push({ runId: input.runId, teamId: input.planTeamId })
+        this.launched.push({ runId: input.runId, teamId: input.planTeamId, toolApprovalMode: input.toolApprovalMode })
         await launchGate
         return { phase: 'running', recoverable: false }
       }
@@ -275,6 +280,26 @@ describe('DurableTeamLifecycleExecution', () => {
     }
     expect(execution.supports(nativePlan, 'launch')).toBe(false)
   })
+
+  test('binds recovered durable state to the admitted approval mode', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-approval-mode-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const execution = new DurableTeamLifecycleExecution(statePath, [new FakeLane()])
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan,
+      commandId: 'command-mode-binding',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await waitForPhase(execution, 'running')
+
+    const changedMode: TeamLifecycleLaunchPlan = { ...plan, toolApprovalMode: 'auto' }
+    await expect(execution.inspect(changedMode)).rejects.toThrow(
+      'Team lifecycle durable approval mode changed',
+    )
+  })
 })
 
 describe('OpenCodeTeamLifecycleLane', () => {
@@ -296,6 +321,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const input = {
       planTeamId: plan.teamId,
       workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode,
       lane: admittedLane,
       runId: 'run_test1234',
     }
@@ -308,6 +334,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     expect((calls[0]!.body as Record<string, unknown>).members).toEqual([
       { name: 'worker', prompt: 'Implement the fixture.', effort: 'high' },
     ])
+    expect(calls[0]!.body).toMatchObject({ toolApprovalMode: 'manual', skipPermissions: false })
   })
 
   test('waits for an in-flight launch before stopping the same lane', async () => {
@@ -329,6 +356,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const input = {
       planTeamId: plan.teamId,
       workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode,
       lane: plan.lanes[0]!,
       runId: 'run_serialized',
     }
@@ -345,6 +373,23 @@ describe('OpenCodeTeamLifecycleLane', () => {
       { phase: 'idle', recoverable: false },
     ])
     expect(calls).toEqual(['opencode.launchTeam', 'opencode.stopTeam'])
+  })
+
+  test('maps an admitted auto plan to explicit automatic wire semantics', async () => {
+    let launchBody: Record<string, unknown> | null = null
+    const execute = (async (input: unknown) => {
+      launchBody = (input as { body: Record<string, unknown> }).body
+      return { ok: true, data: { teamLaunchState: 'ready' } }
+    }) as never
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
+    await lane.launch({
+      planTeamId: plan.teamId,
+      workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: 'auto',
+      lane: plan.lanes[0]!,
+      runId: 'run_auto',
+    })
+    expect(launchBody).toMatchObject({ toolApprovalMode: 'auto', skipPermissions: true })
   })
 })
 

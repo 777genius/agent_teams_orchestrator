@@ -8,9 +8,10 @@ import { PrivateFileTeamLifecycleLaunchPlanStore } from './TeamLifecycleLaunchPl
 
 const scope = { workspaceId: 'workspace_test', teamId: 'team_test' }
 const plan = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   ...scope,
   workspaceRoot: '/tmp/hosted-workspace',
+  toolApprovalMode: 'manual',
   lanes: [{
     laneId: 'lane_test',
     kind: 'native',
@@ -48,6 +49,19 @@ describe('PrivateFileTeamLifecycleLaunchPlanStore raw-byte admission', () => {
       expect(() => JSON.parse(invalid.toString('utf8'))).not.toThrow()
       await fs.writeFile(file, invalid, { mode: 0o600 })
       await expect(new PrivateFileTeamLifecycleLaunchPlanStore(file).load(scope)).rejects.toThrow()
+    })
+  })
+
+  test('fails closed for legacy or missing approval mode instead of silently enabling auto approval', async () => {
+    await withPrivatePlan(async file => {
+      const { toolApprovalMode: _mode, ...missingMode } = plan
+      await fs.writeFile(file, JSON.stringify(missingMode), { mode: 0o600 })
+      await expect(new PrivateFileTeamLifecycleLaunchPlanStore(file).load(scope)).rejects.toThrow()
+
+      await fs.writeFile(file, JSON.stringify({ ...missingMode, schemaVersion: 1 }), { mode: 0o600 })
+      await expect(new PrivateFileTeamLifecycleLaunchPlanStore(file).load(scope)).rejects.toThrow(
+        'Unexpected launch plan fields',
+      )
     })
   })
 })

@@ -172,10 +172,11 @@ async function writePlan(
   await writeFile(
     path,
     JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       workspaceId: stableAuthority.workspaceId,
       teamId,
       workspaceRoot: join(teamRoot, 'sandbox-workspace'),
+      toolApprovalMode: 'manual',
       lanes: [lane],
     }),
     { mode: 0o600 },
