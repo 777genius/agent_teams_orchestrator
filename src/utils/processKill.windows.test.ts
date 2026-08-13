@@ -10,6 +10,42 @@ import {
   terminateExpectedProcessTreeStable,
 } from './processKill.js'
 
+const WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS = 20_000
+const WINDOWS_JOB_TERMINATION_HOST_STARTUP_BUDGET_MS = 20_000
+const WINDOWS_JOB_TERMINATION_TIMEOUT_MS = 2_000
+const WINDOWS_JOB_TERMINATION_ESCALATION_TIMEOUT_MS = 2_000
+const WINDOWS_JOB_CHILD_EXIT_TIMEOUT_MS = 2_000
+const WINDOWS_JOB_TEST_HARNESS_OVERHEAD_MS = 5_000
+const WINDOWS_JOB_TEST_TIMEOUT_MS =
+  WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS +
+  WINDOWS_JOB_TERMINATION_HOST_STARTUP_BUDGET_MS +
+  WINDOWS_JOB_TERMINATION_TIMEOUT_MS +
+  WINDOWS_JOB_TERMINATION_ESCALATION_TIMEOUT_MS +
+  WINDOWS_JOB_CHILD_EXIT_TIMEOUT_MS +
+  WINDOWS_JOB_TEST_HARNESS_OVERHEAD_MS
+const WINDOWS_JOB_STDERR_LIMIT = 16 * 1024
+
+async function withPhaseTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  phase: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${phase} exceeded its ${timeoutMs}ms budget`)),
+          timeoutMs,
+        )
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
 describe('Windows Job process containment', () => {
   it('launches inside the Job and proves it empty after exact termination', async () => {
     if (process.platform !== 'win32') return
@@ -23,34 +59,86 @@ describe('Windows Job process containment', () => {
       stdio: 'ignore',
       env: { ...process.env, JOB_CHILD_PID_FILE: pidFile },
     }, 'win32')
-    const supervisor = spawn(launch.command, launch.args, launch.options)
+    const supervisor = spawn(launch.command, launch.args, {
+      ...launch.options,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let supervisorError: string | null = null
+    let supervisorStderr = ''
+    let supervisorStderrTruncated = false
+    supervisor.once('error', error => {
+      supervisorError = error.stack ?? error.message
+    })
+    supervisor.stderr?.setEncoding('utf8')
+    supervisor.stderr?.on('data', (chunk: string) => {
+      const remaining = WINDOWS_JOB_STDERR_LIMIT - supervisorStderr.length
+      if (remaining <= 0) {
+        supervisorStderrTruncated = true
+        return
+      }
+      supervisorStderr += chunk.slice(0, remaining)
+      if (chunk.length > remaining) supervisorStderrTruncated = true
+    })
     let childPid: number | null = null
     try {
-      const deadline = Date.now() + 10_000
+      // The launch supervisor and termination host each perform an independent
+      // cold Add-Type compilation on hosted Windows runners. Their startup
+      // budgets are therefore separate from the bounded Job termination and
+      // child-exit checks.
+      const deadline = Date.now() + WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS
       while (Date.now() < deadline && childPid === null) {
         childPid = await readFile(pidFile, 'utf8')
           .then(value => Number(value.trim()))
           .catch(() => null)
-        if (childPid === null) await new Promise(resolve => setTimeout(resolve, 25))
+        if (
+          childPid === null &&
+          supervisorError === null &&
+          supervisor.exitCode === null &&
+          supervisor.signalCode === null
+        ) {
+          await new Promise(resolve => setTimeout(resolve, 25))
+        } else if (childPid === null) {
+          break
+        }
+      }
+      if (childPid === null) {
+        const exit = supervisor.exitCode !== null
+          ? `exitCode=${supervisor.exitCode}`
+          : supervisor.signalCode !== null
+            ? `signal=${supervisor.signalCode}`
+            : 'still-running'
+        const stderr = supervisorStderr.trim() || '<empty>'
+        const truncated = supervisorStderrTruncated ? ' [truncated]' : ''
+        throw new Error(
+          `Windows Job supervisor did not publish the child PID within ` +
+          `${WINDOWS_JOB_SUPERVISOR_STARTUP_BUDGET_MS}ms; ${exit}; ` +
+          `spawnError=${supervisorError ?? '<none>'}; stderr=${stderr}${truncated}`,
+        )
       }
       expect(supervisor.pid).toBeNumber()
       expect(childPid).toBeNumber()
       expect(isProcessAlive(childPid!)).toBe(true)
-      await expect(terminateExpectedProcessTreeStable(
-        supervisor.pid!,
-        'SIGTERM',
-        0,
-        launch.osIdentity,
-        {
-          timeoutMs: 2_000,
-          pollMs: 25,
-          escalationTimeoutMs: 2_000,
-          nowMs: Date.now,
-          sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-          platform: 'win32',
-        },
+      await expect(withPhaseTimeout(
+        terminateExpectedProcessTreeStable(
+          supervisor.pid!,
+          'SIGTERM',
+          0,
+          launch.osIdentity,
+          {
+            timeoutMs: WINDOWS_JOB_TERMINATION_TIMEOUT_MS,
+            pollMs: 25,
+            escalationTimeoutMs: WINDOWS_JOB_TERMINATION_ESCALATION_TIMEOUT_MS,
+            nowMs: Date.now,
+            sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+            platform: 'win32',
+          },
+        ),
+        WINDOWS_JOB_TERMINATION_HOST_STARTUP_BUDGET_MS +
+          WINDOWS_JOB_TERMINATION_TIMEOUT_MS +
+          WINDOWS_JOB_TERMINATION_ESCALATION_TIMEOUT_MS,
+        'Windows Job termination host startup and bounded cleanup',
       )).resolves.toBe(true)
-      const exitDeadline = Date.now() + 2_000
+      const exitDeadline = Date.now() + WINDOWS_JOB_CHILD_EXIT_TIMEOUT_MS
       while (Date.now() < exitDeadline && isProcessAlive(childPid!)) {
         await new Promise(resolve => setTimeout(resolve, 25))
       }
@@ -62,5 +150,5 @@ describe('Windows Job process containment', () => {
       }
       await rm(root, { recursive: true, force: true })
     }
-  }, 30_000)
+  }, WINDOWS_JOB_TEST_TIMEOUT_MS)
 })
