@@ -29,55 +29,44 @@ between final token consumption and POST invocation.
 
 ## Atomic OpenCode capability gate
 
-Hosted approval is capability-false unless the OpenCode host implements
-`agent-teams-hosted-approval-v1`. Current upstream OpenCode does not implement
-this contract. The orchestrator probes
-`GET /experimental/agent-teams/hosted-approval-capability` before reading the
-raw pending permission; absence, transport failure, or a malformed response
-performs neither the raw permission read nor a reply POST and is `unavailable`.
-This restriction applies only to hosted approvals; normal OpenCode flows remain
-available.
+Hosted approval is capability-false unless the OpenCode host implements the exact
+`agent-teams-hosted-approval-v2` contract. Production composition remains
+explicitly unmounted until the accepted upstream artifact is pinned and verified.
+All three endpoints use the existing OpenCode Basic Auth; missing server password
+keeps them absent. A missing, unauthenticated, malformed, or failed capability
+performs zero observations and zero reply POSTs. Ordinary non-hosted permission
+fallback behavior is unchanged.
 
 The target upstream contract is:
 
-- Capability response: exact object `{ schemaVersion: 1, protocol:
-  "agent-teams-hosted-approval-v1", configGeneration }` where every config
-  mutation advances `configGeneration` before it becomes observable.
-- `configGeneration` uses the exact grammar
-  `config_generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}`. Valid golden vectors are
-  `config_generation_1` and `config_generation_release-2026.08`; invalid vectors
-  include `config_generation_`, `generation_1`, whitespace, slashes, and strings
-  longer than 242 bytes including the fixed prefix.
-- Conditional reply: one `POST
-  /experimental/agent-teams/permission/{requestId}/reply` with
-  `conditionalReplyVersion: 1`, `expectedConfigGeneration`,
-  `expectedPermissionDigest`, and the reply decision.
-- The server compares the config generation and the canonical raw permission
-  digest and applies the reply in one exclusive transaction. It must perform
-  no provider effect on mismatch and return `409` or `412`. Applied success is
-  the exact object `{ schemaVersion: 1, protocol:
-  "agent-teams-hosted-approval-v1", status: "applied", configGeneration,
-  permissionDigest }`, echoing the values consumed by the transaction.
-- `409`/`412` is proven `not_started`; timeout, socket failure, cancellation,
-  any `3xx`, `5xx`, parse failure, or malformed success is ambiguous and requires
-  the operator. Status classification uses the numeric HTTP response status, never
-  response text. The conditional mutation uses redirect mode `manual`; the client
-  never follows a redirect, falls back, or sends a second reply POST.
+- Capability: `GET /experimental/agent-teams/hosted-approval-capability`, exact
+  `{ schemaVersion: 2, protocol, authentication: "opencode-basic",
+  runtimeInstanceId, configGeneration }`.
+- Observation: one `GET /experimental/agent-teams/hosted-approval/session/
+  {sessionId}/permissions`, exact v2 response, at most 256 permissions and 1 MiB.
+  Every entry binds `requestIncarnation`, `permissionDigest`, and `rawPermission`
+  to the path session.
+- Conditional reply: one `POST /experimental/agent-teams/hosted-approval/session/
+  {sessionId}/permission/{requestId}/reply` with the exact v2 body binding runtime,
+  config, session, request, request incarnation, digest, and decision. Path/body
+  identities must match.
+- Runtime/config/request incarnation identifiers have distinct prefixes followed
+  by exactly 32 lowercase hexadecimal characters; digests are 64 lowercase hex.
+- `409`/`412` is proven `not_started`. Timeout, socket failure, cancellation,
+  any `3xx`, `5xx`, parse failure, or malformed success is ambiguous and is never
+  retried. Redirect mode is `manual`; no v2-to-v1 fallback exists.
 
-Hosted capability and conditional-success bodies are limited to 16 KiB, decoded
-as fatal UTF-8, checked for duplicate object keys before `JSON.parse`, and then
-validated as exact schemas with no additional properties. The capability proof
-and raw `/permission` read use one retained host and one client acquisition;
-missing or malformed capability, transport failure, or a host-acquisition change
-therefore performs zero raw permission reads.
+Capability, reply request, and conditional-success bodies are limited to 16 KiB.
+All hosted responses use bounded streaming, fatal UTF-8, duplicate-key rejection,
+and exact schemas without additional properties. Capability and observation use
+one retained host/client acquisition and the same Basic Auth projection.
 
 Canonical provider permission JSON is UTF-8 JSON with no insignificant
 whitespace: object keys are sorted by JavaScript UTF-16 code-unit order at every
-depth; arrays preserve order; strings, booleans, numbers, and null use
-`JSON.stringify`; unsupported values are rejected. `permissionDigest` is the
-lowercase hexadecimal SHA-256 of those exact bytes. Golden vector:
-`{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` has
-digest `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`.
+depth; arrays preserve order; scalars use `JSON.stringify`; unsupported values
+are rejected. `permissionDigest` is lowercase SHA-256 of those exact bytes.
+Golden vector `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}`
+has digest `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`.
 
 The product decision worker must route every approval record to the owner selected
 from that record's immutable `partition.teamId`; it must not reuse a team selected

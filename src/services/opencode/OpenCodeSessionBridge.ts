@@ -11,6 +11,7 @@ import {
 import path from 'node:path'
 
 import {
+  canonicalHostedApprovalDigest,
   OpenCodePermissionConditionRejectedError,
   openCodeClientFactory,
 } from './OpenCodeClientFactory.js'
@@ -33,6 +34,8 @@ import type {
   OpenCodeLogProjection,
   OpenCodeMessage,
   OpenCodeNormalizedPermission,
+  OpenCodeHostedApprovalCapability,
+  OpenCodeHostedApprovalPermission,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionRecord,
@@ -352,25 +355,49 @@ function canonicalEffectValue(value: unknown): string {
   ).join(',')}}`
 }
 
-const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v1' as const
+const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v2' as const
 
 function decodeHostedApprovalCapability(value: unknown): {
-  schemaVersion: 1
+  schemaVersion: 2
   protocol: typeof HOSTED_APPROVAL_PROTOCOL
+  authentication: 'opencode-basic'
+  runtimeInstanceId: string
   configGeneration: string
 } | null {
   const record = asRecord(value)
   if (!record || Object.keys(record).sort().join(',') !==
-    'configGeneration,protocol,schemaVersion' || record.schemaVersion !== 1 ||
+    'authentication,configGeneration,protocol,runtimeInstanceId,schemaVersion' ||
+    record.schemaVersion !== 2 ||
     record.protocol !== HOSTED_APPROVAL_PROTOCOL ||
+    record.authentication !== 'opencode-basic' ||
+    typeof record.runtimeInstanceId !== 'string' ||
+    !/^runtime_instance_[0-9a-f]{32}$/.test(record.runtimeInstanceId) ||
     typeof record.configGeneration !== 'string' ||
-    !/^config_generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(record.configGeneration)) {
+    !/^config_generation_[0-9a-f]{32}$/.test(record.configGeneration)) {
     return null
   }
   return record as {
-    schemaVersion: 1
+    schemaVersion: 2
     protocol: typeof HOSTED_APPROVAL_PROTOCOL
+    authentication: 'opencode-basic'
+    runtimeInstanceId: string
     configGeneration: string
+  }
+}
+
+export type OpenCodeHostedApprovalObservedPermission = {
+  capability: OpenCodeHostedApprovalCapability
+  permission: OpenCodeHostedApprovalPermission
+  normalized: OpenCodeNormalizedPermission
+}
+
+function hostedApprovalAuth(profile: OpenCodePreparedProfile) {
+  const password = profile.env.OPENCODE_SERVER_PASSWORD?.trim()
+  if (!password) throw new Error('OpenCode hosted approval Basic Auth unavailable')
+  return {
+    username: profile.env.OPENCODE_SERVER_USERNAME?.trim() || 'opencode',
+    password,
+    directory: profile.projectPath,
   }
 }
 
@@ -1487,6 +1514,8 @@ export class OpenCodeSessionBridge {
       decision: 'allow' | 'always' | 'reject'
       /** Exact raw permission incarnation admitted by the hosted owner. */
       expectedPermissionRaw?: OpenCodeNormalizedPermission['raw']
+      /** Exact v2 provider observation admitted by the hosted owner. */
+      expectedHostedPermission?: OpenCodeHostedApprovalObservedPermission
       /** Requires the upstream atomic config-CAS permission-reply contract. */
       requireAtomicConfigReply?: boolean
       /** Revalidates the persisted session/effect binding after fresh host proof. */
@@ -1505,7 +1534,11 @@ export class OpenCodeSessionBridge {
     } = { phase: 'not_started' }
     try {
       return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(
+        baseUrl,
+        {},
+        params.requireAtomicConfigReply ? hostedApprovalAuth(profile) : undefined,
+      )
       let preparedToken: OpenCodePermissionEffectToken | null = null
       let authorityToken: OpenCodePermissionEffectToken | null = null
       let profileToken: OpenCodePermissionEffectToken | null = null
@@ -1515,6 +1548,9 @@ export class OpenCodeSessionBridge {
       let profileConsumed = false
       let hostConsumed = false
       let configGeneration: string | null = null
+      let runtimeInstanceId: string | null = null
+      let requestIncarnation: string | null = null
+      let permissionDigest: string | null = null
       try {
       // Capability probe is deliberately before the raw permission GET. A
       // current upstream host (which lacks atomic config-CAS reply) therefore
@@ -1528,10 +1564,34 @@ export class OpenCodeSessionBridge {
         )
         if (!capability) throw new Error('OpenCode atomic hosted approval capability unavailable')
         configGeneration = capability.configGeneration
+        runtimeInstanceId = capability.runtimeInstanceId
+        if (!client.observeHostedApprovalPermissions || !params.expectedHostedPermission) {
+          throw new Error('OpenCode atomic hosted approval observation unavailable')
+        }
+        const observation = await client.observeHostedApprovalPermissions(record.opencodeSessionId)
+        if (observation.runtimeInstanceId !== capability.runtimeInstanceId ||
+          observation.configGeneration !== capability.configGeneration) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        const expected = params.expectedHostedPermission
+        const permission = observation.permissions.find(candidate =>
+          candidate.requestId === params.requestId &&
+          candidate.sessionId === record.opencodeSessionId &&
+          candidate.requestIncarnation === expected.permission.requestIncarnation &&
+          candidate.permissionDigest === expected.permission.permissionDigest &&
+          canonicalEffectValue(candidate.rawPermission) ===
+            canonicalEffectValue(expected.permission.rawPermission),
+        )
+        if (!permission || expected.capability.runtimeInstanceId !== capability.runtimeInstanceId ||
+          expected.capability.configGeneration !== capability.configGeneration) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        requestIncarnation = permission.requestIncarnation
+        permissionDigest = permission.permissionDigest
       }
       // Observe the exact provider-side incarnation before preparing any final
       // effect tokens. The final host proof below must therefore cover this GET.
-      if (params.expectedPermissionRaw) {
+      if (params.expectedPermissionRaw && !params.requireAtomicConfigReply) {
         const exactPermission = normalizeOpenCodePermissions(await client.getPermissions()).find(permission =>
           permission.requestId === params.requestId &&
           permission.sessionId === record.opencodeSessionId &&
@@ -1592,13 +1652,13 @@ export class OpenCodeSessionBridge {
           requestId: params.requestId,
           sessionId: record.opencodeSessionId,
           decision: params.decision,
-          ...(configGeneration && params.expectedPermissionRaw
+          ...(configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
             ? {
                 condition: {
+                  runtimeInstanceId,
                   configGeneration,
-                  permissionDigest: createHash('sha256')
-                    .update(canonicalEffectValue(params.expectedPermissionRaw))
-                    .digest('hex'),
+                  requestIncarnation,
+                  permissionDigest,
                 },
               }
             : {}),
@@ -1635,8 +1695,8 @@ export class OpenCodeSessionBridge {
   /** Returns the upstream config generation only for the exact atomic contract. */
   async probeHostedApprovalCapability(record: OpenCodeSessionRecord): Promise<string | null> {
     try {
-      return await this.withSessionHost(record, async ({ baseUrl }) => {
-        const client = this.clientFactory.create(baseUrl)
+      return await this.withSessionHost(record, async ({ baseUrl, profile }) => {
+        const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
         if (!client.getHostedApprovalCapability) return null
         const capability = decodeHostedApprovalCapability(
           await client.getHostedApprovalCapability(),
@@ -1655,9 +1715,9 @@ export class OpenCodeSessionBridge {
    */
   async observeHostedApprovalPermissions(
     record: OpenCodeSessionRecord,
-  ): Promise<OpenCodeNormalizedPermission[]> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+  ): Promise<OpenCodeHostedApprovalObservedPermission[]> {
+    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
+      const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
       if (!client.getHostedApprovalCapability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')
       }
@@ -1667,7 +1727,25 @@ export class OpenCodeSessionBridge {
       if (!capability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')
       }
-      return normalizeOpenCodePermissions(await client.getPermissions())
+      if (!client.observeHostedApprovalPermissions) {
+        throw new Error('OpenCode atomic hosted approval observation unavailable')
+      }
+      const observation = await client.observeHostedApprovalPermissions(record.opencodeSessionId)
+      if (observation.runtimeInstanceId !== capability.runtimeInstanceId ||
+        observation.configGeneration !== capability.configGeneration) {
+        throw new Error('OpenCode hosted approval observation generation changed')
+      }
+      return observation.permissions.map(permission => {
+        const normalized = normalizeOpenCodePermissions([
+          permission.rawPermission as import('./types.js').OpenCodePendingPermission,
+        ])[0]
+        if (!normalized || normalized.requestId !== permission.requestId ||
+          normalized.sessionId !== permission.sessionId ||
+          canonicalHostedApprovalDigest(permission.rawPermission) !== permission.permissionDigest) {
+          throw new Error('OpenCode hosted approval permission projection mismatch')
+        }
+        return { capability, permission, normalized }
+      })
     })
   }
 

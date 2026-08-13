@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { OpenCodeNormalizedPermission, OpenCodeSessionRecord } from '../opencode/types.js'
+import { canonicalHostedApprovalDigest } from '../opencode/OpenCodeClientFactory.js'
 import { OpenCodePermissionEffectNotAuthorizedError, type OpenCodePermissionEffectContext } from '../opencode/OpenCodeSessionBridge.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import {
@@ -65,8 +66,36 @@ const permission: OpenCodeNormalizedPermission = {
   requestId: 'permission_1', sessionId: 'session_1', tool: 'bash', title: 'Run tests', kind: 'tool',
   raw: { requestID: 'permission_1', sessionID: 'session_1', tool: 'bash', title: 'Run tests' },
 }
+const providerObservation = {
+  capability: {
+    schemaVersion: 2 as const,
+    protocol: 'agent-teams-hosted-approval-v2' as const,
+    authentication: 'opencode-basic' as const,
+    runtimeInstanceId: `runtime_instance_${'a'.repeat(32)}`,
+    configGeneration: `config_generation_${'b'.repeat(32)}`,
+  },
+  permission: {
+    requestId: permission.requestId,
+    sessionId: permission.sessionId!,
+    requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
+    permissionDigest: canonicalHostedApprovalDigest(permission.raw),
+    rawPermission: permission.raw,
+  },
+  normalized: permission,
+}
+const observed = (value: OpenCodeNormalizedPermission = permission) => ({
+  ...providerObservation,
+  permission: {
+    ...providerObservation.permission,
+    requestId: value.requestId,
+    sessionId: value.sessionId!,
+    permissionDigest: canonicalHostedApprovalDigest(value.raw),
+    rawPermission: value.raw,
+  },
+  normalized: value,
+})
 const expectedEffectRef = ingressRecordForObservedPermission({
-  route, permission, observedAtIso: '2026-08-13T10:00:00.000Z',
+  route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z',
 }).effectRef
 describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
   test('keeps current upstream capability-false before raw permission observation or reply', async () => {
@@ -97,7 +126,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     const gets: unknown[][] = []
     const adapter = new OpenCodeHostedApprovalRuntimeAdapter(
       { get: async (...args: unknown[]) => { gets.push(args); return record } } as never,
-      { observeHostedApprovalPermissions: async () => [permission], answerPermission: async () => undefined } as never,
+      { observeHostedApprovalPermissions: async () => [observed()], answerPermission: async () => undefined } as never,
       () => Date.parse('2026-08-13T10:00:00.000Z'),
     )
     expect(await adapter.observe(route)).toMatchObject([{ permission: { requestId: 'permission_1' } }])
@@ -118,7 +147,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         { get: async () => record } as never,
         {
           observeHostedApprovalPermissions: async () =>
-            (options.permissions ?? [[permission], []])[probe++] ?? [],
+            ((options.permissions ?? [[permission], []])[probe++] ?? []).map(observed),
           answerPermission: async (_record: OpenCodeSessionRecord, params: { authorizeEffect?: (context: OpenCodePermissionEffectContext) => Promise<boolean> }) => {
             if (params.authorizeEffect && !(await params.authorizeEffect(effectContext))) throw new OpenCodePermissionEffectNotAuthorizedError()
             answers += 1; if (options.answerThrows) throw new Error('uncertain')
@@ -146,7 +175,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       const adapter = new OpenCodeHostedApprovalRuntimeAdapter(
         { get: async () => record } as never,
         {
-          observeHostedApprovalPermissions: async () => [permission],
+          observeHostedApprovalPermissions: async () => [observed()],
           answerPermission: async (_record: OpenCodeSessionRecord, params: { authorizeEffect?: (context: OpenCodePermissionEffectContext) => Promise<boolean> }) => {
             await delayedHost
             if (params.authorizeEffect && !(await params.authorizeEffect(rotate(effectContext)))) {
@@ -167,7 +196,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     let reads = 0; let answers = 0
     const adapter = new OpenCodeHostedApprovalRuntimeAdapter(
       { get: async () => ++reads === 1 ? record : null } as never,
-      { observeHostedApprovalPermissions: async () => [permission], answerPermission: async () => { answers += 1 } } as never,
+      { observeHostedApprovalPermissions: async () => [observed()], answerPermission: async () => { answers += 1 } } as never,
     )
     expect(await adapter.deliver({ route, requestId: 'permission_1', expectedEffectRef, decision: 'deny', revalidate: async () => true })).toBe('unavailable')
     expect(answers).toBe(0)
@@ -192,6 +221,34 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     expect(replaced).not.toMatchObject({ outboxId: first.outboxId, effectRef: first.effectRef, deliveryRef: first.deliveryRef })
   })
 
+  test('binds runtime restart and request incarnation even when the raw digest is reused', () => {
+    const first = ingressRecordForObservedPermission({
+      route, permission, providerObservation, observedAtIso: '2026-08-13T10:00:00.000Z',
+    })
+    const restarted = ingressRecordForObservedPermission({
+      route, permission, observedAtIso: '2026-08-13T10:00:01.000Z',
+      providerObservation: {
+        ...providerObservation,
+        capability: {
+          ...providerObservation.capability,
+          runtimeInstanceId: `runtime_instance_${'d'.repeat(32)}`,
+        },
+      },
+    })
+    const reusedRequest = ingressRecordForObservedPermission({
+      route, permission, observedAtIso: '2026-08-13T10:00:02.000Z',
+      providerObservation: {
+        ...providerObservation,
+        permission: {
+          ...providerObservation.permission,
+          requestIncarnation: `request_incarnation_${'e'.repeat(32)}`,
+        },
+      },
+    })
+    expect(restarted.effectRef).not.toBe(first.effectRef)
+    expect(reusedRequest.effectRef).not.toBe(first.effectRef)
+  })
+
   test('performs zero effects when the same run and session rotate live host or auth projection', async () => {
     for (const rotate of [
       (value: OpenCodeSessionRecord) => ({ ...value, hostKey: `${value.hostKey}::replacement` }),
@@ -208,7 +265,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
       let reads = 0; let answers = 0
       const adapter = new OpenCodeHostedApprovalRuntimeAdapter(
         { get: async () => ++reads === 1 ? record : rotate(record) } as never,
-        { observeHostedApprovalPermissions: async () => [permission], answerPermission: async () => { answers += 1 } } as never,
+        { observeHostedApprovalPermissions: async () => [observed()], answerPermission: async () => { answers += 1 } } as never,
       )
       expect(await adapter.deliver({ route, requestId: permission.requestId, expectedEffectRef, decision: 'allow', revalidate: async () => true })).toBe('unavailable')
       expect(answers).toBe(0)
@@ -227,7 +284,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
         },
       } as never,
       {
-        observeHostedApprovalPermissions: async () => [permission],
+        observeHostedApprovalPermissions: async () => [observed()],
         answerPermission: async (received: OpenCodeSessionRecord, params: {
           validatePreparedEffect?: (context: OpenCodePermissionEffectContext) => Promise<boolean | { consume(): boolean }>
         }) => {
@@ -242,7 +299,7 @@ describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
     expect(await adapter.deliver({
       route, requestId: permission.requestId, expectedEffectRef, decision: 'allow',
       revalidate: async () => true,
-    })).toBe('ambiguous')
+    })).toBe('delivered')
     expect(tokenRecord).toEqual(record)
     expect(posts).toBe(1)
   })

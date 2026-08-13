@@ -9,12 +9,14 @@ import {
 } from '../opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore, type OpenCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { OpenCodeNormalizedPermission } from '../opencode/types.js'
+import type { OpenCodeHostedApprovalObservedPermission } from '../opencode/OpenCodeSessionBridge.js'
 import type { HostedApprovalIngressRecord } from './HostedApprovalWire.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 
 export type HostedApprovalObservedPermission = {
   route: HostedApprovalRuntimeRoute
   permission: OpenCodeNormalizedPermission
+  providerObservation?: OpenCodeHostedApprovalObservedPermission
   observedAtIso: string
 }
 
@@ -34,11 +36,16 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
   async observe(route: HostedApprovalRuntimeRoute): Promise<readonly HostedApprovalObservedPermission[]> {
     const record = await this.#record(route)
     const permissions = await this.bridge.observeHostedApprovalPermissions(record)
-    if (permissions.some(permission => permission.sessionId !== route.authority.sessionId)) {
+    if (permissions.some(item => item.permission.sessionId !== route.authority.sessionId)) {
       throw new Error('Hosted approval OpenCode permission session mismatch')
     }
     const observedAtIso = new Date(this.now()).toISOString()
-    return permissions.map(permission => ({ route, permission, observedAtIso }))
+    return permissions.map(providerObservation => ({
+      route,
+      permission: providerObservation.normalized,
+      providerObservation,
+      observedAtIso,
+    }))
   }
 
   async deliver(input: {
@@ -55,7 +62,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
     try { before = await this.observe(input.route) } catch { return 'unavailable' }
     const expected = before.find(item => item.permission.requestId === input.requestId &&
       ingressRecordForObservedPermission(item).effectRef === input.expectedEffectRef)
-    if (!expected) return 'not_started'
+    if (!expected?.providerObservation) return 'not_started'
     let record
     try {
       // Refetch the exact live lane/session/run immediately before the final
@@ -70,6 +77,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
         requestId: input.requestId,
         decision: input.decision === 'allow' ? 'allow' : 'reject',
         expectedPermissionRaw: expected.permission.raw,
+        expectedHostedPermission: expected.providerObservation,
         requireAtomicConfigReply: true,
         validatePreparedEffect: async context => {
           const freshRecord = await this.#record(input.route)
@@ -94,9 +102,10 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
       if (error instanceof OpenCodePermissionEffectNotAuthorizedError) return 'not_started'
       return error instanceof OpenCodePermissionEffectUnavailableError ? 'unavailable' : 'ambiguous'
     }
-    let after: readonly HostedApprovalObservedPermission[]
-    try { after = await this.observe(input.route) } catch { return 'ambiguous' }
-    return after.some(item => item.permission.requestId === input.requestId) ? 'ambiguous' : 'delivered'
+    // The strict v2 success body is the provider transaction receipt. A second
+    // observation would create a fresh race with host restart/config rotation
+    // and must not weaken an already-proven applied result.
+    return 'delivered'
   }
 
   async #record(route: HostedApprovalRuntimeRoute) {
@@ -113,12 +122,17 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
 
 export function ingressRecordForObservedPermission(input: HostedApprovalObservedPermission): HostedApprovalIngressRecord {
   const requestId = input.permission.requestId
+  const provider = input.providerObservation
   const effectDigest = createHash('sha256').update(canonicalJson({
     schemaVersion: 1,
     authority: input.route.authority,
     sessionRecordFingerprint: input.route.openCodeBinding.sessionRecordFingerprint,
     liveEffectFingerprint: input.route.openCodeBinding.liveEffectFingerprint,
     requestId,
+    runtimeInstanceId: provider?.capability.runtimeInstanceId ?? null,
+    configGeneration: provider?.capability.configGeneration ?? null,
+    requestIncarnation: provider?.permission.requestIncarnation ?? null,
+    permissionDigest: provider?.permission.permissionDigest ?? null,
     providerPermission: input.permission.raw,
   })).digest('hex')
   const deliveryRef = `delivery_ref_opencode-${effectDigest}`

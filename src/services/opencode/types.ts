@@ -178,9 +178,28 @@ export type OpenCodeServerDocResponse = {
  * keep hosted approval effects disabled when the probe is absent or malformed.
  */
 export type OpenCodeHostedApprovalCapability = {
-  schemaVersion: 1
-  protocol: 'agent-teams-hosted-approval-v1'
+  schemaVersion: 2
+  protocol: 'agent-teams-hosted-approval-v2'
+  authentication: 'opencode-basic'
+  runtimeInstanceId: string
   configGeneration: string
+}
+
+export type OpenCodeHostedApprovalPermission = {
+  requestId: string
+  sessionId: string
+  requestIncarnation: string
+  permissionDigest: string
+  rawPermission: unknown
+}
+
+export type OpenCodeHostedApprovalObservation = {
+  schemaVersion: 2
+  protocol: 'agent-teams-hosted-approval-v2'
+  runtimeInstanceId: string
+  configGeneration: string
+  sessionId: string
+  permissions: OpenCodeHostedApprovalPermission[]
 }
 
 export type OpenCodeMcpServerConfig = {

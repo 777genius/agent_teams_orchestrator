@@ -47,7 +47,7 @@ const profile: OpenCodePreparedProfile = {
   sourceAuthFingerprint: 'source-auth',
   managedAuthFingerprint: 'managed-auth',
   authState: 'ok',
-  env: {},
+  env: { OPENCODE_SERVER_PASSWORD: 'test-password' },
 }
 
 const host: OpenCodeHostHandle = {
@@ -308,21 +308,41 @@ describe('OpenCodeSessionBridge', () => {
           getHostedApprovalCapability: async () => {
             order.push('capability')
             return {
-              schemaVersion: 1,
-              protocol: 'agent-teams-hosted-approval-v1',
-              configGeneration: 'config_generation_1',
+              schemaVersion: 2,
+              protocol: 'agent-teams-hosted-approval-v2',
+              authentication: 'opencode-basic',
+              runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+              configGeneration: `config_generation_${'2'.repeat(32)}`,
             }
           },
-          getPermissions: async () => {
+          observeHostedApprovalPermissions: async () => {
             order.push('permissions')
-            return [{ requestID: 'permission_1', sessionID: 'session-1' }]
+            const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
+            return {
+              schemaVersion: 2,
+              protocol: 'agent-teams-hosted-approval-v2',
+              runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+              configGeneration: `config_generation_${'2'.repeat(32)}`,
+              sessionId: 'session-1',
+              permissions: [{
+                requestId: 'permission_1', sessionId: 'session-1',
+                requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+                permissionDigest: createHash('sha256')
+                  .update('{"requestID":"permission_1","sessionID":"session-1"}')
+                  .digest('hex'),
+                rawPermission,
+              }],
+            }
           },
         } as never
       } },
     })
 
     await expect(bridge.observeHostedApprovalPermissions(buildRecord({ toolApprovalMode: 'manual' })))
-      .resolves.toMatchObject([{ requestId: 'permission_1', sessionId: 'session-1' }])
+      .resolves.toMatchObject([{
+        normalized: { requestId: 'permission_1', sessionId: 'session-1' },
+        permission: { requestIncarnation: `request_incarnation_${'3'.repeat(32)}` },
+      }])
     expect({ acquisitions, order }).toEqual({
       acquisitions: 1,
       order: ['capability', 'permissions'],
@@ -330,7 +350,7 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   test('performs zero raw permission reads for a missing or malformed capability', async () => {
-    for (const capability of [undefined, async () => ({ schemaVersion: 1, protocol: 'wrong', configGeneration: 'config_generation_1' })]) {
+    for (const capability of [undefined, async () => ({ schemaVersion: 2, protocol: 'wrong', configGeneration: `config_generation_${'2'.repeat(32)}` })]) {
       let rawReads = 0
       const bridge = new OpenCodeSessionBridge({
         prepareProfile: async () => profile,
@@ -340,7 +360,7 @@ describe('OpenCodeSessionBridge', () => {
         },
         clientFactory: { create: () => ({
           ...(capability ? { getHostedApprovalCapability: capability } : {}),
-          getPermissions: async () => { rawReads += 1; return [] },
+          observeHostedApprovalPermissions: async () => { rawReads += 1; return [] },
         } as never) },
       })
       await expect(bridge.observeHostedApprovalPermissions(buildRecord({ toolApprovalMode: 'manual' })))

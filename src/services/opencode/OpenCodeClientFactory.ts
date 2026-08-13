@@ -1,9 +1,13 @@
+import { createHash } from 'node:crypto'
+
 import type {
   OpenCodeAgentResponse,
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
   OpenCodeConfigResponse,
   OpenCodeHostedApprovalCapability,
+  OpenCodeHostedApprovalObservation,
+  OpenCodeHostedApprovalPermission,
   OpenCodeMessage,
   OpenCodeMcpResponse,
   OpenCodeMcpServerConfig,
@@ -25,6 +29,7 @@ export type OpenCodeClient = {
   getProviderAuth(): Promise<Record<string, OpenCodeProviderAuthMethod[]>>
   getServerDoc(): Promise<OpenCodeServerDocResponse>
   getHostedApprovalCapability?(): Promise<OpenCodeHostedApprovalCapability>
+  observeHostedApprovalPermissions?(sessionId: string): Promise<OpenCodeHostedApprovalObservation>
   authorizeProviderOAuth(
     providerId: string,
     body: OpenCodeProviderOAuthAuthorizeInput,
@@ -60,7 +65,9 @@ export type OpenCodeClient = {
     sessionId?: string | null
     decision: 'allow' | 'always' | 'reject'
     condition?: {
+      runtimeInstanceId: string
       configGeneration: string
+      requestIncarnation: string
       permissionDigest: string
     }
   }): Promise<unknown>
@@ -108,6 +115,12 @@ type OpenCodeClientFactoryDeps = {
   fetchImpl?: typeof fetch
 }
 
+export type OpenCodeHostedApprovalAuth = {
+  username?: string
+  password: string
+  directory: string
+}
+
 /** A conditional reply was rejected before any permission effect was applied. */
 export class OpenCodePermissionConditionRejectedError extends Error {
   constructor(readonly cause: unknown) {
@@ -127,19 +140,28 @@ class OpenCodeHttpResponseError extends Error {
   }
 }
 
-const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v1' as const
+const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v2' as const
 const MAX_HOSTED_APPROVAL_RESPONSE_BYTES = 16 * 1024
+const MAX_HOSTED_APPROVAL_OBSERVATION_BYTES = 1024 * 1024
+const HOSTED_RUNTIME_INSTANCE = /^runtime_instance_[0-9a-f]{32}$/
+const HOSTED_CONFIG_GENERATION = /^config_generation_[0-9a-f]{32}$/
+const HOSTED_REQUEST_INCARNATION = /^request_incarnation_[0-9a-f]{32}$/
+const HOSTED_DIGEST = /^[0-9a-f]{64}$/
 
 function validateHostedApprovalCapability(value: unknown): OpenCodeHostedApprovalCapability {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('OpenCode hosted approval capability response was malformed')
   }
   const response = value as Record<string, unknown>
-  if (Object.keys(response).sort().join(',') !== 'configGeneration,protocol,schemaVersion' ||
-    response.schemaVersion !== 1 ||
+  if (Object.keys(response).sort().join(',') !==
+      'authentication,configGeneration,protocol,runtimeInstanceId,schemaVersion' ||
+    response.schemaVersion !== 2 ||
     response.protocol !== HOSTED_APPROVAL_PROTOCOL ||
+    response.authentication !== 'opencode-basic' ||
+    typeof response.runtimeInstanceId !== 'string' ||
+    !HOSTED_RUNTIME_INSTANCE.test(response.runtimeInstanceId) ||
     typeof response.configGeneration !== 'string' ||
-    !/^config_generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(response.configGeneration)) {
+    !HOSTED_CONFIG_GENERATION.test(response.configGeneration)) {
     throw new Error('OpenCode hosted approval capability response was malformed')
   }
   return response as OpenCodeHostedApprovalCapability
@@ -147,25 +169,133 @@ function validateHostedApprovalCapability(value: unknown): OpenCodeHostedApprova
 
 function validateConditionalPermissionReply(
   value: unknown,
-  expected: { configGeneration: string; permissionDigest: string },
+  expected: {
+    runtimeInstanceId: string
+    configGeneration: string
+    requestId: string
+    sessionId: string
+    requestIncarnation: string
+    permissionDigest: string
+    decision: 'allow_once' | 'reject'
+  },
 ): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('OpenCode conditional permission reply was malformed')
   }
   const response = value as Record<string, unknown>
   if (Object.keys(response).sort().join(',') !==
-    'configGeneration,permissionDigest,protocol,schemaVersion,status' ||
-    response.schemaVersion !== 1 ||
-    response.protocol !== 'agent-teams-hosted-approval-v1' ||
+    'configGeneration,decision,permissionDigest,protocol,requestId,requestIncarnation,runtimeInstanceId,schemaVersion,sessionId,status' ||
+    response.schemaVersion !== 2 ||
+    response.protocol !== HOSTED_APPROVAL_PROTOCOL ||
     response.status !== 'applied' ||
+    response.runtimeInstanceId !== expected.runtimeInstanceId ||
     response.configGeneration !== expected.configGeneration ||
-    response.permissionDigest !== expected.permissionDigest) {
+    response.requestId !== expected.requestId ||
+    response.sessionId !== expected.sessionId ||
+    response.requestIncarnation !== expected.requestIncarnation ||
+    response.permissionDigest !== expected.permissionDigest ||
+    response.decision !== expected.decision) {
     throw new Error('OpenCode conditional permission reply was malformed')
   }
   return value
 }
 
-async function readBoundedUtf8Response(response: Response): Promise<string> {
+function assertHostedIdentifier(value: string, field: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(value)) {
+    throw new Error(`Invalid OpenCode hosted approval ${field}`)
+  }
+}
+
+function validateHostedApprovalPermission(
+  value: unknown,
+  sessionId: string,
+): OpenCodeHostedApprovalPermission {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('OpenCode hosted approval permission was malformed')
+  }
+  const record = value as Record<string, unknown>
+  if (Object.keys(record).sort().join(',') !==
+      'permissionDigest,rawPermission,requestId,requestIncarnation,sessionId' ||
+    typeof record.requestId !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(record.requestId) ||
+    record.sessionId !== sessionId ||
+    typeof record.requestIncarnation !== 'string' ||
+    !HOSTED_REQUEST_INCARNATION.test(record.requestIncarnation) ||
+    typeof record.permissionDigest !== 'string' ||
+    !HOSTED_DIGEST.test(record.permissionDigest) ||
+    canonicalHostedApprovalDigest(record.rawPermission) !== record.permissionDigest) {
+    throw new Error('OpenCode hosted approval permission was malformed')
+  }
+  return record as OpenCodeHostedApprovalPermission
+}
+
+function validateHostedApprovalObservation(
+  value: unknown,
+  sessionId: string,
+): OpenCodeHostedApprovalObservation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('OpenCode hosted approval observation was malformed')
+  }
+  const response = value as Record<string, unknown>
+  if (Object.keys(response).sort().join(',') !==
+      'configGeneration,permissions,protocol,runtimeInstanceId,schemaVersion,sessionId' ||
+    response.schemaVersion !== 2 || response.protocol !== HOSTED_APPROVAL_PROTOCOL ||
+    response.sessionId !== sessionId ||
+    typeof response.runtimeInstanceId !== 'string' ||
+    !HOSTED_RUNTIME_INSTANCE.test(response.runtimeInstanceId) ||
+    typeof response.configGeneration !== 'string' ||
+    !HOSTED_CONFIG_GENERATION.test(response.configGeneration) ||
+    !Array.isArray(response.permissions) || response.permissions.length > 256) {
+    throw new Error('OpenCode hosted approval observation was malformed')
+  }
+  return {
+    ...response,
+    permissions: response.permissions.map(permission =>
+      validateHostedApprovalPermission(permission, sessionId)),
+  } as OpenCodeHostedApprovalObservation
+}
+
+function hostedApprovalRequest(
+  auth: OpenCodeHostedApprovalAuth | undefined,
+  init: RequestInit = {},
+): RequestInit {
+  if (!auth?.password) throw new Error('OpenCode hosted approval Basic Auth unavailable')
+  if (!auth.directory || auth.directory.includes('\0')) {
+    throw new Error('OpenCode hosted approval directory unavailable')
+  }
+  const username = auth.username?.trim() || 'opencode'
+  return {
+    ...init,
+    redirect: 'manual',
+    headers: {
+      ...(init.headers ?? {}),
+      authorization: `Basic ${Buffer.from(`${username}:${auth.password}`, 'utf8').toString('base64')}`,
+      'x-opencode-directory': auth.directory,
+    },
+  }
+}
+
+export function canonicalHostedApprovalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    const encoded = JSON.stringify(value)
+    if (encoded === undefined) throw new Error('Unsupported OpenCode hosted approval canonical value')
+    return encoded
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalHostedApprovalJson).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).filter(key => record[key] !== undefined).sort().map(key =>
+    `${JSON.stringify(key)}:${canonicalHostedApprovalJson(record[key])}`,
+  ).join(',')}}`
+}
+
+export function canonicalHostedApprovalDigest(value: unknown): string {
+  return createHash('sha256').update(canonicalHostedApprovalJson(value), 'utf8').digest('hex')
+}
+
+async function readBoundedUtf8Response(
+  response: Response,
+  maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+): Promise<string> {
   const reader = response.body?.getReader()
   if (!reader) return ''
   const chunks: Uint8Array[] = []
@@ -175,7 +305,7 @@ async function readBoundedUtf8Response(response: Response): Promise<string> {
       const next = await reader.read()
       if (next.done) break
       byteLength += next.value.byteLength
-      if (byteLength > MAX_HOSTED_APPROVAL_RESPONSE_BYTES) {
+      if (byteLength > maximumBytes) {
         await reader.cancel().catch(() => undefined)
         throw new Error('OpenCode hosted approval response exceeded byte limit')
       }
@@ -259,10 +389,13 @@ function rejectDuplicateJsonKeys(text: string): void {
   }
 }
 
-async function parseStrictHostedApprovalResponse<T>(response: Response): Promise<T> {
+async function parseStrictHostedApprovalResponse<T>(
+  response: Response,
+  maximumBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+): Promise<T> {
   let text = ''
   try {
-    text = await readBoundedUtf8Response(response)
+    text = await readBoundedUtf8Response(response, maximumBytes)
   } catch (error) {
     if (!response.ok) {
       throw new OpenCodeHttpResponseError(response.status, response.statusText, '')
@@ -334,7 +467,11 @@ function resolveAbortReason(signal: AbortSignal, fallback: Error): unknown {
 export class OpenCodeClientFactory {
   constructor(private readonly deps: OpenCodeClientFactoryDeps = {}) {}
 
-  create(baseUrl: string, context: OpenCodeClientRequestContext = {}): OpenCodeClient {
+  create(
+    baseUrl: string,
+    context: OpenCodeClientRequestContext = {},
+    hostedApprovalAuth?: OpenCodeHostedApprovalAuth,
+  ): OpenCodeClient {
     const fetchImpl = this.deps.fetchImpl ?? fetch
 
     const request = async <T>(
@@ -342,6 +479,7 @@ export class OpenCodeClientFactory {
       init?: RequestInit,
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
       strictHostedApprovalResponse = false,
+      maximumResponseBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
@@ -372,7 +510,7 @@ export class OpenCodeClientFactory {
           },
         })
         return strictHostedApprovalResponse
-          ? parseStrictHostedApprovalResponse<T>(response)
+          ? parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes)
           : parseResponse<T>(response)
       } catch (error) {
         if (context.signal?.aborted) {
@@ -398,10 +536,20 @@ export class OpenCodeClientFactory {
       getHostedApprovalCapability: () =>
         request<OpenCodeHostedApprovalCapability>(
           '/experimental/agent-teams/hosted-approval-capability',
-          undefined,
+          hostedApprovalRequest(hostedApprovalAuth),
           PERMISSION_REQUEST_TIMEOUT_MS,
           true,
         ).then(validateHostedApprovalCapability),
+      observeHostedApprovalPermissions: sessionId => {
+        assertHostedIdentifier(sessionId, 'session id')
+        return request<OpenCodeHostedApprovalObservation>(
+          `/experimental/agent-teams/hosted-approval/session/${encodeURIComponent(sessionId)}/permissions`,
+          hostedApprovalRequest(hostedApprovalAuth),
+          PERMISSION_REQUEST_TIMEOUT_MS,
+          true,
+          MAX_HOSTED_APPROVAL_OBSERVATION_BYTES,
+        ).then(value => validateHostedApprovalObservation(value, sessionId))
+      },
       authorizeProviderOAuth: (providerId, body) =>
         request<OpenCodeProviderOAuthAuthorization>(
           `/provider/${encodeURIComponent(providerId)}/oauth/authorize`,
@@ -517,13 +665,6 @@ export class OpenCodeClientFactory {
           decision: body.decision,
           allow: body.decision === 'allow' || body.decision === 'always',
           always: body.decision === 'always',
-          ...(body.condition
-            ? {
-                conditionalReplyVersion: 1,
-                expectedConfigGeneration: body.condition.configGeneration,
-                expectedPermissionDigest: body.condition.permissionDigest,
-              }
-            : {}),
         }
         const encodedRequestId = encodeURIComponent(body.requestId)
         if (!body.condition) {
@@ -554,17 +695,45 @@ export class OpenCodeClientFactory {
             : new Error(`OpenCode permission answer failed for ${body.requestId}`)
         }
         try {
+          if (!body.sessionId) throw new Error('OpenCode hosted approval session id missing')
+          assertHostedIdentifier(body.requestId, 'request id')
+          assertHostedIdentifier(body.sessionId, 'session id')
+          const decision = body.decision === 'allow' ? 'allow_once' : 'reject'
+          const conditionalPayload = {
+            schemaVersion: 2,
+            protocol: HOSTED_APPROVAL_PROTOCOL,
+            runtimeInstanceId: body.condition.runtimeInstanceId,
+            expectedConfigGeneration: body.condition.configGeneration,
+            requestId: body.requestId,
+            sessionId: body.sessionId,
+            requestIncarnation: body.condition.requestIncarnation,
+            expectedPermissionDigest: body.condition.permissionDigest,
+            decision,
+          }
+          if (!HOSTED_RUNTIME_INSTANCE.test(body.condition.runtimeInstanceId) ||
+            !HOSTED_CONFIG_GENERATION.test(body.condition.configGeneration) ||
+            !HOSTED_REQUEST_INCARNATION.test(body.condition.requestIncarnation) ||
+            !HOSTED_DIGEST.test(body.condition.permissionDigest) ||
+            Buffer.byteLength(JSON.stringify(conditionalPayload), 'utf8') >
+              MAX_HOSTED_APPROVAL_RESPONSE_BYTES) {
+            throw new Error('OpenCode hosted approval conditional request was malformed')
+          }
           const response = await request<unknown>(
-            `/experimental/agent-teams/permission/${encodedRequestId}/reply`,
-            {
+            `/experimental/agent-teams/hosted-approval/session/${encodeURIComponent(body.sessionId)}` +
+              `/permission/${encodedRequestId}/reply`,
+            hostedApprovalRequest(hostedApprovalAuth, {
               method: 'POST',
-              body: JSON.stringify(payload),
-              redirect: 'manual',
-            },
+              body: JSON.stringify(conditionalPayload),
+            }),
             PERMISSION_REQUEST_TIMEOUT_MS,
             true,
           )
-          return validateConditionalPermissionReply(response, body.condition)
+          return validateConditionalPermissionReply(response, {
+            ...body.condition,
+            requestId: body.requestId,
+            sessionId: body.sessionId,
+            decision,
+          })
         } catch (error) {
           if (error instanceof OpenCodeHttpResponseError &&
             (error.status === 409 || error.status === 412)) {

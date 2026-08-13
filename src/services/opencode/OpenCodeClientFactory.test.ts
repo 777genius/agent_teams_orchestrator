@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 
-import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+
+const hostedAuth = { username: 'opencode', password: 'test-password', directory: '/tmp/project' }
+const runtimeInstanceId = `runtime_instance_${'1'.repeat(32)}`
+const configGeneration = `config_generation_${'2'.repeat(32)}`
+const requestIncarnation = `request_incarnation_${'3'.repeat(32)}`
+const permissionDigest = 'a'.repeat(64)
+const hostedClient = (factory: OpenCodeClientFactory) =>
+  factory.create('http://127.0.0.1:4096', {}, hostedAuth)
 
 describe('OpenCodeClientFactory permissions API', () => {
   test('delegates generic provider OAuth authorization and callback to OpenCode', async () => {
@@ -134,24 +142,46 @@ describe('OpenCodeClientFactory permissions API', () => {
     expect(paths).toEqual(['http://127.0.0.1:4096/permission'])
   })
 
-  test('probes the explicit atomic hosted-approval capability endpoint', async () => {
-    const paths: string[] = []
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async input => {
-        paths.push(String(input))
-        return new Response(JSON.stringify({
-          schemaVersion: 1,
-          protocol: 'agent-teams-hosted-approval-v1',
-          configGeneration: 'config_generation_1',
-        }))
-      },
+  test('uses exact authenticated v2 capability and observation contracts', async () => {
+    const requests: Array<{ url: string; authorization: string | null; directory: string | null }> = []
+    const rawPermission = { requestID: 'perm_123', sessionID: 'ses_123', tool: 'bash' }
+    const factory = new OpenCodeClientFactory({ fetchImpl: async (input, init) => {
+      requests.push({
+        url: String(input),
+        authorization: new Headers(init?.headers).get('authorization'),
+        directory: new Headers(init?.headers).get('x-opencode-directory'),
+      })
+      return new Response(JSON.stringify(String(input).endsWith('/permissions') ? {
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
+        configGeneration, sessionId: 'ses_123', permissions: [{
+          requestId: 'perm_123', sessionId: 'ses_123', requestIncarnation,
+          permissionDigest: canonicalHostedApprovalDigest(rawPermission), rawPermission,
+        }],
+      } : {
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2',
+        authentication: 'opencode-basic', runtimeInstanceId, configGeneration,
+      }))
+    } })
+    const client = hostedClient(factory)
+    await expect(client.getHostedApprovalCapability()).resolves.toMatchObject({ runtimeInstanceId })
+    await expect(client.observeHostedApprovalPermissions?.('ses_123')).resolves.toMatchObject({
+      permissions: [{ requestIncarnation }],
     })
-
-    await expect(factory.create('http://127.0.0.1:4096').getHostedApprovalCapability())
-      .resolves.toMatchObject({ configGeneration: 'config_generation_1' })
-    expect(paths).toEqual([
-      'http://127.0.0.1:4096/experimental/agent-teams/hosted-approval-capability',
+    expect(requests.map(item => item.authorization)).toEqual([
+      `Basic ${Buffer.from('opencode:test-password').toString('base64')}`,
+      `Basic ${Buffer.from('opencode:test-password').toString('base64')}`,
     ])
+    expect(requests.map(item => item.directory)).toEqual(['/tmp/project', '/tmp/project'])
+  })
+
+  test('performs no hosted request without the existing server password', async () => {
+    let calls = 0
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => { calls += 1; return new Response('{}') },
+    })
+    expect(() => factory.create('http://127.0.0.1:4096').getHostedApprovalCapability())
+      .toThrow('Basic Auth unavailable')
+    expect(calls).toBe(0)
   })
 
   test('maps allow permission decisions to OpenCode once replies', async () => {
@@ -201,235 +231,83 @@ describe('OpenCodeClientFactory permissions API', () => {
     ])
   })
 
-  test('sends the atomic config and permission conditions on the single reply POST', async () => {
-    const requests: Array<{ url: string; body: Record<string, unknown> }> = []
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async (input, init) => {
-        requests.push({
-          url: String(input),
-          body: JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>,
-        })
-        return new Response(JSON.stringify({
-          schemaVersion: 1,
-          protocol: 'agent-teams-hosted-approval-v1',
-          status: 'applied',
-          configGeneration: 'config_generation_1',
-          permissionDigest: 'a'.repeat(64),
-        }))
-      },
+  test('sends one exact v2 conditional POST and validates exact success', async () => {
+    const requests: Array<{ url: string; body: unknown; redirect: RequestRedirect | undefined }> = []
+    const factory = new OpenCodeClientFactory({ fetchImpl: async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body)), redirect: init?.redirect })
+      return new Response(JSON.stringify({
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        requestIncarnation, permissionDigest, decision: 'allow_once',
+      }))
+    } })
+    await hostedClient(factory).answerPermission({
+      requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+      condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
     })
-    await factory.create('http://127.0.0.1:4096').answerPermission({
-      requestId: 'perm_123',
-      decision: 'allow',
-      condition: {
-        configGeneration: 'config_generation_1',
-        permissionDigest: 'a'.repeat(64),
-      },
-    })
-
     expect(requests).toEqual([{
-      url: 'http://127.0.0.1:4096/experimental/agent-teams/permission/perm_123/reply',
-      body: expect.objectContaining({
-        conditionalReplyVersion: 1,
-        expectedConfigGeneration: 'config_generation_1',
-        expectedPermissionDigest: 'a'.repeat(64),
-      }),
+      url: 'http://127.0.0.1:4096/experimental/agent-teams/hosted-approval/session/ses_123/permission/perm_123/reply',
+      redirect: 'manual',
+      body: {
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
+        expectedConfigGeneration: configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        requestIncarnation, expectedPermissionDigest: permissionDigest, decision: 'allow_once',
+      },
     }])
   })
 
-  test('classifies a conditional 412 as proven not applied', async () => {
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async () => new Response('config generation changed', {
-        status: 412,
-        statusText: 'Precondition Failed',
-      }),
-    })
-    await expect(factory.create('http://127.0.0.1:4096').answerPermission({
-      requestId: 'perm_412',
-      decision: 'allow',
-      condition: {
-        configGeneration: 'config_generation_1',
-        permissionDigest: 'a'.repeat(64),
-      },
-    })).rejects.toThrow('conditional permission reply was rejected without effect')
-  })
-
-  test('uses numeric status only when proving conditional no-effect', async () => {
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async () => new Response('the body mentions (412 Precondition Failed)', {
-        status: 500,
-        statusText: 'Internal Server Error',
-      }),
-    })
-    await expect(factory.create('http://127.0.0.1:4096').answerPermission({
-      requestId: 'perm_500_body_412',
-      decision: 'allow',
-      condition: {
-        configGeneration: 'config_generation_1',
-        permissionDigest: 'a'.repeat(64),
-      },
-    })).rejects.toThrow('OpenCode request failed (500 Internal Server Error)')
-  })
-
-  test('does not follow conditional mutation redirects and invokes transport once', async () => {
-    const requests: RequestInit[] = []
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async (_input, init) => {
-        requests.push(init ?? {})
-        return new Response('', {
-          status: 307,
-          headers: { location: 'http://127.0.0.1:4097/reply' },
-        })
-      },
-    })
-    await expect(factory.create('http://127.0.0.1:4096').answerPermission({
-      requestId: 'perm_redirect',
-      decision: 'allow',
-      condition: {
-        configGeneration: 'config_generation_1',
-        permissionDigest: 'a'.repeat(64),
-      },
-    })).rejects.toThrow('OpenCode request failed (307')
-    expect(requests).toHaveLength(1)
-    expect(requests[0]?.redirect).toBe('manual')
-  })
-
-  test('performs no redirected POST against a real 307 target', async () => {
-    let sourcePosts = 0
-    let targetPosts = 0
-    const target = Bun.serve({
-      port: 0,
-      fetch: request => {
-        if (request.method === 'POST') targetPosts += 1
-        return new Response('{}')
-      },
-    })
-    const source = Bun.serve({
-      port: 0,
-      fetch: request => {
-        if (request.method === 'POST') sourcePosts += 1
-        return new Response('', {
-          status: 307,
-          headers: { location: `http://127.0.0.1:${target.port}/redirected-reply` },
-        })
-      },
-    })
-    try {
-      const factory = new OpenCodeClientFactory()
-      await expect(factory.create(`http://127.0.0.1:${source.port}`).answerPermission({
-        requestId: 'perm_real_redirect', decision: 'allow',
-        condition: {
-          configGeneration: 'config_generation_1',
-          permissionDigest: 'a'.repeat(64),
-        },
-      })).rejects.toThrow('OpenCode request failed (307')
-      expect({ sourcePosts, targetPosts }).toEqual({ sourcePosts: 1, targetPosts: 0 })
-    } finally {
-      source.stop(true)
-      target.stop(true)
+  test('treats numeric 409/412 as no-effect and redirect/server/malformed as ambiguous without retry', async () => {
+    for (const status of [409, 412]) {
+      const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response('', { status }) })
+      await expect(hostedClient(factory).answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
+        condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
+      })).rejects.toBeInstanceOf(Error)
+    }
+    for (const response of [
+      new Response('', { status: 307, headers: { location: 'http://127.0.0.1:9/reply' } }),
+      new Response('mentions (409 conflict)', { status: 500 }),
+      new Response('{}'),
+    ]) {
+      let calls = 0
+      const factory = new OpenCodeClientFactory({ fetchImpl: async () => { calls += 1; return response } })
+      await expect(hostedClient(factory).answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'reject',
+        condition: { runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest },
+      })).rejects.toThrow()
+      expect(calls).toBe(1)
     }
   })
 
-  test('rejects duplicate keys, invalid UTF-8, and oversized hosted responses', async () => {
+  test('rejects v1, duplicate keys, invalid UTF-8, oversized observation and wrong digest', async () => {
+    const rawPermission = { requestID: 'perm_123', sessionID: 'ses_123' }
     const responses = [
-      new Response('{"schemaVersion":1,"schemaVersion":1,"protocol":"agent-teams-hosted-approval-v1","configGeneration":"config_generation_1"}'),
+      new Response(JSON.stringify({ schemaVersion: 1, protocol: 'agent-teams-hosted-approval-v1', configGeneration })),
+      new Response('{"schemaVersion":2,"schemaVersion":2}'),
       new Response(new Uint8Array([0xc3, 0x28])),
-      new Response(' '.repeat(16 * 1024 + 1)),
     ]
     for (const response of responses) {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => response })
-      await expect(factory.create('http://127.0.0.1:4096').getHostedApprovalCapability())
-        .rejects.toThrow()
+      await expect(hostedClient(factory).getHostedApprovalCapability()).rejects.toThrow()
     }
-  })
-
-  test('requires the exact capability schema and config-generation grammar', async () => {
     for (const body of [
-      { schemaVersion: 1, protocol: 'agent-teams-hosted-approval-v1', configGeneration: 'bad' },
-      { schemaVersion: 1, protocol: 'agent-teams-hosted-approval-v1', configGeneration: 'config_generation_1', extra: true },
+      ' '.repeat(1024 * 1024 + 1),
+      JSON.stringify({ schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
+        configGeneration, sessionId: 'ses_123', permissions: [{ requestId: 'perm_123', sessionId: 'ses_123',
+          requestIncarnation, permissionDigest, rawPermission }] }),
     ]) {
-      const factory = new OpenCodeClientFactory({
-        fetchImpl: async () => new Response(JSON.stringify(body)),
-      })
-      await expect(factory.create('http://127.0.0.1:4096').getHostedApprovalCapability())
-        .rejects.toThrow('capability response was malformed')
+      const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response(body) })
+      await expect(hostedClient(factory).observeHostedApprovalPermissions?.('ses_123')).rejects.toThrow()
     }
   })
 
-  test('treats a malformed conditional success as ambiguous without a retry', async () => {
-    let calls = 0
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async () => {
-        calls += 1
-        return new Response('{}')
-      },
-    })
-    await expect(factory.create('http://127.0.0.1:4096').answerPermission({
-      requestId: 'perm_malformed',
-      decision: 'allow',
-      condition: {
-        configGeneration: 'config_generation_1',
-        permissionDigest: 'a'.repeat(64),
-      },
-    })).rejects.toThrow('conditional permission reply was malformed')
-    expect(calls).toBe(1)
-  })
-
-  test('does not retry a hosted conditional permission answer after an ambiguous transport failure', async () => {
-    const requests: Array<{ url: string; method: string | undefined }> = []
-    const transportError = new Error('socket closed after request write')
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async (input, init) => {
-        requests.push({ url: String(input), method: init?.method })
-        throw transportError
-      },
-    })
-
-    await expect(
-      factory.create('http://127.0.0.1:4096').answerPermission({
-        requestId: 'perm/ambiguous',
-        decision: 'allow',
-        condition: {
-          configGeneration: 'config_generation_1',
-          permissionDigest: 'a'.repeat(64),
-        },
-      }),
-    ).rejects.toBe(transportError)
-
-    expect(requests).toEqual([
-      {
-        url: 'http://127.0.0.1:4096/experimental/agent-teams/permission/perm%2Fambiguous/reply',
-        method: 'POST',
-      },
-    ])
-  })
-
-  test('does not retry a hosted conditional permission answer after a server error', async () => {
-    const paths: string[] = []
-    const factory = new OpenCodeClientFactory({
-      fetchImpl: async input => {
-        paths.push(String(input))
-        return new Response('provider may already have applied the answer', {
-          status: 500,
-          statusText: 'Internal Server Error',
-        })
-      },
-    })
-
-    await expect(
-      factory.create('http://127.0.0.1:4096').answerPermission({
-        requestId: 'perm_500',
-        decision: 'reject',
-        condition: {
-          configGeneration: 'config_generation_1',
-          permissionDigest: 'a'.repeat(64),
-        },
-      }),
-    ).rejects.toThrow('OpenCode request failed (500 Internal Server Error)')
-
-    expect(paths).toEqual([
-      'http://127.0.0.1:4096/experimental/agent-teams/permission/perm_500/reply',
-    ])
+  test('preserves canonical raw-permission digest golden', () => {
+    expect(canonicalHostedApprovalDigest({
+      always: [], id: 'per_1', metadata: { cwd: '/tmp', risk: 1 }, patterns: ['ls', 'pwd'],
+      permission: 'bash', sessionID: 'ses_1',
+    })).toBe('04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca')
+    expect(canonicalHostedApprovalDigest({ a: 1, omitted: undefined }))
+      .toBe(canonicalHostedApprovalDigest({ a: 1 }))
   })
 
   test('lists experimental tool ids from the OpenCode endpoint used by readiness', async () => {
