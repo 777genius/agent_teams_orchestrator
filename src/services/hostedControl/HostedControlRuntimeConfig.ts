@@ -93,6 +93,16 @@ export async function loadHostedControlRuntimeConfig(
   }
 }
 
+export async function validateHostedControlRuntimePaths(
+  config: Pick<HostedControlRuntimeConfig, 'socketPath' | 'claudeRoot'>,
+): Promise<void> {
+  socketPathValue(config.socketPath)
+  absolutePath(config.claudeRoot, 'claudeRoot')
+  if (config.socketPath === config.claudeRoot) throw new Error('Hosted control paths must be distinct')
+  await assertCanonicalOwnedDirectory(config.claudeRoot, 'claudeRoot')
+  await assertCanonicalOwnedDirectory(dirname(config.socketPath), 'socket parent')
+}
+
 async function assertCanonicalOwnedDirectory(path: string, field: string): Promise<void> {
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
   try {
@@ -125,7 +135,9 @@ async function assertCanonicalPrivateFile(path: string, field: string): Promise<
 }
 
 export function hostedControlAuthorityFromConfig(
-  config: HostedControlRuntimeConfig,
+  config: Pick<HostedControlRuntimeConfig,
+    'deploymentId' | 'bootId' | 'restoreGeneration' | 'workspaceId' | 'mountGeneration' |
+    'declaredRootHash' | 'teamId'>,
 ): HostedControlStableAuthority {
   return {
     deploymentId: config.deploymentId,
@@ -141,7 +153,7 @@ export function hostedControlAuthorityFromConfig(
 }
 
 export function hostedControlOwnerIdentityFromConfig(
-  config: HostedControlRuntimeConfig,
+  config: Pick<HostedControlRuntimeConfig, 'ownerAuthority' | 'ownerGeneration' | 'ownerSessionId'>,
 ): Omit<HostedControlOwnerBinding, 'socketIdentity'> {
   return {
     ownerAuthority: config.ownerAuthority,

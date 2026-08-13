@@ -87,12 +87,22 @@ async function runHostedControlFastPath(args: string[]): Promise<boolean> {
   if (!feature('HOSTED_CONTROL')) {
     throw new Error('Hosted control is not included in this build')
   }
-  const configPath = readOption(args.slice(1), '--config')
-  if (!configPath) throw new Error('Missing required option --config <absolute-path>')
-  void configPath
-  throw new Error(
-    'Hosted control launch is blocked until config/secret bootstrap uses an isolated non-inherited descriptor boundary',
+  if (args.length !== 1) throw new Error('Hosted control accepts no options')
+  const { runHostedControlFromDescriptors } = await import('../services/hostedControl/HostedControlMain.js')
+  await runHostedControlFromDescriptors()
+  return true
+}
+
+async function runHostedControlSocketBrokerFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== '--hosted-control-socket-broker') return false
+  if (!feature('HOSTED_CONTROL')) {
+    throw new Error('Hosted control is not included in this build')
+  }
+  const { runHostedControlSocketBroker } = await import(
+    '../services/hostedControl/HostedControlSocketBroker.js'
   )
+  await runHostedControlSocketBroker(args.slice(1))
+  return true
 }
 
 function parseOpenCodeCommandOptions(args: string[]): {
@@ -224,6 +234,10 @@ async function main(): Promise<void> {
     // MACRO.VERSION is inlined at build time
     // biome-ignore lint/suspicious/noConsole:: intentional console output
     console.log(`${MACRO.VERSION} (Claude Code)`)
+    return
+  }
+
+  if (await runHostedControlSocketBrokerFastPath(args)) {
     return
   }
 

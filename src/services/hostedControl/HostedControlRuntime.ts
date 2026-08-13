@@ -10,16 +10,22 @@ import type {
   HostedLifecycleCommandPort,
   HostedTeamMessagePort,
 } from './HostedControlDispatcher.js'
-import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
+import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
 import { HostedControlServer } from './HostedControlServer.js'
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
 import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
+import type {
+  HostedControlBootstrapAdmission,
+  HostedControlDescriptorGuard,
+} from './HostedControlBootstrap.js'
 import {
   hostedControlAuthorityFromConfig,
   hostedControlOwnerIdentityFromConfig,
   loadHostedControlRuntimeConfig,
+  validateHostedControlRuntimePaths,
+  type HostedControlRuntimeConfig,
 } from './HostedControlRuntimeConfig.js'
 
 export type HostedControlRuntimePorts = {
@@ -50,9 +56,11 @@ export class HostedControlRuntime {
   #startup: { cancelled: boolean } | null = null
   #startRequested = false
   #rootLease: HostedRootOwnerLease | null = null
+  #descriptorGuard: HostedControlDescriptorGuard | null = null
+  #secret: Buffer | null = null
 
   constructor(
-    private readonly configPath: string,
+    private readonly source: string | HostedControlBootstrapAdmission,
     private readonly createPorts: HostedControlRuntimePortFactory,
   ) {}
 
@@ -76,80 +84,85 @@ export class HostedControlRuntime {
   }
 
   async #start(startup: { cancelled: boolean }): Promise<void> {
-    const config = await loadHostedControlRuntimeConfig(this.configPath)
-    if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
-    const [secret, ownerScope] = await Promise.all([
-      readHostedControlSecret(config.secretFile),
-      resolveHostedControlOwnerBinding({
-        claudeRoot: config.claudeRoot,
-        legacyKey: config.legacyKey,
-      }),
-    ])
-    const configuredAuthority = hostedControlAuthorityFromConfig(config)
-    const authority: HostedControlStableAuthority = Object.freeze({
-      ...configuredAuthority,
-      mountBinding: Object.freeze({ ...configuredAuthority.mountBinding }),
-    })
-    const wal = new HostedTaskMutationWal(
-      join(config.claudeRoot, 'teams', config.legacyKey),
-      config.teamId,
-    )
-    const rootLease = new HostedRootOwnerLease(ownerScope.canonicalTeamRoot)
-    await rootLease.acquire()
-    this.#rootLease = rootLease
-    let startupRecovery = true
-    let server: HostedControlServer | null = null
-    const validateOwner = async (): Promise<boolean> => {
-      if (!this.#acceptingEffects) return false
-      const validRoot = await validateHostedControlOwnerBinding({
-        claudeRoot: config.claudeRoot,
-        legacyKey: config.legacyKey,
-        expectedRootIdentity: ownerScope.rootIdentity,
-      })
-      if (!validRoot) return false
-      return startupRecovery || !!server && await server.hasActiveLease()
+    const descriptorAdmission = typeof this.source === 'string' ? null : this.source
+    if (descriptorAdmission) {
+      this.#secret = descriptorAdmission.secret
+      this.#descriptorGuard = descriptorAdmission.guard
     }
-    const isCurrentAuthority = async (
-      candidate: HostedControlAuthority | HostedLifecycleAuthority,
-    ): Promise<boolean> => authorityMatches(candidate, authority) && await validateOwner()
-    const taskService = new HostedTaskMutationService({
-      claudeRoot: config.claudeRoot,
-      legacyKey: config.legacyKey,
-      authority,
-      wal,
-      validateOwner,
-    })
-    this.#acceptingEffects = true
+    let rootLease: HostedRootOwnerLease | null = null
+    let server: HostedControlServer | null = null
+    let ports: HostedControlRuntimePorts | null = null
     try {
+      const config: HostedControlRuntimeConfig | HostedControlBootstrapAdmission['config'] =
+        descriptorAdmission?.config ?? await loadHostedControlRuntimeConfig(this.source as string)
+      if (descriptorAdmission) await validateHostedControlRuntimePaths(config)
+      if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
+      const secret = descriptorAdmission?.secret ?? await readHostedControlSecret((config as HostedControlRuntimeConfig).secretFile)
+      this.#secret = secret
+      const ownerScope = await resolveHostedControlOwnerBinding({
+        claudeRoot: config.claudeRoot,
+        legacyKey: config.legacyKey,
+      })
+      if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {
+        throw new Error('Hosted control launcher authority is no longer current')
+      }
+      const configuredAuthority = hostedControlAuthorityFromConfig(config)
+      const authority: HostedControlStableAuthority = Object.freeze({
+        ...configuredAuthority,
+        mountBinding: Object.freeze({ ...configuredAuthority.mountBinding }),
+      })
+      const wal = new HostedTaskMutationWal(
+        join(config.claudeRoot, 'teams', config.legacyKey),
+        config.teamId,
+      )
+      rootLease = descriptorAdmission ? null : new HostedRootOwnerLease(ownerScope.canonicalTeamRoot)
+      await rootLease?.acquire()
+      this.#rootLease = rootLease
+      let startupRecovery = true
+      const validateOwner = async (): Promise<boolean> => {
+        if (!this.#acceptingEffects) return false
+        const validRoot = await validateHostedControlOwnerBinding({
+          claudeRoot: config.claudeRoot,
+          legacyKey: config.legacyKey,
+          expectedRootIdentity: ownerScope.rootIdentity,
+        })
+        if (!validRoot) return false
+        if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) return false
+        return startupRecovery || !!server && await server.hasActiveLease()
+      }
+      const isCurrentAuthority = async (
+        candidate: HostedControlAuthority | HostedLifecycleAuthority,
+      ): Promise<boolean> => authorityMatches(candidate, authority) && await validateOwner()
+      const taskService = new HostedTaskMutationService({
+        claudeRoot: config.claudeRoot,
+        legacyKey: config.legacyKey,
+        authority,
+        wal,
+        validateOwner,
+      })
+      this.#acceptingEffects = true
       if (!(await taskService.recover())) {
         throw new Error('Hosted control WAL recovery did not establish a safe state')
       }
-    } catch (error) {
-      this.#acceptingEffects = false
-      this.#rootLease = null
-      await rootLease.release()
-      throw error
-    }
-    startupRecovery = false
-    let dispatcher: HostedControlDispatcher
-    server = new HostedControlServer({
-      socketPath: config.socketPath,
-      secret,
-      ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
-      authority,
-      service: taskService,
-      dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
-    })
-    if (!(await validateHostedControlOwnerBinding({
-      claudeRoot: config.claudeRoot,
-      legacyKey: config.legacyKey,
-      expectedRootIdentity: ownerScope.rootIdentity,
-    }))) {
-      this.#acceptingEffects = false
-      throw new Error('Hosted control owner changed before port composition')
-    }
-    let ports: HostedControlRuntimePorts | null = null
-    try {
+      startupRecovery = false
+      let dispatcher: HostedControlDispatcher
+      server = new HostedControlServer({
+        socketPath: config.socketPath,
+        secret,
+        ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
+        authority,
+        service: taskService,
+        bootstrapBinding: descriptorAdmission?.bootstrapBinding,
+        dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
+      })
+      if (!(await validateHostedControlOwnerBinding({
+        claudeRoot: config.claudeRoot,
+        legacyKey: config.legacyKey,
+        expectedRootIdentity: ownerScope.rootIdentity,
+      })) || this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {
+        this.#acceptingEffects = false
+        throw new Error('Hosted control owner changed before port composition')
+      }
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       ports = await this.createPorts(Object.freeze({
         authority,
@@ -166,16 +179,22 @@ export class HostedControlRuntime {
         messages: ports.messages,
         approvals: ports.approvals,
       })
+      if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {
+        throw new Error('Hosted control launcher authority was lost before socket publication')
+      }
       await server.start()
+      if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {
+        throw new Error('Hosted control launcher authority was lost during socket publication')
+      }
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
       this.#ports = ports
       this.#server = server
     } catch (error) {
       this.#acceptingEffects = false
       this.#ports = null
-      await Promise.allSettled([ports?.close(), server.stop()])
+      await Promise.allSettled([ports?.close(), server?.stop()])
       this.#rootLease = null
-      await rootLease.release()
+      try { await rootLease?.release() } finally { await this.#disposeDescriptorAuthority() }
       throw error
     }
   }
@@ -195,7 +214,7 @@ export class HostedControlRuntime {
         try { await ports?.close() } finally {
           const rootLease = this.#rootLease
           this.#rootLease = null
-          await rootLease?.release()
+          try { await rootLease?.release() } finally { await this.#disposeDescriptorAuthority() }
         }
       }
     })
@@ -205,6 +224,15 @@ export class HostedControlRuntime {
     const result = this.#operationTail.then(operation, operation)
     this.#operationTail = result.catch(() => undefined)
     return result
+  }
+
+  async #disposeDescriptorAuthority(): Promise<void> {
+    const guard = this.#descriptorGuard
+    const secret = this.#secret
+    this.#descriptorGuard = null
+    this.#secret = null
+    secret?.fill(0)
+    await guard?.close()
   }
 }
 

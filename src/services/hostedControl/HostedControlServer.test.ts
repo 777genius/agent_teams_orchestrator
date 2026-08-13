@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, unlink } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { chmod, lstat, mkdir, mkdtemp, rm, unlink } from 'node:fs/promises'
 import { connect, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
-import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
+import { admitHostedReadiness, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
+import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 
 const roots: string[] = []
 const servers: HostedControlServer[] = []
@@ -16,6 +18,42 @@ afterEach(async () => {
 })
 
 describe('HostedControlServer', () => {
+  test('enforces descriptor-v2 exact binding and legacy string-config readiness policy', () => {
+    const secret = Buffer.alloc(32, 9)
+    const fixture = hostedControlGoldenRequestFixture()
+    const ownerBinding = fixture.ownerBinding
+    const bootstrapBinding: HostedControlBootstrapBinding = {
+      deploymentId: fixture.authority.deploymentId, bootId: fixture.authority.bootId,
+      workspaceId: fixture.authority.workspaceId, mountGeneration: fixture.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64), ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
+      proofKeyId: createHash('sha256').update(secret).digest('hex'),
+    }
+    const admits = (lineWithNewline: string, expected = bootstrapBinding) => {
+      const line = lineWithNewline.slice(0, -1)
+      return admitHostedReadiness({ secret, ownerBinding, bootstrapBinding: expected,
+        line, message: JSON.parse(line) as Record<string, unknown> })
+    }
+    expect(admits(legacyReadinessLine(ownerBinding))).toBe(false)
+    const mutations: Record<keyof HostedControlBootstrapBinding, unknown> = {
+      deploymentId: 'deployment-mutated', bootId: 'boot-mutated', workspaceId: 'workspace-mutated',
+      mountGeneration: bootstrapBinding.mountGeneration + 1, bootstrapDigest: '6'.repeat(64),
+      ownerArtifactDigest: `sha256:${'7'.repeat(64)}`, proofKeyId: '8'.repeat(64),
+    }
+    for (const field of Object.keys(mutations) as Array<keyof HostedControlBootstrapBinding>) {
+      expect(admits(descriptorReadinessLine(secret, ownerBinding, {
+        ...bootstrapBinding, [field]: mutations[field],
+      }))).toBe(false)
+    }
+    expect(admits(descriptorReadinessLine(secret, ownerBinding, bootstrapBinding))).toBe(true)
+
+    const legacyLine = legacyReadinessLine(ownerBinding).slice(0, -1)
+    expect(admitHostedReadiness({ secret, ownerBinding, line: legacyLine,
+      message: JSON.parse(legacyLine) as Record<string, unknown> })).toBe(true)
+    const descriptorLine = descriptorReadinessLine(secret, ownerBinding, bootstrapBinding).slice(0, -1)
+    expect(admitHostedReadiness({ secret, ownerBinding, line: descriptorLine,
+      message: JSON.parse(descriptorLine) as Record<string, unknown> })).toBe(false)
+  })
+
   test('does not advertise readiness without the coexisting lifecycle and message dispatcher', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-task-only-'))
     roots.push(root)
@@ -66,9 +104,6 @@ describe('HostedControlServer', () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-canonical-readiness-')); roots.push(root)
     const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
     const fixture = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
-    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: fixture.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => null })
-    servers.push(server); await server.start()
-    const ownerBinding = server.ownerBinding!
     const bootstrapBinding = {
       deploymentId: fixture.authority.deploymentId,
       bootId: fixture.authority.bootId,
@@ -78,6 +113,11 @@ describe('HostedControlServer', () => {
       ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
       proofKeyId: createHash('sha256').update(secret).digest('hex'),
     }
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: fixture.authority,
+      bootstrapBinding, service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null })
+    servers.push(server); await server.start()
+    const ownerBinding = server.ownerBinding!
     const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: ownerBinding.socketIdentity, challenge: '5'.repeat(64), bootstrapBinding, expectedOwnerBinding: ownerBinding }
     const serialized = JSON.stringify(unsigned)
     const controllerProof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
@@ -93,6 +133,59 @@ describe('HostedControlServer', () => {
     const unsigned = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
     const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => null }); servers.push(server); await server.start()
     expect(await exchange(socketPath, `${JSON.stringify({ schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: server.ownerBinding!.socketIdentity, challenge: 'f'.repeat(64), ownerProof: '0'.repeat(64) })}\n`)).toBe('')
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    expect(lease.line).toContain('"kind":"ready"')
+    lease.socket.destroy()
+  })
+
+  test('descriptor readiness requires exact equality for every bootstrap binding field and rejects legacy readiness', async () => {
+    const root = await mkdtemp('/tmp/hcdr-'); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
+    const unsigned = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const bootstrapBinding: HostedControlBootstrapBinding = {
+      deploymentId: unsigned.authority.deploymentId,
+      bootId: unsigned.authority.bootId,
+      workspaceId: unsigned.authority.workspaceId,
+      mountGeneration: unsigned.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64), ownerArtifactDigest: `sha256:${'4'.repeat(64)}`,
+      proofKeyId: createHash('sha256').update(secret).digest('hex'),
+    }
+    const server = new HostedControlServer({
+      socketPath, secret, ownerIdentity, authority: unsigned.authority, bootstrapBinding,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null,
+    })
+    servers.push(server); await server.start()
+    expect(await exchange(socketPath, legacyReadinessLine(server.ownerBinding!))).toBe('')
+
+    const mutations: Record<keyof HostedControlBootstrapBinding, unknown> = {
+      deploymentId: 'deployment-mutated', bootId: 'boot-mutated', workspaceId: 'workspace-mutated',
+      mountGeneration: bootstrapBinding.mountGeneration + 1, bootstrapDigest: '6'.repeat(64),
+      ownerArtifactDigest: `sha256:${'7'.repeat(64)}`, proofKeyId: '8'.repeat(64),
+    }
+    for (const field of Object.keys(mutations) as Array<keyof HostedControlBootstrapBinding>) {
+      const mutated = { ...bootstrapBinding, [field]: mutations[field] }
+      expect(await exchange(socketPath, descriptorReadinessLine(secret, server.ownerBinding!, mutated))).toBe('')
+    }
+    const lease = await openDescriptorReadiness(socketPath, secret, server.ownerBinding!, bootstrapBinding)
+    const ready = JSON.parse(lease.line) as Record<string, unknown>
+    expect(ready.bootstrapDigest).toBe(bootstrapBinding.bootstrapDigest)
+    lease.socket.destroy()
+  })
+
+  test('legacy string-config mode rejects descriptor readiness and continues to admit legacy readiness', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-legacy-readiness-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
+    const unsigned = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => null })
+    servers.push(server); await server.start()
+    const binding: HostedControlBootstrapBinding = {
+      deploymentId: unsigned.authority.deploymentId, bootId: unsigned.authority.bootId,
+      workspaceId: unsigned.authority.workspaceId, mountGeneration: unsigned.authority.mountBinding.mountGeneration,
+      bootstrapDigest: '3'.repeat(64), ownerArtifactDigest: `sha256:${'4'.repeat(64)}`, proofKeyId: '5'.repeat(64),
+    }
+    expect(await exchange(socketPath, descriptorReadinessLine(secret, server.ownerBinding!, binding))).toBe('')
     const lease = await openReadiness(socketPath, server.ownerBinding!)
     expect(lease.line).toContain('"kind":"ready"')
     lease.socket.destroy()
@@ -326,6 +419,22 @@ describe('HostedControlServer', () => {
     lease.socket.destroy()
   })
 
+  test('forwards the admitted raw JSON bytes to dispatch unchanged', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-raw-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9)
+    const unsigned = hostedControlGoldenRequestFixture(); const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    let receivedRaw = ''
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async (_message, rawLine) => { receivedRaw = rawLine; return { kind: 'ok' } } })
+    servers.push(server); await server.start()
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    const rawLine = '{ "padding" : "\\u0061", "operation" : "team_message" }'
+    expect(await exchange(socketPath, `${rawLine}\n`)).toContain('"kind":"ok"')
+    expect(receivedRaw).toBe(rawLine)
+    lease.socket.destroy()
+  })
+
   test('stop preserves a socket substituted at the original path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-server-swap-')); roots.push(root)
     const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
@@ -336,8 +445,148 @@ describe('HostedControlServer', () => {
     await new Promise<void>((resolve, reject) => { replacement.once('error', reject); replacement.listen(socketPath, resolve) })
     await server.stop()
     await new Promise<void>((resolve, reject) => { const socket = connect(socketPath); socket.once('connect', () => { socket.destroy(); resolve() }); socket.once('error', reject) })
-    await new Promise<void>((resolve, reject) => replacement.close(error => error ? reject(error) : resolve()))
     await unlink(socketPath)
+    await new Promise<void>((resolve, reject) => replacement.close(error => error ? reject(error) : resolve()))
+  })
+
+  test('fails closed without chmod or unlink when the published socket is substituted before adoption', async () => {
+    const root = await mkdtemp('/tmp/hc-publish-swap-'); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const replacement = createServer(socket => socket.end('replacement'))
+    let replacementIdentity: Awaited<ReturnType<typeof lstat>> | null = null
+    const server = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      afterSocketPublicationForTest: async () => {
+        await unlink(socketPath)
+        await new Promise<void>((resolve, reject) => {
+          replacement.once('error', reject)
+          replacement.listen(socketPath, resolve)
+        })
+        replacementIdentity = await lstat(socketPath)
+      },
+    })
+    await expect(server.start()).rejects.toThrow('changed during publication')
+    expect(replacementIdentity).not.toBeNull()
+    const afterFailure = await lstat(socketPath)
+    expect({ inode: afterFailure.ino, mode: afterFailure.mode & 0o777 }).toEqual({
+      inode: replacementIdentity!.ino,
+      mode: replacementIdentity!.mode & 0o777,
+    })
+    expect(await exchange(socketPath, '')).toBe('replacement')
+    await unlink(socketPath)
+    await new Promise<void>((resolve, reject) => replacement.close(error => error ? reject(error) : resolve()))
+  })
+
+  test('broker A shutdown preserves replacement B bound at the hidden publication path', async () => {
+    const root = await mkdtemp('/tmp/hc-hidden-close-swap-'); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const replacement = createServer(socket => socket.end('replacement'))
+    let replacementIdentity: Awaited<ReturnType<typeof lstat>> | null = null
+    const server = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      beforeSocketCloseForTest: async hiddenPath => {
+        await new Promise<void>((resolve, reject) => {
+          replacement.once('error', reject)
+          replacement.listen(hiddenPath, resolve)
+        })
+        replacementIdentity = await lstat(hiddenPath)
+      },
+    })
+    await server.start()
+    await server.stop()
+    expect(replacementIdentity).not.toBeNull()
+    const hiddenPath = String(replacement.address())
+    const afterClose = await lstat(hiddenPath)
+    expect({ inode: afterClose.ino, mode: afterClose.mode & 0o777 }).toEqual({
+      inode: replacementIdentity!.ino,
+      mode: replacementIdentity!.mode & 0o777,
+    })
+    expect(await exchange(hiddenPath, '')).toBe('replacement')
+    await unlink(hiddenPath)
+    await new Promise<void>((resolve, reject) => replacement.close(error => error ? reject(error) : resolve()))
+  })
+
+  test('removes the hidden publication path immediately after canonical publication', async () => {
+    const root = await mkdtemp('/tmp/hc-hidden-retained-'); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    let hiddenPath = ''
+    const server = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      beforeSocketCloseForTest: async path => {
+        hiddenPath = path
+        await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+        expect((await lstat(socketPath)).isSocket()).toBe(true)
+      },
+    })
+    await server.start()
+    await server.stop()
+    expect(hiddenPath).not.toBe('')
+    await expect(lstat(hiddenPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('reclaims only an inactive private socket inode and refuses an active listener', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-reclaim-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock')
+    await mkdir(join(root, 'private'), { mode: 0o700 })
+    const stale = spawn(process.execPath, ['-e', `
+      const { createServer } = require('node:net');
+      const { chmodSync } = require('node:fs');
+      const server = createServer();
+      server.listen(${JSON.stringify(socketPath)}, () => {
+        chmodSync(${JSON.stringify(socketPath)}, 0o600);
+        process.stdout.write('ready\\n');
+      });
+    `], { stdio: ['ignore', 'pipe', 'inherit'] })
+    await new Promise<void>((resolve, reject) => {
+      let output = ''
+      stale.stdout!.setEncoding('utf8')
+      stale.stdout!.on('data', chunk => { output += chunk; if (output.includes('\n')) resolve() })
+      stale.once('error', reject)
+      stale.once('exit', code => { if (!output.includes('\n')) reject(new Error(`stale socket fixture exited ${code}`)) })
+    })
+    stale.kill('SIGKILL')
+    await new Promise<void>(resolve => stale.once('exit', () => resolve()))
+    expect((await lstat(socketPath)).isSocket()).toBe(true)
+
+    const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const server = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null,
+    })
+    servers.push(server)
+    await server.start()
+    expect(server.ownerBinding?.socketIdentity.inode).toBe(String((await lstat(socketPath)).ino))
+    await server.stop()
+
+    const active = createServer()
+    await new Promise<void>((resolve, reject) => {
+      active.once('error', reject)
+      active.listen(socketPath, resolve)
+    })
+    await chmod(socketPath, 0o600)
+    const contender = new HostedControlServer({
+      socketPath, secret: Buffer.alloc(32, 9), ownerIdentity, authority: unsigned.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null,
+    })
+    await expect(contender.start()).rejects.toThrow('active hosted control socket')
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(socketPath)
+      socket.once('connect', () => { socket.destroy(); resolve() })
+      socket.once('error', reject)
+    })
+    await new Promise<void>((resolve, reject) => active.close(error => error ? reject(error) : resolve()))
+    await unlink(socketPath).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    })
   })
 })
 
@@ -348,6 +597,37 @@ function openReadiness(socketPath: string, ownerBinding: NonNullable<HostedContr
       const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: ownerBinding.socketIdentity, challenge: 'a'.repeat(64) }
       socket.write(`${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(Buffer.alloc(32, 9), HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', unsigned) })}\n`)
     })
+    socket.on('data', chunk => { output += chunk; if (output.includes('\n')) resolve({ socket, line: output.trim() }) })
+    socket.once('error', reject)
+  })
+}
+
+function legacyReadinessLine(ownerBinding: NonNullable<HostedControlServer['ownerBinding']>): string {
+  const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command', socketIdentity: ownerBinding.socketIdentity, challenge: 'a'.repeat(64) }
+  return `${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(Buffer.alloc(32, 9), HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', unsigned) })}\n`
+}
+
+function descriptorReadinessLine(
+  secret: Uint8Array,
+  ownerBinding: NonNullable<HostedControlServer['ownerBinding']>,
+  bootstrapBinding: HostedControlBootstrapBinding,
+): string {
+  const unsigned = { schemaVersion: 2, operation: 'readiness', capability: 'hosted-lifecycle-command',
+    socketIdentity: ownerBinding.socketIdentity, challenge: 'b'.repeat(64), bootstrapBinding,
+    expectedOwnerBinding: ownerBinding }
+  return `${JSON.stringify({ ...unsigned, controllerProof: createHostedDomainProof(secret,
+    HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', unsigned) })}\n`
+}
+
+function openDescriptorReadiness(
+  socketPath: string,
+  secret: Uint8Array,
+  ownerBinding: NonNullable<HostedControlServer['ownerBinding']>,
+  bootstrapBinding: HostedControlBootstrapBinding,
+): Promise<{ socket: ReturnType<typeof connect>; line: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(socketPath); let output = ''; socket.setEncoding('utf8')
+    socket.once('connect', () => socket.write(descriptorReadinessLine(secret, ownerBinding, bootstrapBinding)))
     socket.on('data', chunk => { output += chunk; if (output.includes('\n')) resolve({ socket, line: output.trim() }) })
     socket.once('error', reject)
   })

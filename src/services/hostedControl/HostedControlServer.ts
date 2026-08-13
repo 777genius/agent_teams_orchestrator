@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { createHash, timingSafeEqual } from 'node:crypto'
-import { constants, chmod, lstat, mkdir, open, unlink } from 'node:fs/promises'
-import { createServer, type Server, type Socket } from 'node:net'
-import { dirname } from 'node:path'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import type { Stats } from 'node:fs'
+import { constants, chmod, link, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
+import { connect, createServer, type Server, type Socket } from 'node:net'
+import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import {
   createHostedControlProof,
@@ -11,6 +13,8 @@ import {
   parseStrictHostedProofLastJsonFrame,
   verifyHostedControlProof,
 } from './ownerProof.js'
+import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
+import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
 import {
   decodeHostedTaskMutationRequest,
   decodeHostedTaskMutationTerminalResult,
@@ -42,6 +46,11 @@ export type HostedControlServerOptions = {
   authority: HostedControlStableAuthority
   service: HostedTaskMutationPort
   readDeadlineMs?: number
+  bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
+  /** Deterministic publication-window seam for security regression tests. */
+  afterSocketPublicationForTest?: () => void | Promise<void>
+  /** Deterministic close-window seam for hidden-path replacement regression tests. */
+  beforeSocketCloseForTest?: (listenPath: string) => void | Promise<void>
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
 }
 
@@ -52,10 +61,13 @@ export type HostedReadinessAdmission =
 export class HostedControlServer {
   readonly #options: HostedControlServerOptions
   #server: Server | null = null
+  #broker: ChildProcess | null = null
   #ownsSocket = false
   readonly #sockets = new Set<Socket>()
   #ownerBinding: HostedControlOwnerBinding | null = null
   #socketParentIdentity: { device: number; inode: number } | null = null
+  #ownedSocketIdentity: { device: number; inode: number } | null = null
+  #listenPath: string | null = null
   #leaseSocket: Socket | null = null
   #leaseConsumed = false
   readonly #mutationLease = new AsyncLocalStorage<Socket>()
@@ -78,33 +90,78 @@ export class HostedControlServer {
   async start(): Promise<void> {
     if (this.#server) throw new Error('Hosted control server is already started')
     if (this.#stopPromise) await this.#stopPromise
+    if (typeof Bun === 'undefined') throw new Error('Hosted control Unix socket publication requires the Bun runtime')
     this.#stopping = false
     const parentIdentity = await prepareSocketPath(this.#options.socketPath)
-    const server = createServer(socket => this.#handleConnection(socket))
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(this.#options.socketPath, () => {
-        server.off('error', reject)
-        this.#server = server
-        resolve()
-      })
-    })
-    this.#ownsSocket = true
-    await chmod(this.#options.socketPath, 0o600)
-    const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath), lstat(dirname(this.#options.socketPath))])
-    if (!socketStat.isSocket() || (socketStat.mode & 0o077) !== 0 || (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.())) {
-      await this.stop()
-      throw new Error('Hosted control socket identity is not privately owned')
-    }
-    if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || parentStat.dev !== parentIdentity.device || parentStat.ino !== parentIdentity.inode) { await this.stop(); throw new Error('Hosted control socket parent was substituted') }
-    this.#ownerBinding = {
-      ...this.#options.ownerIdentity,
-      socketIdentity: {
-        device: String(socketStat.dev), inode: String(socketStat.ino),
-        uid: socketStat.uid, gid: socketStat.gid, mode: socketStat.mode & 0o777,
-      },
-    }
     this.#socketParentIdentity = parentIdentity
+    const listenPath = socketPublicationPath(this.#options.socketPath)
+    const brokerToken = randomBytes(32)
+    let publicationProbe: PublicationProbe | null = null
+    const server = createServer(socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
+      if (publicationProbe) consumePublicationProbe(admitted, publicationProbe, initialData)
+      else this.#handleConnection(admitted, initialData)
+    }))
+    let admittedSocketIdentity: { device: number; inode: number } | null = null
+    try {
+      await listenLoopback(server)
+      this.#server = server
+      this.#listenPath = listenPath
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Hosted control broker endpoint is unavailable')
+      const broker = await startSocketBroker(listenPath, address.port, brokerToken)
+      this.#broker = broker
+      this.#ownsSocket = true
+      const admittedSocketStat = await lstat(listenPath)
+      admittedSocketIdentity = { device: admittedSocketStat.dev, inode: admittedSocketStat.ino }
+      this.#ownedSocketIdentity = admittedSocketIdentity
+      if (!admittedSocketStat.isSocket() || (admittedSocketStat.mode & 0o777) !== 0o600 ||
+        (process.getuid?.() !== undefined && admittedSocketStat.uid !== process.getuid?.())) {
+        throw new Error('Hosted control publication socket is not privately owned')
+      }
+      await proveSocketPathIsServerOwned(listenPath, probe => { publicationProbe = probe })
+      publicationProbe = null
+      const provedSocketStat = await lstat(listenPath)
+      if (!sameSocketIdentity(provedSocketStat, admittedSocketIdentity)) {
+        throw new Error('Hosted control publication socket changed during ownership proof')
+      }
+      await link(listenPath, this.#options.socketPath)
+      await removeOwnedSocketPathIfCurrent(listenPath, admittedSocketIdentity, parentIdentity)
+      await this.#options.afterSocketPublicationForTest?.()
+      const [socketStat, parentStat] = await Promise.all([
+        lstat(this.#options.socketPath), lstat(dirname(this.#options.socketPath)),
+      ])
+      if (!sameSocketIdentity(socketStat, admittedSocketIdentity) || (socketStat.mode & 0o777) !== 0o600 ||
+        (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.())) {
+        throw new Error('Hosted control socket changed during publication')
+      }
+      if (!parentStat.isDirectory() || parentStat.isSymbolicLink() ||
+        parentStat.dev !== parentIdentity.device || parentStat.ino !== parentIdentity.inode) {
+        throw new Error('Hosted control socket parent was substituted')
+      }
+      const publishedSocketStat = await lstat(this.#options.socketPath)
+      if (!sameSocketIdentity(publishedSocketStat, admittedSocketIdentity)) {
+        throw new Error('Hosted control socket changed after publication')
+      }
+      this.#ownerBinding = {
+        ...this.#options.ownerIdentity,
+        socketIdentity: {
+          device: String(publishedSocketStat.dev), inode: String(publishedSocketStat.ino),
+          uid: publishedSocketStat.uid, gid: publishedSocketStat.gid,
+          mode: publishedSocketStat.mode & 0o777,
+        },
+      }
+      broker.once('exit', () => {
+        if (this.#broker === broker) void this.stop().catch(() => undefined)
+      })
+      if (broker.exitCode !== null || broker.signalCode !== null) {
+        throw new Error('Hosted control socket broker exited during publication')
+      }
+    } catch (error) {
+      publicationProbe?.reject(error)
+      publicationProbe = null
+      await this.stop().catch(() => undefined)
+      throw error
+    }
   }
 
   async stop(): Promise<void> {
@@ -121,16 +178,26 @@ export class HostedControlServer {
   async #stop(): Promise<void> {
     this.#stopping = true
     const server = this.#server
-    const ownerBinding = this.#ownerBinding
+    const broker = this.#broker
     const parentIdentity = this.#socketParentIdentity
+    const ownedSocketIdentity = this.#ownedSocketIdentity
+    const listenPath = this.#listenPath
     this.#server = null
+    this.#broker = null
     this.#ownerBinding = null
     this.#leaseSocket = null
     this.#socketParentIdentity = null
+    this.#ownedSocketIdentity = null
+    this.#listenPath = null
     for (const socket of this.#sockets) socket.destroy()
     this.#sockets.clear()
-    if (server) {
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    await this.#options.beforeSocketCloseForTest?.(listenPath ?? '')
+    if (broker) await killSocketBroker(broker)
+    if (server) await closeServer(server)
+    if (listenPath && ownedSocketIdentity && parentIdentity) {
+      await removeOwnedSocketPathIfCurrent(
+        listenPath, ownedSocketIdentity, parentIdentity,
+      )
     }
     await Promise.allSettled([...this.#handlers])
     if (this.#ownsSocket) {
@@ -139,20 +206,18 @@ export class HostedControlServer {
         lstat(this.#options.socketPath).catch(() => null),
         lstat(dirname(this.#options.socketPath)).catch(() => null),
       ])
-      if (ownerBinding && parentIdentity && socketStat?.isSocket() && parentStat?.isDirectory() && !parentStat.isSymbolicLink() &&
-        String(socketStat.dev) === ownerBinding.socketIdentity.device && String(socketStat.ino) === ownerBinding.socketIdentity.inode &&
+      if (ownedSocketIdentity && parentIdentity && socketStat?.isSocket() && parentStat?.isDirectory() && !parentStat.isSymbolicLink() &&
+        socketStat.dev === ownedSocketIdentity.device && socketStat.ino === ownedSocketIdentity.inode &&
         parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode) {
-        await unlink(this.#options.socketPath).catch(error => {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        })
+        await removeSocketIfIdentityMatches(this.#options.socketPath, {
+          device: ownedSocketIdentity.device, inode: ownedSocketIdentity.inode,
+        }, parentIdentity)
       }
     }
   }
 
-  #handleConnection(socket: Socket): void {
+  #handleConnection(socket: Socket, initialData = Buffer.alloc(0)): void {
     if (this.#stopping || !this.#server) { socket.destroy(); return }
-    this.#sockets.add(socket)
-    socket.once('close', () => this.#sockets.delete(socket))
     socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS)
     let chunks: Buffer[] = []
     let bytes = 0
@@ -196,6 +261,31 @@ export class HostedControlServer {
       this.#handlers.add(handler)
       void handler.finally(() => this.#handlers.delete(handler))
     })
+    if (initialData.byteLength > 0) socket.emit('data', initialData)
+  }
+
+  #admitBrokerConnection(
+    socket: Socket,
+    expectedToken: Buffer,
+    admit: (socket: Socket, initialData: Buffer) => void,
+  ): void {
+    this.#sockets.add(socket)
+    socket.once('close', () => this.#sockets.delete(socket))
+    let buffered = Buffer.alloc(0)
+    const reject = () => socket.destroy()
+    socket.setTimeout(this.#options.readDeadlineMs ?? HOSTED_CONTROL_READ_DEADLINE_MS, reject)
+    socket.once('error', () => undefined)
+    const onData = (chunk: Buffer) => {
+      buffered = Buffer.concat([buffered, chunk])
+      if (buffered.byteLength < expectedToken.byteLength) return
+      socket.off('data', onData)
+      const token = buffered.subarray(0, expectedToken.byteLength)
+      if (!timingSafeEqual(token, expectedToken)) { reject(); return }
+      socket.setTimeout(0)
+      const remainder = buffered.subarray(expectedToken.byteLength)
+      admit(socket, remainder)
+    }
+    socket.on('data', onData)
   }
 
   async #processLine(socket: Socket, line: string): Promise<void> {
@@ -279,6 +369,7 @@ export class HostedControlServer {
         secret: this.#options.secret,
         authority: this.#options.authority,
         ownerBinding,
+        bootstrapBinding: this.#options.bootstrapBinding,
         line,
         message,
       })
@@ -317,6 +408,7 @@ export function decodeHostedReadinessRequest(input: {
   secret: Uint8Array
   authority: HostedControlStableAuthority
   ownerBinding: HostedControlOwnerBinding
+  bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
   line: string
   message: Record<string, unknown>
 }): HostedReadinessAdmission {
@@ -324,7 +416,7 @@ export function decodeHostedReadinessRequest(input: {
     throw new TypeError('Invalid hosted readiness frame size')
   }
   if (isLegacyReadiness(input.message)) {
-    if (!isDeepStrictEqual(input.message.socketIdentity, input.ownerBinding.socketIdentity) ||
+    if (input.bootstrapBinding || !isDeepStrictEqual(input.message.socketIdentity, input.ownerBinding.socketIdentity) ||
       !verifyLegacyReadiness(input.secret, input.line, input.message)) {
       throw new TypeError('Invalid legacy hosted readiness proof')
     }
@@ -345,7 +437,9 @@ export function decodeHostedReadinessRequest(input: {
     Array.isArray(identity) || Object.keys(identity).sort().join(',') !== 'device,gid,inode,mode,uid' ||
     !isDeepStrictEqual(identity, input.ownerBinding.socketIdentity) || !expectedOwner ||
     !isDeepStrictEqual(expectedOwner, input.ownerBinding) || !bootstrap || typeof bootstrap !== 'object' ||
-    Array.isArray(bootstrap) || !validBootstrapBinding(bootstrap as Record<string, unknown>, input.authority, proofKeyId) ||
+    Array.isArray(bootstrap) || !input.bootstrapBinding ||
+    !isDeepStrictEqual(bootstrap, input.bootstrapBinding) ||
+    !validBootstrapBinding(bootstrap as Record<string, unknown>, input.authority, proofKeyId) ||
     !verifyRawReadiness(input.secret, signed.serializedUnsignedEnvelope, signed.proof)) {
     throw new TypeError('Invalid canonical hosted readiness proof')
   }
@@ -353,6 +447,33 @@ export function decodeHostedReadinessRequest(input: {
     protocol: 'canonical',
     challenge: input.message.challenge,
     bootstrapDigest: (bootstrap as Record<string, unknown>).bootstrapDigest as string,
+  }
+}
+
+export function admitHostedReadiness(input: {
+  secret: Uint8Array
+  ownerBinding: HostedControlOwnerBinding
+  bootstrapBinding?: Readonly<HostedControlBootstrapBinding>
+  line: string
+  message: Record<string, unknown>
+}): boolean {
+  const binding = input.bootstrapBinding
+  const authority: HostedControlStableAuthority = {
+    deploymentId: binding?.deploymentId ?? '',
+    bootId: binding?.bootId ?? '',
+    restoreGeneration: 0,
+    workspaceId: binding?.workspaceId ?? '',
+    teamId: `team_${'0'.repeat(32)}`,
+    mountBinding: {
+      mountGeneration: binding?.mountGeneration ?? 1,
+      declaredRootHash: '0'.repeat(64),
+    },
+  }
+  try {
+    decodeHostedReadinessRequest({ ...input, authority })
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -433,16 +554,251 @@ function sameStableAuthority(
   return isDeepStrictEqual(stable, stableExpected)
 }
 
+type PublicationProbe = {
+  nonce: Buffer
+  resolve(): void
+  reject(error: unknown): void
+}
+
+function socketPublicationPath(socketPath: string): string {
+  const parent = dirname(socketPath)
+  const publishedName = basename(socketPath)
+  const nameBytes = Buffer.byteLength(publishedName)
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidateName = randomBytes(Math.max(1, Math.ceil(nameBytes * 3 / 4)))
+      .toString('base64url').slice(0, nameBytes)
+    if (candidateName !== publishedName) return join(parent, candidateName)
+  }
+  throw new Error('Hosted control publication socket name could not be allocated')
+}
+
+async function listenLoopback(server: Server): Promise<void> {
+  server.listen({ host: '127.0.0.1', port: 0, exclusive: true })
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => { server.off('listening', onListening); reject(error) }
+    const onListening = () => { server.off('error', onError); resolve() }
+    server.once('error', onError)
+    server.once('listening', onListening)
+  })
+}
+
+async function startSocketBroker(
+  listenPath: string,
+  targetPort: number,
+  token: Buffer,
+): Promise<ChildProcess> {
+  const brokerArgs = [HOSTED_CONTROL_SOCKET_BROKER_FLAG, listenPath, String(targetPort)]
+  const isCompiledBinary = Array.isArray(Bun.embeddedFiles) && Bun.embeddedFiles.length > 0
+  if (!isCompiledBinary) {
+    const entrypoint = process.argv[1]
+    if (!entrypoint) throw new Error('Hosted control socket broker entrypoint is unavailable')
+    if (entrypoint.endsWith('.test.ts')) {
+      brokerArgs.splice(0, 1,
+        new URL('./fixtures/hostedControlSocketBrokerChild.ts', import.meta.url).pathname)
+    } else {
+      brokerArgs.unshift(entrypoint)
+    }
+  }
+  const broker = spawn(process.execPath, brokerArgs, {
+    stdio: ['pipe', 'pipe', 'inherit', 'pipe'],
+  })
+  const tokenPipe = broker.stdio[3]
+  if (!broker.stdin || !broker.stdout || !tokenPipe || !('write' in tokenPipe)) {
+    broker.kill('SIGKILL')
+    throw new Error('Hosted control socket broker pipes are unavailable')
+  }
+  await new Promise<void>((resolve, reject) => {
+    let bytes = Buffer.alloc(0)
+    const timeout = setTimeout(() => finish(new Error('Hosted control socket broker startup timed out')),
+      HOSTED_CONTROL_READ_DEADLINE_MS)
+    const finish = (error?: Error) => {
+      clearTimeout(timeout)
+      broker.stdout?.off('data', onData)
+      tokenPipe.off('error', onTokenError)
+      broker.off('error', onError)
+      broker.off('exit', onExit)
+      if (error) reject(error); else resolve()
+    }
+    const onData = (chunk: Buffer) => {
+      bytes = Buffer.concat([bytes, chunk])
+      if (bytes.byteLength > 256) { finish(new Error('Hosted control socket broker response was oversized')); return }
+      const newline = bytes.indexOf(0x0a)
+      if (newline < 0) return
+      if (newline !== bytes.byteLength - 1 || bytes.toString('utf8', 0, newline) !==
+        '{"schemaVersion":1,"kind":"ready"}') {
+        finish(new Error('Hosted control socket broker response was invalid'))
+        return
+      }
+      finish()
+    }
+    const onError = () => finish(new Error('Hosted control socket broker failed to start'))
+    const onTokenError = () => finish(new Error('Hosted control socket broker credential write failed'))
+    const onExit = () => finish(new Error('Hosted control socket broker exited before readiness'))
+    broker.stdout.on('data', onData)
+    tokenPipe.once('error', onTokenError)
+    broker.once('error', onError)
+    broker.once('exit', onExit)
+    tokenPipe.end(token)
+  }).catch(async error => {
+    await killSocketBroker(broker)
+    throw error
+  })
+  return broker
+}
+
+async function killSocketBroker(broker: ChildProcess): Promise<void> {
+  if (broker.exitCode !== null || broker.signalCode !== null) return
+  const exited = new Promise<void>(resolve => broker.once('exit', () => resolve()))
+  broker.kill('SIGKILL')
+  await exited
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve())
+  })
+}
+
+async function proveSocketPathIsServerOwned(
+  socketPath: string,
+  arm: (probe: PublicationProbe) => void,
+): Promise<void> {
+  const nonce = randomBytes(32)
+  let resolve!: () => void
+  let reject!: (error: unknown) => void
+  const accepted = new Promise<void>((accept, decline) => { resolve = accept; reject = decline })
+  arm({ nonce, resolve, reject })
+  const client = connect(socketPath)
+  const timeout = setTimeout(() => reject(
+    new Error('Hosted control publication ownership proof timed out'),
+  ), HOSTED_CONTROL_READ_DEADLINE_MS)
+  client.once('error', reject)
+  client.end(nonce)
+  await accepted.finally(() => {
+    clearTimeout(timeout)
+    client.destroy()
+  })
+}
+
+function consumePublicationProbe(socket: Socket, probe: PublicationProbe, initialData = Buffer.alloc(0)): void {
+  let bytes = Buffer.from(initialData)
+  socket.setTimeout(HOSTED_CONTROL_READ_DEADLINE_MS, () => {
+    socket.destroy()
+    probe.reject(new Error('Hosted control publication ownership proof timed out'))
+  })
+  socket.on('data', chunk => {
+    bytes = Buffer.concat([bytes, chunk])
+    if (bytes.byteLength > probe.nonce.byteLength) {
+      socket.destroy()
+      probe.reject(new Error('Hosted control publication ownership proof was invalid'))
+    }
+  })
+  socket.once('end', () => {
+    socket.destroy()
+    if (bytes.byteLength === probe.nonce.byteLength && timingSafeEqual(bytes, probe.nonce)) probe.resolve()
+    else probe.reject(new Error('Hosted control publication ownership proof was invalid'))
+  })
+  socket.once('error', probe.reject)
+}
+
+function sameSocketIdentity(
+  stat: Stats,
+  expected: { device: number; inode: number },
+): boolean {
+  return stat.isSocket() && stat.dev === expected.device && stat.ino === expected.inode
+}
+
 async function prepareSocketPath(socketPath: string): Promise<{ device: number; inode: number }> {
   const parent = dirname(socketPath)
   await mkdir(parent, { recursive: true, mode: 0o700 })
   await chmod(parent, 0o700)
   const handle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0)); const stat = await handle.stat(); await handle.close()
-  try {
-    await lstat(socketPath)
-    throw new Error('Refusing to replace an existing hosted control socket path')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  const parentIdentity = { device: stat.dev, inode: stat.ino }
+  let existing
+  try { existing = await lstat(socketPath) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return parentIdentity
+    throw error
   }
-  return { device: stat.dev, inode: stat.ino }
+  if (!existing.isSocket() || (existing.mode & 0o077) !== 0 ||
+    (process.getuid?.() !== undefined && existing.uid !== process.getuid?.())) {
+    throw new Error('Refusing to replace an unsafe hosted control socket path')
+  }
+  if (await socketAcceptsConnections(socketPath)) {
+    throw new Error('Refusing to replace an active hosted control socket')
+  }
+  await removeSocketIfIdentityMatches(socketPath, {
+    device: existing.dev, inode: existing.ino,
+  }, parentIdentity)
+  return parentIdentity
+}
+
+async function socketAcceptsConnections(socketPath: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = connect(socketPath)
+    let settled = false
+    const finish = (active: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(active)
+    }
+    socket.setTimeout(250, () => finish(true))
+    socket.once('connect', () => finish(true))
+    socket.once('error', error => {
+      const code = (error as NodeJS.ErrnoException).code
+      finish(code !== 'ECONNREFUSED' && code !== 'ENOENT')
+    })
+  })
+}
+
+async function removeOwnedSocketPathIfCurrent(
+  socketPath: string,
+  expected: { device: number; inode: number },
+  parentExpected: { device: number; inode: number },
+): Promise<void> {
+  const [socketStat, parentStat] = await Promise.all([
+    lstat(socketPath).catch(() => null),
+    lstat(dirname(socketPath)).catch(() => null),
+  ])
+  if (!socketStat || !parentStat?.isDirectory() || parentStat.isSymbolicLink() ||
+    parentStat.dev !== parentExpected.device || parentStat.ino !== parentExpected.inode ||
+    !sameSocketIdentity(socketStat, expected)) return
+  await removeSocketIfIdentityMatches(socketPath, expected, parentExpected)
+}
+
+/** Atomically quarantines the path, then deletes only the admitted inode. */
+async function removeSocketIfIdentityMatches(
+  socketPath: string,
+  expected: { device: number; inode: number },
+  parentExpected: { device: number; inode: number },
+): Promise<void> {
+  const parent = dirname(socketPath)
+  const quarantine = join(parent, `.${basename(socketPath)}.reclaim-${process.pid}-${randomBytes(16).toString('hex')}`)
+  const parentBefore = await lstat(parent)
+  if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink() ||
+    parentBefore.dev !== parentExpected.device || parentBefore.ino !== parentExpected.inode) {
+    throw new Error('Hosted control socket parent was substituted')
+  }
+  try { await rename(socketPath, quarantine) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  const moved = await lstat(quarantine).catch(() => null)
+  const parentAfter = await lstat(parent).catch(() => null)
+  const movedMatches = !!moved?.isSocket() && moved.dev === expected.device && moved.ino === expected.inode
+  const parentMatches = !!parentAfter?.isDirectory() && !parentAfter.isSymbolicLink() &&
+    parentAfter.dev === parentExpected.device && parentAfter.ino === parentExpected.inode
+  if (!movedMatches || !parentMatches) {
+    // Never let restoration overwrite a replacement that appeared after the
+    // quarantine rename. A hard link is an atomic no-replace restoration of
+    // the exact inode; if the original name is occupied, preserve both names.
+    if (parentMatches) {
+      await link(quarantine, socketPath).then(
+        () => unlink(quarantine),
+        () => undefined,
+      ).catch(() => undefined)
+    }
+    throw new Error('Hosted control socket changed during inode-safe removal')
+  }
+  await unlink(quarantine)
 }

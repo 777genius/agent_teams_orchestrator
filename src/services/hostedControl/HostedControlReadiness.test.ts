@@ -37,7 +37,7 @@ describe('hosted readiness codec', () => {
     const controllerProof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
     const line = `${serialized.slice(0, -1)},"controllerProof":"${controllerProof}"}`
     const message = JSON.parse(line) as Record<string, unknown>
-    expect(decodeHostedReadinessRequest({ secret, authority, ownerBinding, line, message })).toEqual({
+    expect(decodeHostedReadinessRequest({ secret, authority, ownerBinding, bootstrapBinding, line, message })).toEqual({
       protocol: 'canonical', challenge: unsigned.challenge, bootstrapDigest: bootstrapBinding.bootstrapDigest,
     })
 
@@ -50,7 +50,7 @@ describe('hosted readiness codec', () => {
       const changedProof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', changedSerialized)
       const changedLine = `${changedSerialized.slice(0, -1)},"controllerProof":"${changedProof}"}`
       expect(() => decodeHostedReadinessRequest({
-        secret, authority, ownerBinding, line: changedLine,
+        secret, authority, ownerBinding, bootstrapBinding, line: changedLine,
         message: JSON.parse(changedLine) as Record<string, unknown>,
       })).toThrow()
     }
@@ -72,7 +72,7 @@ describe('hosted readiness codec', () => {
     const proof = createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness-request', serialized)
     const noncanonical = `{ ${serialized.slice(1, -1)},"controllerProof":"${proof}"}`
     expect(() => decodeHostedReadinessRequest({
-      secret, authority, ownerBinding, line: noncanonical,
+      secret, authority, ownerBinding, bootstrapBinding: canonicalUnsigned.bootstrapBinding, line: noncanonical,
       message: JSON.parse(noncanonical) as Record<string, unknown>,
     })).toThrow('canonical')
 
