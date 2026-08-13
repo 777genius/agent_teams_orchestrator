@@ -42,6 +42,8 @@ export type OpenCodePreparedProfile = {
   globalAuthPath?: string
   managedAuthPath: string
   sourceAuthPath: string | null
+  /** Every canonical auth source included in sourceAuthFingerprint, in hash order. */
+  sourceAuthSources?: Array<{ path: string; fingerprint: string | null }>
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
   authState: OpenCodeAuthState
@@ -168,6 +170,17 @@ export type OpenCodeProviderOAuthCallbackInput = {
 
 export type OpenCodeServerDocResponse = {
   paths?: Record<string, Record<string, unknown>>
+}
+
+/**
+ * Optional upstream contract required for race-free hosted approval delivery.
+ * Current OpenCode releases do not expose this capability, so callers must
+ * keep hosted approval effects disabled when the probe is absent or malformed.
+ */
+export type OpenCodeHostedApprovalCapability = {
+  schemaVersion: 1
+  protocol: 'agent-teams-hosted-approval-v1'
+  configGeneration: string
 }
 
 export type OpenCodeMcpServerConfig = {

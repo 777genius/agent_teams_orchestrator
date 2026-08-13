@@ -1756,6 +1756,58 @@ export class OpenCodeHostManager {
     return entry.handle.resolvedConfigFingerprint
   }
 
+  /**
+   * Freshly proves the exact process and resolved configuration immediately
+   * before a security-sensitive provider effect. Cached handle fields are not
+   * sufficient here: both PID reuse and in-place configuration drift must fail
+   * closed.
+   */
+  async verifyEffectHost(input: {
+    hostKey: string
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+  }): Promise<boolean> {
+    const entry = this.hosts.get(input.hostKey)
+    if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
+      input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
+    const startedBefore = await this.readProcessStartTimeMs(input.pid).catch(() => null)
+    if (startedBefore !== input.processStartedAtMs) return false
+    if (!(await this.checkHealthyHostOnce(entry.handle.baseUrl))) return false
+    const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
+    if (!fingerprint || fingerprint !== input.resolvedConfigFingerprint) return false
+    const startedAfter = await this.readProcessStartTimeMs(input.pid).catch(() => null)
+    return startedAfter === input.processStartedAtMs && this.isProcessAlive(input.pid)
+  }
+
+  /**
+   * Re-proves the OS process/config identity and returns a synchronous,
+   * one-use invocation token. The token prevents an in-process host rotation
+   * from being interleaved between the last proof and provider invocation.
+   */
+  async prepareEffectHostToken(input: {
+    hostKey: string
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+  }): Promise<{ consume(): boolean } | null> {
+    const entry = this.hosts.get(input.hostKey)
+    if (!entry || !(await this.verifyEffectHost(input))) return null
+    const handle = entry.handle
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        const live = this.hosts.get(input.hostKey)
+        return live === entry && live.handle === handle &&
+          handle.pid === input.pid && handle.processStartedAtMs === input.processStartedAtMs &&
+          handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
+          this.isProcessAlive(input.pid)
+      },
+    }
+  }
+
   private async terminatePersistentHostRecord(
     record: PersistentHostRegistryRecord,
     options: { force: boolean },

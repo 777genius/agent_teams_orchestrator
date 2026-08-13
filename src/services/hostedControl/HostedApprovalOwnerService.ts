@@ -1,0 +1,228 @@
+import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+
+import type {
+  HostedApprovalAuthorityResult,
+  HostedApprovalDeliveryAuthorizationResult,
+  HostedApprovalDeliveryPortResult,
+  HostedApprovalDeliveryRequest,
+  HostedApprovalIngressAuthority,
+  HostedApprovalWirePort,
+} from './HostedApprovalWire.js'
+import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
+import type { HostedApprovalDeliveryState, HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
+import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
+import { ingressRecordForObservedPermission, OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
+
+export class HostedApprovalOwnerService implements HostedApprovalWirePort {
+  readonly #tokens = new Map<string, { request: HostedApprovalDeliveryRequest; fingerprint: string }>()
+  constructor(private readonly options: {
+    store: HostedApprovalOwnerStore
+    admission: HostedApprovalRuntimeAdmission
+    runtime: OpenCodeHostedApprovalRuntimeAdapter
+    isCurrentOuterAuthority(): Promise<boolean>
+    now?: () => number
+    createToken?: () => string
+  }) {}
+
+  async recoverStateOnly(): Promise<void> {
+    // No provider calls. This runs before readiness and revokes rotated routes/mappings.
+    await this.options.store.reconcileAdmission(this.options.admission)
+  }
+
+  async pollIngress(): Promise<number> {
+    if (!(await this.#authorityCurrent())) throw new Error('Hosted approval owner unavailable')
+    let admitted = 0
+    for (const route of this.options.admission.routes) {
+      const observed = await this.options.runtime.observe(route)
+      for (const permission of observed) {
+        const result = await this.options.store.admitIngress(
+          this.options.admission,
+          ingressRecordForObservedPermission(permission),
+        )
+        if (result === 'admitted') admitted += 1
+      }
+    }
+    return admitted
+  }
+
+  async claimIngress(input: Parameters<HostedApprovalWirePort['claimIngress']>[0]) {
+    await this.pollIngress()
+    if (!(await this.#authorityCurrent())) throw new Error('Hosted approval owner unavailable')
+    return this.options.store.claim(input.request, input.maximumAggregateBytes)
+  }
+  async acknowledgeIngress(request: Parameters<HostedApprovalWirePort['acknowledgeIngress']>[0]) {
+    return await this.#authorityCurrent()
+      ? this.options.store.acknowledge(request)
+      : { status: 'unavailable' as const }
+  }
+
+  async getAdmittedIngressAuthority(authority: HostedApprovalIngressAuthority) {
+    if (!(await this.#authorityCurrent())) return null
+    const admittedRoute = this.options.admission.routes.find(route => isDeepStrictEqual(route.authority, authority))
+    if (!admittedRoute) return null
+    const state = await this.options.store.read()
+    return state?.admissionGeneration === this.options.admission.admissionGeneration &&
+      state.admissionDigest === this.options.admission.digest &&
+      state.routes.some(route => isDeepStrictEqual(route, admittedRoute)) ? authority : null
+  }
+
+  async resolveIngressAuthority(authority: HostedApprovalIngressAuthority): Promise<HostedApprovalAuthorityResult> {
+    if (!(await this.#authorityCurrent())) return { status: 'unavailable' }
+    const admittedRoute = this.options.admission.routes.find(route => isDeepStrictEqual(route.authority, authority))
+    if (!admittedRoute) {
+      return { status: 'stale_generation' }
+    }
+    const state = await this.options.store.read()
+    if (state?.admissionGeneration !== this.options.admission.admissionGeneration ||
+      state.admissionDigest !== this.options.admission.digest ||
+      !state.routes.some(route => isDeepStrictEqual(route, admittedRoute))) return { status: 'stale_generation' }
+    return { status: 'resolved', scope: admittedRoute.scope }
+  }
+
+  async authorizeDecision(input: { request: HostedApprovalDeliveryRequest; payloadFingerprint: string }): Promise<HostedApprovalDeliveryAuthorizationResult> {
+    if (!(await this.#authorityCurrent())) return { status: 'unavailable' }
+    const state = await this.options.store.read(); if (!state) return { status: 'unavailable' }
+    const prior = findDelivery(state, input.request)
+    if (prior) return replay(prior, input.request, input.payloadFingerprint)
+    const bound = bindRequest(state, input.request); if (!bound) return { status: 'stale_generation' }
+    const token = `approval-authorization_${(this.options.createToken ?? (() => randomUUID().replaceAll('-', '')))()}`
+    this.#tokens.set(token, { request: input.request, fingerprint: input.payloadFingerprint })
+    return { status: 'authorized', authorization: { token, persistedAuthority: bound.route.authority } }
+  }
+
+  async deliverDecision(input: Parameters<HostedApprovalWirePort['deliverDecision']>[0]): Promise<HostedApprovalDeliveryPortResult> {
+    const token = this.#tokens.get(input.authorization.token); this.#tokens.delete(input.authorization.token)
+    if (!token || token.fingerprint !== input.payloadFingerprint || !isDeepStrictEqual(token.request, input.request) ||
+      !isDeepStrictEqual(input.authorization.persistedAuthority, input.admittedAuthority) || !(await this.#authorityCurrent())) {
+      return { status: 'unavailable' }
+    }
+    return this.options.store.wal.locked(async state => {
+      if (!state || state.admissionGeneration !== this.options.admission.admissionGeneration ||
+        state.admissionDigest !== this.options.admission.digest) return { status: 'stale_generation' }
+      const prior = findDelivery(state, input.request)
+      if (prior) return replay(prior, input.request, input.payloadFingerprint)
+      const bound = bindRequest(state, input.request)
+      if (!bound || !isDeepStrictEqual(bound.route.authority, input.admittedAuthority)) return { status: 'stale_generation' }
+      if (!(await this.#routeCurrent(bound.route))) return { status: 'stale_generation' }
+      if (bound.route.authority.teamId !== input.request.partition.teamId || bound.route.authority.runId !== input.request.partition.runId) {
+        return this.#reject(state, bound.route, bound.record.outboxId, input, 'wrong_lane')
+      }
+      const payload = JSON.parse(bound.record.payloadJson) as { expiresAtMs: number | null }
+      if (payload.expiresAtMs !== null && payload.expiresAtMs <= (this.options.now ?? Date.now)()) {
+        return this.#reject(state, bound.route, bound.record.outboxId, input, 'expired')
+      }
+      if (input.request.principal.kind === 'operator') {
+        const memberId = state.actorMembers[input.request.principal.actorId]
+        if (!memberId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'unavailable')
+        if (memberId === bound.route.authority.deliveryOwnerId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'self_approval')
+      }
+      const started: HostedApprovalDeliveryState = {
+        providerDeliveryId: input.request.providerDeliveryId, deliveryRef: input.request.deliveryRef,
+        payloadFingerprint: input.payloadFingerprint, outboxId: bound.record.outboxId,
+        effectRef: bound.record.effectRef, phase: 'started', result: null,
+      }
+      let startedState = await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] })
+      if (!(await this.#routeCurrent(bound.route))) {
+        return { status: 'operator_required' }
+      }
+      const result = await this.options.runtime.deliver({
+        route: bound.route,
+        requestId: bound.record.commandId,
+        expectedEffectRef: bound.record.effectRef,
+        decision: input.request.decision,
+        // The adapter invokes this again at its final provider boundary. Bind
+        // authority to the exact locked fence incarnation, not just admission.
+        revalidate: () => this.#effectCurrent(bound.route),
+        prepareEffectToken: () => this.#prepareEffectToken(bound.route, startedState),
+      })
+      // Reload after the provider boundary and prove the exact started record
+      // survived before any terminal publish. The WAL fence remains the shared
+      // owner/handover serialization point.
+      const fresh = await this.options.store.read(); const liveStarted = fresh?.deliveries
+        .find(item => item.outboxId === started.outboxId && item.deliveryRef === started.deliveryRef)
+      if (!fresh || !liveStarted || !isDeepStrictEqual(liveStarted, started)) return { status: 'operator_required' }
+      startedState = fresh
+      if (result === 'ambiguous') return { status: 'operator_required' }
+      if (!(await this.#routeCurrent(bound.route))) return { status: 'operator_required' }
+      if (result === 'not_started') return this.#settle(startedState, bound.route, started, 'rejected', 'stale_generation')
+      if (result === 'unavailable') return this.#settle(startedState, bound.route, started, 'rejected', 'unavailable')
+      return this.#settle(startedState, bound.route, started, 'completed', 'delivered')
+    })
+  }
+
+  async #authorityCurrent(): Promise<boolean> {
+    try {
+      return await this.options.isCurrentOuterAuthority() && await this.options.admission.isCurrent()
+    } catch { return false }
+  }
+  async #routeCurrent(route: HostedApprovalRuntimeRoute): Promise<boolean> {
+    try {
+      if (!(await this.#authorityCurrent())) return false
+      const state = await this.options.store.read()
+      return !!state && state.admissionGeneration === this.options.admission.admissionGeneration &&
+        state.admissionDigest === this.options.admission.digest &&
+        this.options.admission.routes.some(current => isDeepStrictEqual(current, route)) &&
+        state.routes.some(current => isDeepStrictEqual(current, route))
+    } catch { return false }
+  }
+  async #effectCurrent(route: HostedApprovalRuntimeRoute): Promise<boolean> {
+    return await this.options.store.wal.ownsCurrentFence() && await this.#routeCurrent(route)
+  }
+  async #prepareEffectToken(route: HostedApprovalRuntimeRoute, expectedState: HostedApprovalOwnerState) {
+    if (!(await this.#routeCurrent(route))) return null
+    const admissionToken = await this.options.admission.prepareEffectToken()
+    if (!admissionToken) return null
+    const walToken = await this.options.store.wal.prepareEffectToken(expectedState)
+    if (!walToken) { admissionToken.consume(); return null }
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        // WAL/fence is the last check at the invocation edge.
+        const admissionCurrent = admissionToken.consume()
+        const walCurrent = walToken.consume()
+        return admissionCurrent && walCurrent
+      },
+    }
+  }
+  async #reject(state: HostedApprovalOwnerState, route: HostedApprovalRuntimeRoute, outboxId: string, input: Parameters<HostedApprovalWirePort['deliverDecision']>[0], result: Exclude<HostedApprovalDeliveryState['result'], 'delivered' | null>) {
+    if (!(await this.#routeCurrent(route))) return { status: 'stale_generation' as const }
+    const record = [...state.ingress, ...state.retiredIngress].find(item => item.outboxId === outboxId)
+    if (!record) return { status: 'unavailable' as const }
+    const delivery: HostedApprovalDeliveryState = { providerDeliveryId: input.request.providerDeliveryId, deliveryRef: input.request.deliveryRef, payloadFingerprint: input.payloadFingerprint, outboxId, effectRef: record.effectRef, phase: 'rejected', result }
+    await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, delivery] })
+    return { status: result } as const
+  }
+  async #settle(state: HostedApprovalOwnerState, route: HostedApprovalRuntimeRoute, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>) {
+    if (!(await this.#routeCurrent(route))) return { status: 'operator_required' as const }
+    await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: state.deliveries.map(item => item.providerDeliveryId === delivery.providerDeliveryId ? { ...item, phase, result } : item) })
+    return { status: result === 'delivered' ? 'delivered' as const : result }
+  }
+}
+
+function bindRequest(state: HostedApprovalOwnerState, request: HostedApprovalDeliveryRequest) {
+  const record = state.ingress.find(item => item.deliveryRef === request.deliveryRef && item.commandId === request.requestId && item.authority.teamId === request.partition.teamId && item.authority.runId === request.partition.runId)
+  if (!record || request.approvalGeneration !== `generation_runtime-permission-${record.effectRef.slice(7)}`) return null
+  const approvalId = `approval_${createHash('sha256').update(JSON.stringify({ schemaVersion: 1, teamId: request.partition.teamId, runId: request.partition.runId, requestId: request.requestId })).digest('hex').slice(0, 32)}`
+  if (request.approvalId !== approvalId) return null
+  const route = state.routes.find(item => isDeepStrictEqual(item.authority, record.authority)); return route ? { record, route } : null
+}
+function replay(prior: HostedApprovalDeliveryState, request: HostedApprovalDeliveryRequest, fingerprint: string): HostedApprovalDeliveryPortResult {
+  if (prior.providerDeliveryId !== request.providerDeliveryId || prior.deliveryRef !== request.deliveryRef ||
+    prior.payloadFingerprint !== fingerprint) return { status: 'conflict' }
+  if (prior.phase === 'started') return { status: 'operator_required' }
+  if (prior.phase === 'completed') return { status: 'idempotent_replay' }
+  return { status: prior.result ?? 'unavailable' }
+}
+function findDelivery(state: HostedApprovalOwnerState, request: HostedApprovalDeliveryRequest): HostedApprovalDeliveryState | undefined {
+  const permissionOutboxes = new Set([...state.ingress, ...state.retiredIngress]
+    .filter(record => record.commandId === request.requestId &&
+      record.authority.teamId === request.partition.teamId && record.authority.runId === request.partition.runId)
+    .map(record => record.outboxId))
+  return state.deliveries.find(item =>
+    item.providerDeliveryId === request.providerDeliveryId || item.deliveryRef === request.deliveryRef ||
+    permissionOutboxes.has(item.outboxId),
+  )
+}

@@ -125,6 +125,7 @@ export type HostedApprovalDeliveryResult = {
     | 'expired'
     | 'wrong_lane'
     | 'self_approval'
+    | 'operator_required'
     | 'unavailable'
 }
 
@@ -270,7 +271,7 @@ export class HostedApprovalWireDispatcher {
         const decoded: HostedApprovalIngressRecord[] = []
         const outboxIds = new Set<string>()
         for (const record of records) {
-          const admitted = decodeIngressRecord(record, outerAuthority)
+          const admitted = decodeHostedApprovalIngressRecord(record, outerAuthority)
           if (!admitted.lease || admitted.lease.ownerId !== request.ownerId ||
             admitted.lease.leaseToken !== request.leaseToken || admitted.acknowledgedAtIso !== null ||
             outboxIds.has(admitted.outboxId)) {
@@ -295,7 +296,7 @@ export class HostedApprovalWireDispatcher {
         ], 'approval acknowledgement result')
       }
       case 'approval_ingress_authority_resolve': {
-        const authority = decodeIngressAuthority(value)
+        const authority = decodeHostedApprovalIngressAuthority(value)
         bindIngressAuthority(authority, outerAuthority)
         const privateBinding = await this.options.approvals.getAdmittedIngressAuthority(authority)
         if (!privateBinding || !isDeepStrictEqual(privateBinding, authority)) {
@@ -348,7 +349,7 @@ function decodeDeliveryAuthorization(
   exactKeys(authorization, ['token', 'persistedAuthority'], 'approval delivery authorization')
   return {
     token: identifier(authorization.token, 'approval delivery authorization token'),
-    persistedAuthority: decodeIngressAuthority(authorization.persistedAuthority),
+    persistedAuthority: decodeHostedApprovalIngressAuthority(authorization.persistedAuthority),
   }
 }
 
@@ -360,7 +361,7 @@ function decodeDeliveryResult(value: unknown): HostedApprovalDeliveryResult {
     value,
     [
       'delivered', 'idempotent_replay', 'stale_generation', 'expired',
-      'wrong_lane', 'self_approval', 'unavailable',
+      'wrong_lane', 'self_approval', 'operator_required', 'unavailable',
     ],
     'approval delivery result',
   )
@@ -396,7 +397,7 @@ function decodeAckRequest(value: unknown): HostedApprovalAckRequest {
   }
 }
 
-function decodeIngressRecord(
+export function decodeHostedApprovalIngressRecord(
   value: unknown,
   outerAuthority: HostedControlAuthority,
 ): HostedApprovalIngressRecord {
@@ -413,7 +414,7 @@ function decodeIngressRecord(
   const outboxId = patterned(input.outboxId, /^runtime_permission:effect:[a-f0-9]{64}$/, 'approval outboxId')
   const effectRef = patterned(input.effectRef, /^effect:[a-f0-9]{64}$/, 'approval effectRef')
   if (outboxId !== `runtime_permission:${effectRef}`) throw new Error('Invalid approval outbox binding')
-  const authority = decodeIngressAuthority(input.authority)
+  const authority = decodeHostedApprovalIngressAuthority(input.authority)
   bindIngressAuthority(authority, outerAuthority)
   const payloadJson = boundedText(input.payloadJson, 'approval payloadJson', HOSTED_APPROVAL_MAX_PAYLOAD_JSON_BYTES, true)
   validateApprovalPayloadJson(payloadJson, String(input.deliveryRef))
@@ -458,7 +459,7 @@ function decodeLease(value: unknown): HostedApprovalIngressLease {
   }
 }
 
-function decodeIngressAuthority(value: unknown): HostedApprovalIngressAuthority {
+export function decodeHostedApprovalIngressAuthority(value: unknown): HostedApprovalIngressAuthority {
   const input = record(value, 'approval ingress authority')
   exactKeys(input, [
     'deploymentId', 'teamId', 'runId', 'planGeneration', 'laneId', 'providerId',

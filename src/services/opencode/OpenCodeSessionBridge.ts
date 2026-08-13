@@ -1,6 +1,19 @@
 import { createHash } from 'node:crypto'
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'node:fs'
+import path from 'node:path'
 
-import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import {
+  OpenCodePermissionConditionRejectedError,
+  openCodeClientFactory,
+} from './OpenCodeClientFactory.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
@@ -19,6 +32,7 @@ import type {
   OpenCodeAppMcpStatus,
   OpenCodeLogProjection,
   OpenCodeMessage,
+  OpenCodeNormalizedPermission,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeSessionRecord,
@@ -35,7 +49,8 @@ type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
-      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease'
+      'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease' |
+      'prepareEffectHostToken'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
@@ -57,6 +72,9 @@ type OpenCodeSessionBridgeDeps = {
     providerId: string
     sourceAuthPath: string
   }) => Promise<void>
+  preparePermissionProfileToken?: (
+    profile: OpenCodePreparedProfile,
+  ) => Promise<OpenCodePermissionEffectToken | null>
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -99,6 +117,167 @@ export type OpenCodeSessionAppMcpReadyResult = {
   status: OpenCodeAppMcpStatus
   connected: boolean | null
   diagnostics: string[]
+}
+
+export type OpenCodePermissionEffectContext = {
+  record: OpenCodeSessionRecord
+  profile: OpenCodePreparedProfile
+  host: {
+    hostKey: string
+    profileRootKey: string
+    projectPath: string
+    projectBehaviorFingerprint: string
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+  }
+}
+
+export type OpenCodePermissionEffectToken = { consume(): boolean }
+
+export class OpenCodePermissionEffectNotAuthorizedError extends Error {
+  constructor() { super('OpenCode permission effect not authorized at provider edge') }
+}
+
+export class OpenCodePermissionPostInvocationError extends Error {
+  constructor(readonly cause: unknown) {
+    super('OpenCode permission POST outcome is uncertain')
+  }
+}
+
+export class OpenCodePermissionEffectUnavailableError extends Error {
+  constructor(readonly cause: unknown) {
+    super('OpenCode permission effect pre-POST verification unavailable')
+  }
+}
+
+const MAX_PERMISSION_PROFILE_FILE_BYTES = 16 * 1024 * 1024
+
+type PinnedProfileFile = {
+  consume(): boolean
+}
+
+function readPinnedFile(fd: number, size: number): Buffer | null {
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_PERMISSION_PROFILE_FILE_BYTES) {
+    return null
+  }
+  const bytes = Buffer.alloc(size)
+  return readSync(fd, bytes, 0, size, 0) === size ? bytes : null
+}
+
+function hashProfileFile(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function missingCanonicalFile(filePath: string): boolean {
+  try {
+    lstatSync(filePath)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+function pinCanonicalProfileFile(
+  filePath: string,
+  expectedFingerprint: string | null,
+): PinnedProfileFile | null {
+  if (expectedFingerprint === null) {
+    if (!missingCanonicalFile(filePath)) return null
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        return missingCanonicalFile(filePath)
+      },
+    }
+  }
+
+  let fd = -1
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(fd)
+    const linked = lstatSync(filePath)
+    const bytes = opened.isFile() ? readPinnedFile(fd, opened.size) : null
+    if (!bytes || !linked.isFile() || linked.isSymbolicLink() ||
+      opened.dev !== linked.dev || opened.ino !== linked.ino ||
+      realpathSync(filePath) !== path.resolve(filePath) ||
+      hashProfileFile(bytes) !== expectedFingerprint) {
+      closeSync(fd)
+      return null
+    }
+    const identity = { dev: opened.dev, ino: opened.ino, size: opened.size }
+    const ownedFd = fd
+    fd = -1
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        try {
+          const current = fstatSync(ownedFd)
+          const linkedBefore = lstatSync(filePath)
+          const currentBytes = current.isFile() ? readPinnedFile(ownedFd, current.size) : null
+          const linkedAfter = lstatSync(filePath)
+          return !!currentBytes && current.dev === identity.dev && current.ino === identity.ino &&
+            current.size === identity.size && linkedBefore.isFile() && linkedAfter.isFile() &&
+            !linkedBefore.isSymbolicLink() && !linkedAfter.isSymbolicLink() &&
+            linkedBefore.dev === identity.dev && linkedBefore.ino === identity.ino &&
+            linkedAfter.dev === identity.dev && linkedAfter.ino === identity.ino &&
+            realpathSync(filePath) === path.resolve(filePath) &&
+            hashProfileFile(currentBytes) === expectedFingerprint
+        } catch {
+          return false
+        } finally {
+          closeSync(ownedFd)
+        }
+      },
+    }
+  } catch {
+    if (fd >= 0) closeSync(fd)
+    return null
+  }
+}
+
+/** Pins every auth file whose bytes form the prepared profile projection. */
+export async function prepareOpenCodePermissionProfileToken(
+  profile: OpenCodePreparedProfile,
+): Promise<OpenCodePermissionEffectToken | null> {
+  const sources = profile.sourceAuthSources
+  if (!sources) return null
+  const sourceFingerprint = sources.some(source => source.fingerprint)
+    ? createHash('sha256').update(sources
+      .filter(source => source.fingerprint)
+      .map(source => `${source.path}:${source.fingerprint}`)
+      .join('\n')).digest('hex')
+    : null
+  const selectedSourcePath = sources.findLast(source => source.fingerprint)?.path ?? null
+  if (sourceFingerprint !== profile.sourceAuthFingerprint ||
+    selectedSourcePath !== profile.sourceAuthPath) return null
+
+  const pinned: PinnedProfileFile[] = []
+  for (const source of [
+    ...sources,
+    { path: profile.managedAuthPath, fingerprint: profile.managedAuthFingerprint },
+  ]) {
+    const token = pinCanonicalProfileFile(source.path, source.fingerprint)
+    if (!token) {
+      for (const prepared of pinned) prepared.consume()
+      return null
+    }
+    pinned.push(token)
+  }
+  let consumed = false
+  return {
+    consume: () => {
+      if (consumed) return false
+      consumed = true
+      let valid = true
+      for (const token of pinned) valid = token.consume() && valid
+      return valid
+    },
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -158,6 +337,41 @@ function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function canonicalEffectValue(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    const encoded = JSON.stringify(value)
+    if (encoded === undefined) throw new Error('Unsupported OpenCode permission canonical value')
+    return encoded
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalEffectValue).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map(key =>
+    `${JSON.stringify(key)}:${canonicalEffectValue(record[key])}`,
+  ).join(',')}}`
+}
+
+const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v1' as const
+
+function decodeHostedApprovalCapability(value: unknown): {
+  schemaVersion: 1
+  protocol: typeof HOSTED_APPROVAL_PROTOCOL
+  configGeneration: string
+} | null {
+  const record = asRecord(value)
+  if (!record || Object.keys(record).sort().join(',') !==
+    'configGeneration,protocol,schemaVersion' || record.schemaVersion !== 1 ||
+    record.protocol !== HOSTED_APPROVAL_PROTOCOL ||
+    typeof record.configGeneration !== 'string' ||
+    !/^config_generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(record.configGeneration)) {
+    return null
+  }
+  return record as {
+    schemaVersion: 1
+    protocol: typeof HOSTED_APPROVAL_PROTOCOL
+    configGeneration: string
+  }
 }
 
 function extractManagedConfigFingerprintFromHostKey(hostKey: string | null | undefined): string | null {
@@ -591,6 +805,7 @@ export class OpenCodeSessionBridge {
       profile: OpenCodePreparedProfile
       resolvedConfigFingerprint: string | null
       runtimePid: number | null
+      host: OpenCodePermissionEffectContext['host']
     }) => Promise<T>,
     profile?: OpenCodePreparedProfile,
   ): Promise<T> {
@@ -618,6 +833,15 @@ export class OpenCodeSessionBridge {
         profile: sessionProfile.profile,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
+        host: {
+          hostKey: host.hostKey,
+          profileRootKey: host.profileRootKey,
+          projectPath: host.projectPath,
+          projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+          pid: host.pid,
+          processStartedAtMs: host.processStartedAtMs ?? null,
+          resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+        },
       })
     } finally {
       await this.hostManager.releaseHost(host.hostKey)
@@ -1261,15 +1485,189 @@ export class OpenCodeSessionBridge {
     params: {
       requestId: string
       decision: 'allow' | 'always' | 'reject'
+      /** Exact raw permission incarnation admitted by the hosted owner. */
+      expectedPermissionRaw?: OpenCodeNormalizedPermission['raw']
+      /** Requires the upstream atomic config-CAS permission-reply contract. */
+      requireAtomicConfigReply?: boolean
+      /** Revalidates the persisted session/effect binding after fresh host proof. */
+      validatePreparedEffect?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean | OpenCodePermissionEffectToken>
+      /** Last asynchronous admission fence, immediately pre-POST. */
+      authorizeEffect?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean | OpenCodePermissionEffectToken>
     },
   ): Promise<unknown> {
+    const invocation: {
+      phase: 'not_started' | 'invoked' | 'completed'
+      completedResult?: unknown
+    } = { phase: 'not_started' }
+    try {
+      return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      const client = this.clientFactory.create(baseUrl)
+      let preparedToken: OpenCodePermissionEffectToken | null = null
+      let authorityToken: OpenCodePermissionEffectToken | null = null
+      let profileToken: OpenCodePermissionEffectToken | null = null
+      let hostToken: OpenCodePermissionEffectToken | null = null
+      let preparedConsumed = false
+      let authorityConsumed = false
+      let profileConsumed = false
+      let hostConsumed = false
+      let configGeneration: string | null = null
+      try {
+      // Capability probe is deliberately before the raw permission GET. A
+      // current upstream host (which lacks atomic config-CAS reply) therefore
+      // performs neither the raw read nor the provider decision effect.
+      if (params.requireAtomicConfigReply) {
+        if (!client.getHostedApprovalCapability) {
+          throw new Error('OpenCode atomic hosted approval capability unavailable')
+        }
+        const capability = decodeHostedApprovalCapability(
+          await client.getHostedApprovalCapability(),
+        )
+        if (!capability) throw new Error('OpenCode atomic hosted approval capability unavailable')
+        configGeneration = capability.configGeneration
+      }
+      // Observe the exact provider-side incarnation before preparing any final
+      // effect tokens. The final host proof below must therefore cover this GET.
+      if (params.expectedPermissionRaw) {
+        const exactPermission = normalizeOpenCodePermissions(await client.getPermissions()).find(permission =>
+          permission.requestId === params.requestId &&
+          permission.sessionId === record.opencodeSessionId &&
+          canonicalEffectValue(permission.raw) === canonicalEffectValue(params.expectedPermissionRaw),
+        )
+        if (!exactPermission) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (params.expectedPermissionRaw) {
+        if (params.validatePreparedEffect) {
+          const prepared = await params.validatePreparedEffect({ record, profile, host })
+          if (!prepared) throw new OpenCodePermissionEffectNotAuthorizedError()
+          preparedToken = typeof prepared === 'boolean' ? null : prepared
+        }
+      }
+      if (params.authorizeEffect) {
+        const authorized = await params.authorizeEffect({ record, profile, host })
+        if (!authorized) throw new OpenCodePermissionEffectNotAuthorizedError()
+        authorityToken = typeof authorized === 'boolean' ? null : authorized
+      }
+      if (params.expectedPermissionRaw) {
+        const prepareProfileToken = this.deps.preparePermissionProfileToken
+          ?? prepareOpenCodePermissionProfileToken
+        profileToken = await prepareProfileToken(profile)
+        if (!profileToken) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      // Host proof is deliberately the last asynchronous operation. Everything
+      // after it is a synchronous one-use token consumption followed by POST.
+      const hostInput = {
+        hostKey: host.hostKey,
+        pid: host.pid,
+        processStartedAtMs: host.processStartedAtMs,
+        resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+      }
+      const prepareHost = this.hostManager.prepareEffectHostToken?.bind(this.hostManager)
+      hostToken = prepareHost
+        ? await prepareHost(hostInput)
+        : null
+      if (params.expectedPermissionRaw && !hostToken) throw new OpenCodePermissionEffectNotAuthorizedError()
+      if (preparedToken) {
+        preparedConsumed = true
+        if (!preparedToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (profileToken) {
+        profileConsumed = true
+        if (!profileToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (hostToken) {
+        hostConsumed = true
+        if (!hostToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (authorityToken) {
+        authorityConsumed = true
+        if (!authorityToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      try {
+        invocation.phase = 'invoked'
+        invocation.completedResult = await client.answerPermission({
+          requestId: params.requestId,
+          sessionId: record.opencodeSessionId,
+          decision: params.decision,
+          ...(configGeneration && params.expectedPermissionRaw
+            ? {
+                condition: {
+                  configGeneration,
+                  permissionDigest: createHash('sha256')
+                    .update(canonicalEffectValue(params.expectedPermissionRaw))
+                    .digest('hex'),
+                },
+              }
+            : {}),
+        })
+        invocation.phase = 'completed'
+        return invocation.completedResult
+      } catch (error) {
+        if (error instanceof OpenCodePermissionConditionRejectedError) {
+          invocation.phase = 'not_started'
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        throw new OpenCodePermissionPostInvocationError(error)
+      }
+      } finally {
+        if (preparedToken && !preparedConsumed) preparedToken.consume()
+        if (profileToken && !profileConsumed) profileToken.consume()
+        if (hostToken && !hostConsumed) hostToken.consume()
+        if (authorityToken && !authorityConsumed) authorityToken.consume()
+      }
+      })
+    } catch (error) {
+      // A successful provider response remains success even if releaseHost or
+      // another post-response cleanup step fails.
+      if (invocation.phase === 'completed') return invocation.completedResult
+      if (invocation.phase === 'invoked' && !(error instanceof OpenCodePermissionPostInvocationError)) {
+        throw new OpenCodePermissionPostInvocationError(error)
+      }
+      if (error instanceof OpenCodePermissionEffectNotAuthorizedError ||
+        error instanceof OpenCodePermissionPostInvocationError) throw error
+      throw new OpenCodePermissionEffectUnavailableError(error)
+    }
+  }
+
+  /** Returns the upstream config generation only for the exact atomic contract. */
+  async probeHostedApprovalCapability(record: OpenCodeSessionRecord): Promise<string | null> {
+    try {
+      return await this.withSessionHost(record, async ({ baseUrl }) => {
+        const client = this.clientFactory.create(baseUrl)
+        if (!client.getHostedApprovalCapability) return null
+        const capability = decodeHostedApprovalCapability(
+          await client.getHostedApprovalCapability(),
+        )
+        return capability?.configGeneration ?? null
+      })
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Proves the hosted capability and reads raw permissions from the same
+   * retained host and client acquisition. No raw permission read occurs unless
+   * the exact capability response has already been validated.
+   */
+  async observeHostedApprovalPermissions(
+    record: OpenCodeSessionRecord,
+  ): Promise<OpenCodeNormalizedPermission[]> {
     return this.withSessionHost(record, async ({ baseUrl }) => {
       const client = this.clientFactory.create(baseUrl)
-      return client.answerPermission({
-        requestId: params.requestId,
-        sessionId: record.opencodeSessionId,
-        decision: params.decision,
-      })
+      if (!client.getHostedApprovalCapability) {
+        throw new Error('OpenCode atomic hosted approval capability unavailable')
+      }
+      const capability = decodeHostedApprovalCapability(
+        await client.getHostedApprovalCapability(),
+      )
+      if (!capability) {
+        throw new Error('OpenCode atomic hosted approval capability unavailable')
+      }
+      return normalizeOpenCodePermissions(await client.getPermissions())
     })
   }
 

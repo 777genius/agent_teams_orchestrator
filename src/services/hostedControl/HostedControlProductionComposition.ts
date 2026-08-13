@@ -14,11 +14,20 @@ import type {
 } from './HostedControlRuntime.js'
 import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
+import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
+import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
+import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
+import { PrivateFileHostedApprovalRuntimeAdmissionStore } from './HostedApprovalRuntimeAdmission.js'
+import { OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
 
 export const HOSTED_LIFECYCLE_PLAN_FILE = 'hosted-lifecycle-plan.v1.json'
 export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
   'hosted-lifecycle-execution-state.v1.json'
 export const HOSTED_MESSAGE_DIRECTORY = 'hosted-messages'
+export const HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE = 'hosted-approval-runtime-admission.v1.json'
+export const HOSTED_APPROVAL_OWNER_WAL_FILE = 'hosted-approval-owner.v1.json'
+/** Current upstream OpenCode lacks atomic config-generation conditional reply. */
+export const OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED: boolean = false
 
 /**
  * Final local composition for the single hosted-control runtime. All state is
@@ -29,7 +38,7 @@ export const HOSTED_MESSAGE_DIRECTORY = 'hosted-messages'
 export function createHostedControlProductionPortFactory(
   createOpenCodeLane: () => TeamLifecycleLaneEffectPort = createProductionOpenCodeTeamLifecycleLane,
 ): HostedControlRuntimePortFactory {
-  return (context: HostedControlRuntimePortFactoryContext) => {
+  return async (context: HostedControlRuntimePortFactoryContext) => {
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
       [createOpenCodeLane()],
@@ -66,8 +75,38 @@ export function createHostedControlProductionPortFactory(
       messageDelivery,
       lifecycleEffects: lifecycle.authority,
     })
+    // Approval capability is installed only after a separate trusted
+    // provisioning owner atomically publishes its private authority. This
+    // composition never manufactures it from launch-plan strings. Until that
+    // producer lands, absence is capability-false; a present malformed file is
+    // still a startup failure.
+    let approvals: HostedApprovalOwnerService | undefined
+    try {
+      const approvalAdmission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(
+        join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE),
+      ).load(context.authority)
+      // Loading still validates a published admission, but current upstream
+      // OpenCode cannot atomically compare config generation while replying.
+      // Keep the production port absent until that server contract exists.
+      if (OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED) {
+        approvals = new HostedApprovalOwnerService({
+          store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
+            join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
+          )),
+          admission: approvalAdmission,
+          runtime: new OpenCodeHostedApprovalRuntimeAdapter(),
+          isCurrentOuterAuthority: () => context.isCurrentAuthority({
+            actorId: 'hosted-approval-owner', ...context.authority,
+          }),
+        })
+        await approvals.recoverStateOnly()
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
     return {
       ...services,
+      ...(approvals ? { approvals } : {}),
       close: async () => {
         await Promise.all([messageDelivery.close(), execution.shutdown()])
       },

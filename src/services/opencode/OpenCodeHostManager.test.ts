@@ -122,6 +122,74 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 describe('OpenCodeHostManager', () => {
+  test('freshly rejects effect-edge PID/start and resolved-config drift', async () => {
+    const spawned = createMockChildProcess(4242)
+    let alive = true
+    let startedAtMs = 1000
+    let configAgent = 'teammate'
+    const manager = new OpenCodeHostManager({
+      prepareProfile: async () => baseProfile,
+      allocateLoopbackPort: async () => 43140,
+      spawnHostProcess: () => spawned.child,
+      isProcessAlive: () => alive,
+      killProcess: () => { alive = false },
+      readProcessStartTimeMs: async () => startedAtMs,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
+        if (url.endsWith('/config')) return { status: 200, data: { default_agent: configAgent } }
+        if (url.endsWith('/config/providers')) return { status: 200, data: { providers: [] } }
+        if (url.endsWith('/agent')) return { status: 200, data: [] }
+        if (url.endsWith('/mcp')) return { status: 200, data: {} }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      sleepMs: async () => {}, persistentRegistryPath: null,
+    })
+    const host = await manager.ensureHost({ hostKey: 'effect-host' })
+    const proof = {
+      hostKey: host.hostKey, pid: host.pid,
+      processStartedAtMs: host.processStartedAtMs ?? null,
+      resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+    }
+    expect(await manager.verifyEffectHost(proof)).toBe(true)
+    startedAtMs = 2000
+    expect(await manager.verifyEffectHost(proof)).toBe(false)
+    startedAtMs = 1000; configAgent = 'replacement'
+    expect(await manager.verifyEffectHost(proof)).toBe(false)
+    await manager.disposeHost(host.hostKey)
+  })
+
+  test('one-use host effect token rejects in-process host replacement before POST', async () => {
+    const spawned = createMockChildProcess(321)
+    let alive = true
+    const manager = new OpenCodeHostManager({
+      persistentRegistryPath: null,
+      prepareProfile: async () => baseProfile,
+      spawnHostProcess: () => spawned.child,
+      isProcessAlive: pid => pid === 321 && alive,
+      killProcess: () => { alive = false },
+      readProcessStartTimeMs: async () => 1_000,
+      allocateLoopbackPort: async () => 4096,
+      fetchJson: async url => {
+        if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true } }
+        if (url.endsWith('/config')) return { status: 200, data: { default_agent: 'teammate' } }
+        if (url.endsWith('/config/providers')) return { status: 200, data: { providers: [] } }
+        if (url.endsWith('/agent')) return { status: 200, data: [] }
+        if (url.endsWith('/mcp')) return { status: 200, data: {} }
+        if (url.endsWith('/global/dispose')) return { status: 200, data: {} }
+        throw new Error(`Unexpected URL ${url}`)
+      },
+      sleepMs: async () => {},
+    })
+    const first = await manager.ensureHost({ projectPath: '/tmp/project' })
+    const token = await manager.prepareEffectHostToken({
+      hostKey: first.hostKey, pid: first.pid, processStartedAtMs: first.processStartedAtMs,
+      resolvedConfigFingerprint: first.resolvedConfigFingerprint,
+    })
+    expect(token).not.toBeNull()
+    await manager.disposeHost(first.hostKey)
+    expect(token!.consume()).toBe(false)
+  })
+
   test('starts a fresh persistent host when managed OpenCode auth changes', async () => {
     let profile = baseProfile
     let port = 43150

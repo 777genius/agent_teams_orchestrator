@@ -170,7 +170,7 @@ export function parseStrictHostedProofLastJsonFrame(
   return { value: envelope, serializedUnsignedEnvelope, proof }
 }
 
-function assertNoDuplicateJsonObjectKeys(source: string): void {
+export function assertNoDuplicateJsonObjectKeys(source: string): void {
   let cursor = 0
   const fail = (): never => { throw new TypeError('Invalid hosted JSON frame') }
   const whitespace = (): void => {

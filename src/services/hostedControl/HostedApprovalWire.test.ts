@@ -186,7 +186,7 @@ describe('HostedApprovalWireDispatcher', () => {
   })
 
   test('bounds claim records and validates deliveryRef rebind in payloadJson', async () => {
-    const tooMany = Array.from({ length: 2 }, ingressRecord)
+    const tooMany = Array.from({ length: 2 }, () => ingressRecord())
     await expect(dispatch(dispatcher({
       ...ports(), claimIngress: async () => tooMany,
     }), 'approval_ingress_claim', {
@@ -214,6 +214,13 @@ describe('HostedApprovalWireDispatcher', () => {
       ...ports(), deliverDecision: async () => ({ status: 'conflict' }),
     }), 'approval_decision_deliver', deliveryRequest()))
       .rejects.toThrow('idempotency conflict')
+  })
+
+  test('surfaces a durable ambiguous provider call as operator_required', async () => {
+    expect((await dispatch(dispatcher({
+      ...ports(), authorizeDecision: async () => ({ status: 'operator_required' }),
+    }), 'approval_decision_deliver', deliveryRequest())).payload)
+      .toEqual({ status: 'operator_required' })
   })
 
   test('binds authenticated principal into the delivery fingerprint and rejects its omission', async () => {

@@ -1,13 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readdir,
-  realpath,
-  rm,
-  writeFile,
-} from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -19,6 +11,7 @@ import {
   HOSTED_LIFECYCLE_EXECUTION_STATE_FILE,
   HOSTED_LIFECYCLE_PLAN_FILE,
   HOSTED_MESSAGE_DIRECTORY,
+  HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE,
 } from './HostedControlProductionComposition.js'
 import type { HostedControlRuntimePortFactoryContext } from './HostedControlRuntime.js'
 
@@ -41,23 +34,44 @@ const lifecycleAuthority: HostedLifecycleAuthority = {
   restoreGeneration: stableAuthority.restoreGeneration,
   resourceRevision: null,
   mountGeneration: stableAuthority.mountBinding.mountGeneration,
-  ownerEffectFence: { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) },
+  ownerEffectFence: {
+    grantRevision: '1'.repeat(64),
+    identityChecksum: '2'.repeat(64),
+  },
 }
 
 afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map(root => rm(root, { recursive: true, force: true })),
-  )
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 
 describe('createHostedControlProductionPorts', () => {
-  test('admits only the private OpenCode plan and roots durable state below the team root', async () => {
-    const teamRoot = await makeTeamRoot('hosted-production-composition-')
+  test('normal production composition starts capability-false until trusted approval authority is published', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-missing-approval-admission-')
     await writePlan(teamRoot, 'opencode')
     const ports = await createHostedControlProductionPorts(context(teamRoot))
+    expect(ports.approvals).toBeUndefined()
+    expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('control_state')
+  })
+
+  test('fails startup closed when a published approval authority is malformed', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-malformed-approval-admission-')
+    await writePlan(teamRoot, 'opencode')
+    await writeFile(join(teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE), '{}', { mode: 0o600 })
+    await expect(createHostedControlProductionPorts(context(teamRoot))).rejects.toThrow()
+  })
+
+  test('keeps current upstream approval capability-false even with valid private admission', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-composition-')
+    await writePlan(teamRoot, 'opencode')
+    await writeApprovalAdmission(teamRoot)
+    const ports = await createHostedControlProductionPorts(context(teamRoot))
+    expect(ports.approvals).toBeUndefined()
 
     const state = await ports.lifecycle.dispatch(controlStateInput())
-    expect(state.payload).toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
+    expect(state.payload).toMatchObject({
+      kind: 'control_state',
+      availableActions: ['launch'],
+    })
 
     const persisted = await ports.messages.dispatch({
       operation: 'message_persist',
@@ -70,33 +84,27 @@ describe('createHostedControlProductionPorts', () => {
       },
     })
     expect(persisted.kind).toBe('persisted')
-    expect(
-      await readdir(join(teamRoot, HOSTED_MESSAGE_DIRECTORY)),
-    ).toHaveLength(1)
-    expect(await readdir(teamRoot)).not.toContain(
-      HOSTED_LIFECYCLE_EXECUTION_STATE_FILE,
-    )
+    expect(await readdir(join(teamRoot, HOSTED_MESSAGE_DIRECTORY))).toHaveLength(1)
+    expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
   })
 
   test('keeps native lanes capability-false and never creates a missing plan', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-native-')
     await writePlan(teamRoot, 'native')
+    await writeApprovalAdmission(teamRoot)
     const native = await createHostedControlProductionPorts(context(teamRoot))
-    expect(
-      (await native.lifecycle.dispatch(controlStateInput())).payload.kind,
-    ).toBe('unavailable')
+    expect((await native.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
 
     await rm(join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE))
     const missing = await createHostedControlProductionPorts(context(teamRoot))
-    expect(
-      (await missing.lifecycle.dispatch(controlStateInput())).payload.kind,
-    ).toBe('unavailable')
+    expect((await missing.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
     expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_PLAN_FILE)
   })
 
   test('keeps an admitted OpenCode plan unavailable when its live owner capability is absent', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-opencode-unavailable-')
     await writePlan(teamRoot, 'opencode')
+    await writeApprovalAdmission(teamRoot)
     const createPorts = createHostedControlProductionPortFactory(() => new OpenCodeTeamLifecycleLane())
     const ports = await createPorts(context(teamRoot))
     expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
@@ -109,6 +117,27 @@ async function makeTeamRoot(prefix: string): Promise<string> {
   const root = join(parent, 'legacy')
   await mkdir(root, { mode: 0o700 })
   return realpath(root)
+}
+
+async function writeApprovalAdmission(teamRoot: string): Promise<void> {
+  await writeFile(
+    join(teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE),
+    JSON.stringify({
+      schemaVersion: 1,
+      admissionGeneration: 'approval-admission-generation_test',
+      outerAuthority: {
+        deploymentId: stableAuthority.deploymentId,
+        bootId: stableAuthority.bootId,
+        workspaceId: stableAuthority.workspaceId,
+        teamId,
+        restoreGeneration: stableAuthority.restoreGeneration,
+        mountBinding: { ...stableAuthority.mountBinding },
+      },
+      routes: [],
+      actorMembers: {},
+    }),
+    { mode: 0o600 },
+  )
 }
 
 function context(teamRoot: string): HostedControlRuntimePortFactoryContext {
@@ -144,10 +173,7 @@ function controlStateInput() {
   }
 }
 
-async function writePlan(
-  teamRoot: string,
-  kind: 'opencode' | 'native',
-): Promise<void> {
+async function writePlan(teamRoot: string, kind: 'opencode' | 'native'): Promise<void> {
   await mkdir(teamRoot, { recursive: true, mode: 0o700 })
   const lane =
     kind === 'opencode'
@@ -156,17 +182,13 @@ async function writePlan(
           kind: 'opencode',
           provider: 'opencode',
           selectedModel: 'openai/gpt-5',
-          members: [
-            { name: 'worker', prompt: 'Work only in the admitted sandbox.' },
-          ],
+          members: [{ name: 'worker', prompt: 'Work only in the admitted sandbox.' }],
         }
       : {
           laneId: 'codex-primary',
           kind: 'native',
           provider: 'codex',
-          members: [
-            { name: 'worker', prompt: 'Work only in the admitted sandbox.' },
-          ],
+          members: [{ name: 'worker', prompt: 'Work only in the admitted sandbox.' }],
         }
   const path = join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE)
   await writeFile(

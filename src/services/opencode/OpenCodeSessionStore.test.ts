@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -31,7 +31,7 @@ const baseRecord = {
 let tempDir = ''
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-store-test-'))
+  tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-session-store-test-')))
 })
 
 afterEach(async () => {
@@ -84,5 +84,29 @@ describe('OpenCodeSessionStore', () => {
       await store.get(baseRecord.teamId, 'secondary:opencode:alice', baseRecord.memberName),
     ).toEqual(secondary)
     expect(await store.list()).toHaveLength(2)
+  })
+
+  test('effect token binds the exact persisted manual session image', async () => {
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
+    const manual = { ...baseRecord, toolApprovalMode: 'manual' as const }
+    await store.upsert(manual)
+    const token = await store.prepareEffectToken(
+      manual.teamId,
+      manual.laneId,
+      manual.memberName,
+      manual,
+    )
+    expect(token).not.toBeNull()
+    await store.upsert({ ...manual, selectedVariant: 'high' })
+    expect(token!.consume()).toBe(false)
+
+    const fresh = await store.prepareEffectToken(
+      manual.teamId,
+      manual.laneId,
+      manual.memberName,
+      { ...manual, selectedVariant: 'high' },
+    )
+    expect(fresh?.consume()).toBe(true)
+    expect(fresh?.consume()).toBe(false)
   })
 })
