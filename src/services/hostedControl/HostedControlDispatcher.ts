@@ -14,6 +14,11 @@ import {
   HOSTED_LIFECYCLE_PROOF_DOMAIN,
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
 } from './HostedControlServer.js'
+import {
+  HostedApprovalWireDispatcher,
+  isHostedApprovalOperation,
+  type HostedApprovalWirePort,
+} from './HostedApprovalWire.js'
 
 const LIFECYCLE_OPERATIONS = [
   'control_state',
@@ -72,14 +77,26 @@ export type HostedControlDispatcherOptions = {
   getOwnerBinding: () => HostedControlOwnerBinding | null
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
+  /** Absent until a single durable approval runtime owner is composed. */
+  approvals?: HostedApprovalWirePort
 }
 
 export class HostedControlDispatcher {
   constructor(private readonly options: HostedControlDispatcherOptions) {}
 
-  async dispatch(message: Record<string, unknown>, rawLine = JSON.stringify(message)): Promise<Record<string, unknown> | null> {
+  async dispatch(message: Record<string, unknown>, rawLine?: string): Promise<Record<string, unknown> | null> {
+    if (isHostedApprovalOperation(message.operation)) {
+      if (rawLine === undefined) throw new Error('Hosted approval raw frame is required')
+      if (!this.options.approvals) throw new Error('Hosted approval owner is unavailable')
+      return new HostedApprovalWireDispatcher({
+        secret: this.options.secret,
+        authority: this.options.authority,
+        getOwnerBinding: this.options.getOwnerBinding,
+        approvals: this.options.approvals,
+      }).dispatch(message, rawLine)
+    }
     if (isLifecycleOperation(message.operation)) {
-      return this.#dispatchLifecycle(message, rawLine)
+      return this.#dispatchLifecycle(message, rawLine ?? JSON.stringify(message))
     }
     if (isMessageOperation(message.operation)) {
       return this.#dispatchMessage(message)

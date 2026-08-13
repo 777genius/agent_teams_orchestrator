@@ -24,7 +24,8 @@ import {
   type HostedTaskMutationTerminalResult,
 } from './protocol.js'
 
-export const HOSTED_CONTROL_MAX_LINE_BYTES = 64 * 1024
+export const HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES = 64 * 1024
+export const HOSTED_CONTROL_MAX_LINE_BYTES = 8 * 1024 * 1024
 export const HOSTED_CONTROL_READ_DEADLINE_MS = 5_000
 export const HOSTED_LIFECYCLE_PROOF_DOMAIN = 'agent-teams.hosted-lifecycle.owner-proof/v1'
 export const HOSTED_TEAM_MESSAGE_PROOF_DOMAIN = 'agent-teams.hosted-team-message.owner-proof/v1'
@@ -202,6 +203,11 @@ export class HostedControlServer {
     const parsed = JSON.parse(line) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { socket.destroy(); return }
     const message = parsed as Record<string, unknown>
+    const frameBytes = Buffer.byteLength(line, 'utf8') + 1
+    if (!isApprovalOperation(message.operation) && frameBytes > HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES) {
+      socket.destroy()
+      return
+    }
     if (message.operation === 'readiness') { await this.#handleReadiness(socket, line, message); return }
     if (message.operation !== HOSTED_CONTROL_OPERATION) {
       const leaseSocket = this.#leaseSocket
@@ -296,6 +302,11 @@ export class HostedControlServer {
     const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath).catch(() => null), lstat(dirname(this.#options.socketPath)).catch(() => null)])
     return !!socketStat?.isSocket() && (socketStat.mode & 0o077) === 0 && (process.getuid?.() === undefined || socketStat.uid === process.getuid?.()) && !!parentStat?.isDirectory() && !parentStat.isSymbolicLink() && String(socketStat.dev) === ownerBinding.socketIdentity.device && String(socketStat.ino) === ownerBinding.socketIdentity.inode && socketStat.uid === ownerBinding.socketIdentity.uid && socketStat.gid === ownerBinding.socketIdentity.gid && (socketStat.mode & 0o777) === ownerBinding.socketIdentity.mode && parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode
   }
+}
+
+function isApprovalOperation(value: unknown): boolean {
+  return value === 'approval_ingress_claim' || value === 'approval_ingress_ack' ||
+    value === 'approval_ingress_authority_resolve' || value === 'approval_decision_deliver'
 }
 
 function decodeUtf8(bytes: Uint8Array): string {
@@ -404,7 +415,10 @@ function taskResultMatchesRequest(
 
 function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): void {
   const line = `${JSON.stringify(value)}\n`
-  if (Buffer.byteLength(line) > HOSTED_CONTROL_MAX_LINE_BYTES) {
+  const maximum = isApprovalOperation(value.operation)
+    ? HOSTED_CONTROL_MAX_LINE_BYTES
+    : HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES
+  if (Buffer.byteLength(line) > maximum) {
     throw new Error('Hosted control response exceeds maximum line size')
   }
   socket.end(line)

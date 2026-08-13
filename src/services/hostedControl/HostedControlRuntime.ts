@@ -10,6 +10,7 @@ import type {
   HostedLifecycleCommandPort,
   HostedTeamMessagePort,
 } from './HostedControlDispatcher.js'
+import type { HostedApprovalWirePort } from './HostedApprovalWire.js'
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
 import { HostedControlServer } from './HostedControlServer.js'
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
@@ -24,6 +25,8 @@ import {
 export type HostedControlRuntimePorts = {
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
+  /** Deliberately optional until the external lifecycle approval owner is installed. */
+  approvals?: HostedApprovalWirePort
   close(): Promise<void>
 }
 
@@ -161,6 +164,7 @@ export class HostedControlRuntime {
         getOwnerBinding: () => server?.ownerBinding ?? null,
         lifecycle: ports.lifecycle,
         messages: ports.messages,
+        approvals: ports.approvals,
       })
       await server.start()
       if (startup.cancelled) throw new Error('Hosted control runtime startup was cancelled')
