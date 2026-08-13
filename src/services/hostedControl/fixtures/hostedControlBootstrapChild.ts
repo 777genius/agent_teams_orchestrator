@@ -29,5 +29,5 @@ try {
       writeError => writeError ? reject(writeError) : resolve(),
     )
   })
-  process.exitCode = 2
+  process.exit(2)
 }
