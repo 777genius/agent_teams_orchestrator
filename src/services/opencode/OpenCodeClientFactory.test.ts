@@ -7,6 +7,14 @@ const runtimeInstanceId = `runtime_instance_${'1'.repeat(32)}`
 const configGeneration = `config_generation_${'2'.repeat(32)}`
 const requestIncarnation = `request_incarnation_${'3'.repeat(32)}`
 const permissionDigest = 'a'.repeat(64)
+const rawPermission = () => ({
+  id: 'perm_123',
+  sessionID: 'ses_123',
+  permission: 'bash',
+  patterns: ['ls'],
+  metadata: { cwd: '/tmp' },
+  always: [],
+})
 const hostedClient = (factory: OpenCodeClientFactory) =>
   factory.create('http://127.0.0.1:4096', {}, hostedAuth)
 
@@ -144,7 +152,7 @@ describe('OpenCodeClientFactory permissions API', () => {
 
   test('uses exact authenticated v2 capability and observation contracts', async () => {
     const requests: Array<{ url: string; authorization: string | null; directory: string | null }> = []
-    const rawPermission = { requestID: 'perm_123', sessionID: 'ses_123', tool: 'bash' }
+    const raw = rawPermission()
     const factory = new OpenCodeClientFactory({ fetchImpl: async (input, init) => {
       requests.push({
         url: String(input),
@@ -155,7 +163,7 @@ describe('OpenCodeClientFactory permissions API', () => {
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
         configGeneration, sessionId: 'ses_123', permissions: [{
           requestId: 'perm_123', sessionId: 'ses_123', requestIncarnation,
-          permissionDigest: canonicalHostedApprovalDigest(rawPermission), rawPermission,
+          permissionDigest: canonicalHostedApprovalDigest(raw), rawPermission: raw,
         }],
       } : {
         schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2',
@@ -182,6 +190,32 @@ describe('OpenCodeClientFactory permissions API', () => {
     expect(() => factory.create('http://127.0.0.1:4096').getHostedApprovalCapability())
       .toThrow('Basic Auth unavailable')
     expect(calls).toBe(0)
+  })
+
+  test('preserves hosted Basic Auth credentials byte-for-byte', async () => {
+    const authorizations: Array<string | null> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (_input, init) => {
+        authorizations.push(new Headers(init?.headers).get('authorization'))
+        return new Response(JSON.stringify({
+          schemaVersion: 2,
+          protocol: 'agent-teams-hosted-approval-v2',
+          authentication: 'opencode-basic',
+          runtimeInstanceId,
+          configGeneration,
+        }))
+      },
+    })
+    await factory.create('http://127.0.0.1:4096', {}, {
+      username: ' user ', password: ' pass ', directory: '/tmp/project',
+    }).getHostedApprovalCapability?.()
+    await factory.create('http://127.0.0.1:4096', {}, {
+      username: '', password: 'pass', directory: '/tmp/project',
+    }).getHostedApprovalCapability?.()
+    expect(authorizations).toEqual([
+      `Basic ${Buffer.from(' user : pass ').toString('base64')}`,
+      `Basic ${Buffer.from(':pass').toString('base64')}`,
+    ])
   })
 
   test('maps allow permission decisions to OpenCode once replies', async () => {
@@ -280,7 +314,7 @@ describe('OpenCodeClientFactory permissions API', () => {
   })
 
   test('rejects v1, duplicate keys, invalid UTF-8, oversized observation and wrong digest', async () => {
-    const rawPermission = { requestID: 'perm_123', sessionID: 'ses_123' }
+    const raw = rawPermission()
     const responses = [
       new Response(JSON.stringify({ schemaVersion: 1, protocol: 'agent-teams-hosted-approval-v1', configGeneration })),
       new Response('{"schemaVersion":2,"schemaVersion":2}'),
@@ -294,10 +328,44 @@ describe('OpenCodeClientFactory permissions API', () => {
       ' '.repeat(1024 * 1024 + 1),
       JSON.stringify({ schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', runtimeInstanceId,
         configGeneration, sessionId: 'ses_123', permissions: [{ requestId: 'perm_123', sessionId: 'ses_123',
-          requestIncarnation, permissionDigest, rawPermission }] }),
+          requestIncarnation, permissionDigest, rawPermission: raw }] }),
     ]) {
       const factory = new OpenCodeClientFactory({ fetchImpl: async () => new Response(body) })
       await expect(hostedClient(factory).observeHostedApprovalPermissions?.('ses_123')).rejects.toThrow()
+    }
+  })
+
+  test('rejects malformed or cross-bound hosted raw permissions', async () => {
+    const valid = rawPermission()
+    const malformed = [
+      { ...valid, id: 'different' },
+      { ...valid, sessionID: 'ses_other' },
+      { ...valid, extra: true },
+      { ...valid, patterns: ['ls', 1] },
+      { ...valid, metadata: [] },
+      { ...valid, tool: { messageID: 'msg_1' } },
+      { ...valid, tool: { messageID: 'msg_1', callID: 'call_1', extra: true } },
+    ]
+    for (const raw of malformed) {
+      const body = {
+        schemaVersion: 2,
+        protocol: 'agent-teams-hosted-approval-v2',
+        runtimeInstanceId,
+        configGeneration,
+        sessionId: 'ses_123',
+        permissions: [{
+          requestId: 'perm_123',
+          sessionId: 'ses_123',
+          requestIncarnation,
+          permissionDigest: canonicalHostedApprovalDigest(raw),
+          rawPermission: raw,
+        }],
+      }
+      const factory = new OpenCodeClientFactory({
+        fetchImpl: async () => new Response(JSON.stringify(body)),
+      })
+      await expect(hostedClient(factory).observeHostedApprovalPermissions?.('ses_123'))
+        .rejects.toThrow('raw permission was malformed')
     }
   })
 

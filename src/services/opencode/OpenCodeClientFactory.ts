@@ -8,6 +8,7 @@ import type {
   OpenCodeHostedApprovalCapability,
   OpenCodeHostedApprovalObservation,
   OpenCodeHostedApprovalPermission,
+  OpenCodeHostedApprovalRawPermission,
   OpenCodeMessage,
   OpenCodeMcpResponse,
   OpenCodeMcpServerConfig,
@@ -200,10 +201,43 @@ function validateConditionalPermissionReply(
   return value
 }
 
-function assertHostedIdentifier(value: string, field: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(value)) {
-    throw new Error(`Invalid OpenCode hosted approval ${field}`)
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === 'string')
+}
+
+function validateHostedRawPermission(
+  value: unknown,
+  requestId: string,
+  sessionId: string,
+): OpenCodeHostedApprovalRawPermission {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('OpenCode hosted approval raw permission was malformed')
   }
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort().join(',')
+  const expectedKeys = record.tool === undefined
+    ? 'always,id,metadata,patterns,permission,sessionID'
+    : 'always,id,metadata,patterns,permission,sessionID,tool'
+  const metadata = record.metadata
+  const tool = record.tool
+  const validTool = tool === undefined || (
+    !!tool && typeof tool === 'object' && !Array.isArray(tool) &&
+    Object.keys(tool).sort().join(',') === 'callID,messageID' &&
+    typeof (tool as Record<string, unknown>).callID === 'string' &&
+    typeof (tool as Record<string, unknown>).messageID === 'string'
+  )
+  if (keys !== expectedKeys ||
+    typeof record.id !== 'string' || !record.id.startsWith('per') || record.id !== requestId ||
+    typeof record.sessionID !== 'string' || !record.sessionID.startsWith('ses') ||
+    record.sessionID !== sessionId ||
+    typeof record.permission !== 'string' ||
+    !isStringArray(record.patterns) ||
+    !metadata || typeof metadata !== 'object' || Array.isArray(metadata) ||
+    !isStringArray(record.always) ||
+    !validTool) {
+    throw new Error('OpenCode hosted approval raw permission was malformed')
+  }
+  return record as OpenCodeHostedApprovalRawPermission
 }
 
 function validateHostedApprovalPermission(
@@ -217,7 +251,7 @@ function validateHostedApprovalPermission(
   if (Object.keys(record).sort().join(',') !==
       'permissionDigest,rawPermission,requestId,requestIncarnation,sessionId' ||
     typeof record.requestId !== 'string' ||
-    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(record.requestId) ||
+    !record.requestId.startsWith('per') ||
     record.sessionId !== sessionId ||
     typeof record.requestIncarnation !== 'string' ||
     !HOSTED_REQUEST_INCARNATION.test(record.requestIncarnation) ||
@@ -226,7 +260,14 @@ function validateHostedApprovalPermission(
     canonicalHostedApprovalDigest(record.rawPermission) !== record.permissionDigest) {
     throw new Error('OpenCode hosted approval permission was malformed')
   }
-  return record as OpenCodeHostedApprovalPermission
+  return {
+    ...record,
+    rawPermission: validateHostedRawPermission(
+      record.rawPermission,
+      record.requestId,
+      record.sessionId,
+    ),
+  } as OpenCodeHostedApprovalPermission
 }
 
 function validateHostedApprovalObservation(
@@ -263,7 +304,7 @@ function hostedApprovalRequest(
   if (!auth.directory || auth.directory.includes('\0')) {
     throw new Error('OpenCode hosted approval directory unavailable')
   }
-  const username = auth.username?.trim() || 'opencode'
+  const username = auth.username ?? 'opencode'
   return {
     ...init,
     redirect: 'manual',
@@ -541,7 +582,6 @@ export class OpenCodeClientFactory {
           true,
         ).then(validateHostedApprovalCapability),
       observeHostedApprovalPermissions: sessionId => {
-        assertHostedIdentifier(sessionId, 'session id')
         return request<OpenCodeHostedApprovalObservation>(
           `/experimental/agent-teams/hosted-approval/session/${encodeURIComponent(sessionId)}/permissions`,
           hostedApprovalRequest(hostedApprovalAuth),
@@ -696,8 +736,9 @@ export class OpenCodeClientFactory {
         }
         try {
           if (!body.sessionId) throw new Error('OpenCode hosted approval session id missing')
-          assertHostedIdentifier(body.requestId, 'request id')
-          assertHostedIdentifier(body.sessionId, 'session id')
+          if (!body.requestId.startsWith('per')) {
+            throw new Error('OpenCode hosted approval request id was malformed')
+          }
           const decision = body.decision === 'allow' ? 'allow_once' : 'reject'
           const conditionalPayload = {
             schemaVersion: 2,

@@ -392,10 +392,12 @@ export type OpenCodeHostedApprovalObservedPermission = {
 }
 
 function hostedApprovalAuth(profile: OpenCodePreparedProfile) {
-  const password = profile.env.OPENCODE_SERVER_PASSWORD?.trim()
-  if (!password) throw new Error('OpenCode hosted approval Basic Auth unavailable')
+  const password = profile.env.OPENCODE_SERVER_PASSWORD
+  if (password === undefined || password === '') {
+    throw new Error('OpenCode hosted approval Basic Auth unavailable')
+  }
   return {
-    username: profile.env.OPENCODE_SERVER_USERNAME?.trim() || 'opencode',
+    username: profile.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
     password,
     directory: profile.projectPath,
   }
@@ -1736,10 +1738,16 @@ export class OpenCodeSessionBridge {
         throw new Error('OpenCode hosted approval observation generation changed')
       }
       return observation.permissions.map(permission => {
-        const normalized = normalizeOpenCodePermissions([
-          permission.rawPermission as import('./types.js').OpenCodePendingPermission,
-        ])[0]
-        if (!normalized || normalized.requestId !== permission.requestId ||
+        const raw = permission.rawPermission
+        const normalized: OpenCodeNormalizedPermission = {
+          requestId: raw.id,
+          sessionId: raw.sessionID,
+          tool: raw.permission,
+          title: null,
+          kind: null,
+          raw,
+        }
+        if (normalized.requestId !== permission.requestId ||
           normalized.sessionId !== permission.sessionId ||
           canonicalHostedApprovalDigest(permission.rawPermission) !== permission.permissionDigest) {
           throw new Error('OpenCode hosted approval permission projection mismatch')

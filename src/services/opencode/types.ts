@@ -190,7 +190,21 @@ export type OpenCodeHostedApprovalPermission = {
   sessionId: string
   requestIncarnation: string
   permissionDigest: string
-  rawPermission: unknown
+  rawPermission: OpenCodeHostedApprovalRawPermission
+}
+
+/** Exact JSON projection of the OpenCode v1 PermissionV1.Request schema. */
+export type OpenCodeHostedApprovalRawPermission = {
+  id: string
+  sessionID: string
+  permission: string
+  patterns: string[]
+  metadata: Record<string, unknown>
+  always: string[]
+  tool?: {
+    messageID: string
+    callID: string
+  }
 }
 
 export type OpenCodeHostedApprovalObservation = {
@@ -325,7 +339,7 @@ export type OpenCodePendingPermission = {
   sessionID?: string
   sessionId?: string
   session?: string
-  tool?: string
+  tool?: string | { messageID?: string; callID?: string }
   toolName?: string
   name?: string
   title?: string
@@ -333,7 +347,7 @@ export type OpenCodePendingPermission = {
   kind?: string
   type?: string
   metadata?: Record<string, unknown>
-  permission?: Record<string, unknown>
+  permission?: Record<string, unknown> | string
   [key: string]: unknown
 }
 
