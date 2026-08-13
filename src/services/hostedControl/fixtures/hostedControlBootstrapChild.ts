@@ -23,6 +23,11 @@ try {
     fd3Closed: !(await descriptorOpen(3)), fd4Closed: !(await descriptorOpen(4)),
   })}\n`)
 } catch (error) {
-  process.stdout.write(`${JSON.stringify({ kind: 'rejected', message: (error as Error).message })}\n`)
-  process.exitCode = 2
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(
+      `${JSON.stringify({ kind: 'rejected', message: (error as Error).message })}\n`,
+      writeError => writeError ? reject(writeError) : resolve(),
+    )
+  })
+  process.exit(2)
 }
