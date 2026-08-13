@@ -45,6 +45,7 @@ import {
 } from '../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../utils/swarm/constants.js'
 import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
+import { killInProcessTeammate } from '../utils/swarm/spawnInProcess.js'
 import {
   TEAMMATE_BOOTSTRAP_RUN_ID_ENV,
   writeChildOwnedTeammateRuntimeEvent,
@@ -53,7 +54,7 @@ import { getLeaderToolUseConfirmQueue } from '../utils/swarm/leaderPermissionBri
 import { sendPermissionResponseViaMailbox } from '../utils/swarm/permissionSync.js'
 import {
   readTeamFile,
-  removeTeammateFromTeamFile,
+  removeTeammateFromTeamFileIfIdentityMatches,
   setMemberMode,
 } from '../utils/swarm/teamHelpers.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
@@ -67,6 +68,8 @@ import {
   isTeammate,
 } from '../utils/teammate.js'
 import { isInProcessTeammate } from '../utils/teammateContext.js'
+export { preserveTeammateAfterTerminationFailure } from '../utils/teammateTermination.js'
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from '../utils/teammateTermination.js'
 import {
   finalizeClaimedMessagesAsRead,
   isLegacyPlanApprovalResponseMessage,
@@ -2779,52 +2782,151 @@ export function useInboxPoller({
         for (const m of shutdownApprovals) {
           const parsed = isShutdownApproved(m.text)
           if (!parsed) continue
+          if (parsed.from !== m.from) {
+            logForDebugging(
+              `[InboxPoller] Ignoring shutdown approval whose claimed sender ${parsed.from} does not match mailbox sender ${m.from}`,
+            )
+            protocolMessagesForLiveContext.push(m)
+            continue
+          }
+
+          const teammateEntries = Object.entries(
+            currentAppState.teamContext?.teammates ?? {},
+          ) as Array<[string, { name?: string; tmuxPaneId?: string }]>
+          const teammateEntry = teammateEntries.find(
+            ([, teammate]) => teammate.name === parsed.from,
+          )
+          const teamFile = teamName ? readTeamFile(teamName) : null
+          const expectedAgentId = teammateEntry?.[0] ?? teamFile?.members.find(
+            member => member.name === parsed.from,
+          )?.agentId
+          const processMember = teamFile?.members.find(
+            member => member.agentId === expectedAgentId,
+          )
+          if (!processMember || processMember.name !== m.from) {
+            logForDebugging(
+              `[InboxPoller] Ignoring shutdown approval without an exact member/agent binding for ${m.from}`,
+            )
+            protocolMessagesForLiveContext.push(m)
+            continue
+          }
+          if (processMember?.outstandingShutdownRequestId !== parsed.requestId) {
+            logForDebugging(
+              `[InboxPoller] Ignoring stale shutdown approval ${parsed.requestId} from ${parsed.from}`,
+            )
+            protocolMessagesForLiveContext.push(m)
+            continue
+          }
+          const messagePaneId = parsed.paneId?.trim()
+          const persistedPaneId =
+            processMember?.tmuxPaneId?.trim() || teammateEntry?.[1].tmuxPaneId?.trim()
+          const persistedBackendType = processMember.backendType as BackendType | undefined
+          if (
+            messagePaneId !== persistedPaneId ||
+            parsed.backendType !== persistedBackendType
+          ) {
+            logForDebugging(
+              `[InboxPoller] Ignoring shutdown approval with substituted runtime binding for ${parsed.from}`,
+            )
+            protocolMessagesForLiveContext.push(m)
+            continue
+          }
+          const runtimePaneId = persistedPaneId
+          const backendType = persistedBackendType
+          const isProcessRuntime =
+            backendType === 'process' ||
+            Boolean(messagePaneId?.startsWith('process:')) ||
+            Boolean(persistedPaneId?.startsWith('process:'))
 
           if (
-            parsed.paneId &&
-            (parsed.backendType || parsed.paneId.trim().startsWith('process:'))
+            backendType === 'in-process' ||
+            runtimePaneId === 'in-process'
           ) {
-            void (async () => {
-              try {
-                const backendType = parsed.backendType as BackendType | undefined
-                if (
-                  backendType === 'process' ||
-                  parsed.paneId!.trim().startsWith('process:')
-                ) {
-                  const teammateEntries = Object.entries(
-                    currentAppState.teamContext?.teammates ?? {},
-                  ) as Array<[string, { name?: string }]>
-                  const expectedAgentId = teammateEntries.find(
-                    ([, teammate]) => teammate.name === parsed.from,
-                  )?.[0] ??
-                    (teamName
-                      ? readTeamFile(teamName)?.members.find(
-                          member => member.name === parsed.from,
-                        )?.agentId
-                      : undefined)
-                  if (!expectedAgentId || !teamName) {
+            const inProcessTask = Object.values(currentAppState.tasks).find(task =>
+              isInProcessTeammateTask(task) &&
+              task.status === 'running' &&
+              task.identity.agentId === expectedAgentId,
+            )
+            const terminated = isInProcessTeammateTask(inProcessTask)
+              ? await killInProcessTeammate(inProcessTask.id, setAppState)
+              : false
+            if (!terminated) {
+              if (teamName && expectedAgentId) {
+                await persistTeammateTerminationRecovery(teamName, expectedAgentId, {
+                  teammateName: parsed.from,
+                  requestId: parsed.requestId,
+                  paneId: runtimePaneId,
+                  detail: 'In-process shutdown termination was not confirmed.',
+                })
+              }
+              protocolMessagesForLiveContext.push(m)
+              continue
+            }
+            continue
+          }
+
+          if (isProcessRuntime || (runtimePaneId && backendType)) {
+            let runtimeTerminationConfirmed = false
+            try {
+                if (isProcessRuntime) {
+                  const approvedIdentity =
+                    Number.isFinite(parsed.processStartedAtMs) &&
+                    parsed.processStartedAtMs !== undefined &&
+                    parsed.processOsIdentity?.trim() &&
+                    parsed.processOwnerToken?.trim() &&
+                    parsed.processRunId?.trim()
+                      ? {
+                          startedAtMs: parsed.processStartedAtMs,
+                          osIdentity: parsed.processOsIdentity?.trim(),
+                          ownerToken: parsed.processOwnerToken.trim(),
+                          runId: parsed.processRunId.trim(),
+                        }
+                      : null
+                  if (
+                    !expectedAgentId ||
+                    !teamName ||
+                    !processMember ||
+                    !runtimePaneId ||
+                    !approvedIdentity
+                  ) {
                     logForDebugging(
-                      `[InboxPoller] Skipping process kill for ${parsed.from}: expected agent id or team name unavailable`,
+                      `[InboxPoller] Skipping process kill for ${parsed.from}: exact shutdown identity unavailable`,
                     )
-                    return
+                  } else if (
+                    (messagePaneId !== undefined &&
+                      persistedPaneId !== undefined &&
+                      messagePaneId !== persistedPaneId) ||
+                    processMember.processStartedAtMs !== approvedIdentity.startedAtMs ||
+                    processMember.processOsIdentity !== approvedIdentity.osIdentity ||
+                    processMember.processOwnerToken !== approvedIdentity.ownerToken ||
+                    processMember.processRunId !== approvedIdentity.runId
+                  ) {
+                    logForDebugging(
+                      `[InboxPoller] Skipping process kill for ${parsed.from}: stale shutdown identity`,
+                    )
+                  } else {
+                    runtimeTerminationConfirmed = await killProcessBackendRuntime(runtimePaneId, {
+                      expectedAgentId,
+                      teamName,
+                      expectedStartedAtMs: approvedIdentity.startedAtMs,
+                      expectedOsIdentity: approvedIdentity.osIdentity,
+                      expectedOwnerToken: approvedIdentity.ownerToken,
+                      expectedRunId: approvedIdentity.runId,
+                    })
+                    logForDebugging(
+                      `[InboxPoller] Killed process runtime ${runtimePaneId} for ${parsed.from}: ${runtimeTerminationConfirmed}`,
+                    )
                   }
-                  const success = await killProcessBackendRuntime(parsed.paneId, {
-                    expectedAgentId,
-                    teamName,
-                  })
-                  logForDebugging(
-                    `[InboxPoller] Killed process runtime ${parsed.paneId} for ${parsed.from}: ${success}`,
-                  )
-                } else if (backendType && isPaneBackend(backendType)) {
+                } else if (runtimePaneId && backendType && isPaneBackend(backendType)) {
                   await ensureBackendsRegistered()
                   const insideTmux = await isInsideTmux()
                   const backend = getBackendByType(backendType)
-                  const success = await backend?.killPane(
-                    parsed.paneId!,
+                  runtimeTerminationConfirmed = Boolean(await backend?.killPane(
+                    runtimePaneId,
                     !insideTmux,
-                  )
+                  ))
                   logForDebugging(
-                    `[InboxPoller] Killed pane ${parsed.paneId} for ${parsed.from}: ${success}`,
+                    `[InboxPoller] Killed pane ${runtimePaneId} for ${parsed.from}: ${runtimeTerminationConfirmed}`,
                   )
                 } else {
                   logForDebugging(
@@ -2836,7 +2938,34 @@ export function useInboxPoller({
                   `[InboxPoller] Failed to kill runtime for ${parsed.from}: ${error}`,
                 )
               }
-            })()
+
+            if (!runtimeTerminationConfirmed) {
+              if (teamName && expectedAgentId) {
+                await persistTeammateTerminationRecovery(teamName, expectedAgentId, {
+                  teammateName: parsed.from,
+                  requestId: parsed.requestId,
+                  paneId: runtimePaneId,
+                  processStartedAtMs: processMember?.processStartedAtMs,
+                  processOsIdentity: processMember?.processOsIdentity,
+                  processOwnerToken: processMember?.processOwnerToken,
+                  processRunId: processMember?.processRunId,
+                  spawnClaimToken: processMember?.spawnClaimToken,
+                  spawnClaimRunId: processMember?.spawnClaimRunId,
+                  detail: 'Interactive shutdown termination was not confirmed.',
+                })
+              }
+              setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                teammateName: parsed.from,
+                requestId: parsed.requestId,
+                paneId: runtimePaneId,
+                processStartedAtMs: parsed.processStartedAtMs,
+                processOsIdentity: parsed.processOsIdentity,
+                processOwnerToken: parsed.processOwnerToken,
+                processRunId: parsed.processRunId,
+              }))
+              protocolMessagesForLiveContext.push(m)
+              continue
+            }
           }
 
           const teammateToRemove = parsed.from
@@ -2849,10 +2978,20 @@ export function useInboxPoller({
 
             if (teammateId) {
               if (teamName) {
-                await removeTeammateFromTeamFile(teamName, {
+                const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
                   agentId: teammateId,
-                  name: teammateToRemove,
+                  paneId: processMember?.tmuxPaneId,
+                  processStartedAtMs: processMember?.processStartedAtMs,
+                  processOsIdentity: processMember?.processOsIdentity,
+                  processOwnerToken: processMember?.processOwnerToken,
+                  processRunId: processMember?.processRunId,
+                  spawnClaimToken: processMember?.spawnClaimToken,
+                  spawnClaimRunId: processMember?.spawnClaimRunId,
                 })
+                if (!removed) {
+                  protocolMessagesForLiveContext.push(m)
+                  continue
+                }
               }
 
               const { notificationMessage } = teamName
@@ -2914,7 +3053,14 @@ export function useInboxPoller({
             }
           }
 
-          protocolMessagesForLiveContext.push(m)
+        }
+      }
+
+      // Successful shutdown approvals are side effects, not prompts. Failed or
+      // stale approvals remain in protocolMessagesForLiveContext for retry.
+      for (const message of shutdownApprovals) {
+        if (!protocolMessagesForLiveContext.includes(message)) {
+          protocolMessagesHandledInline.push(message)
         }
       }
 

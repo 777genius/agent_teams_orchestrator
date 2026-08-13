@@ -69,7 +69,7 @@ export function createHostedControlProductionPortFactory(
     return {
       ...services,
       close: async () => {
-        await Promise.all([messageDelivery.close(), execution.close()])
+        await Promise.all([messageDelivery.close(), execution.shutdown()])
       },
     }
   }

@@ -3,6 +3,7 @@ import type { AgentToolResult } from '../../tools/AgentTool/agentToolUtils.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Message } from '../../types/message.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
+import type { BackendType } from '../../utils/swarm/backends/types.js'
 import type { AgentProgress } from '../LocalAgentTask/LocalAgentTask.js'
 
 /**
@@ -43,6 +44,16 @@ export type InProcessTeammateTaskState = TaskStateBase & {
   abortController?: AbortController // Runtime only, not serialized to disk - kills WHOLE teammate
   currentWorkAbortController?: AbortController // Runtime only - aborts current turn without killing teammate
   unregisterCleanup?: () => void // Runtime only
+  /** Runtime-only termination gate for teammates hosted outside this process. */
+  terminateExternalRuntime?: () => Promise<boolean>
+  externalRuntime?: {
+    paneId: string
+    backendType: BackendType
+    processStartedAtMs?: number
+    processOsIdentity?: string
+    processOwnerToken?: string
+    processRunId?: string
+  }
 
   // Plan mode approval tracking (planModeRequired is in identity)
   awaitingPlanApproval: boolean

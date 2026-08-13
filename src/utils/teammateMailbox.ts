@@ -1394,13 +1394,17 @@ export type ShutdownRequestMessage = z.infer<
  * Shutdown approved message sent from teammate to leader via mailbox
  */
 export const ShutdownApprovedMessageSchema = lazySchema(() =>
-  z.object({
+  z.strictObject({
     type: z.literal('shutdown_approved'),
     requestId: z.string(),
     from: z.string(),
     timestamp: z.string(),
     paneId: z.string().optional(),
-    backendType: z.string().optional(),
+    backendType: z.enum(['tmux', 'iterm2', 'in-process', 'process']).optional(),
+    processStartedAtMs: z.number().optional(),
+    processOsIdentity: z.string().optional(),
+    processOwnerToken: z.string().optional(),
+    processRunId: z.string().optional(),
   }),
 )
 
@@ -1450,6 +1454,10 @@ export function createShutdownApprovedMessage(params: {
   from: string
   paneId?: string
   backendType?: BackendType
+  processStartedAtMs?: number
+  processOsIdentity?: string
+  processOwnerToken?: string
+  processRunId?: string
 }): ShutdownApprovedMessage {
   return {
     type: 'shutdown_approved',
@@ -1458,6 +1466,10 @@ export function createShutdownApprovedMessage(params: {
     timestamp: new Date().toISOString(),
     paneId: params.paneId,
     backendType: params.backendType,
+    processStartedAtMs: params.processStartedAtMs,
+    processOsIdentity: params.processOsIdentity,
+    processOwnerToken: params.processOwnerToken,
+    processRunId: params.processRunId,
   }
 }
 
@@ -1506,6 +1518,11 @@ export async function sendShutdownRequestToMailbox(
     from: senderName,
     reason,
   })
+
+  const { recordOutstandingShutdownRequest } = await import('./swarm/teamHelpers.js')
+  if (!(await recordOutstandingShutdownRequest(resolvedTeamName, targetName, requestId))) {
+    throw new Error(`Cannot record shutdown request for unregistered teammate "${targetName}"`)
+  }
 
   await writeToMailbox(
     targetName,

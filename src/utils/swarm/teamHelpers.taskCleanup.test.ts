@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { withTaskMutationCoordination } from '../taskMutationCoordinator.js'
@@ -15,6 +15,24 @@ afterEach(async () => {
 })
 
 describe('cleanupTeamDirectories task coordination', () => {
+  test('never deletes a directory owned by a colliding exact team name', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-cleanup-collision-'))
+    roots.push(root)
+    process.env.CLAUDE_CONFIG_DIR = root
+    const collidingDir = join(root, 'teams', 'a-b')
+    const configPath = join(collidingDir, 'config.json')
+    const taskPath = join(root, 'tasks', 'a-b', '1.json')
+    await mkdir(collidingDir, { recursive: true })
+    await mkdir(join(root, 'tasks', 'a-b'), { recursive: true })
+    await writeFile(configPath, JSON.stringify({ name: 'a-b', members: [] }))
+    await writeFile(taskPath, '{}')
+
+    await cleanupTeamDirectories('a/b')
+
+    expect(JSON.parse(await readFile(configPath, 'utf8')).name).toBe('a-b')
+    await expect(access(taskPath)).resolves.toBeNull()
+  })
+
   test('waits for the task-list mutation lane before recursively deleting it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-cleanup-test-'))
     roots.push(root)
@@ -24,7 +42,7 @@ describe('cleanupTeamDirectories task coordination', () => {
     await mkdir(join(root, 'tasks', 'test-team'), { recursive: true })
     await mkdir(join(root, 'teams', 'test-team'), { recursive: true })
     await writeFile(taskPath, '{}')
-    await writeFile(teamPath, '{"members":[]}')
+    await writeFile(teamPath, '{"name":"test-team","members":[]}')
 
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })

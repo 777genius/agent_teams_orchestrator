@@ -57,6 +57,7 @@ export class HostedControlRuntime {
   #startRequested = false
   #rootLease: HostedRootOwnerLease | null = null
   #descriptorGuard: HostedControlDescriptorGuard | null = null
+  #descriptorAuthorityLost = false
   #secret: Buffer | null = null
 
   constructor(
@@ -88,6 +89,8 @@ export class HostedControlRuntime {
     if (descriptorAdmission) {
       this.#secret = descriptorAdmission.secret
       this.#descriptorGuard = descriptorAdmission.guard
+      this.#descriptorAuthorityLost = false
+      this.#watchDescriptorAuthority(descriptorAdmission.guard)
     }
     let rootLease: HostedRootOwnerLease | null = null
     let server: HostedControlServer | null = null
@@ -140,6 +143,9 @@ export class HostedControlRuntime {
         wal,
         validateOwner,
       })
+      if (startup.cancelled || this.#descriptorAuthorityLost) {
+        throw new Error('Hosted control launcher authority is no longer current')
+      }
       this.#acceptingEffects = true
       if (!(await taskService.recover())) {
         throw new Error('Hosted control WAL recovery did not establish a safe state')
@@ -224,6 +230,20 @@ export class HostedControlRuntime {
     const result = this.#operationTail.then(operation, operation)
     this.#operationTail = result.catch(() => undefined)
     return result
+  }
+
+  #watchDescriptorAuthority(guard: HostedControlDescriptorGuard): void {
+    const lost = (): void => {
+      // Ignore close-induced resolution from an authority already detached by
+      // disposal. A live descriptor loss must synchronously fence admission;
+      // the queued stop then removes the socket and drains owned effects.
+      if (this.#descriptorGuard !== guard) return
+      this.#descriptorAuthorityLost = true
+      this.#acceptingEffects = false
+      if (this.#startup) this.#startup.cancelled = true
+      void this.stop().catch(() => undefined)
+    }
+    void guard.lost.then(lost, lost)
   }
 
   async #disposeDescriptorAuthority(): Promise<void> {

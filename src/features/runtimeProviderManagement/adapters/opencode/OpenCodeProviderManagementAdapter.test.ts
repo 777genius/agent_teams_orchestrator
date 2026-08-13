@@ -315,6 +315,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       hostManager: {
         ensureHost: async params => {
           ensureHostCalls.push(params ?? {})
+          if (params?.lease) retainedHostLeases.push({ hostKey: 'host-key', lease: params.lease })
           return host()
         },
         releaseHost: async hostKey => {
@@ -398,9 +399,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     ])
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
-    expect(retainedHostLeases).toHaveLength(3)
+    expect(retainedHostLeases).toHaveLength(2)
     expect(releasedHostLeases).toEqual(retainedHostLeases)
-    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(3)
+    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(2)
     expect(
       retainedHostLeases.every(
         ({ hostKey, lease }) =>
@@ -409,7 +410,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(3)
+    expect(reconcileCalls).toHaveLength(2)
     expect(
       reconcileCalls.every(
         options =>
@@ -430,7 +431,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probe: async () => inventory(),
       },
       hostManager: {
-        ensureHost: async () => host(),
+        ensureHost: async params => {
+          if (params?.lease) retained.push(params.lease)
+          return host()
+        },
         retainHostLease: async (_hostKey, lease) => {
           retained.push(lease)
         },

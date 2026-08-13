@@ -383,7 +383,14 @@ export class OpenCodeSessionBridge {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
+      lease: {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      },
     })
+    let promotedSessionId: string | null = null
 
     try {
       const client = this.clientFactory.create(host.baseUrl)
@@ -447,13 +454,35 @@ export class OpenCodeSessionBridge {
         memberName: params.identity.memberName,
         runId: params.runId ?? null,
         sessionId: session.id,
-      }).catch(() => undefined)
+      })
+      promotedSessionId = session.id
+      await this.hostManager.releaseHostLease?.(host.hostKey, {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      })
 
       return {
         retainedHostKey: host.hostKey,
         record,
       }
     } catch (error) {
+      if (promotedSessionId) {
+        await this.hostManager.releaseHostLease?.(host.hostKey, {
+          teamId: params.identity.teamId,
+          laneId: params.identity.laneId,
+          memberName: params.identity.memberName,
+          runId: params.runId ?? null,
+          sessionId: promotedSessionId,
+        }).catch(() => undefined)
+      }
+      await this.hostManager.releaseHostLease?.(host.hostKey, {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      }).catch(() => undefined)
       await this.hostManager.releaseHost(host.hostKey)
       throw error
     }
@@ -478,7 +507,7 @@ export class OpenCodeSessionBridge {
         memberName: record.memberName,
         runId: runId ?? null,
         sessionId: record.opencodeSessionId,
-      }).catch(() => undefined)
+      })
       return null
     }
 
@@ -492,25 +521,26 @@ export class OpenCodeSessionBridge {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
+      lease: {
+        teamId: record.teamId,
+        laneId: record.laneId,
+        memberName: record.memberName,
+        runId: runId ?? null,
+        sessionId: record.opencodeSessionId,
+      },
     })
-    await this.hostManager.retainHostLease?.(record.hostKey, {
-      teamId: record.teamId,
-      laneId: record.laneId,
-      memberName: record.memberName,
-      runId: runId ?? null,
-      sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
     this.retainedSessionHosts.set(sessionKey, record.hostKey)
     return host
   }
 
-  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey'>): Promise<void> {
+  async releaseSession(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'hostKey' | 'opencodeSessionId'>): Promise<void> {
     const sessionKey = this.buildSessionKey(record)
     const retainedHostKey = this.retainedSessionHosts.get(sessionKey)
     await this.hostManager.releaseHostLease?.(record.hostKey, {
       teamId: record.teamId,
       laneId: record.laneId,
       memberName: record.memberName,
+      sessionId: record.opencodeSessionId,
     }).catch(() => undefined)
     if (!retainedHostKey) {
       return
@@ -574,13 +604,13 @@ export class OpenCodeSessionBridge {
       projectPath: record.projectPath,
       hostKey: record.hostKey,
       preparedProfile: sessionProfile.profile,
+      lease: {
+        teamId: record.teamId,
+        laneId: record.laneId,
+        memberName: record.memberName,
+        sessionId: record.opencodeSessionId,
+      },
     })
-    await this.hostManager.retainHostLease?.(record.hostKey, {
-      teamId: record.teamId,
-      laneId: record.laneId,
-      memberName: record.memberName,
-      sessionId: record.opencodeSessionId,
-    }).catch(() => undefined)
 
     try {
       return await callback({
@@ -847,6 +877,8 @@ export class OpenCodeSessionBridge {
         teamId: created.record.teamId,
         laneId: created.record.laneId,
         memberName: created.record.memberName,
+        runId: created.record.runId,
+        sessionId: created.record.opencodeSessionId,
       }).catch(() => undefined)
       await this.hostManager.releaseHost(created.retainedHostKey).catch(() => undefined)
       throw error

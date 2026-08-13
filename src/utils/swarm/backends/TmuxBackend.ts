@@ -129,6 +129,7 @@ export class TmuxBackend implements PaneBackend {
   async createTeammatePaneInSwarmView(
     name: string,
     color: AgentColorName,
+    onCreated?: (paneId: PaneId) => Promise<void>,
   ): Promise<CreatePaneResult> {
     const releaseLock = await acquirePaneCreationLock()
 
@@ -136,10 +137,10 @@ export class TmuxBackend implements PaneBackend {
       const insideTmux = await this.isRunningInside()
 
       if (insideTmux) {
-        return await this.createTeammatePaneWithLeader(name, color)
+        return await this.createTeammatePaneWithLeader(name, color, onCreated)
       }
 
-      return await this.createTeammatePaneExternal(name, color)
+      return await this.createTeammatePaneExternal(name, color, onCreated)
     } finally {
       releaseLock()
     }
@@ -551,6 +552,7 @@ export class TmuxBackend implements PaneBackend {
   private async createTeammatePaneWithLeader(
     teammateName: string,
     teammateColor: AgentColorName,
+    onCreated?: (paneId: PaneId) => Promise<void>,
   ): Promise<CreatePaneResult> {
     const currentPaneId = await this.getCurrentPaneId()
     const windowTarget = await this.getCurrentWindowTarget()
@@ -615,6 +617,7 @@ export class TmuxBackend implements PaneBackend {
     }
 
     const paneId = splitResult.stdout.trim()
+    await onCreated?.(paneId)
     logForDebugging(
       `[TmuxBackend] Created teammate pane for ${teammateName}: ${paneId}`,
     )
@@ -635,6 +638,7 @@ export class TmuxBackend implements PaneBackend {
   private async createTeammatePaneExternal(
     teammateName: string,
     teammateColor: AgentColorName,
+    onCreated?: (paneId: PaneId) => Promise<void>,
   ): Promise<CreatePaneResult> {
     const { windowTarget, paneId: firstPaneId } =
       await this.createExternalSwarmSession()
@@ -690,6 +694,8 @@ export class TmuxBackend implements PaneBackend {
         `[TmuxBackend] Created teammate pane for ${teammateName}: ${paneId}`,
       )
     }
+
+    await onCreated?.(paneId)
 
     await this.setPaneBorderColor(paneId, teammateColor, true)
     await this.setPaneTitle(paneId, teammateName, teammateColor, true)

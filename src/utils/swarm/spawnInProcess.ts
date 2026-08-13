@@ -23,6 +23,7 @@ import type {
   InProcessTeammateTaskState,
   TeammateIdentity,
 } from '../../tasks/InProcessTeammateTask/types.js'
+import { isInProcessTeammateTask } from '../../tasks/InProcessTeammateTask/types.js'
 import { createAbortController } from '../abortController.js'
 import { formatAgentId } from '../agentId.js'
 import { registerCleanup } from '../cleanupRegistry.js'
@@ -40,7 +41,12 @@ import {
   registerAgent as registerPerfettoAgent,
   unregisterAgent as unregisterPerfettoAgent,
 } from '../telemetry/perfettoTracing.js'
-import { removeMemberByAgentId } from './teamHelpers.js'
+import {
+  readTeamFileAsync,
+  removeTeammateFromTeamFileIfIdentityMatches,
+  type TeamMember,
+} from './teamHelpers.js'
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from '../teammateTermination.js'
 
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
 
@@ -135,10 +141,14 @@ export async function spawnInProcessTeammate(
     `[spawnInProcessTeammate] Spawning ${agentId} (taskId: ${taskId})`,
   )
 
+  let partialAbortController: AbortController | undefined
+  let partialUnregisterCleanup: (() => void) | undefined
+  let perfettoRegistered = false
   try {
     // Create independent AbortController for this teammate
     // Teammates should not be aborted when the leader's query is interrupted
     const abortController = createAbortController()
+    partialAbortController = abortController
 
     // Get parent session ID for transcript correlation
     const parentSessionId = getSessionId()
@@ -172,6 +182,7 @@ export async function spawnInProcessTeammate(
     // Register agent in Perfetto trace for hierarchy visualization
     if (isPerfettoTracingEnabled()) {
       registerPerfettoAgent(agentId, name, parentSessionId)
+      perfettoRegistered = true
     }
 
     // Create task state
@@ -213,6 +224,7 @@ export async function spawnInProcessTeammate(
       abortController.abort()
       // Task state will be updated by the execution loop when it detects abort
     })
+    partialUnregisterCleanup = unregisterCleanup
     taskState.unregisterCleanup = unregisterCleanup
 
     // Register task in AppState
@@ -230,6 +242,14 @@ export async function spawnInProcessTeammate(
       teammateContext,
     }
   } catch (error) {
+    partialAbortController?.abort()
+    partialUnregisterCleanup?.()
+    if (perfettoRegistered) unregisterPerfettoAgent(agentId)
+    setAppState(prev => {
+      if (!prev.tasks[taskId]) return prev
+      const { [taskId]: _, ...remainingTasks } = prev.tasks
+      return { ...prev, tasks: remainingTasks }
+    })
     const errorMessage =
       error instanceof Error ? error.message : 'Unknown error during spawn'
     logForDebugging(
@@ -261,6 +281,63 @@ export async function killInProcessTeammate(
   let agentId: string | null = null
   let toolUseId: string | undefined
   let description: string | undefined
+  let rosterIdentity: TeamMember | undefined
+  let externalRuntime: InProcessTeammateTaskState['externalRuntime']
+  let terminateExternalRuntime:
+    | InProcessTeammateTaskState['terminateExternalRuntime']
+    | undefined
+
+  // Capture the runtime gate without mutating state. Out-of-process teammates
+  // must prove termination before their task, roster, or identity is removed.
+  setAppState((prev: AppState) => {
+    const task = prev.tasks[taskId]
+    if (task?.type === 'in_process_teammate' && task.status === 'running') {
+      const teammateTask = task as InProcessTeammateTaskState
+      externalRuntime = teammateTask.externalRuntime
+      terminateExternalRuntime = teammateTask.terminateExternalRuntime
+      agentId = teammateTask.identity.agentId
+      teamName = teammateTask.identity.teamName
+    }
+    return prev
+  })
+
+  if (externalRuntime) {
+    const terminated = terminateExternalRuntime
+      ? await terminateExternalRuntime().catch(() => false)
+      : false
+    if (!terminated) {
+      if (teamName && agentId) {
+        await persistTeammateTerminationRecovery(teamName, agentId, {
+          teammateName: agentId,
+          paneId: externalRuntime?.paneId,
+          processStartedAtMs: externalRuntime?.processStartedAtMs,
+          processOsIdentity: externalRuntime?.processOsIdentity,
+          processOwnerToken: externalRuntime?.processOwnerToken,
+          processRunId: externalRuntime?.processRunId,
+          detail: 'External runtime termination was not confirmed.',
+        }).catch(() => undefined)
+      }
+      setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+        teammateName:
+          agentId && prev.teamContext?.teammates?.[agentId]?.name
+            ? prev.teamContext.teammates[agentId]!.name
+            : agentId ?? 'teammate',
+        paneId: externalRuntime?.paneId,
+        processStartedAtMs: externalRuntime?.processStartedAtMs,
+        processOsIdentity: externalRuntime?.processOsIdentity,
+        processOwnerToken: externalRuntime?.processOwnerToken,
+        processRunId: externalRuntime?.processRunId,
+        detail: 'External runtime termination was not confirmed.',
+      }))
+      return false
+    }
+  }
+
+  if (teamName && agentId) {
+    rosterIdentity = (await readTeamFileAsync(teamName))?.members.find(
+      candidate => candidate.agentId === agentId,
+    )
+  }
 
   setAppState((prev: AppState) => {
     const task = prev.tasks[taskId]
@@ -294,7 +371,14 @@ export async function killInProcessTeammate(
 
     // Remove from teamContext.teammates using the agentId
     let updatedTeamContext = prev.teamContext
-    if (prev.teamContext && prev.teamContext.teammates && agentId) {
+    const replacementExists = agentId && Object.entries(prev.tasks).some(
+      ([candidateId, candidate]) =>
+        candidateId !== taskId &&
+        isInProcessTeammateTask(candidate) &&
+        candidate.status === 'running' &&
+        candidate.identity.agentId === agentId,
+    )
+    if (prev.teamContext && prev.teamContext.teammates && agentId && !replacementExists) {
       const { [agentId]: _, ...remainingTeammates } = prev.teamContext.teammates
       updatedTeamContext = {
         ...prev.teamContext,
@@ -321,6 +405,8 @@ export async function killInProcessTeammate(
           abortController: undefined,
           unregisterCleanup: undefined,
           currentWorkAbortController: undefined,
+          terminateExternalRuntime: undefined,
+          externalRuntime: undefined,
         },
       },
     }
@@ -331,7 +417,18 @@ export async function killInProcessTeammate(
   // task eviction, SDK termination, or registry cleanup for the killed teammate.
   if (teamName && agentId) {
     try {
-      await removeMemberByAgentId(teamName, agentId)
+      if (rosterIdentity) {
+        await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
+          agentId,
+          paneId: rosterIdentity.tmuxPaneId,
+          processStartedAtMs: rosterIdentity.processStartedAtMs,
+          processOsIdentity: rosterIdentity.processOsIdentity,
+          processOwnerToken: rosterIdentity.processOwnerToken,
+          processRunId: rosterIdentity.processRunId,
+          spawnClaimToken: rosterIdentity.spawnClaimToken,
+          spawnClaimRunId: rosterIdentity.spawnClaimRunId,
+        })
+      }
     } catch (error) {
       logForDebugging(
         `[killInProcessTeammate] Failed to remove ${agentId} from team file ${teamName}: ${error}`,

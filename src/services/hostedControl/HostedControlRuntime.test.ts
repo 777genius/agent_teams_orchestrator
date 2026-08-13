@@ -20,6 +20,77 @@ afterEach(async () => {
 })
 
 describe('HostedControlRuntime', () => {
+  test('descriptor loss fences admission and drains exact-run compensation before stop settles', async () => {
+    const root = await realpath(await mkdtemp('/tmp/hosted-control-descriptor-loss-'))
+    roots.push(root)
+    const claudeRoot = join(root, 'claude')
+    const runtimeRoot = join(root, 'runtime')
+    await mkdir(join(claudeRoot, 'teams', 'legacy'), { recursive: true, mode: 0o700 })
+    await mkdir(join(claudeRoot, 'tasks', 'legacy'), { recursive: true, mode: 0o700 })
+    await mkdir(runtimeRoot, { recursive: true, mode: 0o700 })
+    let loseAuthority!: () => void
+    const lost = new Promise<void>(resolve => { loseAuthority = resolve })
+    let releaseCompensation!: () => void
+    const compensationGate = new Promise<void>(resolve => { releaseCompensation = resolve })
+    let compensationStarted!: () => void
+    const enteredCompensation = new Promise<void>(resolve => { compensationStarted = resolve })
+    let portContext!: HostedControlRuntimePortFactoryContext
+    const actions: string[] = []
+    const admission: HostedControlBootstrapAdmission = {
+      config: {
+        socketPath: join(runtimeRoot, 'control.sock'), claudeRoot,
+        deploymentId: 'deployment_test', bootId: 'boot_test', restoreGeneration: 0,
+        workspaceId: 'workspace_test', teamId: `team_${'a'.repeat(32)}`, legacyKey: 'legacy',
+        mountGeneration: 1, declaredRootHash: 'b'.repeat(64),
+        ownerAuthority: 'owner-authority_runtime-test', ownerGeneration: 1,
+        ownerSessionId: `owner-session_${'c'.repeat(32)}`,
+      },
+      bootstrapBinding: {
+        deploymentId: 'deployment_test', bootId: 'boot_test', workspaceId: 'workspace_test',
+        mountGeneration: 1, bootstrapDigest: 'd'.repeat(64),
+        ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
+        proofKeyId: 'f'.repeat(64),
+      },
+      secret: Buffer.alloc(32, 0xa5),
+      guard: {
+        lost,
+        assertCurrent: async () => true,
+        close: async () => undefined,
+      },
+    }
+    const runtime = new HostedControlRuntime(admission, context => {
+      portContext = context
+      return {
+        lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
+        messages: { dispatch: async () => ({}) },
+        close: async () => {
+          actions.push('exact-run-stop')
+          compensationStarted()
+          await compensationGate
+          actions.push('drained')
+        },
+      }
+    })
+    runtimes.push(runtime)
+    await runtime.start()
+
+    loseAuthority()
+    await enteredCompensation
+    expect(runtime.server).toBeNull()
+    expect(await portContext.isCurrentAuthority({
+      actorId: 'after-descriptor-loss', ...portContext.authority,
+    })).toBe(false)
+    let stopped = false
+    const stopping = runtime.stop().then(() => { stopped = true })
+    await Bun.sleep(0)
+    expect(stopped).toBe(false)
+    expect(actions).toEqual(['exact-run-stop'])
+
+    releaseCompensation()
+    await stopping
+    expect(actions).toEqual(['exact-run-stop', 'drained'])
+  })
+
   test('retains descriptor authority through runtime lifetime and zeroes the admitted key on stop', async () => {
     const root = await realpath(await mkdtemp('/tmp/hosted-control-descriptor-'))
     roots.push(root)

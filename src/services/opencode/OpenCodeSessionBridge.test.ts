@@ -124,6 +124,7 @@ describe('OpenCodeSessionBridge', () => {
       hostManager: {
         ensureHost: async input => {
           expect(input?.preparedProfile).toBe(profile)
+          if (input?.lease) retainedLeases.push(input.lease)
           return host
         },
         releaseHost: async () => {},
@@ -694,6 +695,7 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        sessionId: 'session-1',
       },
     ])
     expect(releaseHostCalls).toBe(0)
@@ -706,7 +708,17 @@ describe('OpenCodeSessionBridge', () => {
       prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async input => {
-          expect(input).toEqual({ projectPath: '/tmp/project', hostKey: 'host-key', preparedProfile: profile })
+          expect(input).toEqual({
+            projectPath: '/tmp/project',
+            hostKey: 'host-key',
+            preparedProfile: profile,
+            lease: {
+              teamId: 'team-a',
+              laneId: 'primary',
+              memberName: 'alice',
+              sessionId: 'session-1',
+            },
+          })
           return host
         },
         releaseHost: async () => {
@@ -1012,7 +1024,10 @@ describe('OpenCodeSessionBridge', () => {
         markStale: async () => null,
       },
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async input => {
+          if (input?.lease) retainedLeases.push(input.lease)
+          return host
+        },
         releaseHost: async () => {
           releaseHostCalls += 1
         },
@@ -1071,6 +1086,12 @@ describe('OpenCodeSessionBridge', () => {
         laneId: 'primary',
         memberName: 'alice',
         runId: 'run-1',
+      },
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
         sessionId: 'session-new',
       },
     ])
@@ -1079,8 +1100,67 @@ describe('OpenCodeSessionBridge', () => {
         teamId: 'team-a',
         laneId: 'primary',
         memberName: 'alice',
+        runId: 'run-1',
+      },
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
+        sessionId: 'session-new',
       },
     ])
+    expect(releaseHostCalls).toBe(1)
+  })
+
+  test('rolls back the promoted session lease when provisional lease release fails', async () => {
+    const releasedLeases: Array<{ sessionId?: string }> = []
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'updated',
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releaseHostCalls += 1 },
+        retainHostLease: async () => {},
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeases.push(input)
+          if (!input.sessionId) throw new Error('provisional lease release failed')
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-promoted' }),
+          getSession: async () => ({ id: 'session-promoted' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      runId: 'run-1',
+    })).rejects.toThrow('provisional lease release failed')
+
+    expect(releasedLeases.some(lease => lease.sessionId === 'session-promoted')).toBe(true)
     expect(releaseHostCalls).toBe(1)
   })
 

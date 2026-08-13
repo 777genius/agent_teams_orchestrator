@@ -34,6 +34,8 @@ const plan: TeamLifecycleLaunchPlan = {
 class FakeLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const
   launched: Array<{ runId: string; teamId: string; toolApprovalMode: 'manual' | 'auto' }> = []
+  stoppedRunIds: string[] = []
+  stoppedApprovalModes: Array<'manual' | 'auto'> = []
   actions: string[] = []
   launchResult: TeamLifecycleLaneObservation = { phase: 'running', recoverable: false }
   inspectResult: TeamLifecycleLaneObservation | null = null
@@ -51,8 +53,10 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
     this.actions.push('cancel')
     return { phase: 'idle', recoverable: false }
   }
-  async stop(): Promise<TeamLifecycleLaneObservation> {
+  async stop(input: { runId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
     this.actions.push('stop')
+    this.stoppedRunIds.push(input.runId)
+    this.stoppedApprovalModes.push(input.toolApprovalMode)
     return { phase: 'idle', recoverable: false }
   }
   async recover(): Promise<TeamLifecycleLaneObservation> {
@@ -205,6 +209,50 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'running' })
   })
 
+  test('shutdown compensates the exact running run and cannot settle before stop confirms', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-running-close-'))
+    roots.push(root)
+    let releaseStop!: () => void
+    const stopGate = new Promise<void>(resolve => { releaseStop = resolve })
+    let enteredStop!: () => void
+    const stopEntered = new Promise<void>(resolve => { enteredStop = resolve })
+    class PendingStopLane extends FakeLane {
+      override async stop(input: { runId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
+        this.actions.push('stop')
+        this.stoppedRunIds.push(input.runId)
+        this.stoppedApprovalModes.push(input.toolApprovalMode)
+        enteredStop()
+        await stopGate
+        return { phase: 'idle', recoverable: false }
+      }
+    }
+    const lane = new PendingStopLane()
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idle = await execution.inspect(plan)
+    const launching = await execution.launch({
+      plan, commandId: 'command-launch-before-loss', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const running = await waitForPhase(execution, 'running')
+
+    let closed = false
+    const closing = execution.shutdown().then(() => { closed = true })
+    await stopEntered
+    expect(closed).toBe(false)
+    expect(lane.actions).toEqual(['launch', 'stop'])
+    expect(lane.stoppedRunIds).toEqual([running.runId])
+    expect(lane.stoppedApprovalModes).toEqual(['manual'])
+    expect(execution.supports(plan, 'launch')).toBe(false)
+
+    releaseStop()
+    await closing
+    await expect(execution.launch({
+      plan, commandId: 'command-after-loss', runId: null,
+      expectedProviderGeneration: launching.providerGeneration,
+    })).rejects.toThrow('closed')
+    await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
+  })
+
   test('keeps an in-process launch authoritative until its effect job commits', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-inflight-'))
     roots.push(root)
@@ -265,6 +313,46 @@ describe('DurableTeamLifecycleExecution', () => {
       recoverable: true,
     })
     expect(lane.actions).toEqual([])
+  })
+
+  test('compensates an exact launched run when authority is lost while launch awaits', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-post-effect-loss-'))
+    roots.push(root)
+    let releaseLaunch!: () => void
+    const launchGate = new Promise<void>(resolve => { releaseLaunch = resolve })
+    let authority = true
+    class BlockedLaunchLane extends FakeLane {
+      override async launch(input: { runId: string; planTeamId: string; toolApprovalMode: 'manual' | 'auto' }): Promise<TeamLifecycleLaneObservation> {
+        this.actions.push('launch')
+        this.launched.push({
+          runId: input.runId,
+          teamId: input.planTeamId,
+          toolApprovalMode: input.toolApprovalMode,
+        })
+        await launchGate
+        return { phase: 'running', recoverable: false }
+      }
+    }
+    const lane = new BlockedLaunchLane()
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idle = await execution.inspect(plan)
+    await execution.launch({
+      plan,
+      commandId: 'command-post-effect-loss',
+      runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+      effectGuard: () => authority,
+    })
+    await Bun.sleep(0)
+    authority = false
+    releaseLaunch()
+    await execution.close()
+
+    expect(lane.actions).toEqual(['launch', 'stop'])
+    await expect(execution.inspect(plan)).resolves.toMatchObject({
+      phase: 'failed',
+      recoverable: true,
+    })
   })
 
   test('fails closed for native plans until the sole native process owner is extracted', async () => {

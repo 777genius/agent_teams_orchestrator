@@ -64,6 +64,7 @@ import { settingsChangeDetector } from './utils/settings/changeDetector.js';
 import { skillChangeDetector } from './utils/skills/skillChangeDetector.js';
 import { jsonParse, writeFileSync_DEPRECATED } from './utils/slowOperations.js';
 import { computeInitialTeamContext } from './utils/swarm/reconnection.js';
+import { reconcilePersistedTeammateTerminations } from './utils/teammateTermination.js';
 import { initializeWarningHandler } from './utils/warningHandler.js';
 import { isWorktreeModeEnabled } from './utils/worktreeModeEnabled.js';
 
@@ -2654,6 +2655,9 @@ async function run(): Promise<CommanderCommand> {
         }
       });
     });
+    // Restart consumer for teardown failures persisted by a prior session.
+    // Identity-fenced retries fail closed when the OS cannot prove ownership.
+    void reconcilePersistedTeammateTerminations().catch(() => undefined);
 
     // Initialize versioned plugins system (triggers V1→V2 migration if
     // needed). Then run orphan GC, THEN warm the Grep/Glob exclusion cache.
@@ -3959,6 +3963,7 @@ async function run(): Promise<CommanderCommand> {
   program.addOption(new Option('--agent-color <color>', 'Teammate UI color').hideHelp());
   program.addOption(new Option('--plan-mode-required', 'Require plan mode before implementation').hideHelp());
   program.addOption(new Option('--parent-session-id <id>', 'Parent session ID for analytics correlation').hideHelp());
+  program.addOption(new Option('--process-owner-token <token>', 'Process ownership fencing token').hideHelp());
   program.addOption(new Option('--teammate-runtime <mode>', 'Teammate runtime mode').choices(['headless']).hideHelp());
   program.addOption(new Option('--teammate-mode <mode>', 'How to spawn teammates: "tmux", "in-process", or "auto"').choices(['auto', 'tmux', 'in-process']).hideHelp());
   program.addOption(new Option('--agent-type <type>', 'Custom agent type for this teammate').hideHelp());

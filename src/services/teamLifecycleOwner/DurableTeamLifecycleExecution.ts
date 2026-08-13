@@ -45,8 +45,10 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   readonly #adapters: ReadonlyMap<TeamLifecycleLaunchPlan['lanes'][number]['kind'], TeamLifecycleLaneEffectPort>
   readonly #jobs = new Map<string, Promise<void>>()
   readonly #ownedRuns = new Set<string>()
+  readonly #knownPlans = new Map<string, TeamLifecycleLaunchPlan>()
   #acceptingEffects = true
   #closePromise: Promise<void> | null = null
+  #shutdownPromise: Promise<void> | null = null
   #tail: Promise<void> = Promise.resolve()
 
   constructor(
@@ -70,6 +72,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   inspect(plan: TeamLifecycleLaunchPlan): Promise<HostedLifecycleProviderSnapshot> {
+    this.#rememberPlan(plan)
     return this.#serialized(async () => {
       let state = await this.#read(plan)
       if (state.phase === 'launching' && state.runId && !this.#jobs.has(state.runId)) {
@@ -93,6 +96,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   launch(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
+    this.#rememberPlan(input.plan)
     return this.#serialized(async () => {
       this.#assertAcceptingEffects()
       this.#assertSupported(input.plan, 'launch')
@@ -112,6 +116,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   stop(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
+    this.#rememberPlan(input.plan)
     return this.#serialized(async () => {
       this.#assertAcceptingEffects()
       this.#assertSupported(input.plan, 'stop')
@@ -132,6 +137,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     input: TeamLifecycleOwnerEffectInput,
     action: 'cancel' | 'recover',
   ): Promise<HostedLifecycleProviderSnapshot> {
+    this.#rememberPlan(input.plan)
     return this.#serialized(async () => {
       this.#assertAcceptingEffects()
       this.#assertSupported(input.plan, action)
@@ -168,6 +174,37 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     await this.#serialized(async () => {})
     while (this.#jobs.size > 0) {
       await Promise.all([...this.#jobs.values()])
+    }
+  }
+
+  /** Drains admitted work, then compensates every exact run owned by this process. */
+  shutdown(): Promise<void> {
+    this.#shutdownPromise ??= this.#shutdown()
+    return this.#shutdownPromise
+  }
+
+  async #shutdown(): Promise<void> {
+    await this.close()
+    // Runtime authority loss is a teardown boundary, not a new commanded
+    // effect. Stop only runs durably owned by this process, using their exact
+    // plan/run tuple, before allowing the hosted runtime to finish closing.
+    for (const plan of this.#knownPlans.values()) {
+      await this.#serialized(async () => {
+        const current = await this.#read(plan)
+        if (current.phase !== 'running' || !current.runId || !this.#ownedRuns.has(current.runId)) return
+        let stopped = false
+        try {
+          stopped = (await this.#applyLanesForTeardown(plan, current.runId))
+            .every(observation => observation.phase === 'idle')
+        } catch {}
+        await this.#write({
+          ...current,
+          phase: stopped ? 'idle' : 'failed',
+          runId: stopped ? null : current.runId,
+          recoverable: !stopped,
+        }, plan)
+        if (stopped) this.#ownedRuns.delete(current.runId)
+      })
     }
   }
 
@@ -265,9 +302,37 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       // invoking the provider adapter: a queued launch can outlive its request.
       if (!(await effectGuard())) throw new Error('Team lifecycle effect authority changed')
       const observation = await adapter[action](laneInput)
-      if (!(await effectGuard())) throw new Error('Team lifecycle effect authority changed')
+      if (!(await effectGuard())) {
+        // A successful launch is already an external effect. Losing authority
+        // while it awaited must synchronously compensate that exact run before
+        // the job can settle or close() can declare the owner drained.
+        if (action === 'launch') {
+          const stopped = await adapter.stop(laneInput)
+          if (stopped.phase !== 'idle') {
+            throw new Error('Team lifecycle effect authority changed and exact launch compensation was not confirmed')
+          }
+        }
+        throw new Error('Team lifecycle effect authority changed')
+      }
       return observation
     }))
+  }
+
+  #applyLanesForTeardown(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+  ): Promise<TeamLifecycleLaneObservation[]> {
+    return Promise.all(plan.lanes.map(lane => this.#adapter(lane.kind).stop({
+      planTeamId: plan.teamId,
+      workspaceRoot: plan.workspaceRoot,
+      toolApprovalMode: plan.toolApprovalMode,
+      lane,
+      runId,
+    })))
+  }
+
+  #rememberPlan(plan: TeamLifecycleLaunchPlan): void {
+    this.#knownPlans.set(planFingerprint(plan), plan)
   }
 
   #adapter(kind: TeamLifecycleLaunchPlan['lanes'][number]['kind']): TeamLifecycleLaneEffectPort {

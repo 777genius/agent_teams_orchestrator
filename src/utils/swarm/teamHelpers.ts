@@ -1,9 +1,10 @@
-import { readFileSync } from 'fs'
-import { mkdir, readFile, rm, stat } from 'fs/promises'
+import { constants, readFileSync } from 'fs'
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, rename, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { getSessionCreatedTeams } from '../../bootstrap/state.js'
-import { writeFileAtomic, writeFileAtomicSync, writeJsonFileAtomic } from '../atomicWrite.js'
+import { writeFileAtomicSync, writeJsonFileAtomic } from '../atomicWrite.js'
 import { logForDebugging } from '../debug.js'
 import { getTeamsDir } from '../envUtils.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
@@ -104,6 +105,30 @@ export type TeamFile = {
     worktreeDirtyWarning?: string
     sessionId?: string
     runtimePid?: number
+    processStartedAtMs?: number
+    processOsIdentity?: string
+    processOwnerToken?: string
+    processRunId?: string
+    spawnClaimToken?: string
+    spawnClaimRunId?: string
+    spawnClaimOwnerPid?: number
+    spawnClaimOwnerStartedAtMs?: number
+    spawnClaimRuntimeMayExist?: boolean
+    terminationRecovery?: {
+      requestId?: string
+      agentId: string
+      backendType?: BackendType
+      paneId?: string
+      processStartedAtMs?: number
+      processOsIdentity?: string
+      processOwnerToken?: string
+      processRunId?: string
+      spawnClaimToken?: string
+      spawnClaimRunId?: string
+      detail?: string
+      recordedAt: string
+    }
+    outstandingShutdownRequestId?: string
     subscriptions: string[]
     backendType?: BackendType
     isActive?: boolean // false when idle, undefined/true when active
@@ -111,7 +136,22 @@ export type TeamFile = {
   }>
 }
 
-type TeamMember = TeamFile['members'][number]
+export type TeamMember = TeamFile['members'][number]
+
+export type TeamMemberIdentity = Pick<
+  TeamMember,
+  | 'agentId'
+  | 'tmuxPaneId'
+  | 'processStartedAtMs'
+  | 'processOsIdentity'
+  | 'processOwnerToken'
+  | 'processRunId'
+  | 'spawnClaimToken'
+  | 'spawnClaimRunId'
+  | 'spawnClaimOwnerPid'
+  | 'spawnClaimOwnerStartedAtMs'
+  | 'spawnClaimRuntimeMayExist'
+>
 
 type TeamFileMutationResult = {
   teamFile: TeamFile
@@ -168,10 +208,152 @@ function getTeamFileLockDir(teamName: string): string {
   return join(getTeamDir(teamName), '.config.lock')
 }
 
-const TEAM_FILE_LOCK_TIMEOUT_MS = 10_000
 const TEAM_FILE_LOCK_STALE_MS = 30_000
-const TEAM_FILE_LOCK_RETRY_BASE_MS = 25
 const TEAM_FILE_LOCK_SLOW_WAIT_MS = 100
+const TEAM_FILE_LOCK_MIGRATION_WAIT_MS = 30_000
+
+type WindowsTeamLockGuard =
+  | { state: 'pending'; token: symbol }
+  | { state: 'owned'; handle: bigint; close: () => void }
+
+const windowsTeamLockGuards = new Map<string, WindowsTeamLockGuard>()
+type TeamLockPlatform = Extract<NodeJS.Platform, 'linux' | 'darwin' | 'win32'>
+let teamFileLockPlatformForTests: TeamLockPlatform | null = null
+
+export type WindowsTeamLockMutexApi = {
+  create(name: string): bigint
+  wait(handle: bigint, timeoutMs: number): number
+  release(handle: bigint): boolean
+  close(handle: bigint): void
+  dispose(): void
+}
+
+let windowsTeamLockMutexApiForTests: WindowsTeamLockMutexApi | null = null
+let windowsTeamLockBeforeMutexApiAwaitTestHook: (() => Promise<void>) | null = null
+
+async function createWindowsTeamLockMutexApi(): Promise<WindowsTeamLockMutexApi> {
+  if (windowsTeamLockMutexApiForTests) return windowsTeamLockMutexApiForTests
+  const { dlopen, FFIType, ptr } = await import('bun:ffi')
+  const kernel32 = dlopen('kernel32.dll', {
+    CreateMutexW: {
+      args: [FFIType.ptr, FFIType.u32, FFIType.ptr],
+      returns: FFIType.u64,
+    },
+    WaitForSingleObject: {
+      args: [FFIType.u64, FFIType.u32],
+      returns: FFIType.u32,
+    },
+    ReleaseMutex: { args: [FFIType.u64], returns: FFIType.u32 },
+    CloseHandle: { args: [FFIType.u64], returns: FFIType.u32 },
+  })
+  return {
+    create: name => {
+      const encoded = Buffer.from(`${name}\0`, 'utf16le')
+      return kernel32.symbols.CreateMutexW(null, 0, ptr(encoded))
+    },
+    wait: (handle, timeoutMs) => Number(kernel32.symbols.WaitForSingleObject(handle, timeoutMs)),
+    release: handle => kernel32.symbols.ReleaseMutex(handle) !== 0,
+    close: handle => { kernel32.symbols.CloseHandle(handle) },
+    dispose: () => { kernel32.close() },
+  }
+}
+
+async function acquireWindowsTeamLockGuard(lockPath: string): Promise<boolean> {
+  if (windowsTeamLockGuards.has(lockPath)) return false
+  // A Windows mutex is recursive for its owning thread. Publish an in-process
+  // reservation synchronously, before loading the FFI API, so a second async
+  // acquisition on this JS thread cannot enter the native wait recursively.
+  const pendingToken = Symbol(lockPath)
+  windowsTeamLockGuards.set(lockPath, { state: 'pending', token: pendingToken })
+  let api: WindowsTeamLockMutexApi | null = null
+  let handle = 0n
+  try {
+    await windowsTeamLockBeforeMutexApiAwaitTestHook?.()
+    api = await createWindowsTeamLockMutexApi()
+    handle = api.create(`Local\\ClaudeTeamLock-${Buffer.from(lockPath).toString('base64url')}`)
+    if (handle === 0n) {
+      api.dispose()
+      return false
+    }
+    const waitResult = api.wait(handle, 0)
+    // WAIT_OBJECT_0 and WAIT_ABANDONED both transfer mutex ownership.
+    if (waitResult !== 0 && waitResult !== 0x80) {
+      api.close(handle)
+      api.dispose()
+      return false
+    }
+    windowsTeamLockGuards.set(lockPath, {
+      state: 'owned',
+      handle,
+      close: () => {
+        try { api!.release(handle) } finally {
+          try { api!.close(handle) } finally { api!.dispose() }
+        }
+      },
+    })
+    return true
+  } catch {
+    if (api && handle !== 0n) {
+      try { api.close(handle) } catch {}
+    }
+    try { api?.dispose() } catch {}
+    return false
+  } finally {
+    const guard = windowsTeamLockGuards.get(lockPath)
+    if (guard?.state === 'pending' && guard.token === pendingToken) {
+      windowsTeamLockGuards.delete(lockPath)
+    }
+  }
+}
+
+function releaseWindowsTeamLockGuard(lockPath: string): void {
+  const guard = windowsTeamLockGuards.get(lockPath)
+  if (!guard || guard.state !== 'owned') return
+  windowsTeamLockGuards.delete(lockPath)
+  try { guard.close() } catch {}
+}
+
+type TeamFileLockExchangeTestEvent = {
+  phase: 'before-acquire-publish' | 'before-reclaim-exchange' | 'after-reclaim-restore' | 'before-release-exchange' | 'after-release-restore'
+  lockPath: string
+  stagingPath: string
+}
+
+let teamFileLockExchangeTestHook:
+  | ((event: TeamFileLockExchangeTestEvent) => Promise<void>)
+  | null = null
+
+export function __setTeamFileLockExchangeTestHook(
+  hook: ((event: TeamFileLockExchangeTestEvent) => Promise<void>) | null,
+): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setTeamFileLockExchangeTestHook is only available in tests')
+  }
+  teamFileLockExchangeTestHook = hook
+}
+
+export function __setTeamFileLockPlatformForTests(platform: TeamLockPlatform | null): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setTeamFileLockPlatformForTests is only available in tests')
+  }
+  teamFileLockPlatformForTests = platform
+}
+
+export function __setWindowsTeamLockMutexApiForTests(api: WindowsTeamLockMutexApi | null): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setWindowsTeamLockMutexApiForTests is only available in tests')
+  }
+  windowsTeamLockMutexApiForTests = api
+}
+
+export function __setWindowsTeamLockBeforeMutexApiAwaitTestHook(
+  hook: (() => Promise<void>) | null,
+): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('__setWindowsTeamLockBeforeMutexApiAwaitTestHook is only available in tests')
+  }
+  windowsTeamLockBeforeMutexApiAwaitTestHook = hook
+}
 
 const memberActiveSyncByKey = new Map<string, MemberActiveSyncEntry>()
 
@@ -203,53 +385,132 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+async function exchangeTeamLockPaths(left: string, right: string): Promise<boolean> {
+  const platform = teamFileLockPlatformForTests ?? process.platform
+  if (platform === 'win32') {
+    const guardOwner = windowsTeamLockGuards.get(left)
+    if (guardOwner?.state !== 'owned') return false
+    const temporary = `${left}.windows-exchange-${randomUUID()}`
+    try {
+      await rename(left, temporary)
+      try {
+        await rename(right, left)
+        await rename(temporary, right)
+        return true
+      } catch (error) {
+        await rename(temporary, left).catch(() => undefined)
+        throw error
+      }
+    } catch {
+      return false
+    }
+  }
+  if (platform !== 'linux' && platform !== 'darwin') return false
+  try {
+    const { dlopen, FFIType, ptr } = await import('bun:ffi')
+    const leftBuffer = Buffer.from(`${left}\0`)
+    const rightBuffer = Buffer.from(`${right}\0`)
+    if (platform === 'darwin') {
+      const libc = dlopen('/usr/lib/libSystem.B.dylib', {
+        renamex_np: {
+          args: [FFIType.ptr, FFIType.ptr, FFIType.u32],
+          returns: FFIType.i32,
+        },
+      })
+      try {
+        return libc.symbols.renamex_np(ptr(leftBuffer), ptr(rightBuffer), 0x2) === 0
+      } finally {
+        libc.close()
+      }
+    }
+    const libc = dlopen('libc.so.6', {
+      renameat2: {
+        args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+        returns: FFIType.i32,
+      },
+    })
+    try {
+      return libc.symbols.renameat2(-100, ptr(leftBuffer), -100, ptr(rightBuffer), 0x2) === 0
+    } finally {
+      libc.close()
+    }
+  } catch {
+    return false
+  }
+}
+
+async function publishTeamLockWithoutReplace(candidatePath: string, lockPath: string): Promise<boolean> {
+  const platform = teamFileLockPlatformForTests ?? process.platform
+  if (platform === 'win32') {
+    const guardOwner = windowsTeamLockGuards.get(lockPath)
+    if (guardOwner?.state !== 'owned') return false
+    try {
+      await rename(candidatePath, lockPath)
+      return true
+    } catch (error) {
+      if (['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '')) return false
+      throw error
+    }
+  }
+  if (platform !== 'linux' && platform !== 'darwin') return false
+  try {
+    const { dlopen, FFIType, ptr } = await import('bun:ffi')
+    const candidateBuffer = Buffer.from(`${candidatePath}\0`)
+    const lockBuffer = Buffer.from(`${lockPath}\0`)
+    if (platform === 'darwin') {
+      const libc = dlopen('/usr/lib/libSystem.B.dylib', {
+        renamex_np: {
+          args: [FFIType.ptr, FFIType.ptr, FFIType.u32],
+          returns: FFIType.i32,
+        },
+      })
+      try {
+        // RENAME_EXCL gives rename(2) atomic publication with O_EXCL semantics.
+        return libc.symbols.renamex_np(ptr(candidateBuffer), ptr(lockBuffer), 0x4) === 0
+      } finally {
+        libc.close()
+      }
+    }
+    const libc = dlopen('libc.so.6', {
+      renameat2: {
+        args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32],
+        returns: FFIType.i32,
+      },
+    })
+    try {
+      // RENAME_NOREPLACE atomically fails if even an empty legacy lock exists.
+      return libc.symbols.renameat2(-100, ptr(candidateBuffer), -100, ptr(lockBuffer), 0x1) === 0
+    } finally {
+      libc.close()
+    }
+  } catch {
+    // Fail closed on kernels/filesystems without an atomic no-replace primitive.
+    return false
+  }
+}
+
 async function writeTeamFileAtomicAsync(
   teamName: string,
   teamFile: TeamFile,
 ): Promise<void> {
-  const teamFilePath = getTeamFilePath(teamName)
-  await writeJsonFileAtomic(teamFilePath, teamFile, { indent: 2 })
-}
-
-async function reclaimStaleTeamFileLock(lockDir: string): Promise<boolean> {
-  try {
-    const [lockStat, metadataContent] = await Promise.all([
-      stat(lockDir),
-      readFile(join(lockDir, 'metadata.json'), 'utf-8').catch(() => null),
-    ])
-    const ageMs = Date.now() - lockStat.mtimeMs
-    if (ageMs < TEAM_FILE_LOCK_STALE_MS) {
-      return false
-    }
-
-    let lockPid: number | null = null
-    if (metadataContent) {
-      try {
-        const parsed = jsonParse(metadataContent) as { pid?: unknown }
-        if (typeof parsed.pid === 'number') {
-          lockPid = parsed.pid
-        }
-      } catch {
-        // Ignore malformed metadata; age-based stale detection still applies.
-      }
-    }
-
-    if (lockPid !== null && isProcessAlive(lockPid)) {
-      return false
-    }
-
-    await rm(lockDir, { recursive: true, force: true })
-    logForDebugging(`[TeammateTool] Reclaimed stale team file lock: ${lockDir}`)
-    return true
-  } catch (error) {
-    if (getErrnoCode(error) === 'ENOENT') {
-      return true
-    }
-    logForDebugging(
-      `[TeammateTool] Failed to reclaim stale team file lock ${lockDir}: ${errorMessage(error)}`,
-    )
-    return false
+  if (teamFile.name !== teamName) {
+    throw new Error(`Team file name mismatch: expected "${teamName}", got "${teamFile.name}"`)
   }
+  const teamFilePath = getTeamFilePath(teamName)
+  const existing = await readFile(teamFilePath, 'utf8').catch(error => {
+    if (getErrnoCode(error) === 'ENOENT') return null
+    throw error
+  })
+  if (existing !== null) {
+    let existingName: unknown
+    try { existingName = (jsonParse(existing) as { name?: unknown }).name } catch {}
+    if (existingName !== teamName) {
+      throw new Error(
+        `Team directory collision: "${teamName}" resolves to storage owned by "${String(existingName ?? 'unknown')}"`,
+      )
+    }
+  }
+  await writeJsonFileAtomic(teamFilePath, teamFile, { indent: 2 })
 }
 
 export async function withTeamFileLock<T>(
@@ -257,63 +518,208 @@ export async function withTeamFileLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const teamDir = getTeamDir(teamName)
-  const lockDir = getTeamFileLockDir(teamName)
+  const lockPath = getTeamFileLockDir(teamName)
   const start = Date.now()
-  let attempt = 0
-  let acquiredAt = 0
-
   await mkdir(teamDir, { recursive: true })
 
+  const generation = randomUUID()
+  const metadataPath = join(lockPath, 'metadata.json')
+  const platform = teamFileLockPlatformForTests ?? process.platform
+  if (platform === 'win32') {
+    while (!await acquireWindowsTeamLockGuard(lockPath)) {
+      if (Date.now() - start >= TEAM_FILE_LOCK_MIGRATION_WAIT_MS) {
+        throw new Error(`Timed out waiting for team file CAS guard for "${teamName}"`)
+      }
+      await sleep(25)
+    }
+  }
+  try {
   while (true) {
+    const candidatePath = `${lockPath}.acquire-${process.pid}-${randomUUID()}`
     try {
-      await mkdir(lockDir)
-      try {
-        await writeFileAtomic(
-          join(lockDir, 'metadata.json'),
-          jsonStringify({ pid: process.pid, createdAt: Date.now() }),
-        )
-      } catch (error) {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => {})
-        throw error
-      }
-      acquiredAt = Date.now()
-      break
+      await mkdir(candidatePath)
+      await writeJsonFileAtomic(join(candidatePath, 'metadata.json'), {
+        pid: process.pid,
+        generation,
+        acquiredAt: new Date().toISOString(),
+      })
+      // Publish a fully initialized generation in one namespace operation.
+      // Older binaries therefore never observe our lock without legacy
+      // metadata and cannot age-reclaim a half-published live owner.
+      await teamFileLockExchangeTestHook?.({
+        phase: 'before-acquire-publish',
+        lockPath,
+        stagingPath: candidatePath,
+      })
+      if (await publishTeamLockWithoutReplace(candidatePath, lockPath)) break
+      await rm(candidatePath, { recursive: true, force: true })
     } catch (error) {
-      if (getErrnoCode(error) !== 'EEXIST') {
-        throw error
+      await rm(candidatePath, { recursive: true, force: true }).catch(() => undefined)
+      if (!['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '')) throw error
+    }
+
+    // Keep the observed directory object alive through the namespace exchange.
+    // An open handle prevents its inode/file-id from being recycled for a
+    // successor while we validate the displaced path.
+    const observedHandle = await open(
+      lockPath,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+    ).catch(() => null)
+    try {
+    const observedStat = await observedHandle?.stat().catch(() => null) ?? null
+    const metadata = await readFile(metadataPath, 'utf-8').catch(() => null)
+    let ownerPid: number | null = null
+    let observedGeneration: string | null = null
+    try {
+      const parsed = metadata ? jsonParse(metadata) as { pid?: unknown; generation?: unknown } : null
+      ownerPid = typeof parsed?.pid === 'number' ? parsed.pid : null
+      observedGeneration = typeof parsed?.generation === 'string' ? parsed.generation : null
+    } catch {
+      // A malformed lock is reclaimed only after the stale grace below.
+    }
+
+    const lockAgeMs = await stat(lockPath)
+      .then(value => Date.now() - value.mtimeMs)
+      .catch(() => 0)
+    const reclaimable = ownerPid !== null
+      ? !isProcessAlive(ownerPid)
+      : lockAgeMs >= TEAM_FILE_LOCK_STALE_MS
+    if (reclaimable) {
+      const replacementPath = `${lockPath}.replacement-${process.pid}-${randomUUID()}`
+      try {
+        await mkdir(replacementPath)
+        await writeJsonFileAtomic(join(replacementPath, 'metadata.json'), {
+          pid: process.pid,
+          generation,
+          acquiredAt: new Date().toISOString(),
+        })
+        await teamFileLockExchangeTestHook?.({
+          phase: 'before-reclaim-exchange',
+          lockPath,
+          stagingPath: replacementPath,
+        })
+        if (!await exchangeTeamLockPaths(lockPath, replacementPath)) {
+          // Platforms without atomic exchange fail closed instead of risking
+          // deletion of a successor generation.
+          await rm(replacementPath, { recursive: true, force: true })
+        } else {
+          const displacedStat = await stat(replacementPath).catch(() => null)
+          const displacedMetadataText = await readFile(join(replacementPath, 'metadata.json'), 'utf8')
+            .catch(() => null)
+          const displacedMetadata = displacedMetadataText === null
+            ? null
+            : (() => {
+                try { return jsonParse(displacedMetadataText) as { generation?: unknown } }
+                catch { return null }
+              })()
+          const heldStat = await observedHandle?.stat().catch(() => null) ?? null
+          if (
+            observedStat && heldStat && displacedStat &&
+            observedStat.dev === heldStat.dev &&
+            observedStat.ino === heldStat.ino &&
+            heldStat.dev === displacedStat.dev &&
+            heldStat.ino === displacedStat.ino &&
+            displacedMetadataText === metadata &&
+            (observedGeneration === null
+              ? displacedMetadata?.generation === undefined
+              : displacedMetadata?.generation === observedGeneration)
+          ) {
+            await rm(replacementPath, { recursive: true, force: true })
+            break
+          }
+          if (!await exchangeTeamLockPaths(lockPath, replacementPath)) {
+            throw new Error(`Failed to restore changed team lock generation for "${teamName}"`)
+          }
+          await teamFileLockExchangeTestHook?.({
+            phase: 'after-reclaim-restore',
+            lockPath,
+            stagingPath: replacementPath,
+          })
+          await rm(replacementPath, { recursive: true, force: true })
+        }
+      } catch (error) {
+        await rm(replacementPath, { recursive: true, force: true }).catch(() => undefined)
+        if (!['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '')) {
+          throw error
+        }
       }
-      const reclaimed = await reclaimStaleTeamFileLock(lockDir)
-      if (reclaimed) {
-        continue
-      }
-      if (Date.now() - start >= TEAM_FILE_LOCK_TIMEOUT_MS) {
-        throw new Error(
-          `Timed out waiting for team file lock for "${teamName}" after ${TEAM_FILE_LOCK_TIMEOUT_MS}ms`,
-        )
-      }
-      attempt += 1
-      const jitter = Math.floor(Math.random() * 10)
-      await sleep(
-        Math.min(200, TEAM_FILE_LOCK_RETRY_BASE_MS * attempt) + jitter,
+    }
+
+    if (Date.now() - start >= TEAM_FILE_LOCK_MIGRATION_WAIT_MS) {
+      throw new Error(
+        `Timed out waiting for team file lock for "${teamName}"`,
       )
+    }
+    await sleep(25)
+    } finally {
+      await observedHandle?.close().catch(() => undefined)
     }
   }
 
-  const waitMs = acquiredAt > 0 ? acquiredAt - start : 0
+  const waitMs = Date.now() - start
   if (waitMs >= TEAM_FILE_LOCK_SLOW_WAIT_MS) {
     logForDebugging(
-      `[TeammateTool] Waited ${waitMs}ms for team file lock for "${teamName}" (${attempt} retries)`,
+      `[TeammateTool] Waited ${waitMs}ms for team file lock for "${teamName}"`,
     )
   }
 
   try {
     return await fn()
   } finally {
-    await rm(lockDir, { recursive: true, force: true }).catch(error => {
+    await (async () => {
+      const observedStat = await stat(lockPath).catch(() => null)
+      const metadata = await readFile(metadataPath, 'utf-8').catch(() => null)
+      const parsed = metadata ? jsonParse(metadata) as { generation?: unknown } : null
+      if (parsed?.generation !== generation) return
+      const releasePath = `${lockPath}.release-${process.pid}-${generation}`
+      await mkdir(releasePath)
+      // Keep a non-empty, immediately reclaimable tombstone at the public
+      // path. Removing an empty public directory here would race a successor
+      // rename and could delete the successor after it acquired the lock.
+      await writeJsonFileAtomic(join(releasePath, 'metadata.json'), {
+        pid: 0,
+        generation: `released:${generation}`,
+        acquiredAt: new Date().toISOString(),
+      })
+      await teamFileLockExchangeTestHook?.({
+        phase: 'before-release-exchange',
+        lockPath,
+        stagingPath: releasePath,
+      })
+      if (!await exchangeTeamLockPaths(lockPath, releasePath)) {
+        await rm(releasePath, { recursive: true, force: true })
+        return
+      }
+      const displacedStat = await stat(releasePath).catch(() => null)
+      const displacedMetadata = await readFile(join(releasePath, 'metadata.json'), 'utf8')
+        .then(value => jsonParse(value) as { generation?: unknown })
+        .catch(() => null)
+      if (
+        observedStat && displacedStat &&
+        observedStat.dev === displacedStat.dev &&
+        observedStat.ino === displacedStat.ino &&
+        displacedMetadata?.generation === generation
+      ) {
+        await rm(releasePath, { recursive: true, force: true })
+        return
+      }
+      if (!await exchangeTeamLockPaths(lockPath, releasePath)) {
+        throw new Error(`Failed to restore changed team lock generation for "${teamName}"`)
+      }
+      await teamFileLockExchangeTestHook?.({
+        phase: 'after-release-restore',
+        lockPath,
+        stagingPath: releasePath,
+      })
+      await rm(releasePath, { recursive: true, force: true })
+    })().catch(error => {
       logForDebugging(
         `[TeammateTool] Failed to release team file lock for ${teamName}: ${errorMessage(error)}`,
       )
     })
+  }
+  } finally {
+    if (platform === 'win32') releaseWindowsTeamLockGuard(lockPath)
   }
 }
 
@@ -380,6 +786,17 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.worktreeDirtyWarning === b.worktreeDirtyWarning &&
     a.sessionId === b.sessionId &&
     a.runtimePid === b.runtimePid &&
+    a.processStartedAtMs === b.processStartedAtMs &&
+    a.processOsIdentity === b.processOsIdentity &&
+    a.processOwnerToken === b.processOwnerToken &&
+    a.processRunId === b.processRunId &&
+    a.spawnClaimToken === b.spawnClaimToken &&
+    a.spawnClaimRunId === b.spawnClaimRunId &&
+    a.spawnClaimOwnerPid === b.spawnClaimOwnerPid &&
+    a.spawnClaimOwnerStartedAtMs === b.spawnClaimOwnerStartedAtMs &&
+    a.spawnClaimRuntimeMayExist === b.spawnClaimRuntimeMayExist &&
+    jsonStringify(a.terminationRecovery) === jsonStringify(b.terminationRecovery) &&
+    a.outstandingShutdownRequestId === b.outstandingShutdownRequestId &&
     a.backendType === b.backendType &&
     a.isActive === b.isActive &&
     a.mode === b.mode &&
@@ -395,7 +812,7 @@ export function upsertTeamMember(
   const existingIndex = teamFile.members.findIndex(
     existing =>
       existing.agentId === member.agentId ||
-      sanitizeAgentName(existing.name) === normalizedName,
+      normalizedMemberName(existing.name) === normalizedMemberName(normalizedName),
   )
 
   if (existingIndex === -1) {
@@ -435,7 +852,14 @@ export function upsertTeamMember(
 export function readTeamFile(teamName: string): TeamFile | null {
   try {
     const content = readFileSync(getTeamFilePath(teamName), 'utf-8')
-    return jsonParse(content) as TeamFile
+    const teamFile = jsonParse(content) as TeamFile
+    if (teamFile.name !== teamName) {
+      logForDebugging(
+        `[TeammateTool] Refusing colliding team directory for "${teamName}" owned by "${String(teamFile.name)}"`,
+      )
+      return null
+    }
+    return teamFile
   } catch (e) {
     if (getErrnoCode(e) === 'ENOENT') return null
     logForDebugging(
@@ -453,7 +877,14 @@ export async function readTeamFileAsync(
 ): Promise<TeamFile | null> {
   try {
     const content = await readFile(getTeamFilePath(teamName), 'utf-8')
-    return jsonParse(content) as TeamFile
+    const teamFile = jsonParse(content) as TeamFile
+    if (teamFile.name !== teamName) {
+      logForDebugging(
+        `[TeammateTool] Refusing colliding team directory for "${teamName}" owned by "${String(teamFile.name)}"`,
+      )
+      return null
+    }
+    return teamFile
   } catch (e) {
     if (getErrnoCode(e) === 'ENOENT') return null
     logForDebugging(
@@ -468,6 +899,24 @@ export async function readTeamFileAsync(
  */
 // sync IO: called from sync context
 function writeTeamFile(teamName: string, teamFile: TeamFile): void {
+  if (teamFile.name !== teamName) {
+    throw new Error(`Team file name mismatch: expected "${teamName}", got "${teamFile.name}"`)
+  }
+  const existing = (() => {
+    try { return readFileSync(getTeamFilePath(teamName), 'utf8') } catch (error) {
+      if (getErrnoCode(error) === 'ENOENT') return null
+      throw error
+    }
+  })()
+  if (existing !== null) {
+    let existingName: unknown
+    try { existingName = (jsonParse(existing) as { name?: unknown }).name } catch {}
+    if (existingName !== teamName) {
+      throw new Error(
+        `Team directory collision: "${teamName}" resolves to storage owned by "${String(existingName ?? 'unknown')}"`,
+      )
+    }
+  }
   writeFileAtomicSync(getTeamFilePath(teamName), jsonStringify(teamFile, null, 2))
 }
 
@@ -533,6 +982,234 @@ export async function removeTeammateFromTeamFile(
     `[TeammateTool] Removed teammate from team file: ${identifierStr}`,
   )
   return true
+}
+
+export async function removeTeammateFromTeamFileIfIdentityMatches(
+  teamName: string,
+  expected: {
+    agentId: string
+    paneId?: string
+    processStartedAtMs?: number
+    processOsIdentity?: string
+    processOwnerToken?: string
+    processRunId?: string
+    spawnClaimToken?: string
+    spawnClaimRunId?: string
+  },
+): Promise<boolean> {
+  let removed = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const member = teamFile.members.find(candidate => candidate.agentId === expected.agentId)
+    if (!member) return { changed: false, teamFile }
+    if (
+      member.tmuxPaneId !== expected.paneId ||
+      member.processStartedAtMs !== expected.processStartedAtMs ||
+      member.processOsIdentity !== expected.processOsIdentity ||
+      member.processOwnerToken !== expected.processOwnerToken ||
+      member.processRunId !== expected.processRunId ||
+      member.spawnClaimToken !== expected.spawnClaimToken ||
+      member.spawnClaimRunId !== expected.spawnClaimRunId
+    ) return { changed: false, teamFile }
+    removed = true
+    return { changed: true, teamFile: { ...teamFile, members: teamFile.members.filter(candidate => candidate !== member) } }
+  })
+  return removed
+}
+
+function memberIdentityMatches(
+  member: TeamMember,
+  expected: TeamMemberIdentity,
+): boolean {
+  return member.agentId === expected.agentId &&
+    member.tmuxPaneId === expected.tmuxPaneId &&
+    member.processStartedAtMs === expected.processStartedAtMs &&
+    member.processOsIdentity === expected.processOsIdentity &&
+    member.processOwnerToken === expected.processOwnerToken &&
+    member.processRunId === expected.processRunId &&
+    member.spawnClaimToken === expected.spawnClaimToken &&
+    member.spawnClaimRunId === expected.spawnClaimRunId &&
+    member.spawnClaimOwnerPid === expected.spawnClaimOwnerPid &&
+    member.spawnClaimOwnerStartedAtMs === expected.spawnClaimOwnerStartedAtMs &&
+    member.spawnClaimRuntimeMayExist === expected.spawnClaimRuntimeMayExist
+}
+
+function normalizedMemberName(name: string): string {
+  return sanitizeAgentName(name).trim().toLocaleLowerCase('en-US')
+}
+
+export async function claimTeamMemberForSpawn(
+  teamName: string,
+  reservation: TeamMember & { spawnClaimToken: string; spawnClaimRunId: string },
+  expectedExisting?: TeamMemberIdentity,
+): Promise<boolean> {
+  let claimed = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(member =>
+      member.agentId === reservation.agentId ||
+      normalizedMemberName(member.name) === normalizedMemberName(reservation.name),
+    )
+    if (current && (!expectedExisting || !memberIdentityMatches(current, expectedExisting))) {
+      return { changed: false, teamFile }
+    }
+    claimed = true
+    if (!current) return upsertTeamMember(teamFile, reservation)
+    // Respawn is a new runtime generation. Replace the old record instead of
+    // merging it so shutdown fences and recovery state cannot bleed into the
+    // new incarnation.
+    return {
+      changed: true,
+      teamFile: {
+        ...teamFile,
+        members: teamFile.members.map(member => member === current ? reservation : member),
+      },
+    }
+  })
+  return claimed
+}
+
+export async function publishClaimedTeamMember(
+  teamName: string,
+  claimToken: string,
+  member: TeamMember,
+): Promise<boolean> {
+  let published = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(candidate => candidate.agentId === member.agentId)
+    if (current?.spawnClaimToken !== claimToken) {
+      return { changed: false, teamFile }
+    }
+    published = true
+    return upsertTeamMember(teamFile, {
+      ...member,
+      spawnClaimToken: undefined,
+      spawnClaimRunId: undefined,
+    })
+  })
+  return published
+}
+
+export async function armTeamMemberSpawnClaim(
+  teamName: string,
+  agentId: string,
+  claimToken: string,
+): Promise<boolean> {
+  let armed = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(candidate => candidate.agentId === agentId)
+    if (
+      current?.spawnClaimToken !== claimToken ||
+      current.tmuxPaneId !== `spawn:pending:${claimToken}`
+    ) return { changed: false, teamFile }
+    armed = true
+    return upsertTeamMember(teamFile, { ...current, spawnClaimRuntimeMayExist: true })
+  })
+  return armed
+}
+
+export async function recordArmedTeamMemberSpawnRuntime(
+  teamName: string,
+  agentId: string,
+  claimToken: string,
+  runtime: { paneId: string; backendType: Extract<BackendType, 'tmux' | 'iterm2'> },
+): Promise<boolean> {
+  let recorded = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(candidate => candidate.agentId === agentId)
+    if (
+      current?.spawnClaimToken !== claimToken ||
+      current.spawnClaimRuntimeMayExist !== true ||
+      current.tmuxPaneId !== `spawn:pending:${claimToken}`
+    ) return { changed: false, teamFile }
+    recorded = true
+    return upsertTeamMember(teamFile, {
+      ...current,
+      tmuxPaneId: runtime.paneId,
+      backendType: runtime.backendType,
+    })
+  })
+  return recorded
+}
+
+export async function releaseTeamMemberSpawnClaim(
+  teamName: string,
+  agentId: string,
+  claimToken: string,
+): Promise<boolean> {
+  let removed = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(candidate => candidate.agentId === agentId)
+    if (
+      current?.spawnClaimToken !== claimToken ||
+      current.tmuxPaneId !== `spawn:pending:${claimToken}`
+    ) {
+      return { changed: false, teamFile }
+    }
+    removed = true
+    return {
+      changed: true,
+      teamFile: {
+        ...teamFile,
+        members: teamFile.members.filter(candidate => candidate !== current),
+      },
+    }
+  })
+  return removed
+}
+
+export async function finalizeTeamMemberSpawnClaim(
+  teamName: string,
+  agentId: string,
+  claimToken: string,
+  claimRunId?: string,
+): Promise<boolean> {
+  let finalized = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(candidate => candidate.agentId === agentId)
+    if (!current) {
+      return { changed: false, teamFile }
+    }
+    if (
+      current.spawnClaimToken === undefined &&
+      claimRunId !== undefined &&
+      current.spawnClaimRunId === claimRunId &&
+      current.tmuxPaneId !== `spawn:pending:${claimToken}`
+    ) {
+      finalized = true
+      return { changed: false, teamFile }
+    }
+    if (current.spawnClaimToken !== claimToken || current.tmuxPaneId === `spawn:pending:${claimToken}`) {
+      return { changed: false, teamFile }
+    }
+    finalized = true
+    return upsertTeamMember(teamFile, {
+      ...current,
+      spawnClaimToken: undefined,
+      spawnClaimOwnerPid: undefined,
+      spawnClaimOwnerStartedAtMs: undefined,
+      spawnClaimRuntimeMayExist: undefined,
+    })
+  })
+  return finalized
+}
+
+export async function recordOutstandingShutdownRequest(
+  teamName: string,
+  memberName: string,
+  requestId: string,
+): Promise<boolean> {
+  let recorded = false
+  await updateTeamFileAsync(teamName, teamFile => {
+    const current = teamFile.members.find(
+      member => normalizedMemberName(member.name) === normalizedMemberName(memberName),
+    )
+    if (!current) return { changed: false, teamFile }
+    recorded = true
+    return upsertTeamMember(teamFile, {
+      ...current,
+      outstandingShutdownRequestId: requestId,
+    })
+  })
+  return recorded
 }
 
 /**
@@ -961,26 +1638,38 @@ export async function cleanupSessionTeams(): Promise<void> {
   if (sessionCreatedTeams.size === 0) return
   const teams = Array.from(sessionCreatedTeams)
   logForDebugging(
-    `cleanupSessionTeams: removing ${teams.length} orphan team dir(s): ${teams.join(', ')}`,
+    `cleanupSessionTeams: checking ${teams.length} orphan team dir(s): ${teams.join(', ')}`,
   )
   // Kill panes first — on SIGINT the teammate processes are still running;
   // deleting directories alone would orphan them in open tmux/iTerm2 panes.
   // (TeamDeleteTool's path doesn't need this — by then teammates have
   // gracefully exited and useInboxPoller has already closed their panes.)
-  await Promise.allSettled(teams.map(name => killOrphanedTeammateRuntimes(name)))
-  await Promise.allSettled(teams.map(name => cleanupTeamDirectories(name)))
-  sessionCreatedTeams.clear()
+  await Promise.all(teams.map(async name => {
+    const terminationConfirmed = await killOrphanedTeammateRuntimes(name).catch(
+      () => false,
+    )
+    if (!terminationConfirmed) {
+      logForDebugging(
+        `cleanupSessionTeams: retaining ${name} recovery state because runtime termination was not confirmed`,
+      )
+      return
+    }
+    await cleanupTeamDirectories(name)
+    sessionCreatedTeams.delete(name)
+  }))
 }
 
 /**
- * Best-effort kill of all out-of-process teammate runtimes for a team.
+ * Attempt to stop all out-of-process teammate runtimes for a team. Returns
+ * false unless every runtime termination was confirmed, so callers retain the
+ * recovery files on any uncertain result.
  * Called from cleanupSessionTeams on ungraceful leader exit (SIGINT/SIGTERM).
  * Dynamic imports avoid adding registry/detection to this module's static
  * dep graph — this only runs at shutdown, so the import cost is irrelevant.
  */
-async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
+async function killOrphanedTeammateRuntimes(teamName: string): Promise<boolean> {
   const teamFile = readTeamFile(teamName)
-  if (!teamFile) return
+  if (!teamFile) return true
 
   const processMembers = teamFile.members.filter(
     m =>
@@ -998,8 +1687,20 @@ async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
       m.backendType &&
       isPaneBackend(m.backendType),
   )
+  const unknownRuntimeMembers = teamFile.members.filter(
+    m =>
+      m.name !== TEAM_LEAD_NAME &&
+      !processMembers.includes(m) &&
+      !paneMembers.includes(m),
+  )
+  if (unknownRuntimeMembers.length > 0) {
+    logForDebugging(
+      `cleanupSessionTeams: retaining unknown runtime member(s): ${unknownRuntimeMembers.map(member => member.name).join(', ')}`,
+    )
+    return false
+  }
 
-  await Promise.allSettled(
+  const processResults = await Promise.allSettled(
     processMembers.map(async m => {
       const paneId =
         m.tmuxPaneId?.trim() ||
@@ -1009,14 +1710,22 @@ async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
       const ok = await killProcessBackendRuntime(paneId, {
         expectedAgentId: m.agentId,
         teamName,
+        expectedStartedAtMs: m.processStartedAtMs,
+        expectedOwnerToken: m.processOwnerToken,
+        expectedRunId: m.processRunId,
+        expectedOsIdentity: m.processOsIdentity,
       })
       logForDebugging(
         `cleanupSessionTeams: killProcess ${m.name} (${m.tmuxPaneId}) => ${ok}`,
       )
+      return ok
     }),
   )
 
-  if (paneMembers.length === 0) return
+  const processTerminationConfirmed = processResults.every(
+    result => result.status === 'fulfilled' && result.value === true,
+  )
+  if (paneMembers.length === 0) return processTerminationConfirmed
 
   const [{ ensureBackendsRegistered, getBackendByType }, { isInsideTmux }] =
     await Promise.all([
@@ -1026,11 +1735,11 @@ async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
   await ensureBackendsRegistered()
   const useExternalSession = !(await isInsideTmux())
 
-  await Promise.allSettled(
+  const paneResults = await Promise.allSettled(
     paneMembers.map(async m => {
       // filter above guarantees these; narrow for the type system
       if (!m.tmuxPaneId || !m.backendType || !isPaneBackend(m.backendType)) {
-        return
+        return false
       }
       const ok = await getBackendByType(m.backendType).killPane(
         m.tmuxPaneId,
@@ -1039,7 +1748,11 @@ async function killOrphanedTeammateRuntimes(teamName: string): Promise<void> {
       logForDebugging(
         `cleanupSessionTeams: killPane ${m.name} (${m.backendType} ${m.tmuxPaneId}) → ${ok}`,
       )
+      return ok
     }),
+  )
+  return processTerminationConfirmed && paneResults.every(
+    result => result.status === 'fulfilled' && result.value === true,
   )
 }
 
@@ -1053,6 +1766,22 @@ export async function cleanupTeamDirectories(teamName: string): Promise<void> {
 
   // Read team file to get worktree metadata BEFORE deleting the team directory
   const teamFile = readTeamFile(teamName)
+  // A lossy legacy directory key can collide (for example a/b and a-b).
+  // Missing state is safe to remove, but an existing config owned by another
+  // exact name must never be killed or deleted through the requested alias.
+  if (!teamFile) {
+    const existingConfig = await readFile(getTeamFilePath(teamName), 'utf8').catch(error => {
+      if (getErrnoCode(error) === 'ENOENT') return null
+      throw error
+    })
+    if (existingConfig !== null) {
+      logForDebugging(
+        `[TeammateTool] Refusing cleanup for colliding team name "${teamName}"`,
+        { level: 'warn' },
+      )
+      return
+    }
+  }
   const worktreeMembers: TeamMember[] = []
   if (teamFile) {
     for (const member of teamFile.members) {

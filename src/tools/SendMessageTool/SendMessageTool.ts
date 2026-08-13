@@ -23,7 +23,7 @@ import { semanticBoolean } from '../../utils/semanticBoolean.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import type { BackendType } from '../../utils/swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
-import { readTeamFileAsync } from '../../utils/swarm/teamHelpers.js'
+import { readTeamFileAsync, recordOutstandingShutdownRequest } from '../../utils/swarm/teamHelpers.js'
 import {
   getAgentId,
   getAgentName,
@@ -280,6 +280,9 @@ async function handleShutdownRequest(
     from: senderName,
     reason,
   })
+  if (!(await recordOutstandingShutdownRequest(teamName, targetName, requestId))) {
+    throw new Error(`Cannot record shutdown request for unregistered teammate "${targetName}"`)
+  }
 
   await writeToMailbox(
     targetName,
@@ -316,6 +319,14 @@ async function handleShutdownApproval(
 
   let ownPaneId: string | undefined
   let ownBackendType: BackendType | undefined
+  let ownProcessIdentity:
+    | {
+        processStartedAtMs?: number
+        processOsIdentity?: string
+        processOwnerToken?: string
+        processRunId?: string
+      }
+    | undefined
   if (teamName) {
     const teamFile = await readTeamFileAsync(teamName)
     if (teamFile && agentId) {
@@ -323,6 +334,7 @@ async function handleShutdownApproval(
       if (selfMember) {
         ownPaneId = selfMember.tmuxPaneId
         ownBackendType = selfMember.backendType
+        ownProcessIdentity = selfMember
       }
     }
   }
@@ -332,6 +344,10 @@ async function handleShutdownApproval(
     from: agentName,
     paneId: ownPaneId,
     backendType: ownBackendType,
+    processStartedAtMs: ownProcessIdentity?.processStartedAtMs,
+    processOsIdentity: ownProcessIdentity?.processOsIdentity,
+    processOwnerToken: ownProcessIdentity?.processOwnerToken,
+    processRunId: ownProcessIdentity?.processRunId,
   })
 
   await writeToMailbox(

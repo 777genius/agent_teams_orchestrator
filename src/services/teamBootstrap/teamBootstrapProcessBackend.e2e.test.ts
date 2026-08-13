@@ -1885,7 +1885,7 @@ describe('supervised process teammate backend e2e', () => {
     expect(await pathExists(fixture.markerPath)).toBe(false)
   })
 
-  it('kills the full Windows process tree for a confirmed headless teammate', async () => {
+  it('refuses PID-based Windows teardown without an OS-stable handle', async () => {
     if (process.platform !== 'win32') {
       return
     }
@@ -1918,18 +1918,23 @@ describe('supervised process teammate backend e2e', () => {
     expect(isProcessAlive(runtimePid)).toBe(true)
     expect(isProcessAlive(childPid)).toBe(true)
 
+    const member = (await readTeamFileAsync(fixture.teamName))?.members.find(
+      candidate => candidate.agentId === `alice@${fixture.teamName}`,
+    )
+    expect(member?.processStartedAtMs).toBeNumber()
+    expect(member?.processOwnerToken).toBeTruthy()
+    expect(member?.processRunId).toBeTruthy()
+
     await expect(
       killProcessBackendRuntime(`process:${runtimePid}`, {
         expectedAgentId: `alice@${fixture.teamName}`,
         teamName: fixture.teamName,
+        expectedStartedAtMs: member?.processStartedAtMs,
+        expectedOwnerToken: member?.processOwnerToken,
+        expectedRunId: member?.processRunId,
       }),
-    ).resolves.toBe(true)
+    ).resolves.toBe(false)
 
-    await waitForCondition(() => !isProcessAlive(runtimePid), 7_500)
-    await waitForCondition(() => !isProcessAlive(childPid), 7_500)
-    runtimePids = runtimePids.filter(
-      pid => pid !== runtimePid && pid !== childPid,
-    )
   })
 })
 

@@ -340,6 +340,12 @@ export type AppState = DeepImmutable<{
         cwd: string
         worktreePath?: string
         spawnedAt: number
+        processStartedAtMs?: number
+        processOsIdentity?: string
+        processOwnerToken?: string
+        processRunId?: string
+        spawnClaimToken?: string
+        spawnClaimRunId?: string
       }
     }
   }
@@ -362,6 +368,19 @@ export type AppState = DeepImmutable<{
       messageKind?: 'agent_error' | 'member_work_sync_nudge' | 'task_comment_notification'
     }>
   }
+  teammateTerminationRecovery: Record<string, {
+    teammateName: string
+    requestId?: string
+    paneId?: string
+    processStartedAtMs?: number
+    processOsIdentity?: string
+    processOwnerToken?: string
+    processRunId?: string
+    spawnClaimToken?: string
+    spawnClaimRunId?: string
+    detail?: string
+    recordedAt: string
+  }>
   // Worker sandbox permission requests (leader side) - for network access approval
   workerSandboxPermissions: {
     queue: Array<{
@@ -545,6 +564,7 @@ export function getDefaultAppState(): AppState {
     inbox: {
       messages: [],
     },
+    teammateTerminationRecovery: {},
     workerSandboxPermissions: {
       queue: [],
       selectedIndex: 0,

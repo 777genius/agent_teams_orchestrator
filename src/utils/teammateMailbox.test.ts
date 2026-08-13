@@ -24,10 +24,12 @@ import {
   claimUnreadRegularMessages,
   classifyIdleNotification,
   createCompatibilityInboxMessageId,
+  createShutdownApprovedMessage,
   finalizeClaimedMessagesAsRead,
   isAgentErrorNotificationMessage,
   isLegacyPlanApprovalResponseMessage,
   isPlanApprovalResponse,
+  isShutdownApproved,
   isSilentRegularMailboxMessageForLiveContext,
   isLiveInboxMirrorMessageOwnedBySession,
   readAndClaimInteractiveMailboxSnapshot,
@@ -170,6 +172,40 @@ describe('teammateMailbox', () => {
       requestId: 'plan_approval-alice-1',
       approved: true,
     })
+  })
+
+  it('round-trips exact process identity while continuing to parse legacy shutdown approvals', () => {
+    const exact = createShutdownApprovedMessage({
+      requestId: 'shutdown-1',
+      from: 'alice',
+      paneId: 'process:42',
+      backendType: 'process',
+      processStartedAtMs: 123,
+      processOsIdentity: 'unix-pgid:42',
+      processOwnerToken: 'owner-token',
+      processRunId: 'run-a',
+    })
+    expect(isShutdownApproved(JSON.stringify(exact))).toMatchObject({
+      processStartedAtMs: 123,
+      processOsIdentity: 'unix-pgid:42',
+      processOwnerToken: 'owner-token',
+      processRunId: 'run-a',
+    })
+
+    expect(
+      isShutdownApproved(
+        JSON.stringify({
+          type: 'shutdown_approved',
+          requestId: 'shutdown-legacy',
+          from: 'alice',
+          timestamp: '2026-01-01T00:00:00.000Z',
+          paneId: 'process:42',
+          backendType: 'process',
+        }),
+      ),
+    ).toMatchObject({ requestId: 'shutdown-legacy', paneId: 'process:42' })
+    expect(isShutdownApproved(JSON.stringify({ ...exact, backendType: 'forged-backend' }))).toBeNull()
+    expect(isShutdownApproved(JSON.stringify({ ...exact, unexpected: true }))).toBeNull()
   })
 
   it('writes canonical message ids for new mailbox rows', async () => {

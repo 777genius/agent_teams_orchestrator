@@ -68,8 +68,10 @@ const OPEN_CODE_CURSOR_NATIVE_FAILURE_PROBE_MAX_ATTEMPTS = 2
 const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
-  hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
-    & Partial<Pick<typeof openCodeHostManager, 'retainHostLease' | 'releaseHostLease'>>
+  hostManager?: Pick<
+    typeof openCodeHostManager,
+    'ensureHost' | 'releaseHost' | 'releaseHostLease'
+  >
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (
@@ -1077,6 +1079,9 @@ export class OpenCodeExecutionProbe {
     const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
       promise: null,
     }
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      `model-probe-${params.selectedModel}`,
+    )
     let host: OpenCodeHostHandle
     try {
       host = await this.runPhase(params.runtimeDeadline, 'host_start', async context => {
@@ -1098,6 +1103,7 @@ export class OpenCodeExecutionProbe {
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
             ...(context ? { abortSignal: context.signal } : {}),
             hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
+            lease: preflightLease,
           })
           if (context?.signal.aborted) {
             await this.hostManager.releaseHost(ensuredHost.hostKey).catch(() => undefined)
@@ -1126,11 +1132,6 @@ export class OpenCodeExecutionProbe {
       }
       throw error
     }
-    const preflightLease = createOpenCodePreflightHostLeaseInput(
-      `model-probe-${params.selectedModel}`,
-    )
-    await this.hostManager.retainHostLease?.(host.hostKey, preflightLease).catch(() => undefined)
-
     try {
       const cachePaths = this.persistentCacheEnabled && !params.bypassCache
         ? getPersistentProbeCachePaths({
