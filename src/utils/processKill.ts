@@ -14,6 +14,27 @@ export type ExactProcessTreeSpawn = {
   osIdentity: string
 }
 
+/** Serialize argv using the quoting rules consumed by Win32 native runtimes. */
+function buildWindowsProcessArguments(args: string[]): string {
+  return args.map(argument => {
+    let quoted = '"'
+    let backslashes = 0
+    for (const character of argument) {
+      if (character === '\\') {
+        backslashes += 1
+        continue
+      }
+      if (character === '"') {
+        quoted += '\\'.repeat(backslashes * 2 + 1) + '"'
+      } else {
+        quoted += '\\'.repeat(backslashes) + character
+      }
+      backslashes = 0
+    }
+    return quoted + '\\'.repeat(backslashes * 2) + '"'
+  }).join(' ')
+}
+
 /**
  * Build a launch with the strongest ownership boundary available here.
  * Windows uses a named Job owned by a supervisor which joins itself before
@@ -31,7 +52,10 @@ export function buildExactProcessTreeSpawn(
     return { command, args, options: { ...options, detached: true }, osIdentity: 'unix-pgid:pending' }
   }
   const name = `agent-teams-${randomUUID()}`
-  const payload = Buffer.from(JSON.stringify({ command, args }), 'utf8').toString('base64')
+  const payload = Buffer.from(JSON.stringify({
+    command,
+    arguments: buildWindowsProcessArguments(args),
+  }), 'utf8').toString('base64')
   const script = [
     '$ErrorActionPreference="Stop"',
     'Add-Type -TypeDefinition @"\nusing System; using System.Runtime.InteropServices; public static class J { [StructLayout(LayoutKind.Sequential)] public struct B { public long PerProcessUserTimeLimit,PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize,MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass,SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct IO { public ulong ReadOperationCount,WriteOperationCount,OtherOperationCount,ReadTransferCount,WriteTransferCount,OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct E { public B BasicLimitInformation; public IO IoInfo; public UIntPtr ProcessMemoryLimit,JobMemoryLimit,PeakProcessMemoryUsed,PeakJobMemoryUsed; } [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr a,string n); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr h,int c,ref E i,uint l); [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr h,IntPtr p); [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess(); }\n"@',
@@ -42,7 +66,12 @@ export function buildExactProcessTreeSpawn(
     'if(-not [J]::SetInformationJobObject($h,9,[ref]$i,[Runtime.InteropServices.Marshal]::SizeOf($i))){exit 51}',
     'if(-not [J]::AssignProcessToJobObject($h,[J]::GetCurrentProcess())){exit 52}',
     `$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}'))|ConvertFrom-Json`,
-    '& $p.command @($p.args); exit $LASTEXITCODE',
+    '$s=New-Object Diagnostics.ProcessStartInfo',
+    // ProcessStartInfo bypasses the PowerShell invocation operator which
+    // rewrites embedded quotes before launching native Windows executables.
+    '$s.FileName=[string]$p.command; $s.Arguments=[string]$p.arguments; $s.UseShellExecute=$false',
+    '$c=[Diagnostics.Process]::Start($s); if($null -eq $c){exit 53}',
+    '$c.WaitForExit(); exit $c.ExitCode',
   ].join(';')
   return {
     command: 'powershell.exe',

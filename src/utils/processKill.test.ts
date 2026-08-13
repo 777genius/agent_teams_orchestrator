@@ -51,7 +51,30 @@ describe('processKill', () => {
     expect(first.args.join(' ')).toContain('IoInfo')
     expect(first.args.join(' ')).toContain('PeakJobMemoryUsed')
     expect(first.args.join(' ')).toContain('0x2000')
+    expect(first.args.join(' ')).toContain('Diagnostics.ProcessStartInfo')
+    expect(first.args.join(' ')).not.toContain('& $p.command')
     expect(getProcessTreeContainmentCapability(first.osIdentity, 'win32')).toBe('exact')
+  })
+
+  it('preserves Windows native argv through ProcessStartInfo command-line quoting', () => {
+    const args = [
+      '',
+      'plain',
+      'two words',
+      'require("node:fs")',
+      'embedded"quote',
+      'C:\\Program Files\\agent\\',
+    ]
+    const launch = buildExactProcessTreeSpawn('C:\\Program Files\\Bun\\bun.exe', args, {}, 'win32')
+    const script = launch.args.at(-1)!
+    const encodedPayload = script.match(/FromBase64String\('([^']+)'\)/)?.[1]
+    expect(encodedPayload).toBeString()
+    expect(JSON.parse(Buffer.from(encodedPayload!, 'base64').toString('utf8'))).toEqual({
+      command: 'C:\\Program Files\\Bun\\bun.exe',
+      arguments:
+        '"" "plain" "two words" "require(\\"node:fs\\")" ' +
+        '"embedded\\"quote" "C:\\Program Files\\agent\\\\"',
+    })
   })
 
   it('passes the durable OS tree identity through the stable signal boundary', async () => {
