@@ -121,9 +121,13 @@ export class HostedApprovalOwnerStore {
 
   reconcileDecision(
     request: HostedApprovalReconciliationRequest,
+    admission: HostedApprovalRuntimeAdmission,
   ): Promise<HostedApprovalReconciliationResult> {
     return this.wal.locked(async state => {
-      if (!state) return { status: 'unavailable' }
+      if (!state || state.admissionGeneration !== admission.admissionGeneration ||
+        state.admissionDigest !== admission.digest || !(await admission.isCurrent())) {
+        return { status: 'unavailable' }
+      }
       const matching = state.deliveries.filter(delivery =>
         delivery.providerDeliveryId === request.providerDeliveryId &&
         delivery.reconciliationRef === request.reconciliationRef,
@@ -134,6 +138,12 @@ export class HostedApprovalOwnerStore {
         .find(record => record.outboxId === delivery.outboxId && record.effectRef === delivery.effectRef)
       if (!ingress || ingress.authority.teamId !== request.partition.teamId ||
         ingress.authority.runId !== request.partition.runId) return { status: 'unavailable' }
+      const persistedRoute = state.routes.find(route => isDeepStrictEqual(route.authority, ingress.authority))
+      if (!persistedRoute || !admission.routes.some(route =>
+        route.authority.teamId === request.partition.teamId &&
+        route.authority.runId === request.partition.runId &&
+        isDeepStrictEqual(route, persistedRoute)
+      )) return { status: 'unavailable' }
       if (delivery.phase === 'started') return { status: 'operator_required' }
       if (delivery.phase === 'completed' && delivery.result === 'delivered') {
         return { status: 'delivered' }

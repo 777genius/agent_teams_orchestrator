@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 
 import { fingerprintHostedApprovalDelivery, type HostedApprovalDeliveryRequest } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
-import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
+import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission, HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 import type {
@@ -473,6 +473,52 @@ if (mode === 'replacement') {
       providerDeliveryId: request.providerDeliveryId,
       partition: request.partition,
     })).resolves.toEqual({ status: 'unavailable' })
+  })
+
+  test('fails reconciliation closed for stale WAL admission generation or digest', async () => {
+    for (const stale of ['generation', 'digest'] as const) {
+      const fx = await fixture({ deliver: () => 'ambiguous' })
+      const record = (await fx.service.claimIngress({
+        request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 },
+        maximumAggregateBytes: 1_000_000,
+      }))[0]!
+      const request = delivery(record)
+      await runDelivery(fx.service, request, record.authority)
+      await fx.store.wal.locked(async state => {
+        if (!state) throw new Error('missing owner state')
+        await fx.store.wal.publish(state, {
+          ...withoutRevision(state),
+          ...(stale === 'generation'
+            ? { admissionGeneration: 'approval-admission-generation_stale' }
+            : { admissionDigest: 'f'.repeat(64) }),
+        })
+      })
+      await expect(fx.service.reconcileDecision({
+        reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId,
+        partition: request.partition,
+      })).resolves.toEqual({ status: 'unavailable' })
+    }
+  })
+
+  test('fails reconciliation closed when the immutable route is revoked or rotated', async () => {
+    for (const routeChange of ['revoked', 'rotated'] as const) {
+      const fx = await fixture({ deliver: () => 'ambiguous' })
+      const record = (await fx.service.claimIngress({
+        request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 },
+        maximumAggregateBytes: 1_000_000,
+      }))[0]!
+      const request = delivery(record)
+      await runDelivery(fx.service, request, record.authority)
+      const routes = fx.admission.routes as HostedApprovalRuntimeRoute[]
+      if (routeChange === 'revoked') routes.splice(0, 1)
+      else routes[0] = { ...fx.route, memberName: 'rotated-worker' }
+      await expect(fx.service.reconcileDecision({
+        reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId,
+        partition: request.partition,
+      })).resolves.toEqual({ status: 'unavailable' })
+    }
   })
 
   test('maps identity-snapshot read failures to unavailable during external-writer revalidation', async () => {

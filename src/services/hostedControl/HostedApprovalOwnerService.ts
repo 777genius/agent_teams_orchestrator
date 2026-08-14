@@ -174,7 +174,7 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     if (request.partition.teamId !== this.options.admission.outerAuthority.teamId ||
       !(await this.#authorityCurrent())) return { status: 'unavailable' }
     try {
-      return await this.options.store.reconcileDecision(request)
+      return await this.options.store.reconcileDecision(request, this.options.admission)
     } catch {
       return { status: 'unavailable' }
     }
