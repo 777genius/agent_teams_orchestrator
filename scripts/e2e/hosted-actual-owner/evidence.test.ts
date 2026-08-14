@@ -75,6 +75,18 @@ describe('hosted actual-owner acceptance evidence', () => {
       .toThrow(/evidence_invalid/)
   })
 
+  test('rejects duplicate route/session provider evidence', () => {
+    const evidence = buildAcceptanceEvidence({ config, status: 'starting' })
+    const provider = {
+      routeId: 'route_1', sessionId: 'session_1', sessionRecordFingerprint: 'a'.repeat(64),
+      liveEffectFingerprint: 'b'.repeat(64), executable: evidence.artifact.executable,
+      executableDevice: '1', executableInode: '2', executableSha256: 'a'.repeat(64),
+      pid: 1, processStartIdentity: '1', processStartedAtMs: 1,
+    }
+    expect(() => validateAcceptanceEvidence({ ...evidence, providers: [provider, provider] }))
+      .toThrow(/acceptance_evidence_invalid/)
+  })
+
   test('matches the product owner-WAL discriminated union', () => {
     for (const event of ['poll_ingress', 'reconcile_operator_required']) {
       expect(validateProductTimelineEvent({

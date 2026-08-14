@@ -174,7 +174,7 @@ describe('hosted actual-owner real composition preflight', () => {
     ])).toThrow(/fd_map_invalid/)
   })
 
-  test('invokes the source launcher through a proc fd without using proc as its source root', async () => {
+  test('uses an immutable product-staged entry anchor to launch repository-local source', async () => {
     const root = await mkdtemp('/tmp/actual-owner-launcher-')
     roots.push(root)
     const bunInstall = join(root, 'bun-install')
@@ -182,10 +182,12 @@ describe('hosted actual-owner real composition preflight', () => {
     await writeFile(join(bunInstall, 'bin', 'bun'), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 })
     const launcherPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner/cli-source')
     const entryPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner/owner.ts')
+    const stagedEntryPath = join(root, 'owner.ts')
+    await copyFile(entryPath, stagedEntryPath); await chmod(stagedEntryPath, 0o500)
     const launcher = await open(launcherPath, 'r')
     try {
       const child = spawn('/proc/self/fd/3', [
-        '--hosted-actual-owner-acceptance-entry', entryPath,
+        '--hosted-actual-owner-acceptance-entry', stagedEntryPath,
         '--runtime-manifest', join(root, 'manifest.json'),
         '--launcher-lease-fd', '6', '--liveness-fd', '7', '--bootstrap-fd', '8',
       ], {

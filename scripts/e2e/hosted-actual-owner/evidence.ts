@@ -296,6 +296,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     })()
   const writerFence = owner.writerFence as Record<string, unknown> | null
   const ready = input.status === 'ready'
+  const providerKeys = Array.isArray(input.providers) ? (input.providers as Record<string, unknown>[])
+    .map(provider => `${String(provider.routeId)}\0${String(provider.sessionId)}`) : []
   if (typeof input.markerPath !== 'string' || !input.markerPath.startsWith('/') ||
     typeof artifact.executable !== 'string' || !artifact.executable.startsWith('/') ||
     typeof artifact.sha256 !== 'string' ||
@@ -338,6 +340,7 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     (input.status === 'failed' ? typeof input.failure !== 'string' || input.failure.length < 1 :
       input.failure !== null) ||
     !Array.isArray(input.providers) || (ready && input.providers.length === 0) ||
+    new Set(providerKeys).size !== providerKeys.length ||
     (input.providers as unknown[]).some(candidate => {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return true
       const provider = candidate as Record<string, unknown>

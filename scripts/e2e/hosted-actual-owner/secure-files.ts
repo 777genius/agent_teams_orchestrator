@@ -184,6 +184,29 @@ export async function assertControlCleanupAuthority(
   }
 }
 
+export async function assertSocketBinding(
+  socketPath: string,
+  trustedRoot: string | TrustedRoot,
+  expected: { device: string; inode: string; uid: number; gid: number; mode: number },
+): Promise<void> {
+  const parent = await openTrustedDirectory(dirname(socketPath), trustedRoot)
+  try {
+    const anchored = `${parent.anchoredPath}/${basename(socketPath)}`
+    const [descriptor, linked] = await Promise.all([
+      lstat(anchored, { bigint: true }), lstat(socketPath, { bigint: true }),
+    ])
+    if (!descriptor.isSocket() || !linked.isSocket() || linked.isSymbolicLink() ||
+      !same(descriptor, linked) || descriptor.dev.toString() !== expected.device ||
+      descriptor.ino.toString() !== expected.inode || descriptor.uid !== BigInt(expected.uid) ||
+      descriptor.gid !== BigInt(expected.gid) || Number(descriptor.mode & 0o777n) !== expected.mode) {
+      throw new Error('hosted_actual_owner_socket_binding_mismatch')
+    }
+  } finally {
+    if (parent.handle !== parent.rootHandle) await parent.handle.close()
+    await parent.rootHandle.close()
+  }
+}
+
 export async function atomicPrivateJson(
   path: string,
   trustedRoot: string | TrustedRoot,

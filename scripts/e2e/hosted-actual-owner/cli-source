@@ -21,11 +21,22 @@ if [[ "${1-}" != "--hosted-actual-owner-acceptance-entry" || "${3-}" != "--runti
   exit 64
 fi
 
-ENTRY="$2"
-EXPECTED_ENTRY="$SCRIPT_DIR/owner.ts"
-if [[ "$ENTRY" != "$EXPECTED_ENTRY" ]]; then
-  echo "Refusing an unpinned hosted actual-owner acceptance entry." >&2
+ENTRY_ANCHOR="$2"
+ENTRY_SOURCE="$SCRIPT_DIR/owner.ts"
+if [[ "$ENTRY_ANCHOR" != /* ]] || [[ ! -f "$ENTRY_ANCHOR" ]] ||
+  ! /usr/bin/cmp -s -- "$ENTRY_ANCHOR" "$ENTRY_SOURCE"; then
+  echo "Refusing an acceptance entry that is not the exact repository source." >&2
   exit 65
+fi
+
+# The product harness passes an immutable staged Git-blob anchor.  It proves the
+# cross-repository byte contract, but executing that isolated TypeScript file
+# would sever owner.ts from its relative source imports.  Execute the matching
+# repository-local source entry only after the byte comparison above.
+ENTRY_MODE="$(/usr/bin/stat -c '%a:%h:%u' -- "$ENTRY_ANCHOR")"
+if [[ "$ENTRY_MODE" != "500:1:$(/usr/bin/id -u)" ]]; then
+  echo "Refusing an unsafe hosted actual-owner acceptance entry anchor." >&2
+  exit 67
 fi
 
 if [[ "${NODE_ENV:-}" == "production" ]]; then
@@ -39,5 +50,5 @@ if [[ ! -x "$BUN_BIN" ]]; then
 fi
 
 cd "$REPOSITORY_ROOT"
-exec "$BUN_BIN" run "$ENTRY" --runtime-manifest "$4" \
+exec "$BUN_BIN" run "$ENTRY_SOURCE" --runtime-manifest "$4" \
   --launcher-lease-fd "$6" --liveness-fd "$8" --bootstrap-fd "${10}"

@@ -28,7 +28,7 @@ import { validateBootstrapAcceptance } from './bootstrap.js'
 import { buildAcceptanceEvidence, productTimelineLine, validateAcceptanceEvidence, validateProductTimelineEvent,
   type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
 import {
-  appendPrivateLine, assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
+  appendPrivateLine, assertAnchoredIdentity, assertControlCleanupAuthority, assertSocketBinding, atomicPrivateJson, readAnchoredFile,
   openTrustedDirectory, type SecureFileIdentity,
 } from './secure-files.js'
 
@@ -534,6 +534,9 @@ export class AcceptanceRuntime {
       }
     }
     const ownerSocket = await this.ownerSocket()
+    const ownerBinding = this.runtime?.server?.ownerBinding
+    if (!ownerBinding) throw new Error('hosted_actual_owner_binding_missing')
+    await assertSocketBinding(ownerSocket, sandboxAnchor(this.config.runtime), ownerBinding.socketIdentity)
     const controlSocketIdentity = await socketIdentity(this.config.controlSocket)
     const ownerSocketIdentity = await socketIdentity(ownerSocket)
     const stateSha256 = createHash('sha256').update(JSON.stringify(state)).digest('hex')
