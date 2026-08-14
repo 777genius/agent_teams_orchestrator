@@ -5,11 +5,11 @@ const config = {
   admissionFile: '/tmp/sandbox/team/hosted-approval-runtime-admission.v1.json',
   controlSocket: '/tmp/sandbox/control.sock', evidenceFile: '/tmp/sandbox/evidence.json',
   markerPath: '/tmp/sandbox/marker',
-  openCodeExecutable: '/opt/opencode', openCodeSha256: 'a'.repeat(64),
+  openCodeExecutable: '/opt/opencode', openCodeSha256: 'a'.repeat(64), ownerToken: 'test-token',
   productContract: {
     bytes: Buffer.from('{}\n'), byteCount: 3, sha256: 'c'.repeat(64),
     identity: { device: '1', inode: '7', size: '3', mtimeNs: '4', ctimeNs: '5',
-      mode: '320', nlink: '1', uid: '1000' },
+      mode: '256', nlink: '1', uid: '1000' },
     eventFields: [], correlationFields: [], captureArtifactPathFields: [],
   },
   productRoot: '/product',
@@ -27,9 +27,12 @@ const config = {
     capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
     ownerBinding: { ownerUid: 1000, ownerSessionId: `session_${'b'.repeat(48)}`,
       ownerTokenSha256: 'f'.repeat(64) },
-    socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+    socketIdentity: {
+      driverSocket: { endpoint: '127.0.0.1:49152', device: '1', inode: '10' },
+      productSocket: { endpoint: '127.0.0.1:49153', device: '1', inode: '11' },
+    },
     contract: { path: '/tmp/sandbox/contract.json', sha256: 'c'.repeat(64), byteCount: 3,
-      device: '1', inode: '7', mode: '320', sourceCommit: 'e'.repeat(40),
+      device: '1', inode: '7', mode: '256', sourceCommit: 'e'.repeat(40),
       repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
     browser: { ownerStorageStatePath: '/tmp/sandbox/owner.json',
       nonOwnerStorageStatePath: '/tmp/sandbox/non-owner.json', tracePath: '/tmp/sandbox/trace.zip',
@@ -73,7 +76,8 @@ describe('hosted actual-owner acceptance evidence', () => {
       walSha256: '6'.repeat(64), stateSha256: '7'.repeat(64),
       timeline: { identity, sha256: 'b'.repeat(64), bytes: 42, eventCount: 1, lastSequence: 0 },
       providers: [{
-        routeId: 'route_test', sessionId: 'session_test',
+        routeId: 'route_test', sessionId: 'session_test', routeRunId: `run_${'1'.repeat(32)}`,
+        generation: 'generation_test',
         sessionRecordFingerprint: '8'.repeat(64), liveEffectFingerprint: '9'.repeat(64),
         executable: '/opt/opencode', executableDevice: '1', executableInode: '9',
         executableSha256: 'a'.repeat(64), pid: 42, processStartIdentity: '100',
@@ -97,7 +101,8 @@ describe('hosted actual-owner acceptance evidence', () => {
   test('rejects duplicate route/session provider evidence', () => {
     const evidence = buildAcceptanceEvidence({ config, status: 'starting' })
     const provider = {
-      routeId: 'route_1', sessionId: 'session_1', sessionRecordFingerprint: 'a'.repeat(64),
+      routeId: 'route_1', sessionId: 'session_1', routeRunId: `run_${'1'.repeat(32)}`,
+      generation: 'generation_test', sessionRecordFingerprint: 'a'.repeat(64),
       liveEffectFingerprint: 'b'.repeat(64), executable: evidence.artifact.executable,
       executableDevice: '1', executableInode: '2', executableSha256: 'a'.repeat(64),
       pid: 1, processStartIdentity: '1', processStartedAtMs: 1,
@@ -107,22 +112,29 @@ describe('hosted actual-owner acceptance evidence', () => {
   })
 
   test('matches the product owner-WAL discriminated union', () => {
+    const maximumGeneration = `generation_${'a'.repeat(246)}`
+    expect(validateProductTimelineEvent({
+      schemaVersion: 1, runId: `run_${'b'.repeat(32)}`, sequence: 0,
+      at: '2026-08-14T00:00:00.000Z', event: 'poll_ingress',
+      routeId: 'route_1', sessionId: 'session_1', approvalId: null, requestId: null,
+      effectId: null, generation: maximumGeneration,
+    }).generation).toBe(maximumGeneration)
     for (const event of ['poll_ingress', 'reconcile_operator_required']) {
       expect(validateProductTimelineEvent({
-        schemaVersion: 1, runId: 'b'.repeat(48), sequence: 1,
+        schemaVersion: 1, runId: `run_${'b'.repeat(32)}`, sequence: 1,
         at: '2026-08-14T00:00:00.000Z', event,
         routeId: 'route_1', sessionId: 'session_1', approvalId: null, requestId: null, effectId: null,
         generation: 'generation_test',
       }).event).toBe(event)
     }
     expect(() => validateProductTimelineEvent({
-      schemaVersion: 1, runId: 'b'.repeat(48), sequence: 1,
+      schemaVersion: 1, runId: `run_${'b'.repeat(32)}`, sequence: 1,
       at: '2026-08-14T00:00:00.000Z', event: 'ingress_durable', approvalId: null,
       routeId: 'route_1', sessionId: 'session_1', requestId: null, effectId: null,
       generation: 'generation_test',
     })).toThrow(/timeline_event_invalid/)
     expect(() => validateProductTimelineEvent({
-      schemaVersion: 1, runId: 'b'.repeat(48), sequence: 1,
+      schemaVersion: 1, runId: `run_${'b'.repeat(32)}`, sequence: 1,
       at: '2026-08-14T00:00:00.000Z', event: 'poll_ingress',
       routeId: 'route_1', sessionId: 'session_1', requestId: null, effectId: null,
       approvalId: `approval_${'a'.repeat(32)}`, generation: 'generation_test',
@@ -135,7 +147,7 @@ describe('hosted actual-owner acceptance evidence', () => {
         schemaVersion: 1, at: '2026-08-14T00:00:00.000Z',
         approvalId: `approval_${'a'.repeat(32)}`, event, generation: 'generation_test',
         routeId: 'route_1', sessionId: 'session_1', requestId: 'request_1', effectId: null,
-        runId: 'b'.repeat(48), sequence: 0,
+        runId: `run_${'b'.repeat(32)}`, sequence: 0,
       }).event).toBe(event)
     }
   })

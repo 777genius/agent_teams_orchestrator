@@ -45,13 +45,28 @@ if [[ "${NODE_ENV:-}" == "production" ]]; then
   exit 66
 fi
 
-BUN_BIN="${BUN_INSTALL:-$HOME/.bun}/bin/bun"
-if [[ ! -x "$BUN_BIN" ]]; then
-  BUN_BIN="$(command -v bun)"
+BUN_BIN="${HOSTED_ACTUAL_OWNER_E2E_BUN_EXECUTABLE-}"
+BUN_SHA256="${HOSTED_ACTUAL_OWNER_E2E_BUN_SHA256-}"
+if [[ "$BUN_BIN" != /* ]] || [[ ! "$BUN_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  [[ ! -f "$BUN_BIN" ]] || [[ ! -x "$BUN_BIN" ]]; then
+  echo "A product-supplied absolute Bun executable and digest are required." >&2
+  exit 68
+fi
+exec 9<"$BUN_BIN"
+BUN_MODE="$(/usr/bin/stat -Lc '%F:%h:%u:%a:%d:%i:%s:%y:%z' -- /proc/self/fd/9)"
+BUN_PATH_MODE="$(/usr/bin/stat -Lc '%F:%h:%u:%a:%d:%i:%s:%y:%z' -- "$BUN_BIN")"
+BUN_DIGEST="$(/usr/bin/sha256sum /proc/self/fd/9)"
+BUN_AFTER="$(/usr/bin/stat -Lc '%F:%h:%u:%a:%d:%i:%s:%y:%z' -- /proc/self/fd/9)"
+BUN_PATH_AFTER="$(/usr/bin/stat -Lc '%F:%h:%u:%a:%d:%i:%s:%y:%z' -- "$BUN_BIN")"
+if [[ "$BUN_MODE" != "$BUN_PATH_MODE" ]] || [[ "$BUN_MODE" != "$BUN_AFTER" ]] ||
+  [[ "$BUN_MODE" != "$BUN_PATH_AFTER" ]] || [[ "$BUN_MODE" != "regular file:1:$(/usr/bin/id -u):500:"* ]] ||
+  [[ "$BUN_DIGEST" != "$BUN_SHA256  /proc/self/fd/9" ]]; then
+  echo "The product-supplied Bun executable identity is unsafe or rotated." >&2
+  exit 69
 fi
 
 cd "$REPOSITORY_ROOT"
-exec "$BUN_BIN" run "$ENTRY_SOURCE" --runtime-manifest "$4" \
+exec /proc/self/fd/9 run "$ENTRY_SOURCE" --runtime-manifest "$4" \
   --actual-owner-contract "$6" --actual-owner-contract-sha256 "$8" \
   --actual-owner-contract-byte-count "${10}" --launcher-lease-fd "${12}" \
   --liveness-fd "${14}" --bootstrap-fd "${16}"

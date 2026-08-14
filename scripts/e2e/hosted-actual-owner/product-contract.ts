@@ -127,11 +127,13 @@ export async function loadProductContract(input: {
     throw new Error('hosted_actual_owner_contract_cli_binding_invalid')
   }
   const file = await readAnchoredFile(declared.path, input.anchor, {
-    minimumBytes: 2, maximumBytes: 1024 * 1024, mode: Number(declared.mode),
+    minimumBytes: 2, maximumBytes: 1024 * 1024, mode: 0o400,
   })
   if (file.identity.device !== declared.device || file.identity.inode !== declared.inode ||
     file.identity.size !== String(declared.byteCount) || file.identity.mode !== declared.mode ||
-    file.identity.nlink !== '1') throw new Error('hosted_actual_owner_contract_identity_mismatch')
+    file.identity.nlink !== '1' || declared.mode !== String(0o400)) {
+    throw new Error('hosted_actual_owner_contract_identity_mismatch')
+  }
   const parsed = parseProductContractBundle(file.bytes)
   if (parsed.sha256 !== declared.sha256 || parsed.byteCount !== declared.byteCount) {
     throw new Error('hosted_actual_owner_contract_digest_mismatch')
@@ -154,7 +156,7 @@ export async function assertProductContractCurrent(input: {
 }): Promise<void> {
   const bytes = await assertAnchoredIdentity(input.runtime.contract.path, input.anchor,
     input.contract.identity, { minimumBytes: 2, maximumBytes: 1024 * 1024,
-      mode: Number(input.runtime.contract.mode) })
+      mode: 0o400 })
   const parsed = parseProductContractBundle(bytes)
   if (parsed.sha256 !== input.contract.sha256 || parsed.byteCount !== input.contract.byteCount) {
     throw new Error('hosted_actual_owner_contract_rotated')

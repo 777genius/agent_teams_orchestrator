@@ -25,9 +25,12 @@ function manifest() {
     capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
     ownerBinding: { ownerUid: 1000, ownerSessionId: `session_${'a'.repeat(48)}`,
       ownerTokenSha256: 'f'.repeat(64) },
-    socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+    socketIdentity: {
+      driverSocket: { endpoint: '127.0.0.1:49152', device: '1', inode: '10' },
+      productSocket: { endpoint: '127.0.0.1:49153', device: '1', inode: '11' },
+    },
     contract: { path: '${SANDBOX_ROOT}/contract.json', sha256: 'f'.repeat(64), byteCount: 42,
-      device: '1', inode: '3', mode: '320', sourceCommit: 'e'.repeat(40),
+      device: '1', inode: '3', mode: '256', sourceCommit: 'e'.repeat(40),
       repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
     browser: {
       ownerStorageStatePath: '${SANDBOX_ROOT}/browser/owner.json',
@@ -68,6 +71,13 @@ function descriptor(token: string, path: string) {
 describe('hosted actual-owner acceptance preconditions', () => {
   test('accepts exact frozen refs and marker-owned capture paths', () => {
     expect(parseRuntimeManifest(manifest()).refs.orchestrator).toBe('d'.repeat(40))
+    const aliased = manifest()
+    aliased.socketIdentity.productSocket.device = aliased.socketIdentity.driverSocket.device
+    aliased.socketIdentity.productSocket.inode = aliased.socketIdentity.driverSocket.inode
+    expect(() => parseRuntimeManifest(aliased)).toThrow(/runtime_manifest_binding_invalid/)
+    const sameEndpoint = manifest()
+    sameEndpoint.socketIdentity.productSocket.endpoint = sameEndpoint.socketIdentity.driverSocket.endpoint
+    expect(() => parseRuntimeManifest(sameEndpoint)).toThrow(/runtime_manifest_binding_invalid/)
   })
 
   test('rejects unfrozen refs, extra schema fields, and escaped paths', () => {

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmod, lstat, readFile, readlink, realpath, rename, stat, unlink, type FileHandle } from 'node:fs/promises'
+import { chmod, lstat, rename, unlink, type FileHandle } from 'node:fs/promises'
 import { connect, createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -25,6 +25,8 @@ import {
   isWithin, sandboxAnchor, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
 import { validateBootstrapAcceptance } from './bootstrap.js'
+import { AcceptanceAuthority } from './authority.js'
+import { processStartIdentity, proveExecutingProviderIdentity } from './provider-identity.js'
 import { buildAcceptanceEvidence, productTimelineLine, validateAcceptanceEvidence, validateProductTimelineEvent,
   type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
 import {
@@ -34,67 +36,26 @@ import {
 
 const MAX_CONTROL_BYTES = 16 * 1024
 type ProviderIdentity = ActualOwnerAcceptanceEvidence['providers'][number]
-export async function processStartIdentity(pid: number): Promise<string> {
-  if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('hosted_actual_owner_process_pid_invalid')
-  const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
-  const close = stat.lastIndexOf(')')
-  const started = close < 0 ? undefined : stat.slice(close + 2).trim().split(/\s+/)[19]
-  if (!started || !/^\d+$/.test(started)) throw new Error('hosted_actual_owner_process_start_identity_unavailable')
-  return started
+function approvalIdForRecord(record: { authority: { teamId: string; runId: string }; commandId: string }): string {
+  return `approval_${createHash('sha256').update(JSON.stringify({
+    schemaVersion: 1, teamId: record.authority.teamId,
+    runId: record.authority.runId, requestId: record.commandId,
+  })).digest('hex').slice(0, 32)}`
 }
-
-export async function proveExecutingProviderIdentity(input: {
-  pid: number
-  executable: string
-  device: string
-  inode: string
-  sha256: string
-}): Promise<{ executable: string; device: string; inode: string; processStartIdentity: string }> {
-  const procExecutable = `/proc/${input.pid}/exe`
-  const beforeStart = await processStartIdentity(input.pid)
-  const [firstLink, firstStat, canonical, executableStat] = await Promise.all([
-    readlink(procExecutable),
-    stat(procExecutable, { bigint: true }),
-    realpath(procExecutable),
-    stat(input.executable, { bigint: true }),
-  ])
-  if (firstLink.endsWith(' (deleted)') || firstLink !== input.executable || canonical !== input.executable ||
-    !firstStat.isFile() || !executableStat.isFile() ||
-    firstStat.dev !== executableStat.dev || firstStat.ino !== executableStat.ino ||
-    firstStat.dev.toString() !== input.device || firstStat.ino.toString() !== input.inode ||
-    resolveExecutingOpenCodeArtifactDigest(input.pid) !== `sha256:${input.sha256}`) {
-    throw new Error('hosted_actual_owner_provider_identity_invalid')
-  }
-  const [afterStart, secondLink, secondStat] = await Promise.all([
-    processStartIdentity(input.pid), readlink(procExecutable), stat(procExecutable, { bigint: true }),
-  ])
-  if (afterStart !== beforeStart || secondLink !== firstLink || !secondStat.isFile() ||
-    secondStat.dev !== firstStat.dev || secondStat.ino !== firstStat.ino) {
-    throw new Error('hosted_actual_owner_provider_identity_invalid')
-  }
-  return Object.freeze({
-    executable: firstLink, device: firstStat.dev.toString(), inode: firstStat.ino.toString(),
-    processStartIdentity: afterStart,
-  })
-}
+export { processStartIdentity, proveExecutingProviderIdentity } from './provider-identity.js'
 class EvidenceApprovalPort implements HostedApprovalWirePort {
   constructor(
     readonly service: HostedApprovalOwnerService,
     private readonly changed: (
       event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
       requestId: string | null, effectId: string | null,
+      reconciliation?: { reconciliationRef: string; providerDeliveryId: string; runId: string },
     ) => Promise<void>,
   ) {}
   async claimIngress(input: Parameters<HostedApprovalWirePort['claimIngress']>[0]) {
     const result = await this.service.claimIngress(input)
     for (const record of result) {
-      const approvalId = `approval_${createHash('sha256').update(JSON.stringify({
-        schemaVersion: 1,
-        teamId: record.authority.teamId,
-        runId: record.authority.runId,
-        requestId: record.commandId,
-      })).digest('hex').slice(0, 32)}`
-      await this.changed('ingress_durable', approvalId, record.commandId, record.effectRef)
+      await this.changed('ingress_durable', approvalIdForRecord(record), record.commandId, record.effectRef)
     }
     return result
   }
@@ -112,7 +73,10 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
   }
   async reconcileDecision(request: Parameters<HostedApprovalWirePort['reconcileDecision']>[0]) {
     const result = await this.service.reconcileDecision(request)
-    await this.changed(`reconcile_${result.status}`, null, null, null)
+    await this.changed(`reconcile_${result.status}`, null, null, null, {
+      reconciliationRef: request.reconciliationRef, providerDeliveryId: request.providerDeliveryId,
+      runId: request.partition.runId,
+    })
     return result
   }
 }
@@ -134,6 +98,7 @@ export class AcceptanceRuntime {
   private configSha256: string | null = null
   private ownerProcessStartIdentity = '0'
   private providerIdentities = new Map<string, ProviderIdentity>()
+  private acceptanceAuthority: AcceptanceAuthority | null = null
   private bootstrapReleased = false
   private stopping = false
   private evidence: ActualOwnerAcceptanceEvidence
@@ -303,14 +268,17 @@ export class AcceptanceRuntime {
     }
     const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(this.config.walFile))
     this.admission = admission
-    const capture = async (effect: OpenCodePermissionEffectContext): Promise<void> => {
+    const acceptanceAuthority = await AcceptanceAuthority.acquire(this.config, admission)
+    this.acceptanceAuthority = acceptanceAuthority
+    const capture = async (effect: OpenCodePermissionEffectContext) => {
       await this.assertPublicationCurrent()
-      const route = admission.routes.find(candidate =>
-        candidate.authority.sessionId === effect.record.opencodeSessionId)
+      const sessionRecordFingerprint = fingerprintOpenCodeApprovalSessionRecord(effect.record)
+      const candidates = admission.routes.filter(candidate =>
+        candidate.authority.sessionId === effect.record.opencodeSessionId &&
+        candidate.openCodeBinding.sessionRecordFingerprint === sessionRecordFingerprint)
+      const route = candidates.length === 1 ? candidates[0] : null
       if (!route || effect.host.processStartedAtMs === null || effect.host.pid < 1 ||
-        resolveExecutingOpenCodeArtifactDigest(effect.host.pid) !== expectedDigest ||
-        fingerprintOpenCodeApprovalSessionRecord(effect.record) !==
-          route.openCodeBinding.sessionRecordFingerprint) {
+        resolveExecutingOpenCodeArtifactDigest(effect.host.pid) !== expectedDigest) {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
       }
       const computedLiveEffectFingerprint = liveEffectFingerprint(effect)
@@ -327,6 +295,8 @@ export class AcceptanceRuntime {
       this.providerIdentities.set(route.routeId, Object.freeze({
         routeId: route.routeId,
         sessionId: route.authority.sessionId,
+        routeRunId: route.authority.runId,
+        generation: route.scope.authorityGeneration,
         sessionRecordFingerprint: route.openCodeBinding.sessionRecordFingerprint,
         liveEffectFingerprint: computedLiveEffectFingerprint,
         executable: provider.executable,
@@ -338,15 +308,18 @@ export class AcceptanceRuntime {
         processStartedAtMs: effect.host.processStartedAtMs,
       }))
       await this.assertPublicationCurrent()
+      await acceptanceAuthority.assertCurrent()
+      return acceptanceAuthority.routes.get(route.routeId)!
     }
     const bridge = {
       observeHostedApprovalPermissions: async (
         record: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[0],
         authorize?: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[1],
       ) => openCodeSessionBridge.observeHostedApprovalPermissions(record, async effect => {
-        await capture(effect)
+        const route = await capture(effect)
         const result = authorize ? await authorize(effect) : true
         await this.assertPublicationCurrent()
+        await acceptanceAuthority.token(route.routeId).consume(route)
         return result
       }),
       answerPermission: async (
@@ -369,9 +342,10 @@ export class AcceptanceRuntime {
           return result
         },
         authorizeEffect: async effect => {
-          await capture(effect)
+          const route = await capture(effect)
           const result = parameters.authorizeEffect ? await parameters.authorizeEffect(effect) : true
           await this.assertPublicationCurrent()
+          await acceptanceAuthority.token(route.routeId).consume(route)
           return result
         },
       }),
@@ -405,29 +379,42 @@ export class AcceptanceRuntime {
   private async record(
     event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
     requestId: string | null, effectId: string | null,
+    reconciliation?: { reconciliationRef: string; providerDeliveryId: string; runId: string },
   ): Promise<void> {
     await this.assertPublicationCurrent()
     if (!this.admission) throw new Error('hosted_actual_owner_timeline_admission_missing')
-    const generations = new Set(this.admission.routes.map(route => route.scope.authorityGeneration))
-    if (generations.size !== 1) throw new Error('hosted_actual_owner_timeline_generation_ambiguous')
     const state = await this.store?.read()
-    const ingress = requestId ? [...state?.ingress ?? [], ...state?.retiredIngress ?? []]
+    const ingressRecords = [...state?.ingress ?? [], ...state?.retiredIngress ?? []]
+    let ingress = requestId ? ingressRecords
       .find(record => record.commandId === requestId) : null
+    if (!ingress && reconciliation) {
+      const delivery = state?.deliveries.find(candidate =>
+        candidate.reconciliationRef === reconciliation.reconciliationRef &&
+        candidate.providerDeliveryId === reconciliation.providerDeliveryId)
+      ingress = delivery ? ingressRecords.find(candidate =>
+        candidate.outboxId === delivery.outboxId && candidate.effectRef === delivery.effectRef &&
+        candidate.authority.runId === reconciliation.runId) ?? null : null
+      if (ingress) {
+        approvalId = approvalId ?? approvalIdForRecord(ingress)
+        requestId = ingress.commandId; effectId = delivery!.effectRef
+      }
+    }
     const routes = ingress ? this.admission.routes.filter(route =>
       route.authority.runId === ingress.authority.runId &&
       route.authority.sessionId === ingress.authority.sessionId) : this.admission.routes
-    if (routes.length !== 1) throw new Error('hosted_actual_owner_timeline_route_ambiguous')
-    const route = routes[0]!
+    if (routes.length === 0) throw new Error('hosted_actual_owner_timeline_route_missing')
     const prior = await this.readTimeline(false)
     this.sequence = prior?.lastSequence ?? -1
-    const timeline = validateProductTimelineEvent({
-      schemaVersion: 1, at: new Date().toISOString(), routeId: route.routeId,
-      sessionId: route.authority.sessionId, runId: this.config.runtime.runId,
-      generation: [...generations][0], approvalId, requestId,
-      effectId: effectId ?? ingress?.effectRef ?? null, event, sequence: ++this.sequence,
-    })
-    await appendPrivateLine(this.config.runtime.capture.ownerWalTimelinePath,
-      sandboxAnchor(this.config.runtime), productTimelineLine(timeline))
+    for (const route of [...routes].sort((left, right) => left.routeId.localeCompare(right.routeId))) {
+      const timeline = validateProductTimelineEvent({
+        schemaVersion: 1, at: new Date().toISOString(), routeId: route.routeId,
+        sessionId: route.authority.sessionId, runId: route.authority.runId,
+        generation: route.scope.authorityGeneration, approvalId, requestId,
+        effectId: effectId ?? ingress?.effectRef ?? null, event, sequence: ++this.sequence,
+      })
+      await appendPrivateLine(this.config.runtime.capture.ownerWalTimelinePath,
+        sandboxAnchor(this.config.runtime), productTimelineLine(timeline))
+    }
     this.timeline = await this.readTimeline(true)
     await this.assertPublicationCurrent()
     await this.refreshEvidence('ready')
@@ -470,6 +457,8 @@ export class AcceptanceRuntime {
     for (const route of this.admission.routes) {
       const provider = this.providerIdentities.get(route.routeId)
       if (!provider || provider.sessionId !== route.authority.sessionId ||
+        provider.routeRunId !== route.authority.runId ||
+        provider.generation !== route.scope.authorityGeneration ||
         provider.sessionRecordFingerprint !== route.openCodeBinding.sessionRecordFingerprint ||
         provider.liveEffectFingerprint !== route.openCodeBinding.liveEffectFingerprint) {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
@@ -744,6 +733,8 @@ export class AcceptanceRuntime {
         await this.bootstrap.guard.close()
         this.bootstrapReleased = true
       }
+      await this.acceptanceAuthority?.close()
+      this.acceptanceAuthority = null
     }
     if (cleanupFailure) throw cleanupFailure
   }

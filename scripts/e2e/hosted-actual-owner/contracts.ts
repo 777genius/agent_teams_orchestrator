@@ -22,7 +22,7 @@ export const ACTUAL_OWNER_DESCRIPTOR_TOKENS = Object.freeze({
 const execFileAsync = promisify(execFile)
 const SHA256 = /^[0-9a-f]{64}$/
 const FULL_REF = /^[0-9a-f]{40}$/
-const RUN_ID = /^[0-9a-f]{48}$/
+const HARNESS_RUN_ID = /^[0-9a-f]{48}$/
 
 type JsonRecord = Record<string, unknown>
 
@@ -34,7 +34,10 @@ export type ActualOwnerRuntimeManifest = {
   markerPath: string
   capabilityEndpoint: string
   ownerBinding: { ownerUid: number; ownerSessionId: string; ownerTokenSha256: string }
-  socketIdentity: { driverSocket: string; productSocket: string }
+  socketIdentity: {
+    driverSocket: { endpoint: string; device: string; inode: string }
+    productSocket: { endpoint: string; device: string; inode: string }
+  }
   contract: {
     path: string; sha256: string; byteCount: number; device: string; inode: string; mode: string
     sourceCommit: string; repositoryPath: string
@@ -77,6 +80,7 @@ export type ActualOwnerAcceptanceConfig = {
   markerPath: string
   openCodeExecutable: string
   openCodeSha256: string
+  ownerToken: string
   productContract: ActualOwnerProductContract
   productRoot: string
   productPublicationTimeoutMs: number
@@ -187,7 +191,7 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     'socketIdentity', 'contract', 'browser', 'capture', 'refs', 'descriptors',
   ], 'runtime_manifest')
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_PURPOSE ||
-    typeof input.runId !== 'string' || !RUN_ID.test(input.runId)) {
+    typeof input.runId !== 'string' || !HARNESS_RUN_ID.test(input.runId)) {
     throw new Error('hosted_actual_owner_runtime_manifest_invalid')
   }
   const capture = record(input.capture, 'runtime_capture')
@@ -202,6 +206,10 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   exact(ownerBinding, ['ownerUid', 'ownerSessionId', 'ownerTokenSha256'], 'runtime_owner_binding')
   const socketIdentity = record(input.socketIdentity, 'runtime_socket_identity')
   exact(socketIdentity, ['driverSocket', 'productSocket'], 'runtime_socket_identity')
+  const driverSocket = record(socketIdentity.driverSocket, 'runtime_driver_socket')
+  const productSocket = record(socketIdentity.productSocket, 'runtime_product_socket')
+  exact(driverSocket, ['endpoint', 'device', 'inode'], 'runtime_driver_socket')
+  exact(productSocket, ['endpoint', 'device', 'inode'], 'runtime_product_socket')
   const contract = record(input.contract, 'runtime_contract')
   exact(contract, ['path', 'sha256', 'byteCount', 'device', 'inode', 'mode', 'sourceCommit',
     'repositoryPath'], 'runtime_contract')
@@ -250,12 +258,15 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     expandedCapture.browserResultsPath !== expandedBrowser.resultsPath ||
     expandedCapture.ownerWalTimelineRawPath !== ownerWalTimelinePath ||
     input.capabilityEndpoint !== new URL('v1/capability', driverBaseUrl).toString() ||
-    socketIdentity.driverSocket !== new URL(driverBaseUrl).host ||
-    socketIdentity.productSocket !== new URL(productBaseUrl).host ||
+    driverSocket.endpoint !== new URL(driverBaseUrl).host ||
+    productSocket.endpoint !== new URL(productBaseUrl).host ||
+    driverSocket.endpoint === productSocket.endpoint ||
+    decimal(driverSocket.device, 'driver_socket_device') === decimal(productSocket.device, 'product_socket_device') &&
+      decimal(driverSocket.inode, 'driver_socket_inode') === decimal(productSocket.inode, 'product_socket_inode') ||
     !Number.isSafeInteger(ownerBinding.ownerUid) || (ownerBinding.ownerUid as number) < 0 ||
     ownerBinding.ownerSessionId !== `session_${input.runId}` ||
     typeof ownerBinding.ownerTokenSha256 !== 'string' || !SHA256.test(ownerBinding.ownerTokenSha256)) {
-    throw new Error('hosted_actual_owner_runtime_path_escaped_sandbox')
+    throw new Error('hosted_actual_owner_runtime_manifest_binding_invalid')
   }
   return Object.freeze({
     schemaVersion: 1,
@@ -267,8 +278,14 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     ownerBinding: Object.freeze({ ownerUid: ownerBinding.ownerUid as number,
       ownerSessionId: ownerBinding.ownerSessionId as string,
       ownerTokenSha256: ownerBinding.ownerTokenSha256 as string }),
-    socketIdentity: Object.freeze({ driverSocket: socketIdentity.driverSocket as string,
-      productSocket: socketIdentity.productSocket as string }),
+    socketIdentity: Object.freeze({
+      driverSocket: Object.freeze({ endpoint: driverSocket.endpoint as string,
+        device: decimal(driverSocket.device, 'driver_socket_device'),
+        inode: decimal(driverSocket.inode, 'driver_socket_inode') }),
+      productSocket: Object.freeze({ endpoint: productSocket.endpoint as string,
+        device: decimal(productSocket.device, 'product_socket_device'),
+        inode: decimal(productSocket.inode, 'product_socket_inode') }),
+    }),
     contract: Object.freeze({
       path: expandSandbox(contract.path, 'contract'), sha256: sha256(contract.sha256, 'contract'),
       byteCount: positiveInteger(contract.byteCount, 'contract_byte_count'),
@@ -455,6 +472,10 @@ export async function loadAcceptanceConfig(input: {
   }
   const runtimeFile = await readPrivateCanonicalFile(runtimeManifestPath, externalAnchor, 'runtime_manifest')
   const runtime = parseRuntimeManifest(JSON.parse(runtimeFile.bytes.toString('utf8')))
+  if (runtimeFile.identity.device === runtime.contract.device &&
+    runtimeFile.identity.inode === runtime.contract.inode) {
+    throw new Error('hosted_actual_owner_manifest_contract_identity_aliased')
+  }
   if (runtime.sandboxRoot !== declaredSandboxRoot || runtime.markerPath !== markerPath) {
     throw new Error('hosted_actual_owner_runtime_external_binding_mismatch')
   }
@@ -502,7 +523,7 @@ export async function loadAcceptanceConfig(input: {
     anchor: sandboxAnchor(runtime) })
   return Object.freeze({
     admissionFile, controlSocket, evidenceFile,
-    markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, productContract, productRoot,
+    markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, ownerToken, productContract, productRoot,
     productPublicationTimeoutMs,
     repositoryRoot, runtimeManifestPath, runtimeManifestIdentity: runtimeFile.identity,
     runtimeManifestSha256: createHash('sha256').update(runtimeFile.bytes).digest('hex'),

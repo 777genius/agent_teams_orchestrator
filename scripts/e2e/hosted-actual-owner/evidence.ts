@@ -70,13 +70,13 @@ export function validateProductTimelineEvent(value: unknown): ActualOwnerProduct
     (ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS as readonly string[]).includes(input.event)
   if (keys !== 'approvalId,at,effectId,event,generation,requestId,routeId,runId,schemaVersion,sequence,sessionId' ||
     input.schemaVersion !== 1 ||
-    typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId) ||
+    typeof input.runId !== 'string' || !/^run_[0-9a-f]{32}$/.test(input.runId) ||
     (!approvalEvent && !reconciliationEvent) ||
     !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 0 ||
     typeof input.at !== 'string' || !Number.isFinite(Date.parse(input.at)) ||
     new Date(input.at).toISOString() !== input.at ||
     typeof input.generation !== 'string' ||
-    !/^generation_[A-Za-z0-9._-]{1,128}$/.test(input.generation) ||
+    !/^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/.test(input.generation) ||
     typeof input.routeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.routeId) ||
     typeof input.sessionId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.sessionId)) {
     throw new Error('timeline_event_invalid')
@@ -172,6 +172,8 @@ export type ActualOwnerAcceptanceEvidence = {
   providers: readonly {
     routeId: string
     sessionId: string
+    routeRunId: string
+    generation: string
     sessionRecordFingerprint: string
     liveEffectFingerprint: string
     executable: string
@@ -390,7 +392,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     (input.providers as unknown[]).some(candidate => {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return true
       const provider = candidate as Record<string, unknown>
-      exact(provider, ['routeId', 'sessionId', 'sessionRecordFingerprint', 'liveEffectFingerprint',
+      exact(provider, ['routeId', 'sessionId', 'routeRunId', 'generation',
+        'sessionRecordFingerprint', 'liveEffectFingerprint',
         'executable', 'executableDevice', 'executableInode', 'executableSha256',
         'pid', 'processStartIdentity', 'processStartedAtMs'])
       return !Number.isSafeInteger(provider.pid) || (provider.pid as number) < 1 ||
@@ -406,6 +409,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
         !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(provider.routeId) ||
         typeof provider.sessionId !== 'string' ||
         !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(provider.sessionId) ||
+        !/^run_[0-9a-f]{32}$/.test(String(provider.routeRunId)) ||
+        !/^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/.test(String(provider.generation)) ||
         provider.executable !== artifact.executable ||
         provider.executableSha256 !== (artifact.sha256 as string).slice('sha256:'.length)
     })) {

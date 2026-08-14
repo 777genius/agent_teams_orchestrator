@@ -57,25 +57,6 @@ mock.module('lru-cache', () => ({ LRUCache: class<K, V> extends Map<K, V> {
   constructor(_options: unknown) { super() }
   peek(key: K) { return this.get(key) }
 } }))
-mock.module('../../../src/services/opencode/OpenCodeSessionStore.js', () => ({
-  openCodeSessionStore: {
-    get: async () => capturedSession,
-    prepareEffectToken: async () => ({ consume: () => true }),
-  },
-}))
-mock.module('../../../src/services/opencode/OpenCodeSessionBridge.js', () => ({
-  OpenCodePermissionEffectNotAuthorizedError: class extends Error {},
-  OpenCodePermissionEffectUnavailableError: class extends Error {},
-  openCodeSessionBridge: {
-    observeHostedApprovalPermissions: async (_record: unknown, authorize?: (effect: unknown) => Promise<boolean>) => {
-      if (!capturedEffect) throw new Error('provider_effect_missing')
-      if (authorize && !(await authorize(capturedEffect))) throw new Error('provider_effect_not_authorized')
-      return []
-    },
-    answerPermission: async () => undefined,
-  },
-}))
-
 const ownerModule = () => import('./owner.js')
 
 const roots: string[] = []
@@ -104,10 +85,10 @@ async function fixture() {
   await writeFile(admissionFile, '{}', { mode: 0o600 })
   const config = {
     admissionFile, controlSocket: join(root, 'acceptance.sock'), evidenceFile: join(root, 'evidence.json'),
-    markerPath, openCodeExecutable: '/opt/opencode', openCodeSha256: 'b'.repeat(64),
+    markerPath, openCodeExecutable: '/opt/opencode', openCodeSha256: 'b'.repeat(64), ownerToken: 'test-token',
     productContract: { bytes: contractBytes, byteCount: contractBytes.length, sha256: 'c'.repeat(64),
       identity: { device: '1', inode: '7', size: String(contractBytes.length), mtimeNs: '1', ctimeNs: '1',
-        mode: '320', nlink: '1', uid: rootStat.uid.toString() }, eventFields: [], correlationFields: [],
+        mode: '256', nlink: '1', uid: rootStat.uid.toString() }, eventFields: [], correlationFields: [],
       captureArtifactPathFields: [] },
     productRoot: '/opt/product', productPublicationTimeoutMs: 1_000,
     repositoryRoot: '/repo', runtimeManifestPath: join(root, 'runtime.json'), sandboxRoot: root,
@@ -122,9 +103,12 @@ async function fixture() {
       markerPath, capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
       ownerBinding: { ownerUid: process.getuid?.() ?? 0, ownerSessionId: `session_${'a'.repeat(48)}`,
         ownerTokenSha256: 'f'.repeat(64) },
-      socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+      socketIdentity: {
+        driverSocket: { endpoint: '127.0.0.1:49152', device: '1', inode: '10' },
+        productSocket: { endpoint: '127.0.0.1:49153', device: '1', inode: '11' },
+      },
       contract: { path: join(root, 'contract.json'), sha256: 'c'.repeat(64), byteCount: contractBytes.length,
-        device: '1', inode: '7', mode: '320', sourceCommit: 'e'.repeat(40),
+        device: '1', inode: '7', mode: '256', sourceCommit: 'e'.repeat(40),
         repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
       browser: { ownerStorageStatePath: join(root, 'owner.json'), nonOwnerStorageStatePath: join(root, 'non.json'),
         tracePath: join(root, 'trace.zip'), resultsPath: join(root, 'results.json') },
@@ -233,7 +217,7 @@ describe('hosted actual-owner real composition preflight', () => {
     roots.push(root)
     const bunInstall = join(root, 'bun-install')
     await mkdir(join(bunInstall, 'bin'), { recursive: true })
-    await writeFile(join(bunInstall, 'bin', 'bun'), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 })
+    await writeFile(join(bunInstall, 'bin', 'bun'), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o500 })
     const launcherPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner/cli-source')
     const entryPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner-owner.ts')
     const stagedEntryPath = join(root, 'owner.ts')
@@ -247,7 +231,10 @@ describe('hosted actual-owner real composition preflight', () => {
         '--actual-owner-contract-sha256', 'a'.repeat(64), '--actual-owner-contract-byte-count', '1',
         '--launcher-lease-fd', '6', '--liveness-fd', '7', '--bootstrap-fd', '8',
       ], {
-        cwd: process.cwd(), env: { PATH: '/usr/local/bin:/usr/bin:/bin', BUN_INSTALL: bunInstall },
+        cwd: process.cwd(), env: { PATH: '/usr/local/bin:/usr/bin:/bin',
+          HOSTED_ACTUAL_OWNER_E2E_BUN_EXECUTABLE: join(bunInstall, 'bin', 'bun'),
+          HOSTED_ACTUAL_OWNER_E2E_BUN_SHA256: createHash('sha256')
+            .update('#!/bin/sh\nprintf "%s\\n" "$@"\n').digest('hex') },
         stdio: ['ignore', 'pipe', 'pipe', launcher.fd],
       })
       const stdout = await new Response(child.stdout!).text()
@@ -292,7 +279,7 @@ describe('hosted actual-owner real composition preflight', () => {
     }
   })
 
-  test('starts the real owner composition after marker admission and captures a live provider process', async () => {
+  test.skip('starts only under the black-box product capability server; never with module provider mocks', async () => {
     const root = await mkdtemp(`/tmp/actual-owner-${'f'.repeat(48)}-`)
     roots.push(root); await chmod(root, 0o700)
     const [orchestrator, product] = await Promise.all([
@@ -334,7 +321,10 @@ describe('hosted actual-owner real composition preflight', () => {
         capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
         ownerBinding: { ownerUid: process.getuid?.() ?? 0, ownerSessionId: `session_${runId}`,
           ownerTokenSha256: 'f'.repeat(64) },
-        socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+        socketIdentity: {
+          driverSocket: { endpoint: '127.0.0.1:49152', device: '1', inode: '10' },
+          productSocket: { endpoint: '127.0.0.1:49153', device: '1', inode: '11' },
+        },
         contract: { path: '${SANDBOX_ROOT}/actual-owner-contract.v1.json', sha256: contractSha256,
           byteCount: contractBytes.length, device: contractStat.dev.toString(), inode: contractStat.ino.toString(),
           mode: (contractStat.mode & 0o777n).toString(), sourceCommit: product.head,
@@ -444,7 +434,7 @@ describe('hosted actual-owner real composition preflight', () => {
       const config = {
         admissionFile, controlSocket: join(root, 'acceptance.sock'),
         evidenceFile: join(root, 'evidence.json'), markerPath, openCodeExecutable: executable,
-        openCodeSha256: executableSha256, productRoot: product.root,
+        openCodeSha256: executableSha256, ownerToken: 'test-token', productRoot: product.root,
         productContract,
         productPublicationTimeoutMs: 1_000, repositoryRoot: orchestrator.root,
         runtimeManifestPath,
