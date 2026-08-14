@@ -34,7 +34,6 @@ import {
 
 const MAX_CONTROL_BYTES = 16 * 1024
 type ProviderIdentity = ActualOwnerAcceptanceEvidence['providers'][number]
-
 export async function processStartIdentity(pid: number): Promise<string> {
   if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('hosted_actual_owner_process_pid_invalid')
   const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
@@ -78,12 +77,12 @@ export async function proveExecutingProviderIdentity(input: {
     processStartIdentity: afterStart,
   })
 }
-
 class EvidenceApprovalPort implements HostedApprovalWirePort {
   constructor(
     readonly service: HostedApprovalOwnerService,
     private readonly changed: (
       event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
+      requestId: string | null, effectId: string | null,
     ) => Promise<void>,
   ) {}
   async claimIngress(input: Parameters<HostedApprovalWirePort['claimIngress']>[0]) {
@@ -95,7 +94,7 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
         runId: record.authority.runId,
         requestId: record.commandId,
       })).digest('hex').slice(0, 32)}`
-      await this.changed('ingress_durable', approvalId)
+      await this.changed('ingress_durable', approvalId, record.commandId, record.effectRef)
     }
     return result
   }
@@ -108,16 +107,15 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
     const event = result.status === 'delivered' || result.status === 'idempotent_replay'
       ? input.request.decision === 'allow' ? 'completed' : 'rejected'
       : 'decision_committed'
-    await this.changed(event, input.request.approvalId)
+    await this.changed(event, input.request.approvalId, input.request.requestId, null)
     return result
   }
   async reconcileDecision(request: Parameters<HostedApprovalWirePort['reconcileDecision']>[0]) {
     const result = await this.service.reconcileDecision(request)
-    await this.changed(`reconcile_${result.status}`, null)
+    await this.changed(`reconcile_${result.status}`, null, null, null)
     return result
   }
 }
-
 export class AcceptanceRuntime {
   private runtime: HostedControlRuntime | null = null
   private readinessLease: Socket | null = null
@@ -153,9 +151,6 @@ export class AcceptanceRuntime {
   }
 
   async start(): Promise<void> {
-    // This entire block is read-only. Nothing below may publish evidence, create
-    // a socket, acquire the writer lease, read the bootstrap secret, or touch WAL
-    // until the marker, frozen sources, bootstrap paths, and admission bytes agree.
     await assertMarkerOwnedSandbox(this.config.runtime)
     await this.waitForProductPublication()
     await this.assertPublicationCurrent()
@@ -169,7 +164,7 @@ export class AcceptanceRuntime {
     await this.startReadinessLease(runtime.server.ownerBinding)
     await this.startControl()
     await this.service.pollIngress()
-    await this.record('poll_ingress', null)
+    await this.record('poll_ingress', null, null, null)
     if (this.providerIdentities.size === 0) {
       throw new Error('hosted_actual_owner_provider_identity_missing')
     }
@@ -188,7 +183,6 @@ export class AcceptanceRuntime {
       decisionOperations: this.evidence.owner.decisionOperations,
     })}\n`)
   }
-
   private async waitForProductPublication(): Promise<void> {
     const deadline = Date.now() + this.config.productPublicationTimeoutMs
     while (Date.now() < deadline) {
@@ -211,7 +205,6 @@ export class AcceptanceRuntime {
     }
     throw new Error('hosted_actual_owner_product_publication_timeout')
   }
-
   private async startReadinessLease(ownerBinding: HostedControlOwnerBinding): Promise<void> {
     if (this.readinessLease) throw new Error('hosted_actual_owner_readiness_lease_already_started')
     await this.assertPublicationCurrent()
@@ -271,7 +264,6 @@ export class AcceptanceRuntime {
       throw error
     }
   }
-
   private async assertPublicationCurrent(): Promise<void> {
     if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
     const validated = await validateBootstrapAcceptance(this.config, this.bootstrap)
@@ -291,7 +283,6 @@ export class AcceptanceRuntime {
       throw new Error('hosted_actual_owner_product_publication_rotated')
     }
   }
-
   private async ports(context: HostedControlRuntimePortFactoryContext) {
     await this.assertPublicationCurrent()
     const expectedAdmission = join(context.teamRoot, HOSTED_APPROVAL_ADMISSION_FILE)
@@ -398,7 +389,8 @@ export class AcceptanceRuntime {
     })
     await service.recoverStateOnly()
     this.store = store; this.service = service
-    const approvals = new EvidenceApprovalPort(service, (event, approvalId) => this.record(event, approvalId))
+    const approvals = new EvidenceApprovalPort(service,
+      (event, approvalId, requestId, effectId) => this.record(event, approvalId, requestId, effectId))
     return {
       approvals,
       lifecycle: { dispatch: async () => { throw new Error('hosted_actual_owner_non_approval_operation_forbidden') } },
@@ -406,24 +398,33 @@ export class AcceptanceRuntime {
       close: async () => undefined,
     }
   }
-
   private async ownerSocket(): Promise<string> {
     await this.assertPublicationCurrent()
     return this.bootstrap.config.socketPath
   }
-
   private async record(
     event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
+    requestId: string | null, effectId: string | null,
   ): Promise<void> {
     await this.assertPublicationCurrent()
     if (!this.admission) throw new Error('hosted_actual_owner_timeline_admission_missing')
     const generations = new Set(this.admission.routes.map(route => route.scope.authorityGeneration))
     if (generations.size !== 1) throw new Error('hosted_actual_owner_timeline_generation_ambiguous')
+    const state = await this.store?.read()
+    const ingress = requestId ? [...state?.ingress ?? [], ...state?.retiredIngress ?? []]
+      .find(record => record.commandId === requestId) : null
+    const routes = ingress ? this.admission.routes.filter(route =>
+      route.authority.runId === ingress.authority.runId &&
+      route.authority.sessionId === ingress.authority.sessionId) : this.admission.routes
+    if (routes.length !== 1) throw new Error('hosted_actual_owner_timeline_route_ambiguous')
+    const route = routes[0]!
     const prior = await this.readTimeline(false)
     this.sequence = prior?.lastSequence ?? -1
     const timeline = validateProductTimelineEvent({
-      schemaVersion: 1, at: new Date().toISOString(), approvalId, event,
-      generation: [...generations][0], runId: this.config.runtime.runId, sequence: ++this.sequence,
+      schemaVersion: 1, at: new Date().toISOString(), routeId: route.routeId,
+      sessionId: route.authority.sessionId, runId: this.config.runtime.runId,
+      generation: [...generations][0], approvalId, requestId,
+      effectId: effectId ?? ingress?.effectRef ?? null, event, sequence: ++this.sequence,
     })
     await appendPrivateLine(this.config.runtime.capture.ownerWalTimelinePath,
       sandboxAnchor(this.config.runtime), productTimelineLine(timeline))
@@ -664,7 +665,7 @@ export class AcceptanceRuntime {
     }
     if (request.operation === 'poll_ingress') {
       const admitted = await this.service?.pollIngress()
-      await this.record('poll_ingress', null)
+      await this.record('poll_ingress', null, null, null)
       return { schemaVersion: 1, operation: 'poll_ingress', admitted: admitted ?? 0 }
     }
     if (request.operation === 'shutdown') {
@@ -771,19 +772,20 @@ export async function runActualOwnerAcceptance(args: readonly string[]): Promise
 }
 
 export function parseAcceptanceInvocation(args: readonly string[]): {
-  configArgs: readonly ['--runtime-manifest', string]
+  configArgs: readonly string[]
   bootstrapFds: { launcherLeaseFd: number; livenessFd: number; bootstrapFd: number }
 } {
-  const expected = ['--runtime-manifest', '--launcher-lease-fd', '--liveness-fd', '--bootstrap-fd']
-  if (args.length !== 8 || expected.some((flag, index) => args[index * 2] !== flag)) {
+  const expected = ['--runtime-manifest', '--actual-owner-contract', '--actual-owner-contract-sha256',
+    '--actual-owner-contract-byte-count', '--launcher-lease-fd', '--liveness-fd', '--bootstrap-fd']
+  if (args.length !== 14 || expected.some((flag, index) => args[index * 2] !== flag)) {
     throw new Error('hosted_actual_owner_invocation_invalid')
   }
-  const values = [args[3], args[5], args[7]].map(value => Number(value))
-  if (values.some(value => !Number.isSafeInteger(value) || value < 6) || new Set(values).size !== 3) {
+  const values = [args[9], args[11], args[13]].map(value => Number(value))
+  if (values.some((value, index) => value !== index + 6) || new Set(values).size !== 3) {
     throw new Error('hosted_actual_owner_bootstrap_fd_map_invalid')
   }
   return {
-    configArgs: ['--runtime-manifest', args[1]!],
+    configArgs: args.slice(0, 8),
     bootstrapFds: { launcherLeaseFd: values[0]!, livenessFd: values[1]!, bootstrapFd: values[2]! },
   }
 }

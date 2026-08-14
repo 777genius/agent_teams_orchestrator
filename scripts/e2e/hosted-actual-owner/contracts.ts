@@ -4,6 +4,7 @@ import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { assertAnchoredIdentity, readAnchoredFile, type SecureFileIdentity, type TrustedRoot } from './secure-files.js'
+import { assertProductContractCurrent, loadProductContract, type ActualOwnerProductContract } from './product-contract.js'
 
 export const ACTUAL_OWNER_PURPOSE = 'agent-teams.hosted-actual-owner-e2e/v1' as const
 export const ACTUAL_OWNER_ACCEPTANCE_PURPOSE =
@@ -31,7 +32,21 @@ export type ActualOwnerRuntimeManifest = {
   runId: string
   sandboxRoot: string
   markerPath: string
-  capture: { ownerWalTimelinePath: string }
+  capabilityEndpoint: string
+  ownerBinding: { ownerUid: number; ownerSessionId: string; ownerTokenSha256: string }
+  socketIdentity: { driverSocket: string; productSocket: string }
+  contract: {
+    path: string; sha256: string; byteCount: number; device: string; inode: string; mode: string
+    sourceCommit: string; repositoryPath: string
+  }
+  browser: {
+    ownerStorageStatePath: string; nonOwnerStorageStatePath: string; tracePath: string; resultsPath: string
+  }
+  capture: {
+    browserResultsPath: string; conditionalPostLedgerPath: string; negativeResultsPath: string
+    openCodeTimelinePath: string; ownerWalTimelinePath: string; ownerWalTimelineRawPath: string
+    productTimelinePath: string; protectedEffectLedgerPath: string
+  }
   descriptors: {
     sandboxRoot: RuntimePathDescriptor
     productRoot: RuntimePathDescriptor
@@ -62,6 +77,7 @@ export type ActualOwnerAcceptanceConfig = {
   markerPath: string
   openCodeExecutable: string
   openCodeSha256: string
+  productContract: ActualOwnerProductContract
   productRoot: string
   productPublicationTimeoutMs: number
   repositoryRoot: string
@@ -167,7 +183,8 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   const input = record(value, 'runtime_manifest')
   exact(input, [
     'schemaVersion', 'purpose', 'runId', 'sandboxRoot', 'markerPath', 'evidenceRoot',
-    'driverBaseUrl', 'productBaseUrl', 'approvalPath', 'browser', 'capture', 'refs', 'descriptors',
+    'driverBaseUrl', 'productBaseUrl', 'approvalPath', 'capabilityEndpoint', 'ownerBinding',
+    'socketIdentity', 'contract', 'browser', 'capture', 'refs', 'descriptors',
   ], 'runtime_manifest')
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_PURPOSE ||
     typeof input.runId !== 'string' || !RUN_ID.test(input.runId)) {
@@ -175,9 +192,19 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   }
   const capture = record(input.capture, 'runtime_capture')
   exact(capture, [
-    'conditionalPostLedgerPath', 'negativeResultsPath', 'openCodeTimelinePath',
-    'ownerWalTimelinePath', 'productTimelinePath', 'protectedEffectLedgerPath',
+    'browserResultsPath', 'conditionalPostLedgerPath', 'negativeResultsPath', 'openCodeTimelinePath',
+    'ownerWalTimelinePath', 'ownerWalTimelineRawPath', 'productTimelinePath', 'protectedEffectLedgerPath',
   ], 'runtime_capture')
+  const browser = record(input.browser, 'runtime_browser')
+  exact(browser, ['ownerStorageStatePath', 'nonOwnerStorageStatePath', 'tracePath', 'resultsPath'],
+    'runtime_browser')
+  const ownerBinding = record(input.ownerBinding, 'runtime_owner_binding')
+  exact(ownerBinding, ['ownerUid', 'ownerSessionId', 'ownerTokenSha256'], 'runtime_owner_binding')
+  const socketIdentity = record(input.socketIdentity, 'runtime_socket_identity')
+  exact(socketIdentity, ['driverSocket', 'productSocket'], 'runtime_socket_identity')
+  const contract = record(input.contract, 'runtime_contract')
+  exact(contract, ['path', 'sha256', 'byteCount', 'device', 'inode', 'mode', 'sourceCommit',
+    'repositoryPath'], 'runtime_contract')
   const refs = record(input.refs, 'runtime_refs')
   exact(refs, ['openCode', 'openCodeExecutableSha256', 'orchestrator', 'product'], 'runtime_refs')
   const descriptors = record(input.descriptors, 'runtime_descriptors')
@@ -196,7 +223,38 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   const markerPath = expandDescriptor(input.markerPath, sandboxDescriptor, 'marker')
   const ownerWalTimelinePath = expandDescriptor(capture.ownerWalTimelinePath, sandboxDescriptor,
     'owner_wal_timeline')
-  if (!isWithin(sandboxRoot, markerPath) || !isWithin(sandboxRoot, ownerWalTimelinePath)) {
+  const expandSandbox = (value: unknown, label: string) =>
+    expandDescriptor(value, sandboxDescriptor, label)
+  const expandedBrowser = Object.freeze({
+    ownerStorageStatePath: expandSandbox(browser.ownerStorageStatePath, 'owner_storage_state'),
+    nonOwnerStorageStatePath: expandSandbox(browser.nonOwnerStorageStatePath, 'non_owner_storage_state'),
+    tracePath: expandSandbox(browser.tracePath, 'browser_trace'),
+    resultsPath: expandSandbox(browser.resultsPath, 'browser_results'),
+  })
+  const expandedCapture = Object.freeze({
+    browserResultsPath: expandSandbox(capture.browserResultsPath, 'capture_browser_results'),
+    conditionalPostLedgerPath: expandSandbox(capture.conditionalPostLedgerPath, 'conditional_post_ledger'),
+    negativeResultsPath: expandSandbox(capture.negativeResultsPath, 'negative_results'),
+    openCodeTimelinePath: expandSandbox(capture.openCodeTimelinePath, 'opencode_timeline'),
+    ownerWalTimelinePath,
+    ownerWalTimelineRawPath: expandSandbox(capture.ownerWalTimelineRawPath, 'owner_wal_timeline_raw'),
+    productTimelinePath: expandSandbox(capture.productTimelinePath, 'product_timeline'),
+    protectedEffectLedgerPath: expandSandbox(capture.protectedEffectLedgerPath, 'protected_effect_ledger'),
+  })
+  const driverBaseUrl = loopbackBaseUrl(input.driverBaseUrl, 'driver_base_url')
+  const productBaseUrl = loopbackBaseUrl(input.productBaseUrl, 'product_base_url')
+  if (!isWithin(sandboxRoot, markerPath) || !isWithin(sandboxRoot, ownerWalTimelinePath) ||
+    typeof input.evidenceRoot !== 'string' || !isAbsolute(input.evidenceRoot) ||
+    resolve(input.evidenceRoot) !== input.evidenceRoot ||
+    typeof input.approvalPath !== 'string' || !/^\/[A-Za-z0-9/_-]+$/.test(input.approvalPath) ||
+    expandedCapture.browserResultsPath !== expandedBrowser.resultsPath ||
+    expandedCapture.ownerWalTimelineRawPath !== ownerWalTimelinePath ||
+    input.capabilityEndpoint !== new URL('v1/capability', driverBaseUrl).toString() ||
+    socketIdentity.driverSocket !== new URL(driverBaseUrl).host ||
+    socketIdentity.productSocket !== new URL(productBaseUrl).host ||
+    !Number.isSafeInteger(ownerBinding.ownerUid) || (ownerBinding.ownerUid as number) < 0 ||
+    ownerBinding.ownerSessionId !== `session_${input.runId}` ||
+    typeof ownerBinding.ownerTokenSha256 !== 'string' || !SHA256.test(ownerBinding.ownerTokenSha256)) {
     throw new Error('hosted_actual_owner_runtime_path_escaped_sandbox')
   }
   return Object.freeze({
@@ -205,7 +263,21 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     runId: input.runId,
     sandboxRoot,
     markerPath,
-    capture: Object.freeze({ ownerWalTimelinePath }),
+    capabilityEndpoint: input.capabilityEndpoint as string,
+    ownerBinding: Object.freeze({ ownerUid: ownerBinding.ownerUid as number,
+      ownerSessionId: ownerBinding.ownerSessionId as string,
+      ownerTokenSha256: ownerBinding.ownerTokenSha256 as string }),
+    socketIdentity: Object.freeze({ driverSocket: socketIdentity.driverSocket as string,
+      productSocket: socketIdentity.productSocket as string }),
+    contract: Object.freeze({
+      path: expandSandbox(contract.path, 'contract'), sha256: sha256(contract.sha256, 'contract'),
+      byteCount: positiveInteger(contract.byteCount, 'contract_byte_count'),
+      device: decimal(contract.device, 'contract_device'), inode: decimal(contract.inode, 'contract_inode'),
+      mode: decimal(contract.mode, 'contract_mode'), sourceCommit: fullRef(contract.sourceCommit, 'contract'),
+      repositoryPath: contract.repositoryPath as string,
+    }),
+    browser: expandedBrowser,
+    capture: expandedCapture,
     descriptors: Object.freeze({
       sandboxRoot: sandboxDescriptor,
       productRoot: productDescriptor,
@@ -219,6 +291,25 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
       product: fullRef(refs.product, 'product'),
     }),
   })
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new Error(`hosted_actual_owner_${label}_invalid`)
+  }
+  return value as number
+}
+
+function loopbackBaseUrl(value: unknown, label: string): string {
+  if (typeof value !== 'string') throw new Error(`hosted_actual_owner_${label}_invalid`)
+  let parsed: URL
+  try { parsed = new URL(value) } catch { throw new Error(`hosted_actual_owner_${label}_invalid`) }
+  if (!['http:', 'https:'].includes(parsed.protocol) ||
+    !['127.0.0.1', '[::1]', 'localhost'].includes(parsed.hostname) || parsed.pathname !== '/' ||
+    parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(`hosted_actual_owner_${label}_invalid`)
+  }
+  return parsed.toString()
 }
 
 export async function assertRuntimeDescriptors(runtime: ActualOwnerRuntimeManifest): Promise<void> {
@@ -341,7 +432,7 @@ export async function loadAcceptanceConfig(input: {
 }): Promise<ActualOwnerAcceptanceConfig> {
   const environment = input.environment ?? process.env
   if (environment.NODE_ENV === 'production') throw new Error('hosted_actual_owner_production_use_forbidden')
-  if (input.args.length !== 2 || input.args[0] !== '--runtime-manifest') {
+  if (input.args.length !== 8 || input.args[0] !== '--runtime-manifest') {
     throw new Error('hosted_actual_owner_arguments_invalid')
   }
   const runtimeManifestPath = absolutePath(input.args[1], 'runtime_manifest')
@@ -378,6 +469,11 @@ export async function loadAcceptanceConfig(input: {
   const openCodeExecutable = runtime.descriptors.openCodeExecutable.path
   const openCodeSha256 = runtime.descriptors.openCodeExecutable.sha256
   const productRoot = runtime.descriptors.productRoot.path
+  const ownerToken = requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_OWNER_TOKEN')
+  if (process.getuid?.() !== runtime.ownerBinding.ownerUid ||
+    createHash('sha256').update(ownerToken).digest('hex') !== runtime.ownerBinding.ownerTokenSha256) {
+    throw new Error('hosted_actual_owner_product_owner_binding_mismatch')
+  }
   const productPublicationTimeoutMs = positiveDuration(
     requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_PRODUCT_PUBLICATION_TIMEOUT_MS'),
     'product_publication_timeout',
@@ -402,9 +498,11 @@ export async function loadAcceptanceConfig(input: {
     runtime.descriptors.openCodeExecutable, sandboxAnchor(runtime))
   if (await realpath(productRoot) !== productRoot) throw new Error('hosted_actual_owner_product_root_not_canonical')
   await assertRepository(productRoot, runtime.refs.product, 'product')
+  const productContract = await loadProductContract({ args: input.args.slice(2), runtime, productRoot,
+    anchor: sandboxAnchor(runtime) })
   return Object.freeze({
     admissionFile, controlSocket, evidenceFile,
-    markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, productRoot,
+    markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, productContract, productRoot,
     productPublicationTimeoutMs,
     repositoryRoot, runtimeManifestPath, runtimeManifestIdentity: runtimeFile.identity,
     runtimeManifestSha256: createHash('sha256').update(runtimeFile.bytes).digest('hex'),
@@ -428,6 +526,7 @@ export async function assertAcceptanceConfigCurrent(config: ActualOwnerAcceptanc
   await assertMarkerOwnedSandbox(config.runtime)
   await assertCandidateArtifact(config.openCodeExecutable, config.openCodeSha256,
     config.runtime.descriptors.openCodeExecutable, anchor)
+  await assertProductContractCurrent({ contract: config.productContract, runtime: config.runtime, anchor })
   await Promise.all([
     assertRepository(config.repositoryRoot, config.runtime.refs.orchestrator, 'orchestrator'),
     assertRepository(config.productRoot, config.runtime.refs.product, 'product'),

@@ -22,7 +22,19 @@ function manifest() {
     driverBaseUrl: 'http://127.0.0.1:49152/',
     productBaseUrl: 'http://127.0.0.1:49153/',
     approvalPath: '/hosted/approvals',
-    browser: {},
+    capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
+    ownerBinding: { ownerUid: 1000, ownerSessionId: `session_${'a'.repeat(48)}`,
+      ownerTokenSha256: 'f'.repeat(64) },
+    socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+    contract: { path: '${SANDBOX_ROOT}/contract.json', sha256: 'f'.repeat(64), byteCount: 42,
+      device: '1', inode: '3', mode: '320', sourceCommit: 'e'.repeat(40),
+      repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
+    browser: {
+      ownerStorageStatePath: '${SANDBOX_ROOT}/browser/owner.json',
+      nonOwnerStorageStatePath: '${SANDBOX_ROOT}/browser/non-owner.json',
+      tracePath: '${SANDBOX_ROOT}/browser/trace.zip',
+      resultsPath: '${SANDBOX_ROOT}/capture/browser-results.json',
+    },
     descriptors: {
       sandboxRoot: descriptor('${SANDBOX_ROOT}', root),
       productRoot: descriptor('${PRODUCT_ROOT}', '/opt/agent-teams-product'),
@@ -33,12 +45,14 @@ function manifest() {
       },
     },
     capture: {
-      conditionalPostLedgerPath: `${root}/capture/posts.ndjson`,
-      negativeResultsPath: `${root}/capture/negative.json`,
-      openCodeTimelinePath: `${root}/capture/opencode.ndjson`,
+      browserResultsPath: '${SANDBOX_ROOT}/capture/browser-results.json',
+      conditionalPostLedgerPath: '${SANDBOX_ROOT}/capture/posts.ndjson',
+      negativeResultsPath: '${SANDBOX_ROOT}/capture/negative.json',
+      openCodeTimelinePath: '${SANDBOX_ROOT}/capture/opencode.ndjson',
       ownerWalTimelinePath: '${SANDBOX_ROOT}/capture/owner.ndjson',
-      productTimelinePath: `${root}/capture/product.ndjson`,
-      protectedEffectLedgerPath: `${root}/capture/effects.json`,
+      ownerWalTimelineRawPath: '${SANDBOX_ROOT}/capture/owner.ndjson',
+      productTimelinePath: '${SANDBOX_ROOT}/capture/product.ndjson',
+      protectedEffectLedgerPath: '${SANDBOX_ROOT}/capture/effects.json',
     },
     refs: {
       openCode: 'b'.repeat(40), openCodeExecutableSha256: 'c'.repeat(64),
@@ -74,7 +88,8 @@ describe('hosted actual-owner acceptance preconditions', () => {
       ...manifest(),
       descriptors: { ...manifest().descriptors,
         sandboxRoot: descriptor('${SANDBOX_ROOT}', sandbox) },
-      capture: { ...manifest().capture, ownerWalTimelinePath: '${SANDBOX_ROOT}/owner.ndjson' },
+      capture: { ...manifest().capture, ownerWalTimelinePath: '${SANDBOX_ROOT}/owner.ndjson',
+        ownerWalTimelineRawPath: '${SANDBOX_ROOT}/owner.ndjson' },
     })
     await expect(assertMarkerOwnedSandbox(input)).rejects.toThrow()
   })

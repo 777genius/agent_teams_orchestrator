@@ -7,11 +7,33 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { HostedControlBootstrapAdmission } from '../../../src/services/hostedControl/HostedControlBootstrap.js'
 import type { ActualOwnerAcceptanceConfig } from './contracts.js'
-import { ACTUAL_OWNER_MARKER_FILE, ACTUAL_OWNER_PURPOSE, parseRuntimeManifest } from './contracts.js'
+import { ACTUAL_OWNER_MARKER_FILE, ACTUAL_OWNER_PURPOSE, parseRuntimeManifest, sandboxAnchor } from './contracts.js'
 import { validateBootstrapAcceptance } from './bootstrap.js'
+import { loadProductContract, parseProductContractBundle } from './product-contract.js'
 
 let capturedSession: unknown = null
 let capturedEffect: unknown = null
+
+const contractBytes = Buffer.from(`${JSON.stringify({
+  schemaVersion: 1, purpose: 'agent-teams.hosted-actual-owner-e2e.contract/v1', authority: 'product',
+  orchestratorEntry: 'scripts/e2e/hosted-actual-owner-owner.ts',
+  descriptorTokens: { sandboxRoot: '${SANDBOX_ROOT}', productRoot: '${PRODUCT_ROOT}',
+    orchestratorRoot: '${ORCHESTRATOR_ROOT}', openCodeExecutable: '${OPENCODE_EXECUTABLE}' },
+  inheritedFds: { launcherLeaseFd: 6, livenessFd: 7, bootstrapFd: 8 },
+  runtimeManifest: { ownerBindingFields: ['ownerUid', 'ownerSessionId', 'ownerTokenSha256'],
+    socketIdentityFields: ['driverSocket', 'productSocket'], httpCapabilityEndpointField: 'capabilityEndpoint',
+    ownerWalTimelineRawPathField: 'ownerWalTimelineRawPath', captureArtifactPathFields: [
+      'browserResultsPath', 'conditionalPostLedgerPath', 'negativeResultsPath', 'openCodeTimelinePath',
+      'ownerWalTimelinePath', 'productTimelinePath', 'protectedEffectLedgerPath'] },
+  timeline: { mediaType: 'application/x-ndjson', encoding: 'utf-8', lineTerminator: '\n',
+    timestamp: 'canonical UTC ISO-8601 with exactly milliseconds', digest: 'sha256 of exact raw bytes',
+    byteCount: 'exact raw byte count', fileIdentityFields: ['device', 'inode', 'size', 'mtimeNs', 'ctimeNs'],
+    eventFields: ['schemaVersion', 'at', 'routeId', 'sessionId', 'runId', 'generation', 'approvalId',
+      'requestId', 'effectId', 'event', 'sequence'],
+    approvalIdDiscriminant: 'approval events require approvalId; maintenance events require null',
+    nullableCorrelationFields: ['approvalId', 'requestId', 'effectId'] },
+  correlationFields: ['routeId', 'sessionId', 'runId', 'generation', 'approvalId', 'requestId', 'effectId'],
+})}\n`)
 
 mock.module('env-paths', () => ({
   default: () => ({ data: '/tmp', config: '/tmp', cache: '/tmp', log: '/tmp', temp: '/tmp' }),
@@ -83,6 +105,10 @@ async function fixture() {
   const config = {
     admissionFile, controlSocket: join(root, 'acceptance.sock'), evidenceFile: join(root, 'evidence.json'),
     markerPath, openCodeExecutable: '/opt/opencode', openCodeSha256: 'b'.repeat(64),
+    productContract: { bytes: contractBytes, byteCount: contractBytes.length, sha256: 'c'.repeat(64),
+      identity: { device: '1', inode: '7', size: String(contractBytes.length), mtimeNs: '1', ctimeNs: '1',
+        mode: '320', nlink: '1', uid: rootStat.uid.toString() }, eventFields: [], correlationFields: [],
+      captureArtifactPathFields: [] },
     productRoot: '/opt/product', productPublicationTimeoutMs: 1_000,
     repositoryRoot: '/repo', runtimeManifestPath: join(root, 'runtime.json'), sandboxRoot: root,
     runtimeManifestIdentity: {
@@ -93,7 +119,19 @@ async function fixture() {
     walFile: join(teamRoot, 'hosted-approval-owner.v1.json'),
     runtime: {
       schemaVersion: 1 as const, purpose: ACTUAL_OWNER_PURPOSE, runId: 'a'.repeat(48), sandboxRoot: root,
-      markerPath, capture: { ownerWalTimelinePath: join(root, 'owner.ndjson') },
+      markerPath, capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
+      ownerBinding: { ownerUid: process.getuid?.() ?? 0, ownerSessionId: `session_${'a'.repeat(48)}`,
+        ownerTokenSha256: 'f'.repeat(64) },
+      socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+      contract: { path: join(root, 'contract.json'), sha256: 'c'.repeat(64), byteCount: contractBytes.length,
+        device: '1', inode: '7', mode: '320', sourceCommit: 'e'.repeat(40),
+        repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
+      browser: { ownerStorageStatePath: join(root, 'owner.json'), nonOwnerStorageStatePath: join(root, 'non.json'),
+        tracePath: join(root, 'trace.zip'), resultsPath: join(root, 'results.json') },
+      capture: { browserResultsPath: join(root, 'results.json'), conditionalPostLedgerPath: join(root, 'posts'),
+        negativeResultsPath: join(root, 'negative'), openCodeTimelinePath: join(root, 'opencode'),
+        ownerWalTimelinePath: join(root, 'owner.ndjson'), ownerWalTimelineRawPath: join(root, 'owner.ndjson'),
+        productTimelinePath: join(root, 'product'), protectedEffectLedgerPath: join(root, 'effects') },
       descriptors: {
         sandboxRoot: { token: '${SANDBOX_ROOT}', path: root, device: rootStat.dev.toString(), inode: rootStat.ino.toString(), mode: '448', uid: rootStat.uid.toString() },
         productRoot: { token: '${PRODUCT_ROOT}', path: '/opt/product', device: '1', inode: '2', mode: '493', uid: rootStat.uid.toString() },
@@ -130,7 +168,12 @@ async function privateRepository(root: string, name: string): Promise<{ root: st
   const options = { cwd: path, env: { PATH: '/usr/local/bin:/usr/bin:/bin' } }
   await execFileAsync('/usr/bin/git', ['init', '--quiet'], options)
   await writeFile(join(path, 'source.txt'), `${name}\n`, { mode: 0o600 })
-  await execFileAsync('/usr/bin/git', ['add', '--', 'source.txt'], options)
+  if (name === 'product') {
+    await mkdir(join(path, 'scripts/e2e/hosted-actual-owner'), { recursive: true, mode: 0o700 })
+    await writeFile(join(path, 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json'),
+      contractBytes, { mode: 0o600 })
+  }
+  await execFileAsync('/usr/bin/git', ['add', '--', '.'], options)
   await execFileAsync('/usr/bin/git', [
     '-c', 'user.name=Acceptance Test', '-c', 'user.email=acceptance@example.invalid',
     'commit', '--quiet', '-m', 'test fixture',
@@ -140,6 +183,14 @@ async function privateRepository(root: string, name: string): Promise<{ root: st
 }
 
 describe('hosted actual-owner real composition preflight', () => {
+  test('consumes the canonical product-owned contract bytes and exact fd roles', () => {
+    const parsed = parseProductContractBundle(contractBytes)
+    expect(parsed.byteCount).toBe(contractBytes.length)
+    const mutated = Buffer.from(contractBytes.toString('utf8').replace('"launcherLeaseFd":6',
+      '"launcherLeaseFd":9'))
+    expect(() => parseProductContractBundle(mutated)).toThrow(/semantics_invalid/)
+  })
+
   test('admits the canonical descriptor configuration and exact private admission bytes', async () => {
     const { config, admission } = await fixture()
     const validated = await validateBootstrapAcceptance(config, admission)
@@ -165,12 +216,15 @@ describe('hosted actual-owner real composition preflight', () => {
     const realFixture: HostedControlBootstrapAdmission = admission
     expect('secretFile' in realFixture.config).toBe(false)
     expect(parseAcceptanceInvocation([
-      '--runtime-manifest', '/tmp/manifest', '--launcher-lease-fd', '6',
+      '--runtime-manifest', '/tmp/manifest', '--actual-owner-contract', '/tmp/contract',
+      '--actual-owner-contract-sha256', 'a'.repeat(64), '--actual-owner-contract-byte-count', '1',
+      '--launcher-lease-fd', '6',
       '--liveness-fd', '7', '--bootstrap-fd', '8',
     ]).bootstrapFds).toEqual({ launcherLeaseFd: 6, livenessFd: 7, bootstrapFd: 8 })
     expect(() => parseAcceptanceInvocation([
-      '--runtime-manifest', '/tmp/manifest', '--launcher-lease-fd', '3',
-      '--liveness-fd', '4', '--bootstrap-fd', '5',
+      '--runtime-manifest', '/tmp/manifest', '--actual-owner-contract', '/tmp/contract',
+      '--actual-owner-contract-sha256', 'a'.repeat(64), '--actual-owner-contract-byte-count', '1',
+      '--launcher-lease-fd', '7', '--liveness-fd', '6', '--bootstrap-fd', '8',
     ])).toThrow(/fd_map_invalid/)
   })
 
@@ -181,14 +235,16 @@ describe('hosted actual-owner real composition preflight', () => {
     await mkdir(join(bunInstall, 'bin'), { recursive: true })
     await writeFile(join(bunInstall, 'bin', 'bun'), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o700 })
     const launcherPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner/cli-source')
-    const entryPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner/owner.ts')
+    const entryPath = join(process.cwd(), 'scripts/e2e/hosted-actual-owner-owner.ts')
     const stagedEntryPath = join(root, 'owner.ts')
-    await copyFile(entryPath, stagedEntryPath); await chmod(stagedEntryPath, 0o500)
+    await copyFile(entryPath, stagedEntryPath); await chmod(stagedEntryPath, 0o400)
     const launcher = await open(launcherPath, 'r')
     try {
       const child = spawn('/proc/self/fd/3', [
         '--hosted-actual-owner-acceptance-entry', stagedEntryPath,
         '--runtime-manifest', join(root, 'manifest.json'),
+        '--actual-owner-contract', join(root, 'contract.json'),
+        '--actual-owner-contract-sha256', 'a'.repeat(64), '--actual-owner-contract-byte-count', '1',
         '--launcher-lease-fd', '6', '--liveness-fd', '7', '--bootstrap-fd', '8',
       ], {
         cwd: process.cwd(), env: { PATH: '/usr/local/bin:/usr/bin:/bin', BUN_INSTALL: bunInstall },
@@ -200,6 +256,8 @@ describe('hosted actual-owner real composition preflight', () => {
       expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
       expect(stdout.trim().split('\n')).toEqual([
         'run', entryPath, '--runtime-manifest', join(root, 'manifest.json'),
+        '--actual-owner-contract', join(root, 'contract.json'),
+        '--actual-owner-contract-sha256', 'a'.repeat(64), '--actual-owner-contract-byte-count', '1',
         '--launcher-lease-fd', '6', '--liveness-fd', '7', '--bootstrap-fd', '8',
       ])
     } finally { await launcher.close() }
@@ -262,13 +320,29 @@ describe('hosted actual-owner real composition preflight', () => {
       }
       const executableStat = await lstat(executable, { bigint: true })
       const runtimeManifestPath = join(root, 'runtime.json')
+      const contractPath = join(root, 'actual-owner-contract.v1.json')
+      await writeFile(contractPath, contractBytes, { mode: 0o400 })
+      const contractStat = await lstat(contractPath, { bigint: true })
+      const contractSha256 = createHash('sha256').update(contractBytes).digest('hex')
       const capturePath = join(root, 'capture', 'owner-wal.ndjson')
       await mkdir(join(root, 'capture'), { mode: 0o700 })
       const runtimeSource = {
         schemaVersion: 1, purpose: ACTUAL_OWNER_PURPOSE, runId,
         sandboxRoot: '${SANDBOX_ROOT}', markerPath: '${SANDBOX_ROOT}/.agent-teams-actual-owner-e2e-owner.json',
         evidenceRoot: join(root, 'evidence'), driverBaseUrl: 'http://127.0.0.1:49152/',
-        productBaseUrl: 'http://127.0.0.1:49153/', approvalPath: '/hosted/approvals', browser: {},
+        productBaseUrl: 'http://127.0.0.1:49153/', approvalPath: '/hosted/approvals',
+        capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
+        ownerBinding: { ownerUid: process.getuid?.() ?? 0, ownerSessionId: `session_${runId}`,
+          ownerTokenSha256: 'f'.repeat(64) },
+        socketIdentity: { driverSocket: '127.0.0.1:49152', productSocket: '127.0.0.1:49153' },
+        contract: { path: '${SANDBOX_ROOT}/actual-owner-contract.v1.json', sha256: contractSha256,
+          byteCount: contractBytes.length, device: contractStat.dev.toString(), inode: contractStat.ino.toString(),
+          mode: (contractStat.mode & 0o777n).toString(), sourceCommit: product.head,
+          repositoryPath: 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' },
+        browser: { ownerStorageStatePath: '${SANDBOX_ROOT}/browser/owner.json',
+          nonOwnerStorageStatePath: '${SANDBOX_ROOT}/browser/non-owner.json',
+          tracePath: '${SANDBOX_ROOT}/browser/trace.zip',
+          resultsPath: '${SANDBOX_ROOT}/capture/browser-results.json' },
         descriptors: {
           sandboxRoot: await describe('${SANDBOX_ROOT}', root),
           productRoot: await describe('${PRODUCT_ROOT}', product.root),
@@ -277,12 +351,14 @@ describe('hosted actual-owner real composition preflight', () => {
             size: executableStat.size.toString(), sha256: executableSha256 },
         },
         capture: {
-          conditionalPostLedgerPath: join(root, 'capture', 'posts.ndjson'),
-          negativeResultsPath: join(root, 'capture', 'negative.json'),
-          openCodeTimelinePath: join(root, 'capture', 'opencode.ndjson'),
+          browserResultsPath: '${SANDBOX_ROOT}/capture/browser-results.json',
+          conditionalPostLedgerPath: '${SANDBOX_ROOT}/capture/posts.ndjson',
+          negativeResultsPath: '${SANDBOX_ROOT}/capture/negative.json',
+          openCodeTimelinePath: '${SANDBOX_ROOT}/capture/opencode.ndjson',
           ownerWalTimelinePath: '${SANDBOX_ROOT}/capture/owner-wal.ndjson',
-          productTimelinePath: join(root, 'capture', 'product.ndjson'),
-          protectedEffectLedgerPath: join(root, 'capture', 'effects.json'),
+          ownerWalTimelineRawPath: '${SANDBOX_ROOT}/capture/owner-wal.ndjson',
+          productTimelinePath: '${SANDBOX_ROOT}/capture/product.ndjson',
+          protectedEffectLedgerPath: '${SANDBOX_ROOT}/capture/effects.json',
         },
         refs: { openCode: 'a'.repeat(40), openCodeExecutableSha256: executableSha256,
           orchestrator: orchestrator.head, product: product.head },
@@ -291,6 +367,11 @@ describe('hosted actual-owner real composition preflight', () => {
       await writeFile(runtimeManifestPath, runtimeBytes, { mode: 0o600 })
       const runtimeManifestStat = await lstat(runtimeManifestPath, { bigint: true })
       const runtime = parseRuntimeManifest(runtimeSource)
+      const productContract = await loadProductContract({
+        args: ['--actual-owner-contract', contractPath, '--actual-owner-contract-sha256', contractSha256,
+          '--actual-owner-contract-byte-count', String(contractBytes.length)],
+        runtime, productRoot: product.root, anchor: sandboxAnchor(runtime),
+      })
       const claudeRoot = join(root, 'claude')
       const teamRoot = join(claudeRoot, 'teams', 'team-key')
       await mkdir(teamRoot, { recursive: true, mode: 0o700 })
@@ -364,6 +445,7 @@ describe('hosted actual-owner real composition preflight', () => {
         admissionFile, controlSocket: join(root, 'acceptance.sock'),
         evidenceFile: join(root, 'evidence.json'), markerPath, openCodeExecutable: executable,
         openCodeSha256: executableSha256, productRoot: product.root,
+        productContract,
         productPublicationTimeoutMs: 1_000, repositoryRoot: orchestrator.root,
         runtimeManifestPath,
         runtimeManifestIdentity: {

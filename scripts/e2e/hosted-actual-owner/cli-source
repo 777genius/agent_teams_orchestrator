@@ -15,14 +15,15 @@ if [[ "${1-}" == "hosted-actual-owner-e2e" ]]; then
 fi
 
 if [[ "${1-}" != "--hosted-actual-owner-acceptance-entry" || "${3-}" != "--runtime-manifest" ||
-  "${5-}" != "--launcher-lease-fd" || "${7-}" != "--liveness-fd" ||
-  "${9-}" != "--bootstrap-fd" || "$#" -ne 10 ]]; then
+  "${5-}" != "--actual-owner-contract" || "${7-}" != "--actual-owner-contract-sha256" ||
+  "${9-}" != "--actual-owner-contract-byte-count" || "${11-}" != "--launcher-lease-fd" ||
+  "${13-}" != "--liveness-fd" || "${15-}" != "--bootstrap-fd" || "$#" -ne 16 ]]; then
   echo "This source-only launcher accepts only the hosted actual-owner acceptance entry." >&2
   exit 64
 fi
 
 ENTRY_ANCHOR="$2"
-ENTRY_SOURCE="$SCRIPT_DIR/owner.ts"
+ENTRY_SOURCE="$REPOSITORY_ROOT/scripts/e2e/hosted-actual-owner-owner.ts"
 if [[ "$ENTRY_ANCHOR" != /* ]] || [[ ! -f "$ENTRY_ANCHOR" ]] ||
   ! /usr/bin/cmp -s -- "$ENTRY_ANCHOR" "$ENTRY_SOURCE"; then
   echo "Refusing an acceptance entry that is not the exact repository source." >&2
@@ -34,7 +35,7 @@ fi
 # would sever owner.ts from its relative source imports.  Execute the matching
 # repository-local source entry only after the byte comparison above.
 ENTRY_MODE="$(/usr/bin/stat -c '%a:%h:%u' -- "$ENTRY_ANCHOR")"
-if [[ "$ENTRY_MODE" != "500:1:$(/usr/bin/id -u)" ]]; then
+if [[ "$ENTRY_MODE" != "400:1:$(/usr/bin/id -u)" ]]; then
   echo "Refusing an unsafe hosted actual-owner acceptance entry anchor." >&2
   exit 67
 fi
@@ -51,4 +52,6 @@ fi
 
 cd "$REPOSITORY_ROOT"
 exec "$BUN_BIN" run "$ENTRY_SOURCE" --runtime-manifest "$4" \
-  --launcher-lease-fd "$6" --liveness-fd "$8" --bootstrap-fd "${10}"
+  --actual-owner-contract "$6" --actual-owner-contract-sha256 "$8" \
+  --actual-owner-contract-byte-count "${10}" --launcher-lease-fd "${12}" \
+  --liveness-fd "${14}" --bootstrap-fd "${16}"

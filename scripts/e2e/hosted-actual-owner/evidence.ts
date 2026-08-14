@@ -7,10 +7,14 @@ export type ActualOwnerAcceptanceStatus = 'starting' | 'ready' | 'stopping' | 'f
 
 type ActualOwnerTimelineBase = {
   schemaVersion: 1
-  runId: string
-  sequence: number
   at: string
+  routeId: string
+  sessionId: string
+  runId: string
   generation: string
+  requestId: string | null
+  effectId: string | null
+  sequence: number
 }
 
 export const ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS = Object.freeze([
@@ -64,32 +68,41 @@ export function validateProductTimelineEvent(value: unknown): ActualOwnerProduct
     !!negative && PRODUCT_NEGATIVE_OUTCOMES[negative[1] as ProductNegativeCase] === negative[2])
   const reconciliationEvent = typeof input.event === 'string' &&
     (ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS as readonly string[]).includes(input.event)
-  if (keys !== 'approvalId,at,event,generation,runId,schemaVersion,sequence' || input.schemaVersion !== 1 ||
+  if (keys !== 'approvalId,at,effectId,event,generation,requestId,routeId,runId,schemaVersion,sequence,sessionId' ||
+    input.schemaVersion !== 1 ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId) ||
     (!approvalEvent && !reconciliationEvent) ||
     !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 0 ||
     typeof input.at !== 'string' || !Number.isFinite(Date.parse(input.at)) ||
     new Date(input.at).toISOString() !== input.at ||
     typeof input.generation !== 'string' ||
-    !/^generation_[A-Za-z0-9._-]{1,128}$/.test(input.generation)) {
+    !/^generation_[A-Za-z0-9._-]{1,128}$/.test(input.generation) ||
+    typeof input.routeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.routeId) ||
+    typeof input.sessionId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.sessionId)) {
     throw new Error('timeline_event_invalid')
   }
   if (approvalEvent) {
     if (typeof input.approvalId !== 'string' ||
-      !/^approval_[A-Za-z0-9._:-]{8,191}$/.test(input.approvalId)) {
+      !/^approval_[A-Za-z0-9._:-]{8,191}$/.test(input.approvalId) ||
+      typeof input.requestId !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.requestId) ||
+      input.effectId !== null && (typeof input.effectId !== 'string' || input.effectId.length < 1)) {
       throw new Error('timeline_event_invalid')
     }
     return Object.freeze({
-      schemaVersion: 1, at: input.at, approvalId: input.approvalId,
-      event: input.event as ProductApprovalEvent,
-      generation: input.generation, runId: input.runId, sequence: input.sequence as number,
+      schemaVersion: 1, at: input.at, routeId: input.routeId, sessionId: input.sessionId,
+      runId: input.runId, generation: input.generation, approvalId: input.approvalId,
+      requestId: input.requestId, effectId: input.effectId,
+      event: input.event as ProductApprovalEvent, sequence: input.sequence as number,
     })
   }
-  if (!reconciliationEvent || input.approvalId !== null) throw new Error('timeline_event_invalid')
+  if (!reconciliationEvent || input.approvalId !== null || input.requestId !== null ||
+    input.effectId !== null) throw new Error('timeline_event_invalid')
   return Object.freeze({
-    schemaVersion: 1, at: input.at, approvalId: null,
-    event: input.event as (typeof ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS)[number],
-    generation: input.generation, runId: input.runId, sequence: input.sequence as number,
+    schemaVersion: 1, at: input.at, routeId: input.routeId, sessionId: input.sessionId,
+    runId: input.runId, generation: input.generation, approvalId: null, requestId: null,
+    effectId: null, event: input.event as (typeof ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS)[number],
+    sequence: input.sequence as number,
   })
 }
 
@@ -106,6 +119,14 @@ export type ActualOwnerAcceptanceEvidence = {
   markerPath: string
   refs: { orchestrator: string; openCode: string; product: string }
   artifact: { executable: string; sha256: `sha256:${string}` }
+  contract: {
+    path: string
+    sha256: string
+    byteCount: number
+    identity: SecureFileIdentity
+    sourceCommit: string
+    repositoryPath: string
+  }
   admission: { path: string; digest: string | null; generation: string | null }
   publication: {
     admission: SecureFileIdentity | null
@@ -124,6 +145,9 @@ export type ActualOwnerAcceptanceEvidence = {
     lastSequence: number | null
     authority: {
       productRef: string
+      productContractSha256: string
+      productContractByteCount: number
+      productContractIdentity: SecureFileIdentity
       runtimeManifestSha256: string
       runtimeManifestIdentity: SecureFileIdentity
     }
@@ -199,6 +223,14 @@ export function buildAcceptanceEvidence(input: {
       executable: input.config.openCodeExecutable,
       sha256: `sha256:${input.config.openCodeSha256}` as const,
     }),
+    contract: Object.freeze({
+      path: input.config.runtime.contract.path,
+      sha256: input.config.productContract.sha256,
+      byteCount: input.config.productContract.byteCount,
+      identity: input.config.productContract.identity,
+      sourceCommit: input.config.runtime.contract.sourceCommit,
+      repositoryPath: input.config.runtime.contract.repositoryPath,
+    }),
     admission: Object.freeze({
       path: input.config.admissionFile,
       digest: input.admission?.digest ?? null,
@@ -221,6 +253,9 @@ export function buildAcceptanceEvidence(input: {
       lastSequence: input.timeline?.lastSequence ?? null,
       authority: Object.freeze({
         productRef: input.config.runtime.refs.product,
+        productContractSha256: input.config.productContract.sha256,
+        productContractByteCount: input.config.productContract.byteCount,
+        productContractIdentity: input.config.productContract.identity,
         runtimeManifestSha256: input.config.runtimeManifestSha256,
         runtimeManifestIdentity: input.config.runtimeManifestIdentity,
       }),
@@ -264,13 +299,15 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     }
     return candidate as Record<string, unknown>
   }
-  exact(input, ['schemaVersion', 'purpose', 'status', 'runId', 'markerPath', 'refs', 'artifact', 'admission', 'publication', 'bootstrap', 'timeline', 'owner', 'providers', 'failure'])
+  exact(input, ['schemaVersion', 'purpose', 'status', 'runId', 'markerPath', 'refs', 'artifact', 'contract',
+    'admission', 'publication', 'bootstrap', 'timeline', 'owner', 'providers', 'failure'])
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_ACCEPTANCE_PURPOSE ||
     !['starting', 'ready', 'stopping', 'failed'].includes(String(input.status)) ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId)) {
     throw new Error('acceptance_evidence_invalid')
   }
   const artifact = nested(input.artifact)
+  const contract = nested(input.contract)
   const admission = nested(input.admission)
   const owner = nested(input.owner)
   const publication = nested(input.publication)
@@ -279,6 +316,7 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
   const timeline = nested(input.timeline)
   const timelineAuthority = nested(timeline.authority)
   exact(artifact, ['executable', 'sha256'])
+  exact(contract, ['path', 'sha256', 'byteCount', 'identity', 'sourceCommit', 'repositoryPath'])
   exact(admission, ['path', 'digest', 'generation'])
   exact(owner, ['pid', 'processStartIdentity', 'controlSocket', 'controlSocketIdentity', 'ownerSocket',
     'ownerSocketIdentity', 'walPath', 'walIdentity', 'walSha256', 'walRevision', 'stateSha256',
@@ -287,7 +325,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
   exact(bootstrap, ['bootstrapDigest', 'configSha256', 'ownerArtifactDigest'])
   exact(refs, ['orchestrator', 'openCode', 'product'])
   exact(timeline, ['path', 'identity', 'sha256', 'bytes', 'eventCount', 'lastSequence', 'authority'])
-  exact(timelineAuthority, ['productRef', 'runtimeManifestSha256', 'runtimeManifestIdentity'])
+  exact(timelineAuthority, ['productRef', 'productContractSha256', 'productContractByteCount',
+    'productContractIdentity', 'runtimeManifestSha256', 'runtimeManifestIdentity'])
   const identity = (candidate: unknown): boolean => candidate === null || !!candidate &&
     typeof candidate === 'object' && !Array.isArray(candidate) && (() => {
       const value = candidate as Record<string, unknown>
@@ -302,6 +341,11 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     typeof artifact.executable !== 'string' || !artifact.executable.startsWith('/') ||
     typeof artifact.sha256 !== 'string' ||
     !/^sha256:[0-9a-f]{64}$/.test(artifact.sha256) || !Number.isSafeInteger(owner.pid) ||
+    typeof contract.path !== 'string' || !contract.path.startsWith('/') ||
+    !/^[0-9a-f]{64}$/.test(String(contract.sha256)) ||
+    !Number.isSafeInteger(contract.byteCount) || (contract.byteCount as number) < 2 ||
+    !identity(contract.identity) || contract.sourceCommit !== refs.product ||
+    contract.repositoryPath !== 'scripts/e2e/hosted-actual-owner/actual-owner-contract.v1.json' ||
     (owner.pid as number) < 1 || typeof owner.controlSocket !== 'string' ||
     !owner.controlSocket.startsWith('/') || typeof owner.walPath !== 'string' ||
     !owner.walPath.startsWith('/') || typeof admission.path !== 'string' ||
@@ -311,7 +355,7 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     !/^\d+$/.test(String(owner.processStartIdentity)) ||
     !identity(owner.controlSocketIdentity) || !identity(owner.ownerSocketIdentity) ||
     !identity(owner.walIdentity) || !identity(publication.admission) || !identity(timeline.identity) ||
-    !identity(timelineAuthority.runtimeManifestIdentity) ||
+    !identity(timelineAuthority.runtimeManifestIdentity) || !identity(timelineAuthority.productContractIdentity) ||
     !Object.values(refs).every(ref => typeof ref === 'string' && /^[0-9a-f]{40}$/.test(ref)) ||
     (writerFence !== null && (() => {
       exact(writerFence, ['generation', 'dev', 'ino'])
@@ -334,6 +378,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
       !Number.isSafeInteger(owner.walRevision) || (owner.walRevision as number) < 0)) ||
     typeof timeline.path !== 'string' || !timeline.path.startsWith('/') ||
     timelineAuthority.productRef !== refs.product ||
+    timelineAuthority.productContractSha256 !== contract.sha256 ||
+    timelineAuthority.productContractByteCount !== contract.byteCount ||
     !/^[0-9a-f]{64}$/.test(String(timelineAuthority.runtimeManifestSha256)) ||
     !Number.isSafeInteger(owner.ingressCount) || (owner.ingressCount as number) < 0 ||
     !Number.isSafeInteger(owner.deliveryCount) || (owner.deliveryCount as number) < 0 ||
