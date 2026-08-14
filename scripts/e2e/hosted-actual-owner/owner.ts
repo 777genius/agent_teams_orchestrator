@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
-import { chmod, lstat, open, readFile, realpath, unlink, type FileHandle } from 'node:fs/promises'
+import { chmod, lstat, readFile, readlink, rename, unlink, type FileHandle } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,20 +13,20 @@ import type { HostedControlRuntimePortFactoryContext } from '../../../src/servic
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { readHostedControlBootstrap, type HostedControlBootstrapAdmission } from '../../../src/services/hostedControl/HostedControlBootstrap.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
-import { fingerprintOpenCodeApprovalSessionRecord } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
+import { fingerprintOpenCodeApprovalSessionRecord, liveEffectFingerprint } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
 import { openCodeSessionBridge, type OpenCodePermissionEffectContext } from '../../../src/services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../../src/services/opencode/OpenCodeSessionStore.js'
 import { prepareOpenCodeArtifactDigestToken, resolveExecutingOpenCodeArtifactDigest } from '../../../src/services/opencode/OpenCodeArtifactDigest.js'
 import {
   assertMarkerOwnedSandbox, loadAcceptanceConfig, HOSTED_APPROVAL_ADMISSION_FILE,
-  isWithin, type ActualOwnerAcceptanceConfig,
+  isWithin, sandboxAnchor, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
 import { validateBootstrapAcceptance } from './bootstrap.js'
 import { buildAcceptanceEvidence, validateAcceptanceEvidence, validateProductTimelineEvent,
   type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
 import {
   appendPrivateNdjson, assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
-  type SecureFileIdentity,
+  openTrustedDirectory, type SecureFileIdentity,
 } from './secure-files.js'
 
 const MAX_CONTROL_BYTES = 16 * 1024
@@ -90,6 +89,7 @@ export class AcceptanceRuntime {
   private controlIdentity: { device: number; inode: number } | null = null
   private controlParentIdentity: { device: number; inode: number } | null = null
   private controlParentHandle: FileHandle | null = null
+  private controlRootHandle: FileHandle | null = null
   private publication: {
     admission: SecureFileIdentity
   } | null = null
@@ -105,15 +105,19 @@ export class AcceptanceRuntime {
   constructor(
     readonly config: ActualOwnerAcceptanceConfig,
     readonly bootstrap: HostedControlBootstrapAdmission,
+    private readonly testHooks: Readonly<{ afterControlTombstone?: () => void | Promise<void> }> = {},
   ) {
     this.evidence = buildAcceptanceEvidence({ config, status: 'starting' })
   }
 
   async start(): Promise<void> {
-    this.ownerProcessStartIdentity = await processStartIdentity(process.pid)
-    await this.writeEvidence()
+    // This entire block is read-only. Nothing below may publish evidence, create
+    // a socket, acquire the writer lease, read the bootstrap secret, or touch WAL
+    // until the marker, frozen sources, bootstrap paths, and admission bytes agree.
+    await assertMarkerOwnedSandbox(this.config.runtime)
     await this.waitForProductPublication()
     await this.assertPublicationCurrent()
+    this.ownerProcessStartIdentity = await processStartIdentity(process.pid)
     const runtime = new HostedControlRuntime(this.bootstrap, context => this.ports(context))
     this.runtime = runtime
     await runtime.start()
@@ -121,6 +125,11 @@ export class AcceptanceRuntime {
       throw new Error('hosted_actual_owner_composition_incomplete')
     }
     await this.startControl()
+    await this.service.pollIngress()
+    await this.record('poll_ingress', null)
+    if (this.providerIdentities.size === 0) {
+      throw new Error('hosted_actual_owner_provider_identity_missing')
+    }
     await this.refreshEvidence('ready')
     process.stdout.write(`${JSON.stringify({
       schemaVersion: 1,
@@ -140,7 +149,7 @@ export class AcceptanceRuntime {
     const deadline = Date.now() + this.config.productPublicationTimeoutMs
     while (Date.now() < deadline) {
       await assertMarkerOwnedSandbox(this.config.runtime)
-      const state = await readAnchoredFile(this.config.admissionFile, this.config.sandboxRoot, {
+      const state = await readAnchoredFile(this.config.admissionFile, sandboxAnchor(this.config.runtime), {
           minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600,
         }).catch(error => {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
@@ -162,7 +171,7 @@ export class AcceptanceRuntime {
   private async assertPublicationCurrent(): Promise<void> {
     if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
     await Promise.all([
-      assertAnchoredIdentity(this.config.admissionFile, this.config.sandboxRoot,
+      assertAnchoredIdentity(this.config.admissionFile, sandboxAnchor(this.config.runtime),
         this.publication.admission, { minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600 }),
       this.bootstrap.guard.assertCurrent().then(current => {
         if (!current) throw new Error('hosted_actual_owner_bootstrap_authority_lost')
@@ -199,11 +208,25 @@ export class AcceptanceRuntime {
           route.openCodeBinding.sessionRecordFingerprint) {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
       }
+      const computedLiveEffectFingerprint = liveEffectFingerprint(effect)
+      const executable = await readlink(`/proc/${effect.host.pid}/exe`)
+      const executableStat = await lstat(`/proc/${effect.host.pid}/exe`, { bigint: true })
+      if (computedLiveEffectFingerprint !== route.openCodeBinding.liveEffectFingerprint ||
+        executable.endsWith(' (deleted)') || executable !== this.config.openCodeExecutable ||
+        !executableStat.isFile() ||
+        executableStat.dev.toString() !== this.config.runtime.descriptors.openCodeExecutable.device ||
+        executableStat.ino.toString() !== this.config.runtime.descriptors.openCodeExecutable.inode) {
+        throw new Error('hosted_actual_owner_provider_identity_invalid')
+      }
       this.providerIdentities.set(route.routeId, Object.freeze({
         routeId: route.routeId,
         sessionId: route.authority.sessionId,
         sessionRecordFingerprint: route.openCodeBinding.sessionRecordFingerprint,
-        liveEffectFingerprint: route.openCodeBinding.liveEffectFingerprint,
+        liveEffectFingerprint: computedLiveEffectFingerprint,
+        executable,
+        executableDevice: executableStat.dev.toString(),
+        executableInode: executableStat.ino.toString(),
+        executableSha256: this.config.openCodeSha256,
         pid: effect.host.pid,
         processStartIdentity: await processStartIdentity(effect.host.pid),
         processStartedAtMs: effect.host.processStartedAtMs,
@@ -272,22 +295,38 @@ export class AcceptanceRuntime {
       at: new Date().toISOString(), event, approvalId,
       generation: this.admission.admissionGeneration,
     })
-    await appendPrivateNdjson(this.config.runtime.capture.ownerWalTimelinePath, this.config.sandboxRoot, timeline)
+    await appendPrivateNdjson(this.config.runtime.capture.ownerWalTimelinePath,
+      sandboxAnchor(this.config.runtime), timeline)
     await this.refreshEvidence('ready')
   }
 
   private async refreshEvidence(status: 'ready' | 'stopping'): Promise<void> {
     const state = await this.store?.read() ?? null
-    const wal = await readAnchoredFile(this.config.walFile, this.config.sandboxRoot, {
+    const wal = await readAnchoredFile(this.config.walFile, sandboxAnchor(this.config.runtime), {
       minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600,
     }).catch(() => null)
     const socketIdentity = async (path: string): Promise<SecureFileIdentity | null> => {
-      const stat = await lstat(path, { bigint: true }).catch(() => null)
-      return stat ? {
-        device: stat.dev.toString(), inode: stat.ino.toString(), size: stat.size.toString(),
-        mtimeNs: stat.mtimeNs.toString(), ctimeNs: stat.ctimeNs.toString(),
-        mode: (stat.mode & 0o777n).toString(), nlink: stat.nlink.toString(), uid: stat.uid.toString(),
-      } : null
+      const parent = await openTrustedDirectory(dirname(path), sandboxAnchor(this.config.runtime))
+      try {
+        const anchored = `${parent.anchoredPath}/${path.split('/').at(-1)}`
+        const [stat, linked] = await Promise.all([
+          lstat(anchored, { bigint: true }).catch(() => null), lstat(path, { bigint: true }).catch(() => null),
+        ])
+        if (!stat && !linked) return null
+        if (!stat || !linked || !stat.isSocket() || !linked.isSocket() || linked.isSymbolicLink() ||
+          stat.dev !== linked.dev || stat.ino !== linked.ino || (stat.mode & 0o077n) !== 0n ||
+          (process.getuid?.() !== undefined && stat.uid !== BigInt(process.getuid()))) {
+          throw new Error('hosted_actual_owner_socket_identity_unproved')
+        }
+        return {
+          device: stat.dev.toString(), inode: stat.ino.toString(), size: stat.size.toString(),
+          mtimeNs: stat.mtimeNs.toString(), ctimeNs: stat.ctimeNs.toString(),
+          mode: (stat.mode & 0o777n).toString(), nlink: stat.nlink.toString(), uid: stat.uid.toString(),
+        }
+      } finally {
+        if (parent.handle !== parent.rootHandle) await parent.handle.close()
+        await parent.rootHandle.close()
+      }
     }
     const ownerSocket = await this.ownerSocket()
     this.evidence = buildAcceptanceEvidence({
@@ -307,26 +346,30 @@ export class AcceptanceRuntime {
   }
 
   private async writeEvidence(): Promise<void> {
-    await atomicPrivateJson(this.config.evidenceFile, this.config.sandboxRoot,
+    await atomicPrivateJson(this.config.evidenceFile, sandboxAnchor(this.config.runtime),
       validateAcceptanceEvidence(this.evidence))
+  }
+
+  async writeFailure(failure: string): Promise<void> {
+    this.evidence = buildAcceptanceEvidence({ config: this.config, status: 'failed', failure })
+    await this.writeEvidence()
   }
 
   private async startControl(): Promise<void> {
     const parent = dirname(this.config.controlSocket)
-    if (await realpath(parent) !== parent) throw new Error('hosted_actual_owner_control_parent_not_canonical')
-    const parentHandle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
-    const openedParent = await parentHandle.stat()
-    if (!openedParent.isDirectory() || (openedParent.mode & 0o022) !== 0 ||
-      (process.getuid?.() !== undefined && openedParent.uid !== process.getuid())) {
-      await parentHandle.close()
-      throw new Error('hosted_actual_owner_control_parent_unsafe')
-    }
+    const anchoredParent = await openTrustedDirectory(parent, sandboxAnchor(this.config.runtime))
+    const parentHandle = anchoredParent.handle
+    const openedParent = anchoredParent.stat
     const anchoredSocket = `/proc/self/fd/${parentHandle.fd}/${this.config.controlSocket.split('/').at(-1)}`
     const existing = await lstat(this.config.controlSocket).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     })
-    if (existing) { await parentHandle.close(); throw new Error('hosted_actual_owner_control_socket_already_exists') }
+    if (existing) {
+      if (parentHandle !== anchoredParent.rootHandle) await parentHandle.close()
+      await anchoredParent.rootHandle.close()
+      throw new Error('hosted_actual_owner_control_socket_already_exists')
+    }
     const server = createServer(socket => this.handleControl(socket))
     try {
       await new Promise<void>((resolveListen, rejectListen) => {
@@ -342,16 +385,19 @@ export class AcceptanceRuntime {
         !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
         throw new Error('hosted_actual_owner_control_socket_unsafe')
       }
-      if (parentStat.dev !== openedParent.dev || parentStat.ino !== openedParent.ino) {
+      if (parentStat.dev.toString() !== openedParent.dev.toString() ||
+        parentStat.ino.toString() !== openedParent.ino.toString()) {
         throw new Error('hosted_actual_owner_control_parent_identity_drift')
       }
       this.controlIdentity = { device: socketStat.dev, inode: socketStat.ino }
       this.controlParentIdentity = { device: parentStat.dev, inode: parentStat.ino }
       this.controlParentHandle = parentHandle
+      this.controlRootHandle = anchoredParent.rootHandle
       this.control = server
     } catch (error) {
       if (server.listening) await new Promise<void>(resolveClose => server.close(() => resolveClose()))
-      await parentHandle.close()
+      if (parentHandle !== anchoredParent.rootHandle) await parentHandle.close()
+      await anchoredParent.rootHandle.close()
       throw error
     }
   }
@@ -401,12 +447,15 @@ export class AcceptanceRuntime {
   async stop(): Promise<void> {
     if (this.stopping) return
     this.stopping = true
-    await this.refreshEvidence('stopping').catch(() => undefined)
+    if (this.evidence.status === 'ready') await this.refreshEvidence('stopping').catch(() => undefined)
     const control = this.control; this.control = null
     const parentHandle = this.controlParentHandle; this.controlParentHandle = null
+    const rootHandle = this.controlRootHandle; this.controlRootHandle = null
     const anchoredSocket = parentHandle ? `/proc/self/fd/${parentHandle.fd}/${this.config.controlSocket.split('/').at(-1)}` : null
     const identity = this.controlIdentity; const parentIdentity = this.controlParentIdentity
     this.controlIdentity = null; this.controlParentIdentity = null
+    const tombstoneName = `.hosted-actual-owner-control.closed-${process.pid}-${this.config.runtime.runId}`
+    const anchoredTombstone = parentHandle ? `/proc/self/fd/${parentHandle.fd}/${tombstoneName}` : null
     const anchoredBefore = anchoredSocket ? await lstat(anchoredSocket).catch(() => null) : null
     const provedBefore = identity && parentIdentity && await assertControlCleanupAuthority(
       this.config.controlSocket, identity, parentIdentity,
@@ -417,25 +466,41 @@ export class AcceptanceRuntime {
       if (identity && !provedBefore) {
         cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
       } else if (control) {
+        if (!anchoredSocket || !anchoredTombstone || !parentHandle ||
+          await lstat(anchoredTombstone).then(() => true, error =>
+            (error as NodeJS.ErrnoException).code === 'ENOENT' ? false : Promise.reject(error))) {
+          throw new Error('hosted_actual_owner_control_tombstone_unsafe')
+        }
+        await rename(anchoredSocket, anchoredTombstone)
+        await parentHandle.sync()
+        const moved = await lstat(anchoredTombstone)
+        if (!moved.isSocket() || !identity || moved.dev !== identity.device || moved.ino !== identity.inode ||
+          await lstat(this.config.controlSocket).then(() => true, () => false)) {
+          throw new Error('hosted_actual_owner_control_tombstone_unproved')
+        }
+        // libuv remembers the descriptor path used for bind. Closing that parent
+        // descriptor before server.close makes its unlink target unreachable;
+        // a same-name substitute at the public pathname cannot be removed.
+        await parentHandle.close()
+        await this.testHooks.afterControlTombstone?.()
         await new Promise<void>(resolveClose => control.close(() => resolveClose()))
-        const [currentParent, remaining] = await Promise.all([
-          lstat(dirname(this.config.controlSocket)).catch(() => null),
-          anchoredSocket ? lstat(anchoredSocket).catch(() => null) : null,
-        ])
-        if (!currentParent || !parentIdentity || currentParent.dev !== parentIdentity.device ||
-          currentParent.ino !== parentIdentity.inode) {
-          cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
-        } else if (remaining) {
-          if (!identity || !remaining.isSocket() || remaining.dev !== identity.device || remaining.ino !== identity.inode) {
-            cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
-          } else {
-            await unlink(anchoredSocket!)
-            await parentHandle?.sync()
+        const reopened = await openTrustedDirectory(dirname(this.config.controlSocket),
+          sandboxAnchor(this.config.runtime))
+        try {
+          const remaining = await lstat(`${reopened.anchoredPath}/${tombstoneName}`)
+          if (!remaining.isSocket() || remaining.dev !== identity.device || remaining.ino !== identity.inode) {
+            throw new Error('hosted_actual_owner_control_cleanup_unproved')
           }
+          await unlink(`${reopened.anchoredPath}/${tombstoneName}`)
+          await reopened.handle.sync()
+        } finally {
+          if (reopened.handle !== reopened.rootHandle) await reopened.handle.close()
+          await reopened.rootHandle.close()
         }
       }
     } finally {
-      await parentHandle?.close()
+      if (parentHandle && parentHandle !== rootHandle) await parentHandle.close().catch(() => undefined)
+      await rootHandle?.close().catch(() => undefined)
       if (this.runtime) {
         await this.runtime.stop()
         this.bootstrapReleased = true
@@ -451,8 +516,9 @@ export class AcceptanceRuntime {
 
 export async function runActualOwnerAcceptance(args: readonly string[]): Promise<void> {
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
-  const config = await loadAcceptanceConfig({ args, repositoryRoot })
-  const bootstrap = await readHostedControlBootstrap()
+  const invocation = parseAcceptanceInvocation(args)
+  const config = await loadAcceptanceConfig({ args: invocation.configArgs, repositoryRoot })
+  const bootstrap = await readHostedControlBootstrap(invocation.bootstrapFds)
   const acceptance = new AcceptanceRuntime(config, bootstrap)
   const stop = () => void acceptance.stop().then(() => process.exit(0), error => {
     process.stderr.write(`${error instanceof Error ? error.message : 'hosted_actual_owner_cleanup_failed'}\n`)
@@ -463,14 +529,35 @@ export async function runActualOwnerAcceptance(args: readonly string[]): Promise
     await acceptance.start()
   } catch (error) {
     const failure = error instanceof Error ? error.message : 'hosted_actual_owner_start_failed'
-    await atomicPrivateJson(config.evidenceFile, config.sandboxRoot,
-      buildAcceptanceEvidence({ config, status: 'failed', failure })).catch(() => undefined)
+    await acceptance.writeFailure(failure).catch(() => undefined)
     await acceptance.stop().catch(() => undefined)
     throw error
   }
   await new Promise<void>(() => undefined)
 }
 
-if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+export function parseAcceptanceInvocation(args: readonly string[]): {
+  configArgs: readonly ['--runtime-manifest', string]
+  bootstrapFds: { launcherLeaseFd: number; livenessFd: number; bootstrapFd: number }
+} {
+  const expected = ['--runtime-manifest', '--launcher-lease-fd', '--liveness-fd', '--bootstrap-fd']
+  if (args.length !== 8 || expected.some((flag, index) => args[index * 2] !== flag)) {
+    throw new Error('hosted_actual_owner_invocation_invalid')
+  }
+  const values = [args[3], args[5], args[7]].map(value => Number(value))
+  if (values.some(value => !Number.isSafeInteger(value) || value < 6) || new Set(values).size !== 3) {
+    throw new Error('hosted_actual_owner_bootstrap_fd_map_invalid')
+  }
+  return {
+    configArgs: ['--runtime-manifest', args[1]!],
+    bootstrapFds: { launcherLeaseFd: values[0]!, livenessFd: values[1]!, bootstrapFd: values[2]! },
+  }
+}
+
+export function isDirectAcceptanceEntry(argv: readonly string[], entryUrl = import.meta.url): boolean {
+  return resolve(argv[1] ?? '') === fileURLToPath(entryUrl)
+}
+
+if (isDirectAcceptanceEntry(process.argv)) {
   await runActualOwnerAcceptance(process.argv.slice(2))
 }

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
-import { readAnchoredFile } from './secure-files.js'
+import { readAnchoredFile, type TrustedRoot } from './secure-files.js'
 
 export const ACTUAL_OWNER_PURPOSE = 'agent-teams.hosted-actual-owner-e2e/v1' as const
 export const ACTUAL_OWNER_ACCEPTANCE_PURPOSE =
@@ -69,6 +69,14 @@ export type ActualOwnerAcceptanceConfig = {
   runtime: ActualOwnerRuntimeManifest
   sandboxRoot: string
   walFile: string
+}
+
+export function sandboxAnchor(runtime: ActualOwnerRuntimeManifest): TrustedRoot {
+  return Object.freeze({
+    path: runtime.sandboxRoot,
+    device: runtime.descriptors.sandboxRoot.device,
+    inode: runtime.descriptors.sandboxRoot.inode,
+  })
 }
 
 function record(value: unknown, label: string): JsonRecord {
@@ -244,7 +252,7 @@ export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManife
   if (runtime.markerPath !== resolve(runtime.sandboxRoot, ACTUAL_OWNER_MARKER_FILE)) {
     throw new Error('hosted_actual_owner_marker_not_canonical')
   }
-  const secured = await readAnchoredFile(runtime.markerPath, runtime.sandboxRoot, {
+  const secured = await readAnchoredFile(runtime.markerPath, sandboxAnchor(runtime), {
     minimumBytes: 2, maximumBytes: 1_024, mode: 0o600,
   })
   const rootStat = await lstat(runtime.sandboxRoot, { bigint: true })

@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
-REPOSITORY_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)"
+REPOSITORY_ROOT="$(pwd -P)"
+SCRIPT_DIR="$REPOSITORY_ROOT/scripts/e2e/hosted-actual-owner"
+STABLE_LAUNCHER="$SCRIPT_DIR/cli-source"
+
+if [[ ! -f "$STABLE_LAUNCHER" ]] || ! /usr/bin/cmp -s -- "$0" "$STABLE_LAUNCHER"; then
+  echo "The acceptance launcher is not the exact source anchored by the repository cwd." >&2
+  exit 63
+fi
 
 if [[ "${1-}" == "hosted-actual-owner-e2e" ]]; then
   shift
 fi
 
-if [[ "${1-}" != "--hosted-actual-owner-acceptance-entry" || "${3-}" != "--runtime-manifest" || "$#" -ne 4 ]]; then
+if [[ "${1-}" != "--hosted-actual-owner-acceptance-entry" || "${3-}" != "--runtime-manifest" ||
+  "${5-}" != "--launcher-lease-fd" || "${7-}" != "--liveness-fd" ||
+  "${9-}" != "--bootstrap-fd" || "$#" -ne 10 ]]; then
   echo "This source-only launcher accepts only the hosted actual-owner acceptance entry." >&2
   exit 64
 fi
@@ -31,4 +39,5 @@ if [[ ! -x "$BUN_BIN" ]]; then
 fi
 
 cd "$REPOSITORY_ROOT"
-exec "$BUN_BIN" run "$ENTRY" --runtime-manifest "$4"
+exec "$BUN_BIN" run "$ENTRY" --runtime-manifest "$4" \
+  --launcher-lease-fd "$6" --liveness-fd "$8" --bootstrap-fd "${10}"

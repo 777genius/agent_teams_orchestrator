@@ -47,6 +47,13 @@ describe('hosted actual-owner acceptance evidence', () => {
       configSha256: '5'.repeat(64), controlSocketIdentity: identity,
       ownerSocketIdentity: identity, walIdentity: identity,
       walSha256: '6'.repeat(64), stateSha256: '7'.repeat(64),
+      providers: [{
+        routeId: 'route_test', sessionId: 'session_test',
+        sessionRecordFingerprint: '8'.repeat(64), liveEffectFingerprint: '9'.repeat(64),
+        executable: '/opt/opencode', executableDevice: '1', executableInode: '9',
+        executableSha256: 'a'.repeat(64), pid: 42, processStartIdentity: '100',
+        processStartedAtMs: 1,
+      }],
     })
     expect(validateAcceptanceEvidence(evidence)).toEqual(evidence)
     expect(evidence.publication.admission?.inode).toBe('6')

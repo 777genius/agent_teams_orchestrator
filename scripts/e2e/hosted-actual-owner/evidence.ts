@@ -44,15 +44,31 @@ export function validateProductTimelineEvent(value: unknown): ActualOwnerProduct
   if (keys !== 'approvalId,at,event,generation,runId,schemaVersion,sequence' || input.schemaVersion !== 1 ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId) ||
     (!approvalEvent && !reconciliationEvent) ||
-    (approvalEvent && (typeof input.approvalId !== 'string' ||
-      !/^approval_[A-Za-z0-9._:-]{8,191}$/.test(input.approvalId))) ||
-    (reconciliationEvent && input.approvalId !== null) ||
-    !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 0 ||
+    !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 1 ||
     typeof input.at !== 'string' || !Number.isFinite(Date.parse(input.at)) ||
+    new Date(input.at).toISOString() !== input.at ||
     typeof input.generation !== 'string' || input.generation.length < 1) {
     throw new Error('timeline_event_invalid')
   }
-  return value as ActualOwnerProductTimelineEvent
+  const base: ActualOwnerTimelineBase = Object.freeze({
+    schemaVersion: 1, runId: input.runId, sequence: input.sequence as number,
+    at: input.at, generation: input.generation,
+  })
+  if (approvalEvent) {
+    if (typeof input.approvalId !== 'string' ||
+      !/^approval_[A-Za-z0-9._:-]{8,191}$/.test(input.approvalId)) {
+      throw new Error('timeline_event_invalid')
+    }
+    return Object.freeze({ ...base,
+      event: input.event as (typeof ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS)[number],
+      approvalId: input.approvalId,
+    })
+  }
+  if (!reconciliationEvent || input.approvalId !== null) throw new Error('timeline_event_invalid')
+  return Object.freeze({ ...base,
+    event: input.event as (typeof ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS)[number],
+    approvalId: null,
+  })
 }
 
 export type ActualOwnerAcceptanceEvidence = {
@@ -94,6 +110,10 @@ export type ActualOwnerAcceptanceEvidence = {
     sessionId: string
     sessionRecordFingerprint: string
     liveEffectFingerprint: string
+    executable: string
+    executableDevice: string
+    executableInode: string
+    executableSha256: string
     pid: number
     processStartIdentity: string
     processStartedAtMs: number
@@ -184,18 +204,24 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
       throw new Error('acceptance_evidence_invalid')
     }
   }
+  const nested = (candidate: unknown): Record<string, unknown> => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new Error('acceptance_evidence_invalid')
+    }
+    return candidate as Record<string, unknown>
+  }
   exact(input, ['schemaVersion', 'purpose', 'status', 'runId', 'markerPath', 'refs', 'artifact', 'admission', 'publication', 'bootstrap', 'owner', 'providers', 'failure'])
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_ACCEPTANCE_PURPOSE ||
     !['starting', 'ready', 'stopping', 'failed'].includes(String(input.status)) ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId)) {
     throw new Error('acceptance_evidence_invalid')
   }
-  const artifact = input.artifact as Record<string, unknown>
-  const admission = input.admission as Record<string, unknown>
-  const owner = input.owner as Record<string, unknown>
-  const publication = input.publication as Record<string, unknown>
-  const bootstrap = input.bootstrap as Record<string, unknown>
-  const refs = input.refs as Record<string, unknown>
+  const artifact = nested(input.artifact)
+  const admission = nested(input.admission)
+  const owner = nested(input.owner)
+  const publication = nested(input.publication)
+  const bootstrap = nested(input.bootstrap)
+  const refs = nested(input.refs)
   exact(artifact, ['executable', 'sha256'])
   exact(admission, ['path', 'digest', 'generation'])
   exact(owner, ['pid', 'processStartIdentity', 'controlSocket', 'controlSocketIdentity', 'ownerSocket',
@@ -212,8 +238,14 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     })()
   const writerFence = owner.writerFence as Record<string, unknown> | null
   const ready = input.status === 'ready'
-  if (typeof artifact.executable !== 'string' || typeof artifact.sha256 !== 'string' ||
+  if (typeof input.markerPath !== 'string' || !input.markerPath.startsWith('/') ||
+    typeof artifact.executable !== 'string' || !artifact.executable.startsWith('/') ||
+    typeof artifact.sha256 !== 'string' ||
     !/^sha256:[0-9a-f]{64}$/.test(artifact.sha256) || !Number.isSafeInteger(owner.pid) ||
+    (owner.pid as number) < 1 || typeof owner.controlSocket !== 'string' ||
+    !owner.controlSocket.startsWith('/') || typeof owner.walPath !== 'string' ||
+    !owner.walPath.startsWith('/') || typeof admission.path !== 'string' ||
+    !admission.path.startsWith('/') ||
     !Array.isArray(owner.decisionOperations) || owner.decisionOperations.join(',') !==
       'approval_decision_deliver,approval_decision_reconcile' ||
     !/^\d+$/.test(String(owner.processStartIdentity)) ||
@@ -234,15 +266,26 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
       owner.ownerSocketIdentity === null || owner.walIdentity === null || writerFence === null ||
       !/^[0-9a-f]{64}$/.test(String(owner.walSha256)) ||
       !/^[0-9a-f]{64}$/.test(String(owner.stateSha256)))) ||
-    !Array.isArray(input.providers) || (input.providers as unknown[]).some(candidate => {
+    (input.status === 'failed' ? typeof input.failure !== 'string' || input.failure.length < 1 :
+      input.failure !== null) ||
+    !Array.isArray(input.providers) || (ready && input.providers.length === 0) ||
+    (input.providers as unknown[]).some(candidate => {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return true
       const provider = candidate as Record<string, unknown>
       exact(provider, ['routeId', 'sessionId', 'sessionRecordFingerprint', 'liveEffectFingerprint',
+        'executable', 'executableDevice', 'executableInode', 'executableSha256',
         'pid', 'processStartIdentity', 'processStartedAtMs'])
-      return !Number.isSafeInteger(provider.pid) || !/^\d+$/.test(String(provider.processStartIdentity)) ||
-        !Number.isSafeInteger(provider.processStartedAtMs) ||
+      return !Number.isSafeInteger(provider.pid) || (provider.pid as number) < 1 ||
+        !/^[1-9]\d*$/.test(String(provider.processStartIdentity)) ||
+        !Number.isSafeInteger(provider.processStartedAtMs) || (provider.processStartedAtMs as number) < 1 ||
+        typeof provider.executable !== 'string' || !provider.executable.startsWith('/') ||
+        !/^\d+$/.test(String(provider.executableDevice)) ||
+        !/^\d+$/.test(String(provider.executableInode)) ||
+        !/^[0-9a-f]{64}$/.test(String(provider.executableSha256)) ||
         !/^[0-9a-f]{64}$/.test(String(provider.sessionRecordFingerprint)) ||
-        !/^[0-9a-f]{64}$/.test(String(provider.liveEffectFingerprint))
+        !/^[0-9a-f]{64}$/.test(String(provider.liveEffectFingerprint)) ||
+        provider.executable !== artifact.executable ||
+        provider.executableSha256 !== (artifact.sha256 as string).slice('sha256:'.length)
     })) {
     throw new Error('acceptance_evidence_invalid')
   }

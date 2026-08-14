@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, link, lstat, mkdtemp, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:net'
 import { join } from 'node:path'
 import { appendPrivateNdjson, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile } from './secure-files.js'
@@ -54,6 +54,22 @@ describe('hosted actual-owner descriptor fences', () => {
     })).rejects.toThrow(/identity_drift/)
   })
 
+  test('rejects a self-consistent replacement sandbox and marker tree', async () => {
+    const root = await privateRoot()
+    const stat = await lstat(root, { bigint: true })
+    const anchor = { path: root, device: stat.dev.toString(), inode: stat.ino.toString() }
+    const path = join(root, 'private.json')
+    await writeFile(path, '{"accepted":true}\n', { mode: 0o600 })
+    const displaced = `${root}-displaced`
+    temporaryRoots.push(displaced)
+    await rename(root, displaced)
+    await mkdir(root, { mode: 0o700 })
+    await writeFile(path, '{"accepted":true}\n', { mode: 0o600 })
+    await expect(readAnchoredFile(path, anchor, {
+      minimumBytes: 2, maximumBytes: 1024, mode: 0o600,
+    })).rejects.toThrow(/untrusted_parent/)
+  })
+
   test('does not publish evidence after synchronized temporary substitution', async () => {
     const root = await privateRoot()
     const target = join(root, 'evidence.json')
@@ -83,6 +99,15 @@ describe('hosted actual-owner descriptor fences', () => {
     await symlink(outside, timeline)
     await expect(appendPrivateNdjson(timeline, root, { event: 'poll' })).rejects.toThrow()
     expect(await Bun.file(outside).text()).toBe('')
+  })
+
+  test('timeline append proves the exact prior bytes plus one canonical line', async () => {
+    const root = await privateRoot()
+    const timeline = join(root, 'timeline.ndjson')
+    await writeFile(timeline, '{"sequence":1}\n', { mode: 0o600 })
+    const result = await appendPrivateNdjson(timeline, root, { sequence: 2 })
+    expect(await Bun.file(timeline).text()).toBe('{"sequence":1}\n{"sequence":2}\n')
+    expect(result.size).toBe('30')
   })
 
   test('treats control socket rotation as cleanup unproved', async () => {
