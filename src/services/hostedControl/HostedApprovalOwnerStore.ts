@@ -5,6 +5,8 @@ import type {
   HostedApprovalAckResult,
   HostedApprovalClaimRequest,
   HostedApprovalIngressRecord,
+  HostedApprovalReconciliationRequest,
+  HostedApprovalReconciliationResult,
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerWal, type HostedApprovalOwnerState } from './HostedApprovalOwnerWal.js'
 import type { HostedApprovalRuntimeAdmission } from './HostedApprovalRuntimeAdmission.js'
@@ -114,6 +116,32 @@ export class HostedApprovalOwnerStore {
       ingress[index] = { ...record, acknowledgedAtIso: new Date(now).toISOString() }
       await this.wal.publish(state, { ...withoutRevision(state), ingress })
       return { status: 'acknowledged' }
+    })
+  }
+
+  reconcileDecision(
+    request: HostedApprovalReconciliationRequest,
+  ): Promise<HostedApprovalReconciliationResult> {
+    return this.wal.locked(async state => {
+      if (!state) return { status: 'unavailable' }
+      const matching = state.deliveries.filter(delivery =>
+        delivery.providerDeliveryId === request.providerDeliveryId &&
+        delivery.reconciliationRef === request.reconciliationRef,
+      )
+      if (matching.length !== 1) return { status: 'unavailable' }
+      const delivery = matching[0]!
+      const ingress = [...state.ingress, ...state.retiredIngress]
+        .find(record => record.outboxId === delivery.outboxId && record.effectRef === delivery.effectRef)
+      if (!ingress || ingress.authority.teamId !== request.partition.teamId ||
+        ingress.authority.runId !== request.partition.runId) return { status: 'unavailable' }
+      if (delivery.phase === 'started') return { status: 'operator_required' }
+      if (delivery.phase === 'completed' && delivery.result === 'delivered') {
+        return { status: 'delivered' }
+      }
+      if (delivery.phase === 'rejected') {
+        return { status: 'not_delivered' }
+      }
+      return { status: 'unavailable' }
     })
   }
 

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 
 import { createHostedRawDomainProof } from './ownerProof.js'
 import { HostedControlDispatcher } from './HostedControlDispatcher.js'
@@ -7,6 +8,8 @@ import {
   HOSTED_APPROVAL_MAX_CLAIM_AGGREGATE_BYTES,
   HOSTED_APPROVAL_MAX_PAYLOAD_JSON_BYTES,
   HOSTED_APPROVAL_PROOF_DOMAIN,
+  HOSTED_APPROVAL_WIRE_CAPABILITY,
+  HOSTED_APPROVAL_WIRE_CAPABILITY_DIGEST,
   HostedApprovalWireDispatcher,
   type HostedApprovalDeliveryRequest,
   type HostedApprovalIngressAuthority,
@@ -30,8 +33,8 @@ const authority = {
   restoreGeneration: 4,
   workspaceId,
   mountBinding: { mountGeneration: 9, declaredRootHash: 'a'.repeat(64) },
-  teamId,
 }
+const runtimeAuthority = { ...authority, teamId }
 const ingressAuthority: HostedApprovalIngressAuthority = {
   deploymentId: authority.deploymentId,
   teamId,
@@ -54,9 +57,18 @@ describe('HostedApprovalWireDispatcher', () => {
       ownerId: 'owner_approval-wire',
       leaseToken: 'lease_approval-wire',
     })
+    expect(HOSTED_APPROVAL_WIRE_CAPABILITY).toBe(
+      '{"format":"agent-teams.hosted-approval-wire-capability/v1","wireSchemaVersion":4,"ownerProofDomain":"agent-teams.hosted-runtime-approval.owner-proof/v1","operations":["approval_ingress_claim","approval_ingress_ack","approval_ingress_authority_resolve","approval_decision_deliver","approval_decision_reconcile"],"openCodeProtocol":"agent-teams-hosted-approval-v2","openCodeSchemaVersion":2}',
+    )
+    expect(HOSTED_APPROVAL_WIRE_CAPABILITY_DIGEST).toBe(
+      '40a6c4a131b4e64c04b87337fbce667c91f274fb85b3879c6cdcac49dbbbd639',
+    )
+    expect(request.value.ownerProof).toBe(
+      'a1043f9a8b698597c7bc30cf994c3caa529bc5a614dbdf972376f4b29b4bb1c9',
+    )
     const base = {
       secret,
-      authority,
+      authority: runtimeAuthority,
       getOwnerBinding: () => ownerBinding,
       lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
       messages: { dispatch: async () => ({}) },
@@ -81,8 +93,16 @@ describe('HostedApprovalWireDispatcher', () => {
       ownerId: 'owner_approval-wire',
       leaseToken: 'lease_approval-wire',
     })
+    const golden = JSON.parse(readFileSync(new URL(
+      '../../../docs/hosted-approval-wire-v4-golden.json', import.meta.url,
+    ), 'utf8')) as Record<string, string>
+    const { ownerProof: requestProof, ...unsignedRequest } = request.value
+    expect(golden.capability).toBe(HOSTED_APPROVAL_WIRE_CAPABILITY)
+    expect(golden.capabilitySha256).toBe(HOSTED_APPROVAL_WIRE_CAPABILITY_DIGEST)
+    expect(golden.serializedUnsignedRequest).toBe(JSON.stringify(unsignedRequest))
+    expect(golden.requestOwnerProof).toBe(requestProof)
     expect(request.line.replace(/[0-9a-f]{64}(?="}$)/, 'GOLDEN')).toBe(
-      '{"schemaVersion":2,"exchangeId":"approval-request_66666666666666666666666666666666","operation":"approval_ingress_ack","ownerBinding":{"ownerAuthority":"owner-authority_approval-wire","ownerGeneration":7,"ownerSessionId":"owner-session_approval-wire","socketIdentity":{"device":"11","inode":"12","uid":501,"gid":20,"mode":384}},"authority":{"actorId":"actor_approval-wire","deploymentId":"deployment_approval-wire","bootId":"boot_approval-wire","restoreGeneration":4,"workspaceId":"workspace_33333333333333333333333333333333","mountBinding":{"mountGeneration":9,"declaredRootHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"teamId":"team_11111111111111111111111111111111"},"payload":{"outboxId":"runtime_permission:effect:5555555555555555555555555555555555555555555555555555555555555555","generation":3,"ownerId":"owner_approval-wire","leaseToken":"lease_approval-wire"},"ownerProof":"GOLDEN"}',
+      '{"schemaVersion":4,"exchangeId":"approval-request_66666666666666666666666666666666","operation":"approval_ingress_ack","ownerBinding":{"ownerAuthority":"owner-authority_approval-wire","ownerGeneration":7,"ownerSessionId":"owner-session_approval-wire","socketIdentity":{"device":"11","inode":"12","uid":501,"gid":20,"mode":384}},"authority":{"actorId":"actor_approval-wire","deploymentId":"deployment_approval-wire","bootId":"boot_approval-wire","restoreGeneration":4,"workspaceId":"workspace_33333333333333333333333333333333","mountBinding":{"mountGeneration":9,"declaredRootHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"payload":{"outboxId":"runtime_permission:effect:5555555555555555555555555555555555555555555555555555555555555555","generation":3,"ownerId":"owner_approval-wire","leaseToken":"lease_approval-wire"},"ownerProof":"GOLDEN"}',
     )
     const response = await dispatcher({
       ...ports(),
@@ -104,7 +124,7 @@ describe('HostedApprovalWireDispatcher', () => {
     )
   })
 
-  test('dispatches all four exact product payloads through narrow ports', async () => {
+  test('dispatches all five exact product payloads through narrow ports', async () => {
     const calls: string[] = []
     const delivery = deliveryRequest()
     const wire = dispatcher({
@@ -142,6 +162,10 @@ describe('HostedApprovalWireDispatcher', () => {
         expect(input.payloadFingerprint).toBe(fingerprintHostedApprovalDelivery(delivery))
         return { status: 'idempotent_replay' }
       },
+      reconcileDecision: async (input) => {
+        calls.push(`reconcile:${input.reconciliationRef}`)
+        return { status: 'operator_required' }
+      },
     })
 
     expect((await dispatch(wire, 'approval_ingress_claim', {
@@ -156,10 +180,16 @@ describe('HostedApprovalWireDispatcher', () => {
       .toMatchObject({ status: 'resolved', scope: { restoreGeneration: 4 } })
     expect((await dispatch(wire, 'approval_decision_deliver', delivery)).payload)
       .toEqual({ status: 'idempotent_replay' })
+    expect((await dispatch(wire, 'approval_decision_reconcile', {
+      reconciliationRef: delivery.reconciliationRef,
+      providerDeliveryId: delivery.providerDeliveryId,
+      partition: delivery.partition,
+    })).payload).toEqual({ status: 'operator_required' })
     expect(calls).toEqual([
       `claim:1:${8 * 1024 * 1024 - 8 * 1024}`, 'ack:3', `resolve:${ingressAuthority.laneId}`,
       `authorize:${fingerprintHostedApprovalDelivery(delivery)}`,
       `deliver:${fingerprintHostedApprovalDelivery(delivery)}`,
+      `reconcile:${delivery.reconciliationRef}`,
     ])
   })
 
@@ -175,6 +205,7 @@ describe('HostedApprovalWireDispatcher', () => {
       mutate(valid.value, { ownerBinding: { ...ownerBinding, ownerGeneration: 8 } }),
       mutate(valid.value, { authority: { ...authority, restoreGeneration: 5 } }),
       mutate(valid.value, { authority: { ...authority, mountBinding: { ...authority.mountBinding, mountGeneration: 10 } } }),
+      mutate(valid.value, { authority: { ...authority, teamId } }),
       mutate(valid.value, { payload: { ...ingressAuthority, teamId: `team_${'9'.repeat(32)}` } }),
       mutate(valid.value, { extra: true }),
     ]
@@ -216,11 +247,34 @@ describe('HostedApprovalWireDispatcher', () => {
       .rejects.toThrow('idempotency conflict')
   })
 
+  test('binds reconciliation to the single configured runtime team and exact statuses', async () => {
+    const request = deliveryRequest()
+    const reconciliation = {
+      reconciliationRef: request.reconciliationRef,
+      providerDeliveryId: request.providerDeliveryId,
+      partition: request.partition,
+    }
+    await expect(dispatch(dispatcher(ports()), 'approval_decision_reconcile', {
+      ...reconciliation,
+      partition: { ...request.partition, teamId: `team_${'9'.repeat(32)}` },
+    })).rejects.toThrow('partition')
+    await expect(dispatch(dispatcher(ports()), 'approval_decision_reconcile', {
+      ...reconciliation, extra: true,
+    })).rejects.toThrow('keys')
+    await expect(dispatch(dispatcher({
+      ...ports(),
+      reconcileDecision: async () => ({ status: 'stale_generation' as never }),
+    }), 'approval_decision_reconcile', reconciliation)).rejects.toThrow('status')
+  })
+
   test('surfaces a durable ambiguous provider call as operator_required', async () => {
+    const request = deliveryRequest()
     expect((await dispatch(dispatcher({
-      ...ports(), authorizeDecision: async () => ({ status: 'operator_required' }),
-    }), 'approval_decision_deliver', deliveryRequest())).payload)
-      .toEqual({ status: 'operator_required' })
+      ...ports(), authorizeDecision: async () => ({
+        status: 'operator_required', reconciliationRef: request.reconciliationRef,
+      }),
+    }), 'approval_decision_deliver', request)).payload)
+      .toEqual({ status: 'operator_required', reconciliationRef: request.reconciliationRef })
   })
 
   test('binds authenticated principal into the delivery fingerprint and rejects its omission', async () => {
@@ -337,7 +391,7 @@ describe('HostedApprovalWireDispatcher', () => {
       resolveIngressAuthority: async () => ({ status: 'unavailable' as const }),
     }
     await expect(new HostedControlDispatcher({
-      secret, authority, getOwnerBinding: () => ownerBinding,
+      secret, authority: runtimeAuthority, getOwnerBinding: () => ownerBinding,
       lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
       messages: { dispatch: async () => ({}) }, approvals,
     }).dispatch(request.value)).rejects.toThrow('raw frame')
@@ -406,7 +460,7 @@ describe('HostedApprovalWireDispatcher', () => {
 
 function dispatcher(approvals: HostedApprovalWirePort): HostedApprovalWireDispatcher {
   return new HostedApprovalWireDispatcher({
-    secret, authority, getOwnerBinding: () => ownerBinding, approvals,
+    secret, authority: runtimeAuthority, getOwnerBinding: () => ownerBinding, approvals,
   })
 }
 
@@ -421,6 +475,7 @@ function ports(): HostedApprovalWirePort {
       authorization: { token: 'approval_authorization_wire', persistedAuthority: ingressAuthority },
     }),
     deliverDecision: async () => ({ status: 'unavailable' }),
+    reconcileDecision: async () => ({ status: 'unavailable' }),
   }
 }
 
@@ -429,7 +484,7 @@ function signed(operation: Parameters<typeof dispatch>[1], payload: unknown): {
   line: string
 } {
   const unsigned = {
-    schemaVersion: 2,
+    schemaVersion: 4,
     exchangeId: `approval-request_${'6'.repeat(32)}`,
     operation,
     ownerBinding,
@@ -450,7 +505,8 @@ async function dispatch(
     | 'approval_ingress_claim'
     | 'approval_ingress_ack'
     | 'approval_ingress_authority_resolve'
-    | 'approval_decision_deliver',
+    | 'approval_decision_deliver'
+    | 'approval_decision_reconcile',
   payload: unknown,
 ): Promise<Record<string, unknown>> {
   const request = signed(operation, payload)
@@ -472,6 +528,7 @@ function mutate(value: Record<string, unknown>, patch: Record<string, unknown>):
 function deliveryRequest(): HostedApprovalDeliveryRequest {
   return {
     providerDeliveryId: 'provider_delivery_approval-wire',
+    reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`,
     principal: { kind: 'operator', actorId: 'actor_approval-owner' },
     deliveryRef: 'delivery_ref_approval-wire',
     approvalId: `approval_${'7'.repeat(32)}`,

@@ -397,7 +397,8 @@ export class HostedControlServer {
 
 function isApprovalOperation(value: unknown): boolean {
   return value === 'approval_ingress_claim' || value === 'approval_ingress_ack' ||
-    value === 'approval_ingress_authority_resolve' || value === 'approval_decision_deliver'
+    value === 'approval_ingress_authority_resolve' || value === 'approval_decision_deliver' ||
+    value === 'approval_decision_reconcile'
 }
 
 function decodeUtf8(bytes: Uint8Array): string {

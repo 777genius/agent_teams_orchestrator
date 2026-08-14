@@ -7,6 +7,7 @@ import type {
   HostedApprovalDeliveryPortResult,
   HostedApprovalDeliveryRequest,
   HostedApprovalIngressAuthority,
+  HostedApprovalReconciliationResult,
   HostedApprovalWirePort,
 } from './HostedApprovalWire.js'
 import { HostedApprovalOwnerStore, withoutRevision } from './HostedApprovalOwnerStore.js'
@@ -61,10 +62,12 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     if (!(await this.#authorityCurrent())) return null
     const admittedRoute = this.options.admission.routes.find(route => isDeepStrictEqual(route.authority, authority))
     if (!admittedRoute) return null
-    const state = await this.options.store.read()
-    return state?.admissionGeneration === this.options.admission.admissionGeneration &&
-      state.admissionDigest === this.options.admission.digest &&
-      state.routes.some(route => isDeepStrictEqual(route, admittedRoute)) ? authority : null
+    try {
+      const state = await this.options.store.read()
+      return state?.admissionGeneration === this.options.admission.admissionGeneration &&
+        state.admissionDigest === this.options.admission.digest &&
+        state.routes.some(route => isDeepStrictEqual(route, admittedRoute)) ? authority : null
+    } catch { return null }
   }
 
   async resolveIngressAuthority(authority: HostedApprovalIngressAuthority): Promise<HostedApprovalAuthorityResult> {
@@ -73,7 +76,8 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     if (!admittedRoute) {
       return { status: 'stale_generation' }
     }
-    const state = await this.options.store.read()
+    let state: HostedApprovalOwnerState | null
+    try { state = await this.options.store.read() } catch { return { status: 'unavailable' } }
     if (state?.admissionGeneration !== this.options.admission.admissionGeneration ||
       state.admissionDigest !== this.options.admission.digest ||
       !state.routes.some(route => isDeepStrictEqual(route, admittedRoute))) return { status: 'stale_generation' }
@@ -82,7 +86,9 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
 
   async authorizeDecision(input: { request: HostedApprovalDeliveryRequest; payloadFingerprint: string }): Promise<HostedApprovalDeliveryAuthorizationResult> {
     if (!(await this.#authorityCurrent())) return { status: 'unavailable' }
-    const state = await this.options.store.read(); if (!state) return { status: 'unavailable' }
+    let state: HostedApprovalOwnerState | null
+    try { state = await this.options.store.read() } catch { return { status: 'unavailable' } }
+    if (!state) return { status: 'unavailable' }
     const prior = findDelivery(state, input.request)
     if (prior) return replay(prior, input.request, input.payloadFingerprint)
     const bound = bindRequest(state, input.request); if (!bound) return { status: 'stale_generation' }
@@ -97,7 +103,8 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       !isDeepStrictEqual(input.authorization.persistedAuthority, input.admittedAuthority) || !(await this.#authorityCurrent())) {
       return { status: 'unavailable' }
     }
-    return this.options.store.wal.locked(async state => {
+    let reconciliationOnly = false
+    try { return await this.options.store.wal.locked(async state => {
       if (!state || state.admissionGeneration !== this.options.admission.admissionGeneration ||
         state.admissionDigest !== this.options.admission.digest) return { status: 'stale_generation' }
       const prior = findDelivery(state, input.request)
@@ -118,13 +125,16 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
         if (memberId === bound.route.authority.deliveryOwnerId) return this.#reject(state, bound.route, bound.record.outboxId, input, 'self_approval')
       }
       const started: HostedApprovalDeliveryState = {
-        providerDeliveryId: input.request.providerDeliveryId, deliveryRef: input.request.deliveryRef,
+        providerDeliveryId: input.request.providerDeliveryId,
+        reconciliationRef: input.request.reconciliationRef,
+        deliveryRef: input.request.deliveryRef,
         payloadFingerprint: input.payloadFingerprint, outboxId: bound.record.outboxId,
         effectRef: bound.record.effectRef, phase: 'started', result: null,
       }
       let startedState = await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, started] })
+      reconciliationOnly = true
       if (!(await this.#routeCurrent(bound.route))) {
-        return { status: 'operator_required' }
+        return this.#settle(startedState, started, 'rejected', 'stale_generation')
       }
       const result = await this.options.runtime.deliver({
         route: bound.route,
@@ -139,16 +149,35 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
       // Reload after the provider boundary and prove the exact started record
       // survived before any terminal publish. The WAL fence remains the shared
       // owner/handover serialization point.
-      const fresh = await this.options.store.read(); const liveStarted = fresh?.deliveries
+      let fresh: HostedApprovalOwnerState | null
+      try { fresh = await this.options.store.read() } catch { return operatorRequired(input.request.reconciliationRef) }
+      const liveStarted = fresh?.deliveries
         .find(item => item.outboxId === started.outboxId && item.deliveryRef === started.deliveryRef)
-      if (!fresh || !liveStarted || !isDeepStrictEqual(liveStarted, started)) return { status: 'operator_required' }
+      if (!fresh || !liveStarted || !isDeepStrictEqual(liveStarted, started)) {
+        return operatorRequired(input.request.reconciliationRef)
+      }
       startedState = fresh
-      if (result === 'ambiguous') return { status: 'operator_required' }
-      if (!(await this.#routeCurrent(bound.route))) return { status: 'operator_required' }
-      if (result === 'not_started') return this.#settle(startedState, bound.route, started, 'rejected', 'stale_generation')
-      if (result === 'unavailable') return this.#settle(startedState, bound.route, started, 'rejected', 'unavailable')
-      return this.#settle(startedState, bound.route, started, 'completed', 'delivered')
-    })
+      if (result === 'ambiguous') return operatorRequired(input.request.reconciliationRef)
+      if (result === 'not_started') return this.#settle(startedState, started, 'rejected', 'stale_generation')
+      if (result === 'unavailable') return this.#settle(startedState, started, 'rejected', 'unavailable')
+      return this.#settle(startedState, started, 'completed', 'delivered')
+    }) } catch {
+      return reconciliationOnly
+        ? operatorRequired(input.request.reconciliationRef)
+        : { status: 'unavailable' }
+    }
+  }
+
+  async reconcileDecision(
+    request: Parameters<HostedApprovalWirePort['reconcileDecision']>[0],
+  ): Promise<HostedApprovalReconciliationResult> {
+    if (request.partition.teamId !== this.options.admission.outerAuthority.teamId ||
+      !(await this.#authorityCurrent())) return { status: 'unavailable' }
+    try {
+      return await this.options.store.reconcileDecision(request)
+    } catch {
+      return { status: 'unavailable' }
+    }
   }
 
   async #authorityCurrent(): Promise<boolean> {
@@ -191,12 +220,14 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     if (!(await this.#routeCurrent(route))) return { status: 'stale_generation' as const }
     const record = [...state.ingress, ...state.retiredIngress].find(item => item.outboxId === outboxId)
     if (!record) return { status: 'unavailable' as const }
-    const delivery: HostedApprovalDeliveryState = { providerDeliveryId: input.request.providerDeliveryId, deliveryRef: input.request.deliveryRef, payloadFingerprint: input.payloadFingerprint, outboxId, effectRef: record.effectRef, phase: 'rejected', result }
+    const delivery: HostedApprovalDeliveryState = { providerDeliveryId: input.request.providerDeliveryId, reconciliationRef: input.request.reconciliationRef, deliveryRef: input.request.deliveryRef, payloadFingerprint: input.payloadFingerprint, outboxId, effectRef: record.effectRef, phase: 'rejected', result }
     await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: [...state.deliveries, delivery] })
     return { status: result } as const
   }
-  async #settle(state: HostedApprovalOwnerState, route: HostedApprovalRuntimeRoute, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>) {
-    if (!(await this.#routeCurrent(route))) return { status: 'operator_required' as const }
+  async #settle(state: HostedApprovalOwnerState, delivery: HostedApprovalDeliveryState, phase: 'completed' | 'rejected', result: NonNullable<HostedApprovalDeliveryState['result']>) {
+    // A provider receipt or proven terminal pre-effect failure is stronger than
+    // a later admission rotation. Persist that evidence under the WAL CAS; do
+    // not turn a proved outcome back into ambiguity.
     await this.options.store.wal.publish(state, { ...withoutRevision(state), deliveries: state.deliveries.map(item => item.providerDeliveryId === delivery.providerDeliveryId ? { ...item, phase, result } : item) })
     return { status: result === 'delivered' ? 'delivered' as const : result }
   }
@@ -211,10 +242,13 @@ function bindRequest(state: HostedApprovalOwnerState, request: HostedApprovalDel
 }
 function replay(prior: HostedApprovalDeliveryState, request: HostedApprovalDeliveryRequest, fingerprint: string): HostedApprovalDeliveryPortResult {
   if (prior.providerDeliveryId !== request.providerDeliveryId || prior.deliveryRef !== request.deliveryRef ||
-    prior.payloadFingerprint !== fingerprint) return { status: 'conflict' }
-  if (prior.phase === 'started') return { status: 'operator_required' }
+    prior.reconciliationRef !== request.reconciliationRef || prior.payloadFingerprint !== fingerprint) return { status: 'conflict' }
+  if (prior.phase === 'started') return operatorRequired(prior.reconciliationRef)
   if (prior.phase === 'completed') return { status: 'idempotent_replay' }
   return { status: prior.result ?? 'unavailable' }
+}
+function operatorRequired(reconciliationRef: string): HostedApprovalDeliveryPortResult {
+  return { status: 'operator_required', reconciliationRef }
 }
 function findDelivery(state: HostedApprovalOwnerState, request: HostedApprovalDeliveryRequest): HostedApprovalDeliveryState | undefined {
   const permissionOutboxes = new Set([...state.ingress, ...state.retiredIngress]

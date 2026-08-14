@@ -1,6 +1,6 @@
 # Hosted approval owner routing and settlement contract
 
-The orchestrator owner is partitioned by the immutable tuple
+Each orchestrator runtime remains strictly single-team and is partitioned by the immutable tuple
 `deploymentId + bootId + workspaceId + teamId + restoreGeneration + mountGeneration + declaredRootHash`. Trusted
 provisioning may publish `hosted-approval-runtime-admission.v1.json` as a canonical
 private `0600` file. Until that producer is available, absence keeps approval
@@ -68,22 +68,36 @@ are rejected. `permissionDigest` is lowercase SHA-256 of those exact bytes.
 Golden vector `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}`
 has digest `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`.
 
-The product decision worker must route every approval record to the owner selected
-from that record's immutable `partition.teamId`; it must not reuse a team selected
-in UI or route one mixed-team batch through one socket. The owner response schema
-must include `operator_required`. That result means the provider effect began but
+The product decision worker must bind each product team route to that team's own
+owner generation, owner session, socket path and socket identity, and admission artifact,
+selected from the record's immutable `partition.teamId`. It must not reuse a team selected
+in UI, multiplex teams through one owner/socket, or send a mixed-team batch through one
+socket. Within each owner, every ingress record, delivery, and reconciliation payload is
+validated against the runtime's one configured team. The schema-v4 outer `authority` has
+no process-global `teamId`; the immutable payload partition supplies the team binding.
+
+Schema v4 has exactly five operations: `approval_ingress_claim`, `approval_ingress_ack`,
+`approval_ingress_authority_resolve`, `approval_decision_deliver`, and
+`approval_decision_reconcile`. Its canonical capability digest is
+`sha256:40a6c4a131b4e64c04b87337fbce667c91f274fb85b3879c6cdcac49dbbbd639`.
+The cross-repository raw-byte/HMAC fixture is
+`docs/hosted-approval-wire-v4-golden.json` and is pinned to product head
+`44ada5b51032a3aafe81ce8e30b50cdb4a06c909`.
+
+The owner response schema must include `operator_required` with the request's stable
+`reconciliationRef`. That result means the provider effect began but
 its settlement could not be proved. It is durable, must not be auto-retried or
 acknowledged as delivered, and requires an explicit operator reconciliation action.
-The orchestrator patch exposes this result on the wire; product database/schema,
-cross-team owner lookup, and the operator reconciliation UI/job belong in the
-separate product repository patch.
+Reconciliation never calls the provider effect: durable `started`/ambiguous evidence maps
+to `operator_required`, completed evidence maps to `delivered`, proven terminal
+not-started evidence maps to `not_delivered`, and missing, stale, or unreadable evidence
+maps to `unavailable`.
 
 The normal admission publisher and product per-team owner resolver are separate
 deployment/product integration responsibilities. This orchestrator capability
 remains absent until a trusted publisher supplies the exact private admission
-file. Product must select the owner from each record's immutable `teamId`,
-propagate `operator_required` without retry, and never route a mixed-team batch
-through one fixed socket.
+file. Product must select the team-specific owner from each record's immutable `teamId`,
+propagate `operator_required` without retry, and never implement a same-socket route catalog.
 
 Startup recovery is state-only and performs no provider calls. Live permission
 observation begins only after hosted-control readiness. A failed permission probe

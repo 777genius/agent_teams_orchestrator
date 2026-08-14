@@ -244,12 +244,16 @@ describe('HostedApprovalOwnerService R2', () => {
     expect(auth.status).toBe('authorized')
     if (auth.status === 'authorized') {
       await expect(fx.service.deliverDecision({ request, payloadFingerprint: fingerprint,
-        authorization: auth.authorization, admittedAuthority: record!.authority })).rejects.toThrow()
+        authorization: auth.authorization, admittedAuthority: record!.authority })).resolves.toEqual({
+          status: 'operator_required', reconciliationRef: request.reconciliationRef,
+        })
     }
     expect(effects).toBe(0)
     const persisted = await fx.store.read()
     expect(persisted?.deliveries).toMatchObject([{ phase: 'started', result: null }])
-    expect(await fx.service.authorizeDecision({ request, payloadFingerprint: fingerprint })).toEqual({ status: 'operator_required' })
+    expect(await fx.service.authorizeDecision({ request, payloadFingerprint: fingerprint })).toEqual({
+      status: 'operator_required', reconciliationRef: request.reconciliationRef,
+    })
   })
 
   test('SIGKILL after the service effect edge leaves durable started and the replacement performs zero provider effects', async () => {
@@ -384,7 +388,7 @@ if (mode === 'replacement') {
       throw new Error(`Replacement owner failed: ${await new Response(replacement.stderr).text()}`)
     }
     expect(JSON.parse(await readFile(outcome, 'utf8'))).toEqual({
-      result: { status: 'operator_required' },
+      result: { status: 'operator_required', reconciliationRef: request.reconciliationRef },
       providerCalls: 0,
     })
     expect((await readFile(effects, 'utf8')).trim().split('\n')).toEqual(['provider-effect'])
@@ -412,16 +416,80 @@ if (mode === 'replacement') {
         })
       )[0]!
       const request = delivery(record)
-      expect(await runDelivery(fx.service, request, record.authority)).toEqual({
-        status,
-      })
+      const expected = status === 'operator_required'
+        ? { status, reconciliationRef: request.reconciliationRef }
+        : { status }
+      expect(await runDelivery(fx.service, request, record.authority)).toEqual(expected)
       expect(
         await fx.service.authorizeDecision({
           request,
           payloadFingerprint: fingerprintHostedApprovalDelivery(request),
         }),
-      ).toEqual({ status })
+      ).toEqual(expected)
     }
+  })
+
+  test('reconciles durable evidence without repeating the provider effect', async () => {
+    for (const [effect, expected] of [
+      ['delivered', 'delivered'],
+      ['not_started', 'not_delivered'],
+      ['ambiguous', 'operator_required'],
+      ['unavailable', 'not_delivered'],
+    ] as const) {
+      let providerCalls = 0
+      const fx = await fixture({ deliver: () => { providerCalls += 1; return effect } })
+      const record = (await fx.service.claimIngress({
+        request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 },
+        maximumAggregateBytes: 1_000_000,
+      }))[0]!
+      const request = delivery(record)
+      await runDelivery(fx.service, request, record.authority)
+      expect(providerCalls).toBe(1)
+      expect(await fx.service.reconcileDecision({
+        reconciliationRef: request.reconciliationRef,
+        providerDeliveryId: request.providerDeliveryId,
+        partition: request.partition,
+      })).toEqual({ status: expected })
+      expect(providerCalls).toBe(1)
+    }
+  })
+
+  test('returns unavailable for missing, mismatched, or stale reconciliation identity', async () => {
+    const fx = await fixture({ deliver: () => 'ambiguous' })
+    const record = (await fx.service.claimIngress({
+      request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 },
+      maximumAggregateBytes: 1_000_000,
+    }))[0]!
+    const request = delivery(record)
+    await runDelivery(fx.service, request, record.authority)
+    await expect(fx.service.reconcileDecision({
+      reconciliationRef: `approval-reconciliation_${'9'.repeat(64)}`,
+      providerDeliveryId: request.providerDeliveryId,
+      partition: request.partition,
+    })).resolves.toEqual({ status: 'unavailable' })
+    fx.revoke()
+    await expect(fx.service.reconcileDecision({
+      reconciliationRef: request.reconciliationRef,
+      providerDeliveryId: request.providerDeliveryId,
+      partition: request.partition,
+    })).resolves.toEqual({ status: 'unavailable' })
+  })
+
+  test('maps identity-snapshot read failures to unavailable during external-writer revalidation', async () => {
+    const fx = await fixture()
+    const [record] = await fx.service.claimIngress({
+      request: { ownerId: 'o', leaseToken: 'l', leaseDurationMs: 30_000, limit: 1 },
+      maximumAggregateBytes: 1_000_000,
+    })
+    const request = delivery(record!)
+    fx.store.read = async () => { throw new Error('external writer replaced identity snapshot') }
+    await expect(fx.service.getAdmittedIngressAuthority(record!.authority)).resolves.toBeNull()
+    await expect(fx.service.resolveIngressAuthority(record!.authority))
+      .resolves.toEqual({ status: 'unavailable' })
+    await expect(fx.service.authorizeDecision({
+      request,
+      payloadFingerprint: fingerprintHostedApprovalDelivery(request),
+    })).resolves.toEqual({ status: 'unavailable' })
   })
 
   test('fences acknowledged replay by exact generation owner and token', async () => {
@@ -712,6 +780,7 @@ function delivery(record: {
     .slice(0, 32)}`
   return {
     providerDeliveryId: 'delivery_1',
+    reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`,
     principal: { kind: 'operator', actorId: 'actor_operator' },
     deliveryRef: record.deliveryRef,
     approvalId,
