@@ -12,6 +12,7 @@ import {
   HOSTED_LIFECYCLE_PLAN_FILE,
   HOSTED_MESSAGE_DIRECTORY,
   HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE,
+  OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED,
 } from './HostedControlProductionComposition.js'
 import type { HostedControlRuntimePortFactoryContext } from './HostedControlRuntime.js'
 
@@ -60,7 +61,8 @@ describe('createHostedControlProductionPorts', () => {
     await expect(createHostedControlProductionPorts(context(teamRoot))).rejects.toThrow()
   })
 
-  test('keeps current upstream approval capability-false even with valid private admission', async () => {
+  test('keeps the pinned candidate capability-false pending the no-fake sandbox E2E', async () => {
+    expect(OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED).toBe(false)
     const teamRoot = await makeTeamRoot('hosted-production-composition-')
     await writePlan(teamRoot, 'opencode')
     await writeApprovalAdmission(teamRoot)

@@ -21,6 +21,8 @@ export type HostedApprovalRuntimeRoute = {
     credentialId: string
     runtimeInstanceId: string
     deliveryOwnerId: string
+    /** SHA-256 of the exact OpenCode executable admitted for this route. */
+    openCodeArtifactDigest: `sha256:${string}`
     /** SHA-256 of the exact, stable live OpenCode session projection. */
     sessionRecordFingerprint: string
     /** SHA-256 of prepareProfile + ensured host/process identity at POST edge. */
@@ -270,6 +272,7 @@ function decodeOpenCodeBinding(value: unknown): HostedApprovalRuntimeRoute['open
       'credentialId',
       'runtimeInstanceId',
       'deliveryOwnerId',
+      'openCodeArtifactDigest',
       'sessionRecordFingerprint',
       'liveEffectFingerprint',
     ],
@@ -285,6 +288,8 @@ function decodeOpenCodeBinding(value: unknown): HostedApprovalRuntimeRoute['open
     !IDENTIFIER.test(input.runtimeInstanceId) ||
     typeof input.deliveryOwnerId !== 'string' ||
     !MEMBER_ID.test(input.deliveryOwnerId) ||
+    typeof input.openCodeArtifactDigest !== 'string' ||
+    !/^sha256:[0-9a-f]{64}$/.test(input.openCodeArtifactDigest) ||
     typeof input.sessionRecordFingerprint !== 'string' ||
     !/^[0-9a-f]{64}$/.test(input.sessionRecordFingerprint) ||
     typeof input.liveEffectFingerprint !== 'string' ||

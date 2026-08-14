@@ -598,7 +598,7 @@ function decodeWalRoute(value: unknown, actors: Record<string, unknown>): Hosted
   const scope = object(route.scope, 'WAL route scope')
   exact(scope, ['principalId', 'workspaceId', 'teamId', 'authorityGeneration', 'restoreGeneration'], 'WAL route scope')
   const binding = object(route.openCodeBinding, 'WAL OpenCode binding')
-  exact(binding, ['toolApprovalMode', 'planGeneration', 'credentialGeneration', 'credentialId', 'runtimeInstanceId', 'deliveryOwnerId', 'sessionRecordFingerprint', 'liveEffectFingerprint'], 'WAL OpenCode binding')
+  exact(binding, ['toolApprovalMode', 'planGeneration', 'credentialGeneration', 'credentialId', 'runtimeInstanceId', 'deliveryOwnerId', 'openCodeArtifactDigest', 'sessionRecordFingerprint', 'liveEffectFingerprint'], 'WAL OpenCode binding')
   if (!identifier(route.routeId) || !identifier(route.memberName) || authority.providerId !== 'opencode' ||
     !identifier(authority.deploymentId) || typeof authority.teamId !== 'string' || !/^team_[0-9a-f]{32}$/.test(authority.teamId) ||
     typeof authority.runId !== 'string' || !/^run_[0-9a-f]{32}$/.test(authority.runId) || !positive(authority.planGeneration) ||
@@ -609,6 +609,7 @@ function decodeWalRoute(value: unknown, actors: Record<string, unknown>): Hosted
     binding.planGeneration !== authority.planGeneration ||
     binding.credentialGeneration !== authority.credentialGeneration || binding.credentialId !== authority.credentialId ||
     binding.runtimeInstanceId !== authority.runtimeInstanceId || binding.deliveryOwnerId !== authority.deliveryOwnerId ||
+    typeof binding.openCodeArtifactDigest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(binding.openCodeArtifactDigest) ||
     typeof binding.sessionRecordFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(binding.sessionRecordFingerprint) ||
     typeof binding.liveEffectFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(binding.liveEffectFingerprint) ||
     scope.teamId !== authority.teamId || !identifier(scope.workspaceId) || typeof scope.authorityGeneration !== 'string' ||
@@ -662,6 +663,7 @@ function decodeRetiredWalIngress(value: unknown): HostedApprovalIngressRecord {
       credentialId: authority.credentialId,
       runtimeInstanceId: authority.runtimeInstanceId,
       deliveryOwnerId: authority.deliveryOwnerId,
+      openCodeArtifactDigest: `sha256:${'0'.repeat(64)}`,
       sessionRecordFingerprint: '0'.repeat(64),
       liveEffectFingerprint: '0'.repeat(64),
     },

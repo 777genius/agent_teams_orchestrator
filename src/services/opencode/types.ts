@@ -55,6 +55,8 @@ export type OpenCodeHostHandle = {
   profileRootKey: string
   projectPath: string
   projectBehaviorFingerprint: string
+  /** Exact installed/executing OpenCode executable bytes for this host. */
+  openCodeArtifactDigest?: `sha256:${string}` | null
   baseUrl: string
   port: number
   pid: number
@@ -660,6 +662,8 @@ export type OpenCodeSessionRecord = {
   projectPath: string
   profileRootKey: string
   hostKey: string
+  /** Exact OpenCode executable bytes bound when this session was created. */
+  openCodeArtifactDigest?: `sha256:${string}` | null
   toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null

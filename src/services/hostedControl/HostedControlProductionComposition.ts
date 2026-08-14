@@ -26,7 +26,7 @@ export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
 export const HOSTED_MESSAGE_DIRECTORY = 'hosted-messages'
 export const HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE = 'hosted-approval-runtime-admission.v1.json'
 export const HOSTED_APPROVAL_OWNER_WAL_FILE = 'hosted-approval-owner.v1.json'
-/** Remains false until the accepted hosted-approval v2 upstream artifact is pinned. */
+/** Remains false until the pinned hosted-approval v2 artifact passes the no-fake sandbox E2E. */
 export const OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED: boolean = false
 
 /**
@@ -86,8 +86,8 @@ export function createHostedControlProductionPortFactory(
         join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE),
       ).load(context.authority)
       // Loading still validates a published admission. Keep the production
-      // port absent until the exact authenticated v2 server artifact is pinned
-      // and its cross-repo golden contract is independently verified.
+      // port absent until the exact authenticated v2 server artifact passes
+      // the no-fake sandbox E2E and its cross-repo contract is verified.
       if (OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED) {
         approvals = new HostedApprovalOwnerService({
           store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(

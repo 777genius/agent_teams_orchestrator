@@ -461,6 +461,35 @@ describe('OpenCodeSessionBridge', () => {
     }
   })
 
+  test('authorizes the OpenCode artifact before creating an observation or reply client', async () => {
+    let clients = 0
+    const artifactDigest = `sha256:${'d'.repeat(64)}` as const
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => ({ ...host, openCodeArtifactDigest: artifactDigest }),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clients += 1
+          return {} as never
+        },
+      },
+    })
+    const record = buildRecord({ openCodeArtifactDigest: artifactDigest })
+    const rejectArtifact = async () => false
+
+    await expect(bridge.observeHostedApprovalPermissions(record, rejectArtifact))
+      .rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    await expect(bridge.answerPermission(record, {
+      requestId: 'permission_1',
+      decision: 'allow',
+      authorizeObservation: rejectArtifact,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(clients).toBe(0)
+  })
+
   test('preserves provider success when host cleanup fails after POST', async () => {
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -698,6 +727,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('persists manual tool approval mode in fresh session records', async () => {
     const upserts: OpenCodeSessionRecord[] = []
+    const admittedArtifactDigest = `sha256:${'d'.repeat(64)}` as const
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
       sessionStore: {
@@ -711,7 +741,7 @@ describe('OpenCodeSessionBridge', () => {
       hostManager: {
         ensureHost: async input => {
           expect(input?.preparedProfile).toBe(profile)
-          return host
+          return { ...host, openCodeArtifactDigest: admittedArtifactDigest }
         },
         releaseHost: async () => {},
         retainHostLease: async () => {},
@@ -759,8 +789,10 @@ describe('OpenCodeSessionBridge', () => {
     })
 
     expect(record.toolApprovalMode).toBe('manual')
+    expect(record.openCodeArtifactDigest).toBe(admittedArtifactDigest)
     expect(record.managedConfigFingerprint).toBe('managed-config-v1')
     expect(upserts[0]?.toolApprovalMode).toBe('manual')
+    expect(upserts[0]?.openCodeArtifactDigest).toBe(admittedArtifactDigest)
     expect(upserts[0]?.managedConfigFingerprint).toBe('managed-config-v1')
   })
 

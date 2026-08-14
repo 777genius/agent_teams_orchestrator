@@ -27,6 +27,7 @@ const route: HostedApprovalRuntimeRoute = {
     toolApprovalMode: 'manual',
     planGeneration: 2, credentialGeneration: 3, credentialId: 'credential_1',
     runtimeInstanceId: 'runtime_1', deliveryOwnerId: `member_${'4'.repeat(32)}`,
+    openCodeArtifactDigest: `sha256:${'c'.repeat(64)}`,
     sessionRecordFingerprint: 'a'.repeat(64),
     liveEffectFingerprint: 'b'.repeat(64),
   },
@@ -39,6 +40,16 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     expect(() => decodeOwnerState(extra)).toThrow('keys')
     const substituted = state(); substituted.actorMembers.actor_owner = `member_${'9'.repeat(32)}`
     expect(() => decodeOwnerState(substituted)).toThrow('route binding')
+  })
+
+  test('rejects missing or malformed persisted OpenCode artifact bindings', () => {
+    const missing = state() as unknown as { routes: Array<{ openCodeBinding: Record<string, unknown> }> }
+    delete missing.routes[0]!.openCodeBinding.openCodeArtifactDigest
+    expect(() => decodeOwnerState(missing)).toThrow('WAL OpenCode binding keys')
+
+    const malformed = state()
+    malformed.routes[0]!.openCodeBinding.openCodeArtifactDigest = `sha256:${'C'.repeat(64)}`
+    expect(() => decodeOwnerState(malformed)).toThrow('WAL route binding')
   })
 
   test('rejects ingress authority, payload, acknowledgement, and delivery substitutions', () => {

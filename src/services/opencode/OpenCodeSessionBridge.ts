@@ -130,6 +130,7 @@ export type OpenCodePermissionEffectContext = {
     profileRootKey: string
     projectPath: string
     projectBehaviorFingerprint: string
+    openCodeArtifactDigest?: `sha256:${string}` | null
     pid: number
     processStartedAtMs: number | null
     resolvedConfigFingerprint: string | null
@@ -674,6 +675,7 @@ export class OpenCodeSessionBridge {
         projectPath: host.projectPath,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
+        openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
         toolApprovalMode: params.toolApprovalMode ?? 'auto',
         runtimePid: host.pid > 0 ? host.pid : undefined,
         resolvedBehaviorFingerprint: host.resolvedConfigFingerprint,
@@ -867,6 +869,7 @@ export class OpenCodeSessionBridge {
           profileRootKey: host.profileRootKey,
           projectPath: host.projectPath,
           projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+          openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
           pid: host.pid,
           processStartedAtMs: host.processStartedAtMs ?? null,
           resolvedConfigFingerprint: host.resolvedConfigFingerprint,
@@ -1520,6 +1523,10 @@ export class OpenCodeSessionBridge {
       expectedHostedPermission?: OpenCodeHostedApprovalObservedPermission
       /** Requires the upstream atomic config-CAS permission-reply contract. */
       requireAtomicConfigReply?: boolean
+      /** Fences the executable before any hosted provider observation. */
+      authorizeObservation?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean>
       /** Revalidates the persisted session/effect binding after fresh host proof. */
       validatePreparedEffect?: (
         context: OpenCodePermissionEffectContext,
@@ -1536,6 +1543,10 @@ export class OpenCodeSessionBridge {
     } = { phase: 'not_started' }
     try {
       return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      if (params.authorizeObservation &&
+        !(await params.authorizeObservation({ record, profile, host }))) {
+        throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
       const client = this.clientFactory.create(
         baseUrl,
         {},
@@ -1626,6 +1637,7 @@ export class OpenCodeSessionBridge {
         pid: host.pid,
         processStartedAtMs: host.processStartedAtMs,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+        openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
       }
       const prepareHost = this.hostManager.prepareEffectHostToken?.bind(this.hostManager)
       hostToken = prepareHost
@@ -1717,8 +1729,12 @@ export class OpenCodeSessionBridge {
    */
   async observeHostedApprovalPermissions(
     record: OpenCodeSessionRecord,
+    authorizeObservation?: (context: OpenCodePermissionEffectContext) => Promise<boolean>,
   ): Promise<OpenCodeHostedApprovalObservedPermission[]> {
-    return this.withSessionHost(record, async ({ baseUrl, profile }) => {
+    return this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      if (authorizeObservation && !(await authorizeObservation({ record, profile, host }))) {
+        throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
       const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
       if (!client.getHostedApprovalCapability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')

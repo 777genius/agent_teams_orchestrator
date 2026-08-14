@@ -703,7 +703,7 @@ if (mode === 'replacement') {
     expect(effects).toBe(1)
   })
 
-  test('performs zero effects after exact plan credential runtime or owner rotation with the same run and session', async () => {
+  test('performs zero effects after plan credential runtime owner or artifact rotation with the same run and session', async () => {
     for (const rotate of [
       (route: HostedApprovalRuntimeRoute) => ({
         ...route,
@@ -752,6 +752,13 @@ if (mode === 'replacement') {
         openCodeBinding: {
           ...route.openCodeBinding,
           deliveryOwnerId: `member_${'5'.repeat(32)}`,
+        },
+      }),
+      (route: HostedApprovalRuntimeRoute) => ({
+        ...route,
+        openCodeBinding: {
+          ...route.openCodeBinding,
+          openCodeArtifactDigest: `sha256:${'e'.repeat(64)}` as const,
         },
       }),
     ]) {
@@ -867,6 +874,7 @@ function makeRoute(): HostedApprovalRuntimeRoute {
       credentialId: 'credential_1',
       runtimeInstanceId: 'runtime_1',
       deliveryOwnerId: `member_${'4'.repeat(32)}`,
+      openCodeArtifactDigest: `sha256:${'c'.repeat(64)}`,
       sessionRecordFingerprint: 'a'.repeat(64),
       liveEffectFingerprint: 'b'.repeat(64),
     },

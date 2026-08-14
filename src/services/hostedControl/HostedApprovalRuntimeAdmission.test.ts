@@ -89,6 +89,29 @@ describe('PrivateFileHostedApprovalRuntimeAdmissionStore R2', () => {
       .rejects.toThrow('OpenCode binding')
   })
 
+  test('requires the exact lowercase sha256 OpenCode artifact binding', async () => {
+    const missing = snapshot() as unknown as {
+      routes: Array<{ openCodeBinding: Record<string, unknown> }>
+    }
+    delete missing.routes[0]!.openCodeBinding.openCodeArtifactDigest
+    let input = await file(missing)
+    await expect(new PrivateFileHostedApprovalRuntimeAdmissionStore(input.path).load(authority))
+      .rejects.toThrow('OpenCode binding keys')
+
+    for (const digest of [
+      '033c9c6f4f73e6d84a10c6edc3ab84e5aad078bf5c75f005721e1e94e85b8a02',
+      `sha256:${'A'.repeat(64)}`,
+      `sha256:${'a'.repeat(63)}`,
+      `sha512:${'a'.repeat(64)}`,
+    ]) {
+      const malformed = snapshot()
+      malformed.routes[0]!.openCodeBinding.openCodeArtifactDigest = digest as `sha256:${string}`
+      input = await file(malformed)
+      await expect(new PrivateFileHostedApprovalRuntimeAdmissionStore(input.path).load(authority))
+        .rejects.toThrow('OpenCode binding')
+    }
+  })
+
   test('effect token rejects an admission inode replacement at consume edge', async () => {
     const { path } = await file(snapshot())
     const admission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(path).load(authority)
@@ -178,6 +201,7 @@ function snapshot() {
           credentialId: routeAuthority.credentialId,
           runtimeInstanceId: routeAuthority.runtimeInstanceId,
           deliveryOwnerId: routeAuthority.deliveryOwnerId,
+          openCodeArtifactDigest: 'sha256:033c9c6f4f73e6d84a10c6edc3ab84e5aad078bf5c75f005721e1e94e85b8a02' as const,
           sessionRecordFingerprint: 'a'.repeat(64),
           liveEffectFingerprint: 'b'.repeat(64),
         },

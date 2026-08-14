@@ -10,6 +10,7 @@ import {
 import { openCodeSessionStore, type OpenCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { OpenCodeNormalizedPermission } from '../opencode/types.js'
 import type { OpenCodeHostedApprovalObservedPermission } from '../opencode/OpenCodeSessionBridge.js'
+import { prepareOpenCodeArtifactDigestToken } from '../opencode/OpenCodeArtifactDigest.js'
 import type { HostedApprovalIngressRecord } from './HostedApprovalWire.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
 
@@ -31,11 +32,17 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
       'answerPermission' | 'observeHostedApprovalPermissions'
     > = openCodeSessionBridge,
     private readonly now: () => number = Date.now,
+    private readonly artifacts: {
+      prepareEffectToken(expectedDigest: string): { consume(): boolean } | null
+    } = { prepareEffectToken: prepareOpenCodeArtifactDigestToken },
   ) {}
 
   async observe(route: HostedApprovalRuntimeRoute): Promise<readonly HostedApprovalObservedPermission[]> {
     const record = await this.#record(route)
-    const permissions = await this.bridge.observeHostedApprovalPermissions(record)
+    const permissions = await this.bridge.observeHostedApprovalPermissions(
+      record,
+      async context => this.#artifactMatches(route, context),
+    )
     if (permissions.some(item => item.permission.sessionId !== route.authority.sessionId)) {
       throw new Error('Hosted approval OpenCode permission session mismatch')
     }
@@ -79,6 +86,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
         expectedPermissionRaw: expected.permission.raw,
         expectedHostedPermission: expected.providerObservation,
         requireAtomicConfigReply: true,
+        authorizeObservation: async context => this.#artifactMatches(input.route, context),
         validatePreparedEffect: async context => {
           const freshRecord = await this.#record(input.route)
           if (fingerprintOpenCodeApprovalSessionRecord(freshRecord) !==
@@ -95,7 +103,22 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
         authorizeEffect: async context => {
           if (liveEffectFingerprint(context) !== input.route.openCodeBinding.liveEffectFingerprint ||
             !(await input.revalidate())) return false
-          return input.prepareEffectToken ? await input.prepareEffectToken() ?? false : true
+          const artifactToken = this.artifacts.prepareEffectToken(
+            input.route.openCodeBinding.openCodeArtifactDigest,
+          )
+          if (!artifactToken) return false
+          const ownerToken = input.prepareEffectToken ? await input.prepareEffectToken() : null
+          if (input.prepareEffectToken && !ownerToken) {
+            artifactToken.consume()
+            return false
+          }
+          return {
+            consume: () => {
+              const artifactCurrent = artifactToken.consume()
+              const ownerCurrent = ownerToken?.consume() ?? true
+              return artifactCurrent && ownerCurrent
+            },
+          }
         },
       })
     } catch (error) {
@@ -113,10 +136,18 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
     if (!record || record.providerId !== 'opencode' || record.toolApprovalMode !== 'manual' ||
       record.runId !== route.authority.runId ||
       record.opencodeSessionId !== route.authority.sessionId || record.staleReason !== null ||
+      record.openCodeArtifactDigest !== route.openCodeBinding.openCodeArtifactDigest ||
       fingerprintOpenCodeApprovalSessionRecord(record) !== route.openCodeBinding.sessionRecordFingerprint) {
       throw new Error('Hosted approval OpenCode route changed')
     }
     return record
+  }
+
+  #artifactMatches(route: HostedApprovalRuntimeRoute, context: OpenCodePermissionEffectContext): boolean {
+    if (context.record.openCodeArtifactDigest !== route.openCodeBinding.openCodeArtifactDigest ||
+      context.host.openCodeArtifactDigest !== route.openCodeBinding.openCodeArtifactDigest) return false
+    const token = this.artifacts.prepareEffectToken(route.openCodeBinding.openCodeArtifactDigest)
+    return token?.consume() ?? false
   }
 }
 
@@ -171,6 +202,7 @@ export function fingerprintOpenCodeApprovalSessionRecord(record: {
   opencodeSessionId: string
   projectPath: string
   hostKey: string
+  openCodeArtifactDigest?: `sha256:${string}` | null
   profileRootKey: string
   projectBehaviorFingerprint: string
   managedConfigFingerprint?: string
@@ -190,6 +222,7 @@ export function fingerprintOpenCodeApprovalSessionRecord(record: {
     opencodeSessionId: record.opencodeSessionId,
     projectPath: record.projectPath,
     hostKey: record.hostKey,
+    openCodeArtifactDigest: record.openCodeArtifactDigest ?? null,
     profileRootKey: record.profileRootKey,
     projectBehaviorFingerprint: record.projectBehaviorFingerprint,
     managedConfigFingerprint: record.managedConfigFingerprint ?? null,
@@ -209,6 +242,7 @@ export function liveEffectFingerprint(context: OpenCodePermissionEffectContext):
     profileRootKey: context.host.profileRootKey,
     projectPath: context.host.projectPath,
     projectBehaviorFingerprint: context.host.projectBehaviorFingerprint,
+    openCodeArtifactDigest: context.host.openCodeArtifactDigest ?? null,
     runtimePid: context.host.pid,
     processStartedAtMs: context.host.processStartedAtMs,
     resolvedConfigFingerprint: context.host.resolvedConfigFingerprint,

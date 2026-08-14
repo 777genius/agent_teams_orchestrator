@@ -17,6 +17,10 @@ import {
 } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import {
+  resolveOpenCodeArtifactDigest,
+  type OpenCodeArtifactDigest,
+} from './OpenCodeArtifactDigest.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
@@ -1159,6 +1163,7 @@ export class OpenCodeHostManager {
   private async adoptPersistentHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    openCodeArtifactDigest: OpenCodeArtifactDigest | null,
     resolveConfigFingerprint: boolean,
     lease?: OpenCodeHostLeaseInput,
   ): Promise<OpenCodeHostHandle | null> {
@@ -1236,12 +1241,15 @@ export class OpenCodeHostManager {
     const processStartedAtMs = processIdentity.state === 'unverified'
       ? await this.verifyLegacyPersistentHostIdentity(record, processIdentity.startedAtMs)
       : processIdentity.startedAtMs ?? record.processStartedAtMs
+    const executingArtifactMatches = !openCodeArtifactDigest || process.platform !== 'linux' ||
+      resolveOpenCodeArtifactDigest(`/proc/${record.pid}/exe`) === openCodeArtifactDigest
 
     const handle: OpenCodeHostHandle = {
       hostKey,
       profileRootKey: record.profileRootKey,
       projectPath: record.projectPath,
       projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+      openCodeArtifactDigest: executingArtifactMatches ? openCodeArtifactDigest : null,
       baseUrl: record.baseUrl,
       port: record.port,
       pid: record.pid,
@@ -1455,6 +1463,7 @@ export class OpenCodeHostManager {
   private async createHost(
     hostKey: string,
     profile: OpenCodePreparedProfile,
+    openCodeArtifactDigest: OpenCodeArtifactDigest | null,
     lifetime: OpenCodeHostLifetime,
     resolveConfigFingerprint: boolean,
     abortSignal?: AbortSignal,
@@ -1488,6 +1497,7 @@ export class OpenCodeHostManager {
           profileRootKey: profile.profileRootKey,
           projectPath: profile.projectPath,
           projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+          openCodeArtifactDigest,
           baseUrl,
           port,
           pid: child.pid ?? -1,
@@ -1535,6 +1545,7 @@ export class OpenCodeHostManager {
       profileRootKey: profile.profileRootKey,
       projectPath: profile.projectPath,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+      openCodeArtifactDigest,
       baseUrl,
       port,
       pid: child.pid ?? -1,
@@ -1574,6 +1585,13 @@ export class OpenCodeHostManager {
         throw new Error(
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
         )
+      }
+      if (openCodeArtifactDigest && !this.deps.spawnHostProcess && process.platform === 'linux' &&
+        resolveOpenCodeArtifactDigest(`/proc/${handle.pid}/exe`) !== openCodeArtifactDigest) {
+        // Preserve ordinary OpenCode startup for wrapper/interpreter commands,
+        // but publish no hosted artifact authority unless installed and
+        // executing bytes are the same exact executable.
+        handle.openCodeArtifactDigest = null
       }
       if (lifetime === 'persistent') {
         if (lease) await this.upsertPersistentHostWithLease(handle, lease)
@@ -1629,6 +1647,11 @@ export class OpenCodeHostManager {
       params.abortSignal,
     )
     const binaryPath = resolveOpenCodeBinaryPath()
+    // Test/custom process factories do not prove which executable they run;
+    // only the production resolver/spawn path may publish artifact identity.
+    const openCodeArtifactDigest = this.deps.spawnHostProcess
+      ? null
+      : resolveOpenCodeArtifactDigest(binaryPath)
     if (binaryPath) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
@@ -1646,12 +1669,12 @@ export class OpenCodeHostManager {
     const hostLifetime = params.hostLifetime ?? 'persistent'
     const explicitHostKey = params.hostKey?.trim()
     const hostKey = explicitHostKey || await (async () => {
-      const binaryHostIdentity = binaryPath
+      const binaryHostIdentity = openCodeArtifactDigest ?? (binaryPath
         ? await raceOpenCodeAbortSignal(
             resolveOpenCodeBinaryHostIdentity(binaryPath),
             params.abortSignal,
           )
-        : 'missing-binary'
+        : 'missing-binary')
       const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${profile.managedAuthFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
@@ -1718,11 +1741,12 @@ export class OpenCodeHostManager {
       return this.withPersistentHostStartupLock(hostKey, async () => {
         const adopted =
           hostLifetime === 'persistent'
-            ? await this.adoptPersistentHost(hostKey, profile, resolveConfigFingerprint, params.lease)
+            ? await this.adoptPersistentHost(hostKey, profile, openCodeArtifactDigest, resolveConfigFingerprint, params.lease)
             : null
         const handle = adopted ?? await this.createHost(
           hostKey,
           profile,
+          openCodeArtifactDigest,
           hostLifetime,
           resolveConfigFingerprint,
           params.abortSignal,
@@ -1767,10 +1791,15 @@ export class OpenCodeHostManager {
     pid: number
     processStartedAtMs: number | null
     resolvedConfigFingerprint: string | null
+    openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<boolean> {
     const entry = this.hosts.get(input.hostKey)
     if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
       input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
+    if (input.openCodeArtifactDigest &&
+      (entry.handle.openCodeArtifactDigest !== input.openCodeArtifactDigest ||
+        process.platform === 'linux' &&
+          resolveOpenCodeArtifactDigest(`/proc/${input.pid}/exe`) !== input.openCodeArtifactDigest)) return false
     const startedBefore = await this.readProcessStartTimeMs(input.pid).catch(() => null)
     if (startedBefore !== input.processStartedAtMs) return false
     if (!(await this.checkHealthyHostOnce(entry.handle.baseUrl))) return false
@@ -1790,6 +1819,7 @@ export class OpenCodeHostManager {
     pid: number
     processStartedAtMs: number | null
     resolvedConfigFingerprint: string | null
+    openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<{ consume(): boolean } | null> {
     const entry = this.hosts.get(input.hostKey)
     if (!entry || !(await this.verifyEffectHost(input))) return null
@@ -1803,6 +1833,10 @@ export class OpenCodeHostManager {
         return live === entry && live.handle === handle &&
           handle.pid === input.pid && handle.processStartedAtMs === input.processStartedAtMs &&
           handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
+          (!input.openCodeArtifactDigest ||
+            handle.openCodeArtifactDigest === input.openCodeArtifactDigest) &&
+          (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
+            resolveOpenCodeArtifactDigest(`/proc/${input.pid}/exe`) === input.openCodeArtifactDigest) &&
           this.isProcessAlive(input.pid)
       },
     }
