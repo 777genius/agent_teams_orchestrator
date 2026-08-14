@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { lstat, readFile, realpath } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
+import { readAnchoredFile } from './secure-files.js'
 
 export const ACTUAL_OWNER_PURPOSE = 'agent-teams.hosted-actual-owner-e2e/v1' as const
 export const ACTUAL_OWNER_ACCEPTANCE_PURPOSE =
@@ -132,20 +132,17 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
 }
 
 export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManifest): Promise<void> {
-  const [rootPath, markerPath] = await Promise.all([realpath(runtime.sandboxRoot), realpath(runtime.markerPath)])
-  if (rootPath !== runtime.sandboxRoot || markerPath !== runtime.markerPath ||
-    runtime.markerPath !== resolve(runtime.sandboxRoot, ACTUAL_OWNER_MARKER_FILE)) {
+  if (runtime.markerPath !== resolve(runtime.sandboxRoot, ACTUAL_OWNER_MARKER_FILE)) {
     throw new Error('hosted_actual_owner_marker_not_canonical')
   }
-  const [rootStat, markerStat] = await Promise.all([
-    lstat(runtime.sandboxRoot, { bigint: true }), lstat(runtime.markerPath, { bigint: true }),
-  ])
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || Number(rootStat.mode & 0o077n) !== 0 ||
-    !markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.nlink !== 1n ||
-    Number(markerStat.mode & 0o777n) !== 0o600 || markerStat.size < 2n || markerStat.size > 1_024n) {
+  const secured = await readAnchoredFile(runtime.markerPath, runtime.sandboxRoot, {
+    minimumBytes: 2, maximumBytes: 1_024, mode: 0o600,
+  })
+  const rootStat = await lstat(runtime.sandboxRoot, { bigint: true })
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || Number(rootStat.mode & 0o077n) !== 0) {
     throw new Error('hosted_actual_owner_marker_identity_invalid')
   }
-  const marker = record(JSON.parse(await readFile(runtime.markerPath, 'utf8')), 'marker')
+  const marker = record(JSON.parse(secured.bytes.toString('utf8')), 'marker')
   exact(marker, ['schemaVersion', 'purpose', 'runId', 'rootBasename', 'rootDevice', 'rootInode'], 'marker')
   if (marker.schemaVersion !== 1 || marker.purpose !== ACTUAL_OWNER_PURPOSE ||
     marker.runId !== runtime.runId || marker.rootBasename !== basename(runtime.sandboxRoot) ||
@@ -154,35 +151,26 @@ export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManife
   }
 }
 
-async function hashFile(path: string): Promise<string> {
-  const hash = createHash('sha256')
-  await new Promise<void>((resolveStream, rejectStream) => {
-    const stream = createReadStream(path, { flags: 'r' })
-    stream.on('data', chunk => hash.update(chunk))
-    stream.once('error', rejectStream)
-    stream.once('end', resolveStream)
-  })
-  return hash.digest('hex')
-}
-
-async function assertPrivateCanonicalFile(path: string, label: string): Promise<void> {
-  if (await realpath(path) !== path) throw new Error(`hosted_actual_owner_${label}_not_canonical`)
-  const stat = await lstat(path)
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size < 2 ||
-    stat.size > 1024 * 1024 || (stat.mode & 0o077) !== 0 ||
-    (process.getuid?.() !== undefined && stat.uid !== process.getuid())) {
+async function readPrivateCanonicalFile(path: string, label: string): Promise<Buffer> {
+  try {
+    return (await readAnchoredFile(path, dirname(path), {
+      minimumBytes: 2, maximumBytes: 1024 * 1024,
+    })).bytes
+  } catch {
     throw new Error(`hosted_actual_owner_${label}_not_private`)
   }
 }
 
 export async function assertCandidateArtifact(path: string, expected: string): Promise<void> {
-  if ((await realpath(path)) !== path) throw new Error('hosted_actual_owner_candidate_not_canonical')
-  const stat = await lstat(path)
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size < 1 ||
-    (stat.mode & 0o111) === 0 || (stat.mode & 0o022) !== 0) {
-    throw new Error('hosted_actual_owner_candidate_unsafe')
+  let bytes: Buffer
+  try {
+    bytes = (await readAnchoredFile(path, dirname(path), {
+      minimumBytes: 1, maximumBytes: 1024 * 1024 * 1024, executable: true, ownerOnly: false,
+    })).bytes
+  } catch { throw new Error('hosted_actual_owner_candidate_unsafe') }
+  if (createHash('sha256').update(bytes).digest('hex') !== expected) {
+    throw new Error('hosted_actual_owner_candidate_digest_mismatch')
   }
-  if (await hashFile(path) !== expected) throw new Error('hosted_actual_owner_candidate_digest_mismatch')
 }
 
 async function assertRepository(root: string, expected: string, label: 'orchestrator' | 'product'): Promise<void> {
@@ -223,8 +211,8 @@ export async function loadAcceptanceConfig(input: {
     throw new Error('hosted_actual_owner_arguments_invalid')
   }
   const runtimeManifestPath = absolutePath(input.args[1], 'runtime_manifest')
-  await assertPrivateCanonicalFile(runtimeManifestPath, 'runtime_manifest')
-  const runtime = parseRuntimeManifest(JSON.parse(await readFile(runtimeManifestPath, 'utf8')))
+  const runtimeBytes = await readPrivateCanonicalFile(runtimeManifestPath, 'runtime_manifest')
+  const runtime = parseRuntimeManifest(JSON.parse(runtimeBytes.toString('utf8')))
   await assertMarkerOwnedSandbox(runtime)
   const repositoryRoot = await realpath(input.repositoryRoot)
   await assertRepository(repositoryRoot, runtime.refs.orchestrator, 'orchestrator')

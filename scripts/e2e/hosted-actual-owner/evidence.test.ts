@@ -21,8 +21,13 @@ const config = {
 
 describe('hosted actual-owner acceptance evidence', () => {
   test('emits the exact machine-readable readiness and decision-control schema', () => {
-    const evidence = buildAcceptanceEvidence({ config, status: 'ready' })
+    const identity = { device: '1', inode: '2', size: '3', mtimeNs: '4', ctimeNs: '5' }
+    const evidence = buildAcceptanceEvidence({
+      config, status: 'ready',
+      publication: { hostedControlConfig: identity, admission: { ...identity, inode: '6' } },
+    })
     expect(validateAcceptanceEvidence(evidence)).toEqual(evidence)
+    expect(evidence.publication.admission?.inode).toBe('6')
     expect(evidence.owner.decisionOperations).toEqual([
       'approval_decision_deliver', 'approval_decision_reconcile',
     ])

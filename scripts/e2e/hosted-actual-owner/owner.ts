@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { chmod, lstat, open, readFile, realpath, rename, unlink } from 'node:fs/promises'
+import { chmod, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { HostedApprovalOwnerService } from '../../../src/services/hostedControl/HostedApprovalOwnerService.js'
 import { HostedApprovalOwnerStore } from '../../../src/services/hostedControl/HostedApprovalOwnerStore.js'
-import { HostedApprovalOwnerWal, type HostedApprovalOwnerState } from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
+import { HostedApprovalOwnerWal } from '../../../src/services/hostedControl/HostedApprovalOwnerWal.js'
 import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRuntimeAdmission } from '../../../src/services/hostedControl/HostedApprovalRuntimeAdmission.js'
 import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
@@ -19,15 +19,12 @@ import {
   isWithin, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
 import { buildAcceptanceEvidence, type ActualOwnerAcceptanceEvidence } from './evidence.js'
+import {
+  assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
+  type SecureFileIdentity,
+} from './secure-files.js'
 
 const MAX_CONTROL_BYTES = 16 * 1024
-
-async function atomicPrivateJson(path: string, value: unknown): Promise<void> {
-  const temporary = `${path}.tmp-${process.pid}`
-  const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-  try { await handle.writeFile(`${JSON.stringify(value)}\n`); await handle.sync() } finally { await handle.close() }
-  await rename(temporary, path)
-}
 
 class EvidenceApprovalPort implements HostedApprovalWirePort {
   constructor(
@@ -74,6 +71,11 @@ class AcceptanceRuntime {
   private control: Server | null = null
   private controlIdentity: { device: number; inode: number } | null = null
   private controlParentIdentity: { device: number; inode: number } | null = null
+  private controlParentHandle: FileHandle | null = null
+  private publication: {
+    hostedControlConfig: SecureFileIdentity
+    admission: SecureFileIdentity
+  } | null = null
   private stopping = false
   private evidence: ActualOwnerAcceptanceEvidence
   private sequence = 0
@@ -85,6 +87,7 @@ class AcceptanceRuntime {
   async start(): Promise<void> {
     await this.writeEvidence()
     await this.waitForProductPublication()
+    await this.assertPublicationCurrent()
     const runtime = new HostedControlRuntime(this.config.hostedControlConfig, context => this.ports(context))
     this.runtime = runtime
     await runtime.start()
@@ -94,7 +97,7 @@ class AcceptanceRuntime {
     await this.startControl()
     this.evidence = buildAcceptanceEvidence({
       config: this.config, status: 'ready', admission: this.admission,
-      ownerSocket: await this.ownerSocket(), state: await this.store.read(),
+      ownerSocket: await this.ownerSocket(), state: await this.store.read(), publication: this.publication,
     })
     await this.writeEvidence()
     process.stdout.write(`${JSON.stringify({
@@ -116,23 +119,39 @@ class AcceptanceRuntime {
     while (Date.now() < deadline) {
       await assertMarkerOwnedSandbox(this.config.runtime)
       const states = await Promise.all([this.config.hostedControlConfig, this.config.admissionFile].map(
-        path => lstat(path).then(stat => {
-          if (!stat.isFile() || stat.isSymbolicLink()) {
-            throw new Error('hosted_actual_owner_product_publication_unsafe')
-          }
-          return true
+        path => readAnchoredFile(path, this.config.sandboxRoot, {
+          minimumBytes: 2, maximumBytes: path === this.config.admissionFile ? 16 * 1024 * 1024 : 64 * 1024,
+          mode: 0o600,
         }).catch(error => {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
           throw error
         }),
       ))
-      if (states.every(Boolean)) return
+      if (states[0] && states[1]) {
+        this.publication = {
+          hostedControlConfig: states[0]!.identity,
+          admission: states[1]!.identity,
+        }
+        await this.assertPublicationCurrent()
+        return
+      }
       await new Promise(resolveWait => setTimeout(resolveWait, 50))
     }
     throw new Error('hosted_actual_owner_product_publication_timeout')
   }
 
+  private async assertPublicationCurrent(): Promise<void> {
+    if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
+    await Promise.all([
+      assertAnchoredIdentity(this.config.hostedControlConfig, this.config.sandboxRoot,
+        this.publication.hostedControlConfig, { minimumBytes: 2, maximumBytes: 64 * 1024, mode: 0o600 }),
+      assertAnchoredIdentity(this.config.admissionFile, this.config.sandboxRoot,
+        this.publication.admission, { minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600 }),
+    ])
+  }
+
   private async ports(context: HostedControlRuntimePortFactoryContext) {
+    await this.assertPublicationCurrent()
     const expectedAdmission = join(context.teamRoot, HOSTED_APPROVAL_ADMISSION_FILE)
     if (expectedAdmission !== this.config.admissionFile || !isWithin(this.config.sandboxRoot, context.teamRoot) ||
       this.config.walFile !== join(context.teamRoot, 'hosted-approval-owner.v1.json')) {
@@ -140,6 +159,7 @@ class AcceptanceRuntime {
     }
     const admission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(this.config.admissionFile)
       .load(context.authority)
+    await this.assertPublicationCurrent()
     const expectedDigest = `sha256:${this.config.openCodeSha256}`
     if (admission.routes.length === 0 || admission.routes.some(route =>
       route.openCodeBinding.openCodeArtifactDigest !== expectedDigest)) {
@@ -169,7 +189,12 @@ class AcceptanceRuntime {
   }
 
   private async ownerSocket(): Promise<string> {
-    const parsed = JSON.parse(await readFile(this.config.hostedControlConfig, 'utf8')) as { socketPath?: unknown }
+    if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
+    const bytes = await assertAnchoredIdentity(
+      this.config.hostedControlConfig, this.config.sandboxRoot, this.publication.hostedControlConfig,
+      { minimumBytes: 2, maximumBytes: 64 * 1024, mode: 0o600 },
+    )
+    const parsed = JSON.parse(bytes.toString('utf8')) as { socketPath?: unknown }
     if (typeof parsed.socketPath !== 'string') throw new Error('hosted_actual_owner_owner_socket_missing')
     return parsed.socketPath
   }
@@ -191,37 +216,50 @@ class AcceptanceRuntime {
     this.evidence = buildAcceptanceEvidence({
       config: this.config, status, admission: this.admission,
       ownerSocket: this.evidence.owner.ownerSocket ?? await this.ownerSocket(),
-      state: await this.store?.read() ?? null,
+      state: await this.store?.read() ?? null, publication: this.publication,
     })
     await this.writeEvidence()
   }
 
-  private writeEvidence(): Promise<void> { return atomicPrivateJson(this.config.evidenceFile, this.evidence) }
+  private async writeEvidence(): Promise<void> {
+    await atomicPrivateJson(this.config.evidenceFile, this.config.sandboxRoot, this.evidence)
+  }
 
   private async startControl(): Promise<void> {
     const parent = dirname(this.config.controlSocket)
     if (await realpath(parent) !== parent) throw new Error('hosted_actual_owner_control_parent_not_canonical')
+    const parentHandle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    const openedParent = await parentHandle.stat()
     const existing = await lstat(this.config.controlSocket).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
     })
-    if (existing) throw new Error('hosted_actual_owner_control_socket_already_exists')
+    if (existing) { await parentHandle.close(); throw new Error('hosted_actual_owner_control_socket_already_exists') }
     const server = createServer(socket => this.handleControl(socket))
-    await new Promise<void>((resolveListen, rejectListen) => {
-      server.once('error', rejectListen); server.listen(this.config.controlSocket, resolveListen)
-    })
-    await chmod(this.config.controlSocket, 0o600)
-    const [socketStat, parentStat] = await Promise.all([
-      lstat(this.config.controlSocket), lstat(parent),
-    ])
-    if (!socketStat.isSocket() || (socketStat.mode & 0o777) !== 0o600 ||
-      !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
-      await new Promise<void>(resolveClose => server.close(() => resolveClose()))
-      throw new Error('hosted_actual_owner_control_socket_unsafe')
+    try {
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once('error', rejectListen); server.listen(this.config.controlSocket, resolveListen)
+      })
+      await chmod(this.config.controlSocket, 0o600)
+      const [socketStat, parentStat] = await Promise.all([
+        lstat(this.config.controlSocket), lstat(parent),
+      ])
+      if (!socketStat.isSocket() || (socketStat.mode & 0o777) !== 0o600 ||
+        !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+        throw new Error('hosted_actual_owner_control_socket_unsafe')
+      }
+      if (parentStat.dev !== openedParent.dev || parentStat.ino !== openedParent.ino) {
+        throw new Error('hosted_actual_owner_control_parent_identity_drift')
+      }
+      this.controlIdentity = { device: socketStat.dev, inode: socketStat.ino }
+      this.controlParentIdentity = { device: parentStat.dev, inode: parentStat.ino }
+      this.controlParentHandle = parentHandle
+      this.control = server
+    } catch (error) {
+      if (server.listening) await new Promise<void>(resolveClose => server.close(() => resolveClose()))
+      await parentHandle.close()
+      throw error
     }
-    this.controlIdentity = { device: socketStat.dev, inode: socketStat.ino }
-    this.controlParentIdentity = { device: parentStat.dev, inode: parentStat.ino }
-    this.control = server
   }
 
   private handleControl(socket: Socket): void {
@@ -257,7 +295,10 @@ class AcceptanceRuntime {
       return { schemaVersion: 1, operation: 'poll_ingress', admitted: admitted ?? 0 }
     }
     if (request.operation === 'shutdown') {
-      setTimeout(() => void this.stop(), 0)
+      setTimeout(() => void this.stop().then(() => process.exit(0), error => {
+        process.stderr.write(`${error instanceof Error ? error.message : 'hosted_actual_owner_cleanup_failed'}\n`)
+        process.exit(1)
+      }), 0)
       return { schemaVersion: 1, operation: 'shutdown', accepted: true }
     }
     throw new Error('hosted_actual_owner_control_operation_invalid')
@@ -268,20 +309,42 @@ class AcceptanceRuntime {
     this.stopping = true
     await this.refreshEvidence('stopping').catch(() => undefined)
     const control = this.control; this.control = null
-    if (control) await new Promise<void>(resolveClose => control.close(() => resolveClose()))
-    const [socketStat, parentStat] = await Promise.all([
-      lstat(this.config.controlSocket).catch(() => null),
-      lstat(dirname(this.config.controlSocket)).catch(() => null),
-    ])
+    const parentHandle = this.controlParentHandle; this.controlParentHandle = null
+    const anchoredSocket = parentHandle ? `/proc/self/fd/${parentHandle.fd}/${this.config.controlSocket.split('/').at(-1)}` : null
     const identity = this.controlIdentity; const parentIdentity = this.controlParentIdentity
     this.controlIdentity = null; this.controlParentIdentity = null
-    if (identity && parentIdentity && socketStat?.isSocket() && parentStat?.isDirectory() &&
-      !parentStat.isSymbolicLink() && (socketStat.mode & 0o077) === 0 &&
-      socketStat.dev === identity.device && socketStat.ino === identity.inode &&
-      parentStat.dev === parentIdentity.device && parentStat.ino === parentIdentity.inode) {
-      await unlink(this.config.controlSocket)
+    const anchoredBefore = anchoredSocket ? await lstat(anchoredSocket).catch(() => null) : null
+    const provedBefore = identity && parentIdentity && await assertControlCleanupAuthority(
+      this.config.controlSocket, identity, parentIdentity,
+    ).then(() => true, () => false) && anchoredBefore?.isSocket() &&
+      anchoredBefore.dev === identity.device && anchoredBefore.ino === identity.inode
+    let cleanupFailure: Error | null = null
+    try {
+      if (identity && !provedBefore) {
+        cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
+      } else if (control) {
+        await new Promise<void>(resolveClose => control.close(() => resolveClose()))
+        const [currentParent, remaining] = await Promise.all([
+          lstat(dirname(this.config.controlSocket)).catch(() => null),
+          anchoredSocket ? lstat(anchoredSocket).catch(() => null) : null,
+        ])
+        if (!currentParent || !parentIdentity || currentParent.dev !== parentIdentity.device ||
+          currentParent.ino !== parentIdentity.inode) {
+          cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
+        } else if (remaining) {
+          if (!identity || !remaining.isSocket() || remaining.dev !== identity.device || remaining.ino !== identity.inode) {
+            cleanupFailure = new Error('hosted_actual_owner_control_cleanup_unproved')
+          } else {
+            await unlink(anchoredSocket!)
+            await parentHandle?.sync()
+          }
+        }
+      }
+    } finally {
+      await parentHandle?.close()
+      await this.runtime?.stop()
     }
-    await this.runtime?.stop()
+    if (cleanupFailure) throw cleanupFailure
   }
 }
 
@@ -289,11 +352,15 @@ export async function runActualOwnerAcceptance(args: readonly string[]): Promise
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   const config = await loadAcceptanceConfig({ args, repositoryRoot })
   const acceptance = new AcceptanceRuntime(config)
-  const stop = () => void acceptance.stop().finally(() => process.exit(0))
+  const stop = () => void acceptance.stop().then(() => process.exit(0), error => {
+    process.stderr.write(`${error instanceof Error ? error.message : 'hosted_actual_owner_cleanup_failed'}\n`)
+    process.exit(1)
+  })
   process.once('SIGINT', stop); process.once('SIGTERM', stop)
   try { await acceptance.start() } catch (error) {
     const failure = error instanceof Error ? error.message : 'hosted_actual_owner_start_failed'
-    await atomicPrivateJson(config.evidenceFile, buildAcceptanceEvidence({ config, status: 'failed', failure })).catch(() => undefined)
+    await atomicPrivateJson(config.evidenceFile, config.sandboxRoot,
+      buildAcceptanceEvidence({ config, status: 'failed', failure })).catch(() => undefined)
     await acceptance.stop().catch(() => undefined)
     throw error
   }
