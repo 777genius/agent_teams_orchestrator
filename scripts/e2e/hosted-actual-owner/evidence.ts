@@ -14,17 +14,35 @@ type ActualOwnerTimelineBase = {
 }
 
 export const ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS = Object.freeze([
-  'ingress_durable', 'completed', 'rejected', 'stale_generation', 'expired', 'wrong_lane',
-  'self_approval', 'unavailable', 'operator_required',
+  'completed', 'decision_committed', 'ingress_durable', 'pending_durable',
+  'pending_durable_after_restart', 'permission_settled', 'reconciled_terminal', 'rejected',
 ] as const)
 export const ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS = Object.freeze([
   'poll_ingress', 'reconcile_delivered', 'reconcile_not_delivered',
   'reconcile_operator_required', 'reconcile_unavailable',
 ] as const)
+const PRODUCT_RESTART_CHECKPOINTS = Object.freeze([
+  'after_owner_ingress_before_product_ack', 'after_product_pending_before_decision',
+  'after_product_decision_before_owner_delivery',
+  'after_owner_completion_before_product_reconciliation',
+] as const)
+const PRODUCT_NEGATIVE_OUTCOMES = Object.freeze({
+  stale_identity: 'stale', artifact_rotation: 'stale', process_rotation: 'stale',
+  session_rotation: 'stale', http_401: 'unavailable', http_404: 'unavailable',
+  redirect: 'unavailable', http_5xx: 'unavailable', timeout: 'unavailable',
+  reset: 'unavailable', malformed_response: 'unavailable',
+} as const)
+
+type ProductRestartEvent = `restart_checkpoint:${(typeof PRODUCT_RESTART_CHECKPOINTS)[number]}`
+type ProductNegativeCase = keyof typeof PRODUCT_NEGATIVE_OUTCOMES
+type ProductNegativeEvent = `negative_observed:${ProductNegativeCase}:${
+  (typeof PRODUCT_NEGATIVE_OUTCOMES)[ProductNegativeCase]}`
+type ProductApprovalEvent = (typeof ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS)[number] |
+  ProductRestartEvent | ProductNegativeEvent
 
 export type ActualOwnerProductTimelineEvent =
   | ActualOwnerTimelineBase & {
-    event: (typeof ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS)[number]
+    event: ProductApprovalEvent
     approvalId: string
   }
   | ActualOwnerTimelineBase & {
@@ -37,38 +55,47 @@ export function validateProductTimelineEvent(value: unknown): ActualOwnerProduct
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('timeline_event_invalid')
   const input = value as Record<string, unknown>
   const keys = Object.keys(input).sort().join(',')
-  const approvalEvent = typeof input.event === 'string' &&
-    (ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS as readonly string[]).includes(input.event)
+  const restart = typeof input.event === 'string' ? /^restart_checkpoint:(.+)$/.exec(input.event) : null
+  const negative = typeof input.event === 'string'
+    ? /^negative_observed:([^:]+):([^:]+)$/.exec(input.event) : null
+  const approvalEvent = typeof input.event === 'string' && (
+    (ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS as readonly string[]).includes(input.event) ||
+    !!restart && (PRODUCT_RESTART_CHECKPOINTS as readonly string[]).includes(restart[1]!) ||
+    !!negative && PRODUCT_NEGATIVE_OUTCOMES[negative[1] as ProductNegativeCase] === negative[2])
   const reconciliationEvent = typeof input.event === 'string' &&
     (ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS as readonly string[]).includes(input.event)
   if (keys !== 'approvalId,at,event,generation,runId,schemaVersion,sequence' || input.schemaVersion !== 1 ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId) ||
     (!approvalEvent && !reconciliationEvent) ||
-    !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 1 ||
+    !Number.isSafeInteger(input.sequence) || (input.sequence as number) < 0 ||
     typeof input.at !== 'string' || !Number.isFinite(Date.parse(input.at)) ||
     new Date(input.at).toISOString() !== input.at ||
-    typeof input.generation !== 'string' || input.generation.length < 1) {
+    typeof input.generation !== 'string' ||
+    !/^generation_[A-Za-z0-9._-]{1,128}$/.test(input.generation)) {
     throw new Error('timeline_event_invalid')
   }
-  const base: ActualOwnerTimelineBase = Object.freeze({
-    schemaVersion: 1, runId: input.runId, sequence: input.sequence as number,
-    at: input.at, generation: input.generation,
-  })
   if (approvalEvent) {
     if (typeof input.approvalId !== 'string' ||
       !/^approval_[A-Za-z0-9._:-]{8,191}$/.test(input.approvalId)) {
       throw new Error('timeline_event_invalid')
     }
-    return Object.freeze({ ...base,
-      event: input.event as (typeof ACTUAL_OWNER_APPROVAL_TIMELINE_EVENTS)[number],
-      approvalId: input.approvalId,
+    return Object.freeze({
+      schemaVersion: 1, at: input.at, approvalId: input.approvalId,
+      event: input.event as ProductApprovalEvent,
+      generation: input.generation, runId: input.runId, sequence: input.sequence as number,
     })
   }
   if (!reconciliationEvent || input.approvalId !== null) throw new Error('timeline_event_invalid')
-  return Object.freeze({ ...base,
+  return Object.freeze({
+    schemaVersion: 1, at: input.at, approvalId: null,
     event: input.event as (typeof ACTUAL_OWNER_RECONCILIATION_TIMELINE_EVENTS)[number],
-    approvalId: null,
+    generation: input.generation, runId: input.runId, sequence: input.sequence as number,
   })
+}
+
+/** Exact product-owned field order used for the shared raw NDJSON bytes. */
+export function productTimelineLine(value: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(validateProductTimelineEvent(value))}\n`)
 }
 
 export type ActualOwnerAcceptanceEvidence = {
@@ -87,6 +114,19 @@ export type ActualOwnerAcceptanceEvidence = {
     bootstrapDigest: string | null
     configSha256: string | null
     ownerArtifactDigest: string | null
+  }
+  timeline: {
+    path: string
+    identity: SecureFileIdentity | null
+    sha256: string | null
+    bytes: number
+    eventCount: number
+    lastSequence: number | null
+    authority: {
+      productRef: string
+      runtimeManifestSha256: string
+      runtimeManifestIdentity: SecureFileIdentity
+    }
   }
   owner: {
     pid: number
@@ -141,6 +181,7 @@ export function buildAcceptanceEvidence(input: {
   walSha256?: string | null
   stateSha256?: string | null
   providers?: ActualOwnerAcceptanceEvidence['providers']
+  timeline?: Omit<ActualOwnerAcceptanceEvidence['timeline'], 'path' | 'authority'>
 }): ActualOwnerAcceptanceEvidence {
   const state = input.state ?? null
   return Object.freeze({
@@ -170,6 +211,19 @@ export function buildAcceptanceEvidence(input: {
       bootstrapDigest: input.bootstrap?.bootstrapBinding.bootstrapDigest ?? null,
       configSha256: input.configSha256 ?? null,
       ownerArtifactDigest: input.bootstrap?.bootstrapBinding.ownerArtifactDigest ?? null,
+    }),
+    timeline: Object.freeze({
+      path: input.config.runtime.capture.ownerWalTimelinePath,
+      identity: input.timeline?.identity ?? null,
+      sha256: input.timeline?.sha256 ?? null,
+      bytes: input.timeline?.bytes ?? 0,
+      eventCount: input.timeline?.eventCount ?? 0,
+      lastSequence: input.timeline?.lastSequence ?? null,
+      authority: Object.freeze({
+        productRef: input.config.runtime.refs.product,
+        runtimeManifestSha256: input.config.runtimeManifestSha256,
+        runtimeManifestIdentity: input.config.runtimeManifestIdentity,
+      }),
     }),
     owner: Object.freeze({
       pid: process.pid,
@@ -210,7 +264,7 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
     }
     return candidate as Record<string, unknown>
   }
-  exact(input, ['schemaVersion', 'purpose', 'status', 'runId', 'markerPath', 'refs', 'artifact', 'admission', 'publication', 'bootstrap', 'owner', 'providers', 'failure'])
+  exact(input, ['schemaVersion', 'purpose', 'status', 'runId', 'markerPath', 'refs', 'artifact', 'admission', 'publication', 'bootstrap', 'timeline', 'owner', 'providers', 'failure'])
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_ACCEPTANCE_PURPOSE ||
     !['starting', 'ready', 'stopping', 'failed'].includes(String(input.status)) ||
     typeof input.runId !== 'string' || !/^[0-9a-f]{48}$/.test(input.runId)) {
@@ -222,6 +276,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
   const publication = nested(input.publication)
   const bootstrap = nested(input.bootstrap)
   const refs = nested(input.refs)
+  const timeline = nested(input.timeline)
+  const timelineAuthority = nested(timeline.authority)
   exact(artifact, ['executable', 'sha256'])
   exact(admission, ['path', 'digest', 'generation'])
   exact(owner, ['pid', 'processStartIdentity', 'controlSocket', 'controlSocketIdentity', 'ownerSocket',
@@ -230,6 +286,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
   exact(publication, ['admission'])
   exact(bootstrap, ['bootstrapDigest', 'configSha256', 'ownerArtifactDigest'])
   exact(refs, ['orchestrator', 'openCode', 'product'])
+  exact(timeline, ['path', 'identity', 'sha256', 'bytes', 'eventCount', 'lastSequence', 'authority'])
+  exact(timelineAuthority, ['productRef', 'runtimeManifestSha256', 'runtimeManifestIdentity'])
   const identity = (candidate: unknown): boolean => candidate === null || !!candidate &&
     typeof candidate === 'object' && !Array.isArray(candidate) && (() => {
       const value = candidate as Record<string, unknown>
@@ -250,7 +308,8 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
       'approval_decision_deliver,approval_decision_reconcile' ||
     !/^\d+$/.test(String(owner.processStartIdentity)) ||
     !identity(owner.controlSocketIdentity) || !identity(owner.ownerSocketIdentity) ||
-    !identity(owner.walIdentity) || !identity(publication.admission) ||
+    !identity(owner.walIdentity) || !identity(publication.admission) || !identity(timeline.identity) ||
+    !identity(timelineAuthority.runtimeManifestIdentity) ||
     !Object.values(refs).every(ref => typeof ref === 'string' && /^[0-9a-f]{40}$/.test(ref)) ||
     (writerFence !== null && (() => {
       exact(writerFence, ['generation', 'dev', 'ino'])
@@ -265,7 +324,17 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
       owner.processStartIdentity === '0' || owner.controlSocketIdentity === null ||
       owner.ownerSocketIdentity === null || owner.walIdentity === null || writerFence === null ||
       !/^[0-9a-f]{64}$/.test(String(owner.walSha256)) ||
-      !/^[0-9a-f]{64}$/.test(String(owner.stateSha256)))) ||
+      !/^[0-9a-f]{64}$/.test(String(owner.stateSha256)) ||
+      timeline.identity === null || !/^[0-9a-f]{64}$/.test(String(timeline.sha256)) ||
+      !Number.isSafeInteger(timeline.bytes) || (timeline.bytes as number) < 1 ||
+      !Number.isSafeInteger(timeline.eventCount) || (timeline.eventCount as number) < 1 ||
+      !Number.isSafeInteger(timeline.lastSequence) || (timeline.lastSequence as number) < 0 ||
+      !Number.isSafeInteger(owner.walRevision) || (owner.walRevision as number) < 0)) ||
+    typeof timeline.path !== 'string' || !timeline.path.startsWith('/') ||
+    timelineAuthority.productRef !== refs.product ||
+    !/^[0-9a-f]{64}$/.test(String(timelineAuthority.runtimeManifestSha256)) ||
+    !Number.isSafeInteger(owner.ingressCount) || (owner.ingressCount as number) < 0 ||
+    !Number.isSafeInteger(owner.deliveryCount) || (owner.deliveryCount as number) < 0 ||
     (input.status === 'failed' ? typeof input.failure !== 'string' || input.failure.length < 1 :
       input.failure !== null) ||
     !Array.isArray(input.providers) || (ready && input.providers.length === 0) ||
@@ -284,6 +353,10 @@ export function validateAcceptanceEvidence(value: unknown): ActualOwnerAcceptanc
         !/^[0-9a-f]{64}$/.test(String(provider.executableSha256)) ||
         !/^[0-9a-f]{64}$/.test(String(provider.sessionRecordFingerprint)) ||
         !/^[0-9a-f]{64}$/.test(String(provider.liveEffectFingerprint)) ||
+        typeof provider.routeId !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(provider.routeId) ||
+        typeof provider.sessionId !== 'string' ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(provider.sessionId) ||
         provider.executable !== artifact.executable ||
         provider.executableSha256 !== (artifact.sha256 as string).slice('sha256:'.length)
     })) {

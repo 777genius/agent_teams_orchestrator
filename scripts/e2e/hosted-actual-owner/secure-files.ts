@@ -261,6 +261,17 @@ export async function appendPrivateNdjson(
   trustedRoot: string | TrustedRoot,
   value: unknown,
 ): Promise<SecureFileIdentity> {
+  return appendPrivateLine(path, trustedRoot, Buffer.from(`${JSON.stringify(value)}\n`))
+}
+
+export async function appendPrivateLine(
+  path: string,
+  trustedRoot: string | TrustedRoot,
+  appended: Buffer,
+): Promise<SecureFileIdentity> {
+  if (appended.length < 2 || appended.at(-1) !== 0x0a || appended.subarray(0, -1).includes(0x0a)) {
+    throw new Error('hosted_actual_owner_timeline_line_invalid')
+  }
   const parentPath = dirname(path)
   const parent = await openTrustedDirectory(parentPath, trustedRoot)
   const child = `${parent.anchoredPath}/${basename(path)}`
@@ -281,7 +292,6 @@ export async function appendPrivateNdjson(
     const beforeBytes = Buffer.alloc(Number(before.size))
     const beforeRead = await handle.read(beforeBytes, 0, beforeBytes.length, 0)
     if (beforeRead.bytesRead !== beforeBytes.length) throw new Error('hosted_actual_owner_timeline_short_read')
-    const appended = Buffer.from(`${JSON.stringify(value)}\n`)
     await handle.writeFile(appended)
     await handle.sync()
     const [after, linked] = await Promise.all([

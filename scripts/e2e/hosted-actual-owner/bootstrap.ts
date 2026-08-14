@@ -8,7 +8,7 @@ import {
   sandboxAnchor,
   type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
-import { readAnchoredFile, type SecureFileIdentity } from './secure-files.js'
+import { openTrustedDirectory, readAnchoredFile, type SecureFileIdentity } from './secure-files.js'
 
 export async function validateBootstrapAcceptance(
   config: ActualOwnerAcceptanceConfig,
@@ -23,6 +23,11 @@ export async function validateBootstrapAcceptance(
     config.admissionFile !== join(teamRoot, HOSTED_APPROVAL_ADMISSION_FILE) ||
     config.walFile !== join(teamRoot, HOSTED_APPROVAL_WAL_FILE)) {
     throw new Error('hosted_actual_owner_bootstrap_path_escaped_sandbox')
+  }
+  for (const path of [runtimeConfig.claudeRoot, teamRoot]) {
+    const anchored = await openTrustedDirectory(path, sandboxAnchor(config.runtime))
+    if (anchored.handle !== anchored.rootHandle) await anchored.handle.close()
+    await anchored.rootHandle.close()
   }
   await validateHostedControlRuntimePaths(runtimeConfig)
   if (!(await bootstrap.guard.assertCurrent())) throw new Error('hosted_actual_owner_bootstrap_authority_lost')

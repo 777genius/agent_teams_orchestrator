@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto'
-import { chmod, lstat, readFile, readlink, rename, unlink, type FileHandle } from 'node:fs/promises'
-import { createServer, type Server, type Socket } from 'node:net'
+import { createHash, randomBytes } from 'node:crypto'
+import { chmod, lstat, readFile, readlink, realpath, rename, stat, unlink, type FileHandle } from 'node:fs/promises'
+import { connect, createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -11,6 +11,9 @@ import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRunt
 import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
+import { HOSTED_LIFECYCLE_PROOF_DOMAIN } from '../../../src/services/hostedControl/HostedControlServer.js'
+import { createHostedRawDomainProof, parseStrictHostedProofLastJsonFrame } from '../../../src/services/hostedControl/ownerProof.js'
+import type { HostedControlOwnerBinding } from '../../../src/services/hostedControl/protocol.js'
 import { readHostedControlBootstrap, type HostedControlBootstrapAdmission } from '../../../src/services/hostedControl/HostedControlBootstrap.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
 import { fingerprintOpenCodeApprovalSessionRecord, liveEffectFingerprint } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
@@ -18,14 +21,14 @@ import { openCodeSessionBridge, type OpenCodePermissionEffectContext } from '../
 import { openCodeSessionStore } from '../../../src/services/opencode/OpenCodeSessionStore.js'
 import { prepareOpenCodeArtifactDigestToken, resolveExecutingOpenCodeArtifactDigest } from '../../../src/services/opencode/OpenCodeArtifactDigest.js'
 import {
-  assertMarkerOwnedSandbox, loadAcceptanceConfig, HOSTED_APPROVAL_ADMISSION_FILE,
+  assertAcceptanceConfigCurrent, assertMarkerOwnedSandbox, loadAcceptanceConfig, HOSTED_APPROVAL_ADMISSION_FILE,
   isWithin, sandboxAnchor, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
 import { validateBootstrapAcceptance } from './bootstrap.js'
-import { buildAcceptanceEvidence, validateAcceptanceEvidence, validateProductTimelineEvent,
+import { buildAcceptanceEvidence, productTimelineLine, validateAcceptanceEvidence, validateProductTimelineEvent,
   type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
 import {
-  appendPrivateNdjson, assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
+  appendPrivateLine, assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
   openTrustedDirectory, type SecureFileIdentity,
 } from './secure-files.js'
 
@@ -39,6 +42,41 @@ export async function processStartIdentity(pid: number): Promise<string> {
   const started = close < 0 ? undefined : stat.slice(close + 2).trim().split(/\s+/)[19]
   if (!started || !/^\d+$/.test(started)) throw new Error('hosted_actual_owner_process_start_identity_unavailable')
   return started
+}
+
+export async function proveExecutingProviderIdentity(input: {
+  pid: number
+  executable: string
+  device: string
+  inode: string
+  sha256: string
+}): Promise<{ executable: string; device: string; inode: string; processStartIdentity: string }> {
+  const procExecutable = `/proc/${input.pid}/exe`
+  const beforeStart = await processStartIdentity(input.pid)
+  const [firstLink, firstStat, canonical, executableStat] = await Promise.all([
+    readlink(procExecutable),
+    stat(procExecutable, { bigint: true }),
+    realpath(procExecutable),
+    stat(input.executable, { bigint: true }),
+  ])
+  if (firstLink.endsWith(' (deleted)') || firstLink !== input.executable || canonical !== input.executable ||
+    !firstStat.isFile() || !executableStat.isFile() ||
+    firstStat.dev !== executableStat.dev || firstStat.ino !== executableStat.ino ||
+    firstStat.dev.toString() !== input.device || firstStat.ino.toString() !== input.inode ||
+    resolveExecutingOpenCodeArtifactDigest(input.pid) !== `sha256:${input.sha256}`) {
+    throw new Error('hosted_actual_owner_provider_identity_invalid')
+  }
+  const [afterStart, secondLink, secondStat] = await Promise.all([
+    processStartIdentity(input.pid), readlink(procExecutable), stat(procExecutable, { bigint: true }),
+  ])
+  if (afterStart !== beforeStart || secondLink !== firstLink || !secondStat.isFile() ||
+    secondStat.dev !== firstStat.dev || secondStat.ino !== firstStat.ino) {
+    throw new Error('hosted_actual_owner_provider_identity_invalid')
+  }
+  return Object.freeze({
+    executable: firstLink, device: firstStat.dev.toString(), inode: firstStat.ino.toString(),
+    processStartIdentity: afterStart,
+  })
 }
 
 class EvidenceApprovalPort implements HostedApprovalWirePort {
@@ -69,7 +107,7 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
     const result = await this.service.deliverDecision(input)
     const event = result.status === 'delivered' || result.status === 'idempotent_replay'
       ? input.request.decision === 'allow' ? 'completed' : 'rejected'
-      : result.status
+      : 'decision_committed'
     await this.changed(event, input.request.approvalId)
     return result
   }
@@ -82,6 +120,7 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
 
 export class AcceptanceRuntime {
   private runtime: HostedControlRuntime | null = null
+  private readinessLease: Socket | null = null
   private service: HostedApprovalOwnerService | null = null
   private store: HostedApprovalOwnerStore | null = null
   private admission: HostedApprovalRuntimeAdmission | null = null
@@ -101,6 +140,9 @@ export class AcceptanceRuntime {
   private stopping = false
   private evidence: ActualOwnerAcceptanceEvidence
   private sequence = 0
+  private timeline: {
+    identity: SecureFileIdentity; sha256: string; bytes: number; eventCount: number; lastSequence: number
+  } | null = null
 
   constructor(
     readonly config: ActualOwnerAcceptanceConfig,
@@ -124,6 +166,7 @@ export class AcceptanceRuntime {
     if (!this.service || !this.store || !this.admission || !runtime.server?.ownerBinding) {
       throw new Error('hosted_actual_owner_composition_incomplete')
     }
+    await this.startReadinessLease(runtime.server.ownerBinding)
     await this.startControl()
     await this.service.pollIngress()
     await this.record('poll_ingress', null)
@@ -131,6 +174,7 @@ export class AcceptanceRuntime {
       throw new Error('hosted_actual_owner_provider_identity_missing')
     }
     await this.refreshEvidence('ready')
+    await this.assertReadyAuthority()
     process.stdout.write(`${JSON.stringify({
       schemaVersion: 1,
       purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-readiness/v1',
@@ -168,15 +212,84 @@ export class AcceptanceRuntime {
     throw new Error('hosted_actual_owner_product_publication_timeout')
   }
 
+  private async startReadinessLease(ownerBinding: HostedControlOwnerBinding): Promise<void> {
+    if (this.readinessLease) throw new Error('hosted_actual_owner_readiness_lease_already_started')
+    await this.assertPublicationCurrent()
+    const challenge = randomBytes(32).toString('hex')
+    const unsigned = {
+      schemaVersion: 2 as const, operation: 'readiness' as const,
+      capability: 'hosted-lifecycle-command' as const,
+      socketIdentity: ownerBinding.socketIdentity, challenge,
+      bootstrapBinding: this.bootstrap.bootstrapBinding,
+      expectedOwnerBinding: ownerBinding,
+    }
+    const serialized = JSON.stringify(unsigned)
+    const request = `${serialized.slice(0, -1)},"controllerProof":${JSON.stringify(
+      createHostedRawDomainProof(this.bootstrap.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN,
+        'readiness-request', serialized))}}\n`
+    const socket = connect(this.bootstrap.config.socketPath)
+    socket.setTimeout(5_000)
+    try {
+      const line = await new Promise<string>((resolveLine, rejectLine) => {
+        let bytes = 0; const chunks: Buffer[] = []
+        const reject = (error: unknown) => rejectLine(error instanceof Error ? error :
+          new Error('hosted_actual_owner_readiness_lease_failed'))
+        socket.once('error', reject); socket.once('timeout', () => reject(
+          new Error('hosted_actual_owner_readiness_lease_timeout')))
+        socket.on('data', chunk => {
+          bytes += chunk.byteLength
+          if (bytes > 4 * 1024) { reject(new Error('hosted_actual_owner_readiness_response_oversized')); return }
+          chunks.push(chunk)
+          const raw = Buffer.concat(chunks)
+          const newline = raw.indexOf(0x0a)
+          if (newline < 0) return
+          if (newline !== raw.length - 1) { reject(new Error('hosted_actual_owner_readiness_response_invalid')); return }
+          resolveLine(raw.subarray(0, -1).toString('utf8'))
+        })
+        socket.once('connect', () => socket.write(request))
+      })
+      socket.setTimeout(0); socket.removeAllListeners('data'); socket.removeAllListeners('error')
+      const parsed = parseStrictHostedProofLastJsonFrame(line, 'ownerProof')
+      const response = parsed.value as Record<string, unknown>
+      const expectedProof = createHostedRawDomainProof(this.bootstrap.secret,
+        HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', parsed.serializedUnsignedEnvelope)
+      if (Object.keys(response).sort().join(',') !==
+          'bootstrapDigest,capability,challenge,kind,ownerBinding,ownerProof,schemaVersion' ||
+        response.schemaVersion !== 2 || response.kind !== 'ready' ||
+        response.capability !== 'hosted-lifecycle-command' || response.challenge !== challenge ||
+        response.bootstrapDigest !== this.bootstrap.bootstrapBinding.bootstrapDigest ||
+        JSON.stringify(response.ownerBinding) !== JSON.stringify(ownerBinding) ||
+        response.ownerProof !== expectedProof) {
+        throw new Error('hosted_actual_owner_readiness_response_invalid')
+      }
+      this.readinessLease = socket
+      socket.on('error', () => socket.destroy())
+      socket.once('close', () => { if (this.readinessLease === socket) this.readinessLease = null })
+      await this.assertPublicationCurrent()
+    } catch (error) {
+      socket.destroy()
+      throw error
+    }
+  }
+
   private async assertPublicationCurrent(): Promise<void> {
     if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
+    const validated = await validateBootstrapAcceptance(this.config, this.bootstrap)
     await Promise.all([
       assertAnchoredIdentity(this.config.admissionFile, sandboxAnchor(this.config.runtime),
         this.publication.admission, { minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600 }),
       this.bootstrap.guard.assertCurrent().then(current => {
         if (!current) throw new Error('hosted_actual_owner_bootstrap_authority_lost')
       }),
+      this.admission?.isCurrent().then(current => {
+        if (!current) throw new Error('hosted_actual_owner_admission_authority_lost')
+      }) ?? Promise.resolve(),
     ])
+    if (validated.admissionSha256 !== this.admissionSha256 ||
+      validated.configSha256 !== this.configSha256 ||
+      JSON.stringify(validated.admission) !== JSON.stringify(this.publication.admission)) {
+      throw new Error('hosted_actual_owner_product_publication_rotated')
+    }
   }
 
   private async ports(context: HostedControlRuntimePortFactoryContext) {
@@ -200,6 +313,7 @@ export class AcceptanceRuntime {
     const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(this.config.walFile))
     this.admission = admission
     const capture = async (effect: OpenCodePermissionEffectContext): Promise<void> => {
+      await this.assertPublicationCurrent()
       const route = admission.routes.find(candidate =>
         candidate.authority.sessionId === effect.record.opencodeSessionId)
       if (!route || effect.host.processStartedAtMs === null || effect.host.pid < 1 ||
@@ -209,13 +323,14 @@ export class AcceptanceRuntime {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
       }
       const computedLiveEffectFingerprint = liveEffectFingerprint(effect)
-      const executable = await readlink(`/proc/${effect.host.pid}/exe`)
-      const executableStat = await lstat(`/proc/${effect.host.pid}/exe`, { bigint: true })
+      const provider = await proveExecutingProviderIdentity({
+        pid: effect.host.pid, executable: this.config.openCodeExecutable,
+        device: this.config.runtime.descriptors.openCodeExecutable.device,
+        inode: this.config.runtime.descriptors.openCodeExecutable.inode,
+        sha256: this.config.openCodeSha256,
+      })
       if (computedLiveEffectFingerprint !== route.openCodeBinding.liveEffectFingerprint ||
-        executable.endsWith(' (deleted)') || executable !== this.config.openCodeExecutable ||
-        !executableStat.isFile() ||
-        executableStat.dev.toString() !== this.config.runtime.descriptors.openCodeExecutable.device ||
-        executableStat.ino.toString() !== this.config.runtime.descriptors.openCodeExecutable.inode) {
+        effect.record.opencodeSessionId !== route.authority.sessionId) {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
       }
       this.providerIdentities.set(route.routeId, Object.freeze({
@@ -223,14 +338,15 @@ export class AcceptanceRuntime {
         sessionId: route.authority.sessionId,
         sessionRecordFingerprint: route.openCodeBinding.sessionRecordFingerprint,
         liveEffectFingerprint: computedLiveEffectFingerprint,
-        executable,
-        executableDevice: executableStat.dev.toString(),
-        executableInode: executableStat.ino.toString(),
+        executable: provider.executable,
+        executableDevice: provider.device,
+        executableInode: provider.inode,
         executableSha256: this.config.openCodeSha256,
         pid: effect.host.pid,
-        processStartIdentity: await processStartIdentity(effect.host.pid),
+        processStartIdentity: provider.processStartIdentity,
         processStartedAtMs: effect.host.processStartedAtMs,
       }))
+      await this.assertPublicationCurrent()
     }
     const bridge = {
       observeHostedApprovalPermissions: async (
@@ -238,7 +354,9 @@ export class AcceptanceRuntime {
         authorize?: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[1],
       ) => openCodeSessionBridge.observeHostedApprovalPermissions(record, async effect => {
         await capture(effect)
-        return authorize ? authorize(effect) : true
+        const result = authorize ? await authorize(effect) : true
+        await this.assertPublicationCurrent()
+        return result
       }),
       answerPermission: async (
         record: Parameters<typeof openCodeSessionBridge.answerPermission>[0],
@@ -247,15 +365,23 @@ export class AcceptanceRuntime {
         ...parameters,
         authorizeObservation: async effect => {
           await capture(effect)
-          return parameters.authorizeObservation ? parameters.authorizeObservation(effect) : true
+          const result = parameters.authorizeObservation
+            ? await parameters.authorizeObservation(effect) : true
+          await this.assertPublicationCurrent()
+          return result
         },
         validatePreparedEffect: async effect => {
           await capture(effect)
-          return parameters.validatePreparedEffect ? parameters.validatePreparedEffect(effect) : true
+          const result = parameters.validatePreparedEffect
+            ? await parameters.validatePreparedEffect(effect) : true
+          await this.assertPublicationCurrent()
+          return result
         },
         authorizeEffect: async effect => {
           await capture(effect)
-          return parameters.authorizeEffect ? parameters.authorizeEffect(effect) : true
+          const result = parameters.authorizeEffect ? await parameters.authorizeEffect(effect) : true
+          await this.assertPublicationCurrent()
+          return result
         },
       }),
     }
@@ -289,19 +415,98 @@ export class AcceptanceRuntime {
   private async record(
     event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
   ): Promise<void> {
+    await this.assertPublicationCurrent()
     if (!this.admission) throw new Error('hosted_actual_owner_timeline_admission_missing')
+    const generations = new Set(this.admission.routes.map(route => route.scope.authorityGeneration))
+    if (generations.size !== 1) throw new Error('hosted_actual_owner_timeline_generation_ambiguous')
+    const prior = await this.readTimeline(false)
+    this.sequence = prior?.lastSequence ?? -1
     const timeline = validateProductTimelineEvent({
-      schemaVersion: 1, runId: this.config.runtime.runId, sequence: ++this.sequence,
-      at: new Date().toISOString(), event, approvalId,
-      generation: this.admission.admissionGeneration,
+      schemaVersion: 1, at: new Date().toISOString(), approvalId, event,
+      generation: [...generations][0], runId: this.config.runtime.runId, sequence: ++this.sequence,
     })
-    await appendPrivateNdjson(this.config.runtime.capture.ownerWalTimelinePath,
-      sandboxAnchor(this.config.runtime), timeline)
+    await appendPrivateLine(this.config.runtime.capture.ownerWalTimelinePath,
+      sandboxAnchor(this.config.runtime), productTimelineLine(timeline))
+    this.timeline = await this.readTimeline(true)
+    await this.assertPublicationCurrent()
     await this.refreshEvidence('ready')
   }
 
+  private async readTimeline(required: boolean): Promise<typeof this.timeline> {
+    const file = await readAnchoredFile(this.config.runtime.capture.ownerWalTimelinePath,
+      sandboxAnchor(this.config.runtime), {
+        minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600,
+      }).catch(error => {
+        if (!required && (error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      })
+    if (!file) return null
+    const source = file.bytes.toString('utf8')
+    if (!source.endsWith('\n')) throw new Error('hosted_actual_owner_timeline_bytes_invalid')
+    const events = source.slice(0, -1).split('\n').map(line => {
+      const event = validateProductTimelineEvent(JSON.parse(line))
+      if (!productTimelineLine(event).subarray(0, -1).equals(Buffer.from(line))) {
+        throw new Error('hosted_actual_owner_timeline_bytes_noncanonical')
+      }
+      return event
+    })
+    for (let index = 1; index < events.length; index++) {
+      if (events[index]!.sequence !== events[index - 1]!.sequence + 1) {
+        throw new Error('hosted_actual_owner_timeline_sequence_invalid')
+      }
+    }
+    const lastSequence = events.at(-1)!.sequence
+    return Object.freeze({
+      identity: file.identity, sha256: createHash('sha256').update(file.bytes).digest('hex'),
+      bytes: file.bytes.byteLength, eventCount: events.length, lastSequence,
+    })
+  }
+
+  private async assertProvidersCurrent(): Promise<void> {
+    if (!this.admission || this.providerIdentities.size !== this.admission.routes.length) {
+      throw new Error('hosted_actual_owner_provider_identity_missing')
+    }
+    for (const route of this.admission.routes) {
+      const provider = this.providerIdentities.get(route.routeId)
+      if (!provider || provider.sessionId !== route.authority.sessionId ||
+        provider.sessionRecordFingerprint !== route.openCodeBinding.sessionRecordFingerprint ||
+        provider.liveEffectFingerprint !== route.openCodeBinding.liveEffectFingerprint) {
+        throw new Error('hosted_actual_owner_provider_identity_invalid')
+      }
+      const current = await proveExecutingProviderIdentity({
+        pid: provider.pid, executable: this.config.openCodeExecutable,
+        device: provider.executableDevice, inode: provider.executableInode,
+        sha256: provider.executableSha256,
+      })
+      if (current.processStartIdentity !== provider.processStartIdentity) {
+        throw new Error('hosted_actual_owner_provider_identity_invalid')
+      }
+    }
+  }
+
+  private async assertReadyAuthority(): Promise<void> {
+    if (!this.readinessLease || this.readinessLease.destroyed) {
+      throw new Error('hosted_actual_owner_readiness_lease_lost')
+    }
+    await this.assertPublicationCurrent()
+    await assertAcceptanceConfigCurrent(this.config)
+    await this.assertProvidersCurrent()
+    const timeline = await this.readTimeline(true)
+    if (this.timeline && JSON.stringify(timeline) !== JSON.stringify(this.timeline)) {
+      throw new Error('hosted_actual_owner_timeline_identity_drift')
+    }
+    this.timeline = timeline
+  }
+
   private async refreshEvidence(status: 'ready' | 'stopping'): Promise<void> {
+    if (status === 'ready') await this.assertReadyAuthority()
+    else await this.assertPublicationCurrent()
     const state = await this.store?.read() ?? null
+    if (!state || !this.admission || state.admissionGeneration !== this.admission.admissionGeneration ||
+      state.admissionDigest !== this.admission.digest ||
+      JSON.stringify(state.routes) !== JSON.stringify(this.admission.routes) ||
+      JSON.stringify(state.actorMembers) !== JSON.stringify(this.admission.actorMembers) ||
+      state.revision < 0) throw new Error('hosted_actual_owner_wal_state_invalid')
     const wal = await readAnchoredFile(this.config.walFile, sandboxAnchor(this.config.runtime), {
       minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600,
     }).catch(() => null)
@@ -329,33 +534,57 @@ export class AcceptanceRuntime {
       }
     }
     const ownerSocket = await this.ownerSocket()
+    const controlSocketIdentity = await socketIdentity(this.config.controlSocket)
+    const ownerSocketIdentity = await socketIdentity(ownerSocket)
+    const stateSha256 = createHash('sha256').update(JSON.stringify(state)).digest('hex')
     this.evidence = buildAcceptanceEvidence({
       config: this.config, status, admission: this.admission,
       bootstrap: this.bootstrap, configSha256: this.configSha256,
       ownerProcessStartIdentity: this.ownerProcessStartIdentity,
       ownerSocket, state, publication: this.publication,
-      controlSocketIdentity: await socketIdentity(this.config.controlSocket),
-      ownerSocketIdentity: await socketIdentity(ownerSocket),
+      controlSocketIdentity, ownerSocketIdentity,
       walIdentity: wal?.identity ?? null,
       walSha256: wal ? createHash('sha256').update(wal.bytes).digest('hex') : null,
-      stateSha256: state ? createHash('sha256').update(JSON.stringify(state)).digest('hex') : null,
+      stateSha256,
+      timeline: this.timeline,
       providers: Object.freeze([...this.providerIdentities.values()].sort((a, b) =>
         a.routeId.localeCompare(b.routeId))),
     })
+    if (!wal) throw new Error('hosted_actual_owner_wal_identity_missing')
+    const [currentState, currentControl, currentOwner] = await Promise.all([
+      this.store!.read(), socketIdentity(this.config.controlSocket), socketIdentity(ownerSocket),
+      assertAnchoredIdentity(this.config.walFile, sandboxAnchor(this.config.runtime), wal.identity,
+        { minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600 }),
+    ])
+    if (createHash('sha256').update(JSON.stringify(currentState)).digest('hex') !== stateSha256 ||
+      JSON.stringify(currentControl) !== JSON.stringify(controlSocketIdentity) ||
+      JSON.stringify(currentOwner) !== JSON.stringify(ownerSocketIdentity)) {
+      throw new Error('hosted_actual_owner_readiness_identity_drift')
+    }
+    if (status === 'ready') await this.assertReadyAuthority()
+    else await this.assertPublicationCurrent()
     await this.writeEvidence()
   }
 
   private async writeEvidence(): Promise<void> {
+    await this.assertPublicationCurrent()
     await atomicPrivateJson(this.config.evidenceFile, sandboxAnchor(this.config.runtime),
       validateAcceptanceEvidence(this.evidence))
   }
 
   async writeFailure(failure: string): Promise<void> {
-    this.evidence = buildAcceptanceEvidence({ config: this.config, status: 'failed', failure })
+    if (!this.publication || !this.admission) return
+    await this.assertPublicationCurrent()
+    this.evidence = buildAcceptanceEvidence({
+      config: this.config, status: 'failed', failure, admission: this.admission,
+      publication: this.publication, bootstrap: this.bootstrap, configSha256: this.configSha256,
+      ownerProcessStartIdentity: this.ownerProcessStartIdentity, timeline: this.timeline,
+    })
     await this.writeEvidence()
   }
 
   private async startControl(): Promise<void> {
+    await this.assertPublicationCurrent()
     const parent = dirname(this.config.controlSocket)
     const anchoredParent = await openTrustedDirectory(parent, sandboxAnchor(this.config.runtime))
     const parentHandle = anchoredParent.handle
@@ -422,6 +651,7 @@ export class AcceptanceRuntime {
   }
 
   private async controlRequest(raw: string): Promise<unknown> {
+    await this.assertPublicationCurrent()
     const request = JSON.parse(raw) as Record<string, unknown>
     if (request.schemaVersion !== 1 || Object.keys(request).some(key => !['schemaVersion', 'operation'].includes(key))) {
       throw new Error('hosted_actual_owner_control_invalid')
@@ -502,6 +732,7 @@ export class AcceptanceRuntime {
       if (parentHandle && parentHandle !== rootHandle) await parentHandle.close().catch(() => undefined)
       await rootHandle?.close().catch(() => undefined)
       if (this.runtime) {
+        this.readinessLease?.destroy(); this.readinessLease = null
         await this.runtime.stop()
         this.bootstrapReleased = true
       } else if (!this.bootstrapReleased) {

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
-import { readAnchoredFile, type TrustedRoot } from './secure-files.js'
+import { assertAnchoredIdentity, readAnchoredFile, type SecureFileIdentity, type TrustedRoot } from './secure-files.js'
 
 export const ACTUAL_OWNER_PURPOSE = 'agent-teams.hosted-actual-owner-e2e/v1' as const
 export const ACTUAL_OWNER_ACCEPTANCE_PURPOSE =
@@ -66,6 +66,8 @@ export type ActualOwnerAcceptanceConfig = {
   productPublicationTimeoutMs: number
   repositoryRoot: string
   runtimeManifestPath: string
+  runtimeManifestIdentity: SecureFileIdentity
+  runtimeManifestSha256: string
   runtime: ActualOwnerRuntimeManifest
   sandboxRoot: string
   walFile: string
@@ -249,6 +251,9 @@ export async function assertRuntimeDescriptors(runtime: ActualOwnerRuntimeManife
 }
 
 export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManifest): Promise<void> {
+  if (!new RegExp(`^actual-owner-${runtime.runId}-[A-Za-z0-9]{6}$`).test(basename(runtime.sandboxRoot))) {
+    throw new Error('hosted_actual_owner_sandbox_root_name_invalid')
+  }
   if (runtime.markerPath !== resolve(runtime.sandboxRoot, ACTUAL_OWNER_MARKER_FILE)) {
     throw new Error('hosted_actual_owner_marker_not_canonical')
   }
@@ -268,11 +273,13 @@ export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManife
   }
 }
 
-async function readPrivateCanonicalFile(path: string, label: string): Promise<Buffer> {
+async function readPrivateCanonicalFile(
+  path: string, root: TrustedRoot, label: string,
+): Promise<{ bytes: Buffer; identity: SecureFileIdentity }> {
   try {
-    return (await readAnchoredFile(path, dirname(path), {
+    return await readAnchoredFile(path, root, {
       minimumBytes: 2, maximumBytes: 1024 * 1024,
-    })).bytes
+    })
   } catch {
     throw new Error(`hosted_actual_owner_${label}_not_private`)
   }
@@ -282,10 +289,11 @@ export async function assertCandidateArtifact(
   path: string,
   expected: string,
   descriptor?: RuntimePathDescriptor & { size: string },
+  trustedRoot?: TrustedRoot,
 ): Promise<void> {
   let secured: Awaited<ReturnType<typeof readAnchoredFile>>
   try {
-    secured = await readAnchoredFile(path, dirname(path), {
+    secured = await readAnchoredFile(path, trustedRoot ?? dirname(path), {
       minimumBytes: 1, maximumBytes: 1024 * 1024 * 1024, executable: true, ownerOnly: false,
     })
   } catch { throw new Error('hosted_actual_owner_candidate_unsafe') }
@@ -337,8 +345,28 @@ export async function loadAcceptanceConfig(input: {
     throw new Error('hosted_actual_owner_arguments_invalid')
   }
   const runtimeManifestPath = absolutePath(input.args[1], 'runtime_manifest')
-  const runtimeBytes = await readPrivateCanonicalFile(runtimeManifestPath, 'runtime_manifest')
-  const runtime = parseRuntimeManifest(JSON.parse(runtimeBytes.toString('utf8')))
+  const markerPath = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_MARKER'), 'marker')
+  if (basename(markerPath) !== ACTUAL_OWNER_MARKER_FILE) {
+    throw new Error('hosted_actual_owner_marker_not_canonical')
+  }
+  const declaredSandboxRoot = dirname(markerPath)
+  const declaredRootStat = await lstat(declaredSandboxRoot, { bigint: true })
+  if (!declaredRootStat.isDirectory() || declaredRootStat.isSymbolicLink()) {
+    throw new Error('hosted_actual_owner_sandbox_root_invalid')
+  }
+  const externalAnchor: TrustedRoot = Object.freeze({
+    path: declaredSandboxRoot,
+    device: declaredRootStat.dev.toString(),
+    inode: declaredRootStat.ino.toString(),
+  })
+  if (!isWithin(declaredSandboxRoot, runtimeManifestPath)) {
+    throw new Error('hosted_actual_owner_path_escaped_sandbox')
+  }
+  const runtimeFile = await readPrivateCanonicalFile(runtimeManifestPath, externalAnchor, 'runtime_manifest')
+  const runtime = parseRuntimeManifest(JSON.parse(runtimeFile.bytes.toString('utf8')))
+  if (runtime.sandboxRoot !== declaredSandboxRoot || runtime.markerPath !== markerPath) {
+    throw new Error('hosted_actual_owner_runtime_external_binding_mismatch')
+  }
   await assertRuntimeDescriptors(runtime)
   await assertMarkerOwnedSandbox(runtime)
   const repositoryRoot = await realpath(input.repositoryRoot)
@@ -367,14 +395,41 @@ export async function loadAcceptanceConfig(input: {
     environment.OPENCODE_BIN_PATH && environment.OPENCODE_BIN_PATH !== openCodeExecutable) {
     throw new Error('hosted_actual_owner_opencode_path_binding_mismatch')
   }
-  await assertCandidateArtifact(openCodeExecutable, openCodeSha256, runtime.descriptors.openCodeExecutable)
+  if (!isWithin(runtime.sandboxRoot, openCodeExecutable)) {
+    throw new Error('hosted_actual_owner_opencode_path_escaped_sandbox')
+  }
+  await assertCandidateArtifact(openCodeExecutable, openCodeSha256,
+    runtime.descriptors.openCodeExecutable, sandboxAnchor(runtime))
   if (await realpath(productRoot) !== productRoot) throw new Error('hosted_actual_owner_product_root_not_canonical')
   await assertRepository(productRoot, runtime.refs.product, 'product')
   return Object.freeze({
     admissionFile, controlSocket, evidenceFile,
     markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, productRoot,
     productPublicationTimeoutMs,
-    repositoryRoot, runtimeManifestPath, runtime, sandboxRoot: runtime.sandboxRoot,
+    repositoryRoot, runtimeManifestPath, runtimeManifestIdentity: runtimeFile.identity,
+    runtimeManifestSha256: createHash('sha256').update(runtimeFile.bytes).digest('hex'),
+    runtime, sandboxRoot: runtime.sandboxRoot,
     walFile: resolve(dirname(admissionFile), HOSTED_APPROVAL_WAL_FILE),
   })
+}
+
+export async function assertAcceptanceConfigCurrent(config: ActualOwnerAcceptanceConfig): Promise<void> {
+  const anchor = sandboxAnchor(config.runtime)
+  const manifest = await assertAnchoredIdentity(config.runtimeManifestPath, anchor,
+    config.runtimeManifestIdentity, { minimumBytes: 2, maximumBytes: 1024 * 1024 })
+  if (createHash('sha256').update(manifest).digest('hex') !== config.runtimeManifestSha256) {
+    throw new Error('hosted_actual_owner_runtime_manifest_digest_mismatch')
+  }
+  const reparsed = parseRuntimeManifest(JSON.parse(manifest.toString('utf8')))
+  if (JSON.stringify(reparsed) !== JSON.stringify(config.runtime)) {
+    throw new Error('hosted_actual_owner_runtime_manifest_projection_mismatch')
+  }
+  await assertRuntimeDescriptors(config.runtime)
+  await assertMarkerOwnedSandbox(config.runtime)
+  await assertCandidateArtifact(config.openCodeExecutable, config.openCodeSha256,
+    config.runtime.descriptors.openCodeExecutable, anchor)
+  await Promise.all([
+    assertRepository(config.repositoryRoot, config.runtime.refs.orchestrator, 'orchestrator'),
+    assertRepository(config.productRoot, config.runtime.refs.product, 'product'),
+  ])
 }
