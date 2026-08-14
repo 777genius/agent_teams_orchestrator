@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, lstat, mkdtemp, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdtemp, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:net'
 import { join } from 'node:path'
-import { assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile } from './secure-files.js'
+import { appendPrivateNdjson, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile } from './secure-files.js'
 
 const temporaryRoots: string[] = []
 const servers: Server[] = []
@@ -62,6 +62,27 @@ describe('hosted actual-owner descriptor fences', () => {
       await writeFile(temporary, '{"substituted":true}\n', { mode: 0o600 })
     })).rejects.toThrow(/temp_substituted/)
     await expect(Bun.file(target).exists()).resolves.toBe(false)
+  })
+
+  test('rejects in-place mutation and hardlinking before publication', async () => {
+    for (const attack of [
+      async (temporary: string) => writeFile(temporary, '{"mutated":true}\n'),
+      async (temporary: string) => link(temporary, `${temporary}.hardlink`),
+    ]) {
+      const root = await privateRoot()
+      await expect(atomicPrivateJson(join(root, 'evidence.json'), root, { accepted: true }, attack))
+        .rejects.toThrow(/temp_substituted/)
+    }
+  })
+
+  test('timeline append refuses a symlink target outside its pinned parent', async () => {
+    const root = await privateRoot()
+    const outside = join(await privateRoot(), 'outside.ndjson')
+    await writeFile(outside, '', { mode: 0o600 })
+    const timeline = join(root, 'timeline.ndjson')
+    await symlink(outside, timeline)
+    await expect(appendPrivateNdjson(timeline, root, { event: 'poll' })).rejects.toThrow()
+    expect(await Bun.file(outside).text()).toBe('')
   })
 
   test('treats control socket rotation as cleanup unproved', async () => {

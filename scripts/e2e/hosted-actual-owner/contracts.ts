@@ -11,6 +11,12 @@ export const ACTUAL_OWNER_ACCEPTANCE_PURPOSE =
 export const ACTUAL_OWNER_MARKER_FILE = '.agent-teams-actual-owner-e2e-owner.json' as const
 export const HOSTED_APPROVAL_ADMISSION_FILE = 'hosted-approval-runtime-admission.v1.json' as const
 export const HOSTED_APPROVAL_WAL_FILE = 'hosted-approval-owner.v1.json' as const
+export const ACTUAL_OWNER_DESCRIPTOR_TOKENS = Object.freeze({
+  sandboxRoot: '${SANDBOX_ROOT}',
+  productRoot: '${PRODUCT_ROOT}',
+  orchestratorRoot: '${ORCHESTRATOR_ROOT}',
+  openCodeExecutable: '${OPENCODE_EXECUTABLE}',
+} as const)
 
 const execFileAsync = promisify(execFile)
 const SHA256 = /^[0-9a-f]{64}$/
@@ -26,6 +32,12 @@ export type ActualOwnerRuntimeManifest = {
   sandboxRoot: string
   markerPath: string
   capture: { ownerWalTimelinePath: string }
+  descriptors: {
+    sandboxRoot: RuntimePathDescriptor
+    productRoot: RuntimePathDescriptor
+    orchestratorRoot: RuntimePathDescriptor
+    openCodeExecutable: RuntimePathDescriptor & { size: string; sha256: string }
+  }
   refs: {
     openCode: string
     openCodeExecutableSha256: string
@@ -34,11 +46,19 @@ export type ActualOwnerRuntimeManifest = {
   }
 }
 
+export type RuntimePathDescriptor = {
+  token: string
+  path: string
+  device: string
+  inode: string
+  mode: string
+  uid: string
+}
+
 export type ActualOwnerAcceptanceConfig = {
   admissionFile: string
   controlSocket: string
   evidenceFile: string
-  hostedControlConfig: string
   markerPath: string
   openCodeExecutable: string
   openCodeSha256: string
@@ -87,6 +107,47 @@ function sha256(value: unknown, label: string): string {
   return value
 }
 
+function decimal(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new Error(`hosted_actual_owner_${label}_identity_invalid`)
+  }
+  return value
+}
+
+function parseDescriptor(
+  value: unknown,
+  token: string,
+  label: string,
+  executable = false,
+): RuntimePathDescriptor & { size?: string; sha256?: string } {
+  const input = record(value, `${label}_descriptor`)
+  exact(input, executable
+    ? ['token', 'path', 'device', 'inode', 'mode', 'uid', 'size', 'sha256']
+    : ['token', 'path', 'device', 'inode', 'mode', 'uid'], `${label}_descriptor`)
+  if (input.token !== token) throw new Error(`hosted_actual_owner_${label}_descriptor_token_invalid`)
+  return Object.freeze({
+    token,
+    path: absolutePath(input.path, `${label}_descriptor`),
+    device: decimal(input.device, `${label}_descriptor_device`),
+    inode: decimal(input.inode, `${label}_descriptor_inode`),
+    mode: decimal(input.mode, `${label}_descriptor_mode`),
+    uid: decimal(input.uid, `${label}_descriptor_uid`),
+    ...(executable ? {
+      size: decimal(input.size, `${label}_descriptor_size`),
+      sha256: sha256(input.sha256, `${label}_descriptor`),
+    } : {}),
+  })
+}
+
+function expandDescriptor(value: unknown, descriptor: RuntimePathDescriptor, label: string): string {
+  if (typeof value !== 'string' || value.includes('\0') ||
+    value !== descriptor.token && !value.startsWith(`${descriptor.token}/`)) {
+    throw new Error(`hosted_actual_owner_${label}_descriptor_binding_invalid`)
+  }
+  const expanded = `${descriptor.path}${value.slice(descriptor.token.length)}`
+  return absolutePath(expanded, label)
+}
+
 export function isWithin(root: string, candidate: string): boolean {
   const relation = relative(root, candidate)
   return relation !== '' && relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation)
@@ -96,7 +157,7 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   const input = record(value, 'runtime_manifest')
   exact(input, [
     'schemaVersion', 'purpose', 'runId', 'sandboxRoot', 'markerPath', 'evidenceRoot',
-    'driverBaseUrl', 'productBaseUrl', 'approvalPath', 'browser', 'capture', 'refs',
+    'driverBaseUrl', 'productBaseUrl', 'approvalPath', 'browser', 'capture', 'refs', 'descriptors',
   ], 'runtime_manifest')
   if (input.schemaVersion !== 1 || input.purpose !== ACTUAL_OWNER_PURPOSE ||
     typeof input.runId !== 'string' || !RUN_ID.test(input.runId)) {
@@ -109,9 +170,22 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   ], 'runtime_capture')
   const refs = record(input.refs, 'runtime_refs')
   exact(refs, ['openCode', 'openCodeExecutableSha256', 'orchestrator', 'product'], 'runtime_refs')
-  const sandboxRoot = absolutePath(input.sandboxRoot, 'sandbox_root')
-  const markerPath = absolutePath(input.markerPath, 'marker')
-  const ownerWalTimelinePath = absolutePath(capture.ownerWalTimelinePath, 'owner_wal_timeline')
+  const descriptors = record(input.descriptors, 'runtime_descriptors')
+  exact(descriptors, ['sandboxRoot', 'productRoot', 'orchestratorRoot', 'openCodeExecutable'],
+    'runtime_descriptors')
+  const sandboxDescriptor = parseDescriptor(descriptors.sandboxRoot,
+    ACTUAL_OWNER_DESCRIPTOR_TOKENS.sandboxRoot, 'sandbox_root')
+  const productDescriptor = parseDescriptor(descriptors.productRoot,
+    ACTUAL_OWNER_DESCRIPTOR_TOKENS.productRoot, 'product_root')
+  const orchestratorDescriptor = parseDescriptor(descriptors.orchestratorRoot,
+    ACTUAL_OWNER_DESCRIPTOR_TOKENS.orchestratorRoot, 'orchestrator_root')
+  const openCodeDescriptor = parseDescriptor(descriptors.openCodeExecutable,
+    ACTUAL_OWNER_DESCRIPTOR_TOKENS.openCodeExecutable, 'opencode_executable', true) as
+      RuntimePathDescriptor & { size: string; sha256: string }
+  const sandboxRoot = expandDescriptor(input.sandboxRoot, sandboxDescriptor, 'sandbox_root')
+  const markerPath = expandDescriptor(input.markerPath, sandboxDescriptor, 'marker')
+  const ownerWalTimelinePath = expandDescriptor(capture.ownerWalTimelinePath, sandboxDescriptor,
+    'owner_wal_timeline')
   if (!isWithin(sandboxRoot, markerPath) || !isWithin(sandboxRoot, ownerWalTimelinePath)) {
     throw new Error('hosted_actual_owner_runtime_path_escaped_sandbox')
   }
@@ -122,6 +196,12 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     sandboxRoot,
     markerPath,
     capture: Object.freeze({ ownerWalTimelinePath }),
+    descriptors: Object.freeze({
+      sandboxRoot: sandboxDescriptor,
+      productRoot: productDescriptor,
+      orchestratorRoot: orchestratorDescriptor,
+      openCodeExecutable: openCodeDescriptor,
+    }),
     refs: Object.freeze({
       openCode: fullRef(refs.openCode, 'opencode'),
       openCodeExecutableSha256: sha256(refs.openCodeExecutableSha256, 'opencode_executable'),
@@ -129,6 +209,35 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
       product: fullRef(refs.product, 'product'),
     }),
   })
+}
+
+export async function assertRuntimeDescriptors(runtime: ActualOwnerRuntimeManifest): Promise<void> {
+  const descriptors = runtime.descriptors
+  const checks = [
+    ['sandbox_root', descriptors.sandboxRoot, 'directory'],
+    ['product_root', descriptors.productRoot, 'directory'],
+    ['orchestrator_root', descriptors.orchestratorRoot, 'directory'],
+    ['opencode_executable', descriptors.openCodeExecutable, 'file'],
+  ] as const
+  for (const [label, descriptor, kind] of checks) {
+    const [stat, canonical] = await Promise.all([lstat(descriptor.path, { bigint: true }), realpath(descriptor.path)])
+    if (canonical !== descriptor.path || stat.isSymbolicLink() ||
+      (kind === 'directory' ? !stat.isDirectory() : !stat.isFile()) ||
+      stat.dev.toString() !== descriptor.device || stat.ino.toString() !== descriptor.inode ||
+      (stat.mode & 0o777n).toString() !== descriptor.mode || stat.uid.toString() !== descriptor.uid ||
+      (stat.mode & 0o022n) !== 0n ||
+      (process.getuid?.() !== undefined && stat.uid !== BigInt(process.getuid())) ||
+      (kind === 'file' && ((stat.mode & 0o111n) === 0n || stat.nlink !== 1n ||
+        stat.size.toString() !== descriptors.openCodeExecutable.size))) {
+      throw new Error(`hosted_actual_owner_${label}_descriptor_identity_mismatch`)
+    }
+  }
+  if (descriptors.sandboxRoot.path !== runtime.sandboxRoot ||
+    descriptors.productRoot.path === runtime.sandboxRoot ||
+    descriptors.orchestratorRoot.path === runtime.sandboxRoot ||
+    descriptors.openCodeExecutable.sha256 !== runtime.refs.openCodeExecutableSha256) {
+    throw new Error('hosted_actual_owner_descriptor_binding_mismatch')
+  }
 }
 
 export async function assertMarkerOwnedSandbox(runtime: ActualOwnerRuntimeManifest): Promise<void> {
@@ -161,14 +270,23 @@ async function readPrivateCanonicalFile(path: string, label: string): Promise<Bu
   }
 }
 
-export async function assertCandidateArtifact(path: string, expected: string): Promise<void> {
-  let bytes: Buffer
+export async function assertCandidateArtifact(
+  path: string,
+  expected: string,
+  descriptor?: RuntimePathDescriptor & { size: string },
+): Promise<void> {
+  let secured: Awaited<ReturnType<typeof readAnchoredFile>>
   try {
-    bytes = (await readAnchoredFile(path, dirname(path), {
+    secured = await readAnchoredFile(path, dirname(path), {
       minimumBytes: 1, maximumBytes: 1024 * 1024 * 1024, executable: true, ownerOnly: false,
-    })).bytes
+    })
   } catch { throw new Error('hosted_actual_owner_candidate_unsafe') }
-  if (createHash('sha256').update(bytes).digest('hex') !== expected) {
+  if (descriptor && (secured.identity.device !== descriptor.device ||
+    secured.identity.inode !== descriptor.inode || secured.identity.size !== descriptor.size ||
+    secured.identity.mode !== descriptor.mode || secured.identity.uid !== descriptor.uid)) {
+    throw new Error('hosted_actual_owner_candidate_identity_mismatch')
+  }
+  if (createHash('sha256').update(secured.bytes).digest('hex') !== expected) {
     throw new Error('hosted_actual_owner_candidate_digest_mismatch')
   }
 }
@@ -213,37 +331,39 @@ export async function loadAcceptanceConfig(input: {
   const runtimeManifestPath = absolutePath(input.args[1], 'runtime_manifest')
   const runtimeBytes = await readPrivateCanonicalFile(runtimeManifestPath, 'runtime_manifest')
   const runtime = parseRuntimeManifest(JSON.parse(runtimeBytes.toString('utf8')))
+  await assertRuntimeDescriptors(runtime)
   await assertMarkerOwnedSandbox(runtime)
   const repositoryRoot = await realpath(input.repositoryRoot)
+  if (repositoryRoot !== runtime.descriptors.orchestratorRoot.path) {
+    throw new Error('hosted_actual_owner_orchestrator_descriptor_mismatch')
+  }
   await assertRepository(repositoryRoot, runtime.refs.orchestrator, 'orchestrator')
   const admissionFile = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_ADMISSION_FILE'), 'admission')
-  const hostedControlConfig = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_HOSTED_CONTROL_CONFIG'), 'hosted_control_config')
-  const openCodeExecutable = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_OPENCODE_EXECUTABLE'), 'opencode_executable')
-  const openCodeSha256 = sha256(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_OPENCODE_SHA256'), 'opencode_executable')
-  const productRoot = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_PRODUCT_ROOT'), 'product_root')
+  const openCodeExecutable = runtime.descriptors.openCodeExecutable.path
+  const openCodeSha256 = runtime.descriptors.openCodeExecutable.sha256
+  const productRoot = runtime.descriptors.productRoot.path
   const productPublicationTimeoutMs = positiveDuration(
     requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_PRODUCT_PUBLICATION_TIMEOUT_MS'),
     'product_publication_timeout',
   )
   const controlSocket = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_CONTROL_SOCKET'), 'control_socket')
   const evidenceFile = absolutePath(requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_EVIDENCE_FILE'), 'evidence_file')
-  for (const path of [runtimeManifestPath, admissionFile, hostedControlConfig, controlSocket, evidenceFile]) {
+  for (const path of [runtimeManifestPath, admissionFile, controlSocket, evidenceFile]) {
     if (!isWithin(runtime.sandboxRoot, path)) throw new Error('hosted_actual_owner_path_escaped_sandbox')
   }
   if (runtime.markerPath !== requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_MARKER') ||
-    runtimeManifestPath !== requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_RUNTIME_MANIFEST') ||
-    openCodeSha256 !== runtime.refs.openCodeExecutableSha256) {
+    runtimeManifestPath !== requiredEnvironment(environment, 'HOSTED_ACTUAL_OWNER_E2E_RUNTIME_MANIFEST')) {
     throw new Error('hosted_actual_owner_product_binding_mismatch')
   }
   if (environment.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH !== openCodeExecutable ||
     environment.OPENCODE_BIN_PATH && environment.OPENCODE_BIN_PATH !== openCodeExecutable) {
     throw new Error('hosted_actual_owner_opencode_path_binding_mismatch')
   }
-  await assertCandidateArtifact(openCodeExecutable, openCodeSha256)
+  await assertCandidateArtifact(openCodeExecutable, openCodeSha256, runtime.descriptors.openCodeExecutable)
   if (await realpath(productRoot) !== productRoot) throw new Error('hosted_actual_owner_product_root_not_canonical')
   await assertRepository(productRoot, runtime.refs.product, 'product')
   return Object.freeze({
-    admissionFile, controlSocket, evidenceFile, hostedControlConfig,
+    admissionFile, controlSocket, evidenceFile,
     markerPath: runtime.markerPath, openCodeExecutable, openCodeSha256, productRoot,
     productPublicationTimeoutMs,
     repositoryRoot, runtimeManifestPath, runtime, sandboxRoot: runtime.sandboxRoot,

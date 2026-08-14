@@ -1,0 +1,3 @@
+{"schemaVersion":1,"runId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":1,"at":"2026-08-14T00:00:00.000Z","event":"ingress_durable","approvalId":"approval_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":"approval-admission-generation_fixture"}
+{"schemaVersion":1,"runId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":2,"at":"2026-08-14T00:00:01.000Z","event":"poll_ingress","approvalId":null,"generation":"approval-admission-generation_fixture"}
+{"schemaVersion":1,"runId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":3,"at":"2026-08-14T00:00:02.000Z","event":"reconcile_operator_required","approvalId":null,"generation":"approval-admission-generation_fixture"}

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { chmod, lstat, open, realpath, unlink, type FileHandle } from 'node:fs/promises'
+import { chmod, lstat, open, readFile, realpath, unlink, type FileHandle } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,24 +12,42 @@ import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRunt
 import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
+import { readHostedControlBootstrap, type HostedControlBootstrapAdmission } from '../../../src/services/hostedControl/HostedControlBootstrap.js'
 import { OpenCodeHostedApprovalRuntimeAdapter } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
-import { prepareOpenCodeArtifactDigestToken } from '../../../src/services/opencode/OpenCodeArtifactDigest.js'
+import { fingerprintOpenCodeApprovalSessionRecord } from '../../../src/services/hostedControl/OpenCodeHostedApprovalRuntimeAdapter.js'
+import { openCodeSessionBridge, type OpenCodePermissionEffectContext } from '../../../src/services/opencode/OpenCodeSessionBridge.js'
+import { openCodeSessionStore } from '../../../src/services/opencode/OpenCodeSessionStore.js'
+import { prepareOpenCodeArtifactDigestToken, resolveExecutingOpenCodeArtifactDigest } from '../../../src/services/opencode/OpenCodeArtifactDigest.js'
 import {
   assertMarkerOwnedSandbox, loadAcceptanceConfig, HOSTED_APPROVAL_ADMISSION_FILE,
   isWithin, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
-import { buildAcceptanceEvidence, type ActualOwnerAcceptanceEvidence } from './evidence.js'
+import { validateBootstrapAcceptance } from './bootstrap.js'
+import { buildAcceptanceEvidence, validateAcceptanceEvidence, validateProductTimelineEvent,
+  type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
 import {
-  assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
+  appendPrivateNdjson, assertAnchoredIdentity, assertControlCleanupAuthority, atomicPrivateJson, readAnchoredFile,
   type SecureFileIdentity,
 } from './secure-files.js'
 
 const MAX_CONTROL_BYTES = 16 * 1024
+type ProviderIdentity = ActualOwnerAcceptanceEvidence['providers'][number]
+
+export async function processStartIdentity(pid: number): Promise<string> {
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new Error('hosted_actual_owner_process_pid_invalid')
+  const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
+  const close = stat.lastIndexOf(')')
+  const started = close < 0 ? undefined : stat.slice(close + 2).trim().split(/\s+/)[19]
+  if (!started || !/^\d+$/.test(started)) throw new Error('hosted_actual_owner_process_start_identity_unavailable')
+  return started
+}
 
 class EvidenceApprovalPort implements HostedApprovalWirePort {
   constructor(
     readonly service: HostedApprovalOwnerService,
-    private readonly changed: (event: string, approvalId: string | null) => Promise<void>,
+    private readonly changed: (
+      event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
+    ) => Promise<void>,
   ) {}
   async claimIngress(input: Parameters<HostedApprovalWirePort['claimIngress']>[0]) {
     const result = await this.service.claimIngress(input)
@@ -63,7 +81,7 @@ class EvidenceApprovalPort implements HostedApprovalWirePort {
   }
 }
 
-class AcceptanceRuntime {
+export class AcceptanceRuntime {
   private runtime: HostedControlRuntime | null = null
   private service: HostedApprovalOwnerService | null = null
   private store: HostedApprovalOwnerStore | null = null
@@ -73,33 +91,37 @@ class AcceptanceRuntime {
   private controlParentIdentity: { device: number; inode: number } | null = null
   private controlParentHandle: FileHandle | null = null
   private publication: {
-    hostedControlConfig: SecureFileIdentity
     admission: SecureFileIdentity
   } | null = null
+  private admissionSha256: string | null = null
+  private configSha256: string | null = null
+  private ownerProcessStartIdentity = '0'
+  private providerIdentities = new Map<string, ProviderIdentity>()
+  private bootstrapReleased = false
   private stopping = false
   private evidence: ActualOwnerAcceptanceEvidence
   private sequence = 0
 
-  constructor(readonly config: ActualOwnerAcceptanceConfig) {
+  constructor(
+    readonly config: ActualOwnerAcceptanceConfig,
+    readonly bootstrap: HostedControlBootstrapAdmission,
+  ) {
     this.evidence = buildAcceptanceEvidence({ config, status: 'starting' })
   }
 
   async start(): Promise<void> {
+    this.ownerProcessStartIdentity = await processStartIdentity(process.pid)
     await this.writeEvidence()
     await this.waitForProductPublication()
     await this.assertPublicationCurrent()
-    const runtime = new HostedControlRuntime(this.config.hostedControlConfig, context => this.ports(context))
+    const runtime = new HostedControlRuntime(this.bootstrap, context => this.ports(context))
     this.runtime = runtime
     await runtime.start()
     if (!this.service || !this.store || !this.admission || !runtime.server?.ownerBinding) {
       throw new Error('hosted_actual_owner_composition_incomplete')
     }
     await this.startControl()
-    this.evidence = buildAcceptanceEvidence({
-      config: this.config, status: 'ready', admission: this.admission,
-      ownerSocket: await this.ownerSocket(), state: await this.store.read(), publication: this.publication,
-    })
-    await this.writeEvidence()
+    await this.refreshEvidence('ready')
     process.stdout.write(`${JSON.stringify({
       schemaVersion: 1,
       purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-readiness/v1',
@@ -118,20 +140,17 @@ class AcceptanceRuntime {
     const deadline = Date.now() + this.config.productPublicationTimeoutMs
     while (Date.now() < deadline) {
       await assertMarkerOwnedSandbox(this.config.runtime)
-      const states = await Promise.all([this.config.hostedControlConfig, this.config.admissionFile].map(
-        path => readAnchoredFile(path, this.config.sandboxRoot, {
-          minimumBytes: 2, maximumBytes: path === this.config.admissionFile ? 16 * 1024 * 1024 : 64 * 1024,
-          mode: 0o600,
+      const state = await readAnchoredFile(this.config.admissionFile, this.config.sandboxRoot, {
+          minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600,
         }).catch(error => {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
           throw error
-        }),
-      ))
-      if (states[0] && states[1]) {
-        this.publication = {
-          hostedControlConfig: states[0]!.identity,
-          admission: states[1]!.identity,
-        }
+        })
+      if (state) {
+        const validated = await validateBootstrapAcceptance(this.config, this.bootstrap)
+        this.publication = { admission: validated.admission }
+        this.admissionSha256 = validated.admissionSha256
+        this.configSha256 = validated.configSha256
         await this.assertPublicationCurrent()
         return
       }
@@ -143,10 +162,11 @@ class AcceptanceRuntime {
   private async assertPublicationCurrent(): Promise<void> {
     if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
     await Promise.all([
-      assertAnchoredIdentity(this.config.hostedControlConfig, this.config.sandboxRoot,
-        this.publication.hostedControlConfig, { minimumBytes: 2, maximumBytes: 64 * 1024, mode: 0o600 }),
       assertAnchoredIdentity(this.config.admissionFile, this.config.sandboxRoot,
         this.publication.admission, { minimumBytes: 2, maximumBytes: 16 * 1024 * 1024, mode: 0o600 }),
+      this.bootstrap.guard.assertCurrent().then(current => {
+        if (!current) throw new Error('hosted_actual_owner_bootstrap_authority_lost')
+      }),
     ])
   }
 
@@ -160,13 +180,63 @@ class AcceptanceRuntime {
     const admission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(this.config.admissionFile)
       .load(context.authority)
     await this.assertPublicationCurrent()
+    if (admission.digest !== this.admissionSha256) {
+      throw new Error('hosted_actual_owner_admission_bytes_mismatch')
+    }
     const expectedDigest = `sha256:${this.config.openCodeSha256}`
     if (admission.routes.length === 0 || admission.routes.some(route =>
       route.openCodeBinding.openCodeArtifactDigest !== expectedDigest)) {
       throw new Error('hosted_actual_owner_admission_candidate_digest_mismatch')
     }
     const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(this.config.walFile))
-    const adapter = new OpenCodeHostedApprovalRuntimeAdapter(undefined, undefined, undefined, {
+    this.admission = admission
+    const capture = async (effect: OpenCodePermissionEffectContext): Promise<void> => {
+      const route = admission.routes.find(candidate =>
+        candidate.authority.sessionId === effect.record.opencodeSessionId)
+      if (!route || effect.host.processStartedAtMs === null || effect.host.pid < 1 ||
+        resolveExecutingOpenCodeArtifactDigest(effect.host.pid) !== expectedDigest ||
+        fingerprintOpenCodeApprovalSessionRecord(effect.record) !==
+          route.openCodeBinding.sessionRecordFingerprint) {
+        throw new Error('hosted_actual_owner_provider_identity_invalid')
+      }
+      this.providerIdentities.set(route.routeId, Object.freeze({
+        routeId: route.routeId,
+        sessionId: route.authority.sessionId,
+        sessionRecordFingerprint: route.openCodeBinding.sessionRecordFingerprint,
+        liveEffectFingerprint: route.openCodeBinding.liveEffectFingerprint,
+        pid: effect.host.pid,
+        processStartIdentity: await processStartIdentity(effect.host.pid),
+        processStartedAtMs: effect.host.processStartedAtMs,
+      }))
+    }
+    const bridge = {
+      observeHostedApprovalPermissions: async (
+        record: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[0],
+        authorize?: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[1],
+      ) => openCodeSessionBridge.observeHostedApprovalPermissions(record, async effect => {
+        await capture(effect)
+        return authorize ? authorize(effect) : true
+      }),
+      answerPermission: async (
+        record: Parameters<typeof openCodeSessionBridge.answerPermission>[0],
+        parameters: Parameters<typeof openCodeSessionBridge.answerPermission>[1],
+      ) => openCodeSessionBridge.answerPermission(record, {
+        ...parameters,
+        authorizeObservation: async effect => {
+          await capture(effect)
+          return parameters.authorizeObservation ? parameters.authorizeObservation(effect) : true
+        },
+        validatePreparedEffect: async effect => {
+          await capture(effect)
+          return parameters.validatePreparedEffect ? parameters.validatePreparedEffect(effect) : true
+        },
+        authorizeEffect: async effect => {
+          await capture(effect)
+          return parameters.authorizeEffect ? parameters.authorizeEffect(effect) : true
+        },
+      }),
+    }
+    const adapter = new OpenCodeHostedApprovalRuntimeAdapter(openCodeSessionStore, bridge, undefined, {
       prepareEffectToken: expected => prepareOpenCodeArtifactDigestToken(
         expected, this.config.openCodeExecutable,
       ),
@@ -178,7 +248,7 @@ class AcceptanceRuntime {
       }),
     })
     await service.recoverStateOnly()
-    this.store = store; this.service = service; this.admission = admission
+    this.store = store; this.service = service
     const approvals = new EvidenceApprovalPort(service, (event, approvalId) => this.record(event, approvalId))
     return {
       approvals,
@@ -189,40 +259,56 @@ class AcceptanceRuntime {
   }
 
   private async ownerSocket(): Promise<string> {
-    if (!this.publication) throw new Error('hosted_actual_owner_product_publication_unadmitted')
-    const bytes = await assertAnchoredIdentity(
-      this.config.hostedControlConfig, this.config.sandboxRoot, this.publication.hostedControlConfig,
-      { minimumBytes: 2, maximumBytes: 64 * 1024, mode: 0o600 },
-    )
-    const parsed = JSON.parse(bytes.toString('utf8')) as { socketPath?: unknown }
-    if (typeof parsed.socketPath !== 'string') throw new Error('hosted_actual_owner_owner_socket_missing')
-    return parsed.socketPath
+    await this.assertPublicationCurrent()
+    return this.bootstrap.config.socketPath
   }
 
-  private async record(event: string, approvalId: string | null): Promise<void> {
-    const handle = await open(this.config.runtime.capture.ownerWalTimelinePath, 'a', 0o600)
-    try {
-      await handle.writeFile(`${JSON.stringify({
-        schemaVersion: 1, runId: this.config.runtime.runId, sequence: ++this.sequence,
-        at: new Date().toISOString(), event, approvalId,
-        generation: this.admission?.admissionGeneration ?? null,
-      })}\n`)
-      await handle.sync()
-    } finally { await handle.close() }
+  private async record(
+    event: ActualOwnerProductTimelineEvent['event'], approvalId: string | null,
+  ): Promise<void> {
+    if (!this.admission) throw new Error('hosted_actual_owner_timeline_admission_missing')
+    const timeline = validateProductTimelineEvent({
+      schemaVersion: 1, runId: this.config.runtime.runId, sequence: ++this.sequence,
+      at: new Date().toISOString(), event, approvalId,
+      generation: this.admission.admissionGeneration,
+    })
+    await appendPrivateNdjson(this.config.runtime.capture.ownerWalTimelinePath, this.config.sandboxRoot, timeline)
     await this.refreshEvidence('ready')
   }
 
   private async refreshEvidence(status: 'ready' | 'stopping'): Promise<void> {
+    const state = await this.store?.read() ?? null
+    const wal = await readAnchoredFile(this.config.walFile, this.config.sandboxRoot, {
+      minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600,
+    }).catch(() => null)
+    const socketIdentity = async (path: string): Promise<SecureFileIdentity | null> => {
+      const stat = await lstat(path, { bigint: true }).catch(() => null)
+      return stat ? {
+        device: stat.dev.toString(), inode: stat.ino.toString(), size: stat.size.toString(),
+        mtimeNs: stat.mtimeNs.toString(), ctimeNs: stat.ctimeNs.toString(),
+        mode: (stat.mode & 0o777n).toString(), nlink: stat.nlink.toString(), uid: stat.uid.toString(),
+      } : null
+    }
+    const ownerSocket = await this.ownerSocket()
     this.evidence = buildAcceptanceEvidence({
       config: this.config, status, admission: this.admission,
-      ownerSocket: this.evidence.owner.ownerSocket ?? await this.ownerSocket(),
-      state: await this.store?.read() ?? null, publication: this.publication,
+      bootstrap: this.bootstrap, configSha256: this.configSha256,
+      ownerProcessStartIdentity: this.ownerProcessStartIdentity,
+      ownerSocket, state, publication: this.publication,
+      controlSocketIdentity: await socketIdentity(this.config.controlSocket),
+      ownerSocketIdentity: await socketIdentity(ownerSocket),
+      walIdentity: wal?.identity ?? null,
+      walSha256: wal ? createHash('sha256').update(wal.bytes).digest('hex') : null,
+      stateSha256: state ? createHash('sha256').update(JSON.stringify(state)).digest('hex') : null,
+      providers: Object.freeze([...this.providerIdentities.values()].sort((a, b) =>
+        a.routeId.localeCompare(b.routeId))),
     })
     await this.writeEvidence()
   }
 
   private async writeEvidence(): Promise<void> {
-    await atomicPrivateJson(this.config.evidenceFile, this.config.sandboxRoot, this.evidence)
+    await atomicPrivateJson(this.config.evidenceFile, this.config.sandboxRoot,
+      validateAcceptanceEvidence(this.evidence))
   }
 
   private async startControl(): Promise<void> {
@@ -230,6 +316,12 @@ class AcceptanceRuntime {
     if (await realpath(parent) !== parent) throw new Error('hosted_actual_owner_control_parent_not_canonical')
     const parentHandle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
     const openedParent = await parentHandle.stat()
+    if (!openedParent.isDirectory() || (openedParent.mode & 0o022) !== 0 ||
+      (process.getuid?.() !== undefined && openedParent.uid !== process.getuid())) {
+      await parentHandle.close()
+      throw new Error('hosted_actual_owner_control_parent_unsafe')
+    }
+    const anchoredSocket = `/proc/self/fd/${parentHandle.fd}/${this.config.controlSocket.split('/').at(-1)}`
     const existing = await lstat(this.config.controlSocket).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
       throw error
@@ -238,13 +330,15 @@ class AcceptanceRuntime {
     const server = createServer(socket => this.handleControl(socket))
     try {
       await new Promise<void>((resolveListen, rejectListen) => {
-        server.once('error', rejectListen); server.listen(this.config.controlSocket, resolveListen)
+        server.once('error', rejectListen); server.listen(anchoredSocket, resolveListen)
       })
-      await chmod(this.config.controlSocket, 0o600)
-      const [socketStat, parentStat] = await Promise.all([
-        lstat(this.config.controlSocket), lstat(parent),
+      await chmod(anchoredSocket, 0o600)
+      const [socketStat, linkedSocket, parentStat] = await Promise.all([
+        lstat(anchoredSocket), lstat(this.config.controlSocket), lstat(parent),
       ])
       if (!socketStat.isSocket() || (socketStat.mode & 0o777) !== 0o600 ||
+        !linkedSocket.isSocket() || linkedSocket.isSymbolicLink() ||
+        linkedSocket.dev !== socketStat.dev || linkedSocket.ino !== socketStat.ino ||
         !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
         throw new Error('hosted_actual_owner_control_socket_unsafe')
       }
@@ -342,7 +436,14 @@ class AcceptanceRuntime {
       }
     } finally {
       await parentHandle?.close()
-      await this.runtime?.stop()
+      if (this.runtime) {
+        await this.runtime.stop()
+        this.bootstrapReleased = true
+      } else if (!this.bootstrapReleased) {
+        this.bootstrap.secret.fill(0)
+        await this.bootstrap.guard.close()
+        this.bootstrapReleased = true
+      }
     }
     if (cleanupFailure) throw cleanupFailure
   }
@@ -351,13 +452,16 @@ class AcceptanceRuntime {
 export async function runActualOwnerAcceptance(args: readonly string[]): Promise<void> {
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   const config = await loadAcceptanceConfig({ args, repositoryRoot })
-  const acceptance = new AcceptanceRuntime(config)
+  const bootstrap = await readHostedControlBootstrap()
+  const acceptance = new AcceptanceRuntime(config, bootstrap)
   const stop = () => void acceptance.stop().then(() => process.exit(0), error => {
     process.stderr.write(`${error instanceof Error ? error.message : 'hosted_actual_owner_cleanup_failed'}\n`)
     process.exit(1)
   })
   process.once('SIGINT', stop); process.once('SIGTERM', stop)
-  try { await acceptance.start() } catch (error) {
+  try {
+    await acceptance.start()
+  } catch (error) {
     const failure = error instanceof Error ? error.message : 'hosted_actual_owner_start_failed'
     await atomicPrivateJson(config.evidenceFile, config.sandboxRoot,
       buildAcceptanceEvidence({ config, status: 'failed', failure })).catch(() => undefined)

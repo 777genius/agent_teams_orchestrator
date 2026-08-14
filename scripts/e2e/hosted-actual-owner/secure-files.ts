@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
 import { lstat, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, sep } from 'node:path'
@@ -9,6 +9,9 @@ export type SecureFileIdentity = Readonly<{
   size: string
   mtimeNs: string
   ctimeNs: string
+  mode: string
+  nlink: string
+  uid: string
 }>
 
 type ReadOptions = {
@@ -41,6 +44,7 @@ function identity(stat: BigIntStats): SecureFileIdentity {
   return Object.freeze({
     device: stat.dev.toString(), inode: stat.ino.toString(), size: stat.size.toString(),
     mtimeNs: stat.mtimeNs.toString(), ctimeNs: stat.ctimeNs.toString(),
+    mode: (stat.mode & 0o777n).toString(), nlink: stat.nlink.toString(), uid: stat.uid.toString(),
   })
 }
 
@@ -153,10 +157,12 @@ export async function atomicPrivateJson(
   const temporaryPath = `${parent.anchoredPath}/${temporaryName}`
   let temporaryExists = true
   try {
-    const handle = await open(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, 0o600)
+    const expectedBytes = Buffer.from(`${JSON.stringify(value)}\n`)
+    const expectedDigest = createHash('sha256').update(expectedBytes).digest('hex')
+    const handle = await open(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NOFOLLOW, 0o600)
     let written: BigIntStats
     try {
-      await handle.writeFile(`${JSON.stringify(value)}\n`)
+      await handle.writeFile(expectedBytes)
       await handle.sync()
       written = await handle.stat({ bigint: true })
       if (!written.isFile() || written.nlink !== 1n || Number(written.mode & 0o777n) !== 0o600) {
@@ -164,24 +170,86 @@ export async function atomicPrivateJson(
       }
       await beforeRename?.(temporaryPath)
       const linked = await lstat(temporaryPath, { bigint: true })
-      if (!same(written, linked) || linked.isSymbolicLink()) {
+      const afterCallback = await handle.stat({ bigint: true })
+      const currentBytes = Buffer.alloc(Number(afterCallback.size))
+      const currentRead = await handle.read(currentBytes, 0, currentBytes.byteLength, 0)
+      if (!stable(written, afterCallback) || !stable(afterCallback, linked) || linked.isSymbolicLink() ||
+        afterCallback.nlink !== 1n || Number(afterCallback.mode & 0o777n) !== 0o600 ||
+        currentRead.bytesRead !== expectedBytes.byteLength || currentBytes.byteLength !== expectedBytes.byteLength ||
+        createHash('sha256').update(currentBytes).digest('hex') !== expectedDigest) {
         throw new Error('hosted_actual_owner_evidence_temp_substituted')
       }
     } finally { await handle.close() }
     await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
     await rename(temporaryPath, `${parent.anchoredPath}/${basename(path)}`)
     temporaryExists = false
-    const published = await lstat(`${parent.anchoredPath}/${basename(path)}`, { bigint: true })
-    if (!same(written!, published) || published.isSymbolicLink()) {
-      throw new Error('hosted_actual_owner_evidence_publish_substituted')
-    }
+    const publishedPath = `${parent.anchoredPath}/${basename(path)}`
+    const publishedHandle = await open(publishedPath, constants.O_RDONLY | NOFOLLOW)
+    let published: BigIntStats
+    try {
+      published = await publishedHandle.stat({ bigint: true })
+      const publishedBytes = await publishedHandle.readFile()
+      const publishedAfter = await publishedHandle.stat({ bigint: true })
+      if (!same(written!, published) || written!.size !== published.size || written!.mode !== published.mode ||
+        !stable(published, publishedAfter) || published.nlink !== 1n ||
+        Number(published.mode & 0o777n) !== 0o600 || publishedBytes.byteLength !== expectedBytes.byteLength ||
+        createHash('sha256').update(publishedBytes).digest('hex') !== expectedDigest) {
+        throw new Error('hosted_actual_owner_evidence_publish_substituted')
+      }
+    } finally { await publishedHandle.close() }
     await parent.handle.sync()
     await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
     const final = await lstat(path, { bigint: true })
-    if (!same(written!, final)) throw new Error('hosted_actual_owner_evidence_membership_unproved')
+    if (!stable(published!, final) || final.nlink !== 1n || Number(final.mode & 0o777n) !== 0o600) {
+      throw new Error('hosted_actual_owner_evidence_membership_unproved')
+    }
     return identity(final)
   } finally {
     if (temporaryExists) await unlink(temporaryPath).catch(() => undefined)
+    await parent.handle.close()
+  }
+}
+
+/** Appends one line without ever resolving the child through an unpinned parent. */
+export async function appendPrivateNdjson(
+  path: string,
+  trustedRoot: string,
+  value: unknown,
+): Promise<SecureFileIdentity> {
+  const parentPath = dirname(path)
+  const parent = await anchoredDirectory(parentPath, trustedRoot)
+  const child = `${parent.anchoredPath}/${basename(path)}`
+  let handle: FileHandle | null = null
+  try {
+    try {
+      handle = await open(child, constants.O_WRONLY | constants.O_APPEND | NOFOLLOW)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      handle = await open(child,
+        constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | NOFOLLOW, 0o600)
+    }
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile() || before.nlink !== 1n || Number(before.mode & 0o777n) !== 0o600 ||
+      (process.getuid?.() !== undefined && before.uid !== BigInt(process.getuid()))) {
+      throw new Error('hosted_actual_owner_timeline_unsafe')
+    }
+    await handle.writeFile(`${JSON.stringify(value)}\n`)
+    await handle.sync()
+    const [after, linked] = await Promise.all([
+      handle.stat({ bigint: true }), lstat(child, { bigint: true }),
+    ])
+    if (!same(before, after) || !same(after, linked) || linked.isSymbolicLink() || after.nlink !== 1n ||
+      Number(after.mode & 0o777n) !== 0o600 || after.size <= before.size) {
+      throw new Error('hosted_actual_owner_timeline_identity_drift')
+    }
+    await assertDirectoryMembership(parentPath, parent.stat, parent.handle)
+    const final = await lstat(path, { bigint: true })
+    if (!same(after, final) || final.isSymbolicLink() || final.nlink !== 1n) {
+      throw new Error('hosted_actual_owner_timeline_membership_unproved')
+    }
+    return identity(final)
+  } finally {
+    await handle?.close()
     await parent.handle.close()
   }
 }
