@@ -2110,6 +2110,7 @@ describe('OpenCodeSessionBridge', () => {
       counter: 1,
       randomSuffix: 'AAAAAAAAAAAAAA',
     })
+    const lowerLegacyMessageId = `msg_${latestAssistantMessageId.slice(4, 16)}${'0'.repeat(20)}`
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
       hostManager: {
@@ -2145,7 +2146,7 @@ describe('OpenCodeSessionBridge', () => {
               parts: [],
             },
             {
-              info: { id: 'msg_0d008f4f44e4481a8e3b0bbe848d519c', role: 'user' },
+              info: { id: lowerLegacyMessageId, role: 'user' },
               parts: [],
             },
           ],
