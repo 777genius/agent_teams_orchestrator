@@ -23,7 +23,7 @@ export type HostedApprovalDeliveryState = {
 }
 
 export type HostedApprovalOwnerState = {
-  schemaVersion: 1
+  schemaVersion: 2
   revision: number
   admissionGeneration: string
   admissionDigest: string
@@ -549,8 +549,9 @@ export function parseOwnerStateSource(raw: Uint8Array): HostedApprovalOwnerState
 
 export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
   const state = object(value, 'WAL')
+  if (state.schemaVersion === 1) return migrateLegacyOwnerState(state)
   exact(state, ['schemaVersion', 'revision', 'admissionGeneration', 'admissionDigest', 'routes', 'actorMembers', 'ingress', 'retiredIngress', 'deliveries', 'writerFence'], 'WAL')
-  if (state.schemaVersion !== 1 || !Number.isSafeInteger(state.revision) || (state.revision as number) < 1 ||
+  if (state.schemaVersion !== 2 || !Number.isSafeInteger(state.revision) || (state.revision as number) < 1 ||
     typeof state.admissionGeneration !== 'string' || !/^approval-admission-generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(state.admissionGeneration) ||
     typeof state.admissionDigest !== 'string' || !/^[0-9a-f]{64}$/.test(state.admissionDigest) ||
     !Array.isArray(state.routes) || !Array.isArray(state.ingress) || !Array.isArray(state.retiredIngress) || !Array.isArray(state.deliveries)) {
@@ -583,11 +584,90 @@ export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
     throw new Error('Invalid duplicate hosted approval WAL identity')
   }
   return {
-    schemaVersion: 1, revision: state.revision as number,
+    schemaVersion: 2, revision: state.revision as number,
     admissionGeneration: state.admissionGeneration, admissionDigest: state.admissionDigest,
     routes, actorMembers: actors as Record<string, string>, ingress, retiredIngress, deliveries,
     writerFence: writerFence as HostedApprovalWriterFenceIdentity,
   }
+}
+
+/**
+ * Legacy v1 had no executable authority. Recovery is deliberately state-only:
+ * every route is revoked, and only ingress referenced by durable settlement
+ * evidence survives as non-claimable history. The next fenced publication is v2.
+ */
+function migrateLegacyOwnerState(state: Record<string, unknown>): HostedApprovalOwnerState {
+  exact(state, ['schemaVersion', 'revision', 'admissionGeneration', 'admissionDigest', 'routes', 'actorMembers', 'ingress', 'retiredIngress', 'deliveries', 'writerFence'], 'legacy v1 WAL')
+  if (!Number.isSafeInteger(state.revision) || (state.revision as number) < 1 ||
+    typeof state.admissionGeneration !== 'string' || !/^approval-admission-generation_[A-Za-z0-9][A-Za-z0-9._-]{0,223}$/.test(state.admissionGeneration) ||
+    typeof state.admissionDigest !== 'string' || !/^[0-9a-f]{64}$/.test(state.admissionDigest) ||
+    !Array.isArray(state.routes) || !Array.isArray(state.ingress) ||
+    !Array.isArray(state.retiredIngress) || !Array.isArray(state.deliveries)) {
+    throw new Error('Invalid hosted approval legacy v1 WAL scalar')
+  }
+  const actors = object(state.actorMembers, 'legacy v1 actor members')
+  for (const [actor, member] of Object.entries(actors)) {
+    if (!/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/.test(actor) ||
+      typeof member !== 'string' || !/^member_[0-9a-f]{32}$/.test(member)) {
+      throw new Error('Invalid hosted approval legacy v1 actor mapping')
+    }
+  }
+  const writerFence = decodeWriterFence(state.writerFence)
+  const legacyRoutes = state.routes.map(value => decodeLegacyWalRoute(value, actors))
+  const authorities = legacyRoutes.map(route => route.authority)
+  const decodeLegacyIngress = (value: unknown) => {
+    const record = decodeRetiredWalIngress(value)
+    if (!authorities.some(authority => isDeepStrictEqual(authority, record.authority))) {
+      throw new Error('Invalid hosted approval legacy v1 ingress route')
+    }
+    return record
+  }
+  const allIngress = [...state.ingress.map(decodeLegacyIngress), ...state.retiredIngress.map(decodeLegacyIngress)]
+  const deliveries = state.deliveries.map(value => decodeWalDelivery(value, allIngress))
+  if (new Set(allIngress.map(record => record.outboxId)).size !== allIngress.length ||
+    new Set(allIngress.map(record => record.deliveryRef)).size !== allIngress.length ||
+    new Set(deliveries.map(record => record.providerDeliveryId)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.reconciliationRef)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.deliveryRef)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.outboxId)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.effectRef)).size !== deliveries.length) {
+    throw new Error('Invalid duplicate hosted approval legacy v1 WAL identity')
+  }
+  const referenced = new Set(deliveries.map(delivery => delivery.outboxId))
+  return {
+    schemaVersion: 2,
+    revision: state.revision as number,
+    admissionGeneration: state.admissionGeneration,
+    admissionDigest: state.admissionDigest,
+    routes: [],
+    actorMembers: {},
+    ingress: [],
+    retiredIngress: allIngress.filter(record => referenced.has(record.outboxId)),
+    deliveries,
+    writerFence,
+  }
+}
+
+function decodeWriterFence(value: unknown): HostedApprovalWriterFenceIdentity {
+  const writerFence = object(value, 'writer fence')
+  exact(writerFence, ['generation', 'dev', 'ino'], 'writer fence')
+  if (typeof writerFence.generation !== 'string' || !/^approval-writer-fence_[0-9a-f]{32}$/.test(writerFence.generation) ||
+    typeof writerFence.dev !== 'string' || !/^\d+$/.test(writerFence.dev) ||
+    typeof writerFence.ino !== 'string' || !/^\d+$/.test(writerFence.ino)) {
+    throw new Error('Invalid hosted approval WAL writer fence')
+  }
+  return writerFence as unknown as HostedApprovalWriterFenceIdentity
+}
+
+function decodeLegacyWalRoute(value: unknown, actors: Record<string, unknown>): HostedApprovalRuntimeRoute {
+  const route = object(value, 'legacy v1 WAL route')
+  exact(route, ['routeId', 'authority', 'scope', 'memberName', 'openCodeBinding'], 'legacy v1 WAL route')
+  const binding = object(route.openCodeBinding, 'legacy v1 WAL OpenCode binding')
+  exact(binding, ['toolApprovalMode', 'planGeneration', 'credentialGeneration', 'credentialId', 'runtimeInstanceId', 'deliveryOwnerId', 'sessionRecordFingerprint', 'liveEffectFingerprint'], 'legacy v1 WAL OpenCode binding')
+  return decodeWalRoute({
+    ...route,
+    openCodeBinding: { ...binding, openCodeArtifactDigest: `sha256:${'0'.repeat(64)}` },
+  }, actors)
 }
 
 function decodeWalRoute(value: unknown, actors: Record<string, unknown>): HostedApprovalRuntimeRoute {

@@ -1652,13 +1652,15 @@ export class OpenCodeSessionBridge {
         profileConsumed = true
         if (!profileToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
       }
-      if (hostToken) {
-        hostConsumed = true
-        if (!hostToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
-      }
       if (authorityToken) {
         authorityConsumed = true
         if (!authorityToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      // The fresh process/executed-artifact proof is consumed last, with no
+      // asynchronous boundary before the provider POST.
+      if (hostToken) {
+        hostConsumed = true
+        if (!hostToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
       }
       try {
         invocation.phase = 'invoked'

@@ -18,7 +18,9 @@ import {
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import {
+  prepareExecutingOpenCodeArtifactDigestToken,
   resolveOpenCodeArtifactDigest,
+  resolveExecutingOpenCodeArtifactDigest,
   type OpenCodeArtifactDigest,
 } from './OpenCodeArtifactDigest.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
@@ -122,6 +124,7 @@ type OpenCodeHostManagerDeps = {
   now?: () => Date
   persistentRegistryPath?: string | null
   beforeTempOwnershipMarkerPublish?: () => Promise<void>
+  resolveOpenCodeArtifactDigest?: (binaryPath: string) => OpenCodeArtifactDigest | null
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -475,8 +478,19 @@ export class OpenCodeHostManager {
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
+  private installedArtifact: { binaryPath: string; digest: OpenCodeArtifactDigest | null } | null = null
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
+
+  private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
+    if (!binaryPath || this.deps.spawnHostProcess || process.platform !== 'linux') return null
+    // A manager retains one resolved production launcher. Re-proving the source
+    // belongs at the effect edge; repeated ensureHost calls must not rehash it.
+    if (this.installedArtifact?.binaryPath === binaryPath) return this.installedArtifact.digest
+    const digest = (this.deps.resolveOpenCodeArtifactDigest ?? resolveOpenCodeArtifactDigest)(binaryPath)
+    this.installedArtifact = { binaryPath, digest }
+    return digest
+  }
 
   private async prepareProfile(
     projectPath?: string | null,
@@ -1241,8 +1255,8 @@ export class OpenCodeHostManager {
     const processStartedAtMs = processIdentity.state === 'unverified'
       ? await this.verifyLegacyPersistentHostIdentity(record, processIdentity.startedAtMs)
       : processIdentity.startedAtMs ?? record.processStartedAtMs
-    const executingArtifactMatches = !openCodeArtifactDigest || process.platform !== 'linux' ||
-      resolveOpenCodeArtifactDigest(`/proc/${record.pid}/exe`) === openCodeArtifactDigest
+    const executingArtifactMatches = !!openCodeArtifactDigest && process.platform === 'linux' &&
+      resolveExecutingOpenCodeArtifactDigest(record.pid) === openCodeArtifactDigest
 
     const handle: OpenCodeHostHandle = {
       hostKey,
@@ -1586,11 +1600,10 @@ export class OpenCodeHostManager {
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
         )
       }
-      if (openCodeArtifactDigest && !this.deps.spawnHostProcess && process.platform === 'linux' &&
-        resolveOpenCodeArtifactDigest(`/proc/${handle.pid}/exe`) !== openCodeArtifactDigest) {
-        // Preserve ordinary OpenCode startup for wrapper/interpreter commands,
-        // but publish no hosted artifact authority unless installed and
-        // executing bytes are the same exact executable.
+      if (!openCodeArtifactDigest || this.deps.spawnHostProcess || process.platform !== 'linux' ||
+        resolveExecutingOpenCodeArtifactDigest(handle.pid) !== openCodeArtifactDigest) {
+        // Ordinary startup remains available, but only a direct Linux executable
+        // whose installed and executed immutable bytes match publishes authority.
         handle.openCodeArtifactDigest = null
       }
       if (lifetime === 'persistent') {
@@ -1649,9 +1662,7 @@ export class OpenCodeHostManager {
     const binaryPath = resolveOpenCodeBinaryPath()
     // Test/custom process factories do not prove which executable they run;
     // only the production resolver/spawn path may publish artifact identity.
-    const openCodeArtifactDigest = this.deps.spawnHostProcess
-      ? null
-      : resolveOpenCodeArtifactDigest(binaryPath)
+    const openCodeArtifactDigest = this.resolveInstalledArtifact(binaryPath)
     if (binaryPath) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
@@ -1796,10 +1807,9 @@ export class OpenCodeHostManager {
     const entry = this.hosts.get(input.hostKey)
     if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
       input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
-    if (input.openCodeArtifactDigest &&
-      (entry.handle.openCodeArtifactDigest !== input.openCodeArtifactDigest ||
-        process.platform === 'linux' &&
-          resolveOpenCodeArtifactDigest(`/proc/${input.pid}/exe`) !== input.openCodeArtifactDigest)) return false
+    if (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
+      entry.handle.openCodeArtifactDigest !== input.openCodeArtifactDigest ||
+      resolveExecutingOpenCodeArtifactDigest(input.pid) !== input.openCodeArtifactDigest) return false
     const startedBefore = await this.readProcessStartTimeMs(input.pid).catch(() => null)
     if (startedBefore !== input.processStartedAtMs) return false
     if (!(await this.checkHealthyHostOnce(entry.handle.baseUrl))) return false
@@ -1822,7 +1832,12 @@ export class OpenCodeHostManager {
     openCodeArtifactDigest?: `sha256:${string}` | null
   }): Promise<{ consume(): boolean } | null> {
     const entry = this.hosts.get(input.hostKey)
-    if (!entry || !(await this.verifyEffectHost(input))) return null
+    if (!entry || !input.openCodeArtifactDigest || !(await this.verifyEffectHost(input))) return null
+    const executingToken = prepareExecutingOpenCodeArtifactDigestToken(
+      input.pid,
+      input.openCodeArtifactDigest,
+    )
+    if (!executingToken) return null
     const handle = entry.handle
     let consumed = false
     return {
@@ -1830,14 +1845,13 @@ export class OpenCodeHostManager {
         if (consumed) return false
         consumed = true
         const live = this.hosts.get(input.hostKey)
-        return live === entry && live.handle === handle &&
+        const retained = live === entry && live.handle === handle &&
           handle.pid === input.pid && handle.processStartedAtMs === input.processStartedAtMs &&
           handle.resolvedConfigFingerprint === input.resolvedConfigFingerprint &&
-          (!input.openCodeArtifactDigest ||
-            handle.openCodeArtifactDigest === input.openCodeArtifactDigest) &&
-          (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
-            resolveOpenCodeArtifactDigest(`/proc/${input.pid}/exe`) === input.openCodeArtifactDigest) &&
+          handle.openCodeArtifactDigest === input.openCodeArtifactDigest &&
           this.isProcessAlive(input.pid)
+        const executingCurrent = executingToken.consume()
+        return retained && executingCurrent
       },
     }
   }

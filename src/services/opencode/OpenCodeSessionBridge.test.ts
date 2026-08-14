@@ -240,7 +240,7 @@ describe('OpenCodeSessionBridge', () => {
         ensureHost: async () => { order.push('host'); return { ...host, processStartedAtMs: 1000 } },
         prepareEffectHostToken: async input => {
           order.push(`host-proof:${input.pid}:${input.processStartedAtMs}:${input.resolvedConfigFingerprint}`)
-          return { consume: () => true }
+          return { consume: () => { order.push('host-token'); return true } }
         },
         releaseHost: async () => {}, retainHostLease: async () => {},
       },
@@ -258,12 +258,15 @@ describe('OpenCodeSessionBridge', () => {
         order.push('session-effect')
         return { consume: () => { order.push('session-token'); return true } }
       },
-      authorizeEffect: async () => { order.push('admission'); return true },
+      authorizeEffect: async () => {
+        order.push('admission')
+        return { consume: () => { order.push('owner-token'); return true } }
+      },
     })
     expect(order).toEqual([
       'profile', 'host', 'permissions', 'session-effect', 'admission',
       'host-proof:123:1000:resolved-fingerprint', 'session-token',
-      'auth-token', 'post',
+      'auth-token', 'owner-token', 'host-token', 'post',
     ])
   })
 
@@ -533,7 +536,7 @@ describe('OpenCodeSessionBridge', () => {
       validatePreparedEffect: async () => ({ consume: () => { order.push('session-token'); return true } }),
       authorizeEffect: async () => ({ consume: () => { order.push('owner-token'); return false } }),
     }).catch(error => expect(error).toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError))
-    expect(order).toEqual(['session-token', 'auth-token', 'host-token', 'owner-token'])
+    expect(order).toEqual(['session-token', 'auth-token', 'owner-token', 'host-token'])
   })
 
   test('performs zero POSTs when live auth bytes rotate during final host proof', async () => {

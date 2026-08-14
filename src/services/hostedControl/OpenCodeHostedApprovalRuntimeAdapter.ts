@@ -114,8 +114,8 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
           }
           return {
             consume: () => {
-              const artifactCurrent = artifactToken.consume()
               const ownerCurrent = ownerToken?.consume() ?? true
+              const artifactCurrent = artifactToken.consume()
               return artifactCurrent && ownerCurrent
             },
           }

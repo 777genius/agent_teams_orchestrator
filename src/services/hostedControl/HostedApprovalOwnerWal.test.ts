@@ -68,9 +68,69 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     const duplicate = JSON.stringify(state()).replace('"routeId":"route_1"', '"routeId":"route_1","routeId":"route_substituted"')
     expect(() => parseOwnerStateSource(Buffer.from(duplicate))).toThrow('JSON')
   })
+
+  test('migrates exact legacy v1 state-only, revoking routes and retaining referenced evidence', () => {
+    const current = state()
+    const referenced = current.ingress[0]!
+    const unreferenced = structuredClone(referenced)
+    unreferenced.outboxId = `runtime_permission:effect:${'d'.repeat(64)}`
+    unreferenced.effectRef = `effect:${'d'.repeat(64)}`
+    unreferenced.deliveryRef = 'delivery_ref_unreferenced'
+    unreferenced.commandId = 'permission_unreferenced'
+    const payload = JSON.parse(unreferenced.payloadJson)
+    payload.deliveryRef = unreferenced.deliveryRef
+    unreferenced.payloadJson = JSON.stringify(payload)
+    const legacy = structuredClone(current) as unknown as {
+      schemaVersion: number
+      routes: Array<{ openCodeBinding: Record<string, unknown> }>
+      ingress: typeof current.ingress
+      deliveries: HostedApprovalOwnerState['deliveries']
+    }
+    legacy.schemaVersion = 1
+    delete legacy.routes[0].openCodeBinding.openCodeArtifactDigest
+    legacy.ingress.push(unreferenced)
+    legacy.deliveries = [{
+      providerDeliveryId: 'delivery_legacy',
+      reconciliationRef: 'approval-reconciliation_legacy',
+      deliveryRef: referenced.deliveryRef,
+      payloadFingerprint: 'f'.repeat(64),
+      outboxId: referenced.outboxId,
+      effectRef: referenced.effectRef,
+      phase: 'started',
+      result: null,
+    }]
+    const migrated = decodeOwnerState(legacy)
+    expect(migrated).toMatchObject({
+      schemaVersion: 2,
+      routes: [],
+      actorMembers: {},
+      ingress: [],
+      retiredIngress: [{ outboxId: referenced.outboxId }],
+      deliveries: [{ providerDeliveryId: 'delivery_legacy', phase: 'started' }],
+    })
+  })
 })
 
 describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
+  test('publishes a legacy v1 migration as v2 without restoring legacy routes', async () => {
+    const { path } = await walPath()
+    const wal = new HostedApprovalOwnerWal(path)
+    const published = await wal.locked(async current => wal.publish(current, withoutRevision(state())))
+    const legacy = structuredClone(published) as unknown as {
+      schemaVersion: number
+      routes: Array<{ openCodeBinding: Record<string, unknown> }>
+    }
+    legacy.schemaVersion = 1
+    delete legacy.routes[0]!.openCodeBinding.openCodeArtifactDigest
+    await writeFile(path, `${JSON.stringify(legacy)}\n`, { mode: 0o600 })
+    const migrated = await wal.locked(async current => {
+      expect(current).toMatchObject({ schemaVersion: 2, routes: [], ingress: [] })
+      return wal.publish(current, withoutRevision(current!))
+    })
+    expect(migrated.schemaVersion).toBe(2)
+    expect(JSON.parse(await readFile(path, 'utf8')).schemaVersion).toBe(2)
+  })
+
   test('rejects a writer-fence symlink without mutating its target', async () => {
     const { path } = await walPath(); const wal = new HostedApprovalOwnerWal(path)
     const target = join(path, '..', 'target'); await writeFile(target, 'untouched', { mode: 0o644 })
@@ -367,7 +427,7 @@ function state(): HostedApprovalOwnerState {
     permission: { requestId: 'permission_1', sessionId: 'session_1', tool: 'bash', title: 'Run tests', kind: 'tool', raw: { requestID: 'permission_1', sessionID: 'session_1' } },
   })
   return {
-    schemaVersion: 1 as const, revision: 1, admissionGeneration: 'approval-admission-generation_1',
+    schemaVersion: 2 as const, revision: 1, admissionGeneration: 'approval-admission-generation_1',
     admissionDigest: 'a'.repeat(64), routes: [structuredClone(route)],
     writerFence: { generation: `approval-writer-fence_${'a'.repeat(32)}`, dev: '1', ino: '1' },
     actorMembers: { actor_owner: route.authority.deliveryOwnerId, actor_operator: `member_${'8'.repeat(32)}` },

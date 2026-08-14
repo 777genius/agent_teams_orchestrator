@@ -35,7 +35,7 @@ export class HostedApprovalOwnerStore {
       const retiredIngress = [...retiredByOutbox.values()]
       if (!(await admission.isCurrent())) throw new Error('Hosted approval admission changed during recovery')
       const published = await this.wal.publish(state, {
-        schemaVersion: 1, admissionGeneration: admission.admissionGeneration,
+        schemaVersion: 2, admissionGeneration: admission.admissionGeneration,
         admissionDigest: admission.digest, routes: [...admission.routes],
         actorMembers: { ...admission.actorMembers }, ingress, retiredIngress,
         deliveries: state?.deliveries ?? [],
@@ -138,12 +138,15 @@ export class HostedApprovalOwnerStore {
         .find(record => record.outboxId === delivery.outboxId && record.effectRef === delivery.effectRef)
       if (!ingress || ingress.authority.teamId !== request.partition.teamId ||
         ingress.authority.runId !== request.partition.runId) return { status: 'unavailable' }
-      const persistedRoute = state.routes.find(route => isDeepStrictEqual(route.authority, ingress.authority))
-      if (!persistedRoute || !admission.routes.some(route =>
-        route.authority.teamId === request.partition.teamId &&
-        route.authority.runId === request.partition.runId &&
-        isDeepStrictEqual(route, persistedRoute)
-      )) return { status: 'unavailable' }
+      const retired = state.retiredIngress.some(record => record.outboxId === ingress.outboxId)
+      if (!retired) {
+        const persistedRoute = state.routes.find(route => isDeepStrictEqual(route.authority, ingress.authority))
+        if (!persistedRoute || !admission.routes.some(route =>
+          route.authority.teamId === request.partition.teamId &&
+          route.authority.runId === request.partition.runId &&
+          isDeepStrictEqual(route, persistedRoute)
+        )) return { status: 'unavailable' }
+      }
       if (delivery.phase === 'started') return { status: 'operator_required' }
       if (delivery.phase === 'completed' && delivery.result === 'delivered') {
         return { status: 'delivered' }
