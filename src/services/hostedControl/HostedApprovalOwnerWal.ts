@@ -12,6 +12,7 @@ import { assertNoDuplicateJsonObjectKeys } from './ownerProof.js'
 
 export type HostedApprovalDeliveryState = {
   providerDeliveryId: string
+  reconciliationRef: string
   deliveryRef: string
   payloadFingerprint: string
   outboxId: string
@@ -575,6 +576,7 @@ export function decodeOwnerState(value: unknown): HostedApprovalOwnerState {
     new Set(allIngress.map(record => record.outboxId)).size !== allIngress.length ||
     new Set(allIngress.map(record => record.deliveryRef)).size !== allIngress.length ||
     new Set(deliveries.map(record => record.providerDeliveryId)).size !== deliveries.length ||
+    new Set(deliveries.map(record => record.reconciliationRef)).size !== deliveries.length ||
     new Set(deliveries.map(record => record.deliveryRef)).size !== deliveries.length ||
     new Set(deliveries.map(record => record.outboxId)).size !== deliveries.length ||
     new Set(deliveries.map(record => record.effectRef)).size !== deliveries.length) {
@@ -681,9 +683,11 @@ function decodeLease(value: unknown): HostedApprovalIngressRecord['lease'] {
 
 function decodeWalDelivery(value: unknown, ingress: readonly HostedApprovalIngressRecord[]): HostedApprovalDeliveryState {
   const delivery = object(value, 'WAL delivery')
-  exact(delivery, ['providerDeliveryId', 'deliveryRef', 'payloadFingerprint', 'outboxId', 'effectRef', 'phase', 'result'], 'WAL delivery')
+  exact(delivery, ['providerDeliveryId', 'reconciliationRef', 'deliveryRef', 'payloadFingerprint', 'outboxId', 'effectRef', 'phase', 'result'], 'WAL delivery')
   const record = ingress.find(record => record.outboxId === delivery.outboxId)
-  if (!identifier(delivery.providerDeliveryId) || typeof delivery.deliveryRef !== 'string' || record?.deliveryRef !== delivery.deliveryRef ||
+  if (!identifier(delivery.providerDeliveryId) || typeof delivery.reconciliationRef !== 'string' ||
+    !/^approval-reconciliation_[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/.test(delivery.reconciliationRef) ||
+    typeof delivery.deliveryRef !== 'string' || record?.deliveryRef !== delivery.deliveryRef ||
     typeof delivery.effectRef !== 'string' || record.effectRef !== delivery.effectRef ||
     typeof delivery.payloadFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(delivery.payloadFingerprint) ||
     !['started', 'completed', 'rejected'].includes(String(delivery.phase)) ||

@@ -48,7 +48,7 @@ describe('decodeOwnerState R2 adversarial persistence', () => {
     expect(() => decodeOwnerState(payload)).toThrow('ingress payload')
     const acknowledgement = state(); acknowledgement.ingress[0]!.acknowledgedAtIso = '2026-08-13T09:59:00.000Z'; acknowledgement.ingress[0]!.lease = { generation: 1, ownerId: 'owner_1', leaseToken: 'lease_1', claimedAtIso: '2026-08-13T10:00:01.000Z', leaseExpiresAtIso: '2026-08-13T10:00:02.000Z' }
     expect(() => decodeOwnerState(acknowledgement)).toThrow('acknowledgement')
-    const delivery = state(); delivery.deliveries = [{ providerDeliveryId: 'delivery_1', deliveryRef: 'delivery_ref_wrong', payloadFingerprint: 'f'.repeat(64), outboxId: delivery.ingress[0]!.outboxId, effectRef: delivery.ingress[0]!.effectRef, phase: 'started', result: null }]
+    const delivery = state(); delivery.deliveries = [{ providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`, deliveryRef: 'delivery_ref_wrong', payloadFingerprint: 'f'.repeat(64), outboxId: delivery.ingress[0]!.outboxId, effectRef: delivery.ingress[0]!.effectRef, phase: 'started', result: null }]
     expect(() => decodeOwnerState(delivery)).toThrow('delivery binding')
   })
 
@@ -134,7 +134,7 @@ describe('HostedApprovalOwnerWal R3 shared writer fence', () => {
     const ingress = initial.ingress[0]!
     await crashed.locked(async current => crashed.publish(current, {
       ...withoutRevision(current!),
-      deliveries: [{ providerDeliveryId: 'delivery_1', deliveryRef: ingress.deliveryRef, payloadFingerprint: 'f'.repeat(64), outboxId: ingress.outboxId, effectRef: ingress.effectRef, phase: 'started', result: null }],
+      deliveries: [{ providerDeliveryId: 'delivery_1', reconciliationRef: `approval-reconciliation_${'4'.repeat(64)}`, deliveryRef: ingress.deliveryRef, payloadFingerprint: 'f'.repeat(64), outboxId: ingress.outboxId, effectRef: ingress.effectRef, phase: 'started', result: null }],
     }))
     const replacement = new HostedApprovalOwnerWal(path)
     expect(await replacement.read()).toMatchObject({ deliveries: [{ phase: 'started', result: null, effectRef: ingress.effectRef }] })
@@ -242,7 +242,7 @@ import { HostedApprovalOwnerWal } from ${JSON.stringify(moduleUrl)}
 const wal = new HostedApprovalOwnerWal(process.argv[2])
 await wal.locked(async state => {
   const ingress = state.ingress[0]
-  await wal.publish(state, { ...state, deliveries: [{ providerDeliveryId: 'delivery_1', deliveryRef: ingress.deliveryRef, payloadFingerprint: '${'f'.repeat(64)}', outboxId: ingress.outboxId, effectRef: ingress.effectRef, phase: 'started', result: null }] })
+  await wal.publish(state, { ...state, deliveries: [{ providerDeliveryId: 'delivery_1', reconciliationRef: 'approval-reconciliation_${'4'.repeat(64)}', deliveryRef: ingress.deliveryRef, payloadFingerprint: '${'f'.repeat(64)}', outboxId: ingress.outboxId, effectRef: ingress.effectRef, phase: 'started', result: null }] })
   await writeFile(process.argv[3], 'ready')
   while (await access(process.argv[4]).then(() => false).catch(() => true)) await new Promise(r => setTimeout(r, 5))
   await appendFile(process.argv[5], 'provider-effect\\n')

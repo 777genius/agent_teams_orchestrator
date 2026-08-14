@@ -6,7 +6,6 @@ import {
   parseStrictHostedSignedJsonFrame,
 } from './ownerProof.js'
 import {
-  decodeHostedControlAuthority,
   type HostedControlAuthority,
   type HostedControlOwnerBinding,
   type HostedControlStableAuthority,
@@ -14,6 +13,11 @@ import {
 
 export const HOSTED_APPROVAL_PROOF_DOMAIN =
   'agent-teams.hosted-runtime-approval.owner-proof/v1'
+export const HOSTED_APPROVAL_WIRE_SCHEMA_VERSION = 4 as const
+export const HOSTED_APPROVAL_WIRE_CAPABILITY =
+  '{"format":"agent-teams.hosted-approval-wire-capability/v1","wireSchemaVersion":4,"ownerProofDomain":"agent-teams.hosted-runtime-approval.owner-proof/v1","operations":["approval_ingress_claim","approval_ingress_ack","approval_ingress_authority_resolve","approval_decision_deliver","approval_decision_reconcile"],"openCodeProtocol":"agent-teams-hosted-approval-v2","openCodeSchemaVersion":2}' as const
+export const HOSTED_APPROVAL_WIRE_CAPABILITY_DIGEST =
+  '40a6c4a131b4e64c04b87337fbce667c91f274fb85b3879c6cdcac49dbbbd639' as const
 /** Includes the newline delimiter consumed by HostedControlServer. */
 export const HOSTED_APPROVAL_MAX_FRAME_BYTES = 8 * 1024 * 1024
 export const HOSTED_APPROVAL_MAX_CLAIM_RECORDS = 100
@@ -33,6 +37,7 @@ const OPERATIONS = [
   'approval_ingress_ack',
   'approval_ingress_authority_resolve',
   'approval_decision_deliver',
+  'approval_decision_reconcile',
 ] as const
 
 export type HostedApprovalOperation = (typeof OPERATIONS)[number]
@@ -106,6 +111,7 @@ export type HostedApprovalAuthorityResult =
 
 export type HostedApprovalDeliveryRequest = {
   providerDeliveryId: string
+  reconciliationRef: string
   principal:
     | { kind: 'operator'; actorId: string }
     | { kind: 'system_timeout' }
@@ -117,16 +123,26 @@ export type HostedApprovalDeliveryRequest = {
   requestId: string
 }
 
-export type HostedApprovalDeliveryResult = {
-  status:
+export type HostedApprovalDeliveryResult =
+  | { status:
     | 'delivered'
     | 'idempotent_replay'
     | 'stale_generation'
     | 'expired'
     | 'wrong_lane'
     | 'self_approval'
-    | 'operator_required'
     | 'unavailable'
+  }
+  | { status: 'operator_required'; reconciliationRef: string }
+
+export type HostedApprovalReconciliationRequest = {
+  reconciliationRef: string
+  providerDeliveryId: string
+  partition: { teamId: string; runId: string }
+}
+
+export type HostedApprovalReconciliationResult = {
+  status: 'delivered' | 'not_delivered' | 'operator_required' | 'unavailable'
 }
 
 /** Internal conflict signal; it is never serialized as a product result. */
@@ -182,6 +198,8 @@ export type HostedApprovalWirePort = {
     authorization: HostedApprovalDeliveryAuthorization
     admittedAuthority: HostedApprovalIngressAuthority
   }): Promise<HostedApprovalDeliveryPortResult>
+  /** Classifies durable evidence only. This operation must never call the provider effect. */
+  reconcileDecision(request: HostedApprovalReconciliationRequest): Promise<HostedApprovalReconciliationResult>
 }
 
 export type HostedApprovalWireDispatcherOptions = {
@@ -209,7 +227,7 @@ export class HostedApprovalWireDispatcher {
       'schemaVersion', 'exchangeId', 'operation', 'ownerBinding',
       'authority', 'payload', 'ownerProof',
     ], 'approval request')
-    if (message.schemaVersion !== 2 ||
+    if (message.schemaVersion !== HOSTED_APPROVAL_WIRE_SCHEMA_VERSION ||
       typeof message.exchangeId !== 'string' ||
       !/^approval-request_[0-9a-f]{32}$/.test(message.exchangeId) ||
       !isHostedApprovalOperation(message.operation)) {
@@ -219,8 +237,8 @@ export class HostedApprovalWireDispatcher {
     if (!activeOwner || !isDeepStrictEqual(message.ownerBinding, activeOwner)) {
       throw new Error('Invalid hosted approval owner binding')
     }
-    const authority = decodeHostedControlAuthority(message.authority)
-    if (!sameAuthority(authority, this.options.authority)) {
+    const wireAuthority = decodeApprovalWireAuthority(message.authority)
+    if (!sameWireAuthority(wireAuthority, this.options.authority)) {
       throw new Error('Invalid hosted approval authority')
     }
     verifyRawProof(
@@ -230,13 +248,17 @@ export class HostedApprovalWireDispatcher {
       'request',
     )
 
-    const payload = await this.#dispatchPayload(message.operation, message.payload, authority)
+    const runtimeAuthority: HostedControlAuthority = {
+      ...wireAuthority,
+      teamId: this.options.authority.teamId,
+    }
+    const payload = await this.#dispatchPayload(message.operation, message.payload, runtimeAuthority)
     const envelope = {
-      schemaVersion: 2,
+      schemaVersion: HOSTED_APPROVAL_WIRE_SCHEMA_VERSION,
       exchangeId: message.exchangeId,
       operation: message.operation,
       ownerBinding: activeOwner,
-      authority,
+      authority: wireAuthority,
       payload,
     }
     const serialized = JSON.stringify(envelope)
@@ -317,7 +339,7 @@ export class HostedApprovalWireDispatcher {
           request, payloadFingerprint,
         })
         if (authorizationResult.status !== 'authorized') {
-          return decodeDeliveryResult(authorizationResult)
+          return decodeDeliveryResult(authorizationResult, request.reconciliationRef)
         }
         const authorization = decodeDeliveryAuthorization(authorizationResult)
         const persistedAuthority = authorization.persistedAuthority
@@ -333,7 +355,16 @@ export class HostedApprovalWireDispatcher {
           authorization,
           admittedAuthority,
         })
-        return decodeDeliveryResult(result)
+        return decodeDeliveryResult(result, request.reconciliationRef)
+      }
+      case 'approval_decision_reconcile': {
+        const request = decodeReconciliationRequest(value)
+        if (request.partition.teamId !== outerAuthority.teamId) {
+          throw new Error('Invalid hosted approval reconciliation partition')
+        }
+        return decodeReconciliationResult(
+          await this.options.approvals.reconcileDecision(request),
+        )
       }
     }
   }
@@ -353,18 +384,33 @@ function decodeDeliveryAuthorization(
   }
 }
 
-function decodeDeliveryResult(value: unknown): HostedApprovalDeliveryResult {
+function decodeDeliveryResult(value: unknown, expectedReconciliationRef: string): HostedApprovalDeliveryResult {
   if (record(value, 'approval delivery result').status === 'conflict') {
     throw new Error('Hosted approval delivery idempotency conflict')
   }
-  return decodeStatus(
-    value,
-    [
+  const input = record(value, 'approval delivery result')
+  if (input.status === 'operator_required') {
+    exactKeys(input, ['status', 'reconciliationRef'], 'approval delivery result')
+    if (input.reconciliationRef !== expectedReconciliationRef) {
+      throw new Error('Invalid approval reconciliationRef correlation')
+    }
+    return {
+      status: 'operator_required',
+      reconciliationRef: reconciliationRef(input.reconciliationRef),
+    }
+  }
+  return decodeStatus(input, [
       'delivered', 'idempotent_replay', 'stale_generation', 'expired',
-      'wrong_lane', 'self_approval', 'operator_required', 'unavailable',
+      'wrong_lane', 'self_approval', 'unavailable',
     ],
     'approval delivery result',
   )
+}
+
+function decodeReconciliationResult(value: unknown): HostedApprovalReconciliationResult {
+  return decodeStatus(value, [
+    'delivered', 'not_delivered', 'operator_required', 'unavailable',
+  ], 'approval reconciliation result')
 }
 
 export function isHostedApprovalOperation(value: unknown): value is HostedApprovalOperation {
@@ -526,7 +572,7 @@ function decodeAuthorityResult(
 function decodeDeliveryRequest(value: unknown): HostedApprovalDeliveryRequest {
   const input = record(value, 'approval delivery request')
   exactKeys(input, [
-    'providerDeliveryId', 'principal', 'deliveryRef', 'approvalId', 'approvalGeneration',
+    'providerDeliveryId', 'reconciliationRef', 'principal', 'deliveryRef', 'approvalId', 'approvalGeneration',
     'decision', 'partition', 'requestId',
   ], 'approval delivery request')
   const partition = record(input.partition, 'approval delivery partition')
@@ -541,6 +587,7 @@ function decodeDeliveryRequest(value: unknown): HostedApprovalDeliveryRequest {
   }
   return {
     providerDeliveryId: identifier(input.providerDeliveryId, 'approval providerDeliveryId'),
+    reconciliationRef: reconciliationRef(input.reconciliationRef),
     principal,
     deliveryRef: deliveryRef(input.deliveryRef),
     approvalId: patterned(input.approvalId, /^approval_[0-9a-f]{32}$/, 'approval approvalId'),
@@ -551,6 +598,21 @@ function decodeDeliveryRequest(value: unknown): HostedApprovalDeliveryRequest {
       runId: canonicalId(partition.runId, 'run', 'approval delivery runId'),
     },
     requestId: identifier(input.requestId, 'approval delivery requestId'),
+  }
+}
+
+function decodeReconciliationRequest(value: unknown): HostedApprovalReconciliationRequest {
+  const input = record(value, 'approval reconciliation request')
+  exactKeys(input, ['reconciliationRef', 'providerDeliveryId', 'partition'], 'approval reconciliation request')
+  const partition = record(input.partition, 'approval reconciliation partition')
+  exactKeys(partition, ['teamId', 'runId'], 'approval reconciliation partition')
+  return {
+    reconciliationRef: reconciliationRef(input.reconciliationRef),
+    providerDeliveryId: identifier(input.providerDeliveryId, 'approval reconciliation providerDeliveryId'),
+    partition: {
+      teamId: canonicalId(partition.teamId, 'team', 'approval reconciliation teamId'),
+      runId: canonicalId(partition.runId, 'run', 'approval reconciliation runId'),
+    },
   }
 }
 
@@ -608,12 +670,33 @@ function decodeStatus<T extends string>(
   return { status: input.status as T }
 }
 
-function sameAuthority(authority: HostedControlAuthority, expected: HostedControlStableAuthority): boolean {
+type HostedApprovalWireAuthority = Omit<HostedControlAuthority, 'teamId'>
+
+function decodeApprovalWireAuthority(value: unknown): HostedApprovalWireAuthority {
+  const input = record(value, 'approval wire authority')
+  exactKeys(input, [
+    'actorId', 'deploymentId', 'bootId', 'restoreGeneration', 'workspaceId', 'mountBinding',
+  ], 'approval wire authority')
+  const mount = record(input.mountBinding, 'approval wire mount binding')
+  exactKeys(mount, ['mountGeneration', 'declaredRootHash'], 'approval wire mount binding')
+  return {
+    actorId: patterned(input.actorId, /^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/, 'approval actorId'),
+    deploymentId: patterned(input.deploymentId, /^deployment_[A-Za-z0-9][A-Za-z0-9._-]{0,116}$/, 'approval deploymentId'),
+    bootId: patterned(input.bootId, /^boot_[A-Za-z0-9][A-Za-z0-9._-]{0,122}$/, 'approval bootId'),
+    restoreGeneration: integer(input.restoreGeneration, 'approval restoreGeneration', 0),
+    workspaceId: canonicalId(input.workspaceId, 'workspace', 'approval workspaceId'),
+    mountBinding: {
+      mountGeneration: integer(mount.mountGeneration, 'approval mountGeneration', 1),
+      declaredRootHash: patterned(mount.declaredRootHash, /^[0-9a-f]{64}$/, 'approval declaredRootHash'),
+    },
+  }
+}
+
+function sameWireAuthority(authority: HostedApprovalWireAuthority, expected: HostedControlStableAuthority): boolean {
   return authority.deploymentId === expected.deploymentId &&
     authority.bootId === expected.bootId &&
     authority.restoreGeneration === expected.restoreGeneration &&
     authority.workspaceId === expected.workspaceId &&
-    authority.teamId === expected.teamId &&
     isDeepStrictEqual(authority.mountBinding, expected.mountBinding)
 }
 
@@ -667,6 +750,14 @@ function canonicalId(value: unknown, prefix: string, field: string): string {
 
 function deliveryRef(value: unknown): string {
   return patterned(value, /^delivery_ref_[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/, 'approval deliveryRef')
+}
+
+function reconciliationRef(value: unknown): string {
+  return patterned(
+    value,
+    /^approval-reconciliation_[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/,
+    'approval reconciliationRef',
+  )
 }
 
 function iso(value: unknown, field: string): string {
