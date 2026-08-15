@@ -1,0 +1,107 @@
+{
+  "contractSha256": "c4304b8e5e7899f5a9064c3b0b711c20e15e83b42d607292277f7c84b9d39e",
+  "testOnlyKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "projectionDigest": "b0fa95dff4eaacd423eca5055dee79ccf23c3da99d6cb7dddafb66e61ad54337",
+  "bindingDigest": "bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c",
+  "vectors": [
+    {
+      "id": "P01-acquire-request",
+      "direction": "request",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"acquire\",\"sequence\":1,\"deadlineAtMs\":1700000005000,\"payload\":{\"productProjection\":{\"teamName\":\"team-a\",\"lifecycle\":{\"state\":\"provisioning\",\"ownerGeneration\":7},\"expectedInstalledArtifactDigest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"stableAuthority\":{\"deploymentId\":\"deployment_wire-test\",\"bootId\":\"boot_wire-test\",\"workspaceId\":\"workspace_44444444444444444444444444444444\",\"teamId\":\"team_11111111111111111111111111111111\",\"restoreGeneration\":2,\"mountBinding\":{\"mountGeneration\":3,\"declaredRootHash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}},\"expectedOwner\":{\"teamId\":\"team_11111111111111111111111111111111\",\"ownerAuthority\":\"owner-authority_wire-test\",\"ownerGeneration\":7,\"ownerSessionId\":\"owner-session_wire-test\",\"socketPath\":\"/run/agent-teams/owner.sock\",\"socketIdentity\":{\"device\":\"10\",\"inode\":\"20\",\"uid\":1000,\"gid\":1000,\"mode\":384},\"processIdentity\":{\"pid\":2345,\"startIdentity\":\"start_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"clientProcessIdentity\":{\"pid\":4242,\"startIdentity\":\"start_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}},\"projectionDigest\":\"b0fa95dff4eaacd423eca5055dee79ccf23c3da99d6cb7dddafb66e61ad54337\"}}",
+      "unsignedSha256": "6867b6c04e2fdb841661bfde31a0b7d4c1f7aa13fb90a855c3e62613c16180ba",
+      "expectedHmacSha256": "0ea707f85c0d00b334c505bd75744cd2d503b6be7e70d9bbef97f4dcb52f4ca4"
+    },
+    {
+      "id": "P02-acquire-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"acquire\",\"sequence\":1,\"requestDigest\":\"6867b6c04e2fdb841661bfde31a0b7d4c1f7aa13fb90a855c3e62613c16180ba\",\"payload\":{\"status\":\"acquired\",\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"expiresAtMs\":1700000010000,\"projectionDigest\":\"b0fa95dff4eaacd423eca5055dee79ccf23c3da99d6cb7dddafb66e61ad54337\",\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\",\"binding\":{\"outerAuthority\":{\"deploymentId\":\"deployment_wire-test\",\"bootId\":\"boot_wire-test\",\"workspaceId\":\"workspace_44444444444444444444444444444444\",\"teamId\":\"team_11111111111111111111111111111111\",\"restoreGeneration\":2,\"mountBinding\":{\"mountGeneration\":3,\"declaredRootHash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}},\"routes\":[{\"routeId\":\"route_wire-test\",\"authority\":{\"deploymentId\":\"deployment_wire-test\",\"teamId\":\"team_11111111111111111111111111111111\",\"runId\":\"run_55555555555555555555555555555555\",\"planGeneration\":7,\"laneId\":\"primary\",\"providerId\":\"opencode\",\"credentialGeneration\":5,\"credentialId\":\"credential_wire-test\",\"sessionId\":\"session_wire-test\",\"runtimeInstanceId\":\"runtime_instance_33333333333333333333333333333333\",\"deliveryOwnerId\":\"member_22222222222222222222222222222222\"},\"scope\":{\"principalId\":\"actor_owner\",\"workspaceId\":\"workspace_44444444444444444444444444444444\",\"teamId\":\"team_11111111111111111111111111111111\",\"authorityGeneration\":\"generation_wire-test\",\"restoreGeneration\":2},\"memberName\":\"lead\",\"openCodeBinding\":{\"toolApprovalMode\":\"manual\",\"planGeneration\":7,\"credentialGeneration\":5,\"credentialId\":\"credential_wire-test\",\"runtimeInstanceId\":\"runtime_instance_33333333333333333333333333333333\",\"deliveryOwnerId\":\"member_22222222222222222222222222222222\",\"openCodeArtifactDigest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sessionRecordFingerprint\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"liveEffectFingerprint\":\"8888888888888888888888888888888888888888888888888888888888888888\"}}],\"memberIdsByName\":{\"lead\":\"member_22222222222222222222222222222222\"},\"actorMembers\":{\"actor_owner\":\"member_22222222222222222222222222222222\"},\"owner\":{\"teamId\":\"team_11111111111111111111111111111111\",\"ownerAuthority\":\"owner-authority_wire-test\",\"ownerGeneration\":7,\"ownerSessionId\":\"owner-session_wire-test\",\"socketPath\":\"/run/agent-teams/owner.sock\",\"socketIdentity\":{\"device\":\"10\",\"inode\":\"20\",\"uid\":1000,\"gid\":1000,\"mode\":384},\"processIdentity\":{\"pid\":2345,\"startIdentity\":\"start_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"capability\":{\"schemaVersion\":2,\"protocol\":\"agent-teams-hosted-approval-v2\",\"authentication\":\"opencode-basic\",\"runtimeInstanceId\":\"runtime_instance_33333333333333333333333333333333\",\"configGeneration\":\"config_generation_66666666666666666666666666666666\"}}}}",
+      "unsignedSha256": "ffa149757a2e2cff3ef32860dcf2ccda9a4c84dc13abfed36bd6b112f09f6cbd",
+      "expectedHmacSha256": "b0e1c181a1f24f7658c4494665961bfa3586fb92b4efdebbb53aecb00642e22d"
+    },
+    {
+      "id": "P03-consume-request",
+      "direction": "request",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"consume\",\"sequence\":2,\"deadlineAtMs\":1700000006000,\"payload\":{\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"projectionDigest\":\"b0fa95dff4eaacd423eca5055dee79ccf23c3da99d6cb7dddafb66e61ad54337\",\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\"}}",
+      "unsignedSha256": "59aa1e3527d9eafc93b7e01472468cdfffd8a07e8119309dfc760bd90290ae57",
+      "expectedHmacSha256": "a5c74dc8f46d6801ed71350bda57ae0a3fbc2bbe1e37d830472b5c617bedbb29"
+    },
+    {
+      "id": "P04-assert-request",
+      "direction": "request",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"assert\",\"sequence\":3,\"deadlineAtMs\":1700000007000,\"payload\":{\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\"}}",
+      "unsignedSha256": "1edf7385360d70293c74af11c32c0103012f69a846c1127e166fec04611fa82a",
+      "expectedHmacSha256": "d5551654c156cb3a54cd1fe7b1ec9b02ef1735c172e33be9283953e5ce3424f2"
+    },
+    {
+      "id": "P06-release-request",
+      "direction": "request",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"release\",\"sequence\":4,\"deadlineAtMs\":1700000008000,\"payload\":{\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\"}}",
+      "unsignedSha256": "6099ffb56cdf05ac79f56c0510c289a7ea5a4f90dd80f8f99608aa50ee7e6c75",
+      "expectedHmacSha256": "80e99abaa5b08f62195705a87d7ace7e5664f12eb650df4bbae204eade47f4b0"
+    },
+    {
+      "id": "P05-assert-current-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"assert\",\"sequence\":3,\"requestDigest\":\"1edf7385360d70293c74af11c32c0103012f69a846c1127e166fec04611fa82a\",\"payload\":{\"status\":\"asserted\",\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"current\":true,\"reason\":null}}",
+      "unsignedSha256": "2d1e6263f79fdd8416bea42a1da89cbc61702fb8ffdc1c26146d9c5147b67b9b",
+      "expectedHmacSha256": "267dbd7dbb0ae69de73bc3f7602503f3d9be5ebdc12a1d037726c4b11ea2c12c"
+    },
+    {
+      "id": "P07-release-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"release\",\"sequence\":4,\"requestDigest\":\"6099ffb56cdf05ac79f56c0510c289a7ea5a4f90dd80f8f99608aa50ee7e6c75\",\"payload\":{\"status\":\"released\",\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"releasedAtMs\":1700000007500}}",
+      "unsignedSha256": "2f90a10c7e7eecc8de8ffa3d019827c281474d9f0b1f42db67b384bfe1278389",
+      "expectedHmacSha256": "8da1b194ad2ef2cf480ea14171d9196e2d586abebcd8d151d9889bd01766898d"
+    },
+    {
+      "id": "P08-pin-busy-error",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"consume\",\"sequence\":2,\"requestDigest\":\"59aa1e3527d9eafc93b7e01472468cdfffd8a07e8119309dfc760bd90290ae57\",\"error\":{\"code\":\"PIN_BUSY\",\"message\":\"another transition holds the team pin\",\"retryable\":true,\"retryScope\":\"same_operation\",\"retryAfterMs\":25}}",
+      "unsignedSha256": "32e4bec814fe0b9656bf1700a9e5e876d7cac988494b1aa1960ad232a04180e9",
+      "expectedHmacSha256": "1414fad8b5a273eec5dae4e405fc9488147bdb69fd98d9b3f4f329f806ff718b"
+    },
+    {
+      "id": "N01-wrong-top-level-key-order",
+      "direction": "request",
+      "canonical": false,
+      "canonicalUnsigned": "{\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"schemaVersion\":1,\"operation\":\"release\",\"sequence\":4,\"deadlineAtMs\":1700000008000,\"payload\":{\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\"}}",
+      "unsignedSha256": "6402898202d7b2990947bd01139620108c0ba374f0fcdfaf87413081560269d7",
+      "expectedHmacSha256": "7066bcee6b08e201f51395eed02f626a457a81fc22fa6967dbee0319c7654872"
+    },
+    {
+      "id": "N07-sequence-gap",
+      "direction": "request",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"consume\",\"sequence\":4,\"deadlineAtMs\":1700000006000,\"payload\":{\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"projectionDigest\":\"b0fa95dff4eaacd423eca5055dee79ccf23c3da99d6cb7dddafb66e61ad54337\",\"bindingDigest\":\"bffa99076fe5920f8722f7b232a2d6558f786fbc55d3b796220dfa07ca62ec5c\"}}",
+      "unsignedSha256": "c2eb0439b548d5b5a31392b3ede7fb846e0d91c4ef95565d5d993e1ab00ee683",
+      "expectedHmacSha256": "7dc2da49220218be0f37ba244633d5e1a103c0743dc039a06a4aeb585be75a1c"
+    },
+    {
+      "id": "N08-generation-mismatch-error-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"consume\",\"sequence\":3,\"requestDigest\":\"0f4853a2267f67b0c1614a17db32fb6c21a67857eb34b6d7d1907577d0f3edf6\",\"error\":{\"code\":\"GENERATION_MISMATCH\",\"message\":\"lease generation does not match\",\"retryable\":false,\"retryScope\":\"never\",\"retryAfterMs\":null}}",
+      "unsignedSha256": "9467362fb3ca8f0a4c488b4e5f6c7cebba02b322990c36fd013ba8e10a80398f",
+      "expectedHmacSha256": "42b84439c1d1aff36d8faddc4f1d51fcdc11e377290ffeb3fe51c4028573b202"
+    },
+    {
+      "id": "N09-process-identity-mismatch-error-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"acquire\",\"sequence\":1,\"requestDigest\":\"db8dc40e988577144a1c8b9862126103f320e6cbdbcda69f1ae01afd2704d6d9\",\"error\":{\"code\":\"PROCESS_IDENTITY_MISMATCH\",\"message\":\"owner process identity does not match\",\"retryable\":true,\"retryScope\":\"new_transition\",\"retryAfterMs\":null}}",
+      "unsignedSha256": "7dd71dd11cf9588bb4c53551bb625d2e6e605d6f1a2399a2add4a9f88db3cf36",
+      "expectedHmacSha256": "fe03337626d8aa8208f3c8d96ed1bd6c56ac61df15819bca9ef2c073e45f7857"
+    },
+    {
+      "id": "N10-expired-deadline-error-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"acquire\",\"sequence\":1,\"requestDigest\":\"6b6d031e071a6da85083268ea30a9f3e4ae1cee1e023f8a3627bbb17fb2f10f0\",\"error\":{\"code\":\"DEADLINE_EXCEEDED\",\"message\":\"request deadline has elapsed\",\"retryable\":true,\"retryScope\":\"same_operation\",\"retryAfterMs\":0}}",
+      "unsignedSha256": "509e3cdd1fa14dd23cb160d8616fda640be9d944da9e662eaa0cb154a06d72fe",
+      "expectedHmacSha256": "907984d51dd0666eb810038c53fc9dad9e80b1f0f47770decbb6619fdd95f386"
+    },
+    {
+      "id": "N12-assert-stale-response",
+      "direction": "response",
+      "canonicalUnsigned": "{\"schemaVersion\":1,\"transitionId\":\"approval-transition_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operation\":\"assert\",\"sequence\":3,\"requestDigest\":\"1edf7385360d70293c74af11c32c0103012f69a846c1127e166fec04611fa82a\",\"payload\":{\"status\":\"asserted\",\"leaseId\":\"approval-transition-lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"generation\":11,\"current\":false,\"reason\":\"process_changed\"}}",
+      "unsignedSha256": "8d6e65d0f6e70b5bdd3caec20b76578b672ff77aacdc545edb1f99f8d72b1eb7",
+      "expectedHmacSha256": "9fac21ef88755c3e7c3a661b7e473732669433fd8544dc89bc44619e10592b2b"
+    }
+  ]
+}
