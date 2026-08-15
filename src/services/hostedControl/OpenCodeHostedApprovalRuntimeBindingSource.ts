@@ -342,7 +342,9 @@ export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntim
     memberValues.length !== actorValues.length || new Set(memberValues).size !== memberValues.length ||
     new Set(actorValues).size !== actorValues.length ||
     [...memberValues].sort().join('\0') !== [...actorValues].sort().join('\0')) throw invalid()
-  binding.routes.forEach((route, index) => {
+  for (let index = 0; index < binding.routes.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(binding.routes, index)) throw invalid()
+    const route = binding.routes[index]!
     exact(route, ['routeId', 'authority', 'scope', 'memberName', 'openCodeBinding'])
     exact(route.authority, ['deploymentId', 'teamId', 'runId', 'planGeneration', 'laneId', 'providerId', 'credentialGeneration', 'credentialId', 'sessionId', 'runtimeInstanceId', 'deliveryOwnerId'])
     exact(route.scope, ['principalId', 'workspaceId', 'teamId', 'authorityGeneration', 'restoreGeneration'])
@@ -355,7 +357,7 @@ export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntim
       binding.memberIdsByName[route.memberName] !== route.authority.deliveryOwnerId ||
       binding.actorMembers[route.scope.principalId] !== route.authority.deliveryOwnerId ||
       route.openCodeBinding.runtimeInstanceId !== binding.capability.runtimeInstanceId) throw invalid()
-  })
+  }
   if (new Set(binding.routes.map(route => route.authority.sessionId)).size !== binding.routes.length) throw invalid()
 }
 

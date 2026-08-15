@@ -344,6 +344,14 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
     expect(() => assertHostedApprovalRuntimeBinding({
       ...binding, memberIdsByName, actorMembers,
     } as never)).toThrow('schema')
+
+    const sparseRoutes = new Array(1) as typeof binding.routes
+    expect(() => assertHostedApprovalRuntimeBinding({ ...binding, routes: sparseRoutes }))
+      .toThrow('schema')
+    const deletedRoutes = [...binding.routes]
+    Reflect.deleteProperty(deletedRoutes, '0')
+    expect(() => canonicalHostedApprovalRuntimeBinding({ ...binding, routes: deletedRoutes }))
+      .toThrow('schema')
   })
 
   test('reproduces the frozen canonical binding digest golden', () => {

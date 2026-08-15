@@ -263,7 +263,7 @@ describe('OpenCodeSessionBridge', () => {
     expect(posts).toBe(0)
   })
 
-  test('binds the conditional POST connection to the final endpoint reproof', async () => {
+  test('rejects a conditional POST when the accepted peer differs from the current listener', async () => {
     let posts = 0
     let endpointProofs = 0
     const capability = {
@@ -281,10 +281,11 @@ describe('OpenCodeSessionBridge', () => {
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
       captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
-      captureLoopbackEndpointIdentity: async (pid, port) => ({
-        address: '127.0.0.1', port, pid,
-        startIdentity: `start_${(++endpointProofs === 1 ? 'a' : 'b').repeat(64)}`,
-      }),
+      captureLoopbackEndpointIdentity: async (pid, port) => {
+        endpointProofs += 1
+        return { address: '127.0.0.1', port, pid, startIdentity: `start_${'a'.repeat(64)}` }
+      },
+      captureEstablishedPeerIdentity: async () => null,
       hostManager: {
         ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
         prepareEffectHostToken: async () => ({ consume: () => true }),
@@ -300,7 +301,10 @@ describe('OpenCodeSessionBridge', () => {
           sessionId: 'session-1', permissions: [permission],
         }),
         answerPermission: async body => {
-          if (!(await body.condition?.authorizeConnected?.())) {
+          if (!(await body.condition?.authorizeConnected?.({
+            localAddress: '127.0.0.1', localPort: 50000,
+            remoteAddress: '127.0.0.1', remotePort: host.port,
+          }))) {
             throw new OpenCodePermissionConditionRejectedError(new Error('substituted'))
           }
           posts += 1
@@ -318,7 +322,80 @@ describe('OpenCodeSessionBridge', () => {
         },
       },
     })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
-    expect({ endpointProofs, posts }).toEqual({ endpointProofs: 2, posts: 0 })
+    expect({ endpointProofs, posts }).toEqual({ endpointProofs: 1, posts: 0 })
+  })
+
+  test('consumes fences after exact peer proof and performs exactly one conditional POST', async () => {
+    let posts = 0
+    let peerProofs = 0
+    let fenceConsumes = 0
+    const startIdentity = `start_${'a'.repeat(64)}` as const
+    const capability = {
+      schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
+      authentication: 'opencode-basic' as const,
+      runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+      configGeneration: `config_generation_${'2'.repeat(32)}`,
+    }
+    const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
+    const permission = {
+      requestId: 'permission_1', sessionId: 'session-1',
+      requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+      permissionDigest: '4'.repeat(64), rawPermission,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      captureProcessIdentity: async pid => ({ pid, startIdentity }),
+      captureLoopbackEndpointIdentity: async (pid, port) => ({
+        address: '127.0.0.1', port, pid, startIdentity,
+      }),
+      captureEstablishedPeerIdentity: async (pid, expectedStart, connection) => {
+        peerProofs += 1
+        expect(fenceConsumes).toBe(0)
+        expect(connection).toEqual({
+          localAddress: '127.0.0.1', localPort: 50000,
+          remoteAddress: '127.0.0.1', remotePort: host.port,
+        })
+        return { address: '127.0.0.1', port: host.port, pid, startIdentity: expectedStart as `start_${string}` }
+      },
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        prepareEffectHostToken: async () => ({
+          consume: () => { fenceConsumes += 1; return true },
+        }),
+        releaseHost: async () => {}, retainHostLease: async () => {},
+      },
+      preparePermissionProfileToken: async () => ({
+        consume: () => { fenceConsumes += 1; return true },
+      }),
+      clientFactory: { create: () => ({
+        getHostedApprovalCapability: async () => capability,
+        observeHostedApprovalPermissions: async () => ({
+          schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2',
+          runtimeInstanceId: capability.runtimeInstanceId,
+          configGeneration: capability.configGeneration,
+          sessionId: 'session-1', permissions: [permission],
+        }),
+        answerPermission: async body => {
+          if (!(await body.condition?.authorizeConnected?.({
+            localAddress: '127.0.0.1', localPort: 50000,
+            remoteAddress: '127.0.0.1', remotePort: host.port,
+          }))) throw new OpenCodePermissionConditionRejectedError(new Error('rejected'))
+          posts += 1
+        },
+      } as never) },
+    })
+    await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: rawPermission,
+      requireAtomicConfigReply: true,
+      expectedHostedPermission: {
+        capability, permission,
+        normalized: {
+          requestId: 'permission_1', sessionId: 'session-1', tool: 'bash',
+          title: null, kind: null, raw: rawPermission,
+        },
+      },
+    })).resolves.toBeUndefined()
+    expect({ peerProofs, fenceConsumes, posts }).toEqual({ peerProofs: 1, fenceConsumes: 2, posts: 1 })
   })
 
   test('freshly proves host, persisted effect, exact raw permission, and admission in POST-edge order', async () => {

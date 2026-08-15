@@ -3,6 +3,8 @@ import { request as httpRequest } from 'node:http'
 import { connect as connectTcp } from 'node:net'
 import { Readable } from 'node:stream'
 
+import type { OpenCodeConnectedSocketIdentity } from './OpenCodeLoopbackEndpointIdentity.js'
+
 import type {
   OpenCodeAgentResponse,
   OpenCodeApiAuthInput,
@@ -74,7 +76,7 @@ export type OpenCodeClient = {
       requestIncarnation: string
       permissionDigest: string
       /** Settles against the already-connected socket before any request byte is written. */
-      authorizeConnected?: () => Promise<boolean>
+      authorizeConnected?: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>
     }
   }): Promise<unknown>
   sendSessionMessage(
@@ -462,7 +464,7 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   urlValue: string,
   init: RequestInit,
   signal: AbortSignal,
-  authorizeConnected: () => Promise<boolean>,
+  authorizeConnected: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>,
 ): Promise<Response> {
   const url = new URL(urlValue)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
@@ -492,7 +494,13 @@ async function fetchHostedApprovalOverAuthorizedConnection(
       socket.once('error', failed)
       if (signal.aborted) abortSocket()
     })
-    if (!(await authorizeConnected())) {
+    const connection = {
+      localAddress: socket.localAddress ?? '',
+      localPort: socket.localPort ?? 0,
+      remoteAddress: socket.remoteAddress ?? '',
+      remotePort: socket.remotePort ?? 0,
+    }
+    if (!(await authorizeConnected(connection))) {
       throw new OpenCodePermissionConditionRejectedError(
         new Error('OpenCode hosted approval connected endpoint was not authorized'),
       )
@@ -601,7 +609,7 @@ export class OpenCodeClientFactory {
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
       strictHostedApprovalResponse = false,
       maximumResponseBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
-      authorizeConnected?: () => Promise<boolean>,
+      authorizeConnected?: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>,
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
@@ -636,9 +644,9 @@ export class OpenCodeClientFactory {
               baseUrl + path, requestInit, controller.signal, authorizeConnected,
             )
           : await (async () => {
-              if (authorizeConnected && !(await authorizeConnected())) {
+              if (authorizeConnected) {
                 throw new OpenCodePermissionConditionRejectedError(
-                  new Error('OpenCode hosted approval connected endpoint was not authorized'),
+                  new Error('OpenCode hosted approval connected endpoint proof was unavailable'),
                 )
               }
               return await fetchImpl(baseUrl + path, requestInit)

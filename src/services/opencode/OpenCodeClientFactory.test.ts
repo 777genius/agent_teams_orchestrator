@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { createServer as createTcpServer, type AddressInfo } from 'node:net'
 
 import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
@@ -339,6 +339,48 @@ describe('OpenCodeClientFactory permissions API', () => {
     } finally {
       server.close()
       await once(server, 'close')
+    }
+  })
+
+  test('writes zero POST or credential bytes after an accepted-connection listener swap', async () => {
+    let received = Buffer.alloc(0)
+    let accepted!: () => void
+    const didAccept = new Promise<void>(resolve => { accepted = resolve })
+    const substituted = createTcpServer(socket => {
+      socket.on('data', chunk => { received = Buffer.concat([received, chunk]) })
+      accepted()
+    })
+    substituted.listen(0, '127.0.0.1')
+    await once(substituted, 'listening')
+    const port = (substituted.address() as AddressInfo).port
+    const expected = createTcpServer()
+    try {
+      const client = new OpenCodeClientFactory().create(
+        `http://127.0.0.1:${port}`, {}, hostedAuth,
+      )
+      const reply = client.answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+        condition: {
+          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          authorizeConnected: async connection => {
+            expect(connection.remotePort).toBe(port)
+            await didAccept
+            substituted.close()
+            expected.listen(port, '127.0.0.1')
+            await once(expected, 'listening')
+            // The path now names the expected listener, but the pinned socket
+            // remains connected to the substituted accepted peer.
+            return false
+          },
+        },
+      })
+      await expect(reply).rejects.toThrow('rejected without effect')
+      await Bun.sleep(10)
+      expect(received.byteLength).toBe(0)
+      expect(received.includes(Buffer.from('Authorization: Basic', 'utf8'))).toBe(false)
+    } finally {
+      expected.close()
+      substituted.close()
     }
   })
 

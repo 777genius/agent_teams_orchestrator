@@ -23,7 +23,9 @@ import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
 import {
+  captureOpenCodeEstablishedPeerIdentity,
   captureOpenCodeLoopbackEndpointIdentity,
+  type OpenCodeConnectedSocketIdentity,
   type OpenCodeLoopbackEndpointIdentity,
 } from './OpenCodeLoopbackEndpointIdentity.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
@@ -88,6 +90,7 @@ type OpenCodeSessionBridgeDeps = {
   ) => Promise<OpenCodePermissionEffectToken | null>
   captureProcessIdentity?: typeof captureHostedControlProcessIdentity
   captureLoopbackEndpointIdentity?: typeof captureOpenCodeLoopbackEndpointIdentity
+  captureEstablishedPeerIdentity?: typeof captureOpenCodeEstablishedPeerIdentity
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -1731,10 +1734,20 @@ export class OpenCodeSessionBridge {
                   permissionDigest,
                   // The transport opens and pins its TCP socket first, then
                   // awaits this proof before writing even the HTTP headers.
-                  authorizeConnected: async () => {
+                  authorizeConnected: async (connection: OpenCodeConnectedSocketIdentity) => {
                     try {
-                      return preparedEndpointStartIdentity !== null &&
-                        await proveEndpointOwner() === preparedEndpointStartIdentity &&
+                      if (preparedEndpointStartIdentity === null) return false
+                      const capturePeerIdentity = this.deps.captureEstablishedPeerIdentity
+                        ?? captureOpenCodeEstablishedPeerIdentity
+                      const peer = await capturePeerIdentity(
+                        host.pid,
+                        preparedEndpointStartIdentity,
+                        connection,
+                        this.deps.captureProcessIdentity ?? captureHostedControlProcessIdentity,
+                      )
+                      return peer !== null && peer.pid === host.pid &&
+                        peer.port === connection.remotePort &&
+                        peer.startIdentity === preparedEndpointStartIdentity &&
                         consumePreparedFences()
                     } catch {
                       return false
