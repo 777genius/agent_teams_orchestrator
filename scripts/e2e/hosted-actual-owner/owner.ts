@@ -26,7 +26,7 @@ import {
   isWithin, sandboxAnchor, type ActualOwnerAcceptanceConfig,
 } from './contracts.js'
 import { validateBootstrapAcceptance } from './bootstrap.js'
-import { AcceptanceAuthority } from './authority.js'
+import { AcceptanceAuthority, combineEffectAuthorities } from './authority.js'
 import { processStartIdentity, proveExecutingProviderIdentity } from './provider-identity.js'
 import { buildAcceptanceEvidence, productTimelineLine, validateAcceptanceEvidence, validateProductTimelineEvent,
   type ActualOwnerAcceptanceEvidence, type ActualOwnerProductTimelineEvent } from './evidence.js'
@@ -360,10 +360,17 @@ export class AcceptanceRuntime {
         },
         authorizeEffect: async effect => {
           const route = await capture(effect)
-          const result = parameters.authorizeEffect ? await parameters.authorizeEffect(effect) : true
-          await this.assertPublicationCurrent()
-          if (!result) return false
-          return acceptanceAuthority.prepareEffectToken(route)
+          const adapterAuthority = parameters.authorizeEffect
+            ? await parameters.authorizeEffect(effect) : false
+          if (!adapterAuthority || typeof adapterAuthority === 'boolean') return false
+          try {
+            await this.assertPublicationCurrent()
+            const acceptanceEffectAuthority = await acceptanceAuthority.prepareEffectToken(route)
+            return combineEffectAuthorities(adapterAuthority, acceptanceEffectAuthority)
+          } catch (error) {
+            try { adapterAuthority.consume() } catch { /* release a failed adapter authority */ }
+            throw error
+          }
         },
       }),
     }

@@ -420,11 +420,21 @@ export async function assertCandidateArtifact(
 }
 
 async function assertRepository(root: string, expected: string, label: 'orchestrator' | 'product'): Promise<void> {
-  const options = { encoding: 'utf8' as const, env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' } }
+  const options = {
+    encoding: 'utf8' as const,
+    maxBuffer: 16 * 1024 * 1024,
+    env: {
+      PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C', LC_ALL: 'C',
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+    },
+  }
+  const git = (args: readonly string[]) => execFileAsync('/usr/bin/git', [
+    '--no-replace-objects', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', root, ...args,
+  ], options)
   const [top, head, status] = await Promise.all([
-    execFileAsync('/usr/bin/git', ['-C', root, 'rev-parse', '--show-toplevel'], options),
-    execFileAsync('/usr/bin/git', ['-C', root, 'rev-parse', 'HEAD'], options),
-    execFileAsync('/usr/bin/git', ['-C', root, 'status', '--porcelain=v1', '--untracked-files=all'], options),
+    git(['rev-parse', '--show-toplevel']),
+    git(['rev-parse', '--verify', 'HEAD^{commit}']),
+    git(['status', '--porcelain=v1', '--untracked-files=all']),
   ])
   if (top.stdout.trim() !== root || head.stdout.trim() !== expected) {
     throw new Error(`hosted_actual_owner_${label}_ref_mismatch`)

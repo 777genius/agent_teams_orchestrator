@@ -38,6 +38,29 @@ type FileLease = Readonly<{
   parent: NamespaceLease
 }>
 
+type EffectAuthority = { consume(): boolean }
+
+export function combineEffectAuthorities(
+  adapter: EffectAuthority,
+  acceptance: EffectAuthority,
+): EffectAuthority {
+  let consumed = false
+  return Object.freeze({
+    consume: () => {
+      if (consumed) return false
+      consumed = true
+      let adapterCurrent = false
+      let acceptanceCurrent = false
+      try {
+        adapterCurrent = adapter.consume()
+      } finally {
+        acceptanceCurrent = acceptance.consume()
+      }
+      return adapterCurrent && acceptanceCurrent
+    },
+  })
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('hosted_actual_owner_capability_invalid')
   return value as Record<string, unknown>

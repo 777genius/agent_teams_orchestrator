@@ -1,10 +1,8 @@
 import { createHmac } from 'node:crypto'
 import { describe, expect, test } from 'bun:test'
 
-import {
-  AcceptanceEffectAuthority, acceptanceCapabilityPurpose, acceptanceCaptureFields,
-  authenticateCapabilityEnvelope,
-} from './authority.js'
+import { AcceptanceEffectAuthority, acceptanceCapabilityPurpose, acceptanceCaptureFields,
+  authenticateCapabilityEnvelope, combineEffectAuthorities } from './authority.js'
 
 const ownerToken = 'owner-token'
 const nonce = '1'.repeat(64)
@@ -51,6 +49,27 @@ function signed(overrides: Record<string, unknown> = {}) {
 }
 
 describe('hosted actual-owner effect authority', () => {
+  test('consumes adapter and acceptance authorities once at the same final edge', () => {
+    const consumed: string[] = []
+    const composite = combineEffectAuthorities(
+      { consume: () => { consumed.push('adapter'); return false } },
+      { consume: () => { consumed.push('acceptance'); return true } },
+    )
+    expect(composite.consume()).toBe(false)
+    expect(consumed).toEqual(['adapter', 'acceptance'])
+    expect(composite.consume()).toBe(false)
+    expect(consumed).toEqual(['adapter', 'acceptance'])
+
+    const cleanup: string[] = []
+    const failing = combineEffectAuthorities(
+      { consume: () => { cleanup.push('adapter'); throw new Error('adapter rotated') } },
+      { consume: () => { cleanup.push('acceptance'); return true } },
+    )
+    expect(() => failing.consume()).toThrow('adapter rotated')
+    expect(cleanup).toEqual(['adapter', 'acceptance'])
+    expect(failing.consume()).toBe(false)
+  })
+
   test('authenticates the exact session, sockets, routes, and seven capture namespaces', () => {
     const result = authenticateCapabilityEnvelope(signed(), config, admission as never, nonce)
     expect([...result.routes.values()]).toEqual([route])
