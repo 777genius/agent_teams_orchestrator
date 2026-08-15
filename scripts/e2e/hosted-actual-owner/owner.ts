@@ -13,6 +13,9 @@ import type { HostedControlRuntimePortFactoryContext } from '../../../src/servic
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { hostedControlAuthorityFromConfig } from '../../../src/services/hostedControl/HostedControlRuntimeConfig.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN } from '../../../src/services/hostedControl/HostedControlServer.js'
+import {
+  HOSTED_CONTROL_SOCKET_BROKER_FLAG, runHostedControlSocketBroker,
+} from '../../../src/services/hostedControl/HostedControlSocketBroker.js'
 import { createHostedRawDomainProof, parseStrictHostedProofLastJsonFrame } from '../../../src/services/hostedControl/ownerProof.js'
 import type { HostedControlOwnerBinding } from '../../../src/services/hostedControl/protocol.js'
 import { readHostedControlBootstrap, type HostedControlBootstrapAdmission } from '../../../src/services/hostedControl/HostedControlBootstrap.js'
@@ -758,6 +761,9 @@ export class AcceptanceRuntime {
 }
 
 export async function runActualOwnerAcceptance(args: readonly string[]): Promise<void> {
+  if (args[0] === HOSTED_CONTROL_SOCKET_BROKER_FLAG) {
+    await runHostedControlSocketBroker([...args.slice(1)])
+  }
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
   const invocation = parseAcceptanceInvocation(args)
   const config = await loadAcceptanceConfig({ args: invocation.configArgs, repositoryRoot })

@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { ACTUAL_OWNER_MARKER_FILE, ACTUAL_OWNER_PURPOSE } from './contracts.js'
+import { getOpenCodeManagedSubscriptionPluginPackages } from '../../../src/services/opencode/OpenCodeCuratedSubscriptionCatalog.js'
 
 const execFileAsync = promisify(execFile)
 const roots: string[] = []
@@ -169,7 +170,7 @@ async function control(socketPath: string, operation: string): Promise<Record<st
     socket.once('end', () => {
       try { resolve(JSON.parse(source) as Record<string, unknown>) } catch (error) { reject(error) }
     })
-    socket.once('connect', () => socket.end(`${JSON.stringify({ schemaVersion: 1, operation })}\n`))
+    socket.once('connect', () => socket.write(`${JSON.stringify({ schemaVersion: 1, operation })}\n`))
   })
 }
 
@@ -207,7 +208,7 @@ Bun.serve({hostname:'127.0.0.1',port,fetch(request){
   if (['/config','/config/providers','/agent','/mcp'].includes(url.pathname)) return Response.json({})
   if (request.headers.get('authorization') !== authorization || request.headers.get('x-opencode-directory') !== ${JSON.stringify(project)}) return new Response('forbidden',{status:403})
   if (url.pathname === '/experimental/agent-teams/hosted-approval-capability') return Response.json(capability)
-  if (url.pathname === '/experimental/agent-teams/hosted-approval/session/session_1/permissions') return Response.json({...capability,sessionId:'session_1',permissions:[]})
+  if (url.pathname === '/experimental/agent-teams/hosted-approval/session/session_1/permissions') return Response.json({schemaVersion:capability.schemaVersion,protocol:capability.protocol,runtimeInstanceId:capability.runtimeInstanceId,configGeneration:capability.configGeneration,sessionId:'session_1',permissions:[]})
   return new Response('not found',{status:404})
 }})
 await new Promise(() => {})
@@ -229,6 +230,11 @@ await new Promise(() => {})
     const profile = JSON.parse((await execFileAsync(bunExecutable, ['-e', profileSource], {
       encoding: 'utf8', env: fixtureEnvironment, maxBuffer: 16 * 1024 * 1024,
     })).stdout) as Record<string, any>
+    await Promise.all(getOpenCodeManagedSubscriptionPluginPackages().map(async packageSpec => {
+      const packageRoot = join(profile.xdgCacheHome, 'opencode', 'packages', packageSpec)
+      await mkdir(packageRoot, { recursive: true, mode: 0o700 })
+      await writeFile(join(packageRoot, 'package.json'), '{}\n', { mode: 0o600 })
+    }))
     const resolvedConfigFingerprint = createHash('sha256').update(JSON.stringify({
       config: {}, configProviders: {}, agents: {}, mcp: [],
     })).digest('hex')
