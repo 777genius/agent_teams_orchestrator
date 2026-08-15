@@ -16,7 +16,7 @@ describe('OpenCodeLoopbackEndpointIdentity', () => {
   })
 
   test('binds the listener inode to the exact PID and stable start identity', async () => {
-    const starts = [`start_${'a'.repeat(64)}`, `start_${'a'.repeat(64)}`]
+    const starts: `start_${string}`[] = [`start_${'a'.repeat(64)}`, `start_${'a'.repeat(64)}`]
     const identity = await captureOpenCodeLoopbackEndpointIdentity(
       91,
       4096,
@@ -39,12 +39,18 @@ describe('OpenCodeLoopbackEndpointIdentity', () => {
       readDescriptorLink: async () => 'socket:[999999]',
     }
     expect(await captureOpenCodeLoopbackEndpointIdentity(
-      91, 4096, async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }), io,
+      91, 4096, async pid => ({
+        pid,
+        startIdentity: `start_${'a'.repeat(64)}` as `start_${string}`,
+      }), io,
     )).toBeNull()
     io.readDescriptorLink = async () => 'socket:[424242]'
     let call = 0
     expect(await captureOpenCodeLoopbackEndpointIdentity(
-      91, 4096, async pid => ({ pid, startIdentity: `start_${(++call).toString().repeat(64).slice(0, 64)}` }), io,
+      91, 4096, async pid => ({
+        pid,
+        startIdentity: `start_${(++call).toString().repeat(64).slice(0, 64)}` as `start_${string}`,
+      }), io,
     )).toBeNull()
   })
 })

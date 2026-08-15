@@ -95,7 +95,7 @@ export type HostedApprovalHostEndpointIdentity = {
   address: '127.0.0.1'
   port: number
   pid: number
-  startIdentity: string
+  startIdentity: `start_${string}`
 }
 
 export type HostedApprovalHostBindingRecord = {
@@ -299,8 +299,22 @@ export function liveHostedApprovalEffectFingerprint(host: HostedApprovalHostBind
 }
 
 export function digestHostedApprovalRuntimeBinding(binding: HostedApprovalRuntimeBinding): string {
+  return createHash('sha256').update(canonicalHostedApprovalRuntimeBinding(binding)).digest('hex')
+}
+
+/**
+ * Serializes the binding in frozen schema order. Dictionary members are
+ * emitted directly in UTF-16 order because ordinary object enumeration moves
+ * array-index-shaped names (for example, "2") ahead of "10".
+ */
+export function canonicalHostedApprovalRuntimeBinding(binding: HostedApprovalRuntimeBinding): string {
   assertHostedApprovalRuntimeBinding(binding)
-  return createHash('sha256').update(JSON.stringify(binding)).digest('hex')
+  return `{"outerAuthority":${JSON.stringify(binding.outerAuthority)}` +
+    `,"routes":${JSON.stringify(binding.routes)}` +
+    `,"memberIdsByName":${canonicalDictionary(binding.memberIdsByName)}` +
+    `,"actorMembers":${canonicalDictionary(binding.actorMembers)}` +
+    `,"owner":${JSON.stringify(binding.owner)}` +
+    `,"capability":${JSON.stringify(binding.capability)}}`
 }
 
 export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntimeBinding): void {
@@ -316,7 +330,8 @@ export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntim
   exact(binding.capability, ['schemaVersion', 'protocol', 'authentication', 'runtimeInstanceId', 'configGeneration'])
   const memberValues = Object.values(binding.memberIdsByName)
   const actorValues = Object.values(binding.actorMembers)
-  if (!sortedKeys(binding.memberIdsByName) || !sortedKeys(binding.actorMembers) ||
+  if (!schemaOrderedDictionary(binding.memberIdsByName) ||
+    !schemaOrderedDictionary(binding.actorMembers) ||
     Object.entries(binding.memberIdsByName).some(([name, memberId]) =>
       !validIdentifier(name) || !/^member_[0-9a-f]{32}$/.test(memberId)) ||
     Object.entries(binding.actorMembers).some(([actorId, memberId]) =>
@@ -449,13 +464,33 @@ function sortedDictionary(input: Readonly<Record<string, string>>): Record<strin
   return Object.fromEntries(Object.entries(input).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0))
 }
 
-function sortedKeys(value: Readonly<Record<string, string>>): boolean {
+function canonicalDictionary(value: Readonly<Record<string, string>>): string {
+  const members = Object.keys(value).sort(compareUtf16).map(key =>
+    `${JSON.stringify(key)}:${JSON.stringify(value[key])}`,
+  )
+  return `{${members.join(',')}}`
+}
+
+function schemaOrderedDictionary(value: Readonly<Record<string, string>>): boolean {
   const keys = Object.keys(value)
-  return keys.every((key, index) => index === 0 || keys[index - 1]! < key)
+  // ECMAScript erases the raw placement of array-index-shaped property names.
+  // Their ordering is therefore checked by canonicalDictionary at the byte
+  // boundary; all other dictionaries retain and must expose schema order.
+  if (keys.some(isArrayIndexName)) return true
+  return keys.every((key, index) => index === 0 || compareUtf16(keys[index - 1]!, key) < 0)
+}
+
+function isArrayIndexName(value: string): boolean {
+  const numeric = Number(value)
+  return Number.isInteger(numeric) && numeric >= 0 && numeric < 0xffff_ffff && String(numeric) === value
 }
 
 function compareRouteId(left: { routeId: string }, right: { routeId: string }): number {
-  return left.routeId < right.routeId ? -1 : left.routeId > right.routeId ? 1 : 0
+  return compareUtf16(left.routeId, right.routeId)
+}
+
+function compareUtf16(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
 }
 
 function exact(value: object, expected: readonly string[]): void {
@@ -474,7 +509,7 @@ function validIdentifier(value: string): boolean {
 }
 
 function safeInteger(value: unknown, minimum: number): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+  return typeof value === 'number' && !Object.is(value, -0) && Number.isSafeInteger(value) && value >= minimum
 }
 
 async function current(owner: HostedApprovalRuntimeBindingSourcePorts['owner']): Promise<boolean> {

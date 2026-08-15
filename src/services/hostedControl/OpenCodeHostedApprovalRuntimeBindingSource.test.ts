@@ -4,9 +4,11 @@ import { describe, expect, test } from 'bun:test'
 
 import type { OpenCodePermissionEffectContext } from '../opencode/OpenCodeSessionBridge.js'
 import type { OpenCodeSessionRecord } from '../opencode/types.js'
+import type { HostedControlProcessIdentity } from './HostedControlProcessIdentity.js'
 import { HostedApprovalRuntimeBindingFence } from './HostedApprovalRuntimeBindingFence.js'
 import {
   assertHostedApprovalRuntimeBinding,
+  canonicalHostedApprovalRuntimeBinding,
   digestHostedApprovalRuntimeBinding,
   HOSTED_APPROVAL_BINDING_GOLDEN_DIGEST,
   HOSTED_APPROVAL_TRANSITION_CONTRACT_SHA256,
@@ -23,11 +25,11 @@ const memberId = `member_${'2'.repeat(32)}`
 const runtimeInstanceId = `runtime_instance_${'3'.repeat(32)}`
 const configGeneration = `config_generation_${'4'.repeat(32)}`
 const artifact = `sha256:${'a'.repeat(64)}` as const
-const hostProcess = { pid: 88, startIdentity: `start_${'9'.repeat(64)}` }
+const hostProcess: HostedControlProcessIdentity = { pid: 88, startIdentity: `start_${'9'.repeat(64)}` }
 
-function fixture() {
+function fixture(memberName = 'lead') {
   const record: OpenCodeSessionRecord = {
-    teamId, laneId: 'primary', runId: `run_${'5'.repeat(32)}`, memberName: 'lead',
+    teamId, laneId: 'primary', runId: `run_${'5'.repeat(32)}`, memberName,
     providerId: 'opencode', selectedModel: 'openai/test', projectPath: '/tmp/project',
     profileRootKey: 'profile', hostKey: 'host', openCodeArtifactDigest: artifact,
     toolApprovalMode: 'manual', runtimePid: hostProcess.pid, resolvedBehaviorFingerprint: null,
@@ -76,7 +78,7 @@ function fixture() {
         laneId: 'primary', authorityGeneration: 'generation_test' }],
     }) },
     membership: { read: async () => ({ members: [{
-      routeId: 'route_test', memberName: 'lead', principalId: 'actor_owner', deliveryOwnerId: memberId,
+      routeId: 'route_test', memberName, principalId: 'actor_owner', deliveryOwnerId: memberId,
     }] }) },
     credentials: { read: async () => [{
       routeId: 'route_test', credentialGeneration: 8, credentialId: 'credential_test',
@@ -96,7 +98,10 @@ function fixture() {
       }),
       isCurrent: async () => current,
     },
-    captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'b'.repeat(64)}` }),
+    captureProcessIdentity: async pid => ({
+      pid,
+      startIdentity: `start_${'b'.repeat(64)}` as `start_${string}`,
+    }),
   })
   return {
     source, fence, host,
@@ -127,7 +132,13 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
 
   test('rejects PID/start-identity endpoint substitution', async () => {
     const { source, host, setHost } = fixture()
-    setHost({ ...host, endpointIdentity: { ...host.endpointIdentity, startIdentity: `start_${'8'.repeat(64)}` } })
+    setHost({
+      ...host,
+      endpointIdentity: {
+        ...host.endpointIdentity,
+        startIdentity: `start_${'8'.repeat(64)}` as `start_${string}`,
+      },
+    })
     await expect(source.capture()).rejects.toThrow('unavailable')
   })
 
@@ -196,7 +207,10 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
         teamId: `team_${'1'.repeat(32)}`, ownerAuthority: 'owner-authority_wire-test', ownerGeneration: 7,
         ownerSessionId: 'owner-session_wire-test', socketPath: '/run/agent-teams/owner.sock',
         socketIdentity: { device: '10', inode: '20', uid: 1000, gid: 1000, mode: 384 },
-        processIdentity: { pid: 2345, startIdentity: `start_${'c'.repeat(64)}` },
+        processIdentity: {
+          pid: 2345,
+          startIdentity: `start_${'c'.repeat(64)}` as `start_${string}`,
+        },
       },
       capability: {
         schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
@@ -205,6 +219,88 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
       },
     }
     expect(digestHostedApprovalRuntimeBinding(binding)).toBe(HOSTED_APPROVAL_BINDING_GOLDEN_DIGEST)
+  })
+
+  test('rejects negative zero in every zero-admitting binding integer before digest', async () => {
+    const binding = await fixture().source.capture()
+    const invalidBindings = [
+      { ...binding, outerAuthority: { ...binding.outerAuthority, restoreGeneration: -0 } },
+      { ...binding, outerAuthority: {
+        ...binding.outerAuthority,
+        mountBinding: { ...binding.outerAuthority.mountBinding, mountGeneration: -0 },
+      } },
+      { ...binding, routes: binding.routes.map(route => ({
+        ...route,
+        scope: { ...route.scope, restoreGeneration: -0 },
+      })) },
+      { ...binding, routes: binding.routes.map(route => ({
+        ...route,
+        authority: { ...route.authority, planGeneration: -0 },
+        openCodeBinding: { ...route.openCodeBinding, planGeneration: -0 },
+      })) },
+      { ...binding, routes: binding.routes.map(route => ({
+        ...route,
+        authority: { ...route.authority, credentialGeneration: -0 },
+        openCodeBinding: { ...route.openCodeBinding, credentialGeneration: -0 },
+      })) },
+      { ...binding, owner: { ...binding.owner, ownerGeneration: -0 } },
+      { ...binding, owner: {
+        ...binding.owner,
+        socketIdentity: { ...binding.owner.socketIdentity, uid: -0 },
+      } },
+      { ...binding, owner: {
+        ...binding.owner,
+        socketIdentity: { ...binding.owner.socketIdentity, gid: -0 },
+      } },
+      { ...binding, owner: {
+        ...binding.owner,
+        processIdentity: { ...binding.owner.processIdentity, pid: -0 },
+      } },
+    ]
+    for (const invalidBinding of invalidBindings) {
+      expect(() => digestHostedApprovalRuntimeBinding(invalidBinding)).toThrow('schema')
+    }
+  })
+
+  test('resolves a contract-valid numeric member name', async () => {
+    const binding = await fixture('10').source.capture()
+    expect(binding.routes[0]?.memberName).toBe('10')
+    expect(binding.memberIdsByName['10']).toBe(memberId)
+    expect(() => canonicalHostedApprovalRuntimeBinding(binding)).not.toThrow()
+  })
+
+  test('canonicalizes numeric member names by UTF-16 order for roundtrip and digest', async () => {
+    const captured = await fixture().source.capture()
+    const first = captured.routes[0]!
+    const secondMemberId = `member_${'3'.repeat(32)}`
+    const binding = {
+      ...captured,
+      routes: [{
+        ...first,
+        routeId: 'route_10',
+        memberName: '10',
+      }, {
+        ...first,
+        routeId: 'route_2',
+        authority: {
+          ...first.authority,
+          sessionId: 'session_test_2',
+          deliveryOwnerId: secondMemberId,
+        },
+        scope: { ...first.scope, principalId: 'actor_2' },
+        memberName: '2',
+        openCodeBinding: { ...first.openCodeBinding, deliveryOwnerId: secondMemberId },
+      }],
+      memberIdsByName: { '10': memberId, '2': secondMemberId },
+      actorMembers: { actor_2: secondMemberId, actor_owner: memberId },
+    }
+    const canonical = canonicalHostedApprovalRuntimeBinding(binding)
+    expect(canonical).toContain(`"memberIdsByName":{"10":"${memberId}","2":"${secondMemberId}"}`)
+    expect(JSON.parse(canonical)).toEqual(binding)
+    expect(canonicalHostedApprovalRuntimeBinding(JSON.parse(canonical))).toBe(canonical)
+    expect(digestHostedApprovalRuntimeBinding(binding)).toBe(
+      'dac9800a4d4eb52f7acece9dfa8a480670b9b7ed42cdc486830cf0f687527b7b',
+    )
   })
 
   test('reproduces frozen binding-carrying wire vectors without product imports', () => {
