@@ -62,6 +62,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Gate hosted actual-owner source launcher
+        run: bun run ci:hosted-actual-owner
+
       - name: Test hosted control
         run: bun run test:hosted-control
 
