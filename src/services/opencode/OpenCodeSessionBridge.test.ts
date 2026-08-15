@@ -231,11 +231,44 @@ describe('OpenCodeSessionBridge', () => {
     expect(order).toEqual(['profile', 'host-start', 'host-ready', 'authorize:123:1000'])
   })
 
+  test('performs zero POSTs when final loopback endpoint ownership is substituted', async () => {
+    let posts = 0
+    let endpointProofs = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
+      captureLoopbackEndpointIdentity: async (pid, port) => ({
+        address: '127.0.0.1', port, pid,
+        startIdentity: `start_${(++endpointProofs === 1 ? 'a' : 'b').repeat(64)}`,
+      }),
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        prepareEffectHostToken: async () => ({ consume: () => true }),
+        releaseHost: async () => {}, retainHostLease: async () => {},
+      },
+      preparePermissionProfileToken: async () => ({ consume: () => true }),
+      clientFactory: { create: () => ({
+        getPermissions: async () => [{ requestID: 'permission_1', sessionID: 'session-1' }],
+        answerPermission: async () => { posts += 1 },
+      } as never) },
+    })
+    await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1', decision: 'allow',
+      expectedPermissionRaw: { requestID: 'permission_1', sessionID: 'session-1' },
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(endpointProofs).toBe(2)
+    expect(posts).toBe(0)
+  })
+
   test('freshly proves host, persisted effect, exact raw permission, and admission in POST-edge order', async () => {
     const order: string[] = []
     const raw = { requestID: 'permission_1', sessionID: 'session-1', title: 'Run test' }
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => { order.push('profile'); return profile },
+      captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
+      captureLoopbackEndpointIdentity: async (pid, port) => ({
+        address: '127.0.0.1', port, pid, startIdentity: `start_${'a'.repeat(64)}`,
+      }),
       hostManager: {
         ensureHost: async () => { order.push('host'); return { ...host, processStartedAtMs: 1000 } },
         prepareEffectHostToken: async input => {
@@ -515,6 +548,10 @@ describe('OpenCodeSessionBridge', () => {
     const order: string[] = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
+      captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
+      captureLoopbackEndpointIdentity: async (pid, port) => ({
+        address: '127.0.0.1', port, pid, startIdentity: `start_${'a'.repeat(64)}`,
+      }),
       hostManager: {
         ensureHost: async () => host,
         releaseHost: async () => {},
@@ -564,6 +601,10 @@ describe('OpenCodeSessionBridge', () => {
       let hostProofs = 0
       const bridge = new OpenCodeSessionBridge({
         prepareProfile: async () => liveProfile,
+        captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
+        captureLoopbackEndpointIdentity: async (pid, port) => ({
+          address: '127.0.0.1', port, pid, startIdentity: `start_${'a'.repeat(64)}`,
+        }),
         hostManager: {
           ensureHost: async () => ({ ...host, profile: liveProfile, processStartedAtMs: 1000 }),
           releaseHost: async () => {},

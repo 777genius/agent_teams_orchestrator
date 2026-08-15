@@ -301,7 +301,8 @@ export class AcceptanceRuntime {
         resolveExecutingOpenCodeArtifactDigest(effect.host.pid) !== expectedDigest) {
         throw new Error('hosted_actual_owner_provider_identity_invalid')
       }
-      const computedLiveEffectFingerprint = liveEffectFingerprint(effect)
+      const liveProof = await openCodeSessionBridge.captureHostedApprovalBinding(effect.record)
+      const computedLiveEffectFingerprint = liveEffectFingerprint(liveProof)
       const provider = await proveExecutingProviderIdentity({
         pid: effect.host.pid, executable: this.config.openCodeExecutable,
         device: this.config.runtime.descriptors.openCodeExecutable.device,
@@ -332,6 +333,9 @@ export class AcceptanceRuntime {
       return acceptanceAuthority.routes.get(route.routeId)!
     }
     const bridge = {
+      captureHostedApprovalBinding: async (
+        record: Parameters<typeof openCodeSessionBridge.captureHostedApprovalBinding>[0],
+      ) => openCodeSessionBridge.captureHostedApprovalBinding(record),
       observeHostedApprovalPermissions: async (
         record: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[0],
         authorize?: Parameters<typeof openCodeSessionBridge.observeHostedApprovalPermissions>[1],

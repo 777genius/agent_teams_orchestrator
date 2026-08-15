@@ -2,10 +2,18 @@ import { createHash, createHmac } from 'node:crypto'
 
 import { describe, expect, test } from 'bun:test'
 
-import type { OpenCodePermissionEffectContext } from '../opencode/OpenCodeSessionBridge.js'
-import type { OpenCodeSessionRecord } from '../opencode/types.js'
+import {
+  OpenCodePermissionEffectNotAuthorizedError,
+  type OpenCodeHostedApprovalObservedPermission,
+  type OpenCodePermissionEffectContext,
+} from '../opencode/OpenCodeSessionBridge.js'
+import type { OpenCodeNormalizedPermission, OpenCodeSessionRecord } from '../opencode/types.js'
 import type { HostedControlProcessIdentity } from './HostedControlProcessIdentity.js'
 import { HostedApprovalRuntimeBindingFence } from './HostedApprovalRuntimeBindingFence.js'
+import {
+  ingressRecordForObservedPermission,
+  OpenCodeHostedApprovalRuntimeAdapter,
+} from './OpenCodeHostedApprovalRuntimeAdapter.js'
 import {
   assertHostedApprovalRuntimeBinding,
   canonicalHostedApprovalRuntimeBinding,
@@ -65,6 +73,10 @@ function fixture(memberName = 'lead') {
   }
   let current = true
   let currentHost = host
+  const capability = {
+    schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
+    authentication: 'opencode-basic' as const, runtimeInstanceId, configGeneration,
+  }
   const fence = new HostedApprovalRuntimeBindingFence()
   const source = new OpenCodeHostedApprovalRuntimeBindingSource({
     fence,
@@ -85,10 +97,7 @@ function fixture(memberName = 'lead') {
     }] },
     sessions: { get: async () => record },
     hosts: { read: async () => currentHost },
-    capability: { read: async () => ({
-      schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', authentication: 'opencode-basic',
-      runtimeInstanceId, configGeneration,
-    }) },
+    capability: { read: async () => capability },
     owner: {
       socketPath: '/run/agent-teams/owner.sock', processId: 77,
       getOwnerBinding: () => ({
@@ -104,7 +113,7 @@ function fixture(memberName = 'lead') {
     }),
   })
   return {
-    source, fence, host,
+    source, fence, host, record, capability,
     setCurrent: (value: boolean) => { current = value },
     setHost: (value: typeof host) => { currentHost = value },
   }
@@ -119,7 +128,10 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
       authority: { sessionId: 'session_test', runtimeInstanceId, deliveryOwnerId: memberId },
       openCodeBinding: {
         openCodeArtifactDigest: artifact,
-        liveEffectFingerprint: liveHostedApprovalEffectFingerprint(host),
+        liveEffectFingerprint: liveHostedApprovalEffectFingerprint(host, {
+          schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', authentication: 'opencode-basic',
+          runtimeInstanceId, configGeneration,
+        }),
       },
     })
     expect(binding.memberIdsByName).toEqual({ lead: memberId })
@@ -140,6 +152,99 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
       },
     })
     await expect(source.capture()).rejects.toThrow('unavailable')
+  })
+
+  test('takes a source-produced route to one POST and rejects live proof substitutions before POST', async () => {
+    type Proof = ReturnType<typeof fixture>['host'] & {
+      capability: ReturnType<typeof fixture>['capability']
+    }
+    type Substitution = {
+      proof?: (value: Proof) => Proof
+      context?: (value: OpenCodePermissionEffectContext) => OpenCodePermissionEffectContext
+      ownerToken?: boolean
+    }
+    const execute = async (substitution: Substitution = {}) => {
+      const { source, host, record, capability } = fixture()
+      const binding = await source.capture()
+      const route = binding.routes[0]!
+      const rawPermission = {
+        id: 'permission_source_binding', sessionID: record.opencodeSessionId,
+        permission: 'bash', patterns: [], metadata: {}, always: [],
+      }
+      const permission: OpenCodeNormalizedPermission = {
+        requestId: 'permission_source_binding', sessionId: record.opencodeSessionId,
+        tool: 'bash', title: 'Run provider effect', kind: 'tool',
+        raw: rawPermission,
+      }
+      const providerObservation: OpenCodeHostedApprovalObservedPermission = {
+        capability,
+        permission: {
+          requestId: permission.requestId, sessionId: record.opencodeSessionId,
+          requestIncarnation: `request_incarnation_${'c'.repeat(32)}`,
+          permissionDigest: 'd'.repeat(64), rawPermission,
+        },
+        normalized: permission,
+      }
+      const expectedEffectRef = ingressRecordForObservedPermission({
+        route, permission, providerObservation, observedAtIso: '2026-08-15T00:00:00.000Z',
+      }).effectRef
+      let posts = 0
+      const bridge = {
+        observeHostedApprovalPermissions: async () => [providerObservation],
+        captureHostedApprovalBinding: async () => {
+          const proof = { ...host, capability }
+          return substitution.proof ? substitution.proof(proof) : proof
+        },
+        answerPermission: async (_record: OpenCodeSessionRecord, parameters: {
+          validatePreparedEffect?: (context: OpenCodePermissionEffectContext) => Promise<boolean | { consume(): boolean }>
+          authorizeEffect?: (context: OpenCodePermissionEffectContext) => Promise<boolean | { consume(): boolean }>
+        }) => {
+          const context = substitution.context ? substitution.context(host.context) : host.context
+          const prepared = await parameters.validatePreparedEffect?.(context)
+          if (!prepared || (typeof prepared !== 'boolean' && !prepared.consume())) {
+            throw new OpenCodePermissionEffectNotAuthorizedError()
+          }
+          const authorized = await parameters.authorizeEffect?.(context)
+          if (!authorized || (typeof authorized !== 'boolean' && !authorized.consume())) {
+            throw new OpenCodePermissionEffectNotAuthorizedError()
+          }
+          posts += 1
+        },
+      }
+      const adapter = new OpenCodeHostedApprovalRuntimeAdapter(
+        { get: async () => record, prepareEffectToken: async () => ({ consume: () => true }) },
+        bridge as never,
+        Date.now,
+        { prepareEffectToken: () => ({ consume: () => true }) },
+      )
+      const result = await adapter.deliver({
+        route, requestId: permission.requestId, expectedEffectRef, decision: 'allow',
+        revalidate: async () => true,
+        prepareEffectToken: async () => substitution.ownerToken === false
+          ? null : { consume: () => true },
+      })
+      return { result, posts }
+    }
+
+    expect(await execute()).toEqual({ result: 'delivered', posts: 1 })
+    for (const substitution of [
+      { proof: (proof: Proof) => ({ ...proof, processIdentity: { ...proof.processIdentity,
+        startIdentity: `start_${'1'.repeat(64)}` } }) },
+      { proof: (proof: Proof) => ({ ...proof, endpointIdentity: { ...proof.endpointIdentity,
+        startIdentity: `start_${'2'.repeat(64)}` } }) },
+      { context: (context: OpenCodePermissionEffectContext) => ({ ...context, profile: {
+        ...context.profile, managedAuthFingerprint: 'substituted-profile',
+      } }) },
+      { context: (context: OpenCodePermissionEffectContext) => ({ ...context, host: {
+        ...context.host, hostKey: 'substituted-host',
+      } }) },
+      { proof: (proof: Proof) => ({ ...proof, capability: { ...proof.capability,
+        configGeneration: `config_generation_${'f'.repeat(32)}`,
+      } }) },
+      { ownerToken: false },
+    ] satisfies Substitution[]) {
+      expect(await execute(substitution)).toEqual({ result: 'not_started', posts: 0 })
+    }
   })
 
   test('fails closed when an independent source is no longer current', async () => {
@@ -299,7 +404,7 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
     expect(JSON.parse(canonical)).toEqual(binding)
     expect(canonicalHostedApprovalRuntimeBinding(JSON.parse(canonical))).toBe(canonical)
     expect(digestHostedApprovalRuntimeBinding(binding)).toBe(
-      'dac9800a4d4eb52f7acece9dfa8a480670b9b7ed42cdc486830cf0f687527b7b',
+      '40a72fa011a7f0df1d73e3757b9a7aa83f4ebfcbab4ab95cc35705db9ff73ba1',
     )
   })
 

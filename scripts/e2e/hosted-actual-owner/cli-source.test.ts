@@ -108,8 +108,11 @@ function fingerprintSession(record: Record<string, any>): string {
   })).digest('hex')
 }
 
-function fingerprintEffect(effect: Record<string, any>): string {
-  return createHash('sha256').update(canonicalJson({
+function fingerprintEffect(effect: Record<string, any>, proof: {
+  processStartIdentity: string
+  capability: Record<string, unknown>
+}): string {
+  const priorLiveEffectFingerprint = createHash('sha256').update(canonicalJson({
     schemaVersion: 1, sessionRecordFingerprint: fingerprintSession(effect.record),
     hostKey: effect.host.hostKey, profileRootKey: effect.host.profileRootKey,
     projectPath: effect.host.projectPath,
@@ -123,6 +126,15 @@ function fingerprintEffect(effect: Record<string, any>): string {
       managedConfigFingerprint: effect.profile.managedConfigFingerprint,
       sourceAuthFingerprint: effect.profile.sourceAuthFingerprint,
       managedAuthFingerprint: effect.profile.managedAuthFingerprint },
+  })).digest('hex')
+  return createHash('sha256').update(canonicalJson({
+    schemaVersion: 2, priorLiveEffectFingerprint,
+    processIdentity: { pid: effect.host.pid, startIdentity: proof.processStartIdentity },
+    endpointIdentity: { address: '127.0.0.1', port: effect.host.port,
+      pid: effect.host.pid, startIdentity: proof.processStartIdentity },
+    executedArtifactDigest: effect.host.openCodeArtifactDigest,
+    resolvedConfigFingerprint: effect.host.resolvedConfigFingerprint,
+    capability: proof.capability,
   })).digest('hex')
 }
 
@@ -433,6 +445,13 @@ await new Promise(() => {})
     await waitForHttp(`http://127.0.0.1:${providerPort}/global/health`, trackedProvider)
     const processStartedAtMs = await linuxProcessStartTicks(provider.pid!)
     expect(processStartedAtMs).not.toBeNull()
+    const processStartIdentity = `start_${createHash('sha256')
+      .update(String(provider.pid!)).update('\0').update(`proc:${processStartedAtMs}`).digest('hex')}`
+    const capability = {
+      schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', authentication: 'opencode-basic',
+      runtimeInstanceId: `runtime_instance_${'8'.repeat(32)}`,
+      configGeneration: `config_generation_${'9'.repeat(32)}`,
+    }
 
     const profileModule = join(repositoryRoot, 'src/services/opencode/OpenCodeProfileManager.ts')
     const profileSource = `import { OpenCodeProfileManager } from ${JSON.stringify(profileModule)}; console.log(JSON.stringify(await new OpenCodeProfileManager().prepareProfile(${JSON.stringify(project)}, {toolApprovalMode:'manual'})))`
@@ -463,7 +482,9 @@ await new Promise(() => {})
     const effect = { record: session, profile, host: {
       hostKey, profileRootKey: profile.profileRootKey, projectPath: project,
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
-      openCodeArtifactDigest: session.openCodeArtifactDigest, pid: provider.pid!, processStartedAtMs,
+      openCodeArtifactDigest: session.openCodeArtifactDigest,
+      baseUrl: `http://127.0.0.1:${providerPort}`, port: providerPort,
+      pid: provider.pid!, processStartedAtMs,
       resolvedConfigFingerprint,
     } }
     const memberId = `member_${'4'.repeat(32)}`
@@ -472,15 +493,15 @@ await new Promise(() => {})
         deploymentId: 'deployment-test', teamId, runId: routeRunId, planGeneration: 2,
         laneId: session.laneId, providerId: 'opencode', credentialGeneration: 3,
         credentialId: 'credential_1', sessionId: session.opencodeSessionId,
-        runtimeInstanceId: 'runtime_1', deliveryOwnerId: memberId,
+        runtimeInstanceId: capability.runtimeInstanceId, deliveryOwnerId: memberId,
       },
       scope: { principalId: 'actor_owner', workspaceId: 'workspace-test', teamId,
         authorityGeneration: 'generation_1', restoreGeneration: 1 },
       openCodeBinding: { toolApprovalMode: 'manual', planGeneration: 2, credentialGeneration: 3,
-        credentialId: 'credential_1', runtimeInstanceId: 'runtime_1', deliveryOwnerId: memberId,
+        credentialId: 'credential_1', runtimeInstanceId: capability.runtimeInstanceId, deliveryOwnerId: memberId,
         openCodeArtifactDigest: session.openCodeArtifactDigest,
         sessionRecordFingerprint: fingerprintSession(session),
-        liveEffectFingerprint: fingerprintEffect(effect) },
+        liveEffectFingerprint: fingerprintEffect(effect, { processStartIdentity, capability }) },
     }
 
     const sessionStore = join(data, 'opencode', 'session-store.json')

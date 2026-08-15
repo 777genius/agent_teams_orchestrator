@@ -22,7 +22,7 @@ export function fingerprintHostedApprovalSessionRecord(record: {
   })
 }
 
-export function fingerprintHostedApprovalLiveEffect(context: {
+export type HostedApprovalLiveEffectContext = {
   record: Parameters<typeof fingerprintHostedApprovalSessionRecord>[0]
   profile: {
     profileRootKey: string; projectPath: string; projectBehaviorFingerprint: string
@@ -34,7 +34,46 @@ export function fingerprintHostedApprovalLiveEffect(context: {
     openCodeArtifactDigest?: `sha256:${string}` | null; baseUrl?: string; port?: number; pid: number
     processStartedAtMs: number | null; resolvedConfigFingerprint: string | null
   }
-}): string {
+}
+
+export type HostedApprovalStrengthenedLiveEffect = {
+  context: HostedApprovalLiveEffectContext
+  processIdentity: { pid: number; startIdentity: string }
+  endpointIdentity: { address: '127.0.0.1'; port: number; pid: number; startIdentity: string }
+  executedArtifactDigest: `sha256:${string}`
+  resolvedConfigFingerprint: string
+  capability: {
+    schemaVersion: 2
+    protocol: 'agent-teams-hosted-approval-v2'
+    authentication: 'opencode-basic'
+    runtimeInstanceId: string
+    configGeneration: string
+  }
+}
+
+/**
+ * The exact schema-v2 live-effect identity carried by authoritative bindings.
+ * Both binding production and provider-edge consumption must call this helper;
+ * the schema-v1 context digest is deliberately only an inner component.
+ */
+export function fingerprintHostedApprovalLiveEffect(
+  input: HostedApprovalStrengthenedLiveEffect,
+): string {
+  return digest({
+    schemaVersion: 2,
+    priorLiveEffectFingerprint: fingerprintHostedApprovalLiveEffectContext(input.context),
+    processIdentity: input.processIdentity,
+    endpointIdentity: input.endpointIdentity,
+    executedArtifactDigest: input.executedArtifactDigest,
+    resolvedConfigFingerprint: input.resolvedConfigFingerprint,
+    capability: input.capability,
+  })
+}
+
+/** Inner schema-v1 projection; never compare this directly with a route. */
+export function fingerprintHostedApprovalLiveEffectContext(
+  context: HostedApprovalLiveEffectContext,
+): string {
   return digest({
     schemaVersion: 1,
     sessionRecordFingerprint: fingerprintHostedApprovalSessionRecord(context.record),

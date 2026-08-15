@@ -42,9 +42,28 @@ const effectContext: OpenCodePermissionEffectContext = {
   host: {
     hostKey: record.hostKey, profileRootKey: record.profileRootKey, projectPath: record.projectPath,
     projectBehaviorFingerprint: record.projectBehaviorFingerprint, openCodeArtifactDigest,
+    baseUrl: 'http://127.0.0.1:4096', port: 4096,
     pid: record.runtimePid!, processStartedAtMs: 1000,
     resolvedConfigFingerprint: 'resolved-fingerprint',
   },
+}
+const hostedCapability = {
+  schemaVersion: 2 as const,
+  protocol: 'agent-teams-hosted-approval-v2' as const,
+  authentication: 'opencode-basic' as const,
+  runtimeInstanceId: `runtime_instance_${'a'.repeat(32)}`,
+  configGeneration: `config_generation_${'b'.repeat(32)}`,
+}
+const bindingProof = {
+  context: effectContext,
+  processIdentity: { pid: record.runtimePid!, startIdentity: `start_${'1'.repeat(64)}` },
+  endpointIdentity: {
+    address: '127.0.0.1' as const, port: 4096, pid: record.runtimePid!,
+    startIdentity: `start_${'1'.repeat(64)}`,
+  },
+  executedArtifactDigest: openCodeArtifactDigest,
+  resolvedConfigFingerprint: 'resolved-fingerprint',
+  capability: hostedCapability,
 }
 const route: HostedApprovalRuntimeRoute = {
   routeId: 'route_1', memberName,
@@ -52,7 +71,7 @@ const route: HostedApprovalRuntimeRoute = {
     deploymentId: 'deployment_test', teamId, runId, planGeneration: 2,
     laneId, providerId: 'opencode',
     credentialGeneration: 3, credentialId: 'credential_1', sessionId: 'session_1',
-    runtimeInstanceId: 'runtime_1', deliveryOwnerId: `member_${'4'.repeat(32)}`,
+    runtimeInstanceId: hostedCapability.runtimeInstanceId, deliveryOwnerId: `member_${'4'.repeat(32)}`,
   },
   scope: {
     principalId: 'actor_owner', workspaceId: `workspace_${'3'.repeat(32)}`, teamId,
@@ -61,10 +80,10 @@ const route: HostedApprovalRuntimeRoute = {
   openCodeBinding: {
     toolApprovalMode: 'manual',
     planGeneration: 2, credentialGeneration: 3, credentialId: 'credential_1',
-    runtimeInstanceId: 'runtime_1', deliveryOwnerId: `member_${'4'.repeat(32)}`,
+    runtimeInstanceId: hostedCapability.runtimeInstanceId, deliveryOwnerId: `member_${'4'.repeat(32)}`,
     openCodeArtifactDigest,
     sessionRecordFingerprint: fingerprintOpenCodeApprovalSessionRecord(record),
-    liveEffectFingerprint: liveEffectFingerprint(effectContext),
+    liveEffectFingerprint: liveEffectFingerprint(bindingProof),
   },
 }
 const permission: OpenCodeNormalizedPermission = {
@@ -72,13 +91,7 @@ const permission: OpenCodeNormalizedPermission = {
   raw: { requestID: 'permission_1', sessionID: 'session_1', tool: 'bash', title: 'Run tests' },
 }
 const providerObservation = {
-  capability: {
-    schemaVersion: 2 as const,
-    protocol: 'agent-teams-hosted-approval-v2' as const,
-    authentication: 'opencode-basic' as const,
-    runtimeInstanceId: `runtime_instance_${'a'.repeat(32)}`,
-    configGeneration: `config_generation_${'b'.repeat(32)}`,
-  },
+  capability: hostedCapability,
   permission: {
     requestId: permission.requestId,
     sessionId: permission.sessionId!,
@@ -113,7 +126,10 @@ function makeAdapter(
   now: () => number = Date.now,
   artifacts: ConstructorParameters<typeof OpenCodeHostedApprovalRuntimeAdapter>[3] = matchingArtifacts,
 ) {
-  return new OpenCodeHostedApprovalRuntimeAdapter(store, bridge, now, artifacts)
+  return new OpenCodeHostedApprovalRuntimeAdapter(store, {
+    captureHostedApprovalBinding: async () => bindingProof,
+    ...bridge,
+  } as never, now, artifacts)
 }
 describe('OpenCodeHostedApprovalRuntimeAdapter R2', () => {
   test('keeps current upstream capability-false before raw permission observation or reply', async () => {

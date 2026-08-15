@@ -13,6 +13,11 @@ import type { OpenCodeHostedApprovalObservedPermission } from '../opencode/OpenC
 import { prepareOpenCodeArtifactDigestToken } from '../opencode/OpenCodeArtifactDigest.js'
 import type { HostedApprovalIngressRecord } from './HostedApprovalWire.js'
 import type { HostedApprovalRuntimeRoute } from './HostedApprovalRuntimeAdmission.js'
+import {
+  fingerprintHostedApprovalLiveEffect,
+  fingerprintHostedApprovalLiveEffectContext,
+  fingerprintHostedApprovalSessionRecord,
+} from './HostedApprovalRuntimeBindingFingerprint.js'
 
 export type HostedApprovalObservedPermission = {
   route: HostedApprovalRuntimeRoute
@@ -29,7 +34,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
       Partial<Pick<OpenCodeSessionStore, 'prepareEffectToken'>> = openCodeSessionStore,
     private readonly bridge: Pick<
       OpenCodeSessionBridge,
-      'answerPermission' | 'observeHostedApprovalPermissions'
+      'answerPermission' | 'observeHostedApprovalPermissions' | 'captureHostedApprovalBinding'
     > = openCodeSessionBridge,
     private readonly now: () => number = Date.now,
     private readonly artifacts: {
@@ -91,7 +96,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
           const freshRecord = await this.#record(input.route)
           if (fingerprintOpenCodeApprovalSessionRecord(freshRecord) !==
             fingerprintOpenCodeApprovalSessionRecord(context.record) ||
-            liveEffectFingerprint(context) !== input.route.openCodeBinding.liveEffectFingerprint) return false
+            !(await this.#liveEffectMatches(input.route, context))) return false
           if (!this.sessions.prepareEffectToken) return true
           return await this.sessions.prepareEffectToken(
             input.route.authority.teamId,
@@ -101,7 +106,7 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
           ) ?? false
         },
         authorizeEffect: async context => {
-          if (liveEffectFingerprint(context) !== input.route.openCodeBinding.liveEffectFingerprint ||
+          if (!(await this.#liveEffectMatches(input.route, context)) ||
             !(await input.revalidate())) return false
           const artifactToken = this.artifacts.prepareEffectToken(
             input.route.openCodeBinding.openCodeArtifactDigest,
@@ -148,6 +153,21 @@ export class OpenCodeHostedApprovalRuntimeAdapter {
       context.host.openCodeArtifactDigest !== route.openCodeBinding.openCodeArtifactDigest) return false
     const token = this.artifacts.prepareEffectToken(route.openCodeBinding.openCodeArtifactDigest)
     return token?.consume() ?? false
+  }
+
+  async #liveEffectMatches(
+    route: HostedApprovalRuntimeRoute,
+    context: OpenCodePermissionEffectContext,
+  ): Promise<boolean> {
+    try {
+      const proof = await this.bridge.captureHostedApprovalBinding(context.record)
+      return fingerprintHostedApprovalLiveEffectContext(proof.context) ===
+          fingerprintHostedApprovalLiveEffectContext(context) &&
+        fingerprintHostedApprovalLiveEffect(proof) === route.openCodeBinding.liveEffectFingerprint &&
+        proof.capability.runtimeInstanceId === route.authority.runtimeInstanceId
+    } catch {
+      return false
+    }
   }
 }
 
@@ -212,51 +232,13 @@ export function fingerprintOpenCodeApprovalSessionRecord(record: {
   runtimePid?: number
   createdAt: string
 }): string {
-  return createHash('sha256').update(canonicalJson({
-    schemaVersion: 1,
-    teamId: record.teamId,
-    laneId: record.laneId ?? 'primary',
-    runId: record.runId ?? null,
-    memberName: record.memberName,
-    providerId: record.providerId,
-    opencodeSessionId: record.opencodeSessionId,
-    projectPath: record.projectPath,
-    hostKey: record.hostKey,
-    openCodeArtifactDigest: record.openCodeArtifactDigest ?? null,
-    profileRootKey: record.profileRootKey,
-    projectBehaviorFingerprint: record.projectBehaviorFingerprint,
-    managedConfigFingerprint: record.managedConfigFingerprint ?? null,
-    sourceAuthFingerprint: record.sourceAuthFingerprint,
-    managedAuthFingerprint: record.managedAuthFingerprint,
-    toolApprovalMode: record.toolApprovalMode ?? null,
-    runtimePid: record.runtimePid ?? null,
-    createdAt: record.createdAt,
-  })).digest('hex')
+  return fingerprintHostedApprovalSessionRecord(record)
 }
 
-export function liveEffectFingerprint(context: OpenCodePermissionEffectContext): string {
-  return createHash('sha256').update(canonicalJson({
-    schemaVersion: 1,
-    sessionRecordFingerprint: fingerprintOpenCodeApprovalSessionRecord(context.record),
-    hostKey: context.host.hostKey,
-    profileRootKey: context.host.profileRootKey,
-    projectPath: context.host.projectPath,
-    projectBehaviorFingerprint: context.host.projectBehaviorFingerprint,
-    openCodeArtifactDigest: context.host.openCodeArtifactDigest ?? null,
-    baseUrl: context.host.baseUrl ?? null,
-    port: context.host.port ?? null,
-    runtimePid: context.host.pid,
-    processStartedAtMs: context.host.processStartedAtMs,
-    resolvedConfigFingerprint: context.host.resolvedConfigFingerprint,
-    preparedProfile: {
-      profileRootKey: context.profile.profileRootKey,
-      projectPath: context.profile.projectPath,
-      projectBehaviorFingerprint: context.profile.projectBehaviorFingerprint,
-      managedConfigFingerprint: context.profile.managedConfigFingerprint,
-      sourceAuthFingerprint: context.profile.sourceAuthFingerprint,
-      managedAuthFingerprint: context.profile.managedAuthFingerprint,
-    },
-  })).digest('hex')
+export function liveEffectFingerprint(
+  proof: Parameters<typeof fingerprintHostedApprovalLiveEffect>[0],
+): string {
+  return fingerprintHostedApprovalLiveEffect(proof)
 }
 
 

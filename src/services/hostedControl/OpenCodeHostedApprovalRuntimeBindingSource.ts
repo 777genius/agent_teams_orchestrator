@@ -204,7 +204,7 @@ export class OpenCodeHostedApprovalRuntimeBindingSource {
       bindingCapability = { ...capability }
 
       const sessionRecordFingerprint = fingerprintHostedApprovalSessionRecord(record)
-      const effectFingerprint = liveHostedApprovalEffectFingerprint(host)
+      const effectFingerprint = liveHostedApprovalEffectFingerprint(host, capability)
       capturedRoutes.push({
         routeId: lifecycleRoute.routeId,
         authority: {
@@ -287,15 +287,11 @@ export class OpenCodeHostedApprovalRuntimeBindingSource {
   }
 }
 
-export function liveHostedApprovalEffectFingerprint(host: HostedApprovalHostBindingRecord): string {
-  return createHash('sha256').update(canonicalJson({
-    schemaVersion: 2,
-    priorLiveEffectFingerprint: fingerprintHostedApprovalLiveEffect(host.context),
-    processIdentity: host.processIdentity,
-    endpointIdentity: host.endpointIdentity,
-    executedArtifactDigest: host.executedArtifactDigest,
-    resolvedConfigFingerprint: host.resolvedConfigFingerprint,
-  })).digest('hex')
+export function liveHostedApprovalEffectFingerprint(
+  host: HostedApprovalHostBindingRecord,
+  capability: HostedApprovalRuntimeBindingCapability,
+): string {
+  return fingerprintHostedApprovalLiveEffect({ ...host, capability })
 }
 
 export function digestHostedApprovalRuntimeBinding(binding: HostedApprovalRuntimeBinding): string {

@@ -1587,6 +1587,27 @@ export class OpenCodeSessionBridge {
       let runtimeInstanceId: string | null = null
       let requestIncarnation: string | null = null
       let permissionDigest: string | null = null
+      let preparedEndpointStartIdentity: string | null = null
+      const proveEndpointOwner = async (): Promise<string> => {
+        const port = host.port
+        if (!Number.isSafeInteger(port) || !port || port <= 0) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        const captureProcessIdentity = this.deps.captureProcessIdentity
+          ?? captureHostedControlProcessIdentity
+        const captureEndpointIdentity = this.deps.captureLoopbackEndpointIdentity
+          ?? captureOpenCodeLoopbackEndpointIdentity
+        const processBeforeEndpoint = await captureProcessIdentity(host.pid)
+        const endpoint = await captureEndpointIdentity(host.pid, port, captureProcessIdentity)
+        const processAfterEndpoint = await captureProcessIdentity(host.pid)
+        if (!endpoint || endpoint.address !== '127.0.0.1' || endpoint.port !== port ||
+          endpoint.pid !== host.pid ||
+          endpoint.startIdentity !== processBeforeEndpoint.startIdentity ||
+          processBeforeEndpoint.startIdentity !== processAfterEndpoint.startIdentity) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        return processAfterEndpoint.startIdentity
+      }
       try {
       // Capability probe is deliberately before the raw permission GET. A
       // current upstream host (which lacks atomic config-CAS reply) therefore
@@ -1636,6 +1657,7 @@ export class OpenCodeSessionBridge {
         if (!exactPermission) throw new OpenCodePermissionEffectNotAuthorizedError()
       }
       if (params.expectedPermissionRaw) {
+        preparedEndpointStartIdentity = await proveEndpointOwner()
         if (params.validatePreparedEffect) {
           const prepared = await params.validatePreparedEffect({ record, profile, host })
           if (!prepared) throw new OpenCodePermissionEffectNotAuthorizedError()
@@ -1667,6 +1689,14 @@ export class OpenCodeSessionBridge {
         ? await prepareHost(hostInput)
         : null
       if (params.expectedPermissionRaw && !hostToken) throw new OpenCodePermissionEffectNotAuthorizedError()
+      if (params.expectedPermissionRaw) {
+        // Endpoint ownership is the final asynchronous proof. Process/config/
+        // artifact proof alone cannot exclude a substituted listener on the
+        // same loopback port while the admitted process remains alive.
+        if (await proveEndpointOwner() !== preparedEndpointStartIdentity) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+      }
       if (preparedToken) {
         preparedConsumed = true
         if (!preparedToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
