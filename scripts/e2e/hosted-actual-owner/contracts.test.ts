@@ -18,6 +18,7 @@ function manifest() {
     runId: 'a'.repeat(48),
     sandboxRoot: '${SANDBOX_ROOT}',
     markerPath: '${SANDBOX_ROOT}/.agent-teams-actual-owner-e2e-owner.json',
+    ownerWalTimelineRawPath: '${SANDBOX_ROOT}/capture/owner.ndjson',
     evidenceRoot: `${root}/evidence`,
     driverBaseUrl: 'http://127.0.0.1:49152/',
     productBaseUrl: 'http://127.0.0.1:49153/',
@@ -53,7 +54,6 @@ function manifest() {
       negativeResultsPath: '${SANDBOX_ROOT}/capture/negative.json',
       openCodeTimelinePath: '${SANDBOX_ROOT}/capture/opencode.ndjson',
       ownerWalTimelinePath: '${SANDBOX_ROOT}/capture/owner.ndjson',
-      ownerWalTimelineRawPath: '${SANDBOX_ROOT}/capture/owner.ndjson',
       productTimelinePath: '${SANDBOX_ROOT}/capture/product.ndjson',
       protectedEffectLedgerPath: '${SANDBOX_ROOT}/capture/effects.json',
     },
@@ -70,7 +70,11 @@ function descriptor(token: string, path: string) {
 
 describe('hosted actual-owner acceptance preconditions', () => {
   test('accepts exact frozen refs and marker-owned capture paths', () => {
-    expect(parseRuntimeManifest(manifest()).refs.orchestrator).toBe('d'.repeat(40))
+    const parsed = parseRuntimeManifest(manifest())
+    expect(parsed.refs.orchestrator).toBe('d'.repeat(40))
+    expect(parsed.ownerWalTimelineRawPath).toBe(`${root}/capture/owner.ndjson`)
+    expect(Object.keys(parsed.capture)).toHaveLength(7)
+    expect('ownerWalTimelineRawPath' in parsed.capture).toBe(false)
     const aliased = manifest()
     aliased.socketIdentity.productSocket.device = aliased.socketIdentity.driverSocket.device
     aliased.socketIdentity.productSocket.inode = aliased.socketIdentity.driverSocket.inode
@@ -96,10 +100,10 @@ describe('hosted actual-owner acceptance preconditions', () => {
     await chmod(sandbox, 0o700)
     const input = parseRuntimeManifest({
       ...manifest(),
+      ownerWalTimelineRawPath: '${SANDBOX_ROOT}/owner.ndjson',
       descriptors: { ...manifest().descriptors,
         sandboxRoot: descriptor('${SANDBOX_ROOT}', sandbox) },
-      capture: { ...manifest().capture, ownerWalTimelinePath: '${SANDBOX_ROOT}/owner.ndjson',
-        ownerWalTimelineRawPath: '${SANDBOX_ROOT}/owner.ndjson' },
+      capture: { ...manifest().capture, ownerWalTimelinePath: '${SANDBOX_ROOT}/owner.ndjson' },
     })
     await expect(assertMarkerOwnedSandbox(input)).rejects.toThrow()
   })

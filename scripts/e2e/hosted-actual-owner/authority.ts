@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { constants, type BigIntStats } from 'node:fs'
+import { constants, fstatSync, lstatSync, type BigIntStats } from 'node:fs'
 import { lstat, open, type FileHandle } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
@@ -121,6 +121,27 @@ async function assertFile(lease: FileLease): Promise<void> {
   }
 }
 
+function assertNamespaceSync(lease: NamespaceLease): void {
+  const descriptor = fstatSync(lease.handle.fd, { bigint: true })
+  const linked = lstatSync(lease.parentPath, { bigint: true })
+  if (!descriptor.isDirectory() || !linked.isDirectory() || linked.isSymbolicLink() ||
+    descriptor.dev !== linked.dev || descriptor.ino !== linked.ino ||
+    descriptor.dev.toString() !== lease.device || descriptor.ino.toString() !== lease.inode) {
+    throw new Error('hosted_actual_owner_authority_namespace_rotated')
+  }
+}
+
+function assertFileSync(lease: FileLease): void {
+  assertNamespaceSync(lease.parent)
+  const descriptor = fstatSync(lease.handle.fd, { bigint: true })
+  const linked = lstatSync(lease.path, { bigint: true })
+  if (!descriptor.isFile() || !linked.isFile() || linked.isSymbolicLink() ||
+    descriptor.dev !== linked.dev || descriptor.ino !== linked.ino ||
+    !sameFileIdentity(descriptor, lease.identity)) {
+    throw new Error('hosted_actual_owner_authority_file_rotated')
+  }
+}
+
 function sameFileIdentity(stat: BigIntStats, identity: SecureFileIdentity): boolean {
   return stat.dev.toString() === identity.device && stat.ino.toString() === identity.inode &&
     stat.size.toString() === identity.size && stat.mtimeNs.toString() === identity.mtimeNs &&
@@ -131,12 +152,13 @@ function sameFileIdentity(stat: BigIntStats, identity: SecureFileIdentity): bool
 export class AcceptanceEffectAuthority {
   private consumed = false
   constructor(private readonly authority: AcceptanceAuthority, readonly route: RouteBinding) {}
-  async consume(expected: RouteBinding): Promise<void> {
-    if (this.consumed || JSON.stringify(expected) !== JSON.stringify(this.route)) {
+  consume(): boolean {
+    if (this.consumed) {
       throw new Error('hosted_actual_owner_effect_authority_invalid')
     }
     this.consumed = true
-    await this.authority.assertCurrent()
+    this.authority.assertCurrentAtEffectEdge(this.route)
+    return true
   }
 }
 
@@ -177,10 +199,23 @@ export class AcceptanceAuthority {
     }
   }
 
-  token(routeId: string): AcceptanceEffectAuthority {
-    const route = this.routes.get(routeId)
-    if (!route) throw new Error('hosted_actual_owner_effect_route_unadmitted')
+  async prepareEffectToken(expected: RouteBinding): Promise<AcceptanceEffectAuthority> {
+    const route = this.routes.get(expected.routeId)
+    if (!route || JSON.stringify(expected) !== JSON.stringify(route)) {
+      throw new Error('hosted_actual_owner_effect_route_unadmitted')
+    }
+    await this.assertCurrent()
     return new AcceptanceEffectAuthority(this, route)
+  }
+
+  assertCurrentAtEffectEdge(expected: RouteBinding): void {
+    const route = this.routes.get(expected.routeId)
+    if (!route || JSON.stringify(expected) !== JSON.stringify(route)) {
+      throw new Error('hosted_actual_owner_effect_route_unadmitted')
+    }
+    for (const capture of this.captures) assertNamespaceSync(capture)
+    assertFileSync(this.contract)
+    assertFileSync(this.manifest)
   }
 
   async assertCurrent(): Promise<void> {

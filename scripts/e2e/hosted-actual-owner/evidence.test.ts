@@ -24,6 +24,7 @@ const config = {
   runtime: {
     schemaVersion: 1 as const, purpose: 'agent-teams.hosted-actual-owner-e2e/v1' as const,
     runId: 'b'.repeat(48), sandboxRoot: '/tmp/sandbox', markerPath: '/tmp/sandbox/marker',
+    ownerWalTimelineRawPath: '/tmp/sandbox/owner.ndjson',
     capabilityEndpoint: 'http://127.0.0.1:49152/v1/capability',
     ownerBinding: { ownerUid: 1000, ownerSessionId: `session_${'b'.repeat(48)}`,
       ownerTokenSha256: 'f'.repeat(64) },
@@ -40,7 +41,7 @@ const config = {
     capture: { browserResultsPath: '/tmp/sandbox/results.json',
       conditionalPostLedgerPath: '/tmp/sandbox/posts.ndjson', negativeResultsPath: '/tmp/sandbox/negative.json',
       openCodeTimelinePath: '/tmp/sandbox/opencode.ndjson', ownerWalTimelinePath: '/tmp/sandbox/owner.ndjson',
-      ownerWalTimelineRawPath: '/tmp/sandbox/owner.ndjson', productTimelinePath: '/tmp/sandbox/product.ndjson',
+      productTimelinePath: '/tmp/sandbox/product.ndjson',
       protectedEffectLedgerPath: '/tmp/sandbox/effects.json' },
     descriptors: {
       sandboxRoot: { token: '${SANDBOX_ROOT}', path: '/tmp/sandbox', device: '1', inode: '2', mode: '448', uid: '1000' },
@@ -84,6 +85,7 @@ describe('hosted actual-owner acceptance evidence', () => {
         processStartedAtMs: 1,
       }],
     })
+    expect(evidence.timeline.path).toBe(config.runtime.ownerWalTimelineRawPath)
     expect(validateAcceptanceEvidence(evidence)).toEqual(evidence)
     expect(evidence.publication.admission?.inode).toBe('6')
     expect(evidence.owner.decisionOperations).toEqual([

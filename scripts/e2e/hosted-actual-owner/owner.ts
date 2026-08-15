@@ -11,6 +11,7 @@ import { PrivateFileHostedApprovalRuntimeAdmissionStore, type HostedApprovalRunt
 import type { HostedApprovalWirePort } from '../../../src/services/hostedControl/HostedApprovalWire.js'
 import type { HostedControlRuntimePortFactoryContext } from '../../../src/services/hostedControl/HostedControlRuntime.js'
 import { HostedControlRuntime } from '../../../src/services/hostedControl/HostedControlRuntime.js'
+import { hostedControlAuthorityFromConfig } from '../../../src/services/hostedControl/HostedControlRuntimeConfig.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN } from '../../../src/services/hostedControl/HostedControlServer.js'
 import { createHostedRawDomainProof, parseStrictHostedProofLastJsonFrame } from '../../../src/services/hostedControl/ownerProof.js'
 import type { HostedControlOwnerBinding } from '../../../src/services/hostedControl/protocol.js'
@@ -114,12 +115,27 @@ export class AcceptanceRuntime {
   ) {
     this.evidence = buildAcceptanceEvidence({ config, status: 'starting' })
   }
-
   async start(): Promise<void> {
     await assertMarkerOwnedSandbox(this.config.runtime)
     await this.waitForProductPublication()
     await this.assertPublicationCurrent()
     this.ownerProcessStartIdentity = await processStartIdentity(process.pid)
+    const expectedTeamRoot = join(this.bootstrap.config.claudeRoot, 'teams', this.bootstrap.config.legacyKey)
+    if (this.config.admissionFile !== join(expectedTeamRoot, HOSTED_APPROVAL_ADMISSION_FILE) ||
+      this.config.walFile !== join(expectedTeamRoot, 'hosted-approval-owner.v1.json') ||
+      !isWithin(this.config.sandboxRoot, expectedTeamRoot)) {
+      throw new Error('hosted_actual_owner_product_admission_path_mismatch')
+    }
+    const admission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(this.config.admissionFile)
+      .load(hostedControlAuthorityFromConfig(this.bootstrap.config))
+    await this.assertPublicationCurrent()
+    const expectedDigest = `sha256:${this.config.openCodeSha256}`
+    if (admission.digest !== this.admissionSha256 || admission.routes.length === 0 ||
+      admission.routes.some(route => route.openCodeBinding.openCodeArtifactDigest !== expectedDigest)) {
+      throw new Error('hosted_actual_owner_admission_candidate_digest_mismatch')
+    }
+    this.admission = admission
+    this.acceptanceAuthority = await AcceptanceAuthority.acquire(this.config, admission)
     const runtime = new HostedControlRuntime(this.bootstrap, context => this.ports(context))
     this.runtime = runtime
     await runtime.start()
@@ -255,8 +271,12 @@ export class AcceptanceRuntime {
       this.config.walFile !== join(context.teamRoot, 'hosted-approval-owner.v1.json')) {
       throw new Error('hosted_actual_owner_product_admission_path_mismatch')
     }
-    const admission = await new PrivateFileHostedApprovalRuntimeAdmissionStore(this.config.admissionFile)
-      .load(context.authority)
+    const admission = this.admission
+    const acceptanceAuthority = this.acceptanceAuthority
+    if (!admission || !acceptanceAuthority ||
+      JSON.stringify(context.authority) !== JSON.stringify(hostedControlAuthorityFromConfig(this.bootstrap.config))) {
+      throw new Error('hosted_actual_owner_preflight_authority_missing')
+    }
     await this.assertPublicationCurrent()
     if (admission.digest !== this.admissionSha256) {
       throw new Error('hosted_actual_owner_admission_bytes_mismatch')
@@ -267,9 +287,6 @@ export class AcceptanceRuntime {
       throw new Error('hosted_actual_owner_admission_candidate_digest_mismatch')
     }
     const store = new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(this.config.walFile))
-    this.admission = admission
-    const acceptanceAuthority = await AcceptanceAuthority.acquire(this.config, admission)
-    this.acceptanceAuthority = acceptanceAuthority
     const capture = async (effect: OpenCodePermissionEffectContext) => {
       await this.assertPublicationCurrent()
       const sessionRecordFingerprint = fingerprintOpenCodeApprovalSessionRecord(effect.record)
@@ -319,7 +336,7 @@ export class AcceptanceRuntime {
         const route = await capture(effect)
         const result = authorize ? await authorize(effect) : true
         await this.assertPublicationCurrent()
-        await acceptanceAuthority.token(route.routeId).consume(route)
+        await acceptanceAuthority.assertCurrent()
         return result
       }),
       answerPermission: async (
@@ -345,8 +362,8 @@ export class AcceptanceRuntime {
           const route = await capture(effect)
           const result = parameters.authorizeEffect ? await parameters.authorizeEffect(effect) : true
           await this.assertPublicationCurrent()
-          await acceptanceAuthority.token(route.routeId).consume(route)
-          return result
+          if (!result) return false
+          return acceptanceAuthority.prepareEffectToken(route)
         },
       }),
     }
@@ -412,16 +429,15 @@ export class AcceptanceRuntime {
         generation: route.scope.authorityGeneration, approvalId, requestId,
         effectId: effectId ?? ingress?.effectRef ?? null, event, sequence: ++this.sequence,
       })
-      await appendPrivateLine(this.config.runtime.capture.ownerWalTimelinePath,
+      await appendPrivateLine(this.config.runtime.ownerWalTimelineRawPath,
         sandboxAnchor(this.config.runtime), productTimelineLine(timeline))
     }
     this.timeline = await this.readTimeline(true)
     await this.assertPublicationCurrent()
     await this.refreshEvidence('ready')
   }
-
   private async readTimeline(required: boolean): Promise<typeof this.timeline> {
-    const file = await readAnchoredFile(this.config.runtime.capture.ownerWalTimelinePath,
+    const file = await readAnchoredFile(this.config.runtime.ownerWalTimelineRawPath,
       sandboxAnchor(this.config.runtime), {
         minimumBytes: 2, maximumBytes: 32 * 1024 * 1024, mode: 0o600,
       }).catch(error => {
@@ -449,7 +465,6 @@ export class AcceptanceRuntime {
       bytes: file.bytes.byteLength, eventCount: events.length, lastSequence,
     })
   }
-
   private async assertProvidersCurrent(): Promise<void> {
     if (!this.admission || this.providerIdentities.size !== this.admission.routes.length) {
       throw new Error('hosted_actual_owner_provider_identity_missing')
@@ -473,7 +488,6 @@ export class AcceptanceRuntime {
       }
     }
   }
-
   private async assertReadyAuthority(): Promise<void> {
     if (!this.readinessLease || this.readinessLease.destroyed) {
       throw new Error('hosted_actual_owner_readiness_lease_lost')
@@ -487,7 +501,6 @@ export class AcceptanceRuntime {
     }
     this.timeline = timeline
   }
-
   private async refreshEvidence(status: 'ready' | 'stopping'): Promise<void> {
     if (status === 'ready') await this.assertReadyAuthority()
     else await this.assertPublicationCurrent()
@@ -558,13 +571,11 @@ export class AcceptanceRuntime {
     else await this.assertPublicationCurrent()
     await this.writeEvidence()
   }
-
   private async writeEvidence(): Promise<void> {
     await this.assertPublicationCurrent()
     await atomicPrivateJson(this.config.evidenceFile, sandboxAnchor(this.config.runtime),
       validateAcceptanceEvidence(this.evidence))
   }
-
   async writeFailure(failure: string): Promise<void> {
     if (!this.publication || !this.admission) return
     await this.assertPublicationCurrent()
@@ -575,7 +586,6 @@ export class AcceptanceRuntime {
     })
     await this.writeEvidence()
   }
-
   private async startControl(): Promise<void> {
     await this.assertPublicationCurrent()
     const parent = dirname(this.config.controlSocket)

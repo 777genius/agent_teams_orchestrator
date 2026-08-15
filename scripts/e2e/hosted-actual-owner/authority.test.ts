@@ -79,15 +79,18 @@ describe('hosted actual-owner effect authority', () => {
     }] }), config, admission as never, nonce)).toThrow(/capability_routes_invalid/)
   })
 
-  test('makes effect-edge authority single-use and fail-closed', async () => {
+  test('makes the synchronous post-preparation effect-edge authority single-use and fail-closed', () => {
     let checks = 0
-    const authority = { assertCurrent: async () => { checks += 1 } } as never
+    const authority = { assertCurrentAtEffectEdge: (expected: typeof route) => {
+      checks += 1
+      if (expected.generation !== route.generation) throw new Error('hosted_actual_owner_effect_authority_invalid')
+    } } as never
     const token = new AcceptanceEffectAuthority(authority, route)
-    await token.consume(route)
+    expect(token.consume()).toBe(true)
     expect(checks).toBe(1)
-    await expect(token.consume(route)).rejects.toThrow(/effect_authority_invalid/)
-    await expect(new AcceptanceEffectAuthority(authority, route).consume({
+    expect(() => token.consume()).toThrow(/effect_authority_invalid/)
+    expect(() => new AcceptanceEffectAuthority(authority, {
       ...route, generation: 'generation_rotated',
-    })).rejects.toThrow(/effect_authority_invalid/)
+    }).consume()).toThrow(/effect_authority_invalid/)
   })
 })

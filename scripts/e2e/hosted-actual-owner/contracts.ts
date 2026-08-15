@@ -32,6 +32,7 @@ export type ActualOwnerRuntimeManifest = {
   runId: string
   sandboxRoot: string
   markerPath: string
+  ownerWalTimelineRawPath: string
   capabilityEndpoint: string
   ownerBinding: { ownerUid: number; ownerSessionId: string; ownerTokenSha256: string }
   socketIdentity: {
@@ -47,7 +48,7 @@ export type ActualOwnerRuntimeManifest = {
   }
   capture: {
     browserResultsPath: string; conditionalPostLedgerPath: string; negativeResultsPath: string
-    openCodeTimelinePath: string; ownerWalTimelinePath: string; ownerWalTimelineRawPath: string
+    openCodeTimelinePath: string; ownerWalTimelinePath: string
     productTimelinePath: string; protectedEffectLedgerPath: string
   }
   descriptors: {
@@ -186,7 +187,7 @@ export function isWithin(root: string, candidate: string): boolean {
 export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest {
   const input = record(value, 'runtime_manifest')
   exact(input, [
-    'schemaVersion', 'purpose', 'runId', 'sandboxRoot', 'markerPath', 'evidenceRoot',
+    'schemaVersion', 'purpose', 'runId', 'sandboxRoot', 'markerPath', 'ownerWalTimelineRawPath', 'evidenceRoot',
     'driverBaseUrl', 'productBaseUrl', 'approvalPath', 'capabilityEndpoint', 'ownerBinding',
     'socketIdentity', 'contract', 'browser', 'capture', 'refs', 'descriptors',
   ], 'runtime_manifest')
@@ -197,7 +198,7 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
   const capture = record(input.capture, 'runtime_capture')
   exact(capture, [
     'browserResultsPath', 'conditionalPostLedgerPath', 'negativeResultsPath', 'openCodeTimelinePath',
-    'ownerWalTimelinePath', 'ownerWalTimelineRawPath', 'productTimelinePath', 'protectedEffectLedgerPath',
+    'ownerWalTimelinePath', 'productTimelinePath', 'protectedEffectLedgerPath',
   ], 'runtime_capture')
   const browser = record(input.browser, 'runtime_browser')
   exact(browser, ['ownerStorageStatePath', 'nonOwnerStorageStatePath', 'tracePath', 'resultsPath'],
@@ -229,6 +230,8 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
       RuntimePathDescriptor & { size: string; sha256: string }
   const sandboxRoot = expandDescriptor(input.sandboxRoot, sandboxDescriptor, 'sandbox_root')
   const markerPath = expandDescriptor(input.markerPath, sandboxDescriptor, 'marker')
+  const ownerWalTimelineRawPath = expandDescriptor(input.ownerWalTimelineRawPath, sandboxDescriptor,
+    'owner_wal_timeline_raw')
   const ownerWalTimelinePath = expandDescriptor(capture.ownerWalTimelinePath, sandboxDescriptor,
     'owner_wal_timeline')
   const expandSandbox = (value: unknown, label: string) =>
@@ -245,18 +248,18 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     negativeResultsPath: expandSandbox(capture.negativeResultsPath, 'negative_results'),
     openCodeTimelinePath: expandSandbox(capture.openCodeTimelinePath, 'opencode_timeline'),
     ownerWalTimelinePath,
-    ownerWalTimelineRawPath: expandSandbox(capture.ownerWalTimelineRawPath, 'owner_wal_timeline_raw'),
     productTimelinePath: expandSandbox(capture.productTimelinePath, 'product_timeline'),
     protectedEffectLedgerPath: expandSandbox(capture.protectedEffectLedgerPath, 'protected_effect_ledger'),
   })
   const driverBaseUrl = loopbackBaseUrl(input.driverBaseUrl, 'driver_base_url')
   const productBaseUrl = loopbackBaseUrl(input.productBaseUrl, 'product_base_url')
   if (!isWithin(sandboxRoot, markerPath) || !isWithin(sandboxRoot, ownerWalTimelinePath) ||
+    !isWithin(sandboxRoot, ownerWalTimelineRawPath) ||
     typeof input.evidenceRoot !== 'string' || !isAbsolute(input.evidenceRoot) ||
     resolve(input.evidenceRoot) !== input.evidenceRoot ||
     typeof input.approvalPath !== 'string' || !/^\/[A-Za-z0-9/_-]+$/.test(input.approvalPath) ||
     expandedCapture.browserResultsPath !== expandedBrowser.resultsPath ||
-    expandedCapture.ownerWalTimelineRawPath !== ownerWalTimelinePath ||
+    ownerWalTimelineRawPath !== ownerWalTimelinePath ||
     input.capabilityEndpoint !== new URL('v1/capability', driverBaseUrl).toString() ||
     driverSocket.endpoint !== new URL(driverBaseUrl).host ||
     productSocket.endpoint !== new URL(productBaseUrl).host ||
@@ -274,6 +277,7 @@ export function parseRuntimeManifest(value: unknown): ActualOwnerRuntimeManifest
     runId: input.runId,
     sandboxRoot,
     markerPath,
+    ownerWalTimelineRawPath,
     capabilityEndpoint: input.capabilityEndpoint as string,
     ownerBinding: Object.freeze({ ownerUid: ownerBinding.ownerUid as number,
       ownerSessionId: ownerBinding.ownerSessionId as string,

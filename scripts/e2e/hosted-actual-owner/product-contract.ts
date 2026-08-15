@@ -138,10 +138,12 @@ export async function loadProductContract(input: {
   if (parsed.sha256 !== declared.sha256 || parsed.byteCount !== declared.byteCount) {
     throw new Error('hosted_actual_owner_contract_digest_mismatch')
   }
-  const blob = await execFileAsync('/usr/bin/git', ['-C', input.productRoot, 'show',
+  const blob = await execFileAsync('/usr/bin/git', ['--no-replace-objects', '-C', input.productRoot,
+    'show', '--no-ext-diff', '--no-textconv',
     `${input.runtime.refs.product}:${declared.repositoryPath}`], {
     encoding: null, maxBuffer: 1024 * 1024,
-    env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+    env: { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C', LC_ALL: 'C',
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
   })
   if (!Buffer.from(blob.stdout).equals(file.bytes)) {
     throw new Error('hosted_actual_owner_contract_git_blob_mismatch')

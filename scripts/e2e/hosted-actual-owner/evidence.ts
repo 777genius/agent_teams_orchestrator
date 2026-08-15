@@ -247,7 +247,7 @@ export function buildAcceptanceEvidence(input: {
       ownerArtifactDigest: input.bootstrap?.bootstrapBinding.ownerArtifactDigest ?? null,
     }),
     timeline: Object.freeze({
-      path: input.config.runtime.capture.ownerWalTimelinePath,
+      path: input.config.runtime.ownerWalTimelineRawPath,
       identity: input.timeline?.identity ?? null,
       sha256: input.timeline?.sha256 ?? null,
       bytes: input.timeline?.bytes ?? 0,
