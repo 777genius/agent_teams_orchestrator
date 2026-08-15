@@ -1,6 +1,7 @@
 import { createHash, createHmac } from 'node:crypto'
 
 import { describe, expect, test } from 'bun:test'
+import { fingerprintFixtureEffect } from '../../../scripts/e2e/hosted-actual-owner/fingerprint-fixture.js'
 
 import {
   OpenCodePermissionEffectNotAuthorizedError,
@@ -154,6 +155,14 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
     await expect(source.capture()).rejects.toThrow('unavailable')
   })
 
+  test('keeps the independent acceptance fixture fingerprint byte-identical to runtime', () => {
+    const { host, capability } = fixture()
+    expect(fingerprintFixtureEffect(host.context, {
+      processStartIdentity: host.processIdentity.startIdentity,
+      capability,
+    })).toBe(liveHostedApprovalEffectFingerprint(host, capability))
+  })
+
   test('takes a source-produced route to one POST and rejects live proof substitutions before POST', async () => {
     type Proof = ReturnType<typeof fixture>['host'] & {
       capability: ReturnType<typeof fixture>['capability']
@@ -269,13 +278,72 @@ describe('OpenCodeHostedApprovalRuntimeBindingSource', () => {
 
   test('closed schema rejects extra and reordered fields', async () => {
     const binding = await fixture().source.capture()
-    expect(() => assertHostedApprovalRuntimeBinding({ extra: true, ...binding } as never)).toThrow('schema')
+    const first = binding.routes[0]!
+    const extraFields = [
+      { extra: true, ...binding },
+      { ...binding, outerAuthority: { ...binding.outerAuthority, extra: true } },
+      { ...binding, outerAuthority: { ...binding.outerAuthority,
+        mountBinding: { ...binding.outerAuthority.mountBinding, extra: true } } },
+      { ...binding, routes: [{ ...first, extra: true }] },
+      { ...binding, routes: [{ ...first, authority: { ...first.authority, extra: true } }] },
+      { ...binding, routes: [{ ...first, scope: { ...first.scope, extra: true } }] },
+      { ...binding, routes: [{ ...first,
+        openCodeBinding: { ...first.openCodeBinding, extra: true } }] },
+      { ...binding, owner: { ...binding.owner, extra: true } },
+      { ...binding, owner: { ...binding.owner,
+        socketIdentity: { ...binding.owner.socketIdentity, extra: true } } },
+      { ...binding, owner: { ...binding.owner,
+        processIdentity: { ...binding.owner.processIdentity, extra: true } } },
+      { ...binding, capability: { ...binding.capability, extra: true } },
+    ]
+    for (const value of extraFields) {
+      expect(() => assertHostedApprovalRuntimeBinding(value as never)).toThrow('schema')
+    }
     const reordered = { routes: binding.routes, outerAuthority: binding.outerAuthority,
       memberIdsByName: binding.memberIdsByName, actorMembers: binding.actorMembers,
       owner: binding.owner, capability: binding.capability }
     expect(() => assertHostedApprovalRuntimeBinding(reordered as never)).toThrow('schema')
-    const route = { ...binding.routes[0]!, extra: null }
-    expect(() => assertHostedApprovalRuntimeBinding({ ...binding, routes: [route] } as never)).toThrow('schema')
+  })
+
+  test('rejects coercive, wrong-shape, and over-limit frozen binding values', async () => {
+    const binding = await fixture().source.capture()
+    const first = binding.routes[0]!
+    const coercive = {
+      ...binding,
+      outerAuthority: { ...binding.outerAuthority, bootId: 123, workspaceId: 456 },
+      routes: [{
+        ...first, routeId: 101, memberName: 10,
+        authority: { ...first.authority, laneId: 789, credentialId: 202, sessionId: 303 },
+        scope: { ...first.scope, workspaceId: 456 },
+        openCodeBinding: { ...first.openCodeBinding, credentialId: 202 },
+      }],
+    }
+    const wrongShapes = [
+      null,
+      { ...binding, routes: {} },
+      { ...binding, routes: [null] },
+      { ...binding, memberIdsByName: [] },
+      { ...binding, actorMembers: null },
+      { ...binding, outerAuthority: { ...binding.outerAuthority, mountBinding: null } },
+      { ...binding, owner: null },
+      { ...binding, owner: { ...binding.owner, socketIdentity: [] } },
+      { ...binding, capability: [] },
+    ]
+    expect(() => assertHostedApprovalRuntimeBinding(coercive as never)).toThrow('schema')
+    for (const value of wrongShapes) {
+      expect(() => assertHostedApprovalRuntimeBinding(value as never)).toThrow('schema')
+    }
+
+    const memberIdsByName = Object.fromEntries(Array.from({ length: 257 }, (_, index) => [
+      `name_${String(index).padStart(3, '0')}`,
+      `member_${index.toString(16).padStart(32, '0')}`,
+    ]))
+    const actorMembers = Object.fromEntries(Object.values(memberIdsByName).map((memberId, index) => [
+      `actor_x${String(index).padStart(3, '0')}`, memberId,
+    ]))
+    expect(() => assertHostedApprovalRuntimeBinding({
+      ...binding, memberIdsByName, actorMembers,
+    } as never)).toThrow('schema')
   })
 
   test('reproduces the frozen canonical binding digest golden', () => {

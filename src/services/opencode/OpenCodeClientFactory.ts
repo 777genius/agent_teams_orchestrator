@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
+import { connect as connectTcp } from 'node:net'
+import { Readable } from 'node:stream'
 
 import type {
   OpenCodeAgentResponse,
@@ -70,6 +73,8 @@ export type OpenCodeClient = {
       configGeneration: string
       requestIncarnation: string
       permissionDigest: string
+      /** Settles against the already-connected socket before any request byte is written. */
+      authorizeConnected?: () => Promise<boolean>
     }
   }): Promise<unknown>
   sendSessionMessage(
@@ -453,6 +458,81 @@ async function parseStrictHostedApprovalResponse<T>(
   return JSON.parse(text) as T
 }
 
+async function fetchHostedApprovalOverAuthorizedConnection(
+  urlValue: string,
+  init: RequestInit,
+  signal: AbortSignal,
+  authorizeConnected: () => Promise<boolean>,
+): Promise<Response> {
+  const url = new URL(urlValue)
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
+    throw new Error('OpenCode hosted approval endpoint was not private loopback HTTP')
+  }
+  const port = Number(url.port)
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error('OpenCode hosted approval endpoint port was invalid')
+  }
+  const socket = connectTcp({ host: '127.0.0.1', port })
+  const abortSocket = () => socket.destroy(signal.reason instanceof Error
+    ? signal.reason
+    : new Error('OpenCode hosted approval connection aborted'))
+  const cleanupAbort = () => signal.removeEventListener('abort', abortSocket)
+  signal.addEventListener('abort', abortSocket, { once: true })
+  socket.once('close', cleanupAbort)
+  let requestDispatched = false
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const connected = () => { cleanup(); resolve() }
+      const failed = (error: Error) => { cleanup(); reject(error) }
+      const cleanup = () => {
+        socket.off('connect', connected)
+        socket.off('error', failed)
+      }
+      socket.once('connect', connected)
+      socket.once('error', failed)
+      if (signal.aborted) abortSocket()
+    })
+    if (!(await authorizeConnected())) {
+      throw new OpenCodePermissionConditionRejectedError(
+        new Error('OpenCode hosted approval connected endpoint was not authorized'),
+      )
+    }
+    if (signal.aborted) abortSocket()
+
+    const body = typeof init.body === 'string' ? init.body : undefined
+    const headers = new Headers(init.headers)
+    headers.set('connection', 'close')
+    if (body !== undefined) headers.set('content-length', String(Buffer.byteLength(body, 'utf8')))
+    return await new Promise<Response>((resolve, reject) => {
+      const request = httpRequest({
+        protocol: 'http:', hostname: '127.0.0.1', port,
+        path: `${url.pathname}${url.search}`, method: init.method ?? 'GET',
+        headers: Object.fromEntries(headers.entries()), agent: false,
+        createConnection: () => socket,
+      }, response => {
+        const responseHeaders = new Headers()
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (Array.isArray(value)) value.forEach(member => responseHeaders.append(name, member))
+          else if (value !== undefined) responseHeaders.set(name, String(value))
+        }
+        resolve(new Response(Readable.toWeb(response) as ReadableStream, {
+          status: response.statusCode ?? 500,
+          statusText: response.statusMessage,
+          headers: responseHeaders,
+        }))
+      })
+      requestDispatched = true
+      request.once('error', reject)
+      request.end(body)
+    })
+  } finally {
+    if (!requestDispatched) {
+      cleanupAbort()
+      socket.destroy()
+    }
+  }
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
@@ -521,6 +601,7 @@ export class OpenCodeClientFactory {
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
       strictHostedApprovalResponse = false,
       maximumResponseBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+      authorizeConnected?: () => Promise<boolean>,
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
@@ -542,14 +623,26 @@ export class OpenCodeClientFactory {
       }, timeoutMs)
 
       try {
-        const response = await fetchImpl(baseUrl + path, {
+        const requestInit = {
           ...init,
           signal: controller.signal,
           headers: {
             'content-type': 'application/json',
             ...(init?.headers ?? {}),
           },
-        })
+        }
+        const response = authorizeConnected && !this.deps.fetchImpl
+          ? await fetchHostedApprovalOverAuthorizedConnection(
+              baseUrl + path, requestInit, controller.signal, authorizeConnected,
+            )
+          : await (async () => {
+              if (authorizeConnected && !(await authorizeConnected())) {
+                throw new OpenCodePermissionConditionRejectedError(
+                  new Error('OpenCode hosted approval connected endpoint was not authorized'),
+                )
+              }
+              return await fetchImpl(baseUrl + path, requestInit)
+            })()
         return strictHostedApprovalResponse
           ? parseStrictHostedApprovalResponse<T>(response, maximumResponseBytes)
           : parseResponse<T>(response)
@@ -736,6 +829,11 @@ export class OpenCodeClientFactory {
         }
         try {
           if (!body.sessionId) throw new Error('OpenCode hosted approval session id missing')
+          if (!body.condition.authorizeConnected && !this.deps.fetchImpl) {
+            throw new OpenCodePermissionConditionRejectedError(
+              new Error('OpenCode hosted approval connected endpoint proof was unavailable'),
+            )
+          }
           if (!body.requestId.startsWith('per')) {
             throw new Error('OpenCode hosted approval request id was malformed')
           }
@@ -768,6 +866,8 @@ export class OpenCodeClientFactory {
             }),
             PERMISSION_REQUEST_TIMEOUT_MS,
             true,
+            MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
+            body.condition.authorizeConnected,
           )
           return validateConditionalPermissionReply(response, {
             ...body.condition,

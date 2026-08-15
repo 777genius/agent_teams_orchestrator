@@ -1675,8 +1675,8 @@ export class OpenCodeSessionBridge {
         profileToken = await prepareProfileToken(profile)
         if (!profileToken) throw new OpenCodePermissionEffectNotAuthorizedError()
       }
-      // Host proof is deliberately the last asynchronous operation. Everything
-      // after it is a synchronous one-use token consumption followed by POST.
+      // Prepare the final host token before consuming any one-use fence. The
+      // transport-bound endpoint proof below is the last asynchronous fence.
       const hostInput = {
         hostKey: host.hostKey,
         pid: host.pid,
@@ -1689,31 +1689,32 @@ export class OpenCodeSessionBridge {
         ? await prepareHost(hostInput)
         : null
       if (params.expectedPermissionRaw && !hostToken) throw new OpenCodePermissionEffectNotAuthorizedError()
-      if (params.expectedPermissionRaw) {
-        // Endpoint ownership is the final asynchronous proof. Process/config/
-        // artifact proof alone cannot exclude a substituted listener on the
-        // same loopback port while the admitted process remains alive.
-        if (await proveEndpointOwner() !== preparedEndpointStartIdentity) {
+      const consumePreparedFences = (): boolean => {
+        if (preparedToken) {
+          preparedConsumed = true
+          if (!preparedToken.consume()) return false
+        }
+        if (profileToken) {
+          profileConsumed = true
+          if (!profileToken.consume()) return false
+        }
+        if (authorityToken) {
+          authorityConsumed = true
+          if (!authorityToken.consume()) return false
+        }
+        if (hostToken) {
+          hostConsumed = true
+          if (!hostToken.consume()) return false
+        }
+        return true
+      }
+      const conditionalReply = configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
+      if (!conditionalReply) {
+        if (params.expectedPermissionRaw &&
+          await proveEndpointOwner() !== preparedEndpointStartIdentity) {
           throw new OpenCodePermissionEffectNotAuthorizedError()
         }
-      }
-      if (preparedToken) {
-        preparedConsumed = true
-        if (!preparedToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
-      }
-      if (profileToken) {
-        profileConsumed = true
-        if (!profileToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
-      }
-      if (authorityToken) {
-        authorityConsumed = true
-        if (!authorityToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
-      }
-      // The fresh process/executed-artifact proof is consumed last, with no
-      // asynchronous boundary before the provider POST.
-      if (hostToken) {
-        hostConsumed = true
-        if (!hostToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+        if (!consumePreparedFences()) throw new OpenCodePermissionEffectNotAuthorizedError()
       }
       try {
         invocation.phase = 'invoked'
@@ -1721,13 +1722,24 @@ export class OpenCodeSessionBridge {
           requestId: params.requestId,
           sessionId: record.opencodeSessionId,
           decision: params.decision,
-          ...(configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
+          ...(conditionalReply
             ? {
                 condition: {
                   runtimeInstanceId,
                   configGeneration,
                   requestIncarnation,
                   permissionDigest,
+                  // The transport opens and pins its TCP socket first, then
+                  // awaits this proof before writing even the HTTP headers.
+                  authorizeConnected: async () => {
+                    try {
+                      return preparedEndpointStartIdentity !== null &&
+                        await proveEndpointOwner() === preparedEndpointStartIdentity &&
+                        consumePreparedFences()
+                    } catch {
+                      return false
+                    }
+                  },
                 },
               }
             : {}),

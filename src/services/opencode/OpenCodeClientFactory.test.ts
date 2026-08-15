@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 
 import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
@@ -288,6 +291,55 @@ describe('OpenCodeClientFactory permissions API', () => {
         requestIncarnation, expectedPermissionDigest: permissionDigest, decision: 'allow_once',
       },
     }])
+  })
+
+  test('writes no conditional POST until the connected endpoint proof settles', async () => {
+    let posts = 0
+    const server = createServer((_request, response) => {
+      posts += 1
+      response.end(JSON.stringify({
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        requestIncarnation, permissionDigest, decision: 'allow_once',
+      }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const port = (server.address() as AddressInfo).port
+    try {
+      let settleProof!: (authorized: boolean) => void
+      let proofStarted!: () => void
+      const started = new Promise<void>(resolve => { proofStarted = resolve })
+      const proof = new Promise<boolean>(resolve => { settleProof = resolve })
+      const client = new OpenCodeClientFactory().create(
+        `http://127.0.0.1:${port}`, {}, hostedAuth,
+      )
+      const reply = client.answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+        condition: {
+          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          authorizeConnected: async () => { proofStarted(); return await proof },
+        },
+      })
+      await started
+      await Bun.sleep(10)
+      expect(posts).toBe(0)
+      settleProof(true)
+      await expect(reply).resolves.toBeTruthy()
+      expect(posts).toBe(1)
+
+      await expect(client.answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+        condition: {
+          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          authorizeConnected: async () => false,
+        },
+      })).rejects.toThrow('rejected without effect')
+      expect(posts).toBe(1)
+    } finally {
+      server.close()
+      await once(server, 'close')
+    }
   })
 
   test('treats numeric 409/412 as no-effect and redirect/server/malformed as ambiguous without retry', async () => {

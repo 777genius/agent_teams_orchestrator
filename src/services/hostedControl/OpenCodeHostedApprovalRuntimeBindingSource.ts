@@ -314,8 +314,12 @@ export function canonicalHostedApprovalRuntimeBinding(binding: HostedApprovalRun
 }
 
 export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntimeBinding): void {
+  if (!isRecord(binding)) throw invalid()
   exact(binding, ['outerAuthority', 'routes', 'memberIdsByName', 'actorMembers', 'owner', 'capability'])
-  if (!validOuterAuthority(binding.outerAuthority) || binding.routes.length < 1 || binding.routes.length > 256 ||
+  if (!Array.isArray(binding.routes) || !isRecord(binding.memberIdsByName) ||
+    !isRecord(binding.actorMembers) || !isRecord(binding.owner) || !isRecord(binding.capability) ||
+    !validOuterAuthority(binding.outerAuthority) ||
+    binding.routes.length < 1 || binding.routes.length > 256 ||
     !validOwner(binding.owner, binding.owner.socketPath) || !validProcessIdentity(binding.owner.processIdentity) ||
     binding.owner.teamId !== binding.outerAuthority.teamId || !validCapability(binding.capability)) throw invalid()
   exact(binding.outerAuthority, ['deploymentId', 'bootId', 'workspaceId', 'teamId', 'restoreGeneration', 'mountBinding'])
@@ -326,13 +330,15 @@ export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntim
   exact(binding.capability, ['schemaVersion', 'protocol', 'authentication', 'runtimeInstanceId', 'configGeneration'])
   const memberValues = Object.values(binding.memberIdsByName)
   const actorValues = Object.values(binding.actorMembers)
-  if (!schemaOrderedDictionary(binding.memberIdsByName) ||
+  if (memberValues.length < 1 || memberValues.length > 256 ||
+    actorValues.length < 1 || actorValues.length > 256 ||
+    !schemaOrderedDictionary(binding.memberIdsByName) ||
     !schemaOrderedDictionary(binding.actorMembers) ||
     Object.entries(binding.memberIdsByName).some(([name, memberId]) =>
-      !validIdentifier(name) || !/^member_[0-9a-f]{32}$/.test(memberId)) ||
+      !validIdentifier(name) || !matches(/^member_[0-9a-f]{32}$/, memberId)) ||
     Object.entries(binding.actorMembers).some(([actorId, memberId]) =>
-      !/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/.test(actorId) ||
-      !/^member_[0-9a-f]{32}$/.test(memberId)) ||
+      !matches(/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/, actorId) ||
+      !matches(/^member_[0-9a-f]{32}$/, memberId)) ||
     memberValues.length !== actorValues.length || new Set(memberValues).size !== memberValues.length ||
     new Set(actorValues).size !== actorValues.length ||
     [...memberValues].sort().join('\0') !== [...actorValues].sort().join('\0')) throw invalid()
@@ -355,17 +361,17 @@ export function assertHostedApprovalRuntimeBinding(binding: HostedApprovalRuntim
 
 function validLifecycle(value: HostedApprovalLifecycleBindingRecord): boolean {
   return validOuterAuthority(value.outerAuthority) && value.routes.length >= 1 && value.routes.length <= 256 &&
-    value.routes.every(route => validIdentifier(route.routeId) && /^run_[0-9a-f]{32}$/.test(route.runId) &&
-      safeInteger(route.planGeneration, 1) && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(route.laneId) &&
-      /^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/.test(route.authorityGeneration)) &&
+    value.routes.every(route => validIdentifier(route.routeId) && matches(/^run_[0-9a-f]{32}$/, route.runId) &&
+      safeInteger(route.planGeneration, 1) && matches(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, route.laneId) &&
+      matches(/^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/, route.authorityGeneration)) &&
     new Set(value.routes.map(route => route.routeId)).size === value.routes.length
 }
 
 function validMembership(value: HostedApprovalMembershipBindingRecord): boolean {
   return value.members.length >= 1 && value.members.length <= 256 && value.members.every(member =>
     validIdentifier(member.routeId) && validIdentifier(member.memberName) &&
-    /^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/.test(member.principalId) &&
-    /^member_[0-9a-f]{32}$/.test(member.deliveryOwnerId)) &&
+    matches(/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/, member.principalId) &&
+    matches(/^member_[0-9a-f]{32}$/, member.deliveryOwnerId)) &&
     new Set(value.members.map(member => member.routeId)).size === value.members.length &&
     new Set(value.members.map(member => member.memberName)).size === value.members.length &&
     new Set(value.members.map(member => member.principalId)).size === value.members.length &&
@@ -388,7 +394,7 @@ function validSession(
     record.teamId === teamId && (record.laneId ?? 'primary') === lifecycle.laneId &&
     record.runId === lifecycle.runId && record.memberName === member.memberName &&
     record.staleReason === null && validIdentifier(record.opencodeSessionId) &&
-    /^sha256:[0-9a-f]{64}$/.test(record.openCodeArtifactDigest ?? '')
+    matches(/^sha256:[0-9a-f]{64}$/, record.openCodeArtifactDigest)
 }
 
 function validHost(host: HostedApprovalHostBindingRecord, record: OpenCodeSessionRecord): boolean {
@@ -406,50 +412,55 @@ function validHost(host: HostedApprovalHostBindingRecord, record: OpenCodeSessio
 }
 
 function validCapability(value: HostedApprovalRuntimeBindingCapability): boolean {
-  return value.schemaVersion === 2 && value.protocol === 'agent-teams-hosted-approval-v2' &&
-    value.authentication === 'opencode-basic' && /^runtime_instance_[0-9a-f]{32}$/.test(value.runtimeInstanceId) &&
-    /^config_generation_[0-9a-f]{32}$/.test(value.configGeneration)
+  return isRecord(value) && value.schemaVersion === 2 && value.protocol === 'agent-teams-hosted-approval-v2' &&
+    value.authentication === 'opencode-basic' && matches(/^runtime_instance_[0-9a-f]{32}$/, value.runtimeInstanceId) &&
+    matches(/^config_generation_[0-9a-f]{32}$/, value.configGeneration)
 }
 
 function validOuterAuthority(authority: HostedApprovalRuntimeOuterAuthority): boolean {
-  return /^deployment_[A-Za-z0-9][A-Za-z0-9._-]{0,116}$/.test(authority.deploymentId) &&
+  return isRecord(authority) && isRecord(authority.mountBinding) &&
+    matches(/^deployment_[A-Za-z0-9][A-Za-z0-9._-]{0,116}$/, authority.deploymentId) &&
     validIdentifier(authority.bootId) && validIdentifier(authority.workspaceId) &&
-    /^team_[0-9a-f]{32}$/.test(authority.teamId) && safeInteger(authority.restoreGeneration, 0) &&
+    matches(/^team_[0-9a-f]{32}$/, authority.teamId) && safeInteger(authority.restoreGeneration, 0) &&
     safeInteger(authority.mountBinding.mountGeneration, 1) &&
-    /^[0-9a-f]{64}$/.test(authority.mountBinding.declaredRootHash)
+    matches(/^[0-9a-f]{64}$/, authority.mountBinding.declaredRootHash)
 }
 
 function validRoute(route: HostedApprovalRuntimeRoute): boolean {
+  if (!isRecord(route) || !isRecord(route.authority) || !isRecord(route.scope) ||
+    !isRecord(route.openCodeBinding)) return false
   const { authority, scope, openCodeBinding: binding } = route
   return validIdentifier(route.routeId) && validIdentifier(route.memberName) &&
-    /^deployment_[A-Za-z0-9][A-Za-z0-9._-]{0,116}$/.test(authority.deploymentId) &&
-    /^team_[0-9a-f]{32}$/.test(authority.teamId) && /^run_[0-9a-f]{32}$/.test(authority.runId) &&
-    safeInteger(authority.planGeneration, 1) && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(authority.laneId) &&
+    matches(/^deployment_[A-Za-z0-9][A-Za-z0-9._-]{0,116}$/, authority.deploymentId) &&
+    matches(/^team_[0-9a-f]{32}$/, authority.teamId) && matches(/^run_[0-9a-f]{32}$/, authority.runId) &&
+    safeInteger(authority.planGeneration, 1) && matches(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, authority.laneId) &&
     authority.providerId === 'opencode' && safeInteger(authority.credentialGeneration, 1) &&
     validIdentifier(authority.credentialId) && validIdentifier(authority.sessionId) &&
-    /^runtime_instance_[0-9a-f]{32}$/.test(authority.runtimeInstanceId) &&
-    /^member_[0-9a-f]{32}$/.test(authority.deliveryOwnerId) &&
-    /^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/.test(scope.principalId) && validIdentifier(scope.workspaceId) &&
-    /^team_[0-9a-f]{32}$/.test(scope.teamId) && /^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/.test(scope.authorityGeneration) &&
+    matches(/^runtime_instance_[0-9a-f]{32}$/, authority.runtimeInstanceId) &&
+    matches(/^member_[0-9a-f]{32}$/, authority.deliveryOwnerId) &&
+    matches(/^actor_[A-Za-z0-9][A-Za-z0-9._-]{0,121}$/, scope.principalId) && validIdentifier(scope.workspaceId) &&
+    matches(/^team_[0-9a-f]{32}$/, scope.teamId) && matches(/^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/, scope.authorityGeneration) &&
     safeInteger(scope.restoreGeneration, 0) && binding.toolApprovalMode === 'manual' &&
     binding.planGeneration === authority.planGeneration && binding.credentialGeneration === authority.credentialGeneration &&
     binding.credentialId === authority.credentialId && binding.runtimeInstanceId === authority.runtimeInstanceId &&
-    binding.deliveryOwnerId === authority.deliveryOwnerId && /^sha256:[0-9a-f]{64}$/.test(binding.openCodeArtifactDigest) &&
-    /^[0-9a-f]{64}$/.test(binding.sessionRecordFingerprint) && /^[0-9a-f]{64}$/.test(binding.liveEffectFingerprint)
+    binding.deliveryOwnerId === authority.deliveryOwnerId && matches(/^sha256:[0-9a-f]{64}$/, binding.openCodeArtifactDigest) &&
+    matches(/^[0-9a-f]{64}$/, binding.sessionRecordFingerprint) && matches(/^[0-9a-f]{64}$/, binding.liveEffectFingerprint)
 }
 
 function validOwner(binding: HostedControlOwnerBinding, socketPath: string): boolean {
+  if (!isRecord(binding) || !isRecord(binding.socketIdentity) || typeof socketPath !== 'string') return false
   const socket = binding.socketIdentity
-  return /^owner-authority_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(binding.ownerAuthority) &&
-    safeInteger(binding.ownerGeneration, 1) && /^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(binding.ownerSessionId) &&
+  return matches(/^owner-authority_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, binding.ownerAuthority) &&
+    safeInteger(binding.ownerGeneration, 1) && matches(/^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, binding.ownerSessionId) &&
     isAbsolute(socketPath) && !socketPath.includes('\0') && normalize(socketPath) === socketPath &&
-    Buffer.byteLength(socketPath) <= 103 && /^(?:0|[1-9][0-9]{0,31})$/.test(socket.device) &&
-    /^(?:0|[1-9][0-9]{0,31})$/.test(socket.inode) && safeInteger(socket.uid, 0) &&
+    Buffer.byteLength(socketPath) <= 103 && matches(/^(?:0|[1-9][0-9]{0,31})$/, socket.device) &&
+    matches(/^(?:0|[1-9][0-9]{0,31})$/, socket.inode) && safeInteger(socket.uid, 0) &&
     safeInteger(socket.gid, 0) && socket.mode === 0o600
 }
 
 function validProcessIdentity(identity: HostedControlProcessIdentity): boolean {
-  return safeInteger(identity.pid, 1) && /^start_[0-9a-f]{64}$/.test(identity.startIdentity)
+  return isRecord(identity) && safeInteger(identity.pid, 1) &&
+    matches(/^start_[0-9a-f]{64}$/, identity.startIdentity)
 }
 
 function cloneOuterAuthority(authority: HostedApprovalRuntimeOuterAuthority): HostedApprovalRuntimeOuterAuthority {
@@ -489,8 +500,8 @@ function compareUtf16(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-function exact(value: object, expected: readonly string[]): void {
-  if (Object.keys(value).join('\0') !== expected.join('\0')) throw invalid()
+function exact(value: unknown, expected: readonly string[]): void {
+  if (!isRecord(value) || Object.keys(value).join('\0') !== expected.join('\0')) throw invalid()
 }
 
 function canonicalJson(value: unknown): string {
@@ -500,8 +511,16 @@ function canonicalJson(value: unknown): string {
   return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`
 }
 
-function validIdentifier(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(value)
+function validIdentifier(value: unknown): value is string {
+  return matches(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/, value)
+}
+
+function matches(pattern: RegExp, value: unknown): value is string {
+  return typeof value === 'string' && pattern.test(value)
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function safeInteger(value: unknown, minimum: number): value is number {

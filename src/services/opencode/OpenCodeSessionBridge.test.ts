@@ -16,7 +16,10 @@ import {
   prepareOpenCodePermissionProfileToken,
   OpenCodeSessionBridge,
 } from './OpenCodeSessionBridge.js'
-import { canonicalHostedApprovalDigest } from './OpenCodeClientFactory.js'
+import {
+  canonicalHostedApprovalDigest,
+  OpenCodePermissionConditionRejectedError,
+} from './OpenCodeClientFactory.js'
 
 import type {
   OpenCodeHostHandle,
@@ -258,6 +261,64 @@ describe('OpenCodeSessionBridge', () => {
     })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
     expect(endpointProofs).toBe(2)
     expect(posts).toBe(0)
+  })
+
+  test('binds the conditional POST connection to the final endpoint reproof', async () => {
+    let posts = 0
+    let endpointProofs = 0
+    const capability = {
+      schemaVersion: 2 as const, protocol: 'agent-teams-hosted-approval-v2' as const,
+      authentication: 'opencode-basic' as const,
+      runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+      configGeneration: `config_generation_${'2'.repeat(32)}`,
+    }
+    const rawPermission = { requestID: 'permission_1', sessionID: 'session-1' }
+    const permission = {
+      requestId: 'permission_1', sessionId: 'session-1',
+      requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+      permissionDigest: '4'.repeat(64), rawPermission,
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      captureProcessIdentity: async pid => ({ pid, startIdentity: `start_${'a'.repeat(64)}` }),
+      captureLoopbackEndpointIdentity: async (pid, port) => ({
+        address: '127.0.0.1', port, pid,
+        startIdentity: `start_${(++endpointProofs === 1 ? 'a' : 'b').repeat(64)}`,
+      }),
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        prepareEffectHostToken: async () => ({ consume: () => true }),
+        releaseHost: async () => {}, retainHostLease: async () => {},
+      },
+      preparePermissionProfileToken: async () => ({ consume: () => true }),
+      clientFactory: { create: () => ({
+        getHostedApprovalCapability: async () => capability,
+        observeHostedApprovalPermissions: async () => ({
+          schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2',
+          runtimeInstanceId: capability.runtimeInstanceId,
+          configGeneration: capability.configGeneration,
+          sessionId: 'session-1', permissions: [permission],
+        }),
+        answerPermission: async body => {
+          if (!(await body.condition?.authorizeConnected?.())) {
+            throw new OpenCodePermissionConditionRejectedError(new Error('substituted'))
+          }
+          posts += 1
+        },
+      } as never) },
+    })
+    await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: rawPermission,
+      requireAtomicConfigReply: true,
+      expectedHostedPermission: {
+        capability, permission,
+        normalized: {
+          requestId: 'permission_1', sessionId: 'session-1', tool: 'bash',
+          title: null, kind: null, raw: rawPermission,
+        },
+      },
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect({ endpointProofs, posts }).toEqual({ endpointProofs: 2, posts: 0 })
   })
 
   test('freshly proves host, persisted effect, exact raw permission, and admission in POST-edge order', async () => {
