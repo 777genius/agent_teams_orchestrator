@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, createHmac } from 'node:crypto'
 import {
-  chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rm, stat, writeFile,
+  chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rm, stat, writeFile, type FileHandle,
 } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { join } from 'node:path'
@@ -107,6 +107,39 @@ async function git(root: string, args: string[]): Promise<string> {
   return (await execFileAsync('/usr/bin/git', ['--no-replace-objects', '-C', root, ...args], {
     encoding: 'utf8', env: isolatedEnvironment(),
   })).stdout.trim()
+}
+
+async function inheritedFifo(root: string, name: string): Promise<{ reader: FileHandle; writer: FileHandle }> {
+  const path = join(root, name)
+  await execFileAsync('/usr/bin/mkfifo', ['--mode=600', '--', path], {
+    encoding: 'utf8', env: isolatedEnvironment(),
+  })
+  const linked = await lstat(path, { bigint: true })
+  if (!linked.isFIFO() || linked.nlink !== 1n || (linked.mode & 0o777n) !== 0o600n ||
+    (process.getuid?.() !== undefined && linked.uid !== BigInt(process.getuid()))) {
+    throw new Error('inherited FIFO helper produced an unsafe descriptor')
+  }
+  const [reader, writer] = await Promise.all([open(path, 'r'), open(path, 'w')])
+  const [readStat, writeStat] = await Promise.all([reader.stat({ bigint: true }), writer.stat({ bigint: true })])
+  if (!readStat.isFIFO() || !writeStat.isFIFO() || readStat.dev !== linked.dev ||
+    readStat.ino !== linked.ino || writeStat.dev !== linked.dev || writeStat.ino !== linked.ino) {
+    await Promise.all([reader.close(), writer.close()])
+    throw new Error('inherited FIFO identity changed while opening it')
+  }
+  return { reader, writer }
+}
+
+async function writeAllAndClose(handle: FileHandle, bytes: Buffer): Promise<void> {
+  try {
+    let offset = 0
+    while (offset < bytes.byteLength) {
+      const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset)
+      if (bytesWritten === 0) throw new Error('inherited FIFO accepted a zero-byte write')
+      offset += bytesWritten
+    }
+  } finally {
+    await handle.close()
+  }
 }
 
 async function createProductRepository(root: string): Promise<{ path: string; head: string }> {
@@ -411,6 +444,9 @@ await new Promise(() => {})
       const stagedEntry = join(root, 'owner.ts')
       await copyFile(sourceEntry, stagedEntry); await chmod(stagedEntry, 0o400)
       const launcher = await open(join(repositoryRoot, 'scripts/e2e/hosted-actual-owner/cli-source'), 'r')
+      const liveness = await inheritedFifo(root, 'liveness.fifo')
+      const bootstrap = await inheritedFifo(root, 'bootstrap.fifo')
+      await writeAllAndClose(bootstrap.writer, bootstrapFrame)
       const controlSocket = join(root, 'acceptance.sock')
       const evidenceFile = join(root, 'evidence.json')
       const child = spawn('/proc/self/fd/3', [
@@ -430,11 +466,14 @@ await new Promise(() => {})
         HOSTED_ACTUAL_OWNER_E2E_EVIDENCE_FILE: evidenceFile,
         HOSTED_ACTUAL_OWNER_E2E_RUNTIME_MANIFEST: runtimeManifestPath,
         CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH: bunExecutable, OPENCODE_BIN_PATH: bunExecutable,
-      }, stdio: ['ignore', 'pipe', 'pipe', launcher.fd, 'ignore', 'ignore', lease.fd, 'pipe', 'pipe'] })
+      }, stdio: ['ignore', 'pipe', 'pipe', launcher.fd, 'ignore', 'ignore', lease.fd,
+        liveness.reader.fd, bootstrap.reader.fd] })
       children.add(child)
+      const inheritedStdio = child.stdio as unknown as Array<NodeJS.ReadableStream | NodeJS.WritableStream | null>
+      expect(inheritedStdio[7]).toBeNull()
+      expect(inheritedStdio[8]).toBeNull()
+      await Promise.all([liveness.reader.close(), bootstrap.reader.close()])
       child.stderr!.on('data', chunk => process.stderr.write(chunk))
-      const stdio = child.stdio as unknown as Array<NodeJS.ReadableStream | NodeJS.WritableStream | null>
-      ;(stdio[8] as NodeJS.WritableStream).end(bootstrapFrame)
       const lines = jsonLine(child.stdout!)
       const readiness = await Promise.race([lines.next(), Bun.sleep(15_000).then(() => {
         throw new Error('actual-owner readiness timed out')
@@ -450,7 +489,7 @@ await new Promise(() => {})
         Bun.sleep(10_000).then(() => { throw new Error('actual-owner shutdown timed out') })])
       expect(exit).toBe(0)
       children.delete(child)
-      ;(stdio[7] as NodeJS.WritableStream).end()
+      await liveness.writer.close()
       await launcher.close(); await lease.close()
     } finally {
       await capabilityServer.stop(true)
