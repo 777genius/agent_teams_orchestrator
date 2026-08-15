@@ -243,6 +243,8 @@ export function liveEffectFingerprint(context: OpenCodePermissionEffectContext):
     projectPath: context.host.projectPath,
     projectBehaviorFingerprint: context.host.projectBehaviorFingerprint,
     openCodeArtifactDigest: context.host.openCodeArtifactDigest ?? null,
+    baseUrl: context.host.baseUrl ?? null,
+    port: context.host.port ?? null,
     runtimePid: context.host.pid,
     processStartedAtMs: context.host.processStartedAtMs,
     resolvedConfigFingerprint: context.host.resolvedConfigFingerprint,

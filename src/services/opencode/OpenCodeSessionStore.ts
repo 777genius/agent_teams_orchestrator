@@ -13,6 +13,10 @@ import path from 'node:path'
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import {
+  hostedApprovalRuntimeBindingFences,
+  type HostedApprovalRuntimeBindingMutationFence,
+} from '../hostedControl/HostedApprovalRuntimeBindingFence.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import type { OpenCodeSessionRecord } from './types.js'
@@ -50,10 +54,16 @@ export class OpenCodeSessionStore {
   private readonly filePath: string
   private readonly lockPath: string
 
-  constructor(filePath?: string) {
+  private readonly bindingMutationFence: HostedApprovalRuntimeBindingMutationFence
+
+  constructor(
+    filePath?: string,
+    bindingMutationFence: HostedApprovalRuntimeBindingMutationFence = hostedApprovalRuntimeBindingFences,
+  ) {
     const paths = resolveClaudeMultimodelPaths()
     this.filePath = filePath ?? path.join(paths.data, 'opencode', 'session-store.json')
     this.lockPath = `${this.filePath}.lock`
+    this.bindingMutationFence = bindingMutationFence
   }
 
   private async ensureParentDir(): Promise<void> {
@@ -192,19 +202,21 @@ export class OpenCodeSessionStore {
   }
 
   async upsert(record: OpenCodeSessionRecord): Promise<UpsertResult> {
-    return this.withStoreLock(async () => {
-      const store = await this.readStore()
-      const key = buildRecordKey(record)
-      const previous = store.records[key]
+    return this.bindingMutationFence.withTeamBindingMutation(record.teamId, async () =>
+      await this.withStoreLock(async () => {
+        const store = await this.readStore()
+        const key = buildRecordKey(record)
+        const previous = store.records[key]
 
-      if (previous && jsonStringify(previous) === jsonStringify(record)) {
-        return 'unchanged'
-      }
+        if (previous && jsonStringify(previous) === jsonStringify(record)) {
+          return 'unchanged'
+        }
 
-      store.records[key] = record
-      await this.writeStore(store)
-      return previous ? 'updated' : 'created'
-    })
+        store.records[key] = record
+        await this.writeStore(store)
+        return previous ? 'updated' : 'created'
+      }),
+    )
   }
 
   async markStale(
@@ -216,44 +228,48 @@ export class OpenCodeSessionStore {
     const laneId = staleReasonMaybe ? laneIdOrMemberName : 'primary'
     const memberName = staleReasonMaybe ? memberNameOrStaleReason : laneIdOrMemberName
     const staleReason = staleReasonMaybe ?? memberNameOrStaleReason
-    return this.withStoreLock(async () => {
-      const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName })
-      const previous = store.records[key]
-      if (!previous) {
-        return null
-      }
+    return this.bindingMutationFence.withTeamBindingMutation(teamId, async () =>
+      await this.withStoreLock(async () => {
+        const store = await this.readStore()
+        const key = buildRecordKey({ teamId, laneId, memberName })
+        const previous = store.records[key]
+        if (!previous) {
+          return null
+        }
 
-      if (previous.staleReason === staleReason) {
-        return previous
-      }
+        if (previous.staleReason === staleReason) {
+          return previous
+        }
 
-      const next: OpenCodeSessionRecord = {
-        ...previous,
-        staleReason,
-        updatedAt: new Date().toISOString(),
-      }
+        const next: OpenCodeSessionRecord = {
+          ...previous,
+          staleReason,
+          updatedAt: new Date().toISOString(),
+        }
 
-      store.records[key] = next
-      await this.writeStore(store)
-      return next
-    })
+        store.records[key] = next
+        await this.writeStore(store)
+        return next
+      }),
+    )
   }
 
   async delete(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<boolean> {
     const laneId = memberName ? laneIdOrMemberName : 'primary'
     const normalizedMemberName = memberName ?? laneIdOrMemberName
-    return this.withStoreLock(async () => {
-      const store = await this.readStore()
-      const key = buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })
-      if (!store.records[key]) {
-        return false
-      }
+    return this.bindingMutationFence.withTeamBindingMutation(teamId, async () =>
+      await this.withStoreLock(async () => {
+        const store = await this.readStore()
+        const key = buildRecordKey({ teamId, laneId, memberName: normalizedMemberName })
+        if (!store.records[key]) {
+          return false
+        }
 
-      delete store.records[key]
-      await this.writeStore(store)
-      return true
-    })
+        delete store.records[key]
+        await this.writeStore(store)
+        return true
+      }),
+    )
   }
 }
 

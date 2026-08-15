@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { HostedApprovalRuntimeBindingFence } from './HostedApprovalRuntimeBindingFence.js'
+import {
+  HostedApprovalRuntimeBindingFence,
+  HostedApprovalRuntimeBindingFenceRegistry,
+} from './HostedApprovalRuntimeBindingFence.js'
 
 describe('HostedApprovalRuntimeBindingFence', () => {
   test('serializes controlled writes behind the single transition pin', async () => {
@@ -38,5 +41,20 @@ describe('HostedApprovalRuntimeBindingFence', () => {
     await expect(second.capturePinned(pin, async () => 'wrong team'))
       .rejects.toThrow('another fence')
     pin.release()
+  })
+
+  test('exposes the same per-team fence to remaining profile and host writers', async () => {
+    const registry = new HostedApprovalRuntimeBindingFenceRegistry()
+    const teamId = `team_${'1'.repeat(32)}`
+    const pin = registry.forTeam(teamId).tryAcquirePin()
+    if (!pin) throw new Error('expected binding pin')
+    let mutated = false
+    const mutation = registry.writerIntegrationForTeam(teamId)
+      .withBindingMutation(async () => { mutated = true })
+    await Promise.resolve()
+    expect(mutated).toBe(false)
+    pin.release()
+    await mutation
+    expect(mutated).toBe(true)
   })
 })

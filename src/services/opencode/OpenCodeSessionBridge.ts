@@ -22,6 +22,10 @@ import {
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
+import {
+  captureOpenCodeLoopbackEndpointIdentity,
+  type OpenCodeLoopbackEndpointIdentity,
+} from './OpenCodeLoopbackEndpointIdentity.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
@@ -57,7 +61,7 @@ type OpenCodeSessionBridgeDeps = {
     & Partial<Pick<
       typeof openCodeHostManager,
       'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'retainHostLease' |
-      'prepareEffectHostToken'
+      'prepareEffectHostToken' | 'verifyEffectHost'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
@@ -83,6 +87,7 @@ type OpenCodeSessionBridgeDeps = {
     profile: OpenCodePreparedProfile,
   ) => Promise<OpenCodePermissionEffectToken | null>
   captureProcessIdentity?: typeof captureHostedControlProcessIdentity
+  captureLoopbackEndpointIdentity?: typeof captureOpenCodeLoopbackEndpointIdentity
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -136,6 +141,8 @@ export type OpenCodePermissionEffectContext = {
     projectPath: string
     projectBehaviorFingerprint: string
     openCodeArtifactDigest?: `sha256:${string}` | null
+    baseUrl?: string
+    port?: number
     pid: number
     processStartedAtMs: number | null
     resolvedConfigFingerprint: string | null
@@ -145,6 +152,9 @@ export type OpenCodePermissionEffectContext = {
 export type OpenCodeHostedApprovalBindingCapture = {
   capability: OpenCodeHostedApprovalCapability
   processIdentity: HostedControlProcessIdentity
+  endpointIdentity: OpenCodeLoopbackEndpointIdentity
+  executedArtifactDigest: `sha256:${string}`
+  resolvedConfigFingerprint: string
   context: OpenCodePermissionEffectContext
 }
 
@@ -881,6 +891,8 @@ export class OpenCodeSessionBridge {
           projectPath: host.projectPath,
           projectBehaviorFingerprint: host.projectBehaviorFingerprint,
           openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
+          baseUrl: host.baseUrl,
+          port: host.port,
           pid: host.pid,
           processStartedAtMs: host.processStartedAtMs ?? null,
           resolvedConfigFingerprint: host.resolvedConfigFingerprint,
@@ -1746,12 +1758,20 @@ export class OpenCodeSessionBridge {
     return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
       if (record.providerId !== 'opencode' || record.toolApprovalMode !== 'manual' ||
         record.staleReason !== null || host.pid <= 0 ||
-        !host.openCodeArtifactDigest || !host.resolvedConfigFingerprint) {
+        !host.openCodeArtifactDigest || !host.resolvedConfigFingerprint ||
+        host.baseUrl !== baseUrl || !Number.isSafeInteger(host.port) || !host.port || host.port <= 0) {
         throw new Error('OpenCode hosted approval binding is unavailable')
       }
+      const port = host.port
       const captureProcessIdentity = this.deps.captureProcessIdentity
         ?? captureHostedControlProcessIdentity
       const before = await captureProcessIdentity(host.pid)
+      const captureEndpointIdentity = this.deps.captureLoopbackEndpointIdentity
+        ?? captureOpenCodeLoopbackEndpointIdentity
+      const endpointBefore = await captureEndpointIdentity(host.pid, port, captureProcessIdentity)
+      if (!endpointBefore || endpointBefore.startIdentity !== before.startIdentity) {
+        throw new Error('OpenCode hosted approval endpoint ownership is unavailable')
+      }
       const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
       if (!client.getHostedApprovalCapability) {
         throw new Error('OpenCode atomic hosted approval capability unavailable')
@@ -1761,12 +1781,31 @@ export class OpenCodeSessionBridge {
       )
       if (!capability) throw new Error('OpenCode atomic hosted approval capability unavailable')
       const after = await captureProcessIdentity(host.pid)
-      if (before.startIdentity !== after.startIdentity) {
+      const endpointAfter = await captureEndpointIdentity(host.pid, port, captureProcessIdentity)
+      const verifyHost = this.hostManager.verifyEffectHost?.bind(this.hostManager)
+      if (before.startIdentity !== after.startIdentity || !endpointAfter ||
+        endpointAfter.startIdentity !== after.startIdentity ||
+        endpointBefore.port !== endpointAfter.port ||
+        !verifyHost || !(await verifyHost({
+          hostKey: host.hostKey,
+          pid: host.pid,
+          processStartedAtMs: host.processStartedAtMs ?? null,
+          resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+          openCodeArtifactDigest: host.openCodeArtifactDigest,
+        }))) {
         throw new Error('OpenCode hosted approval process identity changed')
+      }
+      const endpointFinal = await captureEndpointIdentity(host.pid, port, captureProcessIdentity)
+      if (!endpointFinal || endpointFinal.startIdentity !== after.startIdentity ||
+        endpointFinal.port !== endpointAfter.port) {
+        throw new Error('OpenCode hosted approval endpoint ownership changed')
       }
       return {
         capability,
         processIdentity: after,
+        endpointIdentity: endpointFinal,
+        executedArtifactDigest: host.openCodeArtifactDigest,
+        resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         context: { record, profile, host },
       }
     })

@@ -43,6 +43,7 @@ describe('OpenCodeSessionBridge.captureHostedApprovalBinding', () => {
       hostManager: {
         ensureHost: async () => { calls.push('host'); return host },
         releaseHost: async () => { calls.push('release') },
+        verifyEffectHost: async () => { calls.push('verify-host'); return true },
       },
       clientFactory: { create: () => ({
         getHostedApprovalCapability: async () => {
@@ -55,15 +56,25 @@ describe('OpenCodeSessionBridge.captureHostedApprovalBinding', () => {
         calls.push('process')
         return { pid, startIdentity: `start_${'5'.repeat(64)}` }
       },
+      captureLoopbackEndpointIdentity: async (pid, port) => {
+        calls.push('endpoint')
+        return { address: '127.0.0.1', port, pid, startIdentity: `start_${'5'.repeat(64)}` }
+      },
     })
     const capture = await bridge.captureHostedApprovalBinding(record)
     expect(capture.capability).toMatchObject({ runtimeInstanceId, configGeneration })
     expect(capture.context).toEqual({ record, profile, host: {
       hostKey: host.hostKey, profileRootKey: host.profileRootKey, projectPath: host.projectPath,
       projectBehaviorFingerprint: host.projectBehaviorFingerprint,
-      openCodeArtifactDigest: artifact, pid: host.pid, processStartedAtMs: 10,
+      openCodeArtifactDigest: artifact, baseUrl: host.baseUrl, port: host.port,
+      pid: host.pid, processStartedAtMs: 10,
       resolvedConfigFingerprint: 'resolved',
     } })
-    expect(calls).toEqual(['host', 'process', 'capability', 'process', 'release'])
+    expect(capture.endpointIdentity).toMatchObject({ pid: host.pid, port: host.port })
+    expect(capture.executedArtifactDigest).toBe(artifact)
+    expect(calls).toEqual([
+      'host', 'process', 'endpoint', 'capability', 'process',
+      'endpoint', 'verify-host', 'endpoint', 'release',
+    ])
   })
 })

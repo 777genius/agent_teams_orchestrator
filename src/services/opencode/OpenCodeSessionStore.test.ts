@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import { HostedApprovalRuntimeBindingFenceRegistry } from '../hostedControl/HostedApprovalRuntimeBindingFence.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 
 const baseRecord = {
@@ -108,5 +109,25 @@ describe('OpenCodeSessionStore', () => {
     )
     expect(fresh?.consume()).toBe(true)
     expect(fresh?.consume()).toBe(false)
+  })
+
+  test('upsert, markStale, and delete share the per-team transition fence', async () => {
+    const fences = new HostedApprovalRuntimeBindingFenceRegistry()
+    const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'), fences)
+    await store.upsert(baseRecord)
+    const pin = fences.forTeam(baseRecord.teamId).tryAcquirePin()
+    if (!pin) throw new Error('expected team binding pin')
+    const settled: string[] = []
+    const stale = store.markStale(baseRecord.teamId, baseRecord.memberName, 'fenced')
+      .then(() => { settled.push('stale') })
+    const upsert = store.upsert({ ...baseRecord, memberName: 'bob' })
+      .then(() => { settled.push('upsert') })
+    const deletion = store.delete(baseRecord.teamId, baseRecord.memberName)
+      .then(() => { settled.push('delete') })
+    await Promise.resolve()
+    expect(settled).toEqual([])
+    pin.release()
+    await Promise.all([stale, upsert, deletion])
+    expect(settled.sort()).toEqual(['delete', 'stale', 'upsert'])
   })
 })
