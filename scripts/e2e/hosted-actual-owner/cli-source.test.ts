@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, createHmac } from 'node:crypto'
+import { constants } from 'node:fs'
 import {
-  chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rm, stat, writeFile, type FileHandle,
+  chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rm, stat, unlink, writeFile, type FileHandle,
 } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { join } from 'node:path'
@@ -13,7 +14,74 @@ import { getOpenCodeManagedSubscriptionPluginPackages } from '../../../src/servi
 
 const execFileAsync = promisify(execFile)
 const roots: string[] = []
-const children = new Set<ChildProcess>()
+
+type ChildTermination =
+  | { kind: 'error'; error: Error }
+  | { kind: 'close'; code: number | null; signal: NodeJS.Signals | null }
+
+interface TrackedChild {
+  child: ChildProcess
+  termination: Promise<ChildTermination>
+  isTerminated(): boolean
+}
+
+const children = new Map<ChildProcess, TrackedChild>()
+
+function trackChild(child: ChildProcess): TrackedChild {
+  let terminated = child.exitCode !== null || child.signalCode !== null
+  const termination = new Promise<ChildTermination>(resolve => {
+    let settled = false
+    const settle = (value: ChildTermination) => {
+      terminated = true
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    child.once('error', error => settle({ kind: 'error', error }))
+    child.once('close', (code, signal) => settle({ kind: 'close', code, signal }))
+    if (terminated) settle({ kind: 'close', code: child.exitCode, signal: child.signalCode })
+  })
+  const tracked = { child, termination, isTerminated: () => terminated }
+  children.set(child, tracked)
+  return tracked
+}
+
+function childFailure(tracked: TrackedChild, context: string): Promise<never> {
+  return tracked.termination.then(termination => {
+    if (termination.kind === 'error') throw new Error(`${context}: ${termination.error.message}`, { cause: termination.error })
+    throw new Error(`${context}: child closed with code ${termination.code} and signal ${termination.signal ?? 'none'}`)
+  })
+}
+
+async function terminateChild(tracked: TrackedChild): Promise<void> {
+  if (!tracked.isTerminated()) tracked.child.kill('SIGKILL')
+  await Promise.race([
+    tracked.termination,
+    Bun.sleep(5_000).then(() => { throw new Error(`child cleanup timed out for pid ${tracked.child.pid ?? 'unassigned'}`) }),
+  ])
+  children.delete(tracked.child)
+}
+
+class CleanupStack {
+  readonly #callbacks: Array<() => Promise<void>> = []
+
+  defer(callback: () => Promise<void>): void {
+    this.#callbacks.push(callback)
+  }
+
+  async dispose(): Promise<void> {
+    const failures: unknown[] = []
+    for (const callback of this.#callbacks.reverse()) {
+      try { await callback() } catch (error) { failures.push(error) }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, 'fixture cleanup failed')
+  }
+}
+
+function idempotentClose(handle: FileHandle): () => Promise<void> {
+  let closed: Promise<void> | undefined
+  return () => closed ??= handle.close()
+}
 
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') {
@@ -89,13 +157,15 @@ const contractBytes = Buffer.from(`${JSON.stringify({
 })}\n`)
 
 afterEach(async () => {
-  for (const child of children) child.kill('SIGKILL')
-  await Promise.all([...children].map(child => new Promise<void>(resolve => {
-    if (child.exitCode !== null || child.signalCode !== null) resolve()
-    else child.once('exit', () => resolve())
-  })))
+  const failures: unknown[] = []
+  await Promise.all([...children.values()].map(async child => {
+    try { await terminateChild(child) } catch (error) { failures.push(error) }
+  }))
   children.clear()
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+  for (const root of roots.splice(0)) {
+    try { await rm(root, { recursive: true, force: true }) } catch (error) { failures.push(error) }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, 'afterEach cleanup failed')
 })
 
 const isolatedEnvironment = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
@@ -109,27 +179,76 @@ async function git(root: string, args: string[]): Promise<string> {
   })).stdout.trim()
 }
 
-async function inheritedFifo(root: string, name: string): Promise<{ reader: FileHandle; writer: FileHandle }> {
-  const path = join(root, name)
-  await execFileAsync('/usr/bin/mkfifo', ['--mode=600', '--', path], {
-    encoding: 'utf8', env: isolatedEnvironment(),
-  })
-  const linked = await lstat(path, { bigint: true })
-  if (!linked.isFIFO() || linked.nlink !== 1n || (linked.mode & 0o777n) !== 0o600n ||
-    (process.getuid?.() !== undefined && linked.uid !== BigInt(process.getuid()))) {
-    throw new Error('inherited FIFO helper produced an unsafe descriptor')
-  }
-  const [reader, writer] = await Promise.all([open(path, 'r'), open(path, 'w')])
-  const [readStat, writeStat] = await Promise.all([reader.stat({ bigint: true }), writer.stat({ bigint: true })])
-  if (!readStat.isFIFO() || !writeStat.isFIFO() || readStat.dev !== linked.dev ||
-    readStat.ino !== linked.ino || writeStat.dev !== linked.dev || writeStat.ino !== linked.ino) {
-    await Promise.all([reader.close(), writer.close()])
-    throw new Error('inherited FIFO identity changed while opening it')
-  }
-  return { reader, writer }
+interface InheritedFifo {
+  reader: FileHandle
+  writer: FileHandle
+  closeReader(): Promise<void>
+  closeWriter(): Promise<void>
+  close(): Promise<void>
 }
 
-async function writeAllAndClose(handle: FileHandle, bytes: Buffer): Promise<void> {
+async function inheritedFifo(
+  root: string,
+  name: string,
+  afterOpen?: (path: string, reader: FileHandle, writer: FileHandle) => Promise<void>,
+): Promise<InheritedFifo> {
+  const path = join(root, name)
+  let pathExists = false
+  let rendezvous: FileHandle | undefined
+  let reader: FileHandle | undefined
+  let writer: FileHandle | undefined
+  let handedOff = false
+  try {
+    await execFileAsync('/usr/bin/mkfifo', ['--mode=600', '--', path], {
+      encoding: 'utf8', env: isolatedEnvironment(),
+    })
+    pathExists = true
+    const linked = await lstat(path, { bigint: true })
+    if (!linked.isFIFO() || linked.nlink !== 1n || (linked.mode & 0o777n) !== 0o600n ||
+      (process.getuid?.() !== undefined && linked.uid !== BigInt(process.getuid()))) {
+      throw new Error('inherited FIFO helper produced an unsafe descriptor')
+    }
+    // Linux permits an O_RDWR rendezvous handle, keeping the two real FIFO ends
+    // from blocking one another during setup without changing their inherited modes.
+    rendezvous = await open(path, constants.O_RDWR | constants.O_NOFOLLOW)
+    reader = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    writer = await open(path, constants.O_WRONLY | constants.O_NOFOLLOW)
+    await rendezvous.close()
+    rendezvous = undefined
+    await afterOpen?.(path, reader, writer)
+
+    const [readStat, writeStat] = await Promise.all([
+      reader.stat({ bigint: true }), writer.stat({ bigint: true }),
+    ])
+    for (const opened of [readStat, writeStat]) {
+      if (!opened.isFIFO() || opened.dev !== linked.dev || opened.ino !== linked.ino ||
+        opened.mode !== linked.mode || opened.uid !== linked.uid || opened.nlink !== linked.nlink) {
+        throw new Error('inherited FIFO identity or security metadata changed while opening it')
+      }
+    }
+
+    await unlink(path)
+    pathExists = false
+    const closeReader = idempotentClose(reader)
+    const closeWriter = idempotentClose(writer)
+    handedOff = true
+    return {
+      reader, writer, closeReader, closeWriter,
+      close: async () => { await Promise.all([closeReader(), closeWriter()]) },
+    }
+  } finally {
+    const cleanup: Promise<unknown>[] = []
+    if (rendezvous) cleanup.push(rendezvous.close())
+    if (!handedOff && reader) cleanup.push(reader.close())
+    if (!handedOff && writer) cleanup.push(writer.close())
+    if (pathExists) cleanup.push(unlink(path))
+    const results = await Promise.allSettled(cleanup)
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
+    if (failures.length > 0) throw new AggregateError(failures, `failed to clean up inherited FIFO ${path}`)
+  }
+}
+
+async function writeAllAndClose(handle: FileHandle, close: () => Promise<void>, bytes: Buffer): Promise<void> {
   try {
     let offset = 0
     while (offset < bytes.byteLength) {
@@ -138,7 +257,7 @@ async function writeAllAndClose(handle: FileHandle, bytes: Buffer): Promise<void
       offset += bytesWritten
     }
   } finally {
-    await handle.close()
+    await close()
   }
 }
 
@@ -166,11 +285,11 @@ async function unusedPort(): Promise<number> {
   return port
 }
 
-async function waitForHttp(url: string): Promise<void> {
+async function waitForHttp(url: string, child: TrackedChild): Promise<void> {
   const deadline = Date.now() + 5_000
   while (Date.now() < deadline) {
     if (await fetch(url).then(response => response.ok, () => false)) return
-    await Bun.sleep(25)
+    await Promise.race([Bun.sleep(25), childFailure(child, `fixture server failed before readiness at ${url}`)])
   }
   throw new Error(`fixture server did not become ready: ${url}`)
 }
@@ -178,34 +297,88 @@ async function waitForHttp(url: string): Promise<void> {
 function jsonLine(stream: NodeJS.ReadableStream): { next(): Promise<Record<string, unknown>> } {
   let buffered = ''
   const queue: Record<string, unknown>[] = []
-  const waiters: Array<(line: Record<string, unknown>) => void> = []
+  const waiters: Array<{ resolve(line: Record<string, unknown>): void; reject(error: Error): void }> = []
+  let streamFailure: Error | undefined
+  const fail = (error: Error) => {
+    streamFailure ??= error
+    for (const waiter of waiters.splice(0)) waiter.reject(streamFailure)
+  }
   stream.on('data', chunk => {
     buffered += chunk.toString()
     for (;;) {
       const end = buffered.indexOf('\n')
       if (end < 0) break
-      const line = JSON.parse(buffered.slice(0, end)) as Record<string, unknown>
+      let line: Record<string, unknown>
+      try { line = JSON.parse(buffered.slice(0, end)) as Record<string, unknown> } catch (error) {
+        fail(new Error('child emitted invalid readiness JSON', { cause: error })); return
+      }
       buffered = buffered.slice(end + 1)
       const waiter = waiters.shift()
-      if (waiter) waiter(line); else queue.push(line)
+      if (waiter) waiter.resolve(line); else queue.push(line)
     }
   })
+  stream.once('error', error => fail(error))
+  stream.once('end', () => fail(new Error('child stdout ended before a complete readiness line')))
+  stream.once('close', () => fail(new Error('child stdout closed before a complete readiness line')))
   return { next: () => queue.length > 0 ? Promise.resolve(queue.shift()!) :
-    new Promise(resolve => waiters.push(resolve)) }
+    streamFailure ? Promise.reject(streamFailure) : new Promise((resolve, reject) => waiters.push({ resolve, reject })) }
 }
 
 async function control(socketPath: string, operation: string): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath)
     let source = ''
-    socket.once('error', reject)
+    let settled = false
+    const finish = (error?: unknown, value?: Record<string, unknown>) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      if (error) reject(error); else resolve(value!)
+    }
+    socket.setTimeout(5_000, () => finish(new Error(`control operation timed out: ${operation}`)))
+    socket.once('error', error => finish(error))
     socket.on('data', chunk => { source += chunk.toString() })
     socket.once('end', () => {
-      try { resolve(JSON.parse(source) as Record<string, unknown>) } catch (error) { reject(error) }
+      try { finish(undefined, JSON.parse(source) as Record<string, unknown>) } catch (error) { finish(error) }
     })
-    socket.once('connect', () => socket.write(`${JSON.stringify({ schemaVersion: 1, operation })}\n`))
+    socket.once('connect', () => socket.write(`${JSON.stringify({ schemaVersion: 1, operation })}\n`, error => {
+      if (error) finish(error)
+    }))
   })
 }
+
+test('rejects same-owner FIFO metadata drift and cleans opened handles and path', async () => {
+  const root = await mkdtemp('/tmp/actual-owner-fifo-regression-')
+  roots.push(root)
+  await chmod(root, 0o700)
+  const openedFds: number[] = []
+  const path = join(root, 'drift.fifo')
+
+  await expect(inheritedFifo(root, 'drift.fifo', async (fifoPath, reader, writer) => {
+    openedFds.push(reader.fd, writer.fd)
+    await chmod(fifoPath, 0o400)
+  })).rejects.toThrow('inherited FIFO identity or security metadata changed while opening it')
+  expect(openedFds).toHaveLength(2)
+  await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+  for (const fd of openedFds) {
+    await expect(stat(`/proc/self/fd/${fd}`)).rejects.toMatchObject({ code: 'ENOENT' })
+  }
+})
+
+test('settles child failures on both spawn error and premature close', async () => {
+  const failedSpawn = trackChild(spawn('/definitely-missing-hosted-owner-fixture'))
+  await expect(childFailure(failedSpawn, 'spawn regression')).rejects.toThrow('spawn regression')
+  await terminateChild(failedSpawn)
+
+  const prematureClose = trackChild(spawn(process.execPath, ['-e', 'process.exit(23)'], {
+    stdio: 'ignore', env: isolatedEnvironment(),
+  }))
+  await expect(childFailure(prematureClose, 'close regression')).rejects.toThrow(
+    'close regression: child closed with code 23 and signal none',
+  )
+  await terminateChild(prematureClose)
+  expect(children.size).toBe(0)
+})
 
 describe('hosted actual-owner source launcher black box', () => {
   test('runs pinned Bun through real source bootstrap, capability, readiness, and shutdown', async () => {
@@ -251,10 +424,13 @@ await new Promise(() => {})
       CLAUDE_MULTIMODEL_DATA_HOME: data, CLAUDE_MULTIMODEL_CACHE_HOME: cache,
       OPENCODE_SERVER_PASSWORD: password,
     })
+    const cleanup = new CleanupStack()
     const provider = spawn(bunExecutable, ['run', providerSource, 'serve', '--port', String(providerPort),
       '--hostname', '127.0.0.1'], { env: fixtureEnvironment, stdio: ['ignore', 'ignore', 'pipe'] })
-    children.add(provider)
-    await waitForHttp(`http://127.0.0.1:${providerPort}/global/health`)
+    const trackedProvider = trackChild(provider)
+    cleanup.defer(() => terminateChild(trackedProvider))
+    try {
+    await waitForHttp(`http://127.0.0.1:${providerPort}/global/health`, trackedProvider)
     const processStartedAtMs = await linuxProcessStartTicks(provider.pid!)
     expect(processStartedAtMs).not.toBeNull()
 
@@ -420,6 +596,7 @@ await new Promise(() => {})
       const leaseBytes = Buffer.from('actual-owner-source-fixture\n')
       await writeFile(leasePath, leaseBytes, { mode: 0o600 })
       const lease = await open(leasePath, 'r')
+      cleanup.defer(idempotentClose(lease))
       const leaseStat = await lease.stat()
       const secret = Buffer.alloc(32, 0xa5)
       const leaseDigest = createHash('sha256').update(leaseBytes).digest('hex')
@@ -444,9 +621,12 @@ await new Promise(() => {})
       const stagedEntry = join(root, 'owner.ts')
       await copyFile(sourceEntry, stagedEntry); await chmod(stagedEntry, 0o400)
       const launcher = await open(join(repositoryRoot, 'scripts/e2e/hosted-actual-owner/cli-source'), 'r')
+      cleanup.defer(idempotentClose(launcher))
       const liveness = await inheritedFifo(root, 'liveness.fifo')
+      cleanup.defer(() => liveness.close())
       const bootstrap = await inheritedFifo(root, 'bootstrap.fifo')
-      await writeAllAndClose(bootstrap.writer, bootstrapFrame)
+      cleanup.defer(() => bootstrap.close())
+      await writeAllAndClose(bootstrap.writer, bootstrap.closeWriter, bootstrapFrame)
       const controlSocket = join(root, 'acceptance.sock')
       const evidenceFile = join(root, 'evidence.json')
       const child = spawn('/proc/self/fd/3', [
@@ -468,16 +648,19 @@ await new Promise(() => {})
         CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH: bunExecutable, OPENCODE_BIN_PATH: bunExecutable,
       }, stdio: ['ignore', 'pipe', 'pipe', launcher.fd, 'ignore', 'ignore', lease.fd,
         liveness.reader.fd, bootstrap.reader.fd] })
-      children.add(child)
+      const trackedChild = trackChild(child)
+      cleanup.defer(() => terminateChild(trackedChild))
       const inheritedStdio = child.stdio as unknown as Array<NodeJS.ReadableStream | NodeJS.WritableStream | null>
       expect(inheritedStdio[7]).toBeNull()
       expect(inheritedStdio[8]).toBeNull()
-      await Promise.all([liveness.reader.close(), bootstrap.reader.close()])
+      await Promise.all([liveness.closeReader(), bootstrap.closeReader()])
       child.stderr!.on('data', chunk => process.stderr.write(chunk))
       const lines = jsonLine(child.stdout!)
-      const readiness = await Promise.race([lines.next(), Bun.sleep(15_000).then(() => {
-        throw new Error('actual-owner readiness timed out')
-      })])
+      const readiness = await Promise.race([
+        lines.next(),
+        childFailure(trackedChild, 'actual-owner failed before readiness'),
+        Bun.sleep(15_000).then(() => { throw new Error('actual-owner readiness timed out') }),
+      ])
       expect(readiness).toMatchObject({
         purpose: 'agent-teams.hosted-actual-owner-e2e.orchestrator-readiness/v1', status: 'ready',
         evidenceFile, controlSocket,
@@ -485,14 +668,17 @@ await new Promise(() => {})
       expect(capabilityRequests).toBeGreaterThanOrEqual(2)
       expect(await control(controlSocket, 'readiness')).toMatchObject({ status: 'ready' })
       expect(await control(controlSocket, 'shutdown')).toEqual({ schemaVersion: 1, operation: 'shutdown', accepted: true })
-      const exit = await Promise.race([new Promise<number | null>(resolve => child.once('exit', resolve)),
+      const termination = await Promise.race([trackedChild.termination,
         Bun.sleep(10_000).then(() => { throw new Error('actual-owner shutdown timed out') })])
-      expect(exit).toBe(0)
+      if (termination.kind === 'error') throw termination.error
+      expect(termination).toMatchObject({ kind: 'close', code: 0, signal: null })
       children.delete(child)
-      await liveness.writer.close()
-      await launcher.close(); await lease.close()
+      await liveness.closeWriter()
     } finally {
       await capabilityServer.stop(true)
+    }
+    } finally {
+      await cleanup.dispose()
     }
   }, 30_000)
 })
