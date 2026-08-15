@@ -301,10 +301,11 @@ describe('OpenCodeSessionBridge', () => {
           sessionId: 'session-1', permissions: [permission],
         }),
         answerPermission: async body => {
-          if (!(await body.condition?.authorizeConnected?.({
+          const finalizeConnected = await body.condition?.authorizeConnected?.({
             localAddress: '127.0.0.1', localPort: 50000,
             remoteAddress: '127.0.0.1', remotePort: host.port,
-          }))) {
+          })
+          if (!finalizeConnected?.()) {
             throw new OpenCodePermissionConditionRejectedError(new Error('substituted'))
           }
           posts += 1
@@ -376,11 +377,15 @@ describe('OpenCodeSessionBridge', () => {
           sessionId: 'session-1', permissions: [permission],
         }),
         answerPermission: async body => {
-          if (!(await body.condition?.authorizeConnected?.({
+          const finalizeConnected = await body.condition?.authorizeConnected?.({
             localAddress: '127.0.0.1', localPort: 50000,
             remoteAddress: '127.0.0.1', remotePort: host.port,
-          }))) throw new OpenCodePermissionConditionRejectedError(new Error('rejected'))
+          })
+          if (!finalizeConnected?.()) {
+            throw new OpenCodePermissionConditionRejectedError(new Error('rejected'))
+          }
           posts += 1
+          expect(finalizeConnected()).toBe(false)
         },
       } as never) },
     })

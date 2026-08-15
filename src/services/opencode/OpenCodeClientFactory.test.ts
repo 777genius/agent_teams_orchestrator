@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { once } from 'node:events'
-import { createServer } from 'node:http'
+import { ClientRequest, createServer } from 'node:http'
 import { createServer as createTcpServer, type AddressInfo } from 'node:net'
 
 import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
@@ -307,10 +307,10 @@ describe('OpenCodeClientFactory permissions API', () => {
     await once(server, 'listening')
     const port = (server.address() as AddressInfo).port
     try {
-      let settleProof!: (authorized: boolean) => void
+      let settleProof!: (finalizer: (() => boolean) | null) => void
       let proofStarted!: () => void
       const started = new Promise<void>(resolve => { proofStarted = resolve })
-      const proof = new Promise<boolean>(resolve => { settleProof = resolve })
+      const proof = new Promise<(() => boolean) | null>(resolve => { settleProof = resolve })
       const client = new OpenCodeClientFactory().create(
         `http://127.0.0.1:${port}`, {}, hostedAuth,
       )
@@ -324,7 +324,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       await started
       await Bun.sleep(10)
       expect(posts).toBe(0)
-      settleProof(true)
+      settleProof(() => true)
       await expect(reply).resolves.toBeTruthy()
       expect(posts).toBe(1)
 
@@ -332,7 +332,7 @@ describe('OpenCodeClientFactory permissions API', () => {
         requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
         condition: {
           runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
-          authorizeConnected: async () => false,
+          authorizeConnected: async () => () => false,
         },
       })).rejects.toThrow('rejected without effect')
       expect(posts).toBe(1)
@@ -370,7 +370,7 @@ describe('OpenCodeClientFactory permissions API', () => {
             await once(expected, 'listening')
             // The path now names the expected listener, but the pinned socket
             // remains connected to the substituted accepted peer.
-            return false
+            return null
           },
         },
       })
@@ -381,6 +381,88 @@ describe('OpenCodeClientFactory permissions API', () => {
     } finally {
       expected.close()
       substituted.close()
+    }
+  })
+
+  test('dispatches synchronously before a final-consumption authority mutation', async () => {
+    let authority = 'current'
+    let authorityAtEnd: string | null = null
+    const server = createServer((_request, response) => {
+      response.end(JSON.stringify({
+        schemaVersion: 2, protocol: 'agent-teams-hosted-approval-v2', status: 'applied',
+        runtimeInstanceId, configGeneration, requestId: 'perm_123', sessionId: 'ses_123',
+        requestIncarnation, permissionDigest, decision: 'allow_once',
+      }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const port = (server.address() as AddressInfo).port
+    const originalEnd = ClientRequest.prototype.end
+    ClientRequest.prototype.end = function (...args: unknown[]) {
+      authorityAtEnd = authority
+      return originalEnd.apply(this, args as never)
+    } as typeof ClientRequest.prototype.end
+    try {
+      const client = new OpenCodeClientFactory().create(
+        `http://127.0.0.1:${port}`, {}, hostedAuth,
+      )
+      await client.answerPermission({
+        requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+        condition: {
+          runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+          authorizeConnected: async () => () => {
+            queueMicrotask(() => { authority = 'changed' })
+            return true
+          },
+        },
+      })
+      expect(authorityAtEnd).toBe('current')
+      expect(authority).toBe('changed')
+    } finally {
+      ClientRequest.prototype.end = originalEnd
+      server.close()
+      await once(server, 'close')
+    }
+  })
+
+  test('writes zero POST or credential bytes on finalizer drift, throw, or second use', async () => {
+    let used = false
+    const oneUseFinalizer = () => {
+      if (used) return false
+      used = true
+      return true
+    }
+    expect(oneUseFinalizer()).toBe(true)
+    for (const finalizer of [
+      () => false,
+      () => { throw new Error('finalizer drift') },
+      oneUseFinalizer,
+    ]) {
+      let received = Buffer.alloc(0)
+      const server = createTcpServer(socket => {
+        socket.on('data', chunk => { received = Buffer.concat([received, chunk]) })
+      })
+      server.listen(0, '127.0.0.1')
+      await once(server, 'listening')
+      const port = (server.address() as AddressInfo).port
+      try {
+        const client = new OpenCodeClientFactory().create(
+          `http://127.0.0.1:${port}`, {}, hostedAuth,
+        )
+        await expect(client.answerPermission({
+          requestId: 'perm_123', sessionId: 'ses_123', decision: 'allow',
+          condition: {
+            runtimeInstanceId, configGeneration, requestIncarnation, permissionDigest,
+            authorizeConnected: async () => finalizer,
+          },
+        })).rejects.toThrow('rejected without effect')
+        await Bun.sleep(10)
+        expect(received.byteLength).toBe(0)
+        expect(received.includes(Buffer.from('Authorization: Basic', 'utf8'))).toBe(false)
+      } finally {
+        server.close()
+        await once(server, 'close')
+      }
     }
   })
 

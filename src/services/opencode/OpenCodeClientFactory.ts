@@ -28,6 +28,8 @@ import type {
   OpenCodeSessionSummary,
 } from './types.js'
 
+export type OpenCodeConnectedAuthorizationFinalizer = () => boolean
+
 export type OpenCodeClient = {
   getConfig(): Promise<OpenCodeConfigResponse>
   getConfigProviders(): Promise<OpenCodeConfigProvidersResponse>
@@ -75,8 +77,13 @@ export type OpenCodeClient = {
       configGeneration: string
       requestIncarnation: string
       permissionDigest: string
-      /** Settles against the already-connected socket before any request byte is written. */
-      authorizeConnected?: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>
+      /**
+       * Proves the already-connected socket asynchronously, then returns a
+       * one-use synchronous fence finalizer for the transport's dispatch edge.
+       */
+      authorizeConnected?: (
+        connection: OpenCodeConnectedSocketIdentity,
+      ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>
     }
   }): Promise<unknown>
   sendSessionMessage(
@@ -464,7 +471,9 @@ async function fetchHostedApprovalOverAuthorizedConnection(
   urlValue: string,
   init: RequestInit,
   signal: AbortSignal,
-  authorizeConnected: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>,
+  authorizeConnected: (
+    connection: OpenCodeConnectedSocketIdentity,
+  ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>,
 ): Promise<Response> {
   const url = new URL(urlValue)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password) {
@@ -500,7 +509,8 @@ async function fetchHostedApprovalOverAuthorizedConnection(
       remoteAddress: socket.remoteAddress ?? '',
       remotePort: socket.remotePort ?? 0,
     }
-    if (!(await authorizeConnected(connection))) {
+    const finalizeConnected = await authorizeConnected(connection)
+    if (!finalizeConnected) {
       throw new OpenCodePermissionConditionRejectedError(
         new Error('OpenCode hosted approval connected endpoint was not authorized'),
       )
@@ -529,8 +539,25 @@ async function fetchHostedApprovalOverAuthorizedConnection(
           headers: responseHeaders,
         }))
       })
-      requestDispatched = true
       request.once('error', reject)
+      let finalized = false
+      try {
+        finalized = finalizeConnected()
+      } catch (error) {
+        request.destroy()
+        reject(new OpenCodePermissionConditionRejectedError(error))
+        return
+      }
+      if (!finalized) {
+        request.destroy()
+        reject(new OpenCodePermissionConditionRejectedError(
+          new Error('OpenCode hosted approval connected endpoint finalizer rejected dispatch'),
+        ))
+        return
+      }
+      // This call intentionally shares the finalizer's synchronous stack: no
+      // promise, await, or microtask may interpose after fence consumption.
+      requestDispatched = true
       request.end(body)
     })
   } finally {
@@ -609,7 +636,9 @@ export class OpenCodeClientFactory {
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
       strictHostedApprovalResponse = false,
       maximumResponseBytes = MAX_HOSTED_APPROVAL_RESPONSE_BYTES,
-      authorizeConnected?: (connection: OpenCodeConnectedSocketIdentity) => Promise<boolean>,
+      authorizeConnected?: (
+        connection: OpenCodeConnectedSocketIdentity,
+      ) => Promise<OpenCodeConnectedAuthorizationFinalizer | null>,
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(

@@ -1693,23 +1693,33 @@ export class OpenCodeSessionBridge {
         : null
       if (params.expectedPermissionRaw && !hostToken) throw new OpenCodePermissionEffectNotAuthorizedError()
       const consumePreparedFences = (): boolean => {
+        let current = true
+        let failure: unknown = null
+        const consume = (token: { consume(): boolean }): void => {
+          try {
+            if (!token.consume()) current = false
+          } catch (error) {
+            failure ??= error
+          }
+        }
         if (preparedToken) {
           preparedConsumed = true
-          if (!preparedToken.consume()) return false
+          consume(preparedToken)
         }
         if (profileToken) {
           profileConsumed = true
-          if (!profileToken.consume()) return false
+          consume(profileToken)
         }
         if (authorityToken) {
           authorityConsumed = true
-          if (!authorityToken.consume()) return false
+          consume(authorityToken)
         }
         if (hostToken) {
           hostConsumed = true
-          if (!hostToken.consume()) return false
+          consume(hostToken)
         }
-        return true
+        if (failure !== null) throw failure
+        return current
       }
       const conditionalReply = configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
       if (!conditionalReply) {
@@ -1732,11 +1742,12 @@ export class OpenCodeSessionBridge {
                   configGeneration,
                   requestIncarnation,
                   permissionDigest,
-                  // The transport opens and pins its TCP socket first, then
-                  // awaits this proof before writing even the HTTP headers.
+                  // The transport opens and pins its TCP socket first, awaits
+                  // this proof, then consumes the returned one-use finalizer
+                  // synchronously at the request.end dispatch edge.
                   authorizeConnected: async (connection: OpenCodeConnectedSocketIdentity) => {
                     try {
-                      if (preparedEndpointStartIdentity === null) return false
+                      if (preparedEndpointStartIdentity === null) return null
                       const capturePeerIdentity = this.deps.captureEstablishedPeerIdentity
                         ?? captureOpenCodeEstablishedPeerIdentity
                       const peer = await capturePeerIdentity(
@@ -1745,12 +1756,17 @@ export class OpenCodeSessionBridge {
                         connection,
                         this.deps.captureProcessIdentity ?? captureHostedControlProcessIdentity,
                       )
-                      return peer !== null && peer.pid === host.pid &&
-                        peer.port === connection.remotePort &&
-                        peer.startIdentity === preparedEndpointStartIdentity &&
-                        consumePreparedFences()
+                      if (peer === null || peer.pid !== host.pid ||
+                        peer.port !== connection.remotePort ||
+                        peer.startIdentity !== preparedEndpointStartIdentity) return null
+                      let finalized = false
+                      return () => {
+                        if (finalized) return false
+                        finalized = true
+                        return consumePreparedFences()
+                      }
                     } catch {
-                      return false
+                      return null
                     }
                   },
                 },
