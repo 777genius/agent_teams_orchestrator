@@ -31,6 +31,21 @@ export class HostedApprovalOwnerService implements HostedApprovalWirePort {
     await this.options.store.reconcileAdmission(this.options.admission)
   }
 
+  /** Fail-closed proof that recovery published this exact admission snapshot. */
+  async isAdmissionRecoveredCurrent(): Promise<boolean> {
+    try {
+      if (!(await this.#authorityCurrent())) return false
+      const state = await this.options.store.read()
+      return !!state &&
+        state.admissionGeneration === this.options.admission.admissionGeneration &&
+        state.admissionDigest === this.options.admission.digest &&
+        isDeepStrictEqual(state.routes, this.options.admission.routes) &&
+        isDeepStrictEqual(state.actorMembers, this.options.admission.actorMembers)
+    } catch {
+      return false
+    }
+  }
+
   async pollIngress(): Promise<number> {
     if (!(await this.#authorityCurrent())) throw new Error('Hosted approval owner unavailable')
     let admitted = 0

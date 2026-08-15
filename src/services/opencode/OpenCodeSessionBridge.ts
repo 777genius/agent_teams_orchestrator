@@ -11,6 +11,10 @@ import {
 import path from 'node:path'
 
 import {
+  captureHostedControlProcessIdentity,
+  type HostedControlProcessIdentity,
+} from '../hostedControl/HostedControlProcessIdentity.js'
+import {
   canonicalHostedApprovalDigest,
   OpenCodePermissionConditionRejectedError,
   openCodeClientFactory,
@@ -78,6 +82,7 @@ type OpenCodeSessionBridgeDeps = {
   preparePermissionProfileToken?: (
     profile: OpenCodePreparedProfile,
   ) => Promise<OpenCodePermissionEffectToken | null>
+  captureProcessIdentity?: typeof captureHostedControlProcessIdentity
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -135,6 +140,12 @@ export type OpenCodePermissionEffectContext = {
     processStartedAtMs: number | null
     resolvedConfigFingerprint: string | null
   }
+}
+
+export type OpenCodeHostedApprovalBindingCapture = {
+  capability: OpenCodeHostedApprovalCapability
+  processIdentity: HostedControlProcessIdentity
+  context: OpenCodePermissionEffectContext
 }
 
 export type OpenCodePermissionEffectToken = { consume(): boolean }
@@ -1722,6 +1733,43 @@ export class OpenCodeSessionBridge {
     } catch {
       return null
     }
+  }
+
+  /**
+   * Read-only capture of the exact session/profile/host/process/capability
+   * incarnation used by hosted approval. This performs only the capability GET;
+   * it never observes a permission and can never invoke a provider decision.
+   */
+  async captureHostedApprovalBinding(
+    record: OpenCodeSessionRecord,
+  ): Promise<OpenCodeHostedApprovalBindingCapture> {
+    return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      if (record.providerId !== 'opencode' || record.toolApprovalMode !== 'manual' ||
+        record.staleReason !== null || host.pid <= 0 ||
+        !host.openCodeArtifactDigest || !host.resolvedConfigFingerprint) {
+        throw new Error('OpenCode hosted approval binding is unavailable')
+      }
+      const captureProcessIdentity = this.deps.captureProcessIdentity
+        ?? captureHostedControlProcessIdentity
+      const before = await captureProcessIdentity(host.pid)
+      const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+      if (!client.getHostedApprovalCapability) {
+        throw new Error('OpenCode atomic hosted approval capability unavailable')
+      }
+      const capability = decodeHostedApprovalCapability(
+        await client.getHostedApprovalCapability(),
+      )
+      if (!capability) throw new Error('OpenCode atomic hosted approval capability unavailable')
+      const after = await captureProcessIdentity(host.pid)
+      if (before.startIdentity !== after.startIdentity) {
+        throw new Error('OpenCode hosted approval process identity changed')
+      }
+      return {
+        capability,
+        processIdentity: after,
+        context: { record, profile, host },
+      }
+    })
   }
 
   /**

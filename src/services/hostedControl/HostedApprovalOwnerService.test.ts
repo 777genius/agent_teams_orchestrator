@@ -112,6 +112,13 @@ async function fixture(
 }
 
 describe('HostedApprovalOwnerService R2', () => {
+  test('exposes only the exact recovered and still-current admission', async () => {
+    const fx = await fixture()
+    await expect(fx.service.isAdmissionRecoveredCurrent()).resolves.toBe(true)
+    fx.revoke()
+    await expect(fx.service.isAdmissionRecoveredCurrent()).resolves.toBe(false)
+  })
+
   test('dynamically polls and atomically admits exact pending permissions before claim', async () => {
     const { service } = await fixture()
     const records = await service.claimIngress({
