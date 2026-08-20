@@ -772,7 +772,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
   test('fails closed without portable birth identity for a live non-self PID', async () => {
     const directory = await workspaceTemp('foreign-live-no-birth')
     const path = join(directory, 'attempt.json')
-    const child = Bun.spawn(['/root/.bun/bin/bun', '-e', 'await Bun.sleep(30_000)'])
+    const child = Bun.spawn([process.execPath, '-e', 'await Bun.sleep(30_000)'])
     const owner = { version: 1, pid: child.pid, processBirth: '1', token: crypto.randomUUID() }
     await mkdir(leasePath(path), { mode: 0o700 })
     await writeFile(join(leasePath(path), 'owner.json'), JSON.stringify(owner), { mode: 0o600 })
@@ -1057,8 +1057,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       }, context);
     `
     try {
-      const one = Bun.spawn(['/root/.bun/bin/bun', '-e', child('one')], { stdout: 'pipe', stderr: 'pipe' })
-      const two = Bun.spawn(['/root/.bun/bin/bun', '-e', child('two')], { stdout: 'pipe', stderr: 'pipe' })
+      const one = Bun.spawn([process.execPath, '-e', child('one')], { stdout: 'pipe', stderr: 'pipe' })
+      const two = Bun.spawn([process.execPath, '-e', child('two')], { stdout: 'pipe', stderr: 'pipe' })
       const exits = await Promise.all([one.exited, two.exited])
       expect(exits.filter(code => code === 0)).toHaveLength(1)
       const journal = await readCommittedJournal(path)
@@ -1095,9 +1095,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       }, context);
     `
     try {
-      const first = Bun.spawn(['/root/.bun/bin/bun', '-e', firstCode], { stdout: 'pipe', stderr: 'pipe' })
+      const first = Bun.spawn([process.execPath, '-e', firstCode], { stdout: 'pipe', stderr: 'pipe' })
       while (true) { try { await readFile(ready); break } catch { await Bun.sleep(5) } }
-      const second = Bun.spawn(['/root/.bun/bin/bun', '-e', secondCode], { stdout: 'pipe', stderr: 'pipe' })
+      const second = Bun.spawn([process.execPath, '-e', secondCode], { stdout: 'pipe', stderr: 'pipe' })
       expect(await second.exited).toBe(0)
       expect(await first.exited).toBe(0)
       expect(await readFile(rejected, 'utf8')).toBe('rejected')

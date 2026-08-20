@@ -3446,9 +3446,17 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, projectPath, {
-      mode: options.inventoryMode ?? 'full',
-    })
+    let inventory: OpenCodeInventorySnapshot
+    try {
+      inventory = await this.probeInventory(inventoryService, projectPath, {
+        mode: options.inventoryMode ?? 'full',
+      })
+    } catch (error) {
+      return providerManagementError(
+        options.failureCode ?? 'runtime-unhealthy',
+        redactSecret(error instanceof Error ? error.message : String(error), options.secretToRedact),
+      )
+    }
 
     if (!inventory.detected) {
       return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
@@ -4967,7 +4975,7 @@ export class OpenCodeProviderManagementAdapter
           inventory.projectPath,
           {
             bypassCache: true,
-            mode: 'summary',
+            mode: 'profile',
           },
         )
         const refresh = useActionRefreshInventory(
@@ -4990,7 +4998,7 @@ export class OpenCodeProviderManagementAdapter
           value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
         }
       },
-      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
+      { failureCode: 'model-test-failed', inventoryMode: 'profile' },
     )
   }
 
@@ -5071,7 +5079,7 @@ export class OpenCodeProviderManagementAdapter
           }),
         }
       },
-      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
+      { failureCode: 'model-test-failed', inventoryMode: 'profile' },
     )
   }
 
@@ -5215,7 +5223,7 @@ export class OpenCodeProviderManagementAdapter
           },
         }
       },
-      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
+      { failureCode: 'model-test-failed', inventoryMode: 'profile' },
     )
   }
 }

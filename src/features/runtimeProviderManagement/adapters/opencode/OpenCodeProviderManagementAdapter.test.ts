@@ -7362,6 +7362,156 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toBe('openrouter/new-model')
   })
 
+  test('prepares only profile inventory before active model actions', async () => {
+    const inventoryModes: Array<string | undefined> = []
+    const hostPolicies: Array<string | undefined> = []
+    const probedModels: string[] = []
+    const savedDefaults: Array<[string, string]> = []
+    const savedLimits: Array<[string, string]> = []
+    const authMutations: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          inventoryModes.push(options?.mode)
+          return inventory({
+            connectedProviders: [],
+            availableProviders: ['local', 'kiro', 'cursor-acp'],
+            models: ['local/qwen', 'kiro/claude', 'cursor-acp/gpt'],
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async input => {
+          hostPolicies.push(input.managedPluginStartupPolicy)
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({
+            providers: [
+              { id: 'local', name: 'Local', models: { qwen: {} } },
+              { id: 'kiro', name: 'Kiro', models: { claude: {} } },
+              { id: 'cursor-acp', name: 'Cursor', models: { gpt: {} } },
+            ],
+            default: {},
+          }),
+          getProviders: async () => ({
+            all: [
+              { id: 'local', name: 'Local' },
+              { id: 'kiro', name: 'Kiro' },
+              { id: 'cursor-acp', name: 'Cursor' },
+            ],
+            connected: [],
+            default: {},
+          }),
+          getProviderAuth: async () => ({}),
+          setProviderAuth: async providerId => {
+            authMutations.push(`set:${providerId}`)
+            return true
+          },
+          deleteProviderAuth: async providerId => {
+            authMutations.push(`delete:${providerId}`)
+            return true
+          },
+        }),
+      },
+      executionProbe: {
+        probeModel: async input => {
+          probedModels.push(input.selectedModel)
+          return executionProbeResult(input.selectedModel)
+        },
+      },
+      managedPreferences: {
+        setDefaultModel: async (profileRootPath, modelId) => {
+          savedDefaults.push([profileRootPath, modelId])
+        },
+        setModelLimits: async (profileRootPath, input) => {
+          savedLimits.push([profileRootPath, input.modelId])
+        },
+      },
+    })
+
+    const setDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: false,
+      projectPath: '/tmp/project',
+    })
+    const testModel = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      projectPath: '/tmp/project',
+    })
+    const configureLimits = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000, projectPath: '/tmp/project',
+    })
+
+    expect([setDefault.ok, testModel.ok, configureLimits.ok]).toEqual([true, true, true])
+    expect(inventoryModes).toEqual(['profile', 'profile', 'profile', 'profile'])
+    expect(inventoryModes).not.toContain('summary')
+    expect(inventoryModes).not.toContain('full')
+    expect(hostPolicies).toEqual(['serve-startup', 'serve-startup', 'serve-startup'])
+    expect(probedModels).toEqual(['local/qwen', 'local/qwen', 'local/qwen'])
+    expect(savedDefaults).toEqual([['/tmp/profile', 'local/qwen']])
+    expect(savedLimits).toEqual([['/tmp/profile', 'local/qwen']])
+    expect(authMutations).toEqual([])
+  })
+
+  test('fails active model actions safely when profile preparation is missing or cancelled', async () => {
+    const actionCalls: string[] = []
+    const clientFactory = {
+      create: () => {
+        actionCalls.push('client')
+        throw new Error('active client must not be created')
+      },
+    }
+    const missingAdapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          expect(options?.mode).toBe('profile')
+          return inventory({ detected: false, binaryPath: null, version: null, profile: null })
+        },
+      },
+      clientFactory,
+    })
+    const cancelledAdapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async (_projectPath, options) => {
+          expect(options?.mode).toBe('profile')
+          throw new DOMException('profile preparation cancelled', 'AbortError')
+        },
+      },
+      clientFactory,
+    })
+    const actions = (adapter: OpenCodeProviderManagementAdapter) => [
+      adapter.setDefaultModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: false,
+      }),
+      adapter.testModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      }),
+      adapter.configureModelLimits({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+        contextTokens: 32_000, outputTokens: 8_000,
+      }),
+    ]
+
+    const missing = await Promise.all(actions(missingAdapter))
+    const cancelled = await Promise.all(actions(cancelledAdapter))
+    expect(missing.map(result => expectFailure(result).code)).toEqual([
+      'runtime-missing', 'runtime-missing', 'runtime-missing',
+    ])
+    expect(cancelled.map(result => expectFailure(result).code)).toEqual([
+      'model-test-failed', 'model-test-failed', 'model-test-failed',
+    ])
+    expect(cancelled.map(result => expectFailure(result).message)).toEqual([
+      'profile preparation cancelled',
+      'profile preparation cancelled',
+      'profile preparation cancelled',
+    ])
+    expect(actionCalls).toEqual([])
+  })
+
   test('tests models when live OpenCode server reports the provider as connected', async () => {
     let probedModel: string | null = null
     const adapter = new OpenCodeProviderManagementAdapter({
