@@ -1,29 +1,31 @@
 import type {
+  OpenCodeCurrentScopedProfilePlan,
   OpenCodeScopedPreparedProfile,
+  OpenCodeScopedProfilePlan,
   OpenCodeScopedProfilePlanContract,
 } from './types.js'
 
-export type OpenCodeProviderCatalogProductionPlan = {
+export type OpenCodeProviderCatalogProductionPlan = OpenCodeScopedProfilePlan & {
   purpose: 'provider-catalog'
-  providerId: string
-  runtimeInstanceId: string
-  projectPath?: string | null
-  abortSignal?: AbortSignal
 }
 
 export type OpenCodeProviderCatalogProductionProfileManager = {
-  planScopedProfile(input: OpenCodeProviderCatalogProductionPlan): OpenCodeScopedProfilePlanContract
-  prepareScopedProfile(
+  captureCurrentScopedProfilePlan(
     input: OpenCodeProviderCatalogProductionPlan,
+  ): Promise<OpenCodeCurrentScopedProfilePlan>
+  planScopedProfile(input: OpenCodeCurrentScopedProfilePlan): OpenCodeScopedProfilePlanContract
+  prepareScopedProfile(
+    input: OpenCodeCurrentScopedProfilePlan,
     expectedPlan: OpenCodeScopedProfilePlanContract,
   ): Promise<OpenCodeScopedPreparedProfile>
 }
 
 /** Exact production catalog wiring: authorization plan and mutation share one contract snapshot. */
-export function prepareOpenCodeProviderCatalogProductionProfile(
+export async function prepareOpenCodeProviderCatalogProductionProfile(
   manager: OpenCodeProviderCatalogProductionProfileManager,
   input: OpenCodeProviderCatalogProductionPlan,
 ): Promise<OpenCodeScopedPreparedProfile> {
-  const expectedPlan = manager.planScopedProfile(input)
-  return manager.prepareScopedProfile(input, expectedPlan)
+  const current = await manager.captureCurrentScopedProfilePlan(input)
+  const expectedPlan = manager.planScopedProfile(current)
+  return manager.prepareScopedProfile(current, expectedPlan)
 }

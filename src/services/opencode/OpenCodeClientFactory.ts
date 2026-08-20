@@ -39,6 +39,7 @@ export type OpenCodeClient = {
   connectMcp?(name: string): Promise<OpenCodeMcpResponse>
   createSession(body?: OpenCodeCreateSessionInput): Promise<OpenCodeSessionSummary>
   getSession(id: string): Promise<OpenCodeSessionSummary>
+  deleteSession(id: string): Promise<boolean>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatusInput>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
   getSessionMessage?(id: string, messageID: string): Promise<OpenCodeMessage | null>
@@ -329,6 +330,9 @@ export class OpenCodeClientFactory {
         return session
       },
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
+      deleteSession: id => request<boolean>(`/session/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
       getSessionStatus: () =>
         request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),
       getSessionMessages: (id, limit) =>

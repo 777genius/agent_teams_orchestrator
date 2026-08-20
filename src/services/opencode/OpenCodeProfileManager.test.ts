@@ -45,6 +45,8 @@ import {
 } from './OpenCodeManagedPaths.js'
 import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPolicy.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { prepareOpenCodeProviderCatalogProductionProfile } from './OpenCodeProviderCatalogProduction.js'
+import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
 
 const pureDigest = (value: string): string => createHash('sha256').update(value).digest('hex')
 const fakePluginTree = [{
@@ -316,6 +318,93 @@ async function buildDeepinfraPlannedInput(
 }
 
 describe('OpenCodeProfileManager immutable planned preparation', () => {
+  test('production catalog composition captures current evidence through the actual manager and policy', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-catalog-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      const prepared = await prepareOpenCodeProviderCatalogProductionProfile(fixture.manager, {
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-a',
+        projectPath: tempDir,
+      })
+      expect(prepared.providerId).toBe('deepinfra')
+      expect(prepared.purpose).toBe('provider-catalog')
+      expect(prepared.scopedPlanDigest).toMatch(/^[a-f0-9]{64}$/)
+
+      const launchAuthorization = await authorizeOpenCodeLaunchScopedProfile(fixture.manager, {
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'launch-attempt-a', projectPath: tempDir,
+      })
+      expect(launchAuthorization.expected.purpose).toBe('launch')
+      expect(launchAuthorization.input.runtimeInstanceId).toBe('launch-attempt-a')
+      expect(launchAuthorization.effectivePlanDigest).toMatch(/^[a-f0-9]{64}$/)
+
+      const first = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-b',
+        projectPath: tempDir,
+      })
+      await writeFile(path.join(tempDir, 'AGENTS.md'), 'fresh attempt evidence\n')
+      const second = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-c',
+        projectPath: tempDir,
+      })
+      expect(fixture.manager.planScopedProfile(second).digest)
+        .not.toBe(fixture.manager.planScopedProfile(first).digest)
+      await expect(fixture.manager.prepareScopedProfile(first, fixture.manager.planScopedProfile(first)))
+        .rejects.toThrow('evidence drifted')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('actual production planning preserves ordinary plugins and materializes only the selected Kiro app plugin', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-kiro-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packageCacheRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const writeCachedPackage = async (spec: string, name: string, version: string): Promise<void> => {
+      const root = path.join(packageCacheRoot, spec)
+      await mkdir(root, { recursive: true })
+      await writeFile(path.join(root, 'package.json'), JSON.stringify({ name, version }))
+      await writeFile(path.join(root, 'index.js'), 'export default {}\n')
+    }
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
+      await writeCachedPackage('ordinary-user-choice@1.2.3', 'ordinary-user-choice', '1.2.3')
+      await writeCachedPackage('opencode-kiro@0.4.0', 'opencode-kiro', '0.4.0')
+      // This unrelated app-managed package is present in the shared cache but
+      // is not selected and must never be injected into the Kiro plan.
+      await writeCachedPackage('@rama_nigg/open-cursor@2.5.2', '@rama_nigg/open-cursor', '2.5.2')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'kiro-catalog-attempt',
+        projectPath: tempDir,
+      })
+      expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
+        ['ordinary-user-choice@1.2.3', 'project'],
+        ['opencode-kiro@0.4.0', 'app-managed'],
+      ])
+      expect(current.evidence.nativeAccountIdentitySource).toBe('official-provider-cli')
+      const expected = fixture.manager.planScopedProfile(current)
+      expect(expected.plugins.map(plugin => plugin.spec)).toEqual([
+        'ordinary-user-choice@1.2.3', 'opencode-kiro@0.4.0',
+      ])
+      expect(JSON.stringify(expected)).not.toContain('@rama_nigg/open-cursor')
+      const prepared = await fixture.manager.prepareScopedProfile(current, expected)
+      expect(prepared.managedConfig.plugin).toEqual([
+        'file:./node_modules/ordinary-user-choice',
+        'file:./node_modules/opencode-kiro',
+      ])
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test.each(['root', 'nested'] as const)(
     'rejects a replaced %s project parent after capture and before descriptor-relative copy',
     async replacement => {
@@ -727,16 +816,32 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
-  test('creates Windows scoped managed directories without traversing reparse-point ancestry', async () => {
+  test('uses only a trusted pre-provisioned Windows tree and rejects a swap at the former mkdir boundary', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-windows-v2-'))
     const boundary = path.join(tempDir, 'managed')
     const target = path.join(boundary, 'one', 'two')
     const outside = path.join(tempDir, 'outside')
+    const displacedBoundary = path.join(tempDir, 'managed-original')
     try {
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32'))
+        .rejects.toThrow('trusted and pre-existing')
+      await mkdir(target, { recursive: true })
+      await mkdir(outside)
       await ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32')
       expect((await stat(target)).isDirectory()).toBe(true)
 
-      await mkdir(outside)
+      let swapped = false
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, async componentPath => {
+        if (componentPath !== boundary || swapped) return
+        swapped = true
+        await rename(boundary, displacedBoundary)
+        await symlink(outside, boundary, 'dir')
+      }, 'win32')).rejects.toThrow('ancestry is not canonical')
+      expect(swapped).toBe(true)
+      expect(await readdir(outside)).toEqual([])
+      await rm(boundary)
+      await rename(displacedBoundary, boundary)
+
       await symlink(outside, path.join(boundary, 'linked'), 'dir')
       await expect(ensureOpenCodeManagedDirectoryPath(
         path.join(boundary, 'linked', 'child'),

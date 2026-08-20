@@ -175,9 +175,34 @@ function executionProbeResult(
 }
 
 describe('OpenCodeProviderManagementAdapter', () => {
-  test('routes loadModels through the provider-scoped catalog port without legacy inventory or host calls', async () => {
+  test('rejects uppercase and malformed provider rows without throwing before the catalog boundary', async () => {
     let catalogCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: {
+        loadCatalog: async () => {
+          catalogCalls += 1
+          throw new Error('invalid boundary input must not reach the catalog')
+        },
+      },
+    })
+
+    for (const providerId of ['DEEPINFRA', '../deepinfra', { trim: () => { throw new Error('getter') } }, Symbol('provider')]) {
+      const result = await adapter.loadModels({
+        runtimeId: 'opencode', providerId: providerId as any, projectPath: '/project-a',
+      })
+      expect(result).toMatchObject({ ok: false, error: { code: 'provider-missing' } })
+    }
+    expect(catalogCalls).toBe(0)
+  })
+
+  test('routes loadModels through the provider-scoped catalog port without legacy inventory or host calls', async () => {
+    let catalogCalls = 0
+    const statusUpdates: any[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      activeStatusPublisher: {
+        publishInventory: async () => {},
+        publishProviderUpdate: async input => { statusUpdates.push(input) },
+      },
       providerCatalog: {
         loadCatalog: async input => {
           catalogCalls += 1
@@ -226,6 +251,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(catalogCalls).toBe(1)
+    expect(statusUpdates).toEqual([{
+      projectPath: '/project-a', providerId: 'deepinfra', catalogAvailable: true,
+      modelIds: ['deepinfra/model'],
+    }])
     expect(result.value.models.map(model => model.modelId)).toEqual(['deepinfra/model'])
     expect(result.value.models[0]).toMatchObject({
       accessKind: 'catalog_selection_only',

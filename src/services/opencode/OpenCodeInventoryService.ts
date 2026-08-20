@@ -31,6 +31,10 @@ import {
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
+import {
+  openCodeActiveStatusSnapshotPublisher,
+  type OpenCodeActiveStatusPublisherPort,
+} from './OpenCodeActiveStatusSnapshotPublisher.js'
 
 import type {
   OpenCodeAgentMode,
@@ -958,6 +962,18 @@ export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSumma
 export class OpenCodeInventoryService {
   private readonly cache = new Map<string, CacheEntry>()
 
+  constructor(
+    private readonly activeStatusPublisher: OpenCodeActiveStatusPublisherPort = openCodeActiveStatusSnapshotPublisher,
+  ) {}
+
+  private async publishAuthoritativeSnapshot(
+    snapshot: OpenCodeInventorySnapshot,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted || snapshot.probeError) return
+    await this.activeStatusPublisher.publishInventory(snapshot, signal).catch(() => undefined)
+  }
+
   clearCache(): void {
     this.cache.clear()
   }
@@ -1055,6 +1071,7 @@ export class OpenCodeInventoryService {
           snapshot: missingSnapshot,
         })
       }
+      await this.publishAuthoritativeSnapshot(missingSnapshot, options.abortSignal)
       return missingSnapshot
     }
 
@@ -1263,6 +1280,7 @@ export class OpenCodeInventoryService {
       })
     }
 
+    await this.publishAuthoritativeSnapshot(snapshot, options.abortSignal)
     return snapshot
   }
 }

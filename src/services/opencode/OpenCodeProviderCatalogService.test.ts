@@ -111,6 +111,11 @@ describe('OpenCodeProviderCatalogService', () => {
     const f = fixture({
       prepareProfile: undefined,
       profileManager: {
+        captureCurrentScopedProfilePlan: async input => {
+          calls.push('capture')
+          return { ...input, providerId: input.providerId!, modelId: null,
+            projectPath: input.projectPath ?? '/project', evidence: {} as never }
+        },
         planScopedProfile: input => {
           calls.push('plan')
           expect(input).toMatchObject({ purpose: 'provider-catalog', providerId: 'deepinfra' })
@@ -126,7 +131,7 @@ describe('OpenCodeProviderCatalogService', () => {
 
     await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
       .resolves.toMatchObject({ catalog: { providerId: 'deepinfra' } })
-    expect(calls).toEqual(['plan', 'prepare'])
+    expect(calls).toEqual(['capture', 'plan', 'prepare'])
   })
 
   test('builds a catalog-only selected-provider plan and uses only the host provider API', async () => {

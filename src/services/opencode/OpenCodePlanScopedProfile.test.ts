@@ -6,36 +6,45 @@ import {
   type OpenCodeExpectedScopedProfilePlan,
   type OpenCodePlanScopedProfileManagerPort,
 } from './OpenCodePlanScopedProfile.js'
-import type { OpenCodeScopedPreparedProfile, OpenCodeScopedProfilePlan } from './types.js'
+import { planScopedProfile } from './OpenCodeOperationPolicy.js'
+import type {
+  OpenCodeCurrentScopedProfilePlan,
+  OpenCodeScopedPreparedProfile,
+  OpenCodeScopedProfilePlan,
+  OpenCodeScopedProfilePlanContract,
+} from './types.js'
 
 const hex = (character: string) => character.repeat(64)
-const key = (kind: string, character: string) =>
-  `opencode-operation-policy-v2:${kind}:${hex(character)}`
 
 const input: OpenCodeScopedProfilePlan = {
   purpose: 'launch', providerId: 'openrouter', modelId: 'openrouter/model',
   runtimeInstanceId: '018f47a2-4a13-7c2f-8d44-c0ffee123456', projectPath: '/fake/project',
 }
 
-function plan(overrides: Partial<OpenCodeExpectedScopedProfilePlan> = {}): OpenCodeExpectedScopedProfilePlan {
-  return {
-    scopeSchema: 'opencode-scoped-profile-plan-v1', purpose: 'launch', providerId: 'openrouter',
-    modelId: 'openrouter/model', runtimeInstanceId: input.runtimeInstanceId,
-    operationKey: key('operation', 'a'), profileKey: key('profile', 'b'),
-    pluginKey: key('plugin', 'c'), cacheKey: key('cache', 'd'),
-    profileScopeIdentity: hex('e'), selectedAuthBaselineFingerprint: hex('f'),
-    binaryFingerprint: hex('1'), planDigest: hex('2'), ...overrides,
-  }
+function current(overrides: Partial<OpenCodeCurrentScopedProfilePlan['evidence']> = {}): OpenCodeCurrentScopedProfilePlan {
+  return { ...input, providerId: input.providerId!, modelId: input.modelId!,
+    projectPath: input.projectPath!, evidence: {
+    canonicalProjectPathFingerprint: hex('1'), projectBehaviorFingerprint: hex('2'),
+    providerEnvironmentFingerprint: hex('3'), selectedAuthFingerprint: hex('4'),
+    binaryFingerprint: hex('5'), configFingerprint: hex('6'),
+    nativeAccountIdentityFingerprint: hex('7'), nativeAccountIdentitySource: 'managed-auth',
+    nativeTargetExecutableFingerprint: hex('8'), profileLayoutFingerprint: hex('9'),
+    automaticUserPluginFingerprint: hex('a'), plugins: [], ...overrides,
+  } }
+}
+
+function plan(overrides: Partial<OpenCodeScopedProfilePlanContract> = {}): OpenCodeExpectedScopedProfilePlan {
+  return { ...planScopedProfile(current()), ...overrides }
 }
 
 function prepared(expected: OpenCodeExpectedScopedProfilePlan): OpenCodeScopedPreparedProfile {
   return {
     scopeSchema: 'opencode-scoped-profile-v1', purpose: expected.purpose,
     providerId: expected.providerId, modelId: expected.modelId,
-    runtimeInstanceId: expected.runtimeInstanceId, operationKey: expected.operationKey,
-    profileKey: expected.profileKey, pluginKey: expected.pluginKey, cacheKey: expected.cacheKey,
-    profileScopeIdentity: expected.profileScopeIdentity,
-    selectedAuthBaselineFingerprint: expected.selectedAuthBaselineFingerprint,
+    runtimeInstanceId: input.runtimeInstanceId, scopedPlanDigest: expected.digest,
+    plannedHostKey: expected.expectedHostKey,
+    canonicalProjectPathFingerprint: expected.canonicalProjectPathFingerprint,
+    selectedAuthBaselineFingerprint: expected.selectedAuthFingerprint,
     binaryFingerprint: expected.binaryFingerprint,
   } as OpenCodeScopedPreparedProfile
 }
@@ -49,22 +58,22 @@ describe('OpenCode PlanScopedProfile production contract', () => {
     await expect(authorizeOpenCodeLaunchScopedProfile(missingPlan, input))
       .rejects.toThrow('contract is unavailable')
     const missingPrepare: OpenCodePlanScopedProfileManagerPort = {
-      planScopedProfile: async () => { calls += 1; return plan() },
+      captureCurrentScopedProfilePlan: async () => { calls += 1; return current() },
+      planScopedProfile: () => { calls += 1; return plan() },
     }
     await expect(authorizeOpenCodeLaunchScopedProfile(missingPrepare, input))
       .rejects.toThrow('contract is unavailable')
     expect(calls).toBe(0)
   })
 
-  test('malformed or mismatched plan fails before preparation', async () => {
+  test('mismatched current attempt evidence fails before planning or preparation', async () => {
     let prepares = 0
-    for (const returned of [{}, plan({ providerId: 'other' }), plan({ planDigest: 'not-a-digest' })]) {
-      const manager: OpenCodePlanScopedProfileManagerPort = {
-        planScopedProfile: async () => returned,
-        prepareScopedProfile: async () => { prepares += 1; return prepared(plan()) },
-      }
-      await expect(authorizeOpenCodeLaunchScopedProfile(manager, input)).rejects.toThrow(/malformed|mismatched/)
+    const manager: OpenCodePlanScopedProfileManagerPort = {
+      captureCurrentScopedProfilePlan: async () => ({ ...current(), runtimeInstanceId: 'other-attempt' }),
+      planScopedProfile: () => { throw new Error('must not plan') },
+      prepareScopedProfile: async () => { prepares += 1; return prepared(plan()) },
     }
+    await expect(authorizeOpenCodeLaunchScopedProfile(manager, input)).rejects.toThrow('mismatched')
     expect(prepares).toBe(0)
   })
 
@@ -72,10 +81,11 @@ describe('OpenCode PlanScopedProfile production contract', () => {
     const expected = plan()
     let received: OpenCodeExpectedScopedProfilePlan | undefined
     const manager: OpenCodePlanScopedProfileManagerPort = {
-      planScopedProfile: async () => expected,
+      captureCurrentScopedProfilePlan: async () => current(),
+      planScopedProfile: () => expected,
       prepareScopedProfile: async (_value, planned) => {
         received = planned
-        return prepared({ ...planned, profileKey: key('profile', '9') })
+        return { ...prepared(planned), binaryFingerprint: hex('b') }
       },
     }
     const authorization = await authorizeOpenCodeLaunchScopedProfile(manager, input)
@@ -87,14 +97,15 @@ describe('OpenCode PlanScopedProfile production contract', () => {
   test('valid plan flows and every returned identity contributes to the effective digest', async () => {
     const expected = plan()
     const manager: OpenCodePlanScopedProfileManagerPort = {
-      planScopedProfile: async () => expected,
+      captureCurrentScopedProfilePlan: async () => current(),
+      planScopedProfile: () => expected,
       prepareScopedProfile: async (_value, planned) => prepared(planned),
     }
     const authorization = await authorizeOpenCodeLaunchScopedProfile(manager, input)
     await expect(prepareAuthorizedOpenCodeLaunchScopedProfile(manager, authorization))
       .resolves.toEqual(prepared(expected))
     const changedManager: OpenCodePlanScopedProfileManagerPort = {
-      ...manager, planScopedProfile: async () => plan({ planDigest: hex('3') }),
+      ...manager, planScopedProfile: () => plan({ digest: hex('3') }),
     }
     const changed = await authorizeOpenCodeLaunchScopedProfile(changedManager, input)
     expect(changed.effectivePlanDigest).not.toBe(authorization.effectivePlanDigest)

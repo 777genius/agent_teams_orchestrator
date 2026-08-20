@@ -59,6 +59,7 @@ import {
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
   resolveClaudeMultimodelPaths,
 } from './OpenCodeManagedPaths.js'
+import { ensureOpenCodeWindowsManagedDirectoryPath } from './OpenCodeWindowsManagedDirectory.js'
 import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
@@ -81,7 +82,9 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeCurrentScopedProfilePlan,
   OpenCodeScopedPreparedProfile,
+  OpenCodeScopedProfilePlan,
   OpenCodePlanScopedProfileInput,
   OpenCodeScopedProfilePlanContract,
   OpenCodeToolApprovalMode,
@@ -534,83 +537,6 @@ async function assertCanonicalOwnedPathComponents(
   }
 }
 
-async function ensureWindowsManagedDirectoryPath(
-  resolved: string,
-  ownershipBoundary: string,
-  afterComponentOpened?: (componentPath: string) => void | Promise<void>,
-): Promise<void> {
-  const parsed = path.parse(resolved)
-  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
-
-  const inspectThrough = async (target: string): Promise<void> => {
-    const targetParts = target.slice(parsed.root.length).split(path.sep).filter(Boolean)
-    let current = parsed.root
-    for (const part of targetParts) {
-      current = path.join(current, part)
-      const metadata = await lstat(current).catch(error => {
-        if (getErrnoCode(error) === 'ENOENT') return null
-        throw error
-      })
-      if (!metadata) {
-        throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
-      }
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
-      }
-      if (typeof process.getuid === 'function' && !isOpenCodeManagedPathComponentOwnershipValid(
-        current,
-        ownershipBoundary,
-        metadata,
-        process.getuid(),
-      )) {
-        throw new Error('OpenCode scoped managed path ancestry is not safely app-owned [redacted]')
-      }
-    }
-  }
-
-  const walk = async (createMissing: boolean, notify: boolean): Promise<bigint[]> => {
-    const identities: bigint[] = []
-    let current = parsed.root
-    for (const part of relativeParts) {
-      const parent = current
-      current = path.join(parent, part)
-      await inspectThrough(parent)
-      let metadata = await lstat(current, { bigint: true }).catch(error => {
-        if (getErrnoCode(error) === 'ENOENT') return null
-        throw error
-      })
-      if (!metadata) {
-        if (!createMissing) {
-          throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
-        }
-        try {
-          await mkdir(current, { mode: 0o700 })
-        } catch (error) {
-          if (getErrnoCode(error) !== 'EEXIST') throw error
-        }
-        metadata = await lstat(current, { bigint: true }).catch(error => {
-          throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]', {
-            cause: error,
-          })
-        })
-      }
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
-      }
-      if (notify) await afterComponentOpened?.(current)
-      identities.push(metadata.dev, metadata.ino)
-    }
-    return identities
-  }
-
-  const createdIdentities = await walk(true, true)
-  const reachableIdentities = await walk(false, false)
-  if (createdIdentities.length !== reachableIdentities.length
-    || createdIdentities.some((identity, index) => identity !== reachableIdentities[index])) {
-    throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
-  }
-}
-
 /**
  * Creates a managed directory one component at a time relative to a held
  * no-follow directory descriptor. The optional callback is a deterministic
@@ -633,10 +559,9 @@ export async function ensureOpenCodeManagedDirectoryPath(
     throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
   }
   if (platform === 'win32') {
-    // Node does not expose mkdirat/openat on Windows. Walk one component at a
-    // time without recursive mkdir, reject reparse-point ancestry, and verify
-    // that every component retains the same file identity across a second walk.
-    await ensureWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
+    // Standard Node APIs cannot safely
+    // create through a potentially replaceable Windows reparse-point ancestry.
+    await ensureOpenCodeWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
     return
   }
 
@@ -2687,6 +2612,112 @@ async function collectScopedPreservedPlugins(
   ]
 }
 
+function exactScopedPluginPackage(spec: string): { name: string; version: string } {
+  const match = spec.match(/^(@[^/@]+\/[^/@]+|[^@/]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/)
+  if (!match) throw new Error('OpenCode scoped plugin requires an exact immutable package version')
+  return { name: match[1]!, version: match[2]! }
+}
+
+async function captureScopedPluginPlanningEvidence(
+  plugins: readonly OpenCodePreservedPlugin[],
+  packagesRoot: string,
+): Promise<OpenCodePlanScopedProfileInput['evidence']['plugins']> {
+  const captured = new Map<string, Omit<OpenCodePlanScopedProfileInput['evidence']['plugins'][number], 'provenance'>>()
+  for (const plugin of plugins) {
+    const prior = captured.get(plugin.spec)
+    if (prior) continue
+    const exact = exactScopedPluginPackage(plugin.spec)
+    const sourceRoot = path.join(packagesRoot, plugin.spec)
+    const entries: OpenCodePlanScopedProfileInput['evidence']['plugins'][number]['immutableTreeEntries'] = []
+    let entryCount = 0
+    let byteCount = 0
+    const visit = async (directory: string, relative: string): Promise<void> => {
+      const before = await lstat(directory, { bigint: true })
+      if (!before.isDirectory() || before.isSymbolicLink()) {
+        throw new Error('OpenCode scoped plugin cache contains an unsupported directory [redacted]')
+      }
+      const children = await readdir(directory, { withFileTypes: true })
+      children.sort((left, right) => left.name.localeCompare(right.name))
+      for (const child of children) {
+        if (child.name === '.DS_Store' || child.name === '.git') continue
+        if (++entryCount > 20_000) throw new Error('OpenCode scoped plugin cache is too large [redacted]')
+        const childPath = path.join(directory, child.name)
+        const childRelative = relative ? `${relative}/${child.name}` : child.name
+        if (child.isDirectory()) {
+          await visit(childPath, childRelative)
+          continue
+        }
+        if (!child.isFile()) {
+          throw new Error('OpenCode scoped plugin cache contains an unsupported entry [redacted]')
+        }
+        const handle = await open(childPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+        try {
+          const retainedBefore = await handle.stat({ bigint: true })
+          if (!retainedBefore.isFile()) throw new Error('OpenCode scoped plugin cache file is not regular')
+          const bytes = await handle.readFile()
+          const retainedAfter = await handle.stat({ bigint: true })
+          const visible = await lstat(childPath, { bigint: true })
+          if (visible.isSymbolicLink() || retainedBefore.dev !== retainedAfter.dev
+            || retainedBefore.ino !== retainedAfter.ino || retainedBefore.size !== retainedAfter.size
+            || retainedBefore.mtimeNs !== retainedAfter.mtimeNs || retainedBefore.ctimeNs !== retainedAfter.ctimeNs
+            || retainedAfter.dev !== visible.dev || retainedAfter.ino !== visible.ino) {
+            throw new Error('OpenCode scoped plugin cache changed during capture [redacted]')
+          }
+          byteCount += bytes.length
+          if (byteCount > 64 * 1024 * 1024) {
+            throw new Error('OpenCode scoped plugin cache exceeds the evidence limit [redacted]')
+          }
+          entries.push({
+            path: `${exact.name}/${childRelative}`,
+            bytesBase64: bytes.toString('base64'),
+            mode: (Number(retainedAfter.mode) & 0o111) === 0 ? 0o400 : 0o500,
+          })
+        } finally {
+          await handle.close()
+        }
+      }
+      const after = await lstat(directory, { bigint: true })
+      if (!after.isDirectory() || after.isSymbolicLink()
+        || before.dev !== after.dev || before.ino !== after.ino
+        || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+        throw new Error('OpenCode scoped plugin cache directory changed during capture [redacted]')
+      }
+    }
+    await visit(sourceRoot, '')
+    const manifestEntry = entries.find(entry => entry.path === `${exact.name}/package.json`)
+    if (!manifestEntry) throw new Error('OpenCode scoped plugin cache manifest is unavailable [redacted]')
+    const manifestBytes = Buffer.from(manifestEntry.bytesBase64, 'base64')
+    let manifest: Record<string, unknown>
+    try { manifest = JSON.parse(manifestBytes.toString('utf8')) as Record<string, unknown> }
+    catch { throw new Error('OpenCode scoped plugin cache manifest is invalid [redacted]') }
+    if (manifest.name !== exact.name || manifest.version !== exact.version) {
+      throw new Error('OpenCode scoped plugin cache does not match its exact spec [redacted]')
+    }
+    entries.sort((left, right) => left.path.localeCompare(right.path))
+    const dependencyTreeFingerprint = canonicalFingerprint(entries.map(entry => ({
+      path: entry.path,
+      mode: entry.mode,
+      fingerprint: hashBuffer(Buffer.from(entry.bytesBase64, 'base64')),
+    })))
+    const packageIntegrity = `sha512-${createHash('sha512')
+      .update(dependencyTreeFingerprint).digest('base64')}`
+    const lockBindingFingerprint = canonicalFingerprint({
+      packageName: exact.name,
+      version: exact.version,
+      packageIntegrity,
+      manifestFingerprint: hashBuffer(manifestBytes),
+      dependencyTreeFingerprint,
+    })
+    captured.set(plugin.spec, {
+      spec: plugin.spec,
+      dependencyTreeFingerprint,
+      resolvedIdentity: `sha256:${lockBindingFingerprint}`,
+      immutableTreeEntries: entries,
+    })
+  }
+  return plugins.map(plugin => ({ ...captured.get(plugin.spec)!, provenance: plugin.provenance }))
+}
+
 function getScopedPluginConfigCandidates(
   projectPath: string,
   env: NodeJS.ProcessEnv,
@@ -2943,6 +2974,230 @@ export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
   private readonly paths = resolveClaudeMultimodelPaths()
+
+  /**
+   * Captures the mutable production inputs which the pure policy deliberately
+   * cannot read.  The returned snapshot is single-attempt data: production
+   * composition passes it directly to plan + prepare, whose publication gate
+   * captures the same sources again and rejects any drift.
+   */
+  async captureCurrentScopedProfilePlan(
+    requested: OpenCodeScopedProfilePlan,
+  ): Promise<OpenCodeCurrentScopedProfilePlan> {
+    const requestedSnapshot = { ...requested }
+    const signal = requestedSnapshot.abortSignal
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
+    const providerId = requestedSnapshot.providerId?.trim()
+      ? canonicalizeOpenCodeProviderId(requestedSnapshot.providerId)
+      : null
+    if (!providerId) throw new Error('OpenCode scoped planning requires a provider id')
+    const projectPath = await normalizeScopedProjectPath(requestedSnapshot.projectPath)
+    const hostEnvironment = { ...process.env }
+    const binaryPath = resolveOpenCodeBinaryPath()
+    if (!binaryPath) throw new Error('OpenCode scoped planning requires the OpenCode binary')
+    const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
+      || path.join(os.homedir(), '.config')
+    const [behavior, binaryFingerprint, preservedPlugins, automaticUserPluginEntries] =
+      await Promise.all([
+        collectProjectBehaviorMetadata(projectPath),
+        fingerprintScopedBinary(binaryPath),
+        collectScopedPreservedPlugins(projectPath, hostEnvironment),
+        collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
+      ])
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
+
+    // Never silently discard ordinary user/project/environment plugins.  A
+    // package tree needs immutable bytes, not merely a mutable config string;
+    // until those bytes are locally available this attempt must fail closed.
+    const policyProbe = resolveOpenCodeOperationPolicy({
+      purpose: requestedSnapshot.purpose,
+      providerId,
+      preservedPlugins,
+      fingerprints: {
+        project: canonicalFingerprint(null), model: canonicalFingerprint(null),
+        policy: canonicalFingerprint(null), plugin: canonicalFingerprint(null),
+        version: canonicalFingerprint(null), config: canonicalFingerprint(null),
+        auth: canonicalFingerprint(null), environment: canonicalFingerprint(null),
+        binary: binaryFingerprint, layout: canonicalFingerprint(null),
+      },
+    })
+    const planningPlugins = await captureScopedPluginPlanningEvidence(
+      policyProbe.plugins,
+      path.join(this.paths.cache, 'opencode', 'shared-cache', 'opencode', 'packages'),
+    ).catch(error => {
+      throw new Error('OpenCode configured plugin immutable planning evidence is unavailable [redacted]', {
+        cause: error,
+      })
+    })
+
+    const globalAuthPath = this.getGlobalAuthPath()
+    const sourceAuthPaths = Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()]))
+    const sourceStores = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
+    const mergedAuth = mergeOpenCodeManagedAuthSources({ sourceAuthPaths, sourceStores, globalAuthPath })
+    const selectedCredentialCandidate = mergedAuth[providerId.toLowerCase()]
+    const selectedCredential = (
+      (providerId === 'kiro' && isKiroCliAuthMarker(selectedCredentialCandidate ?? null))
+      || (providerId === 'cursor-acp' && isCursorAgentAuthMarker(selectedCredentialCandidate ?? null))
+    ) ? undefined : selectedCredentialCandidate
+    const selectedAuth = selectedCredential ? { [providerId.toLowerCase()]: selectedCredential } : {}
+    let scopedSelectedAuth = selectedAuth
+    let nativeAccountIdentityFingerprint = selectedCredential
+      ? canonicalFingerprint({ providerId, selectedAuth })
+      : canonicalFingerprint(null)
+    let nativeAccountIdentitySource: 'official-provider-cli' | 'managed-auth' = 'managed-auth'
+    const nativeCredentialHostHomePath = (
+      process.platform === 'win32'
+        ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim()
+        : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim()
+    ) || os.homedir()
+    const nativeTargetCommand = providerId === 'cursor-acp'
+      ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+      : providerId === 'kiro' ? 'kiro-cli' : null
+    const nativeTargetExecutablePath = nativeTargetCommand
+      ? await resolveNativeTargetExecutable(nativeTargetCommand, hostEnvironment, process.platform)
+      : null
+    if (nativeTargetCommand && !nativeTargetExecutablePath) {
+      throw new Error('OpenCode selected native provider executable could not be resolved')
+    }
+    const nativeTargetExecutableFingerprint = nativeTargetExecutablePath
+      ? await fingerprintScopedBinary(nativeTargetExecutablePath)
+      : canonicalFingerprint(null)
+    const nativeAccountEvidence = await fingerprintNativeAccountEvidence(
+      providerId,
+      nativeCredentialHostHomePath,
+    )
+    let nativeCredentialProofFingerprint = canonicalFingerprint(null)
+    const nativeProofProviderId: 'kiro' | 'cursor-acp' | null = providerId === 'kiro'
+      ? 'kiro'
+      : providerId === 'cursor-acp' ? 'cursor-acp' : null
+    if (nativeProofProviderId && (nativeProofProviderId === 'kiro' || !selectedCredential)) {
+      const nativeProof = await probeNativeCredentialIdentity(
+        nativeProofProviderId,
+        nativeTargetExecutablePath!,
+        process.platform,
+        hostEnvironment,
+      ).catch(() => ({ reportsAuthenticated: false, accountIdentity: null }))
+      nativeCredentialProofFingerprint = canonicalFingerprint({
+        providerId,
+        accountIdentity: nativeProof.accountIdentity,
+        credentialEvidence: nativeAccountEvidence.definitive ? nativeAccountEvidence.fingerprint : null,
+      })
+      if (!nativeProof.reportsAuthenticated || nativeProof.accountIdentity === null) {
+        throw new Error('OpenCode native provider authenticated account identity could not be established')
+      }
+      nativeAccountIdentitySource = 'official-provider-cli'
+      nativeAccountIdentityFingerprint = canonicalFingerprint({
+        providerId,
+        accountIdentity: nativeProof.accountIdentity,
+      })
+      if (!selectedCredential) {
+        scopedSelectedAuth = providerId === 'kiro'
+          ? { kiro: { type: 'oauth', access: 'authenticated', refresh: '', expires: Number.MAX_SAFE_INTEGER } }
+          : { 'cursor-acp': { type: 'api', key: CURSOR_AGENT_AUTH_MARKER, expires: Number.MAX_SAFE_INTEGER } }
+      }
+    }
+    const selectedAuthFingerprint = canonicalFingerprint(scopedSelectedAuth)
+    const nativeBridgeInputFingerprint = canonicalFingerprint(
+      nativeProofProviderId
+        ? {
+            providerId,
+            platform: process.platform,
+            home: process.platform === 'win32'
+              ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim() || os.homedir()
+              : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim() || os.homedir(),
+            path: hostEnvironment.PATH ?? '',
+            cursorAgentExecutable: providerId === 'cursor-acp'
+              ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+              : null,
+            credentialProof: nativeCredentialProofFingerprint,
+            accountEvidence: nativeAccountEvidence.fingerprint,
+            targetExecutable: nativeTargetExecutableFingerprint,
+          }
+        : null,
+    )
+    const providerEnvironmentFingerprint = canonicalFingerprint({
+      inherited: fingerprintOpenCodeScopedInheritedEnvironment(hostEnvironment),
+      nativeBridgeInputs: nativeBridgeInputFingerprint,
+      finalEnvironmentInputs: {
+        npmConfigCache: path.join(this.paths.cache, 'opencode', 'package-downloads'),
+        multimodelDataHome: this.paths.data,
+        multimodelCacheHome: this.paths.cache,
+        disableAutoUpdate: applyOpenCodeAutoUpdatePolicy({ ...hostEnvironment })
+          .OPENCODE_DISABLE_AUTOUPDATE ?? null,
+      },
+    })
+    const pluginConfigCandidates = getScopedPluginConfigCandidates(projectPath, hostEnvironment)
+    let importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(hostEnvironment)
+    for (const [configPath, provenance] of pluginConfigCandidates) {
+      if (provenance !== 'project') continue
+      importedRuntimeConfig = deepMergeOpenCodeConfig(
+        importedRuntimeConfig,
+        await readSafeOpenCodeRuntimeConfigFile(configPath),
+      )
+    }
+    const modelId = requestedSnapshot.modelId?.trim() || null
+    const automaticUserPluginFingerprint = canonicalFingerprint(automaticUserPluginEntries)
+    const initialFingerprints = {
+      project: canonicalFingerprint({ projectPath, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }),
+      model: canonicalFingerprint(modelId),
+      policy: canonicalFingerprint({ purpose: requestedSnapshot.purpose, providerId }),
+      plugin: canonicalFingerprint({ preservedPlugins, automaticUserPluginEntries,
+        automaticUserPluginFingerprint, dependencySnapshot: null }),
+      version: canonicalFingerprint({ specs: preservedPlugins.map(plugin => plugin.spec),
+        dependencySnapshot: null }),
+      config: canonicalFingerprint(importedRuntimeConfig),
+      auth: selectedAuthFingerprint,
+      environment: providerEnvironmentFingerprint,
+      binary: binaryFingerprint,
+      layout: canonicalFingerprint(OPEN_CODE_SCOPED_PROFILE_LAYOUT_GENERATION),
+    }
+    const preliminaryPolicy = resolveOpenCodeOperationPolicy({
+      purpose: requestedSnapshot.purpose, providerId, preservedPlugins, fingerprints: initialFingerprints,
+    })
+    const appMcpConfig = preliminaryPolicy.appMcp === 'enabled'
+      ? await this.resolveManagedAppMcpConfig()
+      : null
+    const managedConfig = deepMergeOpenCodeConfig(importedRuntimeConfig, buildManagedConfig(appMcpConfig, {
+      allowAutoUpdate: isOpenCodeAutoUpdateAllowed(hostEnvironment),
+      defaultModelId: modelId,
+      toolApprovalMode: preliminaryPolicy.toolApproval === 'auto' ? 'auto' : undefined,
+    }))
+    if (preliminaryPolicy.toolApproval === 'none') {
+      managedConfig.agent = Object.fromEntries(
+        Object.entries(asRecord(managedConfig.agent)).map(([agentName, rawAgent]) => [agentName, {
+          ...asRecord(rawAgent), tools: { '*': false }, permission: { '*': 'deny' },
+        }]),
+      )
+    }
+    const providers = asRecord(managedConfig.provider)
+    managedConfig.provider = providers[providerId] ? { [providerId]: providers[providerId] } : {}
+    managedConfig.plugin = planningPlugins.map(plugin => {
+      const exact = exactScopedPluginPackage(plugin.spec)
+      return `file:./node_modules/${exact.name}`
+    })
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
+    return cloneAndDeepFreezeScopedInput({
+      purpose: requestedSnapshot.purpose,
+      providerId,
+      modelId,
+      runtimeInstanceId: requestedSnapshot.runtimeInstanceId,
+      projectPath,
+      evidence: {
+        canonicalProjectPathFingerprint: canonicalFingerprint(projectPath),
+        projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+        providerEnvironmentFingerprint,
+        selectedAuthFingerprint,
+        binaryFingerprint,
+        configFingerprint: buildManagedConfigFingerprint(managedConfig),
+        nativeAccountIdentityFingerprint,
+        nativeAccountIdentitySource,
+        nativeTargetExecutableFingerprint,
+        profileLayoutFingerprint: canonicalFingerprint(OPEN_CODE_SCOPED_PROFILE_LAYOUT_GENERATION),
+        automaticUserPluginFingerprint,
+        plugins: planningPlugins,
+      },
+    })
+  }
 
   planScopedProfile(input: OpenCodePlanScopedProfileInput): OpenCodeScopedProfilePlanContract {
     return planScopedProfile(input)
