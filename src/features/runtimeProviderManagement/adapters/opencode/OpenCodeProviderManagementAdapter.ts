@@ -805,6 +805,8 @@ function applyClearedProjectDefaultToInventory(
     return inventory
   }
   const effectiveManagedDefaultModelId = profile.allProjectsDefaultModelId ?? null
+  const effectiveDefaultModelId =
+    effectiveManagedDefaultModelId ?? profile.importedConfigDefaultModelId ?? null
   const { model: _projectDefaultModel, ...managedConfigWithoutModel } = profile.managedConfig
   return {
     ...inventory,
@@ -813,8 +815,8 @@ function applyClearedProjectDefaultToInventory(
       projectDefaultModelId: null,
       effectiveManagedDefaultModelId,
       effectiveManagedDefaultSource: effectiveManagedDefaultModelId ? 'all_projects' : null,
-      managedConfig: effectiveManagedDefaultModelId
-        ? { ...managedConfigWithoutModel, model: effectiveManagedDefaultModelId }
+      managedConfig: effectiveDefaultModelId
+        ? { ...managedConfigWithoutModel, model: effectiveDefaultModelId }
         : managedConfigWithoutModel,
     },
   }
@@ -4915,7 +4917,7 @@ export class OpenCodeProviderManagementAdapter
     const projectPath = input.projectPath?.trim()
     if (!projectPath) {
       return providerManagementError(
-        'runtime-misconfigured',
+        'unsupported-action',
         'A project path is required to clear its OpenCode default model',
       )
     }

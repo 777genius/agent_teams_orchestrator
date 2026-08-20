@@ -6508,6 +6508,85 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.defaultModelSource).toBe('all_projects')
   })
 
+  test('preserves an imported OpenCode config default when clear refresh times out', async () => {
+    const clearedProfiles: string[] = []
+    let probeCallCount = 0
+    const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: {
+        probe: async () => {
+          probeCallCount += 1
+          if (probeCallCount > 1) {
+            return inventory({
+              connectedProviders: [],
+              availableProviders: [],
+              models: [],
+              profile: null,
+              probeError: timeoutMessage,
+              diagnostics: [timeoutMessage],
+            })
+          }
+          return inventory({
+            models: ['openrouter/project-model', 'ollama/imported-model'],
+            profile: {
+              ...inventory().profile!,
+              projectDefaultModelId: 'openrouter/project-model',
+              importedConfigDefaultModelId: 'ollama/imported-model',
+              effectiveManagedDefaultModelId: 'openrouter/project-model',
+              effectiveManagedDefaultSource: 'project',
+              managedConfig: { model: 'openrouter/project-model' },
+            },
+          })
+        },
+      },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }),
+      },
+      managedPreferences: {
+        clearProjectDefaultModel: async profileRootPath => {
+          clearedProfiles.push(profileRootPath)
+        },
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.clearProjectDefaultModel({
+      runtimeId: 'opencode',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(clearedProfiles).toEqual(['/tmp/profile'])
+    expect(result.value.projectDefaultModel).toBeNull()
+    expect(result.value.allProjectsDefaultModel).toBeNull()
+    expect(result.value.defaultModel).toBe('ollama/imported-model')
+    expect(result.value.defaultModelSource).toBe('opencode_config')
+    expect(result.value.diagnostics).toContain(timeoutMessage)
+  })
+
+  test('rejects clearing a project default without a project path using the public error contract', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter()
+
+    const result = await adapter.clearProjectDefaultModel({
+      runtimeId: 'opencode',
+      projectPath: null,
+    })
+
+    expect(expectFailure(result)).toMatchObject({
+      code: 'unsupported-action',
+      message: 'A project path is required to clear its OpenCode default model',
+    })
+  })
+
   test('sets all-projects default without writing project preferences', async () => {
     const projectWrites: Array<{ profileRootPath: string; modelId: string }> = []
     const allProjectWrites: string[] = []

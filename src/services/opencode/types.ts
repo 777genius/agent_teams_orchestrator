@@ -28,6 +28,7 @@ export type OpenCodePreparedProfile = {
   profileRootPath: string
   projectDefaultModelId?: string | null
   allProjectsDefaultModelId?: string | null
+  importedConfigDefaultModelId?: string | null
   effectiveManagedDefaultModelId?: string | null
   effectiveManagedDefaultSource?: 'project' | 'all_projects' | null
   projectBehaviorFingerprint: string

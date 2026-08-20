@@ -4413,9 +4413,9 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersSetDefault(opts);
   });
-  runtimeProviders.command('clear-project-default').description('Clear the project OpenCode default and inherit the all-projects default').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
+  runtimeProviders.command('clear-project-default').description('Clear the project OpenCode default and inherit the next available default').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
-    projectPath?: string;
+    projectPath: string;
     compact?: boolean;
     json?: boolean;
   }) => {

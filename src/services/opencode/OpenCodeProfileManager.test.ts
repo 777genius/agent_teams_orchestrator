@@ -1114,6 +1114,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         models: { 'google/gemma-3n-e4b': {} },
       })
       expect(managedConfig.model).toBe('ollama/qwen2.5-coder:0.5b')
+      expect(profile.importedConfigDefaultModelId).toBe('ollama/qwen2.5-coder:0.5b')
       expect(managedConfig.small_model).toBe('llama.cpp/qwen-test:0.5b')
       expect(managedConfig.plugin).toEqual([
         'opencode-kiro@0.4.0',
