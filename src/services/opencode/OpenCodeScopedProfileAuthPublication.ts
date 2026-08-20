@@ -37,8 +37,8 @@ const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) 
   }
   return Object.freeze({
     commit: async () => {
-      await transaction!.commit().catch(() => undefined)
-      await directory.close().catch(() => undefined)
+      await transaction!.commit()
+      await directory.close()
     },
     rollback: async () => {
       try { await transaction!.rollback() }
@@ -50,25 +50,25 @@ const publishAuth: PublishAuth = async (directoryPath, fileName, bytes, signal) 
 export async function finalizeOpenCodeScopedProfileAuth(preparedProfile: object): Promise<void> {
   const record = profileAuthTransactions.get(preparedProfile)
   if (!record) return
+  await record.transaction.commit()
   profileAuthTransactions.delete(preparedProfile)
   if (record.signal) signalAuthTransactions.delete(record.signal)
-  await record.transaction.commit()
 }
 
 export async function rollbackOpenCodeScopedProfileAuth(preparedProfile: object): Promise<void> {
   const record = profileAuthTransactions.get(preparedProfile)
   if (!record) return
+  await record.transaction.rollback()
   profileAuthTransactions.delete(preparedProfile)
   if (record.signal) signalAuthTransactions.delete(record.signal)
-  await record.transaction.rollback()
 }
 
 export async function rollbackOpenCodeScopedProfileAuthSignal(signal: AbortSignal): Promise<void> {
   const record = signalAuthTransactions.get(signal)
   if (!record) return
+  await record.transaction.rollback()
   signalAuthTransactions.delete(signal)
   profileAuthTransactions.delete(record.profile)
-  await record.transaction.rollback()
 }
 
 /** The auth write is the final awaited preparation phase. */

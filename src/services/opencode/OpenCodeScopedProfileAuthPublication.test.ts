@@ -112,3 +112,24 @@ test('deadline signal can roll back auth before preparation returns its profile'
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('failed rollback remains unsettled and retryable', async () => {
+  const preparedProfile = { identity: 'retryable-rollback', purpose: 'provider-catalog' }
+  let attempts = 0
+  await commitOpenCodeScopedProfileAuth({
+    managedAuthPath: path.join(os.tmpdir(), 'retryable-auth.json'),
+    managedAuthBytes: Buffer.from('{}'),
+    preparedProfile,
+    publish: async () => ({
+      commit: async () => {},
+      rollback: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('injected durable rollback failure')
+      },
+    }),
+  })
+  await expect(rollbackOpenCodeScopedProfileAuth(preparedProfile))
+    .rejects.toThrow('injected durable rollback failure')
+  await rollbackOpenCodeScopedProfileAuth(preparedProfile)
+  expect(attempts).toBe(2)
+})

@@ -7,8 +7,8 @@ type Request = Readonly<{
   budgetMs: number
   cacheHome: string
   windowsPlatformAuthority: boolean
-  testStallPhase?: 'open' | 'commit'
-  testGate?: Readonly<{ phase: 'open' | 'commit'; path: string }>
+  testStallPhase?: 'open' | 'commit' | 'after-commit'
+  testGate?: Readonly<{ phase: 'open' | 'commit' | 'after-commit'; path: string }>
 }>
 
 const decoder = new TextDecoder()

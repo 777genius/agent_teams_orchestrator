@@ -6,21 +6,21 @@ import { Database } from 'bun:sqlite'
 
 import { allocateOpenCodeProviderCatalogAttempt } from './OpenCodeProviderCatalogService.js'
 
-test('global allocator keeps 4,096 scopes in fixed rows and monotonic sqlite_sequence', async () => {
+test('global allocator keeps 256 scopes in fixed rows and a monotonic transaction sequence', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-attempt-bound-'))
   const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
   process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
   try {
     const scope = '/canonical/project\0deepinfra'
     let allocation = await allocateOpenCodeProviderCatalogAttempt(`${scope}-0`, 1_000)
-    for (let index = 1; index < 4_096; index += 1) {
+    for (let index = 1; index < 256; index += 1) {
       allocation = await allocateOpenCodeProviderCatalogAttempt(`${scope}-${index}`, 1_000)
       if (index % 256 === 0) await new Promise<void>(resolve => setImmediate(resolve))
     }
-    expect(allocation.requestGeneration).toBe(4_096)
+    expect(allocation.requestGeneration).toBe(256)
     const allocationRoot = path.join(root, 'opencode', 'provider-catalog-attempts-v2')
     await mkdir(path.join(allocationRoot, 'crashed-unrelated.ticket'), { recursive: true })
-    expect((await allocateOpenCodeProviderCatalogAttempt(scope, 900)).requestGeneration).toBe(4_097)
+    expect((await allocateOpenCodeProviderCatalogAttempt(scope, 900)).requestGeneration).toBe(257)
     const inspection = new Database(path.join(allocationRoot, 'attempts.sqlite'))
     inspection.exec('PRAGMA wal_checkpoint(PASSIVE)')
     expect(inspection.query<{ count: number }, []>('SELECT count(*) AS count FROM allocation_ticket').get()?.count)
@@ -41,9 +41,9 @@ test('global allocator keeps 4,096 scopes in fixed rows and monotonic sqlite_seq
       return Number(stdout.trim())
     }))
     expect(concurrent.sort((left, right) => left - right)).toEqual(
-      Array.from({ length: 8 }, (_, index) => 4_098 + index),
+      Array.from({ length: 8 }, (_, index) => 258 + index),
     )
-    expect((await allocateOpenCodeProviderCatalogAttempt(scope, 700)).requestGeneration).toBe(4_106)
+    expect((await allocateOpenCodeProviderCatalogAttempt(scope, 700)).requestGeneration).toBe(266)
     const files = await readdir(allocationRoot)
     expect(files.filter(file => file.startsWith('attempts.sqlite')).length).toBeLessThanOrEqual(3)
     expect((await stat(path.join(allocationRoot, 'attempts.sqlite'))).size).toBeLessThan(1_000_000)

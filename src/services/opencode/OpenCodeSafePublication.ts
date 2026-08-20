@@ -381,10 +381,11 @@ export class OpenCodeSafePublicationDirectory {
       }
       if (testHooks?.retainTransaction) {
         let settled = false
+        let settlement: Promise<void> | null = null
         const finish = async (rollback: boolean): Promise<void> => {
           if (settled) return
-          settled = true
-          try {
+          if (settlement) return settlement
+          settlement = (async () => {
             if (rollback && temporaryIdentity) {
               // Capture and prove the currently named object before changing
               // its visibility. A successor or any verification failure is a
@@ -410,11 +411,20 @@ export class OpenCodeSafePublicationDirectory {
                 if ((rollbackError as NodeJS.ErrnoException).code !== 'ENOENT') throw rollbackError
               }
             }
-          } finally {
-            await unlink(quarantinePath).catch(() => undefined)
-            await unlink(backupPath).catch(() => undefined)
+            // Settlement records remain intact until every required mutation is
+            // durable. A failed commit/rollback is retryable and is never
+            // reported as settled merely because cleanup began.
+            await unlink(quarantinePath).catch(error => {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            })
+            await unlink(backupPath).catch(error => {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            })
             await this.#handle?.sync().catch(fail)
-          }
+            settled = true
+          })()
+          try { await settlement }
+          finally { if (!settled) settlement = null }
         }
         testHooks.retainTransaction(Object.freeze({
           commit: () => finish(false),

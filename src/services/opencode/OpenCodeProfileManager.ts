@@ -4276,7 +4276,14 @@ export class OpenCodeProfileManager {
     }
 
     const profileScopeIdentity = canonicalFingerprint(policy.identity.canonicalInput)
-    const profileRootKey = profileScopeIdentity
+    // Catalog authorization is attempt-local. Passive model discovery must not
+    // publish into the canonical profile's auth pathname and then rely on a
+    // rollback racing a successor. Content-addressed dependency/download caches
+    // remain shared, while the authorization-bearing profile tree receives this
+    // unguessable operation identity.
+    const profileRootKey = policy.purpose === 'provider-catalog'
+      ? `${profileScopeIdentity}-catalog-${canonicalFingerprint(runtimeInstanceId)}`
+      : profileScopeIdentity
     const profileRootPath = path.join(this.paths.data, 'opencode', 'scoped-profiles', profileRootKey)
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
