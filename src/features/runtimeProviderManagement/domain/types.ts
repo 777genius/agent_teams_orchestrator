@@ -231,6 +231,12 @@ export type ProviderDirectoryEntry = {
     requiresManualConfig: boolean
     supportedInlineAuth: boolean
     configuredAuthless: boolean
+    /** Passive evidence only; connection state must not be used as a substitute. */
+    configuredEvidence?: 'configured' | 'not_configured' | 'unknown'
+    /** Safe redacted identifiers used only by passive directory search. */
+    knownModelIds?: readonly string[]
+    knownModelIdsTotal?: number
+    knownModelIdsTruncated?: boolean
   }
 }
 

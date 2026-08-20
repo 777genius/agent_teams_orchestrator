@@ -96,6 +96,9 @@ describe('OpenCode passive status production adapters', () => {
       lastConnected: { value: { state: 'connected', at: 800 }, authority: 'auth_metadata' },
       catalogAvailable: { value: 'available', authority: 'catalog_snapshot' },
       executionVerified: { value: 'verified', authority: 'execution_snapshot' },
+      knownModelIds: ['deepinfra/llama-4'],
+      knownModelIdsTotal: 1,
+      knownModelIdsTruncated: false,
     })
     expect(status.authorization).toBe('unknown')
     expect(status.launchReadiness).toBe('not_authorized')
@@ -112,6 +115,10 @@ describe('OpenCode passive status production adapters', () => {
     const staleStatus = await stale.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
     expect(staleStatus.providers[0].configured).toMatchObject({
       value: 'configured', freshness: 'stale', condition: 'degraded', authority: 'config_metadata', issueCode: 'expired',
+    })
+    expect(staleStatus.providers[0]).toMatchObject({
+      catalogAvailable: { value: 'available', freshness: 'stale', authority: 'catalog_snapshot' },
+      knownModelIds: ['deepinfra/llama-4'],
     })
 
     expect(staleStatus.binary).toMatchObject({

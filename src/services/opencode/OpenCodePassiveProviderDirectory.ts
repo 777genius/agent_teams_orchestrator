@@ -6,7 +6,14 @@ import type {
 } from '../../features/runtimeProviderManagement/domain/types.js'
 import { OpenCodePassiveStatusProductionReader } from './OpenCodePassiveStatusProductionReader.js'
 import type { OpenCodePassiveStatusV1 } from './OpenCodePassiveStatusContract.js'
-import { OPEN_CODE_PASSIVE_MAX_PROVIDERS } from './OpenCodePassiveStatusContract.js'
+import {
+  isOpenCodeCanonicalModelId,
+  OPEN_CODE_PASSIVE_MAX_PROVIDERS,
+} from './OpenCodePassiveStatusContract.js'
+import {
+  OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS,
+  OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS,
+} from './OpenCodeRedactedStatusSnapshot.js'
 import {
   readOpenCodePassiveStatusWithinRouteDeadline,
   type OpenCodePassiveRouteDeadlineDeps,
@@ -83,6 +90,7 @@ export function buildOpenCodePassiveProviderDirectory(
   const all = status.providers.map(provider => {
     const connected = provider.lastConnected.value.state === 'connected'
     const configured = provider.configured.value === 'configured'
+    const knownModelIds = searchableModelIds(provider)
     const state: ProviderDirectoryEntry['state'] = connected
       ? 'connected'
       : configured ? 'not-connected' : 'available'
@@ -107,13 +115,22 @@ export function buildOpenCodePassiveProviderDirectory(
         requiresManualConfig: false,
         supportedInlineAuth: false,
         configuredAuthless: false,
+        configuredEvidence: provider.configured.value,
+        knownModelIds,
+        knownModelIdsTotal: projectedModelTotal(provider, knownModelIds.length),
+        knownModelIdsTruncated: provider.knownModelIdsTruncated === true
+          || projectedModelTotal(provider, knownModelIds.length) > knownModelIds.length,
       },
     } satisfies ProviderDirectoryEntry
   })
   const filtered = all.filter(entry => {
-    if (query && !`${entry.providerId} ${entry.displayName}`.toLowerCase().includes(query)) return false
+    if (query && ![
+      entry.providerId,
+      entry.displayName,
+      ...(entry.metadata.knownModelIds ?? []),
+    ].some(value => value.toLowerCase().includes(query))) return false
     if (filter === 'connected') return entry.state === 'connected'
-    if (filter === 'configured') return entry.state === 'connected' || entry.state === 'not-connected'
+    if (filter === 'configured') return entry.metadata.configuredEvidence === 'configured'
     if (filter === 'connectable') return false
     if (filter === 'manual') return false
     if (filter === 'has-models') return entry.metadata.hasKnownModels
@@ -144,6 +161,30 @@ export function buildOpenCodePassiveProviderDirectory(
         : [],
     fetchedAt: new Date(status.completedAt).toISOString(),
   }
+}
+
+function searchableModelIds(provider: OpenCodePassiveStatusV1['providers'][number]): readonly string[] {
+  if (provider.catalogAvailable.value !== 'available'
+    || provider.catalogAvailable.authority !== 'catalog_snapshot'
+    || (provider.catalogAvailable.freshness !== 'fresh' && provider.catalogAvailable.freshness !== 'stale')
+    || !Array.isArray(provider.knownModelIds)) return []
+  const unique = new Set<string>()
+  for (const modelId of provider.knownModelIds) {
+    if (unique.size >= OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) break
+    if (isOpenCodeCanonicalModelId(modelId)) unique.add(modelId)
+  }
+  return Object.freeze([...unique])
+}
+
+function projectedModelTotal(
+  provider: OpenCodePassiveStatusV1['providers'][number],
+  retained: number,
+): number {
+  const total = provider.knownModelIdsTotal
+  return typeof total === 'number' && Number.isSafeInteger(total)
+    && total >= retained && total <= OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS
+    ? total
+    : retained
 }
 
 function displayName(providerId: string): string {

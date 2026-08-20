@@ -49,6 +49,10 @@ export type OpenCodePassiveProviderStatus = {
   lastConnected: OpenCodePassiveObservation<OpenCodeLastConnectedStatus>
   catalogAvailable: OpenCodePassiveObservation<OpenCodeCatalogStatus>
   executionVerified: OpenCodePassiveObservation<OpenCodeExecutionStatus>
+  /** Redacted, bounded catalog projection. Absent means no searchable evidence. */
+  knownModelIds?: readonly string[]
+  knownModelIdsTotal?: number
+  knownModelIdsTruncated?: boolean
 }
 export type OpenCodePassiveStatusV1 = {
   contractVersion: 1

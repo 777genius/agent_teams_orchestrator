@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { types as nodeTypes } from 'node:util'
 
 import {
+  isOpenCodeCanonicalModelId,
   isOpenCodeCanonicalProviderId,
   OPEN_CODE_PASSIVE_MAX_PROVIDERS,
   isOpenCodePassiveBinaryVersion,
@@ -19,6 +20,7 @@ import {
 import {
   decodeOpenCodeRedactedSnapshotV1,
   OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES,
+  type OpenCodeRedactedSnapshotProviderV1,
   type OpenCodeRedactedSnapshotV1,
 } from './OpenCodeRedactedStatusSnapshot.js'
 
@@ -371,7 +373,7 @@ function resolveBinary(result: OpenCodePassiveReadResult<{ present: boolean; ver
   return degraded(history, { presence: 'unknown', version: null }, resultIssue(result, fallback))
 }
 
-function resolveProvider(providerId: string, completions: Completion[], history: OpenCodePassiveProviderStatus | undefined, now: number, fallback: OpenCodePassiveIssueCode): OpenCodePassiveProviderStatus {
+function resolveProvider(providerId: string, completions: Completion[], history: OpenCodeRedactedSnapshotProviderV1 | undefined, now: number, fallback: OpenCodePassiveIssueCode): OpenCodePassiveProviderStatus {
   const firstProvider = completions.find(item => item.target === 'provider' && item.providerId === providerId) as Extract<Completion, { target: 'provider' }> | undefined
   const expectedScope = firstProvider?.expectedScope
   const find = (kind: ProviderReadKind) => (completions.find(item => item.target === 'provider' && item.expectedScope === expectedScope && item.providerId === providerId && item.kind === kind) as Extract<Completion, { target: 'provider' }> | undefined)?.result
@@ -379,7 +381,7 @@ function resolveProvider(providerId: string, completions: Completion[], history:
   const connected = find('lastConnected')
   const catalog = find('catalogAvailable')
   const execution = find('executionVerified')
-  return {
+  const resolved: OpenCodePassiveProviderStatus = {
     providerId,
     configured: validBooleanResult(configured, 'configured', now)
       ? authoritative(configured.value.configured ? 'configured' : 'not_configured', 'config_metadata', configured, now)
@@ -394,6 +396,19 @@ function resolveProvider(providerId: string, completions: Completion[], history:
       ? authoritative(execution.value.verified ? 'verified' : 'rejected', 'execution_snapshot', execution, now)
       : degraded(history?.executionVerified, 'unknown', resultIssue(execution, fallback)),
   }
+  // Model identifiers have no active read port. They may only flow from the
+  // already decoded, project-scoped redacted catalog snapshot. Legacy
+  // snapshots without identifiers deliberately remain an empty projection.
+  if (history && (history.modelIds !== undefined || history.modelIdsTotal !== undefined)) {
+    const identifiers = history.modelIds ?? []
+    if (identifiers.every(isOpenCodeCanonicalModelId)) {
+      resolved.knownModelIds = [...new Set(identifiers)]
+      resolved.knownModelIdsTotal = history.modelIdsTotal ?? resolved.knownModelIds.length
+      resolved.knownModelIdsTruncated = history.modelIdsTruncated
+        ?? resolved.knownModelIdsTotal > resolved.knownModelIds.length
+    }
+  }
+  return resolved
 }
 
 function authoritative<T>(value: T, authority: OpenCodePassiveAuthority, result: OpenCodePassiveReadSuccess<unknown>, now: number): OpenCodePassiveObservation<T> {
@@ -486,6 +501,7 @@ function freezePassiveStatus(status: OpenCodePassiveStatusV1): OpenCodePassiveSt
     freezeObservation(provider.lastConnected)
     freezeObservation(provider.catalogAvailable)
     freezeObservation(provider.executionVerified)
+    if (provider.knownModelIds) Object.freeze(provider.knownModelIds)
     Object.freeze(provider)
   }
   Object.freeze(status.providers)
