@@ -1,9 +1,22 @@
 import { describe, expect, test } from 'bun:test'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
+import { buildOpenCodePassiveProviderDirectory } from './OpenCodePassiveProviderDirectory.js'
 import { OpenCodePassiveStatusProductionReader } from './OpenCodePassiveStatusProductionReader.js'
-import { encodeOpenCodeRedactedSnapshotV1, type OpenCodeRedactedSnapshotV1 } from './OpenCodeRedactedStatusSnapshot.js'
+import {
+  decodeOpenCodeRedactedSnapshotV1,
+  encodeOpenCodeRedactedSnapshotV1,
+  type OpenCodeRedactedSnapshotV1,
+} from './OpenCodeRedactedStatusSnapshot.js'
 import type { OpenCodeInventorySnapshot } from './types.js'
+
+function managedProfile(...providerIds: string[]): NonNullable<OpenCodeInventorySnapshot['profile']> {
+  return {
+    managedConfig: {
+      provider: Object.fromEntries(providerIds.map(providerId => [providerId, {}])),
+    },
+  } as NonNullable<OpenCodeInventorySnapshot['profile']>
+}
 
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
   return {
@@ -11,7 +24,7 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
     binaryPath: '/redacted/by-publisher',
     version: '1.2.3',
     projectPath: '/project/secret-name',
-    profile: null,
+    profile: managedProfile('deepinfra'),
     connectedProviders: [{ id: 'deepinfra', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }],
     availableProviders: ['deepinfra'],
     models: ['deepinfra/llama-4'],
@@ -20,46 +33,59 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
   }
 }
 
+function publisherHarness(clock: { now: number }) {
+  let stored: string | null = null
+  let writes = 0
+  const publisher = new OpenCodeActiveStatusSnapshotPublisher({
+    now: () => clock.now,
+    canonicalizePath: async () => '/canonical/project',
+    readSnapshot: async () => stored,
+    writer: {
+      write: async (snapshot: OpenCodeRedactedSnapshotV1) => {
+        const encoded = encodeOpenCodeRedactedSnapshotV1(snapshot)
+        if (!encoded.ok || !encoded.bytes) throw new Error('invalid snapshot')
+        writes += 1
+        stored = new TextDecoder().decode(encoded.bytes)
+      },
+    },
+  })
+  return {
+    publisher,
+    stored: () => stored,
+    writes: () => writes,
+  }
+}
+
+function productionReader(clock: { now: number }, stored: () => string | null) {
+  return new OpenCodePassiveStatusProductionReader({
+    now: () => clock.now,
+    canonicalizePath: async () => '/canonical/project',
+    readBoundedText: async () => stored(),
+  })
+}
+
 describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
   test('publishes redacted active authority, retains it on transient updates, and passive status has zero write/probe effects', async () => {
-    let now = 1_000
-    let stored: string | null = null
-    let writes = 0
-    const publisher = new OpenCodeActiveStatusSnapshotPublisher({
-      now: () => now,
-      canonicalizePath: async () => '/canonical/project',
-      readSnapshot: async () => stored,
-      writer: {
-        write: async (snapshot: OpenCodeRedactedSnapshotV1) => {
-          writes += 1
-          const encoded = encodeOpenCodeRedactedSnapshotV1(snapshot)
-          if (!encoded.ok || !encoded.bytes) throw new Error('invalid snapshot')
-          stored = new TextDecoder().decode(encoded.bytes)
-        },
-      },
-    })
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
 
-    await publisher.publishInventory(inventory())
-    await publisher.publishProviderUpdate({
+    await harness.publisher.publishInventory(inventory())
+    await harness.publisher.publishProviderUpdate({
       projectPath: '/project/secret-name', providerId: 'deepinfra', executionVerified: true,
       modelIds: ['deepinfra/llama-4'],
     })
-    expect(writes).toBe(2)
-    expect(stored).not.toContain('/project/secret-name')
-    expect(stored).not.toContain('/secret/auth.json')
-    expect(stored).not.toContain('/redacted/by-publisher')
+    expect(harness.writes()).toBe(2)
+    expect(harness.stored()).not.toContain('/project/secret-name')
+    expect(harness.stored()).not.toContain('/secret/auth.json')
+    expect(harness.stored()).not.toContain('/redacted/by-publisher')
 
-    await publisher.publishInventory(inventory({ probeError: 'transient timeout' }))
-    expect(writes).toBe(2)
+    await harness.publisher.publishInventory(inventory({ probeError: 'transient timeout' }))
+    expect(harness.writes()).toBe(2)
 
-    now = 2_000
-    const reader = new OpenCodePassiveStatusProductionReader({
-      now: () => now,
-      canonicalizePath: async () => '/canonical/project',
-      readBoundedText: async filePath => filePath.endsWith('binary.snapshot.json') ? stored : stored,
-    })
+    clock.now = 2_000
+    const reader = productionReader(clock, harness.stored)
     const status = await reader.reader.read({ projectPath: '/project/secret-name', providerIds: ['deepinfra'], timeoutMs: 50 })
-    expect(writes).toBe(2)
+    expect(harness.writes()).toBe(2)
     expect(status.providers[0]).toMatchObject({
       configured: { value: 'configured', freshness: 'fresh' },
       lastConnected: { value: { state: 'connected' }, freshness: 'fresh' },
@@ -68,5 +94,109 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     })
     expect(status.authorization).toBe('unknown')
     expect(status.launchReadiness).toBe('not_authorized')
+  })
+
+  test('ages expired retained execution proof before a later inventory capture and keeps unrelated fresh proof readable', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory())
+    await harness.publisher.publishProviderUpdate({
+      projectPath: '/project/secret-name', providerId: 'deepinfra', executionVerified: true,
+    })
+
+    clock.now = 120_000
+    await harness.publisher.publishProviderUpdate({
+      projectPath: '/project/secret-name', providerId: 'ollama', executionVerified: true,
+    })
+    clock.now = 301_001
+    await harness.publisher.publishInventory(inventory())
+
+    const serialized = harness.stored()
+    expect(serialized).not.toBeNull()
+    const decoded = decodeOpenCodeRedactedSnapshotV1(serialized!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.capturedAt).toBe(301_001)
+    expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')?.executionVerified)
+      .toEqual({
+        value: 'verified', authority: 'execution_snapshot', freshness: 'stale', condition: 'degraded',
+        observedAt: 1_000, validUntil: 301_000, issueCode: 'expired',
+      })
+    expect(decoded.value.providers.find(provider => provider.providerId === 'ollama')?.executionVerified)
+      .toMatchObject({ value: 'verified', freshness: 'fresh', observedAt: 120_000, validUntil: 420_000 })
+
+    const status = await productionReader(clock, harness.stored).reader.read({
+      projectPath: '/project/secret-name', providerIds: ['deepinfra', 'ollama'], timeoutMs: 50,
+    })
+    expect(status.providers[0]).toMatchObject({
+      providerId: 'deepinfra',
+      configured: { value: 'configured', freshness: 'fresh' },
+      lastConnected: { value: { state: 'connected' }, freshness: 'fresh' },
+      catalogAvailable: { value: 'available', freshness: 'fresh' },
+      executionVerified: {
+        value: 'verified', freshness: 'stale', condition: 'degraded', issueCode: 'expired',
+        observedAt: 1_000, validUntil: 301_000,
+      },
+    })
+    expect(status.providers[1]?.executionVerified).toMatchObject({ value: 'verified', freshness: 'fresh' })
+    expect(harness.writes()).toBe(4)
+  })
+
+  test('publishes managed authless configuration independently from connection without authorizing launch', async () => {
+    const clock = { now: 10_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile('ollama'),
+      connectedProviders: [],
+      availableProviders: ['ollama'],
+      models: ['ollama/qwen2.5-coder'],
+    }))
+
+    const status = await productionReader(clock, harness.stored).reader.read({
+      projectPath: '/project/secret-name', providerIds: ['ollama'], timeoutMs: 50,
+    })
+    expect(status.providers[0]).toMatchObject({
+      configured: { value: 'configured', authority: 'config_metadata' },
+      lastConnected: { value: { state: 'not_connected' }, authority: 'auth_metadata' },
+      catalogAvailable: { value: 'available', authority: 'catalog_snapshot' },
+    })
+    expect(status.authorization).toBe('unknown')
+    expect(status.launchReadiness).toBe('not_authorized')
+    const configured = buildOpenCodePassiveProviderDirectory(status, { filter: 'configured' })
+    expect(configured.entries.map(entry => [entry.providerId, entry.state]))
+      .toEqual([['ollama', 'not-connected']])
+  })
+
+  test('clears missing connections on complete inventory and retains positive evidence on transient inventory', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory())
+
+    clock.now = 2_000
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile(), connectedProviders: [], availableProviders: [], models: [],
+    }))
+    let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')).toMatchObject({
+      configured: { value: 'not_configured', observedAt: 2_000 },
+      lastConnected: { value: { state: 'not_connected' }, observedAt: 2_000 },
+      catalogAvailable: { value: 'unavailable', observedAt: 2_000 },
+    })
+
+    clock.now = 3_000
+    await harness.publisher.publishInventory(inventory())
+    const writesBeforeTransient = harness.writes()
+    clock.now = 4_000
+    await harness.publisher.publishInventory(inventory({
+      connectedProviders: [], availableProviders: [], models: [], probeError: 'temporary provider timeout',
+    }))
+    expect(harness.writes()).toBe(writesBeforeTransient)
+    decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')?.lastConnected)
+      .toMatchObject({ value: { state: 'connected', at: 3_000 }, observedAt: 3_000 })
   })
 })
