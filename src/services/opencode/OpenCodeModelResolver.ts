@@ -1,9 +1,9 @@
 import {
   formatOpenCodeModelRef,
-  normalizeOpenCodeProviderId,
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
 import { evaluateOpenCodeAgentModelCompatibility } from './OpenCodeAgentModelCompatibility.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 
 import type { OpenCodeProvisioningSnapshot } from './types.js'
 
@@ -25,7 +25,7 @@ function getConfigProviderModelMatches(
   const matches: Array<{ providerId: string; modelId: string }> = []
 
   for (const provider of providers) {
-    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
+    const providerId = canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
     const models = asRecord(provider.models)
     if (!providerId || !models) {
       continue
@@ -54,7 +54,7 @@ function getLiveProviderModelMatches(
   const matches: Array<{ providerId: string; modelId: string }> = []
 
   for (const provider of snapshot.providers?.all ?? []) {
-    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
+    const providerId = canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
     const models = asRecord(provider.models)
     if (!providerId || !models) {
       continue
@@ -97,7 +97,7 @@ function getDefaultProviderMatch(
     }
     for (const [providerId, modelId] of Object.entries(defaults)) {
       if (asString(modelId) === rawModelId) {
-        return { providerId, modelId: rawModelId }
+        return { providerId: canonicalizeOpenCodeProviderId(providerId), modelId: rawModelId }
       }
     }
   }
@@ -107,8 +107,15 @@ function getDefaultProviderMatch(
 
 function splitProviderScopedModel(
   selectedModel: string,
-): { providerId: string; modelId: string } | null {
-  return parseOpenCodeProviderScopedModelRef(selectedModel)
+): { providerId: string; modelId: string; raw: string } | null {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!parsed) return null
+  const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  return {
+    providerId,
+    modelId: parsed.modelId,
+    raw: formatOpenCodeModelRef(providerId, parsed.modelId),
+  }
 }
 
 function hasProviderScopedModel(
@@ -117,13 +124,13 @@ function hasProviderScopedModel(
   modelId: string,
 ): boolean {
   const scopedModel = formatScopedModel(providerId, modelId)
-  if ((snapshot.models ?? []).some(model => parseOpenCodeProviderScopedModelRef(model)?.raw === scopedModel)) {
+  if ((snapshot.models ?? []).some(model => splitProviderScopedModel(model)?.raw === scopedModel)) {
     return true
   }
 
   const providers = snapshot.configProviders?.providers ?? []
   for (const provider of providers) {
-    if (normalizeOpenCodeProviderId(asString(provider.id)) !== providerId) {
+    if (canonicalizeOpenCodeProviderId(asString(provider.id) ?? '') !== providerId) {
       continue
     }
     const models = asRecord(provider.models)
@@ -133,7 +140,7 @@ function hasProviderScopedModel(
   }
 
   for (const provider of snapshot.providers?.all ?? []) {
-    if (normalizeOpenCodeProviderId(asString(provider.id)) !== providerId) {
+    if (canonicalizeOpenCodeProviderId(asString(provider.id) ?? '') !== providerId) {
       continue
     }
     const models = asRecord(provider.models)
@@ -148,35 +155,35 @@ function getKnownProviderIds(snapshot: OpenCodeProvisioningSnapshot): Set<string
   const providerIds = new Set<string>()
 
   for (const provider of snapshot.configProviders?.providers ?? []) {
-    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
+    const providerId = canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
     if (providerId) {
       providerIds.add(providerId)
     }
   }
 
   for (const provider of snapshot.providers?.all ?? []) {
-    const providerId = normalizeOpenCodeProviderId(asString(provider.id))
+    const providerId = canonicalizeOpenCodeProviderId(asString(provider.id) ?? '')
     if (providerId) {
       providerIds.add(providerId)
     }
   }
 
   for (const providerId of snapshot.providers?.connected ?? []) {
-    const normalizedProviderId = normalizeOpenCodeProviderId(asString(providerId))
+    const normalizedProviderId = canonicalizeOpenCodeProviderId(asString(providerId) ?? '')
     if (normalizedProviderId) {
       providerIds.add(normalizedProviderId)
     }
   }
 
   for (const providerId of Object.keys(asRecord(snapshot.configProviders?.default) ?? {})) {
-    const normalizedProviderId = normalizeOpenCodeProviderId(providerId)
+    const normalizedProviderId = canonicalizeOpenCodeProviderId(providerId)
     if (normalizedProviderId) {
       providerIds.add(normalizedProviderId)
     }
   }
 
   for (const providerId of Object.keys(asRecord(snapshot.providers?.default) ?? {})) {
-    const normalizedProviderId = normalizeOpenCodeProviderId(providerId)
+    const normalizedProviderId = canonicalizeOpenCodeProviderId(providerId)
     if (normalizedProviderId) {
       providerIds.add(normalizedProviderId)
     }
@@ -201,7 +208,9 @@ function assertAgentCompatibleModel(
   snapshot: OpenCodeProvisioningSnapshot,
 ): string {
   const metadata = snapshot.modelMetadata?.find(item => item.id === resolvedModel)
-  const compatibility = evaluateOpenCodeAgentModelCompatibility(resolvedModel, metadata)
+  const compatibility = evaluateOpenCodeAgentModelCompatibility(resolvedModel, metadata, {
+    requireAffirmativeCapabilities: snapshot.profileLiveModelVerification === true,
+  })
   if (!compatibility.compatible) {
     throw new Error(
       `OpenCode model "${resolvedModel}" cannot be used by Agent Teams: ${compatibility.reason}`,
@@ -246,8 +255,8 @@ export function resolveOpenCodeProviderScopedModel(
 
   const connectedProviders = new Set(
     (snapshot.providers?.connected ?? [])
-      .map(providerId => normalizeOpenCodeProviderId(providerId))
-      .filter((providerId): providerId is string => Boolean(providerId)),
+      .map(providerId => canonicalizeOpenCodeProviderId(providerId))
+      .filter(providerId => providerId !== null),
   )
   const connectedMatches = matches.filter(match => connectedProviders.has(match.providerId))
   if (connectedMatches.length === 1 && connectedMatches[0]) {

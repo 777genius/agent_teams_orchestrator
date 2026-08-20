@@ -1,18 +1,22 @@
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants as fsConstants, type Dirent } from 'node:fs'
 import {
   chmod,
   copyFile,
   lstat,
   mkdir,
+  open,
   readlink,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
   symlink,
   writeFile,
+  realpath,
+  type FileHandle,
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -32,6 +36,10 @@ import {
   getOpenCodeCuratedSubscriptionProviderConfigs,
   getOpenCodeManagedSubscriptionPluginPackages,
 } from './OpenCodeCuratedSubscriptionCatalog.js'
+import {
+  OpenCodeSafePublicationDirectory,
+  withOpenCodeSafePublicationDirectory,
+} from './OpenCodeSafePublication.js'
 import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
@@ -55,6 +63,16 @@ import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
+import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import {
+  canonicalSerializeOpenCodePolicyIdentity,
+  planScopedProfile,
+  resolveOpenCodeOperationPolicy,
+  type OpenCodePreservedPlugin,
+} from './OpenCodeOperationPolicy.js'
+
+export { planScopedProfile } from './OpenCodeOperationPolicy.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import {
   buildCursorAgentResourceExhaustedPreloadScript,
   CURSOR_RESOURCE_EXHAUSTED_PATCH_DISABLED_ENV,
@@ -63,12 +81,16 @@ import type {
   OpenCodeMcpServerConfig,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
+  OpenCodeScopedPreparedProfile,
+  OpenCodePlanScopedProfileInput,
+  OpenCodeScopedProfilePlanContract,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
 export const OPEN_CODE_TEAMMATE_AGENT_NAME = 'teammate'
 export const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT_NAME = 'teammate-bootstrap'
 export const OPEN_CODE_MODEL_PROBE_AGENT_NAME = 'teammate-model-probe'
+export const OPEN_CODE_SCOPED_PROFILE_LAYOUT_GENERATION = '1'
 
 const ATLAS_CLOUD_PROVIDER_ID = 'atlascloud'
 const GITHUB_COPILOT_PROVIDER_ID = 'github-copilot'
@@ -454,11 +476,174 @@ async function runAfterSettled(previous: Promise<void> | undefined): Promise<voi
   }
 }
 
+/** Pure ownership rule shared by runtime validation and non-root fixtures. */
+export function isOpenCodeManagedPathComponentOwnershipValid(
+  componentPath: string,
+  ownershipBoundaryPath: string,
+  metadata: { uid: number; mode: number },
+  currentUid: number,
+): boolean {
+  const component = path.resolve(componentPath)
+  const boundary = path.resolve(ownershipBoundaryPath)
+  const insideBoundary = component === boundary || component.startsWith(`${boundary}${path.sep}`)
+  return !insideBoundary
+    || (metadata.uid === currentUid && (metadata.mode & 0o022) === 0)
+}
+
+async function assertCanonicalOwnedPathComponents(
+  targetPath: string,
+  ownershipBoundaryPath: string,
+): Promise<void> {
+  const resolved = path.resolve(targetPath)
+  const ownershipBoundary = path.resolve(ownershipBoundaryPath)
+  if (resolved !== ownershipBoundary
+    && !resolved.startsWith(`${ownershipBoundary}${path.sep}`)) {
+    throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
+  }
+  const parsed = path.parse(resolved)
+  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
+  let current = parsed.root
+  for (const part of relativeParts) {
+    current = path.join(current, part)
+    const metadata = await lstat(current).catch(error => {
+      if (getErrnoCode(error) === 'ENOENT') return null
+      throw error
+    })
+    if (!metadata) break
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
+    }
+    if (typeof process.getuid === 'function') {
+      if (!isOpenCodeManagedPathComponentOwnershipValid(
+        current,
+        ownershipBoundary,
+        metadata,
+        process.getuid(),
+      )) {
+        throw new Error('OpenCode scoped managed path ancestry is not safely app-owned [redacted]')
+      }
+    }
+  }
+}
+
+/**
+ * Creates a managed directory one component at a time relative to a held
+ * no-follow directory descriptor. The optional callback is a deterministic
+ * adversarial-test seam; production callers omit it.
+ */
+export async function ensureOpenCodeManagedDirectoryPath(
+  targetPath: string,
+  ownershipBoundaryPath: string,
+  afterComponentOpened?: (componentPath: string) => void | Promise<void>,
+): Promise<void> {
+  const resolved = path.resolve(targetPath)
+  const ownershipBoundary = path.resolve(ownershipBoundaryPath)
+  if (resolved !== ownershipBoundary
+    && !resolved.startsWith(`${ownershipBoundary}${path.sep}`)) {
+    throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
+  }
+  if (process.platform === 'win32') {
+    // Node does not expose mkdirat/openat on Windows. Refuse the descriptor-
+    // relative S1 path instead of falling back to a check-then-mkdir sequence.
+    throw new Error('OpenCode scoped descriptor-relative directory creation is unsupported [redacted]')
+  }
+
+  const descriptorRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'
+  const parsed = path.parse(resolved)
+  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
+  const openDirectory = (directoryPath: string): Promise<FileHandle> => open(
+    directoryPath,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+  )
+  const walk = async (createMissing: boolean, notify: boolean): Promise<bigint[]> => {
+    let parent = await openDirectory(parsed.root)
+    try {
+      let logicalPath = parsed.root
+      for (const part of relativeParts) {
+        logicalPath = path.join(logicalPath, part)
+        const descriptorChild = path.join(descriptorRoot, String(parent.fd), part)
+        let child: FileHandle | null = null
+        try {
+          child = await openDirectory(descriptorChild)
+        } catch (error) {
+          if (!createMissing || getErrnoCode(error) !== 'ENOENT') {
+            throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]', {
+              cause: error,
+            })
+          }
+          try {
+            await mkdir(descriptorChild, { mode: 0o700 })
+          } catch (mkdirError) {
+            if (getErrnoCode(mkdirError) !== 'EEXIST') throw mkdirError
+          }
+          child = await openDirectory(descriptorChild).catch(error => {
+            throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]', {
+              cause: error,
+            })
+          })
+        }
+        try {
+          const metadata = await child.stat({ bigint: true })
+          if (!metadata.isDirectory() || (
+            typeof process.getuid === 'function'
+            && !isOpenCodeManagedPathComponentOwnershipValid(
+              logicalPath,
+              ownershipBoundary,
+              { uid: Number(metadata.uid), mode: Number(metadata.mode) },
+              process.getuid(),
+            )
+          )) {
+            throw new Error('OpenCode scoped managed path ancestry is not safely app-owned [redacted]')
+          }
+          if (notify) await afterComponentOpened?.(logicalPath)
+          await parent.close()
+          parent = child
+          child = null
+        } finally {
+          await child?.close().catch(() => undefined)
+        }
+      }
+      const metadata = await parent.stat({ bigint: true })
+      return [metadata.dev, metadata.ino]
+    } finally {
+      await parent.close().catch(() => undefined)
+    }
+  }
+
+  const createdIdentity = await walk(true, true)
+  const reachableIdentity = await walk(false, false)
+  if (createdIdentity[0] !== reachableIdentity[0] || createdIdentity[1] !== reachableIdentity[1]) {
+    throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+  }
+}
+
+async function readRegularFileNoFollow(filePath: string): Promise<Buffer | null> {
+  let handle: import('node:fs/promises').FileHandle
+  try {
+    handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') return null
+    throw error
+  }
+  try {
+    const metadata = await handle.stat()
+    if (!metadata.isFile()) throw new Error('OpenCode scoped managed file is not regular [redacted]')
+    return await handle.readFile()
+  } finally {
+    await handle.close()
+  }
+}
+
 const PROJECT_BEHAVIOR_FILES = [
   'opencode.json',
   'opencode.jsonc',
   'AGENTS.md',
   'CLAUDE.md',
+  'CLAUDE.local.md',
+  '.claude/CLAUDE.md',
+  '.github/copilot-instructions.md',
+  '.opencode/opencode.json',
+  '.opencode/opencode.jsonc',
   '.opencode/package.json',
   '.opencode/package-lock.json',
   '.opencode/pnpm-lock.yaml',
@@ -476,39 +661,62 @@ const PROJECT_BEHAVIOR_DIRS = [
   '.opencode/modes',
   '.opencode/skills',
   '.agents/skills',
+  '.claude/rules',
+  '.cursor/rules',
 ] as const
 
 async function collectBehaviorDirectoryEntries(
   rootPath: string,
   relativeDir: string,
+  excludeRuntimeDirectories = true,
+  includeMode = false,
 ): Promise<string[]> {
   const absoluteDir = path.join(rootPath, relativeDir)
   if (!(await fileExists(absoluteDir))) {
     return []
   }
+  const rootMetadata = await lstat(absoluteDir)
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    throw new Error(`OpenCode behavior directory has unsupported type (symlinks are not allowed): ${relativeDir}`)
+  }
 
   const entries: string[] = []
   const walk = async (currentDir: string): Promise<void> => {
+    const currentMetadata = await lstat(currentDir)
+    if (!currentMetadata.isDirectory() || currentMetadata.isSymbolicLink()) {
+      throw new Error('OpenCode behavior directory changed during capture')
+    }
     const dirents = await readdir(currentDir, { withFileTypes: true })
     dirents.sort((left, right) => left.name.localeCompare(right.name))
 
     for (const dirent of dirents) {
-      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') {
+      if (dirent.name === '.DS_Store' || dirent.name === '.git'
+        || (excludeRuntimeDirectories && dirent.name === 'node_modules')) {
         continue
       }
 
       const nextPath = path.join(currentDir, dirent.name)
       if (dirent.isDirectory()) {
+        const directoryMetadata = await lstat(nextPath)
+        if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+          throw new Error('OpenCode behavior directory changed during capture')
+        }
         await walk(nextPath)
         continue
       }
       if (!dirent.isFile()) {
-        continue
+        throw new Error(
+          `OpenCode behavior entry has unsupported type (symlinks are not allowed): ${path.relative(rootPath, nextPath)}`,
+        )
       }
 
       const relativePath = path.relative(rootPath, nextPath)
-      const content = await readFile(nextPath)
-      entries.push(`${relativePath}:${hashBuffer(content)}`)
+      const handle = await open(nextPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+      const [content, metadata] = await Promise.all([handle.readFile(), handle.stat()])
+        .finally(() => handle.close())
+      entries.push(includeMode
+        ? `${relativePath}:${metadata.mode & 0o777}:${hashBuffer(content)}`
+        : `${relativePath}:${hashBuffer(content)}`)
     }
   }
 
@@ -516,31 +724,420 @@ async function collectBehaviorDirectoryEntries(
   return entries
 }
 
-export async function collectProjectBehaviorMetadata(projectPath: string): Promise<{
-  projectBehaviorFingerprint: string
-  behaviorSources: string[]
-}> {
-  const entries: string[] = []
-  const behaviorSources = new Set<string>()
-
-  for (const relativePath of PROJECT_BEHAVIOR_FILES) {
-    const absolutePath = path.join(projectPath, relativePath)
-    if (!(await fileExists(absolutePath))) {
-      continue
+async function publishImmutableUserPluginSnapshot(
+  sourcePath: string,
+  targetPath: string,
+  expectedEntries: readonly string[],
+): Promise<void> {
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  targetPath = publicationDirectory.child(path.basename(targetPath))
+  try {
+  const verifyTarget = async (): Promise<boolean> => {
+    const metadata = await lstat(targetPath).catch(() => null)
+    if (!metadata) return false
+    if (metadata.isSymbolicLink()) {
+      // Migrate the former app-managed link without touching its user-owned target.
+      await rm(targetPath, { force: true })
+      return false
     }
+    if (!metadata.isDirectory()) {
+      throw new Error('OpenCode managed user plugin snapshot has unsupported type')
+    }
+    const actual = await collectBehaviorDirectoryEntries(
+      path.dirname(targetPath), path.basename(targetPath), false,
+    )
+    if (canonicalSerializeOpenCodePolicyIdentity(actual)
+      !== canonicalSerializeOpenCodePolicyIdentity(expectedEntries)) {
+      throw new Error('OpenCode managed user plugin snapshot fingerprint mismatch')
+    }
+    return true
+  }
+  if (await verifyTarget()) return
 
-    const content = await readFile(absolutePath)
-    entries.push(`${relativePath}:${hashBuffer(content)}`)
-    behaviorSources.add(relativePath)
+  const temporaryPath = `${targetPath}.snapshot-${process.pid}-${randomUUID()}`
+  const copiedEntries: string[] = []
+  const copyDirectory = async (sourceDirectory: string, targetDirectory: string): Promise<void> => {
+    const sourceMetadata = await lstat(sourceDirectory)
+    if (!sourceMetadata.isDirectory() || sourceMetadata.isSymbolicLink()) {
+      throw new Error('OpenCode user plugin directory changed during snapshot')
+    }
+    await mkdir(targetDirectory, { mode: 0o700 })
+    const dirents = await readdir(sourceDirectory, { withFileTypes: true })
+    dirents.sort((left, right) => left.name.localeCompare(right.name))
+    for (const dirent of dirents) {
+      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
+      const sourceEntry = path.join(sourceDirectory, dirent.name)
+      const targetEntry = path.join(targetDirectory, dirent.name)
+      if (dirent.isDirectory()) {
+        await copyDirectory(sourceEntry, targetEntry)
+        continue
+      }
+      if (!dirent.isFile()) {
+        throw new Error('OpenCode user plugin entry changed to an unsupported type during snapshot')
+      }
+      const sourceHandle = await open(sourceEntry, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+      try {
+        const metadata = await sourceHandle.stat()
+        if (!metadata.isFile()) {
+          throw new Error('OpenCode user plugin entry is not a regular file')
+        }
+        const bytes = await sourceHandle.readFile()
+        const relativePath = path.relative(sourcePath, sourceEntry)
+        copiedEntries.push(`${path.join('plugins', relativePath)}:${hashBuffer(bytes)}`)
+        await writeFile(targetEntry, bytes, { flag: 'wx', mode: 0o400 })
+      } finally {
+        await sourceHandle.close()
+      }
+    }
+    await chmod(targetDirectory, 0o500)
   }
 
-  for (const relativeDir of PROJECT_BEHAVIOR_DIRS) {
-    const dirEntries = await collectBehaviorDirectoryEntries(projectPath, relativeDir)
-    for (const entry of dirEntries) {
-      const separatorIndex = entry.indexOf(':')
-      behaviorSources.add(separatorIndex >= 0 ? entry.slice(0, separatorIndex) : entry)
-      entries.push(entry)
+  try {
+    await copyDirectory(sourcePath, temporaryPath)
+    if (canonicalSerializeOpenCodePolicyIdentity(copiedEntries)
+      !== canonicalSerializeOpenCodePolicyIdentity(expectedEntries)) {
+      throw new Error('OpenCode user plugin bytes changed during snapshot')
     }
+    await rename(temporaryPath, targetPath).catch(async error => {
+      if (getErrnoCode(error) !== 'EEXIST' || !(await verifyTarget())) throw error
+    })
+    await verifyTarget()
+  } finally {
+    await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+  }
+  } finally {
+    await publicationDirectory.close()
+  }
+}
+
+async function publishImmutablePluginDependencySnapshot(
+  targetPath: string,
+  plugins: OpenCodePlanScopedProfileInput['evidence']['plugins'],
+): Promise<void> {
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  targetPath = publicationDirectory.child(path.basename(targetPath))
+  try {
+  const entries = new Map<string, { bytes: Buffer; mode: 0o400 | 0o500 }>()
+  for (const plugin of plugins) {
+    for (const entry of plugin.immutableTreeEntries) {
+      const relativePath = entry.path.replaceAll('\\', '/')
+      const bytes = Buffer.from(entry.bytesBase64, 'base64')
+      const previous = entries.get(relativePath)
+      if (previous && (
+        previous.mode !== entry.mode || !previous.bytes.equals(bytes)
+      )) throw new Error('OpenCode scoped plugin dependency snapshot collision')
+      entries.set(relativePath, { bytes, mode: entry.mode })
+    }
+  }
+  const verify = async (): Promise<boolean> => {
+    const metadata = await lstat(targetPath).catch(() => null)
+    if (!metadata) return false
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error('OpenCode plugin dependency snapshot has unsupported type')
+    }
+    const actual = await collectBehaviorDirectoryEntries(
+      path.dirname(targetPath), path.basename(targetPath), false, true,
+    )
+    const expected = Array.from(entries, ([relativePath, entry]) =>
+      `${path.join(path.basename(targetPath), relativePath)}:${entry.mode}:${hashBuffer(entry.bytes)}`,
+    ).sort()
+    if (canonicalSerializeOpenCodePolicyIdentity(actual)
+      !== canonicalSerializeOpenCodePolicyIdentity(expected)) {
+      throw new Error('OpenCode plugin dependency snapshot fingerprint mismatch')
+    }
+    return true
+  }
+  if (await verify()) return
+  const temporaryPath = `${targetPath}.dependencies-${process.pid}-${randomUUID()}`
+  try {
+    await mkdir(temporaryPath, { mode: 0o700 })
+    for (const [relativePath, entry] of entries) {
+      const destination = path.join(temporaryPath, relativePath)
+      if (!destination.startsWith(`${temporaryPath}${path.sep}`)) {
+        throw new Error('OpenCode plugin dependency snapshot path escaped its root')
+      }
+      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+      await writeFile(destination, entry.bytes, { flag: 'wx', mode: entry.mode })
+    }
+    const freeze = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) await freeze(path.join(directory, entry.name))
+      }
+      await chmod(directory, 0o500)
+    }
+    await freeze(temporaryPath)
+    await rename(temporaryPath, targetPath).catch(async error => {
+      if (getErrnoCode(error) !== 'EEXIST' || !(await verify())) throw error
+    })
+    await verify()
+  } finally {
+    await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+  }
+  } finally {
+    await publicationDirectory.close()
+  }
+}
+
+type ProjectBehaviorFileIdentity = {
+  dev: bigint
+  ino: bigint
+  size: bigint
+  mtimeNs: bigint
+  ctimeNs: bigint
+}
+
+type ProjectBehaviorDirectoryIdentity = {
+  dev: bigint
+  ino: bigint
+}
+
+type OpenCodeProjectBehaviorCapture = {
+  projectBehaviorFingerprint: string
+  behaviorSources: string[]
+  behaviorEntryManifest: string[]
+  resolvedProjectPath: string
+  fdRoot: string
+  rootHandle: FileHandle | null
+  directories: Map<string, { handle: FileHandle; identity: ProjectBehaviorDirectoryIdentity }>
+  directoryEntryManifests: Map<string, string[]>
+  files: Map<string, { parentDirectory: string; name: string; identity: ProjectBehaviorFileIdentity }>
+  close(): Promise<void>
+}
+
+function sameProjectBehaviorDirectoryIdentity(
+  actual: { isDirectory(): boolean; dev: bigint; ino: bigint },
+  expected: ProjectBehaviorDirectoryIdentity,
+): boolean {
+  return actual.isDirectory() && actual.dev === expected.dev && actual.ino === expected.ino
+}
+
+function sameProjectBehaviorFileIdentity(
+  actual: {
+    isFile(): boolean
+    dev: bigint
+    ino: bigint
+    size: bigint
+    mtimeNs: bigint
+    ctimeNs: bigint
+  },
+  expected: ProjectBehaviorFileIdentity,
+): boolean {
+  return actual.isFile()
+    && actual.dev === expected.dev
+    && actual.ino === expected.ino
+    && actual.size === expected.size
+    && actual.mtimeNs === expected.mtimeNs
+    && actual.ctimeNs === expected.ctimeNs
+}
+
+async function captureProjectBehaviorMetadata(
+  projectPath: string,
+): Promise<OpenCodeProjectBehaviorCapture> {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('OpenCode descriptor-relative project capture is unsupported [redacted]')
+  }
+  const fdRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'
+  const resolvedProjectPath = path.resolve(projectPath)
+  const directories = new Map<
+    string,
+    { handle: FileHandle; identity: ProjectBehaviorDirectoryIdentity }
+  >()
+  const files = new Map<
+    string,
+    { parentDirectory: string; name: string; identity: ProjectBehaviorFileIdentity }
+  >()
+  const directoryEntryManifests = new Map<string, string[]>()
+  let closed = false
+  const close = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    await Promise.all(Array.from(directories.values(), ({ handle }) =>
+      handle.close().catch(() => undefined)))
+    directories.clear()
+  }
+  let rootHandle: FileHandle
+  try {
+    rootHandle = await open(
+      resolvedProjectPath,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+    )
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT') {
+      return {
+        projectBehaviorFingerprint: hashString(''),
+        behaviorSources: [],
+        behaviorEntryManifest: [],
+        resolvedProjectPath,
+        fdRoot,
+        rootHandle: null,
+        directories,
+        directoryEntryManifests,
+        files,
+        close,
+      }
+    }
+    throw error
+  }
+  const rootMetadata = await rootHandle.stat({ bigint: true })
+  if (!rootMetadata.isDirectory()) {
+    await rootHandle.close()
+    throw new Error('OpenCode project behavior root is not a directory')
+  }
+  directories.set('', {
+    handle: rootHandle,
+    identity: { dev: rootMetadata.dev, ino: rootMetadata.ino },
+  })
+  const entries: string[] = []
+  const behaviorSources = new Set<string>()
+  const openDirectoryComponents = async (components: readonly string[]): Promise<FileHandle | null> => {
+    let relativeDirectory = ''
+    let current = rootHandle
+    for (const component of components) {
+      relativeDirectory = relativeDirectory
+        ? path.join(relativeDirectory, component)
+        : component
+      const retained = directories.get(relativeDirectory)
+      if (retained) {
+        current = retained.handle
+        continue
+      }
+      let next: FileHandle
+      try {
+        next = await open(
+          path.join(fdRoot, String(current.fd), component),
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+        )
+      } catch (error) {
+        if (getErrnoCode(error) === 'ENOENT') return null
+        throw new Error('OpenCode project behavior path contains a link or unsupported component')
+      }
+      const metadata = await next.stat({ bigint: true })
+      if (!metadata.isDirectory()) {
+        await next.close()
+        throw new Error('OpenCode project behavior path contains a link or unsupported component')
+      }
+      directories.set(relativeDirectory, {
+        handle: next,
+        identity: { dev: metadata.dev, ino: metadata.ino },
+      })
+      current = next
+    }
+    return current
+  }
+  const captureFile = async (
+    parent: FileHandle,
+    parentDirectory: string,
+    name: string,
+    relativePath: string,
+    allowMissing = false,
+  ): Promise<boolean> => {
+    let child: FileHandle
+    try {
+      child = await open(
+        path.join(fdRoot, String(parent.fd), name),
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+      )
+    } catch (error) {
+      if (allowMissing && getErrnoCode(error) === 'ENOENT') return false
+      throw new Error('OpenCode project behavior path contains a link or unsupported component', {
+        cause: error,
+      })
+    }
+    try {
+      const before = await child.stat({ bigint: true })
+      if (!before.isFile()) throw new Error('OpenCode project behavior entry is not regular')
+      const bytes = await child.readFile()
+      const after = await child.stat({ bigint: true })
+      const identity = {
+        dev: before.dev,
+        ino: before.ino,
+        size: before.size,
+        mtimeNs: before.mtimeNs,
+        ctimeNs: before.ctimeNs,
+      }
+      if (!sameProjectBehaviorFileIdentity(after, identity)) {
+        throw new Error('OpenCode project behavior entry changed during capture')
+      }
+      entries.push(`file:${relativePath}:${hashBuffer(bytes)}`)
+      behaviorSources.add(relativePath)
+      files.set(relativePath, { parentDirectory, name, identity })
+      return true
+    } finally {
+      await child.close()
+    }
+  }
+  const captureDirectory = async (directory: FileHandle, relativeDir: string): Promise<void> => {
+    const dirents = await readdir(path.join(fdRoot, String(directory.fd)), { withFileTypes: true })
+    dirents.sort((left, right) => left.name.localeCompare(right.name))
+    const entryManifest: string[] = []
+    entries.push(`directory:${relativeDir}`)
+    for (const dirent of dirents) {
+      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
+      const relativePath = path.join(relativeDir, dirent.name)
+      const childPath = path.join(fdRoot, String(directory.fd), dirent.name)
+      if (dirent.isDirectory()) {
+        entryManifest.push(`directory:${dirent.name}`)
+        const child = await open(
+          childPath,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+        ).catch(() => { throw new Error('OpenCode project behavior path contains a link or unsupported component') })
+        const metadata = await child.stat({ bigint: true })
+        if (!metadata.isDirectory()) {
+          await child.close()
+          throw new Error('OpenCode project behavior path contains a link or unsupported component')
+        }
+        const previous = directories.get(relativePath)
+        if (previous) {
+          await child.close()
+          if (!sameProjectBehaviorDirectoryIdentity(metadata, previous.identity)) {
+            throw new Error('OpenCode project behavior directory changed during capture')
+          }
+          await captureDirectory(previous.handle, relativePath)
+        } else {
+          directories.set(relativePath, {
+            handle: child,
+            identity: { dev: metadata.dev, ino: metadata.ino },
+          })
+          await captureDirectory(child, relativePath)
+        }
+      } else {
+        if (!dirent.isFile()) throw new Error('OpenCode project behavior path contains a link or unsupported component')
+        entryManifest.push(`file:${dirent.name}`)
+        await captureFile(directory, relativeDir, dirent.name, relativePath)
+      }
+    }
+    directoryEntryManifests.set(relativeDir, entryManifest.sort())
+  }
+
+  try {
+    for (const relativePath of PROJECT_BEHAVIOR_FILES) {
+      const parts = relativePath.split('/').filter(Boolean)
+      const parent = parts.length > 1 ? await openDirectoryComponents(parts.slice(0, -1)) : rootHandle
+      if (!parent) continue
+      try {
+        await captureFile(
+          parent,
+          parts.slice(0, -1).join(path.sep),
+          parts.at(-1)!,
+          relativePath,
+          true,
+        )
+      } catch (error) {
+        throw new Error(
+          `OpenCode behavior file has unsupported type (symlinks are not allowed): ${relativePath}`,
+          { cause: error },
+        )
+      }
+    }
+
+    for (const relativeDir of PROJECT_BEHAVIOR_DIRS) {
+      const directory = await openDirectoryComponents(relativeDir.split('/').filter(Boolean))
+      if (!directory) continue
+      await captureDirectory(directory, relativeDir)
+    }
+  } catch (error) {
+    await close()
+    throw error
   }
 
   entries.sort()
@@ -548,6 +1145,467 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
   return {
     projectBehaviorFingerprint: hashString(entries.join('\n')),
     behaviorSources: Array.from(behaviorSources).sort(),
+    behaviorEntryManifest: entries,
+    resolvedProjectPath,
+    fdRoot,
+    rootHandle,
+    directories,
+    directoryEntryManifests,
+    files,
+    close,
+  }
+}
+
+export async function collectProjectBehaviorMetadata(projectPath: string): Promise<{
+  projectBehaviorFingerprint: string
+  behaviorSources: string[]
+  behaviorEntryManifest: string[]
+}> {
+  const capture = await captureProjectBehaviorMetadata(projectPath)
+  try {
+    return {
+      projectBehaviorFingerprint: capture.projectBehaviorFingerprint,
+      behaviorSources: capture.behaviorSources,
+      behaviorEntryManifest: capture.behaviorEntryManifest,
+    }
+  } finally {
+    await capture.close()
+  }
+}
+
+async function publishImmutableProjectBehaviorSnapshot(
+  capture: OpenCodeProjectBehaviorCapture | null,
+  targetPath: string,
+  expectedEntries: readonly string[],
+  testHooks?: {
+    afterCaptureBeforeCopy?: () => void | Promise<void>
+    afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
+    afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
+  },
+): Promise<void> {
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  targetPath = publicationDirectory.child(path.basename(targetPath))
+  try {
+  const expectedFiles = new Map<string, string>()
+  const expectedDirectories = new Set<string>()
+  for (const entry of expectedEntries) {
+    if (entry.startsWith('directory:')) {
+      expectedDirectories.add(entry.slice('directory:'.length))
+      continue
+    }
+    if (!entry.startsWith('file:')) {
+      throw new Error('OpenCode project behavior manifest entry type is invalid')
+    }
+    const separator = entry.lastIndexOf(':')
+    const relativePath = entry.slice('file:'.length, separator)
+    const digest = entry.slice(separator + 1)
+    if (!relativePath || !/^[a-f0-9]{64}$/.test(digest) || expectedFiles.has(relativePath)) {
+      throw new Error('OpenCode project behavior manifest entry is invalid')
+    }
+    expectedFiles.set(relativePath, digest)
+  }
+  const targetName = (relativeSource: string): string => {
+    if (relativeSource === 'opencode.json' || relativeSource === 'opencode.jsonc') {
+      return path.join('_source-config', `root-${relativeSource}`)
+    }
+    if (relativeSource === '.opencode/opencode.json' || relativeSource === '.opencode/opencode.jsonc') {
+      return path.join('_source-config', `project-${path.basename(relativeSource)}`)
+    }
+    return relativeSource.startsWith('.opencode/')
+      ? relativeSource.slice('.opencode/'.length)
+      : relativeSource
+  }
+  const expectedTargetDigests = new Map(Array.from(expectedFiles, ([relativeSource, digest]) => [
+    targetName(relativeSource), digest,
+  ]))
+  const expectedTargetDirectories = new Set<string>([
+    '',
+    ...Array.from(expectedDirectories, targetName),
+  ])
+  for (const relativeTarget of expectedTargetDigests.keys()) {
+    let directory = path.dirname(relativeTarget)
+    while (directory !== '.') {
+      expectedTargetDirectories.add(directory)
+      const parent = path.dirname(directory)
+      if (parent === directory) break
+      directory = parent
+    }
+  }
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null
+  const descriptorRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'
+  if (currentUid === null) {
+    throw new Error('OpenCode immutable project behavior ownership verification is unsupported')
+  }
+  const verifyTree = async (rootPath: string): Promise<ProjectBehaviorDirectoryIdentity | null> => {
+    let root: FileHandle
+    try {
+      root = await open(
+        rootPath,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+      )
+    } catch (error) {
+      if (getErrnoCode(error) === 'ENOENT') return null
+      throw new Error('OpenCode immutable project behavior snapshot has unsupported type', {
+        cause: error,
+      })
+    }
+    const actualFiles: string[] = []
+    const actualDirectories: string[] = []
+    const walk = async (directory: FileHandle, relativeDirectory: string): Promise<void> => {
+      const directoryMetadata = await directory.stat({ bigint: true })
+      if (!directoryMetadata.isDirectory()
+        || Number(directoryMetadata.uid) !== currentUid
+        || (Number(directoryMetadata.mode) & 0o777) !== 0o500) {
+        throw new Error('OpenCode immutable project behavior snapshot directory ownership or mode mismatch')
+      }
+      actualDirectories.push(relativeDirectory)
+      const entries = await readdir(
+        path.join(descriptorRoot, String(directory.fd)),
+        { withFileTypes: true },
+      )
+      entries.sort((left, right) => left.name.localeCompare(right.name))
+      for (const entry of entries) {
+        const relativeEntry = relativeDirectory
+          ? path.join(relativeDirectory, entry.name)
+          : entry.name
+        const descriptorEntry = path.join(descriptorRoot, String(directory.fd), entry.name)
+        if (entry.isDirectory()) {
+          const child = await open(
+            descriptorEntry,
+            fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+          ).catch(error => {
+            throw new Error('OpenCode immutable project behavior snapshot contains unsupported entries', {
+              cause: error,
+            })
+          })
+          try { await walk(child, relativeEntry) } finally { await child.close() }
+          continue
+        }
+        if (!entry.isFile()) {
+          throw new Error('OpenCode immutable project behavior snapshot contains unsupported entries')
+        }
+        const child = await open(
+          descriptorEntry,
+          fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+        ).catch(error => {
+          throw new Error('OpenCode immutable project behavior snapshot contains unsupported entries', {
+            cause: error,
+          })
+        })
+        try {
+          const before = await child.stat({ bigint: true })
+          if (!before.isFile()
+            || Number(before.uid) !== currentUid
+            || (Number(before.mode) & 0o777) !== 0o400) {
+            throw new Error('OpenCode immutable project behavior snapshot file ownership or mode mismatch')
+          }
+          const bytes = await child.readFile()
+          const after = await child.stat({ bigint: true })
+          if (before.dev !== after.dev || before.ino !== after.ino
+            || before.size !== after.size || before.mtimeNs !== after.mtimeNs
+            || before.ctimeNs !== after.ctimeNs) {
+            throw new Error('OpenCode immutable project behavior snapshot changed during verification')
+          }
+          if (hashBuffer(bytes) !== expectedTargetDigests.get(relativeEntry)) {
+            throw new Error('OpenCode immutable project behavior snapshot fingerprint mismatch')
+          }
+          actualFiles.push(relativeEntry)
+        } finally {
+          await child.close()
+        }
+      }
+    }
+    try {
+      const rootMetadata = await root.stat({ bigint: true })
+      await walk(root, '')
+      const expectedFiles = Array.from(expectedTargetDigests.keys()).sort()
+      if (canonicalSerializeOpenCodePolicyIdentity(actualFiles.sort())
+        !== canonicalSerializeOpenCodePolicyIdentity(expectedFiles)) {
+        throw new Error('OpenCode immutable project behavior snapshot contains unexpected entries')
+      }
+      if (canonicalSerializeOpenCodePolicyIdentity(actualDirectories.sort())
+        !== canonicalSerializeOpenCodePolicyIdentity(
+          Array.from(expectedTargetDirectories).sort(),
+        )) {
+        throw new Error('OpenCode immutable project behavior snapshot contains unexpected directories')
+      }
+      return { dev: rootMetadata.dev, ino: rootMetadata.ino }
+    } finally {
+      await root.close()
+    }
+  }
+  const verify = async (): Promise<boolean> => (await verifyTree(targetPath)) !== null
+  if (await verify()) return
+  if (!capture) {
+    throw new Error('OpenCode immutable project behavior snapshot is missing')
+  }
+  const temporaryPath = `${targetPath}.snapshot-${process.pid}-${randomUUID()}`
+  let publishedIdentity: ProjectBehaviorDirectoryIdentity | null = null
+  let renamedFinalIdentity: ProjectBehaviorDirectoryIdentity | null = null
+  const revalidateDirectoryChain = async (relativeDirectory: string): Promise<void> => {
+    if (!capture.rootHandle) {
+      throw new Error('OpenCode project behavior root disappeared before materialization')
+    }
+    const components = relativeDirectory.split(path.sep).filter(Boolean)
+    let current = await open(
+      capture.resolvedProjectPath,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+    ).catch(error => {
+      throw new Error('OpenCode project behavior ancestry changed before materialization', {
+        cause: error,
+      })
+    })
+    try {
+      const rootExpected = capture.directories.get('')!
+      if (!sameProjectBehaviorDirectoryIdentity(
+        await current.stat({ bigint: true }), rootExpected.identity,
+      )) throw new Error('OpenCode project behavior ancestry changed before materialization')
+      let relative = ''
+      for (const component of components) {
+        relative = relative ? path.join(relative, component) : component
+        const expectedDirectory = capture.directories.get(relative)
+        if (!expectedDirectory) {
+          throw new Error('OpenCode project behavior capture is incomplete')
+        }
+        const next = await open(
+          path.join(capture.fdRoot, String(current.fd), component),
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+        ).catch(error => {
+          throw new Error('OpenCode project behavior ancestry changed before materialization', {
+            cause: error,
+          })
+        })
+        const metadata = await next.stat({ bigint: true })
+        await current.close()
+        current = next
+        if (!sameProjectBehaviorDirectoryIdentity(metadata, expectedDirectory.identity)) {
+          throw new Error('OpenCode project behavior ancestry changed before materialization')
+        }
+      }
+    } finally {
+      await current.close().catch(() => undefined)
+    }
+  }
+  const readCapturedFile = async (relativeSource: string, digest: string): Promise<Buffer> => {
+    const capturedFile = capture.files.get(relativeSource)
+    if (!capturedFile) throw new Error('OpenCode project behavior capture is incomplete')
+    const parent = capture.directories.get(capturedFile.parentDirectory)
+    if (!parent) throw new Error('OpenCode project behavior capture is incomplete')
+    await revalidateDirectoryChain(capturedFile.parentDirectory)
+    if (!sameProjectBehaviorDirectoryIdentity(
+      await parent.handle.stat({ bigint: true }), parent.identity,
+    )) throw new Error('OpenCode project behavior retained directory changed before materialization')
+    const handle = await open(
+      path.join(capture.fdRoot, String(parent.handle.fd), capturedFile.name),
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    ).catch(error => {
+      throw new Error('OpenCode project behavior entry changed before materialization', {
+        cause: error,
+      })
+    })
+    try {
+      const before = await handle.stat({ bigint: true })
+      if (!sameProjectBehaviorFileIdentity(before, capturedFile.identity)) {
+        throw new Error('OpenCode project behavior entry changed before materialization')
+      }
+      const bytes = await handle.readFile()
+      const after = await handle.stat({ bigint: true })
+      if (!sameProjectBehaviorFileIdentity(after, capturedFile.identity)
+        || hashBuffer(bytes) !== digest) {
+        throw new Error('OpenCode project behavior changed while being materialized')
+      }
+      await revalidateDirectoryChain(capturedFile.parentDirectory)
+      return bytes
+    } finally {
+      await handle.close()
+    }
+  }
+  const revalidateCapturedDirectoryEntrySets = async (): Promise<void> => {
+    const manifests = Array.from(capture.directoryEntryManifests)
+      .sort(([left], [right]) => {
+        const depth = left.split(path.sep).length - right.split(path.sep).length
+        return depth || left.localeCompare(right)
+      })
+    for (const [relativeDirectory, expectedManifest] of manifests) {
+      await revalidateDirectoryChain(relativeDirectory)
+      const retained = capture.directories.get(relativeDirectory)
+      if (!retained || !sameProjectBehaviorDirectoryIdentity(
+        await retained.handle.stat({ bigint: true }), retained.identity,
+      )) throw new Error('OpenCode project behavior directory changed before materialization')
+      const actualManifest = (await readdir(
+        path.join(capture.fdRoot, String(retained.handle.fd)),
+        { withFileTypes: true },
+      ))
+        .filter(entry => entry.name !== '.DS_Store' && entry.name !== '.git' && entry.name !== 'node_modules')
+        .map(entry => entry.isDirectory()
+          ? `directory:${entry.name}`
+          : entry.isFile() ? `file:${entry.name}` : `unsupported:${entry.name}`)
+        .sort((left, right) => left.localeCompare(right))
+      if (canonicalSerializeOpenCodePolicyIdentity(actualManifest)
+        !== canonicalSerializeOpenCodePolicyIdentity(expectedManifest)) {
+        throw new Error('OpenCode project behavior directory entry set changed before materialization')
+      }
+    }
+  }
+  const freezeTree = async (directory: FileHandle): Promise<void> => {
+    const entries = await readdir(
+      path.join(capture.fdRoot, String(directory.fd)),
+      { withFileTypes: true },
+    )
+    for (const entry of entries) {
+      const descriptorEntry = path.join(capture.fdRoot, String(directory.fd), entry.name)
+      if (entry.isDirectory()) {
+        const child = await open(
+          descriptorEntry,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+        )
+        try { await freezeTree(child) } finally { await child.close() }
+      } else if (entry.isFile()) {
+        const child = await open(
+          descriptorEntry,
+          fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+        )
+        try { await child.chmod(0o400) } finally { await child.close() }
+      } else {
+        throw new Error('OpenCode temporary project behavior snapshot contains unsupported entries')
+      }
+    }
+    await directory.chmod(0o500)
+  }
+  const quarantineInvalidCurrentPublication = async (): Promise<void> => {
+    // The failed verifier is authoritative for the pathname as it exists now,
+    // not for the temporary inode that was renamed there earlier. A competing
+    // preparer may have replaced our publication while the final verification
+    // was in flight. Preserve a replacement that already verifies, otherwise
+    // quarantine the exact current inode under the publication lock so an
+    // immediate retry does not inherit a poisoned final path.
+    try {
+      if (await verify()) return
+    } catch {
+      // Capture and quarantine the invalid current target below.
+    }
+    // lstat deliberately captures the path entry itself, including a regular
+    // file or symlink replacement, without following it. The publication lock
+    // excludes cooperating writers between this receipt and the rename.
+    const currentMetadata = await lstat(targetPath, { bigint: true }).catch(() => null)
+    if (!currentMetadata) return
+    const currentIdentity: ProjectBehaviorDirectoryIdentity = {
+      dev: currentMetadata.dev,
+      ino: currentMetadata.ino,
+    }
+    const quarantinePath = `${targetPath}.incomplete-${process.pid}-${randomUUID()}`
+    await rename(targetPath, quarantinePath)
+    const quarantinedMetadata = await lstat(quarantinePath, { bigint: true }).catch(() => null)
+    if (!quarantinedMetadata) {
+      throw new Error('OpenCode incomplete project snapshot quarantine disappeared')
+    }
+    if (!sameProjectBehaviorDirectoryIdentity(quarantinedMetadata, currentIdentity)) {
+      throw new Error('OpenCode incomplete project snapshot quarantine identity changed')
+    }
+    await rm(quarantinePath, { recursive: true, force: true })
+  }
+  try {
+    await mkdir(temporaryPath, { mode: 0o700 })
+    await testHooks?.afterCaptureBeforeCopy?.()
+    await revalidateCapturedDirectoryEntrySets()
+    for (const relativeDirectory of Array.from(expectedTargetDirectories).sort()) {
+      if (relativeDirectory) {
+        await mkdir(path.join(temporaryPath, relativeDirectory), { recursive: true, mode: 0o700 })
+      }
+    }
+    for (const [relativeSource, digest] of expectedFiles) {
+      const relativeTarget = targetName(relativeSource)
+      const targetFile = path.join(temporaryPath, relativeTarget)
+      await mkdir(path.dirname(targetFile), { recursive: true, mode: 0o700 })
+      await writeFile(targetFile, await readCapturedFile(relativeSource, digest), {
+        flag: 'wx', mode: 0o400,
+      })
+    }
+    await revalidateCapturedDirectoryEntrySets()
+    const temporaryRoot = await open(
+      temporaryPath,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+    )
+    try { await freezeTree(temporaryRoot) } finally { await temporaryRoot.close() }
+    publishedIdentity = await verifyTree(temporaryPath)
+    if (!publishedIdentity) throw new Error('OpenCode temporary project behavior snapshot disappeared')
+    await testHooks?.afterTemporaryTreeVerified?.(temporaryPath)
+    const sourceIdentityBeforeRename = await verifyTree(temporaryPath)
+    if (!sourceIdentityBeforeRename
+      || sourceIdentityBeforeRename.dev !== publishedIdentity.dev
+      || sourceIdentityBeforeRename.ino !== publishedIdentity.ino) {
+      throw new Error('OpenCode temporary project behavior snapshot pathname changed before publication')
+    }
+    let renamed = false
+    await rename(temporaryPath, targetPath).then(() => {
+      renamed = true
+    }).catch(async error => {
+      if (!['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '') || !(await verify())) throw error
+      publishedIdentity = null
+    })
+    if (renamed) {
+      const renamedRoot = await open(
+        targetPath,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | (fsConstants.O_NOFOLLOW ?? 0),
+      ).catch(() => null)
+      if (!renamedRoot) throw new Error('OpenCode immutable project behavior snapshot disappeared after publication')
+      try {
+        const renamedMetadata = await renamedRoot.stat({ bigint: true })
+        renamedFinalIdentity = { dev: renamedMetadata.dev, ino: renamedMetadata.ino }
+      } finally {
+        await renamedRoot.close()
+      }
+      if (renamedFinalIdentity.dev !== publishedIdentity.dev
+        || renamedFinalIdentity.ino !== publishedIdentity.ino) {
+        throw new Error('OpenCode temporary project behavior snapshot inode changed during publication')
+      }
+      await testHooks?.afterRenameBeforeFinalVerify?.(targetPath)
+    }
+    const finalIdentity = await verifyTree(targetPath)
+    if (!finalIdentity) {
+      throw new Error('OpenCode immutable project behavior snapshot disappeared after publication')
+    }
+    if (renamed && (finalIdentity.dev !== publishedIdentity!.dev
+      || finalIdentity.ino !== publishedIdentity!.ino)) {
+      throw new Error('OpenCode immutable project behavior snapshot inode changed after publication')
+    }
+  } catch (error) {
+    try {
+      await quarantineInvalidCurrentPublication()
+    } catch (quarantineError) {
+      throw new Error('OpenCode invalid project snapshot quarantine failed', {
+        cause: quarantineError,
+      })
+    }
+    throw error
+  } finally {
+    await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+  }
+  } finally {
+    await publicationDirectory.close()
+  }
+}
+
+/** Deterministic descriptor/publication regression seam; production uses the same internals. */
+export async function publishOpenCodeProjectBehaviorSnapshotForTest(
+  projectPath: string,
+  targetPath: string,
+  testHooks?: {
+    afterCaptureBeforeCopy?: () => void | Promise<void>
+    afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
+    afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
+  },
+): Promise<void> {
+  const capture = await captureProjectBehaviorMetadata(projectPath)
+  try {
+    await publishImmutableProjectBehaviorSnapshot(
+      capture,
+      targetPath,
+      capture.behaviorEntryManifest,
+      testHooks,
+    )
+  } finally {
+    await capture.close()
   }
 }
 
@@ -742,9 +1800,14 @@ export async function areOpenCodeManagedPluginCachesReady(
 
 interface OpenCodeNativeCliCredentialBridge {
   binPath: string
+  cursorAgentExecutablePath: string | null
+  kiroCliExecutablePath: string | null
+  hostHomePath: string
+}
+
+interface OpenCodeFullNativeCliCredentialBridge extends OpenCodeNativeCliCredentialBridge {
   cursorAgentExecutablePath: string
   kiroCliExecutablePath: string
-  hostHomePath: string
 }
 
 type KiroCliAuthProbe = (
@@ -857,8 +1920,72 @@ const probeKiroCliAuth: KiroCliAuthProbe = async (executablePath, platform) =>
     )
   })
 
+export async function probeNativeCredentialIdentity(
+  providerId: 'kiro' | 'cursor-acp',
+  executablePath: string,
+  platform: NodeJS.Platform,
+  environment: NodeJS.ProcessEnv,
+): Promise<{ reportsAuthenticated: boolean; accountIdentity: string | null }> {
+  const args = providerId === 'kiro' ? ['whoami', '--format', 'json'] : ['status']
+  return new Promise(resolve => {
+    execFile(executablePath, args, {
+      timeout: 15_000,
+      windowsHide: true,
+      shell: platform === 'win32',
+      env: environment,
+    }, (error, stdout, stderr) => {
+      const reportsAuthenticated = providerId === 'kiro'
+        ? isKiroCliWhoamiAuthenticated({ error, stdout, stderr })
+        : !error && /\blogged in\b/i.test(`${stdout}\n${stderr}`)
+      const accountIdentity = resolveOpenCodeNativeAccountIdentity(providerId, stdout, stderr)
+      resolve({
+        // A generic "logged in"/account-type response is not an account
+        // identity. It may authorize an interactive CLI, but cannot safely
+        // key a retained provider-scoped host.
+        reportsAuthenticated,
+        accountIdentity,
+      })
+    })
+  })
+}
+
+/**
+ * Extracts only provider-specific stable account identifiers. The raw value is
+ * immediately hashed and is never returned or persisted.
+ */
+export function resolveOpenCodeNativeAccountIdentity(
+  providerId: 'kiro' | 'cursor-acp',
+  stdout: Buffer | string | null | undefined,
+  stderr: Buffer | string | null | undefined,
+): string | null {
+  for (const output of [stdout, stderr]) {
+    const json = extractFirstBalancedJsonObject(output?.toString() ?? '')
+    if (!json) continue
+    try {
+      const source = JSON.parse(json) as Record<string, unknown>
+      const fields = providerId === 'kiro'
+        ? ['accountId', 'userId', 'subject']
+        : ['accountId', 'userId', 'subject', 'email', 'sub']
+      const stable = Object.fromEntries(fields.flatMap(field => {
+        const value = source[field]
+        return typeof value === 'string' && value.trim() ? [[field, value.trim()]] : []
+      }))
+      if (Object.keys(stable).length > 0) return canonicalFingerprint({ providerId, stable })
+    } catch {
+      // Malformed output is never identity evidence.
+    }
+  }
+  return null
+}
+
 function isCursorAgentAuthMarker(credential: Record<string, unknown> | null): boolean {
   return credential?.type === 'api' && credential.key === CURSOR_AGENT_AUTH_MARKER
+}
+
+function isKiroCliAuthMarker(credential: Record<string, unknown> | null): boolean {
+  return credential?.type === 'oauth'
+    && credential.access === 'authenticated'
+    && credential.refresh === ''
 }
 
 function isFreshCursorAgentAuthMarker(
@@ -1064,10 +2191,60 @@ function escapeWindowsBatchValue(value: string): string {
   return value.replaceAll('%', '%%')
 }
 
+async function publishImmutableBridgeFile(
+  filePath: string,
+  content: string,
+  mode: number,
+): Promise<void> {
+  await withOpenCodeSafePublicationDirectory(path.dirname(filePath), directory =>
+    directory.publishImmutableFile(path.basename(filePath), content, mode))
+}
+
+export async function fingerprintOpenCodeNativeCredentialBridge(
+  bridge: OpenCodeScopedPreparedProfile['nativeCredentialBridge'],
+): Promise<string> {
+  if (!bridge) return canonicalFingerprint(null)
+  const expectedNames = bridge.providerId === 'kiro'
+    ? [path.basename(bridge.executablePath)]
+    : [path.basename(bridge.executablePath), 'cursor-resource-exhausted-preload.cjs']
+  const entries = await readdir(bridge.binPath, { withFileTypes: true })
+  if (
+    entries.some(entry => !entry.isFile() || !expectedNames.includes(entry.name))
+    || entries.length !== expectedNames.length
+  ) {
+    throw new Error('OpenCode native credential bridge contains unexpected entries')
+  }
+  return canonicalFingerprint(await Promise.all(expectedNames.sort().map(async name => {
+    const filePath = path.join(bridge.binPath, name)
+    const handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    try {
+      const metadata = await handle.stat()
+      if (!metadata.isFile()) {
+        throw new Error('OpenCode native credential bridge is not a regular file')
+      }
+      return { name, digest: hashBuffer(await handle.readFile()) }
+    } finally {
+      await handle.close()
+    }
+  })))
+}
+
+export function ensureOpenCodeNativeCliCredentialBridge(
+  profileRootPath: string,
+  hostEnv?: NodeJS.ProcessEnv,
+  platform?: NodeJS.Platform,
+): Promise<OpenCodeFullNativeCliCredentialBridge>
+export function ensureOpenCodeNativeCliCredentialBridge(
+  profileRootPath: string,
+  hostEnv: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  selectedProviderId: 'kiro' | 'cursor-acp',
+): Promise<OpenCodeNativeCliCredentialBridge>
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  selectedProviderId: 'kiro' | 'cursor-acp' | null = null,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
   const hostHomePath = (
     platform === 'win32'
@@ -1077,16 +2254,24 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   const hostPath = hostEnv.PATH ?? ''
   const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
-  await mkdir(binPath, { recursive: true })
-  const cursorResourceExhaustedPreloadPath = path.join(
-    binPath,
-    'cursor-resource-exhausted-preload.cjs',
-  )
-  await writeFile(
-    cursorResourceExhaustedPreloadPath,
-    buildCursorAgentResourceExhaustedPreloadScript(),
-    { encoding: 'utf8', mode: 0o600 },
-  )
+  await ensureOpenCodeManagedDirectoryPath(profileRootPath, profileRootPath)
+  const existingBin = await lstat(binPath).catch(error => {
+    if (getErrnoCode(error) === 'ENOENT') return null
+    throw error
+  })
+  if (existingBin && (!existingBin.isDirectory() || existingBin.isSymbolicLink())) {
+    throw new Error('OpenCode native credential bridge parent is not canonical [redacted]')
+  }
+  if (!existingBin) await ensureOpenCodeManagedDirectoryPath(binPath, profileRootPath)
+  await assertCanonicalOwnedPathComponents(binPath, profileRootPath)
+  const cursorResourceExhaustedPreloadPath = path.join(binPath, 'cursor-resource-exhausted-preload.cjs')
+  if (selectedProviderId === null || selectedProviderId === 'cursor-acp') {
+    await publishImmutableBridgeFile(
+      cursorResourceExhaustedPreloadPath,
+      buildCursorAgentResourceExhaustedPreloadScript(),
+      0o400,
+    )
+  }
 
   const writeBridge = async (command: 'cursor-agent' | 'kiro-cli'): Promise<string> => {
     const hostCommand = command === 'cursor-agent' ? cursorAgentCommand : command
@@ -1110,7 +2295,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
-      await writeFile(bridgePath, content, 'utf8')
+      await publishImmutableBridgeFile(bridgePath, content, 0o500)
       return bridgePath
     }
 
@@ -1132,15 +2317,19 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
-    await writeFile(bridgePath, content, 'utf8')
-    await chmod(bridgePath, 0o700)
+    await publishImmutableBridgeFile(bridgePath, content, 0o500)
     return bridgePath
   }
 
   const [cursorAgentExecutablePath, kiroCliExecutablePath] = await Promise.all([
-    writeBridge('cursor-agent'),
-    writeBridge('kiro-cli'),
+    selectedProviderId === null || selectedProviderId === 'cursor-acp'
+      ? writeBridge('cursor-agent')
+      : Promise.resolve(null),
+    selectedProviderId === null || selectedProviderId === 'kiro'
+      ? writeBridge('kiro-cli')
+      : Promise.resolve(null),
   ])
+  await chmod(binPath, 0o500)
   return { binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath }
 }
 
@@ -1166,10 +2355,11 @@ function pickSafeOpenCodeRuntimeConfig(value: unknown): Record<string, unknown> 
 }
 
 function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
-  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
+  const canonicalHome = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || path.join(canonicalHome, '.config')
   const candidates = [
-    path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
-    path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc'),
+    path.join(canonicalHome, '.config', 'opencode', 'opencode.json'),
+    path.join(canonicalHome, '.config', 'opencode', 'opencode.jsonc'),
     // An explicit XDG config is closer to the invoking runtime than the
     // canonical user config and must win model/provider conflicts.
     path.join(xdgConfigHome, 'opencode', 'opencode.json'),
@@ -1180,6 +2370,16 @@ function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
     candidates.push(path.resolve(explicitConfigPath))
   }
   return Array.from(new Set(candidates.map(candidate => path.resolve(candidate))))
+}
+
+function readInlineConfiguredPlugins(
+  value: string | undefined,
+  provenance: OpenCodePreservedPlugin['provenance'],
+): OpenCodePreservedPlugin[] {
+  const parsed = asRecord(safeParseJSONC(value))
+  return (Array.isArray(parsed.plugin) ? parsed.plugin : [])
+    .filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
+    .map(spec => ({ spec: spec.trim(), provenance }))
 }
 
 async function readSafeOpenCodeRuntimeConfigFile(
@@ -1249,11 +2449,6 @@ function normalizeManagedConfigForFingerprint(value: unknown): unknown {
 
   const record = value as Record<string, unknown>
   return Object.keys(record).sort().reduce<Record<string, unknown>>((acc, key) => {
-    // Environment values like PATH, TMPDIR, and control URLs are runtime
-    // transport detail, not capability identity for production proof.
-    if (key === 'environment' || (key === 'url' && record.type === 'remote')) {
-      return acc
-    }
     acc[key] = normalizeManagedConfigForFingerprint(record[key])
     return acc
   }, {})
@@ -1290,21 +2485,390 @@ export function orderOpenCodeAuthSyncSources(input: {
   return sources
 }
 
+async function normalizeScopedProjectPath(projectPath?: string | null): Promise<string> {
+  const resolved = path.resolve(projectPath?.trim() || getCwd())
+  const canonical = await realpath(resolved).catch(() => resolved)
+  const normalized = path.normalize(canonical)
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+/**
+ * Provider inputs that OpenCode and its provider SDKs may inherit from this
+ * process. Values are never returned or persisted; only the canonical digest
+ * participates in profile and host identity.
+ */
+export const OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_DEFAULT_REGION',
+  'AWS_PROFILE',
+  'AWS_REGION',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'AZURE_OPENAI_API_KEY',
+  'AZURE_OPENAI_ENDPOINT',
+  'CEREBRAS_API_KEY',
+  'CLOUDFLARE_ACCOUNT_ID',
+  'CLOUDFLARE_API_TOKEN',
+  'COHERE_API_KEY',
+  'DEEPINFRA_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'FIREWORKS_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'GROQ_API_KEY',
+  'MISTRAL_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'OPENROUTER_API_KEY',
+  'PERPLEXITY_API_KEY',
+  'SAMBANOVA_API_KEY',
+  'TOGETHER_AI_API_KEY',
+  'VERTEX_PROJECT',
+  'XAI_API_KEY',
+] as const
+
+/** Non-provider variables required to execute a child without inheriting the app's whole environment. */
+export const OPEN_CODE_SCOPED_EXECUTION_ENV_ALLOWLIST = [
+  'PATH',
+  'SystemRoot',
+  'WINDIR',
+  'ComSpec',
+  'PATHEXT',
+  'LANG',
+  'LC_ALL',
+  'TZ',
+] as const
+
+function selectScopedInheritedEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const selected: NodeJS.ProcessEnv = {}
+  for (const key of [
+    ...OPEN_CODE_SCOPED_EXECUTION_ENV_ALLOWLIST,
+    ...OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST,
+  ]) {
+    if (env[key] !== undefined) selected[key] = env[key]
+  }
+  return selected
+}
+
+export function fingerprintOpenCodeScopedInheritedEnvironment(env: NodeJS.ProcessEnv): string {
+  // Digest exactly the inherited subset. This makes every caller-controlled
+  // byte passed to the provider runtime part of durable profile/host identity.
+  return canonicalFingerprint(Object.fromEntries(
+    [...OPEN_CODE_SCOPED_EXECUTION_ENV_ALLOWLIST, ...OPEN_CODE_MATERIAL_PROVIDER_ENV_ALLOWLIST]
+      .map(key => [key, env[key] ?? null]),
+  ))
+}
+
+async function readConfiguredPlugins(
+  filePath: string,
+  provenance: OpenCodePreservedPlugin['provenance'],
+): Promise<OpenCodePreservedPlugin[]> {
+  try {
+    const handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    const bytes = await handle.readFile().finally(() => handle.close())
+    const parsed = asRecord(safeParseJSONC(bytes.toString('utf8')))
+    return (Array.isArray(parsed.plugin) ? parsed.plugin : [])
+      .filter((entry): entry is string => typeof entry === 'string' && Boolean(entry.trim()))
+      .map(spec => ({ spec: spec.trim(), provenance }))
+  } catch (error) {
+    if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') return []
+    throw new Error('OpenCode plugin config must be a readable regular file without symlinks')
+  }
+}
+
+async function collectScopedPreservedPlugins(
+  projectPath: string,
+  env: NodeJS.ProcessEnv,
+): Promise<OpenCodePreservedPlugin[]> {
+  const candidates = getScopedPluginConfigCandidates(projectPath, env)
+  return [
+    ...(await Promise.all(
+      candidates.map(([filePath, provenance]) => readConfiguredPlugins(filePath, provenance)),
+    )).flat(),
+    ...readInlineConfiguredPlugins(env.OPENCODE_CONFIG_CONTENT, 'environment'),
+  ]
+}
+
+function getScopedPluginConfigCandidates(
+  projectPath: string,
+  env: NodeJS.ProcessEnv,
+): Array<readonly [string, OpenCodePreservedPlugin['provenance']]> {
+  return [
+    ...getOpenCodeConfigImportPaths(env).map(configPath => [configPath, 'user'] as const),
+    [path.join(projectPath, 'opencode.json'), 'project'],
+    [path.join(projectPath, 'opencode.jsonc'), 'project'],
+    [path.join(projectPath, '.opencode', 'opencode.json'), 'project'],
+    [path.join(projectPath, '.opencode', 'opencode.jsonc'), 'project'],
+  ]
+}
+
+async function fingerprintScopedBinary(binaryPath: string): Promise<string> {
+  const handle = await open(path.resolve(binaryPath), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile()) throw new Error(`OpenCode binary is not a file: ${binaryPath}`)
+    const bytes = await handle.readFile()
+    const after = await handle.stat({ bigint: true })
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+      throw new Error('OpenCode binary changed while being verified')
+    }
+    return hashBuffer(bytes)
+  } finally {
+    await handle.close()
+  }
+}
+
+async function publishImmutableNativeExecutable(
+  sourcePath: string,
+  profileRootPath: string,
+  fingerprint: string,
+): Promise<string> {
+  const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+  let bytes: Buffer | null = null
+  try {
+    const before = await sourceHandle.stat({ bigint: true })
+    if (!before.isFile()) throw new Error('OpenCode native executable is not a regular file')
+    bytes = await sourceHandle.readFile()
+    const after = await sourceHandle.stat({ bigint: true })
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs
+      || hashBuffer(bytes) !== fingerprint) {
+      throw new Error('OpenCode native executable changed while being captured')
+    }
+  } finally {
+    await sourceHandle.close()
+  }
+  if (!bytes) throw new Error('OpenCode native executable could not be captured')
+  const root = path.join(profileRootPath, 'native-executables')
+  const targetDirectory = path.join(root, fingerprint)
+  await ensureOpenCodeManagedDirectoryPath(targetDirectory, profileRootPath)
+  for (const directory of [profileRootPath, root, targetDirectory]) {
+    const metadata = await lstat(directory)
+    const canonical = await realpath(directory).catch(() => null)
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || canonical !== path.resolve(directory)
+      || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())) {
+      throw new Error('OpenCode native executable parent is not canonical and app-owned')
+    }
+  }
+  const targetPath = path.join(targetDirectory, path.basename(sourcePath))
+  await withOpenCodeSafePublicationDirectory(targetDirectory, directory =>
+    directory.publishImmutableFile(path.basename(targetPath), bytes!, 0o500))
+  await chmod(targetDirectory, 0o500)
+  if (await fingerprintScopedBinary(targetPath) !== fingerprint) {
+    throw new Error('OpenCode immutable native executable verification failed')
+  }
+  return targetPath
+}
+
+function canonicalFingerprint(value: unknown): string {
+  return hashString(canonicalSerializeOpenCodePolicyIdentity(value))
+}
+
+function cloneAndDeepFreezeScopedInput<T>(value: T): T {
+  const clone = (entry: unknown, ancestors: Set<object>): unknown => {
+    if (entry === null || typeof entry !== 'object') return entry
+    if (ancestors.has(entry)) {
+      throw new Error('OpenCode scoped input must not contain cycles')
+    }
+    const prototype = Object.getPrototypeOf(entry)
+    if (prototype !== Object.prototype && prototype !== null && !Array.isArray(entry)) {
+      throw new Error('OpenCode scoped input must contain only plain immutable evidence')
+    }
+    const nextAncestors = new Set(ancestors).add(entry)
+    const copy: object = Array.isArray(entry)
+      ? entry.map(item => clone(item, nextAncestors))
+      : Object.fromEntries(Object.entries(entry).map(([key, item]) => [
+          key, clone(item, nextAncestors),
+        ]))
+    return Object.freeze(copy)
+  }
+  return clone(value, new Set()) as T
+}
+
+function stripScopedBridgePath(
+  value: string | undefined,
+  bridgeBinPath: string | undefined,
+): string | undefined {
+  if (!value || !bridgeBinPath) return value
+  if (value === bridgeBinPath) return undefined
+  return value.startsWith(`${bridgeBinPath}${path.delimiter}`)
+    ? value.slice(bridgeBinPath.length + path.delimiter.length)
+    : value
+}
+
+async function resolveNativeTargetExecutable(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): Promise<string | null> {
+  const hasPathSeparator = command.includes('/') || command.includes('\\')
+  const candidates = hasPathSeparator
+    ? [path.resolve(command)]
+    : (env.PATH ?? '').split(path.delimiter).filter(Boolean).flatMap(directory => {
+        const base = path.join(directory, command)
+        return platform === 'win32'
+          ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map(extension =>
+              base.toLowerCase().endsWith(extension.toLowerCase()) ? base : `${base}${extension}`)
+          : [base]
+      })
+  for (const candidate of candidates) {
+    const metadata = await stat(candidate).catch(() => null)
+    if (metadata?.isFile()) return await realpath(candidate).catch(() => path.resolve(candidate))
+  }
+  return null
+}
+
+async function fingerprintNativeAccountEvidence(
+  providerId: string | null,
+  hostHomePath: string,
+): Promise<{ fingerprint: string; definitive: boolean }> {
+  const relativeEntries = providerId === 'cursor-acp'
+    ? ['.cursor/auth.json', '.cursor/cli-config.json', '.cursor-agent/auth.json']
+    : providerId === 'kiro'
+      ? ['.aws/credentials', '.aws/config', '.aws/sso/cache', '.aws/amazonq/cache', '.kiro/credentials.json']
+      : []
+  const definitiveCredentialEntries = new Set(providerId === 'cursor-acp'
+    ? ['.cursor/auth.json', '.cursor-agent/auth.json']
+    : [])
+  const evidence: Array<{ path: string; digest: string | null }> = []
+  let definitive = false
+  for (const relativeEntry of relativeEntries) {
+    const absoluteEntry = path.join(hostHomePath, relativeEntry)
+    const metadata = await lstat(absoluteEntry).catch(() => null)
+    if (!metadata) {
+      evidence.push({ path: relativeEntry, digest: null })
+    } else if (metadata.isFile() && !metadata.isSymbolicLink()) {
+      const bytes = await readFile(absoluteEntry)
+      evidence.push({ path: relativeEntry, digest: hashBuffer(bytes) })
+      definitive ||= definitiveCredentialEntries.has(relativeEntry) && bytes.length > 0
+    } else if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+      const entries = await collectBehaviorDirectoryEntries(
+        path.dirname(absoluteEntry),
+        path.basename(absoluteEntry),
+      )
+      evidence.push({ path: relativeEntry, digest: canonicalFingerprint(entries) })
+      definitive ||= definitiveCredentialEntries.has(relativeEntry) && entries.length > 0
+    } else {
+      throw new Error('OpenCode native credential evidence has unsupported type')
+    }
+  }
+  return { fingerprint: canonicalFingerprint({ providerId, evidence }), definitive }
+}
+
+export function fingerprintOpenCodeScopedExecutionEnvironment(env: NodeJS.ProcessEnv): string {
+  return canonicalFingerprint(Object.fromEntries(
+    Object.keys(env).sort().map(key => [key, env[key] ?? null]),
+  ))
+}
+
+export async function revalidateOpenCodeScopedPreparedProfileInputs(
+  profile: OpenCodeScopedPreparedProfile,
+): Promise<void> {
+  const expectedInheritedEnvironment = {
+    ...profile.env,
+    PATH: stripScopedBridgePath(profile.env.PATH, profile.nativeCredentialBridge?.binPath),
+  }
+  const manifestFingerprint = canonicalFingerprint(profile.expectedEntryManifest)
+  if (manifestFingerprint !== profile.expectedEntryManifestFingerprint) {
+    throw new Error('OpenCode scoped entry manifest identity mismatch')
+  }
+  const projectSnapshotPath = path.join(
+    profile.profileRootPath,
+    profile.expectedEntryManifest.projectBehaviorSnapshotPath,
+  )
+  const projectSnapshotMetadata = await lstat(projectSnapshotPath).catch(() => null)
+  if (!projectSnapshotMetadata?.isDirectory() || projectSnapshotMetadata.isSymbolicLink()) {
+    throw new Error('OpenCode immutable project behavior snapshot is missing')
+  }
+  await publishImmutableProjectBehaviorSnapshot(
+    null,
+    projectSnapshotPath,
+    profile.expectedEntryManifest.projectBehaviorEntryManifest,
+  )
+  const userPluginEntries = await collectBehaviorDirectoryEntries(
+    path.join(profile.xdgConfigHome, 'opencode'),
+    'plugins',
+  )
+  const pluginDependencyEntries = profile.expectedEntryManifest.pluginDependencyEntries
+    ? await collectBehaviorDirectoryEntries(
+        path.dirname(profile.pluginNodeModulesPath),
+        path.basename(profile.pluginNodeModulesPath),
+        false,
+        true,
+      )
+    : null
+  const authBytes = await readRegularFileNoFollow(profile.managedAuthPath).catch(() => null)
+  let authBaselineFingerprint: string | null = null
+  if (authBytes) {
+    try {
+      authBaselineFingerprint = canonicalFingerprint(JSON.parse(authBytes.toString()))
+    } catch {
+      authBaselineFingerprint = null
+    }
+  }
+  if (
+    canonicalSerializeOpenCodePolicyIdentity(userPluginEntries)
+      !== canonicalSerializeOpenCodePolicyIdentity(profile.expectedEntryManifest.userPluginEntries)
+    || (pluginDependencyEntries !== null
+      && canonicalSerializeOpenCodePolicyIdentity(pluginDependencyEntries)
+        !== canonicalSerializeOpenCodePolicyIdentity(
+          profile.expectedEntryManifest.pluginDependencyEntries,
+        ))
+    || !authBytes
+    || hashBuffer(authBytes) !== profile.managedAuthFingerprint
+    || authBaselineFingerprint !== profile.selectedAuthBaselineFingerprint
+    || await fingerprintOpenCodeNativeCredentialBridge(profile.nativeCredentialBridge)
+      !== profile.nativeCredentialBridgeFingerprint
+    || fingerprintOpenCodeScopedExecutionEnvironment(profile.env)
+      !== profile.executionEnvironmentFingerprint
+    || (profile.nativeCredentialHostHomePath !== null
+      && fingerprintOpenCodeScopedInheritedEnvironment(process.env)
+        !== fingerprintOpenCodeScopedInheritedEnvironment(expectedInheritedEnvironment))
+  ) throw new Error('OpenCode scoped entry inputs changed after preparation')
+
+  const hostHomePath = profile.nativeCredentialHostHomePath
+  if (profile.nativeCredentialBridge) {
+    const targetFingerprint = profile.nativeTargetExecutablePath
+      ? await fingerprintScopedBinary(profile.nativeTargetExecutablePath).catch(() => canonicalFingerprint(null))
+      : canonicalFingerprint(null)
+    if (
+      targetFingerprint !== profile.nativeTargetExecutableFingerprint
+      || (hostHomePath !== null
+        && (await fingerprintNativeAccountEvidence(profile.providerId!, hostHomePath)).fingerprint
+          !== profile.nativeAccountEvidenceFingerprint)
+    ) throw new Error('OpenCode native account or executable evidence changed after preparation')
+  }
+}
+
 export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
   private readonly paths = resolveClaudeMultimodelPaths()
 
+  planScopedProfile(input: OpenCodePlanScopedProfileInput): OpenCodeScopedProfilePlanContract {
+    return planScopedProfile(input)
+  }
+
   private getSourceAuthPaths(): string[] {
+    const canonicalHome = process.env.HOME?.trim()
+      || process.env.USERPROFILE?.trim()
+      || os.homedir()
     const xdgDataHome =
-      process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share')
+      process.env.XDG_DATA_HOME?.trim() || path.join(canonicalHome, '.local', 'share')
     return Array.from(new Set([
       path.join(xdgDataHome, 'opencode', 'auth.json'),
       // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
       // isolated runtime directory. Always include the canonical user OpenCode
       // auth store as the highest-priority source so a fresh `opencode auth`
       // login can override stale app-global OAuth credentials.
-      path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
+      path.join(canonicalHome, '.local', 'share', 'opencode', 'auth.json'),
     ]))
   }
 
@@ -1391,6 +2955,644 @@ export class OpenCodeProfileManager {
     }
   }
 
+  /**
+   * Additive S1 entry point. It intentionally shares no fallback with
+   * prepareProfile: invalid plans fail before any managed directory or lock is
+   * created, and preparation writes only the selected provider's staged auth.
+   */
+  async prepareScopedProfile(
+    plan: OpenCodePlanScopedProfileInput,
+    expectedPlan: OpenCodeScopedProfilePlanContract,
+  ): Promise<OpenCodeScopedPreparedProfile> {
+    // These are caller-owned objects. Snapshot both synchronously before the
+    // first await and deliberately shadow the parameters so no continuation
+    // can observe caller mutation after preparation yields.
+    plan = cloneAndDeepFreezeScopedInput(plan)
+    expectedPlan = cloneAndDeepFreezeScopedInput(expectedPlan)
+    if (!plan || typeof plan !== 'object') {
+      throw new Error('OpenCode scoped profile plan is required')
+    }
+    // The plan gate is intentionally the first operation after shallow shape
+    // validation. It cannot touch the filesystem or environment and therefore
+    // rejects a wrong expected digest before canonicalization or publication.
+    if (!expectedPlan) {
+      throw new Error('OpenCode scoped preparation requires expectedPlan')
+    }
+    const actualPlan = planScopedProfile(plan)
+    if (
+      canonicalSerializeOpenCodePolicyIdentity(actualPlan)
+        !== canonicalSerializeOpenCodePolicyIdentity(expectedPlan)
+    ) {
+      throw new Error('OpenCode scoped expected plan mismatch [redacted]')
+    }
+    if (![
+      'passive-status',
+      'provider-catalog',
+      'provider-connect',
+      'execution-probe',
+      'launch',
+      'session-resume',
+      'legacy-diagnostic',
+    ].includes(plan.purpose)) {
+      throw new Error(`Unsupported OpenCode operation purpose: ${String(plan.purpose)}`)
+    }
+    if (plan.purpose === 'passive-status') {
+      throw new Error('OpenCode passive-status must not prepare a profile')
+    }
+    if (plan.purpose === 'legacy-diagnostic') {
+      throw new Error('OpenCode legacy-diagnostic cannot prepare a scoped profile')
+    }
+    const runtimeInstanceId = plan.runtimeInstanceId?.trim()
+    if (!runtimeInstanceId) {
+      throw new Error('OpenCode scoped profile requires runtimeInstanceId')
+    }
+    const providerId = plan.providerId?.trim()
+      ? canonicalizeOpenCodeProviderId(plan.providerId)
+      : null
+    if (!providerId) {
+      throw new Error(`OpenCode operation ${plan.purpose} requires a providerId`)
+    }
+    const profileLayoutGeneration = OPEN_CODE_SCOPED_PROFILE_LAYOUT_GENERATION
+    const modelId = plan.modelId?.trim() || null
+    if (
+      (plan.purpose === 'execution-probe'
+        || plan.purpose === 'launch'
+        || plan.purpose === 'session-resume')
+      && !modelId
+    ) {
+      throw new Error(`OpenCode operation ${plan.purpose} requires a modelId`)
+    }
+    // Capture once: identity derivation, credential finalization, bridge
+    // publication, and child inheritance must all observe the same inputs.
+    const hostEnvironment = { ...process.env }
+
+    const projectPath = await normalizeScopedProjectPath(plan.projectPath)
+    const binaryPath = resolveOpenCodeBinaryPath()
+    if (!binaryPath) throw new Error('OpenCode binary is required for scoped profile preparation')
+    await Promise.all([
+      assertCanonicalOwnedPathComponents(this.paths.data, this.paths.data),
+      assertCanonicalOwnedPathComponents(this.paths.cache, this.paths.cache),
+      assertCanonicalOwnedPathComponents(path.join(this.paths.data, 'opencode'), this.paths.data),
+      assertCanonicalOwnedPathComponents(path.join(this.paths.cache, 'opencode'), this.paths.cache),
+    ])
+    const earlyPreparationLockRoot = path.join(
+      this.paths.data,
+      'opencode',
+      'scoped-preparation-locks',
+    )
+    await ensureOpenCodeManagedDirectoryPath(earlyPreparationLockRoot, this.paths.data)
+    const earlyPreparationLockPath = path.join(
+      earlyPreparationLockRoot,
+      `${canonicalFingerprint({ projectPath, purpose: plan.purpose, providerId, modelId })}.lock`,
+    )
+    const earlyLockDirectory = await OpenCodeSafePublicationDirectory.open(earlyPreparationLockRoot)
+    const earlyLockName = path.basename(earlyPreparationLockPath)
+    await earlyLockDirectory.ensureRegularFile(earlyLockName).catch(async error => {
+      await earlyLockDirectory.close()
+      throw error
+    })
+    const releaseEarlyPreparationLock = await lockfile.lock(
+      earlyLockDirectory.child(earlyLockName),
+      OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+    ).catch(async error => {
+      await earlyLockDirectory.close()
+      throw error
+    })
+    let behaviorCapture: OpenCodeProjectBehaviorCapture | null = null
+    try {
+    const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
+      || path.join(os.homedir(), '.config')
+    const userPluginDirectory = path.join(userConfigRoot, 'opencode', 'plugins')
+    behaviorCapture = await captureProjectBehaviorMetadata(projectPath)
+    const behavior = behaviorCapture
+    const [binaryFingerprint, preservedPlugins, automaticUserPluginEntries] = await Promise.all([
+      fingerprintScopedBinary(binaryPath),
+      collectScopedPreservedPlugins(projectPath, hostEnvironment),
+      collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
+    ])
+    const automaticUserPluginFingerprint = canonicalFingerprint(automaticUserPluginEntries)
+    if (expectedPlan && (
+      expectedPlan.canonicalProjectPathFingerprint !== canonicalFingerprint(projectPath)
+      || expectedPlan.projectBehaviorFingerprint !== behavior.projectBehaviorFingerprint
+      || expectedPlan.binaryFingerprint !== binaryFingerprint
+      || expectedPlan.profileLayoutFingerprint !== canonicalFingerprint(profileLayoutGeneration)
+      || expectedPlan.automaticUserPluginFingerprint !== automaticUserPluginFingerprint
+    )) throw new Error('OpenCode scoped planned project or binary evidence drifted [redacted]')
+    const pluginConfigCandidates = getScopedPluginConfigCandidates(projectPath, hostEnvironment)
+    const configuredPluginsWithoutInline = (await Promise.all(
+      pluginConfigCandidates.map(([configPath, provenance]) =>
+        readConfiguredPlugins(configPath, provenance)),
+    )).flat()
+    const nativeCredentialHostHomePath = (
+      process.platform === 'win32'
+        ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim()
+        : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim()
+    ) || os.homedir()
+    const nativeTargetCommand = providerId === 'cursor-acp'
+      ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+      : providerId === 'kiro' ? 'kiro-cli' : null
+    const nativeTargetSourceExecutablePath = nativeTargetCommand
+      ? await resolveNativeTargetExecutable(nativeTargetCommand, hostEnvironment, process.platform)
+      : null
+    if (nativeTargetCommand && !nativeTargetSourceExecutablePath) {
+      throw new Error('OpenCode selected native provider executable could not be resolved')
+    }
+    const nativeTargetExecutableFingerprint = nativeTargetSourceExecutablePath
+      ? await fingerprintScopedBinary(nativeTargetSourceExecutablePath)
+      : canonicalFingerprint(null)
+    const nativeProofExecutablePath = nativeTargetSourceExecutablePath
+      ? await publishImmutableNativeExecutable(
+          nativeTargetSourceExecutablePath,
+          path.join(this.paths.data, 'opencode', 'scoped-native-proof'),
+          nativeTargetExecutableFingerprint,
+        )
+      : null
+    const nativeAccountEvidence = await fingerprintNativeAccountEvidence(
+      providerId,
+      nativeCredentialHostHomePath,
+    )
+    const nativeAccountEvidenceFingerprint = nativeAccountEvidence.fingerprint
+    const expectedEntryManifest = {
+      projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+      projectBehaviorSnapshotPath: 'project-behavior',
+      projectBehaviorEntryManifest: behavior.behaviorEntryManifest,
+      userPluginDirectory,
+      userPluginEntries: automaticUserPluginEntries,
+      pluginConfigs: pluginConfigCandidates.map(([configPath, provenance]) => ({
+        path: configPath,
+        provenance,
+      })),
+      preservedPlugins,
+      preservedPluginsFingerprint: canonicalFingerprint(configuredPluginsWithoutInline),
+      inlinePluginsFingerprint: canonicalFingerprint(
+        readInlineConfiguredPlugins(hostEnvironment.OPENCODE_CONFIG_CONTENT, 'environment'),
+      ),
+      pluginDependencyFingerprint: expectedPlan?.pluginFingerprint ?? null,
+      pluginDependencyEntries: 'evidence' in plan
+        ? Array.from(new Set(plan.evidence.plugins.flatMap(plugin =>
+            plugin.immutableTreeEntries.map(entry =>
+              `${path.join('node_modules', entry.path.replaceAll('\\', '/'))}:${entry.mode}:${hashBuffer(
+                Buffer.from(entry.bytesBase64, 'base64'),
+              )}`,
+            ),
+          ))).sort()
+        : undefined,
+    }
+    const expectedEntryManifestFingerprint = canonicalFingerprint(expectedEntryManifest)
+    const globalAuthPath = this.getGlobalAuthPath()
+    const sourceAuthPaths = Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()]))
+    const sourceStores = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
+    const mergedAuth = mergeOpenCodeManagedAuthSources({
+      sourceAuthPaths,
+      sourceStores,
+      globalAuthPath,
+    })
+    const selectedCredentialCandidate = providerId ? mergedAuth[providerId.toLowerCase()] : undefined
+    const selectedCredential = (
+      (providerId === 'kiro' && isKiroCliAuthMarker(selectedCredentialCandidate ?? null))
+      || (providerId === 'cursor-acp' && isCursorAgentAuthMarker(selectedCredentialCandidate ?? null))
+    ) ? undefined : selectedCredentialCandidate
+    const selectedAuth = selectedCredential && providerId
+      ? { [providerId.toLowerCase()]: selectedCredential }
+      : {}
+    let scopedSelectedAuth = selectedAuth
+    let nativeCredentialProofFingerprint = canonicalFingerprint(null)
+    let nativeAccountIdentityFingerprint = selectedCredential
+      ? canonicalFingerprint({ providerId, selectedAuth })
+      : canonicalFingerprint(null)
+    const nativeProofProviderId: 'kiro' | 'cursor-acp' | null = providerId === 'kiro'
+      ? 'kiro'
+      : providerId === 'cursor-acp'
+        ? 'cursor-acp'
+        : null
+    if (nativeProofProviderId && (nativeProofProviderId === 'kiro' || !selectedCredential)) {
+      const nativeCommand = nativeProofExecutablePath!
+      const nativeBytesBeforeProof = await fingerprintScopedBinary(nativeCommand)
+      if (nativeBytesBeforeProof !== nativeTargetExecutableFingerprint) {
+        throw new Error('OpenCode native provider executable changed before account proof')
+      }
+      const nativeProof = await probeNativeCredentialIdentity(
+        nativeProofProviderId,
+        nativeCommand,
+        process.platform,
+        hostEnvironment,
+      ).catch(() => ({ reportsAuthenticated: false, accountIdentity: null }))
+      const nativeBytesAfterProof = await fingerprintScopedBinary(nativeCommand)
+      if (nativeBytesAfterProof !== nativeTargetExecutableFingerprint) {
+        throw new Error('OpenCode native provider executable changed during account proof')
+      }
+      // Credential/cache presence (especially generic AWS state) is rotation
+      // evidence only. It can never turn an ambiguous Kiro whoami response
+      // into a durable provider-account identity.
+      const hasDefinitiveIdentity = nativeProof.accountIdentity !== null
+      nativeCredentialProofFingerprint = canonicalFingerprint({
+        providerId,
+        accountIdentity: nativeProof.accountIdentity,
+        credentialEvidence: nativeAccountEvidence.definitive ? nativeAccountEvidenceFingerprint : null,
+      })
+      nativeAccountIdentityFingerprint = nativeProof.accountIdentity
+        ? canonicalFingerprint({ providerId, accountIdentity: nativeProof.accountIdentity })
+        : canonicalFingerprint(null)
+      if (nativeProof.reportsAuthenticated && hasDefinitiveIdentity) {
+        // These are stable presence markers, not bearer credentials. A stable
+        // value makes concurrent preparations converge on one immutable auth
+        // artifact while account/key material still separates through hashes.
+        if (!selectedCredential) {
+          scopedSelectedAuth = providerId === 'kiro'
+            ? { kiro: { type: 'oauth', access: 'authenticated', refresh: '', expires: Number.MAX_SAFE_INTEGER } }
+            : { 'cursor-acp': { type: 'api', key: CURSOR_AGENT_AUTH_MARKER, expires: Number.MAX_SAFE_INTEGER } }
+        }
+      } else {
+        throw new Error('OpenCode native provider authenticated account identity could not be established')
+      }
+    }
+    const selectedAuthBaselineFingerprint = canonicalFingerprint(scopedSelectedAuth)
+    const nativeBridgeInputFingerprint = canonicalFingerprint(
+      providerId === 'kiro' || providerId === 'cursor-acp'
+        ? {
+            providerId,
+            platform: process.platform,
+            home: process.platform === 'win32'
+              ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim() || os.homedir()
+              : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim() || os.homedir(),
+            path: hostEnvironment.PATH ?? '',
+            cursorAgentExecutable: providerId === 'cursor-acp'
+              ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+              : null,
+            credentialProof: nativeCredentialProofFingerprint,
+            accountEvidence: nativeAccountEvidenceFingerprint,
+            targetExecutable: nativeTargetExecutableFingerprint,
+          }
+        : null,
+    )
+    let importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(hostEnvironment)
+    for (const [configPath, provenance] of pluginConfigCandidates) {
+      if (provenance !== 'project') continue
+      importedRuntimeConfig = deepMergeOpenCodeConfig(
+        importedRuntimeConfig,
+        await readSafeOpenCodeRuntimeConfigFile(configPath),
+      )
+    }
+    const policyPreservedPlugins = preservedPlugins
+    const providerEnvironmentFingerprint = canonicalFingerprint({
+      inherited: fingerprintOpenCodeScopedInheritedEnvironment(hostEnvironment),
+      nativeBridgeInputs: nativeBridgeInputFingerprint,
+      finalEnvironmentInputs: {
+        npmConfigCache: path.join(this.paths.cache, 'opencode', 'package-downloads'),
+        multimodelDataHome: this.paths.data,
+        multimodelCacheHome: this.paths.cache,
+        disableAutoUpdate: applyOpenCodeAutoUpdatePolicy({ ...hostEnvironment })
+          .OPENCODE_DISABLE_AUTOUPDATE ?? null,
+      },
+    })
+    const policySeed = canonicalFingerprint({
+      purpose: plan.purpose,
+      providerId,
+    })
+    const initialFingerprints = {
+      project: canonicalFingerprint({
+        projectPath,
+        projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+      }),
+      model: canonicalFingerprint(modelId),
+      policy: policySeed,
+      plugin: canonicalFingerprint({
+        preservedPlugins,
+        automaticUserPluginEntries,
+        automaticUserPluginFingerprint,
+        dependencySnapshot: expectedPlan?.pluginFingerprint ?? null,
+      }),
+      version: canonicalFingerprint({
+        specs: preservedPlugins.map(plugin => plugin.spec),
+        dependencySnapshot: expectedPlan?.pluginFingerprint ?? null,
+      }),
+      config: canonicalFingerprint(importedRuntimeConfig),
+      auth: selectedAuthBaselineFingerprint,
+      environment: providerEnvironmentFingerprint,
+      binary: binaryFingerprint,
+      layout: expectedPlan
+        ? canonicalFingerprint({ profileLayoutGeneration, planDigest: expectedPlan.digest })
+        : canonicalFingerprint(profileLayoutGeneration),
+    }
+    const preliminaryPolicy = resolveOpenCodeOperationPolicy({
+      purpose: plan.purpose,
+      providerId,
+      preservedPlugins: policyPreservedPlugins,
+      fingerprints: initialFingerprints,
+    })
+    const appMcpConfig = preliminaryPolicy.appMcp === 'enabled'
+      ? await this.resolveManagedAppMcpConfig()
+      : null
+    const managedConfig = deepMergeOpenCodeConfig(
+      importedRuntimeConfig,
+      buildManagedConfig(appMcpConfig, {
+        allowAutoUpdate: isOpenCodeAutoUpdateAllowed(hostEnvironment),
+        defaultModelId: modelId,
+        toolApprovalMode: preliminaryPolicy.toolApproval === 'auto' ? 'auto' : undefined,
+      }),
+    )
+    if (preliminaryPolicy.toolApproval === 'none') {
+      managedConfig.agent = Object.fromEntries(
+        Object.entries(asRecord(managedConfig.agent)).map(([agentName, rawAgent]) => [
+          agentName,
+          {
+            ...asRecord(rawAgent),
+            tools: { '*': false },
+            permission: { '*': 'deny' },
+          },
+        ]),
+      )
+    }
+    if (providerId) {
+      const providers = asRecord(managedConfig.provider)
+      managedConfig.provider = providers[providerId]
+        ? { [providerId]: providers[providerId] }
+        : {}
+    }
+    managedConfig.plugin = expectedPlan
+      ? expectedPlan.plugins.map(plugin => plugin.executionSpecifier)
+      : preliminaryPolicy.plugins.map(plugin => plugin.spec)
+    const managedConfigFingerprint = buildManagedConfigFingerprint(managedConfig)
+    const policy = resolveOpenCodeOperationPolicy({
+      purpose: plan.purpose,
+      providerId,
+      preservedPlugins: policyPreservedPlugins,
+      fingerprints: {
+        ...initialFingerprints,
+        plugin: canonicalFingerprint({
+          plugins: preliminaryPolicy.plugins,
+          automaticUserPluginEntries,
+          dependencySnapshot: expectedPlan?.pluginFingerprint ?? null,
+        }),
+        version: canonicalFingerprint({
+          specs: preliminaryPolicy.plugins.map(plugin => plugin.spec),
+          dependencySnapshot: expectedPlan?.pluginFingerprint ?? null,
+        }),
+        config: managedConfigFingerprint,
+      },
+    })
+    if (!policy.identity.profileKey || !policy.identity.pluginKey || !policy.identity.cacheKey) {
+      throw new Error(`OpenCode operation ${plan.purpose} cannot prepare a scoped profile`)
+    }
+    if (expectedPlan && 'evidence' in plan) {
+      const materialPlugins = policy.plugins.map(policyPlugin => {
+        const evidencePlugin = plan.evidence.plugins.find(plugin =>
+          plugin.spec.trim() === policyPlugin.spec
+          && plugin.provenance === policyPlugin.provenance)
+        return evidencePlugin
+          ? expectedPlan.plugins.find(plugin =>
+              plugin.spec === evidencePlugin.spec.trim()
+              && plugin.provenance === evidencePlugin.provenance) ?? null
+          : null
+      })
+      if (
+        materialPlugins.some(plugin => plugin === null)
+        || canonicalSerializeOpenCodePolicyIdentity(materialPlugins)
+          !== canonicalSerializeOpenCodePolicyIdentity(expectedPlan.plugins)
+        || expectedPlan.providerEnvironmentFingerprint !== providerEnvironmentFingerprint
+        || expectedPlan.selectedAuthFingerprint !== selectedAuthBaselineFingerprint
+        || expectedPlan.nativeAccountIdentityFingerprint !== nativeAccountIdentityFingerprint
+        || expectedPlan.nativeTargetExecutableFingerprint !== nativeTargetExecutableFingerprint
+        || expectedPlan.configFingerprint !== managedConfigFingerprint
+      ) throw new Error('OpenCode scoped planned material evidence drifted [redacted]')
+    }
+
+    const profileScopeIdentity = canonicalFingerprint(policy.identity.canonicalInput)
+    const profileRootKey = profileScopeIdentity
+    const profileRootPath = path.join(this.paths.data, 'opencode', 'scoped-profiles', profileRootKey)
+    const homePath = path.join(profileRootPath, 'home')
+    const tmpPath = path.join(profileRootPath, 'tmp')
+    const xdgConfigHome = path.join(profileRootPath, 'config')
+    const xdgDataHome = path.join(profileRootPath, 'data')
+    const xdgCacheHome = path.join(
+      this.paths.cache,
+      'opencode',
+      'scoped',
+      policy.identity.cacheKey.split(':').at(-1)!,
+    )
+    const pluginNodeModulesPath = path.join(xdgConfigHome, 'opencode', 'node_modules')
+    const managedAuthPath = path.join(xdgDataHome, 'opencode', 'auth.json')
+    const preparationLockPath = path.join(profileRootPath, `prepare-${policy.identity.operationKey.split(':').at(-1)!}.lock`)
+
+    return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
+      await ensureOpenCodeManagedDirectoryPath(homePath, this.paths.data)
+      await ensureOpenCodeManagedDirectoryPath(tmpPath, this.paths.data)
+      await ensureOpenCodeManagedDirectoryPath(
+        path.join(xdgConfigHome, 'opencode'), this.paths.data,
+      )
+      await ensureOpenCodeManagedDirectoryPath(path.dirname(managedAuthPath), this.paths.data)
+      await ensureOpenCodeManagedDirectoryPath(xdgCacheHome, this.paths.cache)
+      await assertCanonicalOwnedPathComponents(pluginNodeModulesPath, this.paths.data)
+      const projectBehaviorSnapshotPath = path.join(
+        profileRootPath,
+        expectedEntryManifest.projectBehaviorSnapshotPath,
+      )
+      const scopedLockDirectory = await OpenCodeSafePublicationDirectory.open(
+        path.dirname(preparationLockPath),
+      )
+      const scopedLockName = path.basename(preparationLockPath)
+      await scopedLockDirectory.ensureRegularFile(scopedLockName).catch(async error => {
+        await scopedLockDirectory.close()
+        throw error
+      })
+      const releaseScopedLock = await lockfile.lock(
+        scopedLockDirectory.child(scopedLockName),
+        OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+      ).catch(async error => {
+        await scopedLockDirectory.close()
+        throw error
+      })
+      try {
+        // No user/project bytes are published before the cross-process lock.
+        // Contending preparers therefore cannot expose a half-owned snapshot.
+        // Re-derive every immutable tree fingerprint, package closure,
+        // resolved identity, digest, and host key at the publication boundary.
+        // Only the authorized expected-plan snapshot may authorize these bytes.
+        const publicationPlan = planScopedProfile(plan)
+        if (
+          canonicalSerializeOpenCodePolicyIdentity(publicationPlan)
+            !== canonicalSerializeOpenCodePolicyIdentity(expectedPlan)
+        ) throw new Error('OpenCode scoped publication evidence drifted [redacted]')
+        if (automaticUserPluginEntries.length > 0) {
+          await publishImmutableUserPluginSnapshot(
+            userPluginDirectory,
+            path.join(xdgConfigHome, 'opencode', 'plugins'),
+            automaticUserPluginEntries,
+          )
+        }
+        if (expectedPlan && 'evidence' in plan) {
+          // Materialize only caller-captured regular bytes. No package manager,
+          // mutable cache, lifecycle hook, network or original project path is
+          // available to the scoped host.
+          await publishImmutablePluginDependencySnapshot(
+            pluginNodeModulesPath,
+            plan.evidence.plugins,
+          )
+        }
+        await publishImmutableProjectBehaviorSnapshot(
+          behaviorCapture,
+          projectBehaviorSnapshotPath,
+          expectedEntryManifest.projectBehaviorEntryManifest,
+        )
+        const nativeTargetExecutablePath = nativeProofExecutablePath
+          ? await publishImmutableNativeExecutable(
+              nativeProofExecutablePath,
+              profileRootPath,
+              nativeTargetExecutableFingerprint,
+            )
+          : null
+        let nativeCredentialBridge: OpenCodeScopedPreparedProfile['nativeCredentialBridge'] = null
+        const nativeBridgeProviderId: 'kiro' | 'cursor-acp' | null = providerId === 'kiro'
+          ? 'kiro'
+          : providerId === 'cursor-acp'
+            ? 'cursor-acp'
+            : null
+        if (nativeBridgeProviderId) {
+          const bridgeHostEnvironment = { ...hostEnvironment }
+          if (nativeBridgeProviderId === 'cursor-acp') {
+            bridgeHostEnvironment.CURSOR_AGENT_EXECUTABLE = nativeTargetExecutablePath!
+          } else {
+            bridgeHostEnvironment.PATH = `${path.dirname(nativeTargetExecutablePath!)}${path.delimiter}${hostEnvironment.PATH ?? ''}`
+          }
+          const bridge = await ensureOpenCodeNativeCliCredentialBridge(
+            profileRootPath,
+            bridgeHostEnvironment,
+            process.platform,
+            nativeBridgeProviderId,
+          )
+          const executablePath = nativeBridgeProviderId === 'kiro'
+            ? bridge.kiroCliExecutablePath!
+            : bridge.cursorAgentExecutablePath!
+          nativeCredentialBridge = {
+            providerId: nativeBridgeProviderId,
+            binPath: bridge.binPath,
+            executablePath,
+          }
+        }
+        const managedAuthContent = JSON.stringify(scopedSelectedAuth, null, 2)
+        const managedAuthFingerprint = await withOpenCodeSafePublicationDirectory(
+          path.dirname(managedAuthPath),
+          async directory => {
+            await directory.writeFileAtomic(
+              path.basename(managedAuthPath), managedAuthContent, 0o600, plan.abortSignal,
+            )
+            const managedAuthHandle = await open(
+              directory.child(path.basename(managedAuthPath)),
+              fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+            )
+            try {
+              const managedAuthBytes = await managedAuthHandle.readFile()
+              if (
+                canonicalFingerprint(JSON.parse(managedAuthBytes.toString()))
+                  !== selectedAuthBaselineFingerprint
+              ) throw new Error('OpenCode scoped auth artifact changed before binding')
+              return hashBuffer(managedAuthBytes)
+            } finally {
+              await managedAuthHandle.close()
+            }
+          },
+        )
+        const nativeCredentialBridgeFingerprint = await fingerprintOpenCodeNativeCredentialBridge(
+          nativeCredentialBridge,
+        )
+        const env: NodeJS.ProcessEnv = applyOpenCodeAutoUpdatePolicy({
+          ...selectScopedInheritedEnvironment(hostEnvironment),
+          HOME: homePath,
+          USERPROFILE: homePath,
+          TMPDIR: tmpPath,
+          TMP: tmpPath,
+          TEMP: tmpPath,
+          XDG_CONFIG_HOME: xdgConfigHome,
+          XDG_DATA_HOME: xdgDataHome,
+          XDG_CACHE_HOME: xdgCacheHome,
+          NPM_CONFIG_CACHE: path.join(this.paths.cache, 'opencode', 'package-downloads'),
+          [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: this.paths.data,
+          [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: this.paths.cache,
+          OPENCODE_DISABLE_CLAUDE_CODE: '1',
+          OPENCODE_CONFIG_CONTENT: JSON.stringify(managedConfig),
+          OPENCODE_CONFIG_DIR: projectBehaviorSnapshotPath,
+          OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+        })
+        delete env.OPENCODE_CONFIG
+        if (nativeCredentialBridge) {
+          env.PATH = hostEnvironment.PATH
+            ? `${nativeCredentialBridge.binPath}${path.delimiter}${hostEnvironment.PATH}`
+            : nativeCredentialBridge.binPath
+          if (nativeCredentialBridge.providerId === 'cursor-acp') {
+            env.CURSOR_AGENT_EXECUTABLE = nativeCredentialBridge.executablePath
+          } else {
+            delete env.CURSOR_AGENT_EXECUTABLE
+          }
+        }
+        const executionEnvironmentFingerprint = fingerprintOpenCodeScopedExecutionEnvironment(env)
+        const preparedProfile: OpenCodeScopedPreparedProfile = {
+          scopeSchema: 'opencode-scoped-profile-v1',
+          policy,
+          purpose: policy.purpose,
+          providerId: policy.providerScope.kind === 'provider' ? policy.providerScope.providerId : null,
+          modelId,
+          runtimeInstanceId,
+          canonicalProjectPathFingerprint: canonicalFingerprint(projectPath),
+          executionProjectPath: projectBehaviorSnapshotPath,
+          profileLayoutGeneration,
+          scopedPlanDigest: expectedPlan.digest,
+          plannedHostKey: expectedPlan.expectedHostKey,
+          operationKey: policy.identity.operationKey,
+          profileKey: policy.identity.profileKey!,
+          pluginKey: policy.identity.pluginKey!,
+          cacheKey: policy.identity.cacheKey!,
+          profileScopeIdentity,
+          selectedAuthBaselineFingerprint,
+          providerEnvironmentFingerprint,
+          nativeCredentialBridgeInputFingerprint: nativeBridgeInputFingerprint,
+          nativeCredentialBridgeFingerprint,
+          nativeTargetExecutableFingerprint,
+          nativeTargetExecutablePath,
+          nativeCredentialHostHomePath: nativeTargetCommand ? nativeCredentialHostHomePath : null,
+          nativeAccountEvidenceFingerprint,
+          executionEnvironmentFingerprint,
+          expectedEntryManifest,
+          expectedEntryManifestFingerprint,
+          automaticUserPluginFingerprint,
+          binaryPath: await realpath(binaryPath).catch(() => path.resolve(binaryPath)),
+          binaryFingerprint,
+          pluginNodeModulesPath,
+          preparationLockPath,
+          projectPath,
+          profileRootKey,
+          profileRootPath,
+          projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+          behaviorSources: behavior.behaviorSources,
+          managedConfig,
+          managedConfigFingerprint,
+          homePath,
+          tmpPath,
+          xdgConfigHome,
+          xdgDataHome,
+          xdgCacheHome,
+          globalAuthPath,
+          managedAuthPath,
+          sourceAuthPath: null,
+          sourceAuthFingerprint: selectedAuthBaselineFingerprint,
+          managedAuthFingerprint,
+          authState: Object.keys(scopedSelectedAuth).length > 0 ? 'ok' : 'missing',
+          nativeCredentialBridge,
+          env,
+        }
+        return preparedProfile
+      } finally {
+        await releaseScopedLock()
+        await scopedLockDirectory.close()
+      }
+    })
+    } finally {
+      await behaviorCapture?.close()
+      await releaseEarlyPreparationLock()
+      await earlyLockDirectory.close()
+    }
+  }
+
+  /** @deprecated Compatibility only; scoped callers must use prepareScopedProfile. */
   async prepareProfile(
     projectPath?: string | null,
     options: OpenCodePrepareProfileOptions = {},
@@ -1519,12 +3721,12 @@ export class OpenCodeProfileManager {
         ensureOpenCodeCursorPluginAuthCredential({
           globalAuthPath,
           managedAuthPath,
-          cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath,
+          cursorAgentExecutablePath: nativeCliCredentialBridge.cursorAgentExecutablePath!,
         }),
         ensureOpenCodeKiroPluginAuthCredential({
           globalAuthPath,
           managedAuthPath,
-          kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath,
+          kiroCliExecutablePath: nativeCliCredentialBridge.kiroCliExecutablePath!,
         }),
       ])
     }
@@ -1582,7 +3784,7 @@ export class OpenCodeProfileManager {
       env.CURSOR_ACP_HOME_DIR =
         process.env.CURSOR_ACP_HOME_DIR?.trim() || nativeCliCredentialBridge.hostHomePath
       env.CURSOR_AGENT_EXECUTABLE =
-        nativeCliCredentialBridge.cursorAgentExecutablePath
+        nativeCliCredentialBridge.cursorAgentExecutablePath!
     }
     delete env.OPENCODE_CONFIG
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)

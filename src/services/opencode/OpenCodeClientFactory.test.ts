@@ -314,3 +314,32 @@ describe('OpenCodeClientFactory request context', () => {
     expect(requestSignals[0]?.aborted).toBe(false)
   })
 })
+
+describe('OpenCodeClientFactory provider response bounds', () => {
+  test('rejects an oversized provider body from content-length before parsing', async () => {
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => new Response('{}', {
+        status: 200,
+        headers: { 'content-length': String(2 * 1024 * 1024 + 1) },
+      }),
+    })
+    await expect(factory.create('http://127.0.0.1:4096').getProviders())
+      .rejects.toThrow('response body exceeded the allowed size')
+  })
+
+  test('cancels an oversized streamed provider body when no length is declared', async () => {
+    const chunk = new Uint8Array(1024 * 1024 + 1)
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunk)
+        controller.enqueue(chunk)
+        controller.close()
+      },
+    })
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async () => new Response(body, { status: 200 }),
+    })
+    await expect(factory.create('http://127.0.0.1:4096').getProviders())
+      .rejects.toThrow('response body exceeded the allowed size')
+  })
+})

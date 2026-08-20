@@ -283,6 +283,7 @@ export type ProviderModelCatalogStatus = 'active' | 'alpha' | 'beta' | 'deprecat
 export type OpenCodeRuntimeModelAccessKind =
   | 'no_model'
   | 'unknown_model'
+  | 'catalog_selection_only'
   | 'credentialed'
   | 'builtin_free'
   | 'configured_authless'

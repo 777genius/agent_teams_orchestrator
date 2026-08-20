@@ -2,11 +2,6 @@
 
 import { readFile } from 'node:fs/promises'
 
-import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
-import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
-import { writeFileAtomic } from '../../utils/atomicWrite.js'
-import { jsonStringify } from '../../utils/slowOperations.js'
-
 const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
 export const OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS = 1_000
 
@@ -18,8 +13,10 @@ export function startRuntimeCommandKeepAlive(deps: {
   setInterval?: RuntimeCommandSetInterval
   clearInterval?: RuntimeCommandClearInterval
 } = {}): () => void {
-  const setIntervalFn = deps.setInterval ?? setInterval
-  const clearIntervalFn = deps.clearInterval ?? clearInterval
+  const setIntervalFn: RuntimeCommandSetInterval = deps.setInterval ?? setInterval
+  const clearIntervalFn: RuntimeCommandClearInterval = deps.clearInterval ?? (timer => {
+    clearInterval(timer)
+  })
   const timer = setIntervalFn(() => undefined, OPENCODE_COMMAND_KEEPALIVE_INTERVAL_MS)
   let cleared = false
   return () => {
@@ -36,6 +33,19 @@ export async function runtimeOpenCodeCommand(opts: {
   json?: boolean
   output?: string
 }): Promise<void> {
+  const raw = await readFile(opts.input, 'utf8')
+  const envelope = JSON.parse(raw) as unknown
+  const passiveCommandStatus = isPassiveCommandStatusEnvelope(envelope)
+  if (passiveCommandStatus) {
+    const result = await executeRuntimeOpenCodeCommandEnvelope(envelope)
+    await writeRuntimeCommandPayload(opts.output, JSON.stringify(result) + '\n')
+    process.exit(0)
+  }
+
+  const [{ executeOpenCodeBridgeCommandEnvelope }, { openCodeHostManager }] = await Promise.all([
+    import('../../services/opencode/OpenCodeBridgeCommandHandler.js'),
+    import('../../services/opencode/OpenCodeHostManager.js'),
+  ])
   let signalCleanupPromise: Promise<void> | null = null
   const cleanupUnregisteredHostsAndExit = (exitCode: number): void => {
     if (signalCleanupPromise) {
@@ -57,19 +67,13 @@ export async function runtimeOpenCodeCommand(opts: {
   const stopKeepAlive = startRuntimeCommandKeepAlive()
 
   try {
-    const raw = await readFile(opts.input, 'utf8')
-    const envelope = JSON.parse(raw) as unknown
     const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
     if (signalCleanupPromise) {
       await signalCleanupPromise
       return
     }
-    const payload = jsonStringify(result) + '\n'
-    if (opts.output?.trim()) {
-      await writeOutputFileAtomically(opts.output.trim(), payload)
-    } else {
-      await writeStdoutAndDrain(payload)
-    }
+    const { jsonStringify } = await import('../../utils/slowOperations.js')
+    await writeRuntimeCommandPayload(opts.output, jsonStringify(result) + '\n')
   } finally {
     stopKeepAlive()
     process.off('SIGTERM', onSigterm)
@@ -78,8 +82,43 @@ export async function runtimeOpenCodeCommand(opts: {
   process.exit(0)
 }
 
-async function writeOutputFileAtomically(outputPath: string, payload: string): Promise<void> {
-  await writeFileAtomic(outputPath, payload)
+export async function executeRuntimeOpenCodeCommandEnvelope(
+  envelope: unknown,
+  deps: {
+    executePassive?: (input: unknown) => Promise<unknown>
+    executeActive?: (input: unknown) => Promise<unknown>
+  } = {},
+): Promise<unknown> {
+  if (isPassiveCommandStatusEnvelope(envelope)) {
+    const executePassive = deps.executePassive ?? (async input => {
+      const { executeOpenCodePassiveCommandStatusEnvelope } = await import(
+        '../../services/opencode/OpenCodePassiveCommandStatusRoute.js'
+      )
+      return executeOpenCodePassiveCommandStatusEnvelope(input)
+    })
+    return executePassive(envelope)
+  }
+  const executeActive = deps.executeActive ?? (async input => {
+    const { executeOpenCodeBridgeCommandEnvelope } = await import(
+      '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+    )
+    return executeOpenCodeBridgeCommandEnvelope(input)
+  })
+  return executeActive(envelope)
+}
+
+function isPassiveCommandStatusEnvelope(input: unknown): boolean {
+  return input !== null && typeof input === 'object' && !Array.isArray(input)
+    && (input as { command?: unknown }).command === 'opencode.commandStatus'
+}
+
+async function writeRuntimeCommandPayload(outputPath: string | undefined, payload: string): Promise<void> {
+  if (outputPath?.trim()) {
+    const { writeFileAtomic } = await import('../../utils/atomicWrite.js')
+    await writeFileAtomic(outputPath.trim(), payload)
+    return
+  }
+  await writeStdoutAndDrain(payload)
 }
 
 function writeStdoutAndDrain(payload: string): Promise<void> {

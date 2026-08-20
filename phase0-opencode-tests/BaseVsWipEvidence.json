@@ -1,0 +1,6 @@
+{
+  "schema": 2,
+  "baseRevision": "73993bad8ff96dc08086b5ecf125084e1df4a08f",
+  "purpose": "The executable test creates disposable base and patch-bound WIP git checkouts, runs this unchanged production regression command in both, and compares generated evidence inside its temporary sandbox.",
+  "command": "bun test phase0-opencode-tests/OpenCodeStatusCatalogLaunch.regression.test.ts"
+}

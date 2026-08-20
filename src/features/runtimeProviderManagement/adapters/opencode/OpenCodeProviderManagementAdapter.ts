@@ -1,7 +1,6 @@
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
 import {
   getOpenCodeCuratedSubscriptionProvider,
-  getOpenCodeCuratedSubscriptionProviderIds,
   getOpenCodeFastCuratedSubscriptionProviderIds,
   getOpenCodeSeededSubscriptionProviderIds,
   OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS,
@@ -22,6 +21,13 @@ import {
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { OpenCodeHostLeaseInput } from '../../../../services/opencode/OpenCodeHostManager.js'
 import {
+  mergeOpenCodeModelMetadata,
+  normalizeOpenCodeLiveConfigProvidersResponse,
+  normalizeOpenCodeLiveModelMetadata,
+  normalizeOpenCodeLiveProviderAuth,
+  normalizeOpenCodeLiveProviderResponse,
+} from '../../../../services/opencode/OpenCodeLiveProviderNormalizer.js'
+import {
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
   OPEN_CODE_SUPERGROK_OAUTH_MIN_VERSION,
@@ -40,6 +46,11 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
+import {
+  openCodeProviderCatalogService,
+  type OpenCodeProviderCatalogPort,
+} from '../../../../services/opencode/OpenCodeProviderCatalogService.js'
 import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
@@ -112,6 +123,10 @@ import type {
   ProviderManagementDirectoryQueryPort,
   ProviderManagementQueryPort,
 } from '../../ports/ProviderManagementPorts.js'
+import {
+  readOpenCodePassiveProviderDirectory,
+} from '../../../../services/opencode/OpenCodePassiveProviderDirectory.js'
+import type { OpenCodePassiveStatusV1 } from '../../../../services/opencode/OpenCodePassiveStatusContract.js'
 
 type OpenCodeInventoryServiceLike = {
   probe(
@@ -151,6 +166,13 @@ type OpenCodeClientFactoryLike = {
 }
 
 type OpenCodeProviderManagementAdapterDeps = {
+  providerCatalog?: OpenCodeProviderCatalogPort
+  getOpenCodePassiveStatus?: (input: {
+    projectPath: string
+    providerIds: readonly string[]
+    timeoutMs: number
+  }) => Promise<OpenCodePassiveStatusV1>
+  passiveStatusTimeoutMs?: number
   inventoryService?: OpenCodeInventoryServiceLike
   hostManager?: OpenCodeHostManagerLike
   clientFactory?: OpenCodeClientFactoryLike
@@ -190,6 +212,7 @@ type OpenCodeProviderManagementAdapterDeps = {
       outputTokens?: number
       bypassCache?: boolean
       runtimeDeadline?: OpenCodeRuntimeDeadline
+      providerBaseUrl?: string | null
     }): Promise<OpenCodeExecutionProbeResult>
   }
   managedPreferences?: {
@@ -209,7 +232,6 @@ type SafeValue<T> = { ok: true; value: T } | { ok: false; message: string }
 const FAST_CURATED_SETUP_PROVIDER_IDS = new Set<string>(
   getOpenCodeFastCuratedSubscriptionProviderIds(),
 )
-const CURATED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeCuratedSubscriptionProviderIds()
 const SEEDED_SUBSCRIPTION_PROVIDER_IDS = getOpenCodeSeededSubscriptionProviderIds()
 const CURATED_SUBSCRIPTION_PROVIDER_LABELS = Object.fromEntries(
   OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => [
@@ -248,26 +270,6 @@ const SEEDED_PROVIDER_IDS = [
   'atlascloud',
   ...SEEDED_SUBSCRIPTION_PROVIDER_IDS,
 ] as const
-const SUMMARY_PROVIDER_IDS = new Set<string>([
-  'xai',
-  'github-copilot',
-  ...CURATED_SUBSCRIPTION_PROVIDER_IDS,
-])
-const SUMMARY_PROVIDER_AUTH_METHODS: Record<string, OpenCodeProviderAuthMethod[]> = {
-  xai: [{ type: 'oauth' }, { type: 'api' }],
-  'github-copilot': [{ type: 'oauth' }],
-  ...Object.fromEntries(
-    OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS.map(definition => [
-      definition.id,
-      [{
-        type:
-          definition.credentialKind === 'api-key' || definition.id === 'cursor-acp'
-            ? 'api'
-            : 'oauth',
-      }],
-    ]),
-  ),
-}
 const PROVIDERS_REQUIRING_EXPLICIT_CREDENTIAL_EVIDENCE = new Set<string>([
   'atlascloud',
   'github-copilot',
@@ -318,13 +320,6 @@ const CONNECT_EXECUTION_PROOF_MODEL_PREFERENCES: Record<string, readonly string[
     'atlascloud/deepseek-ai/deepseek-v4-flash',
     'atlascloud/zai-org/glm-5.1',
   ],
-  'github-copilot': [
-    'github-copilot/gpt-5-mini',
-    'github-copilot/gpt-5.5',
-    'github-copilot/claude-haiku-4.5',
-    'github-copilot/claude-sonnet-4.6',
-    'github-copilot/gpt-5.6-luna',
-  ],
   ...Object.fromEntries(
     OPEN_CODE_CURATED_SUBSCRIPTION_PROVIDERS
       .filter(definition => definition.modelProbePreferences.length > 0)
@@ -355,7 +350,7 @@ const CURATED_API_BOOTSTRAP_PROVIDER_IDS = new Set<string>([
   'zenmux',
 ])
 const COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE =
-  'GitHub sign-in succeeded, but OpenCode could not use any explicit Copilot model allowed for this account. Copilot Free and Student are Auto-only, which OpenCode does not currently support. On a paid or organization plan, check model policies.'
+  'GitHub sign-in succeeded, but no tested explicit Copilot model was usable. GitHub/OpenCode did not report the plan name. This can mean an Auto-only Free or Student account, an organization model policy, or an OpenCode integration restriction blocked the tested models. Agent Teams cannot use Copilot Auto yet.'
 
 function isCopilotExplicitModelUnsupported(reason: string): boolean {
   const normalized = reason.trim().toLowerCase()
@@ -363,6 +358,14 @@ function isCopilotExplicitModelUnsupported(reason: string): boolean {
     || normalized.includes('selected model is not supported')
     || normalized.includes('model is unsupported for this copilot account')
     || normalized.includes('model is not supported for this copilot account')
+    || normalized.includes('model is not available for integrator')
+}
+
+function isExecutionProbeInfrastructureFailure(
+  result: Pick<OpenCodeExecutionProbeResult, 'failureCode'>,
+): boolean {
+  return result.failureCode === 'prompt_start_failed'
+    || result.failureCode === 'execution_timeout'
 }
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
@@ -390,12 +393,6 @@ const EMPTY_CAPABILITIES: OpenCodeProviderManagementCapabilities = {
   deleteAuth: false,
   authorizeOAuth: false,
   completeOAuth: false,
-}
-
-const SUMMARY_CAPABILITIES: OpenCodeProviderManagementCapabilities = {
-  deleteAuth: false,
-  authorizeOAuth: true,
-  completeOAuth: true,
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -517,8 +514,10 @@ function normalizeDirectoryCursor(value: string | null | undefined): number {
 }
 
 function normalizeProviderId(value: string | null | undefined): string | null {
-  const normalized = value?.trim().toLowerCase()
-  return normalized && /^[a-z0-9][a-z0-9._-]*$/i.test(normalized) ? normalized : null
+  const normalized = value?.trim()
+  if (!normalized) return null
+  const canonical = canonicalizeOpenCodeProviderId(normalized)
+  return /^[a-z0-9][a-z0-9._-]*$/i.test(canonical) ? canonical : null
 }
 
 function normalizePositiveLimit(value: number | null | undefined): number | null {
@@ -2119,90 +2118,6 @@ function sortProviderDirectoryEntries(
   })
 }
 
-function buildSummaryConfigProviders(
-  inventory: OpenCodeInventorySnapshot,
-): OpenCodeConfigProvidersResponse | null {
-  const managedProviders = asRecord(inventory.profile?.managedConfig.provider)
-  if (!managedProviders) {
-    return null
-  }
-
-  const providers = Object.entries(managedProviders).flatMap(([rawProviderId, rawConfig]) => {
-    const providerId = normalizeProviderId(rawProviderId)
-    const config = asRecord(rawConfig)
-    if (!providerId || !config || !SUMMARY_PROVIDER_IDS.has(providerId)) {
-      return []
-    }
-    const name = asString(config.name)
-    const npm = asString(config.npm)
-    const source = asString(config.source)
-    const options = asRecord(config.options)
-    const models = asRecord(config.models)
-    const provider: OpenCodeProviderListEntry = {
-      id: providerId,
-      ...(name ? { name } : {}),
-      ...(npm ? { npm } : {}),
-      ...(source ? { source } : {}),
-      ...(options ? { options } : {}),
-      ...(models ? { models } : {}),
-    }
-    return [provider]
-  })
-
-  return providers.length > 0 ? { providers } : null
-}
-
-function buildSummaryProviderDirectory(input: {
-  inventory: OpenCodeInventorySnapshot
-  query?: string | null
-  filter?: ProviderDirectoryFilter | null
-  limit?: number | null
-  cursor?: string | null
-}): ProviderDirectoryView {
-  const inventory: OpenCodeInventorySnapshot = {
-    ...input.inventory,
-    availableProviders: Array.from(new Set([
-      ...input.inventory.availableProviders,
-      ...SUMMARY_PROVIDER_IDS,
-    ])),
-  }
-  const configProviders = buildSummaryConfigProviders(inventory)
-  const source = {
-    inventory,
-    configProviders,
-    providers: null,
-    providerAuth: SUMMARY_PROVIDER_AUTH_METHODS,
-    capabilities: SUMMARY_CAPABILITIES,
-    diagnostics: inventory.diagnostics,
-  }
-  const unpagedDirectory = buildProviderDirectory({
-    ...source,
-    query: null,
-    filter: 'all',
-    limit: Number.MAX_SAFE_INTEGER,
-    cursor: null,
-  })
-  const entries = unpagedDirectory.entries.filter(entry =>
-    SUMMARY_PROVIDER_IDS.has(entry.providerId),
-  )
-  const summaryDirectory: ProviderDirectoryView = {
-    ...unpagedDirectory,
-    totalCount: entries.length,
-    returnedCount: entries.length,
-    nextCursor: null,
-    entries,
-  }
-
-  return filterAndPageProviderDirectory({
-    directory: summaryDirectory,
-    modelIdsByProviderId: buildProviderDirectoryModelSearchIndex(source),
-    query: input.query,
-    filter: input.filter,
-    limit: input.limit,
-    cursor: input.cursor,
-  })
-}
-
 function buildProviderDirectory(input: {
   inventory: OpenCodeInventorySnapshot
   configProviders: OpenCodeConfigProvidersResponse | null
@@ -2493,12 +2408,31 @@ async function readLiveView(input: {
     ...safeReadDiagnostics(serverDocResult),
   ]
 
+  const configProviders = configProvidersResult.ok
+    ? normalizeOpenCodeLiveConfigProvidersResponse(configProvidersResult.value)
+    : null
+  const providers = providersResult.ok
+    ? normalizeOpenCodeLiveProviderResponse(providersResult.value)
+    : null
+  const providerAuth = providerAuthResult.ok
+    ? normalizeOpenCodeLiveProviderAuth(providerAuthResult.value)
+    : null
+  const inventory = providers
+    ? {
+        ...input.inventory,
+        modelMetadata: mergeOpenCodeModelMetadata(
+          input.inventory.modelMetadata ?? [],
+          normalizeOpenCodeLiveModelMetadata(providers),
+        ),
+      }
+    : input.inventory
+
   return buildView({
-    inventory: input.inventory,
+    inventory,
     host: input.host,
-    configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-    providers: providersResult.ok ? providersResult.value : null,
-    providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+    configProviders,
+    providers,
+    providerAuth,
     capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
     diagnostics,
   })
@@ -2645,8 +2579,12 @@ function getProviderCredentialValidationModelIds(input: {
   if (defaultModelId) appendCandidates([defaultModelId])
   appendCandidates(modelIds)
 
+  // Copilot's catalog and plan policy change independently. Every explicit
+  // model rejected as unsupported is safe to skip because it never starts a
+  // generation. Do not cap Copilot to a stale hard-coded shortlist: walk the
+  // live catalog and stop at the first model that completes the proof.
   const maxCandidates = input.providerId === 'github-copilot'
-    ? Math.max(CONNECT_EXECUTION_PROOF_MAX_CANDIDATES, preferredModelIds.length)
+    ? candidates.length
     : CONNECT_EXECUTION_PROOF_MAX_CANDIDATES
   return candidates.slice(0, maxCandidates)
 }
@@ -2889,12 +2827,58 @@ function mapProbeOutcomeToAvailability(
   return 'unknown'
 }
 
+function sanitizeProviderBaseUrl(value: unknown): string | null {
+  const raw = asString(value)
+  if (!raw) return null
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
+    }
+    return parsed.origin
+  } catch {
+    return null
+  }
+}
+
+function sanitizeProviderSource(value: unknown): string | null {
+  const source = asString(value)
+  return source && ['env', 'config', 'custom', 'api'].includes(source) ? source : null
+}
+
+function resolveEffectiveProviderEndpoint(input: {
+  providerId: string
+  configProviders: OpenCodeConfigProvidersResponse | null
+}): { baseUrl: string | null; providerSource: string | null } {
+  const provider = input.configProviders?.providers?.find(candidate =>
+    normalizeProviderId(candidate.id) === input.providerId
+  )
+  const options = asRecord(provider?.options)
+  return {
+    baseUrl: sanitizeProviderBaseUrl(options?.baseURL ?? options?.baseUrl),
+    providerSource: sanitizeProviderSource(provider?.source),
+  }
+}
+
 function buildProviderModelTestResult(input: {
   providerId: string
   modelId: string
   probe: OpenCodeExecutionProbeResult
+  configProviders: OpenCodeConfigProvidersResponse | null
 }): ProviderModelTestResult {
   const availability = mapProbeOutcomeToAvailability(input.probe.outcome)
+  const endpoint = resolveEffectiveProviderEndpoint({
+    providerId: input.providerId,
+    configProviders: input.configProviders,
+  })
+  const diagnostics = [...input.probe.diagnostics]
+  if (endpoint.baseUrl) {
+    diagnostics.push(
+      endpoint.providerSource
+        ? `OpenCode resolved provider endpoint: ${endpoint.baseUrl} (provider source: ${endpoint.providerSource})`
+        : `OpenCode resolved provider endpoint: ${endpoint.baseUrl}`,
+    )
+  }
   return {
     providerId: input.providerId,
     modelId: input.modelId,
@@ -2904,7 +2888,10 @@ function buildProviderModelTestResult(input: {
       input.probe.outcome === 'available'
         ? 'Model probe passed'
         : (input.probe.reason ?? 'Model probe failed'),
-    diagnostics: input.probe.diagnostics,
+    diagnostics,
+    failureCode: input.probe.failureCode ?? null,
+    effectiveBaseUrl: endpoint.baseUrl,
+    providerSource: endpoint.providerSource,
   }
 }
 
@@ -3307,6 +3294,7 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const failedCandidates: string[] = []
+    const infrastructureFailures: string[] = []
     let copilotUnsupportedCandidateCount = 0
     for (const validationModelId of validationModelIds) {
       const runtimeDeadline = new OpenCodeRuntimeDeadline(
@@ -3321,18 +3309,24 @@ export class OpenCodeProviderManagementAdapter
           // exhaust tiny overrides before emitting the verification response.
           bypassCache: true,
           runtimeDeadline,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId: input.providerId,
+            configProviders: input.configProviders,
+          }).baseUrl,
         })
       } catch (error) {
         const reason = redactSecret(
           error instanceof Error ? error.message : String(error),
           input.secretToRedact ?? '',
         )
-        failedCandidates.push(`${validationModelId}: ${reason}`)
         if (
           input.providerId === 'github-copilot'
           && isCopilotExplicitModelUnsupported(reason)
         ) {
+          failedCandidates.push(`${validationModelId}: ${reason}`)
           copilotUnsupportedCandidateCount += 1
+        } else {
+          infrastructureFailures.push(`${validationModelId}: ${reason}`)
         }
         continue
       } finally {
@@ -3362,16 +3356,28 @@ export class OpenCodeProviderManagementAdapter
             : `Provider authentication failed for ${validationModelId}`,
         )
       }
+      if (isExecutionProbeInfrastructureFailure(probeResult)) {
+        infrastructureFailures.push(`${validationModelId}: ${probeReason}`)
+        continue
+      }
       failedCandidates.push(`${validationModelId}: ${probeReason}`)
     }
 
     if (
       input.providerId === 'github-copilot'
+      && infrastructureFailures.length === 0
       && copilotUnsupportedCandidateCount === validationModelIds.length
     ) {
       return providerManagementError(
-        'model-test-failed',
+        'model-access-unavailable',
         COPILOT_EXPLICIT_MODEL_UNSUPPORTED_MESSAGE,
+      )
+    }
+
+    if (infrastructureFailures.length > 0) {
+      return providerManagementError(
+        'runtime-unhealthy',
+        `OpenCode connected to ${input.providerId}, but runtime verification could not determine model access. Retry verification. Diagnostics: ${infrastructureFailures.join('; ')}`,
       )
     }
 
@@ -3431,6 +3437,9 @@ export class OpenCodeProviderManagementAdapter
         projectPath: inventory.projectPath,
         hostLifetime,
         resolveConfigFingerprint: false,
+        managedPluginStartupPolicy: options.inventoryMode === 'profile'
+          ? 'serve-startup'
+          : 'catalog-prewarm',
       })
       if (hostLifetime === 'persistent') {
         hostLease = await this.retainProviderManagementHost(hostManager, host)
@@ -3471,7 +3480,9 @@ export class OpenCodeProviderManagementAdapter
     }
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
-    const inventory = await this.probeInventory(inventoryService, request.projectPath)
+    const inventory = await this.probeInventory(inventoryService, request.projectPath, {
+      mode: 'profile',
+    })
 
     if (!inventory.detected) {
       return {
@@ -3514,6 +3525,7 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime: 'persistent',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        managedPluginStartupPolicy: 'serve-startup',
       })
       hostLease = await this.retainProviderManagementHost(hostManager, host)
       const client = clientFactory.create(host.baseUrl)
@@ -3562,6 +3574,27 @@ export class OpenCodeProviderManagementAdapter
       )
     }
 
+    if (input.summary) {
+      try {
+        return {
+          ok: true,
+          value: await readOpenCodePassiveProviderDirectory({
+            projectPath: input.projectPath?.trim() || process.cwd(),
+            query: input.query,
+            filter: input.filter,
+            limit: input.limit,
+            cursor: input.cursor,
+            timeoutMs: this.deps.passiveStatusTimeoutMs,
+          }, this.deps.getOpenCodePassiveStatus ?? null),
+        }
+      } catch {
+        return providerManagementError(
+          'runtime-unhealthy',
+          'OpenCode passive provider summary is unavailable.',
+        )
+      }
+    }
+
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, input.projectPath, {
       mode: input.summary ? 'summary' : input.refresh ? 'full' : 'profile',
@@ -3601,19 +3634,6 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     }
-    if (input.summary) {
-      return {
-        ok: true,
-        value: buildSummaryProviderDirectory({
-          inventory,
-          query: input.query,
-          filter: input.filter,
-          limit: input.limit,
-          cursor: input.cursor,
-        }),
-      }
-    }
-
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = input.refresh ? 'process' : 'persistent'
@@ -3630,6 +3650,7 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        managedPluginStartupPolicy: input.refresh ? 'catalog-prewarm' : 'serve-startup',
       })
       hostLease = await this.retainProviderManagementHost(hostManager, host)
       const cacheKey = this.getDirectoryCacheKey({
@@ -3669,6 +3690,15 @@ export class OpenCodeProviderManagementAdapter
           serverDocRead,
         ])
       const directoryVersion = inventory.version ?? host.version
+      const liveConfigProviders = configProvidersResult.ok
+        ? normalizeOpenCodeLiveConfigProvidersResponse(configProvidersResult.value)
+        : null
+      const liveProviders = providersResult.ok
+        ? normalizeOpenCodeLiveProviderResponse(providersResult.value)
+        : null
+      const liveProviderAuth = providerAuthResult.ok
+        ? normalizeOpenCodeLiveProviderAuth(providerAuthResult.value)
+        : null
       const {
         connectedProviders: directoryConnectedProviders,
         unsupportedSuperGrokOAuth,
@@ -3679,6 +3709,12 @@ export class OpenCodeProviderManagementAdapter
       const directoryInventory = {
         ...inventory,
         version: directoryVersion,
+        modelMetadata: liveProviders && !input.refresh
+          ? mergeOpenCodeModelMetadata(
+              inventory.modelMetadata ?? [],
+              normalizeOpenCodeLiveModelMetadata(liveProviders),
+            )
+          : inventory.modelMetadata,
         connectedProviders: directoryConnectedProviders,
         diagnostics: [
           ...inventory.diagnostics.filter(
@@ -3700,9 +3736,9 @@ export class OpenCodeProviderManagementAdapter
       ]
       const directorySource = {
         inventory: directoryInventory,
-        configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-        providers: providersResult.ok ? providersResult.value : null,
-        providerAuth: providerAuthResult.ok ? providerAuthResult.value : null,
+        configProviders: liveConfigProviders,
+        providers: liveProviders,
+        providerAuth: liveProviderAuth,
         capabilities: getCapabilities(serverDocResult.ok ? serverDocResult.value : null),
         diagnostics,
       }
@@ -3836,55 +3872,75 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
-    return this.withManagedOpenCodeClient(
-      input.runtimeId,
-      input.projectPath,
-      async ({ inventory, client }) => {
-        const managedPreferencesResult = inventory.profile
-          ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
-          : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
-        const [configProvidersResult, providersResult, preferencesResult] = await Promise.all([
-          safeRead(() => client.getConfigProviders()),
-          safeRead(() => client.getProviders()),
-          managedPreferencesResult,
-        ])
-        const diagnostics = [
-          ...inventory.diagnostics,
-          ...safeReadDiagnostics(configProvidersResult),
-          ...safeReadDiagnostics(providersResult),
-        ]
-        const modelsView = buildProviderModelsView({
-          providerId,
-          inventory,
-          configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-          providers: providersResult.ok ? providersResult.value : null,
-          query: input.query,
-          limit: input.limit,
-          cursor: input.cursor,
-          diagnostics,
-          managedModelLimitOverrides:
-            preferencesResult.ok && preferencesResult.value
-              ? preferencesResult.value.modelLimitOverrides
-              : undefined,
-        })
-
-        if (modelsView.models.length === 0) {
-          const knownProviderIds = getKnownProviderIds({
-            inventory,
-            configProviders: configProvidersResult.ok ? configProvidersResult.value : null,
-            providers: providersResult.ok ? providersResult.value : null,
+    if (input.runtimeId !== 'opencode') {
+      return providerManagementError('unsupported-runtime', 'Provider catalog is unavailable', false)
+    }
+    try {
+      const scoped = await (this.deps.providerCatalog ?? openCodeProviderCatalogService)
+        .loadCatalog({ providerId, projectPath: input.projectPath })
+      const catalog = scoped.catalog
+      const preferencesResult = await safeRead(() =>
+        this.getManagedPreferences().read(scoped.profileRootPath)
+      )
+      const overrides: Readonly<Record<string, OpenCodeManagedModelLimitOverride>> = preferencesResult.ok
+        ? preferencesResult.value.modelLimitOverrides
+        : Object.freeze({})
+      const query = normalizeQuery(input.query)
+      const limit = normalizePositiveLimit(input.limit)
+      const offset = normalizeDirectoryCursor(input.cursor)
+      const sourceLabel = getProviderDisplayName(providerId)
+      const allModels: RuntimeProviderModel[] = catalog.models
+        .filter(model => model.status !== 'deprecated')
+        .map(model => {
+          const modelId = `${providerId}/${model.id}`
+          const managed = overrides[modelId] ?? null
+          return Object.freeze({
+            modelId,
+            providerId,
+            displayName: model.displayName ?? model.id,
+            sourceLabel,
+            free: model.billing === 'free',
+            default: false,
+            catalogStatus: model.status === 'unknown' ? 'active' : model.status,
+            availability: 'untested',
+            accessKind: 'catalog_selection_only',
+            routeKind: 'catalog_provider',
+            proofState: 'needs_probe',
+            requiresExecutionProof: true,
+            accessReason: 'Provider catalog data permits model selection only; launch requires an independent fresh proof.',
+            catalogContextTokens: model.limits.context,
+            catalogOutputTokens: model.limits.output,
+            managedContextTokens: managed?.contextTokens ?? null,
+            managedOutputTokens: managed?.outputTokens ?? null,
+            managedUpdatedAt: managed?.updatedAt ?? null,
           })
-          if (!knownProviderIds.has(providerId)) {
-            return providerManagementError(
-              'provider-missing',
-              `OpenCode provider ${providerId} was not found in the live catalog`,
-            )
-          }
-        }
-
-        return { ok: true, value: modelsView }
-      },
-    )
+        }).filter(model => providerModelMatchesQuery(model, query))
+      const models = limit ? allModels.slice(offset, offset + limit) : allModels.slice(offset)
+      const nextOffset = offset + models.length
+      return {
+        ok: true,
+        value: {
+          runtimeId: 'opencode',
+          providerId,
+          totalCount: allModels.length,
+          returnedCount: models.length,
+          limit,
+          cursor: input.cursor?.trim() || null,
+          nextCursor: nextOffset < allModels.length ? String(nextOffset) : null,
+          models: Object.freeze(models),
+          defaultModelId: null,
+          diagnostics: Object.freeze([
+            ...scoped.diagnostics,
+            ...safeReadDiagnostics(preferencesResult),
+          ]),
+        },
+      }
+    } catch {
+      return providerManagementError(
+        'runtime-unhealthy',
+        'OpenCode provider catalog is temporarily unavailable.',
+      )
+    }
   }
 
   async connectWithApiKey(
@@ -4808,6 +4864,10 @@ export class OpenCodeProviderManagementAdapter
             selectedModel: modelId,
             projectPath: inventory.projectPath,
             bypassCache: true,
+            providerBaseUrl: resolveEffectiveProviderEndpoint({
+              providerId,
+              configProviders,
+            }).baseUrl,
           })
           if (probeResult.outcome !== 'available') {
             if (probeResult.outcome === 'not_authenticated') {
@@ -4854,6 +4914,7 @@ export class OpenCodeProviderManagementAdapter
           inventory.projectPath,
           {
             bypassCache: true,
+            mode: 'summary',
           },
         )
         const refresh = useActionRefreshInventory(
@@ -4876,7 +4937,7 @@ export class OpenCodeProviderManagementAdapter
           value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
     )
   }
 
@@ -4942,6 +5003,10 @@ export class OpenCodeProviderManagementAdapter
           selectedModel: modelId,
           projectPath: inventory.projectPath,
           bypassCache: true,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId,
+            configProviders,
+          }).baseUrl,
         })
         return {
           ok: true,
@@ -4949,10 +5014,11 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             modelId,
             probe,
+            configProviders,
           }),
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
     )
   }
 
@@ -5045,6 +5111,10 @@ export class OpenCodeProviderManagementAdapter
           contextTokens,
           outputTokens,
           bypassCache: true,
+          providerBaseUrl: resolveEffectiveProviderEndpoint({
+            providerId,
+            configProviders,
+          }).baseUrl,
         })
         const verified = probe.outcome === 'available'
         if (!verified) {
@@ -5092,7 +5162,7 @@ export class OpenCodeProviderManagementAdapter
           },
         }
       },
-      { failureCode: 'model-test-failed' },
+      { failureCode: 'model-test-failed', inventoryMode: 'summary' },
     )
   }
 }

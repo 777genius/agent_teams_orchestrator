@@ -11,7 +11,10 @@ import {
   parseFirstOpenCodeModelToken,
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
-import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  canonicalizeOpenCodeProviderId,
+  tryCreateOpenCodeCanonicalProviderId,
+} from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import {
@@ -132,7 +135,7 @@ async function acquireOpenCodeLock(
   }
 }
 
-type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
+export type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 
 type OpenCodeInventoryProbeOptions = {
   bypassCache?: boolean
@@ -215,7 +218,16 @@ type CacheEntry = {
 }
 
 function normalizeProviderId(value: string): string {
-  return canonicalizeOpenCodeProviderId(value)
+  const canonical = tryCreateOpenCodeCanonicalProviderId(value)
+  if (canonical) return canonical
+  // Provider CLI output may use a plain human label (for example,
+  // "Cloudflare Workers AI"). Only this deliberately narrow word-only form
+  // is converted; punctuation/authority/credential-shaped text still fails
+  // at the shared canonical identity boundary.
+  if (!/^[A-Za-z0-9]+(?: [A-Za-z0-9]+)*$/.test(value)) {
+    return canonicalizeOpenCodeProviderId(value)
+  }
+  return canonicalizeOpenCodeProviderId(value.toLowerCase().replace(/ +/g, '-'))
 }
 
 function getTrimmedNonEmptyLines(output: string): string[] {
@@ -505,6 +517,26 @@ async function withOpenCodeInventoryCommandLock<T>(
   }
 }
 
+export function runOpenCodeInventoryPreparedProfileProbe<T>(input: {
+  mode: OpenCodeInventoryProbeMode
+  profile: OpenCodePreparedProfile
+  abortSignal?: AbortSignal
+  probe: () => Promise<T>
+  withCommandLock?: <R>(
+    profile: OpenCodePreparedProfile,
+    callback: () => Promise<R>,
+    abortSignal?: AbortSignal,
+  ) => Promise<R>
+}): Promise<T> {
+  return input.mode === 'profile'
+    ? input.probe()
+    : (input.withCommandLock ?? withOpenCodeInventoryCommandLock)(
+        input.profile,
+        input.probe,
+        input.abortSignal,
+      )
+}
+
 function profileUsesManagedSubscriptionPlugins(profile: OpenCodePreparedProfile): boolean {
   const configuredPlugins = Array.isArray(profile.managedConfig.plugin)
     ? profile.managedConfig.plugin.filter((value): value is string => typeof value === 'string')
@@ -643,7 +675,7 @@ function collectFiniteNumbers(value: unknown): number[] {
   return []
 }
 
-function isFreeCost(cost: unknown): boolean {
+export function isOpenCodeCostFree(cost: unknown): boolean {
   const numbers = collectFiniteNumbers(cost)
   return numbers.length > 0 && numbers.every(value => value === 0)
 }
@@ -733,7 +765,7 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
         cost: raw.cost ?? null,
         context: getModelContextLimit(limits),
         limits,
-        free: isFreeCost(raw.cost),
+        free: isOpenCodeCostFree(raw.cost),
         catalogStatus,
         raw,
       })
@@ -746,6 +778,38 @@ export function parseOpenCodeModelsVerboseOutput(output: string): {
   return {
     models,
     modelMetadata,
+  }
+}
+
+export async function resolveOpenCodeModelsWithFallback(input: {
+  mode: OpenCodeInventoryProbeMode
+  modelsResult: OpenCodeCommandResult
+  refreshModels?: boolean
+  execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
+}): Promise<{
+  models: string[]
+  modelMetadata: OpenCodeModelMetadata[]
+  modelsResult: OpenCodeCommandResult
+}> {
+  const verboseModels = input.mode === 'full' && input.modelsResult.code === 0
+    ? parseOpenCodeModelsVerboseOutput(input.modelsResult.stdout)
+    : { models: [], modelMetadata: [] }
+  if (
+    input.mode !== 'full'
+    || input.refreshModels
+    || input.modelsResult.code !== 0
+    || verboseModels.models.length > 0
+  ) {
+    return { ...verboseModels, modelsResult: input.modelsResult }
+  }
+
+  const fallbackModelsResult = await input.execOpenCode(['models'])
+  return {
+    models: fallbackModelsResult.code === 0
+      ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
+      : [],
+    modelMetadata: [],
+    modelsResult: fallbackModelsResult,
   }
 }
 
@@ -937,6 +1001,27 @@ export class OpenCodeInventoryService {
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
     const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
+    // Summary is a passive status boundary. It must never prepare a profile,
+    // reserve a port, spawn OpenCode, or enumerate providers/models/agents.
+    // Rich passive status is served by OpenCodePassiveStatusProductionReader;
+    // this compatibility snapshot intentionally carries no active authority.
+    if (mode === 'summary') {
+      return {
+        detected: false,
+        binaryPath: null,
+        version: null,
+        projectPath: resolvedProjectPath,
+        profile: null,
+        connectedProviders: [],
+        availableProviders: [],
+        models: [],
+        modelMetadata: [],
+        agents: [],
+        authStorePath: null,
+        probeError: null,
+        diagnostics: ['Passive OpenCode summary has no active inventory authority'],
+      }
+    }
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
     const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
     const cached = this.cache.get(cacheKey)
@@ -976,7 +1061,7 @@ export class OpenCodeInventoryService {
       openCodeProfileManager.prepareProfile(resolvedProjectPath, {
         abortSignal: options.abortSignal,
         includeAppMcp: options.includeAppMcp !== false,
-        includeManagedSubscriptionPlugins: mode !== 'summary',
+        includeManagedSubscriptionPlugins: true,
         toolApprovalMode,
       }),
       options.abortSignal,
@@ -984,17 +1069,21 @@ export class OpenCodeInventoryService {
       .finally(() => {
         leaveProfileStep?.()
       })
-    return withOpenCodeInventoryCommandLock(profile, () =>
-      this.probePreparedProfile({
-        mode,
-        resolvedProjectPath,
-        options,
-        cacheKey,
-        cacheEnabled,
-        binaryPath,
-        profile,
-      }), options.abortSignal,
-    )
+    const probePreparedProfile = () => this.probePreparedProfile({
+      mode,
+      resolvedProjectPath,
+      options,
+      cacheKey,
+      cacheEnabled,
+      binaryPath,
+      profile,
+    })
+    return runOpenCodeInventoryPreparedProfileProbe({
+      mode,
+      profile,
+      abortSignal: options.abortSignal,
+      probe: probePreparedProfile,
+    })
   }
 
   private async probePreparedProfile(input: {
@@ -1100,33 +1189,19 @@ export class OpenCodeInventoryService {
       providers: discoveredConnectedProviders,
       version,
     })
-    const verboseModels =
-      mode !== 'full'
-        ? {
-            models: [],
-            modelMetadata: [],
-          }
-        : modelsResult.code === 0
-          ? parseOpenCodeModelsVerboseOutput(modelsResult.stdout)
-          : { models: [], modelMetadata: [] }
-    let models = verboseModels.models
-    let modelMetadata = verboseModels.modelMetadata
-    let finalModelsResult = modelsResult
-    if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, [
-        'models',
-        ...(options.refreshModels ? ['--refresh'] : []),
-      ], profile, {
+    const {
+      models,
+      modelMetadata,
+      modelsResult: finalModelsResult,
+    } = await resolveOpenCodeModelsWithFallback({
+      mode,
+      modelsResult,
+      refreshModels: options.refreshModels,
+      execOpenCode: args => this.execOpenCode(binaryPath, args, profile, {
         abortSignal: options.abortSignal,
         progress: options.progress,
-      })
-      finalModelsResult = fallbackModelsResult
-      models =
-        fallbackModelsResult.code === 0
-          ? parseOpenCodeModelsOutput(fallbackModelsResult.stdout)
-          : []
-      modelMetadata = []
-    }
+      }),
+    })
     const agents = agentsResult.code === 0 ? parseOpenCodeAgentListOutput(agentsResult.stdout) : []
 
     const availableProviders = Array.from(
@@ -1134,7 +1209,7 @@ export class OpenCodeInventoryService {
         ...connectedProviders.map(provider => provider.id),
         ...models
           .map(model => parseOpenCodeProviderScopedModelRef(model)?.providerId)
-          .filter(Boolean),
+          .filter((providerId): providerId is string => providerId !== undefined),
       ]),
     ).sort()
 

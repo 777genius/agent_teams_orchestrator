@@ -1,3 +1,8 @@
+import type {
+  OpenCodeOperationPolicy,
+  OpenCodeOperationPurpose,
+} from './OpenCodeOperationPolicy.js'
+
 export type OpenCodeAuthSource = 'credentials' | 'environment'
 
 export type OpenCodeAgentMode = 'primary' | 'subagent' | 'unknown'
@@ -20,6 +25,92 @@ export type OpenCodePrepareProfileOptions = {
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
+}
+
+/** Required, fail-closed input for the additive provider-scoped runtime path. */
+export type OpenCodeScopedProfilePlan = {
+  purpose: OpenCodeOperationPurpose
+  providerId?: string | null
+  modelId?: string | null
+  runtimeInstanceId: string
+  projectPath?: string | null
+  abortSignal?: AbortSignal
+}
+
+/**
+ * Immutable evidence supplied to the pure scoped planner.  Values which can
+ * contain credentials are accepted only as already-redacted SHA-256 digests;
+ * the returned plan can therefore be logged or compared without retaining
+ * provider material.
+ */
+export type OpenCodeScopedProfilePlanningEvidence = {
+  canonicalProjectPathFingerprint: string
+  projectBehaviorFingerprint: string
+  providerEnvironmentFingerprint: string
+  selectedAuthFingerprint: string
+  binaryFingerprint: string
+  configFingerprint: string
+  nativeAccountIdentityFingerprint: string
+  nativeAccountIdentitySource: 'official-provider-cli' | 'managed-auth'
+  nativeTargetExecutableFingerprint: string
+  profileLayoutFingerprint: string
+  /** Digest of the synchronously captured automatic user-plugin file manifest. */
+  automaticUserPluginFingerprint?: string
+  plugins: readonly {
+    spec: string
+    provenance: 'user' | 'project' | 'environment' | 'app-managed'
+    /** Exact immutable package/local tree bytes, including transitive dependencies. */
+    dependencyTreeFingerprint: string
+    /** Canonical tagged SHA-256 of the immutable resolved package identity. */
+    resolvedIdentity: string
+    /** Fake/caller-captured regular files relative to a node_modules snapshot root. */
+    immutableTreeEntries: readonly {
+      path: string
+      bytesBase64: string
+      mode: 0o400 | 0o500
+    }[]
+  }[]
+}
+
+export type OpenCodePlanScopedProfileInput = Omit<OpenCodeScopedProfilePlan, 'abortSignal'> & {
+  abortSignal?: never
+  evidence: OpenCodeScopedProfilePlanningEvidence
+}
+
+/** Pure, redacted and read-only contract passed from planning to preparation. */
+export type OpenCodeScopedProfilePlanContract = {
+  schema: 'opencode-scoped-profile-plan-v1'
+  purpose: OpenCodeOperationPurpose
+  providerId: string
+  modelId: string | null
+  canonicalProjectPathFingerprint: string
+  projectBehaviorFingerprint: string
+  providerEnvironmentFingerprint: string
+  selectedAuthFingerprint: string
+  binaryFingerprint: string
+  configFingerprint: string
+  nativeAccountIdentityFingerprint: string
+  nativeAccountIdentitySource: 'official-provider-cli' | 'managed-auth'
+  nativeTargetExecutableFingerprint: string
+  profileLayoutFingerprint: string
+  automaticUserPluginFingerprint: string
+  plugins: readonly {
+    spec: string
+    provenance: 'user' | 'project' | 'environment' | 'app-managed'
+    dependencyTreeFingerprint: string
+    packageIntegrity: string
+    manifestFingerprint: string
+    lockBindingFingerprint: string
+    resolvedIdentity: string
+    executionSpecifier: string
+  }[]
+  pluginFingerprint: string
+  cacheFingerprint: string
+  profileFingerprint: string
+  operationFingerprint: string
+  accountFingerprint: string
+  digest: string
+  expectedHostKey: string
 }
 
 export type OpenCodePreparedProfile = {
@@ -46,6 +137,76 @@ export type OpenCodePreparedProfile = {
   managedAuthFingerprint: string | null
   authState: OpenCodeAuthState
   env: NodeJS.ProcessEnv
+}
+
+/** Legacy compatibility profiles cannot carry scoped-policy proof fields. */
+export type OpenCodeCompatibilityPreparedProfile = OpenCodePreparedProfile & {
+  scopeSchema?: never
+}
+
+/**
+ * A policy-proven profile. Compatibility profiles deliberately cannot satisfy
+ * this type, which prevents scoped hosts from silently falling back to legacy
+ * caller-controlled behavior.
+ */
+export type OpenCodeScopedPreparedProfile = OpenCodePreparedProfile & {
+  scopeSchema: 'opencode-scoped-profile-v1'
+  policy: OpenCodeOperationPolicy
+  purpose: OpenCodeOperationPurpose
+  providerId: string | null
+  modelId: string | null
+  runtimeInstanceId: string
+  /** Digest of the canonical project path, distinct from project behavior bytes. */
+  canonicalProjectPathFingerprint: string
+  /** Immutable mirror used as the scoped host cwd; original-project discovery is forbidden. */
+  executionProjectPath: string
+  operationKey: string
+  profileKey: string
+  pluginKey: string
+  cacheKey: string
+  profileScopeIdentity: string
+  selectedAuthBaselineFingerprint: string
+  providerEnvironmentFingerprint: string
+  nativeCredentialBridgeInputFingerprint: string
+  nativeCredentialBridgeFingerprint: string
+  /** Digest of the resolved native CLI target bytes, never the target bytes themselves. */
+  nativeTargetExecutableFingerprint: string
+  nativeTargetExecutablePath: string | null
+  nativeCredentialHostHomePath: string | null
+  /** Digest of allowlisted native account/credential artifacts; raw credentials are never retained. */
+  nativeAccountEvidenceFingerprint: string
+  /** Digest of every final child environment key/value after all derived values are installed. */
+  executionEnvironmentFingerprint: string
+  /** Immutable source snapshot used to fail closed if project/plugin inputs change after prepare. */
+  expectedEntryManifest: {
+    projectBehaviorFingerprint: string
+    projectBehaviorSnapshotPath: string
+    projectBehaviorEntryManifest: string[]
+    userPluginDirectory: string
+    userPluginEntries: string[]
+    pluginConfigs: Array<{ path: string; provenance: 'user' | 'project' | 'environment' }>
+    preservedPlugins: Array<{ spec: string; provenance: 'user' | 'project' | 'environment' }>
+    preservedPluginsFingerprint: string
+    inlinePluginsFingerprint: string
+    pluginDependencyFingerprint?: string | null
+    pluginDependencyEntries?: string[]
+  }
+  expectedEntryManifestFingerprint: string
+  automaticUserPluginFingerprint: string
+  binaryPath: string
+  binaryFingerprint: string
+  pluginNodeModulesPath: string
+  preparationLockPath: string
+  profileLayoutGeneration: string
+  /** Digest of the mandatory pure plan/materialize contract. */
+  scopedPlanDigest: string
+  /** Canonical host key produced by that pure plan. */
+  plannedHostKey: string
+  nativeCredentialBridge: {
+    providerId: 'kiro' | 'cursor-acp'
+    binPath: string
+    executablePath: string
+  } | null
 }
 
 export type OpenCodeHostHandle = {
@@ -233,6 +394,8 @@ export type OpenCodeProvisioningSnapshot = {
   projectPath: string
   models?: string[]
   modelMetadata?: OpenCodeModelMetadata[]
+  /** Require selected models to be affirmatively verified by the live profile catalog. */
+  profileLiveModelVerification?: boolean
   profile: OpenCodePreparedProfile | null
   host: OpenCodeHostHandle | null
   config: OpenCodeConfigResponse | null
@@ -522,6 +685,11 @@ export type OpenCodeExecutionProbeOutcome =
   | 'not_authenticated'
   | 'unknown'
 
+export type OpenCodeExecutionProbeFailureCode =
+  | 'prompt_start_failed'
+  | 'execution_timeout'
+  | 'provider_endpoint_unreachable'
+
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'
   modelId: string
@@ -537,7 +705,7 @@ export type OpenCodeExecutionProbeResult = {
   toolCallCount: number
   errorCount: number
   diagnostics: string[]
-  failureCode?: 'prompt_start_failed' | 'execution_timeout'
+  failureCode?: OpenCodeExecutionProbeFailureCode
   verifiedAt?: string
 }
 

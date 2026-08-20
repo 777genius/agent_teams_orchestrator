@@ -760,12 +760,53 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(probeCalled).toBe(true)
     expect(probeOptions).toEqual({
       disposeHostOnRelease: process.platform !== 'win32',
+      inventoryMode: 'full',
     })
     if (result.ok) {
       expect(result.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
       expect(result.data.server.runtime.capabilitySnapshotId).toMatch(/^opencode:/)
     }
   })
+
+  test('uses profile inventory for a non-OpenCode selected model in a launch handshake', async () => {
+    let probeOptions: Parameters<typeof openCodeProvisioningProbe.probe>[1] = undefined
+    openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
+      probeOptions = options
+      return snapshot
+    }) as typeof openCodeProvisioningProbe.probe
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.handshake', {
+        requiredCommand: 'opencode.launchTeam',
+        expectedCapabilitySnapshotId: 'opencode:expected',
+        selectedModel: 'openrouter/openai/gpt-5.4',
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(probeOptions?.inventoryMode).toBe('profile')
+  })
+
+  for (const selectedModel of ['opencode/big-pickle', 'raw-model', null] as const) {
+    test(`keeps full inventory for ${selectedModel ?? 'an absent model'} in a launch handshake`, async () => {
+      let probeOptions: Parameters<typeof openCodeProvisioningProbe.probe>[1] = undefined
+      openCodeProvisioningProbe.probe = (async (_projectPath, options) => {
+        probeOptions = options
+        return snapshot
+      }) as typeof openCodeProvisioningProbe.probe
+
+      const result = await executeOpenCodeBridgeCommandEnvelope(
+        buildEnvelope('opencode.handshake', {
+          requiredCommand: 'opencode.launchTeam',
+          expectedCapabilitySnapshotId: 'opencode:expected',
+          ...(selectedModel ? { selectedModel } : {}),
+        }),
+      )
+
+      expect(result.ok).toBe(true)
+      expect(probeOptions?.inventoryMode).toBe('full')
+    })
+  }
 
   test('executes host cleanup without provisioning a readiness host', async () => {
     let probeCalled = false
@@ -819,7 +860,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
-  test('checks command status with read-only summary inventory', async () => {
+  test('checks command status through passive redacted status without inventory', async () => {
     const probeCalls: Array<{ projectPath?: string | null; options?: Record<string, unknown> }> = []
     openCodeInventoryService.probe = (async (projectPath, options) => {
       probeCalls.push({ projectPath, options: options as Record<string, unknown> })
@@ -852,12 +893,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.data.status).toBe('unknown')
-    expect(probeCalls).toEqual([
-      {
-        projectPath: '/tmp/project',
-        options: { mode: 'summary', includeAppMcp: false },
-      },
-    ])
+    expect(probeCalls).toEqual([])
   })
 
   test('compatibility mode without execution probe still rejects unknown raw model ids', async () => {
@@ -1076,6 +1112,38 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(executionProbeCalled).toBe(false)
   })
 
+  test('compatibility mode does not trust a catalog-reported Copilot model without proof', async () => {
+    mockRequiredMcpTools()
+    openCodeProvisioningProbe.probe = async () =>
+      buildReadinessSnapshot({
+        models: ['github-copilot/gpt-5-mini'],
+        providers: {
+          connected: ['github-copilot'],
+          default: {},
+        },
+      })
+    let executionProbeCalled = false
+    openCodeExecutionProbe.probeModel = (async () => {
+      executionProbeCalled = true
+      throw new Error('execution probe should not run in compatibility mode')
+    }) as typeof openCodeExecutionProbe.probeModel
+
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.readiness', {
+        projectPath: '/tmp/project',
+        selectedModel: 'github-copilot/gpt-5-mini',
+        requireExecutionProbe: false,
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.data.state).toBe('model_unavailable')
+    expect(result.data.launchAllowed).toBe(false)
+    expect(result.data.missing[0]).toContain('account plan and organization policies')
+    expect(executionProbeCalled).toBe(false)
+  })
+
   test('deep readiness verifies configured authless local models with execution probe', async () => {
     mockRequiredMcpTools()
     const provisioningOptions: Array<
@@ -1146,11 +1214,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
         disposeHostOnRelease: process.platform !== 'win32',
         ensureAppMcp: false,
         bypassCache: true,
+        inventoryMode: 'profile',
       },
       {
         disposeHostOnRelease: process.platform !== 'win32',
         ensureAppMcp: true,
         bypassCache: true,
+        inventoryMode: 'profile',
       },
     ])
     expect(provisioningOptions.map(options => options.phaseContext?.phase)).toEqual([
@@ -2274,15 +2344,21 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
   test('keeps the launch provisioning host retained until launch finishes', async () => {
     let releaseCalls = 0
+    let retainingProbeOptions: Parameters<
+      typeof openCodeProvisioningProbe.probeRetainingHost
+    >[1] = undefined
     openCodeProvisioningProbe.probe = async () => {
       throw new Error('unretained probe should not be used for launch')
     }
-    openCodeProvisioningProbe.probeRetainingHost = (async () => ({
-      snapshot,
-      release: async () => {
-        releaseCalls += 1
-      },
-    })) as typeof openCodeProvisioningProbe.probeRetainingHost
+    openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
+      retainingProbeOptions = options
+      return {
+        snapshot,
+        release: async () => {
+          releaseCalls += 1
+        },
+      }
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeSessionBridge.ensureSession = (async input =>
       buildRecord({
         laneId: input.laneId,
@@ -2318,6 +2394,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ]),
     )
     expect(releaseCalls).toBe(1)
+    expect(retainingProbeOptions?.inventoryMode).toBe('profile')
   })
 
   test('launches provider-scoped OpenCode model ids that contain nested slashes', async () => {

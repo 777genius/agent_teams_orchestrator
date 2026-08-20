@@ -37,7 +37,7 @@ export type OpenCodeClient = {
   getMcp(): Promise<OpenCodeMcpResponse>
   addMcp?(name: string, config: OpenCodeMcpServerConfig): Promise<OpenCodeMcpResponse>
   connectMcp?(name: string): Promise<OpenCodeMcpResponse>
-  createSession(body?: { parentID?: string; title?: string }): Promise<OpenCodeSessionSummary>
+  createSession(body?: OpenCodeCreateSessionInput): Promise<OpenCodeSessionSummary>
   getSession(id: string): Promise<OpenCodeSessionSummary>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatusInput>>
   getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
@@ -93,6 +93,19 @@ export type OpenCodeClient = {
   abortSession(id: string): Promise<boolean>
 }
 
+/** Caller-supplied session IDs are authoritative launch idempotency keys. */
+export type OpenCodeCreateSessionInput = {
+  id?: string
+  parentID?: string
+  title?: string
+}
+
+const OPEN_CODE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
+
+export function isAuthoritativeOpenCodeSessionId(value: unknown): value is string {
+  return typeof value === 'string' && OPEN_CODE_SESSION_ID.test(value)
+}
+
 export type OpenCodeClientRequestContext = {
   signal?: AbortSignal
   remainingMs?: () => number
@@ -107,6 +120,8 @@ const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000
 const PROVIDER_OAUTH_AUTHORIZE_TIMEOUT_MS = 30_000
+const DEFAULT_RESPONSE_BODY_MAX_BYTES = 8 * 1024 * 1024
+const PROVIDER_RESPONSE_BODY_MAX_BYTES = 2 * 1024 * 1024
 // GitHub device authorization codes can remain valid for up to 15 minutes.
 // Keep the transport alive slightly longer so Agent Teams does not abort a
 // still-valid browser flow before the provider finishes polling.
@@ -123,8 +138,38 @@ function buildQueryPath(path: string, query: Record<string, string | null | unde
   return encoded.length > 0 ? `${path}?${encoded}` : path
 }
 
-async function parseResponse<T>(response: Response): Promise<T> {
-  const text = await response.text()
+async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string> {
+  const declared = response.headers.get('content-length')
+  if (declared !== null) {
+    const length = Number(declared)
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxBytes) {
+      throw new Error('OpenCode response body exceeded the allowed size.')
+    }
+  }
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let bytes = 0
+  let text = ''
+  try {
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      bytes += chunk.value.byteLength
+      if (bytes > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new Error('OpenCode response body exceeded the allowed size.')
+      }
+      text += decoder.decode(chunk.value, { stream: true })
+    }
+    return text + decoder.decode()
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+async function parseResponse<T>(response: Response, maxBytes: number): Promise<T> {
+  const text = await readBoundedResponseText(response, maxBytes)
   if (!response.ok) {
     throw new Error(
       `OpenCode request failed (${response.status} ${response.statusText}): ${text || 'no response body'}`,
@@ -166,6 +211,7 @@ export class OpenCodeClientFactory {
       path: string,
       init?: RequestInit,
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+      responseBodyMaxBytes = DEFAULT_RESPONSE_BODY_MAX_BYTES,
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
@@ -195,7 +241,7 @@ export class OpenCodeClientFactory {
             ...(init?.headers ?? {}),
           },
         })
-        return parseResponse<T>(response)
+        return parseResponse<T>(response, responseBodyMaxBytes)
       } catch (error) {
         if (context.signal?.aborted) {
           throw resolveAbortReason(context.signal, timeoutError)
@@ -213,7 +259,9 @@ export class OpenCodeClientFactory {
     return {
       getConfig: () => request<OpenCodeConfigResponse>('/config'),
       getConfigProviders: () => request<OpenCodeConfigProvidersResponse>('/config/providers'),
-      getProviders: () => request<OpenCodeProviderResponse>('/provider'),
+      getProviders: () => request<OpenCodeProviderResponse>(
+        '/provider', undefined, DEFAULT_REQUEST_TIMEOUT_MS, PROVIDER_RESPONSE_BODY_MAX_BYTES,
+      ),
       getProviderAuth: () =>
         request<Record<string, OpenCodeProviderAuthMethod[]>>('/provider/auth'),
       getServerDoc: () => request<OpenCodeServerDocResponse>('/doc'),
@@ -266,11 +314,20 @@ export class OpenCodeClientFactory {
           },
           MCP_REQUEST_TIMEOUT_MS,
         ),
-      createSession: body =>
-        request<OpenCodeSessionSummary>('/session', {
+      createSession: async body => {
+        if (body?.id !== undefined && !isAuthoritativeOpenCodeSessionId(body.id)) {
+          throw new TypeError('OpenCode authoritative session id is invalid')
+        }
+        const session = await request<OpenCodeSessionSummary>('/session', {
           method: 'POST',
           body: JSON.stringify(body ?? {}),
-        }),
+        })
+        if (!isAuthoritativeOpenCodeSessionId(session?.id)
+          || (body?.id !== undefined && session.id !== body.id)) {
+          throw new Error('OpenCode create-session response did not preserve the authoritative session id')
+        }
+        return session
+      },
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
       getSessionStatus: () =>
         request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),

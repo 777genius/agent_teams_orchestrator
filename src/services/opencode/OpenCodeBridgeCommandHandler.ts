@@ -9,6 +9,16 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import {
+  isOpenCodeOpaqueIdentity,
+} from './OpenCodeBridgeContractV2.js'
+import type {
+  OpenCodeBridgeCommandHandlerPorts,
+  OpenCodeLaunchBridgeMember,
+} from './OpenCodeLaunchAttemptBridge.js'
+import { getOpenCodeLaunchAttemptProductionPorts } from './OpenCodeLaunchAttemptBridge.js'
+import { ensureOpenCodeLaunchAttemptProductionComposition } from './OpenCodeLaunchAttemptProduction.js'
+import { decodeStrictOpenCodeProductionLaunch } from './OpenCodeLaunchProductionRouting.js'
+import {
   buildOpenCodeExecutionProof,
   parseOpenCodeExecutionProof,
   validateOpenCodeExecutionProof,
@@ -23,6 +33,7 @@ import {
 import {
   hasOpenCodeBuiltinFreeModel,
   openCodeInventoryService,
+  type OpenCodeInventoryProbeMode,
 } from './OpenCodeInventoryService.js'
 import {
   buildOpenCodeModelAccessCatalogFromProvisioningSnapshot,
@@ -36,6 +47,7 @@ import {
 } from './OpenCodeMcpManager.js'
 import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
+import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -77,6 +89,11 @@ import {
   isEnvDefinedFalsy,
 } from '../../utils/envUtils.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
+import {
+  OpenCodePassiveStatusProductionReader,
+  OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
+} from './OpenCodePassiveStatusProductionReader.js'
+import { OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS } from './OpenCodePassiveProviderDirectory.js'
 
 import type { OpenCodeSnapshotBoundary } from './OpenCodeChangeEvidence.js'
 import type {
@@ -505,17 +522,19 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
 }
 
 async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<OpenCodeProvisioningSnapshot> {
-  const inventory = await openCodeInventoryService.probe(projectPath, {
-    mode: 'summary',
-    includeAppMcp: false,
+  const passiveReader = new OpenCodePassiveStatusProductionReader()
+  const passive = await passiveReader.reader.read({
+    projectPath,
+    providerIds: OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS,
+    timeoutMs: OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
   })
   return {
-    detected: inventory.detected,
+    detected: passive.binary.value.presence === 'present',
     hostHealthy: false,
-    projectPath: inventory.projectPath,
-    models: [...inventory.models],
-    modelMetadata: [...(inventory.modelMetadata ?? [])],
-    profile: inventory.profile,
+    projectPath: '',
+    models: [],
+    modelMetadata: [],
+    profile: null,
     host: null,
     config: null,
     configProviders: null,
@@ -524,11 +543,8 @@ async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<
     agents: [],
     mcp: null,
     appMcp: null,
-    probeError: inventory.probeError,
-    diagnostics: [
-      ...inventory.diagnostics,
-      'OpenCode command status used read-only summary inventory snapshot; host state was not probed.',
-    ],
+    probeError: passive.projectScope === null ? 'passive_scope_unavailable' : null,
+    diagnostics: ['OpenCode command status used passive redacted status; active runtime state was not probed.'],
   }
 }
 
@@ -1793,11 +1809,10 @@ function readinessData(
         ? `Agent Teams MCP tools are not visible in OpenCode: ${toolProof.missingTools.join(', ')}`
         : 'Agent Teams MCP tools are not visible in OpenCode',
     )
-  } else if (
-    selectedModelAccess.kind === 'configured_authless'
-    && selectedModelAccess.requiresExecutionProof
-  ) {
-    state = 'not_authenticated'
+  } else if (selectedModelAccess.requiresExecutionProof) {
+    state = selectedModelAccess.kind === 'configured_authless'
+      ? 'not_authenticated'
+      : 'model_unavailable'
     launchAllowed = false
     missing.push(selectedModelAccess.reason ?? 'OpenCode selected model requires execution verification')
   } else if (selectedModelAccess.kind === 'unknown_model') {
@@ -1848,6 +1863,15 @@ function getOpenCodeAccessPolicyModels(snapshot: OpenCodeProvisioningSnapshot): 
       ?? []),
     ...(snapshot.models ?? []),
   ])).sort()
+}
+
+function getLaunchCriticalInventoryMode(
+  selectedModel: string | null | undefined,
+): OpenCodeInventoryProbeMode {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  return parsed && canonicalizeOpenCodeProviderId(parsed.providerId) !== 'opencode'
+    ? 'profile'
+    : 'full'
 }
 
 function getOpenCodeAccessPolicyCatalog(snapshot: OpenCodeProvisioningSnapshot) {
@@ -2141,7 +2165,7 @@ async function assertOpenCodeSelectedModelLaunchAccess(
     return
   }
 
-  if (access.kind !== 'configured_authless' || !access.requiresExecutionProof) {
+  if (!access.requiresExecutionProof) {
     throw new Error(access.reason ?? 'OpenCode selected model provider is not connected')
   }
 
@@ -2215,7 +2239,7 @@ function assertOpenCodeSelectedModelReconcilable(
   })
   if (
     access.launchAllowed
-    || (access.kind === 'configured_authless' && access.requiresExecutionProof)
+    || access.requiresExecutionProof
   ) {
     return
   }
@@ -2324,6 +2348,7 @@ async function runReadiness(
   const disposeReadinessHostOnRelease = shouldDisposeBridgeProbeHostOnRelease()
   const projectPath = asString(envelope.body.projectPath) ?? envelope.cwd
   const selectedModel = asString(envelope.body.selectedModel)
+  const inventoryMode = getLaunchCriticalInventoryMode(selectedModel)
   const requireSelectedModel = envelope.body.requireExecutionProbe === true || selectedModel !== null
   const shouldProbeSelectedModel = envelope.body.requireExecutionProbe === true && selectedModel !== null
   const runProvisioningPhase = async (
@@ -2438,6 +2463,7 @@ async function runReadiness(
     disposeHostOnRelease: disposeReadinessHostOnRelease,
     ensureAppMcp: !shouldProbeSelectedModel,
     bypassCache: shouldProbeSelectedModel,
+    inventoryMode,
   })
   let snapshot = modelSnapshot
   let executionModel: string | null = null
@@ -2500,7 +2526,7 @@ async function runReadiness(
       !selectedModelAccess.launchAllowed &&
       (
         selectedModelAccess.kind === 'not_authenticated' ||
-        selectedModelAccess.kind === 'configured_authless'
+        selectedModelAccess.requiresExecutionProof
       )
     ) {
       return {
@@ -2523,8 +2549,7 @@ async function runReadiness(
       catalog: getOpenCodeAccessPolicyCatalog(snapshot),
     })
     if (
-      selectedModelAccess.kind === 'configured_authless'
-      && selectedModelAccess.requiresExecutionProof
+      selectedModelAccess.requiresExecutionProof
       && modelSnapshot.host
     ) {
       if (!directToolProof.ok) {
@@ -2593,6 +2618,7 @@ async function runReadiness(
       disposeHostOnRelease: disposeReadinessHostOnRelease,
       ensureAppMcp: true,
       bypassCache: true,
+      inventoryMode,
     })
   }
   directToolProof ??= await runDirectToolProof()
@@ -2761,6 +2787,7 @@ async function markStaleAndReleaseSession(
 async function runLaunch(
   envelope: BridgeEnvelope,
   runtimeDeadline: OpenCodeRuntimeDeadline,
+  ports?: OpenCodeBridgeCommandHandlerPorts,
 ) {
   const body = envelope.body
   const runId = asString(body.runId)
@@ -2774,37 +2801,49 @@ async function runLaunch(
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
 
-  const probeStartedAt = Date.now()
-  let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
-  let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
-  try {
-    retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
-      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
-        asString(body.projectPath) ?? envelope.cwd,
-        { toolApprovalMode, phaseContext: context },
-      )
-      return pendingProbe
-    })
-  } catch (error) {
-    if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
-      const cleanup = pendingProbe
-        .then(probe => probe.release())
-        .catch(() => undefined)
-      void cleanup
-      await withTimeout(cleanup, 5_000).catch(() => undefined)
+  {
+    // S3 is the only production launch path. Older callers may omit the
+    // optional envelope discriminator, but they still have to supply the full
+    // launch-attempt contract. A genuinely legacy body fails before the
+    // provisioning/profile/session code below can observe it.
+    const request = decodeStrictOpenCodeProductionLaunch(body)
+    if (!ports?.launchAttempt) {
+      throw new Error('OpenCode launch-attempt runtime is not configured')
     }
-    throw error
-  }
-  const provisioningProbeMs = elapsedMs(probeStartedAt)
-  try {
-    return await runLaunchWithProvisioningSnapshot(
-      envelope,
-      retainedProbe.snapshot,
-      runtimeDeadline,
-      { provisioningProbeMs },
-    )
-  } finally {
-    await retainedProbe.release().catch(() => undefined)
+    if (request.launchAttempt.modelId !== selectedModel) {
+      throw new Error('OpenCode launch-attempt selectedModel does not match launchAttempt.modelId')
+    }
+    const members: OpenCodeLaunchBridgeMember[] = membersRaw.map((item, index) => {
+      const member = asRecord(item)
+      const name = asString(member?.name)
+      const memberIdentity = member?.memberIdentity
+      if (!name || !isOpenCodeOpaqueIdentity(memberIdentity)) {
+        throw new Error(`Invalid OpenCode launch-attempt member at index ${index}`)
+      }
+      return {
+        name,
+        memberIdentity,
+        ...(asString(member?.prompt) ? { prompt: asString(member?.prompt)! } : {}),
+        ...(asString(member?.effort) ? { effort: asString(member?.effort)! } : {}),
+      }
+    })
+    const continuation = body.continuation === true
+      || request.launchAttempt.continuationToken !== undefined
+    const result = await ports.launchAttempt.execute({
+      request,
+      members,
+      runId,
+      laneId,
+      teamId,
+      projectPath: asString(body.projectPath) ?? envelope.cwd,
+      selectedModel,
+      toolApprovalMode,
+      continuation,
+      requestedBudgetMs: envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000,
+      outerRemainingBudgetMs: runtimeDeadline.remainingMs(),
+      signal: runtimeDeadline.signal,
+    })
+    return result
   }
 }
 
@@ -4317,18 +4356,8 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
   let accepted = isAcceptedOutcomeStatus(status)
   const diagnostics = [...query.diagnostics, ...query.record.diagnostics]
 
-  if (status === 'prompt_submitting' && query.record.runtimePromptMessageId) {
-    const proof = await findPromptAcceptedEvidenceReadOnly({
-      record: query.record,
-      runtimePromptMessageId: query.record.runtimePromptMessageId,
-    })
-    diagnostics.push(...proof.diagnostics)
-    if (proof.accepted) {
-      status = 'prompt_accepted'
-      accepted = true
-      diagnostics.push(`OpenCode prompt acceptance recovered from ${proof.source}.`)
-    }
-  }
+  // commandStatus is a passive summary surface. Live transcript/host recovery is
+  // intentionally reserved for explicit reconcile operations.
 
   const safeToRetry = accepted
     ? false
@@ -4367,6 +4396,7 @@ async function runCommandStatus(envelope: BridgeEnvelope): Promise<{
 async function handleEnvelope(
   envelope: BridgeEnvelope,
   runtimeDeadline?: OpenCodeRuntimeDeadline,
+  ports?: OpenCodeBridgeCommandHandlerPorts,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -4375,6 +4405,7 @@ async function handleEnvelope(
         ? null
         : await openCodeProvisioningProbe.probe(envelope.cwd, {
           disposeHostOnRelease: shouldDisposeBridgeProbeHostOnRelease(),
+          inventoryMode: getLaunchCriticalInventoryMode(asString(envelope.body.selectedModel)),
         })
       const identity = createBridgeServerIdentity(snapshot, {
         runtimeStoreManifestHighWatermark: lightweightLaunchHandshake
@@ -4408,7 +4439,7 @@ async function handleEnvelope(
       if (!runtimeDeadline) {
         throw new Error('OpenCode launch preflight deadline was not initialized')
       }
-      return runLaunch(envelope, runtimeDeadline)
+      return runLaunch(envelope, runtimeDeadline, ports)
     case 'opencode.reconcileTeam':
       return runReconcile(envelope)
     case 'opencode.stopTeam':
@@ -4456,7 +4487,16 @@ async function handleEnvelope(
   }
 }
 
-export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
+export async function executeOpenCodeBridgeCommandEnvelope(
+  input: unknown,
+  ports?: OpenCodeBridgeCommandHandlerPorts,
+) {
+  if (asString(asRecord(input)?.command) === 'opencode.commandStatus') {
+    const { executeOpenCodePassiveCommandStatusEnvelope } = await import(
+      './OpenCodePassiveCommandStatusRoute.js'
+    )
+    return executeOpenCodePassiveCommandStatusEnvelope(input)
+  }
   const startedAtMs = Date.now()
   let envelope: BridgeEnvelope
   try {
@@ -4487,7 +4527,12 @@ export async function executeOpenCodeBridgeCommandEnvelope(input: unknown) {
     ? new OpenCodeRuntimeDeadline(envelope.timeoutMs > 0 ? envelope.timeoutMs : 300_000)
     : undefined
   try {
-    const result = await handleEnvelope(envelope, runtimeDeadline)
+    const result = await handleEnvelope(
+      envelope,
+      runtimeDeadline,
+      ports ?? getOpenCodeLaunchAttemptProductionPorts()
+        ?? ensureOpenCodeLaunchAttemptProductionComposition(),
+    )
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
     }

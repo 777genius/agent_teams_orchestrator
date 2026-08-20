@@ -63,6 +63,26 @@ describe('OpenCode agent model compatibility', () => {
     expect(getOpenCodeModelInputModalities(text)).toEqual(['text', 'image'])
   })
 
+  test('requires affirmative live text and tool-call capabilities only in strict mode', () => {
+    const supported = metadata('openrouter/supported', {
+      capabilities: { output: { text: true }, toolcall: true },
+    })
+    const incomplete = metadata('openrouter/incomplete', {
+      capabilities: { output: { text: true } },
+    })
+
+    expect(evaluateOpenCodeAgentModelCompatibility(supported.id, supported, {
+      requireAffirmativeCapabilities: true,
+    }).compatible).toBe(true)
+    expect(evaluateOpenCodeAgentModelCompatibility(incomplete.id, incomplete).compatible).toBe(true)
+    expect(evaluateOpenCodeAgentModelCompatibility(incomplete.id, incomplete, {
+      requireAffirmativeCapabilities: true,
+    }).compatible).toBe(false)
+    expect(evaluateOpenCodeAgentModelCompatibility('openrouter/missing', null, {
+      requireAffirmativeCapabilities: true,
+    }).compatible).toBe(false)
+  })
+
   test('filters only models that can act as teammates', () => {
     const image = metadata('xai/grok-imagine-image', {
       modalities: { output: ['image'] },

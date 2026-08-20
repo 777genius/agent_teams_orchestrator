@@ -1,0 +1,104 @@
+import { describe, expect, test } from 'bun:test'
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink } from 'node:fs/promises'
+import path from 'node:path'
+
+import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
+
+describe('OpenCodeSafePublication', () => {
+  test('a coordinated parent swap creates zero files in the attacker directory', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-publication-'))
+    const owned = path.join(root, 'owned')
+    const displaced = path.join(root, 'displaced')
+    const outside = path.join(root, 'outside')
+    await Promise.all([mkdir(owned), mkdir(outside)])
+    const directory = await OpenCodeSafePublicationDirectory.open(owned)
+    try {
+      await rename(owned, displaced)
+      await symlink(outside, owned, 'dir')
+      await directory.writeFileAtomic('registry.json', '{"safe":true}', 0o600)
+      expect(await readdir(outside)).toEqual([])
+      expect(await readFile(path.join(displaced, 'registry.json'), 'utf8')).toBe('{"safe":true}')
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('immutable publication accepts identical bytes and rejects collisions', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-immutable-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await directory.publishImmutableFile('bridge', 'one', 0o500)
+      await directory.publishImmutableFile('bridge', 'one', 0o500)
+      await expect(directory.publishImmutableFile('bridge', 'two', 0o500)).rejects.toThrow(
+        'safe publication primitive is unavailable',
+      )
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('failed immutable publication exposes no incomplete final inode and retry recovers', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-immutable-retry-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await expect(directory.publishImmutableFile('bridge', 'complete', 0o500, {
+        afterTemporaryWrite: () => { throw new Error('injected publication failure') },
+      })).rejects.toThrow('injected publication failure')
+      expect(await readdir(root)).toEqual([])
+      await directory.publishImmutableFile('bridge', 'complete', 0o500)
+      expect(await readFile(path.join(root, 'bridge'), 'utf8')).toBe('complete')
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('atomic publication cancellation preserves the complete old file and removes its temp', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-cancel-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await directory.writeFileAtomic('auth.json', '{"generation":"old"}', 0o600)
+      const cancellation = new AbortController()
+      cancellation.abort(new Error('cancelled before publication'))
+      await expect(directory.writeFileAtomic(
+        'auth.json', '{"generation":"new"}', 0o600, cancellation.signal,
+      )).rejects.toThrow('cancelled before publication')
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"generation":"old"}')
+      expect((await stat(path.join(root, 'auth.json'))).mode & 0o777).toBe(0o600)
+      expect((await readdir(root)).filter(name => name.includes('.tmp.'))).toEqual([])
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('concurrent readers observe only complete old or new atomic auth bytes', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-reader-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    const authPath = path.join(root, 'auth.json')
+    const oldBytes = JSON.stringify({ generation: 'old', padding: 'a'.repeat(128 * 1024) })
+    const newBytes = JSON.stringify({ generation: 'new', padding: 'b'.repeat(128 * 1024) })
+    try {
+      await directory.writeFileAtomic('auth.json', oldBytes, 0o600)
+      const observations: string[] = []
+      const publication = directory.writeFileAtomic('auth.json', newBytes, 0o600)
+      for (let index = 0; index < 64; index += 1) {
+        observations.push(await readFile(authPath, 'utf8'))
+      }
+      await publication
+      observations.push(await readFile(authPath, 'utf8'))
+      expect(observations.every(value => value === oldBytes || value === newBytes)).toBe(true)
+      expect(observations.at(-1)).toBe(newBytes)
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})

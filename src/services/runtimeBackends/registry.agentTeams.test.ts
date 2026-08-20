@@ -11,6 +11,45 @@ import {
 } from '../../utils/anthropicConnectionMode.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 import { resetAnthropicRuntimeCatalogCache } from './anthropicCatalog.js'
+import type {
+  OpenCodePassiveAuthority,
+  OpenCodePassiveStatusV1,
+} from '../opencode/OpenCodePassiveStatusContract.js'
+
+function openCodePassiveFixture(options: {
+  binary?: 'present' | 'absent' | 'unknown'
+  connected?: boolean
+  degraded?: boolean
+} = {}): OpenCodePassiveStatusV1 {
+  const binary = options.binary ?? 'present'
+  const degraded = options.degraded === true
+  const fact = <T>(value: T, authority: OpenCodePassiveAuthority) => ({
+    value,
+    authority,
+    freshness: degraded ? 'stale' : 'fresh',
+    condition: degraded ? 'degraded' : 'normal',
+    observedAt: 100,
+    validUntil: degraded ? 150 : 1_000,
+    issueCode: degraded ? 'read_timeout' : 'none',
+  })
+  return {
+    contractVersion: 1 as const,
+    projectScope: `sha256:${'a'.repeat(64)}` as const,
+    binary: binary === 'unknown'
+      ? { value: { presence: 'unknown' as const, version: null }, authority: 'none' as const, freshness: 'unknown' as const, condition: 'degraded' as const, observedAt: null, validUntil: null, issueCode: 'read_timeout' as const }
+      : fact({ presence: binary, version: binary === 'present' ? '1.2.3' : null }, 'binary_metadata'),
+    providers: [{
+      providerId: 'deepinfra',
+      configured: fact('configured' as const, 'config_metadata'),
+      lastConnected: fact(options.connected ? { state: 'connected' as const, at: 90 } : { state: 'not_connected' as const }, 'auth_metadata'),
+      catalogAvailable: fact('available' as const, 'catalog_snapshot'),
+      executionVerified: fact('verified' as const, 'execution_snapshot'),
+    }],
+    authorization: 'unknown' as const,
+    launchReadiness: 'not_authorized' as const,
+    completedAt: 200,
+  }
+}
 
 describe('runtime backend registry with agent_teams capabilities', () => {
   test('explicit Anthropic API-key mode ignores inherited Bedrock routing end to end', async () => {
@@ -652,7 +691,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
   })
 
   test(
-    'opencode summary runtime status returns degraded JSON when inventory probing stalls',
+    'opencode summary runtime status ignores a stalled inventory/profile path',
     async () => {
       const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
       process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
@@ -663,33 +702,22 @@ describe('runtime backend registry with agent_teams capabilities', () => {
           `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
         )
 
+        let inventoryCalls = 0
         const payload = await getUnifiedRuntimeStatusPayload('opencode', {
-          getOpenCodeInventorySnapshot: async () => new Promise(resolve => {
-            setTimeout(() => resolve({
-              detected: true,
-              binaryPath: process.execPath,
-              version: 'slow-test-inventory',
-              projectPath: '/tmp/project',
-              profile: null,
-              connectedProviders: [],
-              availableProviders: [],
-              models: [],
-              modelMetadata: [],
-              agents: [],
-              authStorePath: null,
-              probeError: null,
-              diagnostics: [],
-            }), 50)
-          }),
-          openCodeInventoryTimeoutMs: 1,
+          getOpenCodeInventorySnapshot: async () => {
+            inventoryCalls += 1
+            return new Promise(() => {})
+          },
+          getOpenCodePassiveStatus: async () => openCodePassiveFixture({ binary: 'unknown', degraded: true }),
         }, { detailLevel: 'summary' })
         const opencode = payload.providers.opencode
 
-        expect(opencode?.supported).toBe(true)
+        expect(inventoryCalls).toBe(0)
+        expect(opencode?.supported).toBe(false)
         expect(opencode?.authenticated).toBe(false)
-        expect(opencode?.verificationState).toBe('error')
-        expect(opencode?.statusMessage).toBe('OpenCode probe incomplete')
-        expect(opencode?.detailMessage).toContain('OpenCode inventory probe timed out after 1ms')
+        expect(opencode?.verificationState).toBe('unknown')
+        expect(opencode?.statusMessage).toBe('OpenCode passive status unavailable')
+        expect(opencode?.capabilities.teamLaunch).toBe(false)
         expect(opencode?.models).toEqual([])
         expect(opencode).not.toHaveProperty('modelCatalog')
       } finally {
@@ -712,27 +740,15 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       )
 
       const payload = await getUnifiedRuntimeStatusPayload('opencode', {
-        getOpenCodeInventorySnapshot: async () => ({
-          detected: true,
-          binaryPath: '/opt/homebrew/bin/opencode',
-          version: '1.14.48',
-          projectPath: '/tmp/project',
-          profile: null,
-          connectedProviders: [{ id: 'openrouter', authHint: 'api', source: 'credentials' }],
-          availableProviders: ['openrouter'],
-          models: [],
-          modelMetadata: [],
-          agents: [],
-          authStorePath: null,
-          probeError: null,
-          diagnostics: [],
-        }),
+        getOpenCodePassiveStatus: async () => openCodePassiveFixture({ connected: true }),
       }, { detailLevel: 'summary' })
       const opencode = payload.providers.opencode
 
       expect(opencode?.supported).toBe(true)
-      expect(opencode?.authenticated).toBe(true)
-      expect(opencode?.authMethod).toBe('opencode_managed')
+      expect(opencode?.authenticated).toBe(false)
+      expect(opencode?.authMethod).toBe(null)
+      expect(opencode?.capabilities.teamLaunch).toBe(false)
+      expect(opencode?.passiveStatus?.providers[0].lastConnected.value).toEqual({ state: 'connected', at: 90 })
       expect(opencode?.models).toEqual([])
       expect(opencode).not.toHaveProperty('modelCatalog')
       expect(opencode).not.toHaveProperty('capabilitiesInfo')
@@ -753,21 +769,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       )
 
       const payload = await getUnifiedRuntimeStatusPayload('opencode', {
-        getOpenCodeInventorySnapshot: async () => ({
-          detected: true,
-          binaryPath: '/opt/homebrew/bin/opencode',
-          version: '1.14.48',
-          projectPath: '/tmp/project',
-          profile: null,
-          connectedProviders: [],
-          availableProviders: ['opencode'],
-          models: [],
-          modelMetadata: [],
-          agents: [],
-          authStorePath: null,
-          probeError: null,
-          diagnostics: [],
-        }),
+        getOpenCodePassiveStatus: async () => openCodePassiveFixture(),
       }, { detailLevel: 'summary' })
       const opencode = payload.providers.opencode
 
@@ -775,7 +777,7 @@ describe('runtime backend registry with agent_teams capabilities', () => {
       expect(opencode?.authenticated).toBe(false)
       expect(opencode?.authMethod).toBe(null)
       expect(opencode?.models).toEqual([])
-      expect(opencode?.statusMessage).toBe('No OpenCode providers connected')
+      expect(opencode?.statusMessage).toBe('OpenCode detected (passive)')
       expect(opencode).not.toHaveProperty('modelCatalog')
     },
     15_000,
