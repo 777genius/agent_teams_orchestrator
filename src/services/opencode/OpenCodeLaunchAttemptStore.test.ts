@@ -59,7 +59,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       directory: 'C:\\App', lock: 'C:\\App\\attempt.json.lease',
     })
     expect(await readFile(new URL('./OpenCodeLaunchAttemptStore.ts', import.meta.url), 'utf8'))
-      .not.toContain('/proc/self/fd')
+      .not.toContain('/proc/')
   })
   test('atomically persists a mode-0600 file and leaves no temporary journal', async () => {
     const directory = await workspaceTemp('journal')
@@ -447,6 +447,63 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
+  test('retains one descriptor-relative namespace when the parent pathname is deterministically swapped', async () => {
+    if (process.platform === 'win32') return
+    const outer = await workspaceTemp('parent-swap-anchor')
+    const live = join(outer, 'live')
+    const retained = join(outer, 'retained')
+    await mkdir(live)
+    const path = join(live, 'attempt.json')
+    let swapped = false
+    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+      afterNamespaceAnchored: async () => {
+        await rename(live, retained)
+        await mkdir(live)
+        swapped = true
+      },
+    })
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    try {
+      const store = new OpenCodeLaunchAttemptStore(persistence)
+      await store.withGeneration(identity, 'begin', async lease => {
+        expect(swapped).toBe(true)
+        expect(await readdir(live)).toEqual([])
+        expect((await readdir(retained)).sort()).toEqual([
+          'attempt.json', 'attempt.json.fence', 'attempt.json.lease', 'attempt.json.slot0',
+        ])
+        expect(lease).toMatchObject({ generation: 1, fence: 1 })
+      }, context)
+      expect(await store.inspect(identity, context)).toMatchObject({ generation: 1, fence: 1 })
+      expect((await readdir(retained)).sort()).toEqual([
+        'attempt.json', 'attempt.json.fence', 'attempt.json.slot0',
+      ])
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
+  test('trusted-root platform backend preserves Windows first-use and rejects a swapped root', async () => {
+    const outer = await workspaceTemp('trusted-root-backend')
+    const live = join(outer, 'live')
+    const displaced = join(outer, 'displaced')
+    const path = join(live, 'attempt.json')
+    try {
+      const firstUse = new OpenCodeLaunchFileJournalPersistence(path, { platform: 'win32' })
+      await firstUse.replaceAndSync(new TextEncoder().encode('{"windows":true}'))
+      expect(new TextDecoder().decode((await firstUse.read())!)).toBe('{"windows":true}')
+
+      let swapped = false
+      const guarded = new OpenCodeLaunchFileJournalPersistence(path, {
+        platform: 'win32',
+        afterNamespaceAnchored: async () => {
+          await rename(live, displaced); await mkdir(live); swapped = true
+        },
+      })
+      await expect(guarded.read()).rejects.toMatchObject({ code: 'foreign' })
+      expect(swapped).toBe(true)
+      expect(await readdir(live)).toEqual([])
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
   test('rejects a pre-planted lease symlink without reading or mutating its target namespace', async () => {
     const directory = await workspaceTemp('lease-symlink')
     const target = join(directory, 'target')
@@ -475,6 +532,9 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       expect(owner.processBirth).toMatch(/^\d+$/)
       expect(await readdir(`${path}.lease`)).toEqual(['owner.json'])
       await release(context)
+      const releaseAgain = await new OpenCodeLaunchFileJournalPersistence(path).acquireExclusive(context)
+      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8')).processBirth).toBe(owner.processBirth)
+      await releaseAgain(context)
       expect(await readdir(directory)).toEqual([])
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
@@ -575,6 +635,74 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       await expect(waiting).rejects.toThrow('stop waiting')
       expect((await stat(`${path}.lease`)).isDirectory()).toBe(true)
       await release({ ...context, signal: new AbortController().signal })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test('fails closed without portable birth identity for a live non-self PID', async () => {
+    const directory = await workspaceTemp('foreign-live-no-birth')
+    const path = join(directory, 'attempt.json')
+    const child = Bun.spawn(['/root/.bun/bin/bun', '-e', 'await Bun.sleep(30_000)'])
+    const owner = { version: 1, pid: child.pid, processBirth: '1', token: crypto.randomUUID() }
+    await mkdir(`${path}.lease`, { mode: 0o700 })
+    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    const controller = new AbortController()
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now, signal: controller.signal }
+    try {
+      const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+        processBirth: async pid => {
+          if (pid === process.pid) return '2'
+          throw new Error('portable birth unavailable')
+        },
+      })
+      const waiting = persistence.acquireExclusive(context)
+      await Bun.sleep(20); controller.abort(new Error('stop waiting'))
+      await expect(waiting).rejects.toThrow('stop waiting')
+      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))).toEqual(owner)
+    } finally {
+      child.kill(); await child.exited
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('reaps a live reused PID only when the platform birth identity proves mismatch', async () => {
+    const directory = await workspaceTemp('pid-reuse')
+    const path = join(directory, 'attempt.json')
+    const owner = { version: 1, pid: process.pid, processBirth: '1', token: crypto.randomUUID() }
+    await mkdir(`${path}.lease`, { mode: 0o700 })
+    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    try {
+      const persistence = new OpenCodeLaunchFileJournalPersistence(path, { processBirth: async () => '2' })
+      const release = await persistence.acquireExclusive(context)
+      const replacement = JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))
+      expect(replacement.token).not.toBe(owner.token)
+      expect(replacement.processBirth).toBe('2')
+      await release(context)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test('recovers a dead PID without requiring any foreign process birth identity', async () => {
+    const directory = await workspaceTemp('dead-pid-no-birth')
+    const path = join(directory, 'attempt.json')
+    const owner = { version: 1, pid: 2_147_483_647, processBirth: '1', token: crypto.randomUUID() }
+    await mkdir(`${path}.lease`, { mode: 0o700 })
+    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    let foreignBirthRead = false
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    try {
+      const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
+        processBirth: async pid => {
+          if (pid === process.pid) return '2'
+          foreignBirthRead = true
+          throw new Error('foreign birth must not be read for a dead PID')
+        },
+      })
+      const release = await persistence.acquireExclusive(context)
+      expect(foreignBirthRead).toBe(false)
+      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8')).token).not.toBe(owner.token)
+      await release(context)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
