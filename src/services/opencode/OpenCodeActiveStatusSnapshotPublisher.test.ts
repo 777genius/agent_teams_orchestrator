@@ -119,7 +119,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       models: [...kiroModels].reverse().concat(['xai/org/Team:Model-v2'], [...deepinfraModels].reverse()),
     }))
 
-    clock.now = 301_001
+    clock.now = 300_999
     await harness.publisher.publishProviderUpdate({
       projectPath: '/project/secret-name', providerId: 'xai', executionVerified: true,
     })
@@ -130,7 +130,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(status.providers.find(provider => provider.providerId === 'deepinfra')?.knownModelIds).toEqual(deepinfraModels)
     expect(status.providers.find(provider => provider.providerId === 'kiro')).toMatchObject({
       knownModelIds: kiroModels.slice(0, 116), knownModelIdsTotal: 140, knownModelIdsTruncated: true,
-      catalogAvailable: { freshness: 'stale', authority: 'catalog_snapshot' },
+      catalogAvailable: { freshness: 'fresh', authority: 'catalog_snapshot' },
     })
     expect(status.providers.find(provider => provider.providerId === 'xai')).toMatchObject({
       knownModelIdsTotal: 1, knownModelIdsTruncated: true,
