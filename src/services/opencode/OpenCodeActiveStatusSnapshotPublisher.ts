@@ -110,6 +110,10 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       ])
       for (const providerId of knownProviderIds) {
         const provider = getOrCreateProvider(snapshot, providerId)
+        const priorConfigured = provider.configured.value
+        const priorConnected = provider.lastConnected.value.state
+        const priorFingerprint = provider.fingerprint
+        const evidenceFingerprint = providerEvidenceFingerprint(inventory, providerId)
         if (completeness.profileConfig.state === 'complete' && inventory.profile) {
           provider.configured = observation(
             configuredProviderIds.has(providerId) ? 'configured' : 'not_configured',
@@ -126,11 +130,18 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
           )
         }
         if (completeness.modelCatalog.state === 'complete') {
+          provider.fingerprint = evidenceFingerprint
           provider.catalogAvailable = observation(
             modelIds.has(providerId) ? 'available' : 'unavailable',
             'catalog_snapshot', now,
           )
           replaceModelRefs(provider, modelIds.has(providerId) ? modelIds.get(providerId) : undefined)
+          provider.catalogIdentity = catalogIdentity(snapshot.projectScope, provider, now)
+        } else if (provider.configured.value !== priorConfigured
+          || provider.lastConnected.value.state !== priorConnected
+          || evidenceFingerprint !== priorFingerprint) {
+          provider.fingerprint = evidenceFingerprint
+          delete provider.catalogIdentity
         }
       }
     })
@@ -156,7 +167,14 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       if (input.executionVerified !== undefined) provider.executionVerified = observation(
         input.executionVerified ? 'verified' : 'rejected', 'execution_snapshot', now,
       )
-      if (input.modelIds) replaceModelRefs(provider, input.modelIds)
+      if (input.modelIds) {
+        replaceModelRefs(provider, input.modelIds)
+        provider.catalogIdentity = catalogIdentity(snapshot.projectScope, provider, now)
+      } else if (input.configured !== undefined || input.connected !== undefined || input.catalogAvailable !== undefined) {
+        // The retained catalog status remains useful, but its older model IDs
+        // are no longer generation-bound to this config/auth/catalog update.
+        delete provider.catalogIdentity
+      }
     })
   }
 
@@ -223,6 +241,47 @@ function legacyCompleteness(inventory: OpenCodeInventorySnapshot): OpenCodeInven
 
 function projectScope(canonicalPath: string): `sha256:${string}` {
   return `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonicalPath).digest('hex')}`
+}
+
+function catalogIdentity(
+  scope: `sha256:${string}`,
+  provider: OpenCodeRedactedSnapshotProviderV1,
+  generation: number,
+): `sha256:${string}` {
+  const models = [...(provider.modelIds ?? [])].sort()
+  const config = provider.configured.value
+  const auth = provider.lastConnected.value.state === 'connected'
+    ? `connected:${provider.lastConnected.value.at}` : provider.lastConnected.value.state
+  const material = JSON.stringify({
+    scope,
+    providerId: provider.providerId,
+    providerFingerprint: provider.fingerprint ?? null,
+    config,
+    auth,
+    generation,
+    catalog: provider.catalogAvailable.value,
+    models,
+  })
+  return `sha256:${createHash('sha256').update('opencode-passive-catalog-identity-v1\0').update(material).digest('hex')}`
+}
+
+function providerEvidenceFingerprint(
+  inventory: OpenCodeInventorySnapshot,
+  providerId: string,
+): `sha256:${string}` {
+  const profile = inventory.profile
+  const connected = inventory.connectedProviders.find(provider => provider.id === providerId)
+  const material = JSON.stringify({
+    providerId,
+    managedConfigFingerprint: profile?.managedConfigFingerprint ?? null,
+    managedAuthFingerprint: profile?.managedAuthFingerprint ?? null,
+    sourceAuthFingerprint: profile?.sourceAuthFingerprint ?? null,
+    providerEnvironmentFingerprint: profile?.providerEnvironmentFingerprint ?? null,
+    authSource: connected?.source ?? null,
+    authHint: connected?.authHint ?? null,
+    credentialScopes: [...(connected?.credentialScopes ?? [])].sort(),
+  })
+  return `sha256:${createHash('sha256').update('opencode-passive-provider-evidence-v1\0').update(material).digest('hex')}`
 }
 
 function getManagedConfiguredProviderIds(inventory: OpenCodeInventorySnapshot): Set<string> {

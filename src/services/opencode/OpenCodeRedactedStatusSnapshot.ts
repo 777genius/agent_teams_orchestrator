@@ -28,6 +28,8 @@ export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_SCALAR_CODE_UNITS = 129
 
 export type OpenCodeRedactedSnapshotProviderV1 = OpenCodePassiveProviderStatus & {
   fingerprint?: `sha256:${string}`
+  /** Binds catalog availability and its model projection to one redacted evidence generation. */
+  catalogIdentity?: `sha256:${string}`
   modelIds?: string[]
   modelIdsTotal?: number
   modelIdsTruncated?: boolean
@@ -57,7 +59,7 @@ const freshness = ['fresh', 'stale', 'unknown'] as const
 const conditions = ['normal', 'degraded'] as const
 const issues = ['none', 'unknown', 'expired', 'read_timeout', 'read_cancelled', 'read_failed', 'invalid_payload', 'unsupported_version', 'scope_unavailable'] as const
 const topKeys = ['schemaVersion', 'projectScope', 'capturedAt', 'binary', 'providers'] as const
-const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'modelIds', 'modelIdsTotal', 'modelIdsTruncated', 'modelIdsFingerprint'] as const
+const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'catalogIdentity', 'modelIds', 'modelIdsTotal', 'modelIdsTruncated', 'modelIdsFingerprint'] as const
 const observationKeys = ['value', 'authority', 'freshness', 'condition', 'observedAt', 'validUntil', 'issueCode'] as const
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!
@@ -110,6 +112,10 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
     if (provider.fingerprint !== undefined) {
       if (!isOpenCodeOpaqueSha256(provider.fingerprint)) return invalid()
       decoded.fingerprint = provider.fingerprint
+    }
+    if (provider.catalogIdentity !== undefined) {
+      if (!isOpenCodeOpaqueSha256(provider.catalogIdentity)) return invalid()
+      decoded.catalogIdentity = provider.catalogIdentity
     }
     if (provider.modelIds !== undefined) {
       if (!Array.isArray(provider.modelIds) || !provider.modelIds.every(isOpenCodeCanonicalModelId)) return invalid()
@@ -189,6 +195,10 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
     if (provider.fingerprint !== undefined) {
       if (!isOpenCodeOpaqueSha256(provider.fingerprint)) return invalid()
       owned.fingerprint = provider.fingerprint
+    }
+    if (provider.catalogIdentity !== undefined) {
+      if (!isOpenCodeOpaqueSha256(provider.catalogIdentity)) return invalid()
+      owned.catalogIdentity = provider.catalogIdentity
     }
     if (provider.modelIds !== undefined) {
       const models = captureArray(provider.modelIds, OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS)

@@ -55,7 +55,7 @@ export interface OpenCodeRedactedAuthMetadataReadPort {
   read(providerId: string, projectScope: `sha256:${string}`, signal: AbortSignal, handoff: OpenCodePassiveReadHandoff<{ lastConnectedAt: number | null }>): void
 }
 export interface OpenCodeRedactedCatalogMetadataReadPort {
-  read(providerId: string, projectScope: `sha256:${string}`, signal: AbortSignal, handoff: OpenCodePassiveReadHandoff<{ available: boolean }>): void
+  read(providerId: string, projectScope: `sha256:${string}`, signal: AbortSignal, handoff: OpenCodePassiveReadHandoff<{ available: boolean; catalogIdentity?: `sha256:${string}` | null }>): void
 }
 export interface OpenCodeRedactedExecutionMetadataReadPort {
   read(providerId: string, projectScope: `sha256:${string}`, signal: AbortSignal, handoff: OpenCodePassiveReadHandoff<{ verified: boolean }>): void
@@ -238,7 +238,7 @@ export class OpenCodePassiveStatusReader {
         for (const providerId of providerIds) {
           track(handoff => ports.configRead(providerId, scope, controller.signal, handoff), (result, at) => normalizeBooleanResult(result, 'configured', at), result => ({ target: 'provider', expectedScope: scope, providerId, kind: 'configured', result }))
           track(handoff => ports.authRead(providerId, scope, controller.signal, handoff), normalizeConnectedResult, result => ({ target: 'provider', expectedScope: scope, providerId, kind: 'lastConnected', result }))
-          track(handoff => ports.catalogRead(providerId, scope, controller.signal, handoff), (result, at) => normalizeBooleanResult(result, 'available', at), result => ({ target: 'provider', expectedScope: scope, providerId, kind: 'catalogAvailable', result }))
+          track(handoff => ports.catalogRead(providerId, scope, controller.signal, handoff), normalizeCatalogResult, result => ({ target: 'provider', expectedScope: scope, providerId, kind: 'catalogAvailable', result }))
           track(handoff => ports.executionRead(providerId, scope, controller.signal, handoff), (result, at) => normalizeBooleanResult(result, 'verified', at), result => ({ target: 'provider', expectedScope: scope, providerId, kind: 'executionVerified', result }))
         }
       },
@@ -340,6 +340,23 @@ function normalizeConnectedResult(value: unknown, settledAt: number): OpenCodePa
       : null
   })
 }
+function normalizeCatalogResult(value: unknown, settledAt: number): OpenCodePassiveReadResult<{ available: boolean; catalogIdentity: `sha256:${string}` | null }> {
+  return normalizedSuccess(value, settledAt, candidate => {
+    const record = exactDataRecord(candidate, ['available'])
+    if (!record || typeof record.available !== 'boolean') return null
+    let identity: unknown = null
+    try {
+      const descriptor = candidate !== null && typeof candidate === 'object'
+        ? Object.getOwnPropertyDescriptor(candidate, 'catalogIdentity') : undefined
+      if (descriptor) {
+        if (!('value' in descriptor)) return null
+        identity = descriptor.value
+      }
+    } catch { return null }
+    if (identity !== null && (typeof identity !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(identity))) return null
+    return { available: record.available, catalogIdentity: identity as `sha256:${string}` | null }
+  })
+}
 function normalizeScopeResult(value: unknown, settledAt: number): OpenCodePassiveReadResult<OpenCodeCanonicalProjectScopeResult | null> {
   return normalizedSuccess(value, settledAt, candidate => {
     if (candidate === null) return null
@@ -389,7 +406,7 @@ function resolveProvider(providerId: string, completions: Completion[], history:
     lastConnected: validConnectedResult(connected, now)
       ? authoritative(connected.value.lastConnectedAt === null ? { state: 'not_connected' } : { state: 'connected', at: connected.value.lastConnectedAt }, 'auth_metadata', connected, now)
       : degraded(history?.lastConnected, { state: 'unknown' }, resultIssue(connected, fallback)),
-    catalogAvailable: validBooleanResult(catalog, 'available', now)
+    catalogAvailable: validCatalogResult(catalog, now)
       ? authoritative(catalog.value.available ? 'available' : 'unavailable', 'catalog_snapshot', catalog, now)
       : degraded(history?.catalogAvailable, 'unknown', resultIssue(catalog, fallback)),
     executionVerified: validBooleanResult(execution, 'verified', now)
@@ -399,7 +416,9 @@ function resolveProvider(providerId: string, completions: Completion[], history:
   // Model identifiers have no active read port. They may only flow from the
   // already decoded, project-scoped redacted catalog snapshot. Legacy
   // snapshots without identifiers deliberately remain an empty projection.
-  if (history && (history.modelIds !== undefined || history.modelIdsTotal !== undefined)) {
+  const catalogIdentity = validCatalogResult(catalog, now) ? catalog.value.catalogIdentity : null
+  if (history?.catalogIdentity !== undefined && catalogIdentity === history.catalogIdentity
+    && (history.modelIds !== undefined || history.modelIdsTotal !== undefined)) {
     const identifiers = history.modelIds ?? []
     if (identifiers.every(isOpenCodeCanonicalModelId)) {
       resolved.knownModelIds = [...new Set(identifiers)]
@@ -455,6 +474,12 @@ function validBooleanResult(result: OpenCodePassiveReadResult<unknown> | undefin
   if (!result?.ok || !validProducerTimes(result, now)) return false
   const value = exactDataRecord(result.value, [field])
   return value !== null && typeof value[field] === 'boolean'
+}
+function validCatalogResult(result: OpenCodePassiveReadResult<unknown> | undefined, now: number): result is OpenCodePassiveReadSuccess<{ available: boolean; catalogIdentity: `sha256:${string}` | null }> {
+  if (!result?.ok || !validProducerTimes(result, now)) return false
+  const value = exactDataRecord(result.value, ['available', 'catalogIdentity'])
+  return value !== null && typeof value.available === 'boolean'
+    && (value.catalogIdentity === null || (typeof value.catalogIdentity === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.catalogIdentity)))
 }
 function validConnectedResult(result: OpenCodePassiveReadResult<unknown> | undefined, now: number): result is OpenCodePassiveReadSuccess<{ lastConnectedAt: number | null }> {
   if (!result?.ok || !validProducerTimes(result, now)) return false
@@ -518,6 +543,7 @@ const INERT_RECORD_SCHEMAS = [
   ['present', 'version'],
   ['configured'],
   ['lastConnectedAt'],
+  ['available', 'catalogIdentity'],
   ['available'],
   ['verified'],
   ['canonicalPath', 'inputPathIdentity'],
@@ -560,7 +586,8 @@ function copyInertOwned(value: unknown, depth: number, budget: OwnedCopyBudget):
     for (const schema of INERT_RECORD_SCHEMAS) {
       budget.descriptors += 1
       if (budget.descriptors > INERT_MAX_DESCRIPTORS) return { ok: false }
-      if (Object.getOwnPropertyDescriptor(value, schema[0])) {
+      if (Object.getOwnPropertyDescriptor(value, schema[0])
+        && schema.slice(1).every(key => Object.getOwnPropertyDescriptor(value, key))) {
         fields = schema
         break
       }

@@ -352,6 +352,66 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(decoded.value.providers[0].modelIds).toBeUndefined()
   })
 
+  test('invalidates catalog identity on config/auth changes until a same-generation catalog is published', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory())
+    let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers[0].catalogIdentity).toMatch(/^sha256:[0-9a-f]{64}$/)
+
+    clock.now = 2_000
+    await harness.publisher.publishProviderUpdate({
+      projectPath: '/project/secret-name', providerId: 'deepinfra', connected: false,
+    })
+    decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers[0].catalogIdentity).toBeUndefined()
+    expect(decoded.value.providers[0].modelIds).toEqual(['deepinfra/llama-4'])
+
+    const passive = await productionReader(clock, harness.stored).reader.read({
+      projectPath: '/project/secret-name', providerIds: ['deepinfra'], timeoutMs: 50,
+    })
+    expect(passive.providers[0].catalogAvailable.value).toBe('available')
+    expect(passive.providers[0].knownModelIds).toBeUndefined()
+
+    clock.now = 3_000
+    await harness.publisher.publishProviderUpdate({
+      projectPath: '/project/secret-name', providerId: 'deepinfra', catalogAvailable: true,
+      modelIds: ['deepinfra/llama-4'],
+    })
+    decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers[0].catalogIdentity).toMatch(/^sha256:[0-9a-f]{64}$/)
+  })
+
+  test('invalidates retained IDs when redacted config or auth fingerprints change', async () => {
+    for (const field of ['managedConfigFingerprint', 'managedAuthFingerprint'] as const) {
+      const clock = { now: 1_000 }
+      const harness = publisherHarness(clock)
+      await harness.publisher.publishInventory(inventory())
+      const changedProfile = managedProfile('deepinfra')
+      changedProfile[field] = `fake-${field}-generation-2`
+      clock.now = 2_000
+      await harness.publisher.publishInventory(inventory({
+        profile: changedProfile,
+        completeness: completeness({ modelCatalog: 'skipped' }),
+      }))
+      const decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+      expect(decoded.ok).toBe(true)
+      if (!decoded.ok) throw new Error(decoded.issueCode)
+      expect(decoded.value.providers[0].catalogAvailable.value).toBe('available')
+      expect(decoded.value.providers[0].catalogIdentity).toBeUndefined()
+      const passive = await productionReader(clock, harness.stored).reader.read({
+        projectPath: '/project/secret-name', providerIds: ['deepinfra'], timeoutMs: 50,
+      })
+      expect(passive.providers[0].knownModelIds).toBeUndefined()
+    }
+  })
+
   test('cross-instance scope lease keeps independent DeepInfra and Ollama observations', async () => {
     let stored: string | null = null
     let tail = Promise.resolve()

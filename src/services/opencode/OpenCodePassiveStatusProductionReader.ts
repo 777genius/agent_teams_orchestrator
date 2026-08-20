@@ -157,9 +157,9 @@ export class OpenCodePassiveStatusProductionReader {
           signal,
           handoff,
           provider => provider.catalogAvailable,
-          observation => observation.value === 'unknown'
+          (observation, provider) => observation.value === 'unknown'
             ? null
-            : { available: observation.value === 'available' },
+            : { available: observation.value === 'available', catalogIdentity: provider.catalogIdentity ?? null },
           'catalog_snapshot',
         ),
       },
@@ -198,7 +198,7 @@ export class OpenCodePassiveStatusProductionReader {
     signal: AbortSignal,
     handoff: OpenCodePassiveReadHandoff<U>,
     select: (provider: OpenCodeRedactedSnapshotV1['providers'][number]) => T,
-    project: (observation: T) => U | null,
+    project: (observation: T, provider: OpenCodeRedactedSnapshotV1['providers'][number]) => U | null,
     authority: string,
   ): void {
     void this.#loadSnapshot(scope, signal).then(
@@ -213,7 +213,7 @@ export class OpenCodePassiveStatusProductionReader {
           return
         }
         const observation = select(provider)
-        const value = isDirectObservation(observation, authority) ? project(observation) : null
+        const value = isDirectObservation(observation, authority) ? project(observation, provider) : null
         if (value === null || observation.observedAt === null || observation.validUntil === null
           || observation.validUntil < this.#safeNow()) {
           handoff(value === null && observation.authority === authority

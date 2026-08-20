@@ -18,6 +18,8 @@ import {
 
 const projectScope = (canonicalPath: string): `sha256:${string}` =>
   `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonicalPath).digest('hex')}`
+const catalogIdentity = (marker: string): `sha256:${string}` =>
+  `sha256:${createHash('sha256').update(`fake-catalog:${marker}`).digest('hex')}`
 
 const observation = <T>(
   value: T,
@@ -42,6 +44,7 @@ function snapshot(canonicalPath = '/canonical/a', validUntil = 2_000): OpenCodeR
     providers: [{
       providerId: 'deepinfra',
       fingerprint: `sha256:${'b'.repeat(64)}`,
+      catalogIdentity: catalogIdentity(`${canonicalPath}:${validUntil}`),
       modelIds: ['deepinfra/llama-4'],
       configured: observation('configured', 'config_metadata', validUntil),
       lastConnected: observation({ state: 'connected', at: 800 }, 'auth_metadata', validUntil),
@@ -118,12 +121,90 @@ describe('OpenCode passive status production adapters', () => {
     })
     expect(staleStatus.providers[0]).toMatchObject({
       catalogAvailable: { value: 'available', freshness: 'stale', authority: 'catalog_snapshot' },
-      knownModelIds: ['deepinfra/llama-4'],
     })
+    expect(staleStatus.providers[0].knownModelIds).toBeUndefined()
 
     expect(staleStatus.binary).toMatchObject({
       value: { presence: 'unknown', version: null }, authority: 'none', freshness: 'unknown', condition: 'degraded',
     })
+  })
+
+  test('never labels cached generation N model IDs as part of newer disk catalog evidence', async () => {
+    let disk = snapshot()
+    const adapter = new OpenCodePassiveStatusProductionReader({
+      rootDirectory: '/passive', now: () => 1_000,
+      canonicalizePath: async () => '/canonical/a',
+      readBoundedText: async filePath => filePath.endsWith('binary.snapshot.json') ? null : encoded(disk),
+    })
+    const first = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
+    expect(first.providers[0].knownModelIds).toEqual(['deepinfra/llama-4'])
+
+    disk = structuredClone(disk)
+    disk.providers[0].modelIds = ['deepinfra/qwen-2.5-coder']
+    disk.providers[0].catalogIdentity = catalogIdentity('generation-n-plus-1')
+    const next = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
+    expect(next.providers[0].catalogAvailable.value).toBe('available')
+    expect(next.providers[0].knownModelIds).toBeUndefined()
+    expect(JSON.stringify(next)).not.toContain('llama-4')
+  })
+
+  test('drops cached model IDs when config or auth evidence changes identity', async () => {
+    for (const change of ['config', 'auth'] as const) {
+      let disk = snapshot()
+      const adapter = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: '/passive', now: () => 1_000,
+        canonicalizePath: async () => '/canonical/a',
+        readBoundedText: async filePath => filePath.endsWith('binary.snapshot.json') ? null : encoded(disk),
+      })
+      expect((await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 }))
+        .providers[0].knownModelIds).toEqual(['deepinfra/llama-4'])
+      disk = structuredClone(disk)
+      if (change === 'config') disk.providers[0].configured = observation('not_configured', 'config_metadata')
+      else disk.providers[0].lastConnected = observation({ state: 'not_connected' }, 'auth_metadata')
+      disk.providers[0].catalogIdentity = catalogIdentity(`${change}-changed`)
+      const changed = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
+      expect(changed.providers[0].knownModelIds).toBeUndefined()
+    }
+  })
+
+  test('legacy snapshots without catalog identity retain safe status but expose no model IDs', async () => {
+    const legacy = snapshot()
+    delete legacy.providers[0].catalogIdentity
+    const adapter = new OpenCodePassiveStatusProductionReader({
+      rootDirectory: '/passive', now: () => 1_000,
+      canonicalizePath: async () => '/canonical/a',
+      readBoundedText: async filePath => filePath.endsWith('binary.snapshot.json') ? null : encoded(legacy),
+    })
+    const status = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
+    expect(status.providers[0].catalogAvailable.value).toBe('available')
+    expect(status.providers[0].configured.value).toBe('configured')
+    expect(status.providers[0].knownModelIds).toBeUndefined()
+  })
+
+  test('binds the same provider independently for two project cache keys', async () => {
+    const disks = new Map<string, OpenCodeRedactedSnapshotV1>([
+      [projectScope('/canonical/a').slice(7), snapshot('/canonical/a')],
+      [projectScope('/canonical/b').slice(7), snapshot('/canonical/b')],
+    ])
+    const adapter = new OpenCodePassiveStatusProductionReader({
+      rootDirectory: '/passive', now: () => 1_000,
+      canonicalizePath: async value => `/canonical/${value.slice(1)}`,
+      readBoundedText: async filePath => {
+        if (filePath.endsWith('binary.snapshot.json')) return null
+        return encoded(disks.get(filePath.slice(filePath.lastIndexOf('/') + 1, -5))!)
+      },
+    })
+    for (const project of ['/a', '/b']) {
+      const initial = await adapter.reader.read({ projectPath: project, providerIds: ['deepinfra'], timeoutMs: 50 })
+      expect(initial.providers[0].knownModelIds).toEqual(['deepinfra/llama-4'])
+    }
+    const changedA = structuredClone(disks.get(projectScope('/canonical/a').slice(7))!)
+    changedA.providers[0].catalogIdentity = catalogIdentity('project-a-new-generation')
+    disks.set(projectScope('/canonical/a').slice(7), changedA)
+    expect((await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 }))
+      .providers[0].knownModelIds).toBeUndefined()
+    expect((await adapter.reader.read({ projectPath: '/b', providerIds: ['deepinfra'], timeoutMs: 50 }))
+      .providers[0].knownModelIds).toEqual(['deepinfra/llama-4'])
   })
 
   test('never promotes stored stale/degraded timeout evidence through direct production ports', async () => {
@@ -251,9 +332,11 @@ describe('OpenCode passive status production adapters', () => {
     release(encoded(snapshot()))
     await flushMicrotasks()
     expect(status.providers[0].configured).toMatchObject({ value: 'unknown', authority: 'none' })
+    expect(status.providers[0].knownModelIds).toBeUndefined()
     firstRequest = false
     const later = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 10 })
     expect(later.providers[0].configured).toMatchObject({ value: 'unknown', authority: 'none' })
+    expect(later.providers[0].knownModelIds).toBeUndefined()
     expect(clock.pendingTimers()).toBe(0)
   })
 
@@ -363,6 +446,7 @@ describe('OpenCode passive status production adapters', () => {
     expect(degraded.providers[0].configured).toMatchObject({
       value: 'configured', authority: 'config_metadata', freshness: 'stale', condition: 'degraded', issueCode: 'read_timeout',
     })
+    expect(degraded.providers[0].knownModelIds).toBeUndefined()
 
     const otherPending = adapter.reader.read({ projectPath: '/b', providerIds: ['deepinfra'], timeoutMs: 10 })
     await flushMicrotasks()
