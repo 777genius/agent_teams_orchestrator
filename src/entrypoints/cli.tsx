@@ -116,6 +116,7 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   const provider = readOption(providerArgs, '--provider') ?? ''
   const model = readOption(providerArgs, '--model') ?? ''
   const {
+    runtimeProvidersClearProjectDefault,
     runtimeProvidersConnect,
     runtimeProvidersConnectApiKey,
     runtimeProvidersDirectory,
@@ -195,6 +196,12 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
         model,
         scope: readOption(providerArgs, '--scope') as 'project' | 'all-projects' | undefined,
         probe: hasOption(providerArgs, '--probe'),
+        compact: hasOption(providerArgs, '--compact'),
+      })
+      return true
+    case 'clear-project-default':
+      await runtimeProvidersClearProjectDefault({
+        ...common,
         compact: hasOption(providerArgs, '--compact'),
       })
       return true

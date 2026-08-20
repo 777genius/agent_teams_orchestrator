@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import {
+  clearOpenCodeManagedDefaultModel,
   getOpenCodeManagedPreferencesPath,
   readOpenCodeManagedRuntimePreferences,
   setOpenCodeManagedDefaultModel,
@@ -24,6 +25,25 @@ afterEach(async () => {
 })
 
 describe('OpenCodeManagedPreferences', () => {
+  test('clears only the project default and preserves model limits', async () => {
+    const profileRootPath = await makeProfile()
+    await setOpenCodeManagedDefaultModel(profileRootPath, 'local/default-model')
+    await setOpenCodeManagedModelLimits(profileRootPath, {
+      modelId: 'local/model-a',
+      contextTokens: 32_000,
+      outputTokens: 4_000,
+    })
+
+    await clearOpenCodeManagedDefaultModel(profileRootPath)
+
+    const preferences = await readOpenCodeManagedRuntimePreferences(profileRootPath)
+    expect(preferences.defaultModelId).toBeNull()
+    expect(preferences.modelLimitOverrides['local/model-a']).toMatchObject({
+      contextTokens: 32_000,
+      outputTokens: 4_000,
+    })
+  })
+
   test('serializes concurrent default and model-limit updates for one profile', async () => {
     const profileRootPath = await makeProfile()
 

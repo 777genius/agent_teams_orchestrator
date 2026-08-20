@@ -9,6 +9,7 @@ import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionSto
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeLedgerBridgeService } from '../../services/opencode/OpenCodeLedgerBridgeService.js'
 import {
+  clearProviderProjectDefaultModel,
   connectProviderWithApiKey,
   connectProvider,
   configureProviderModelLimits,
@@ -1741,6 +1742,37 @@ export async function runtimeProvidersSetDefault(opts: {
         projectPath: opts.projectPath?.trim() || null,
         scope: opts.scope === 'all-projects' ? 'all_projects' : 'project',
         probe: opts.probe === true,
+      }),
+    async (result, stdoutWrite) => {
+      if (!('error' in result)) {
+        await writeProviderManagementViewResponse(
+          runtimeId,
+          opts.compact ? compactProviderManagementView(result.value) : result.value,
+          null,
+          stdoutWrite,
+        )
+        return 0
+      }
+
+      await writeProviderManagementViewResponse(runtimeId, null, result.error, stdoutWrite)
+      return 1
+    },
+    recoverProviderManagementError(),
+  )
+}
+
+export async function runtimeProvidersClearProjectDefault(opts: {
+  runtime?: string
+  projectPath?: string
+  compact?: boolean
+  json?: boolean
+}): Promise<void> {
+  const runtimeId = normalizeProviderManagementRuntime(opts.runtime)
+  await withRuntimeJsonStdoutGuardedResponse(
+    () =>
+      clearProviderProjectDefaultModel(openCodeProviderManagementAdapter, {
+        runtimeId,
+        projectPath: opts.projectPath?.trim() || null,
       }),
     async (result, stdoutWrite) => {
       if (!('error' in result)) {

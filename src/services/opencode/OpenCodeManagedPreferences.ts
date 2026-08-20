@@ -195,6 +195,23 @@ export async function setOpenCodeManagedDefaultModel(
   })
 }
 
+export async function clearOpenCodeManagedDefaultModel(
+  profileRootPath: string,
+): Promise<OpenCodeManagedRuntimePreferences> {
+  const preferencesPath = getOpenCodeManagedPreferencesPath(profileRootPath)
+  return withPreferenceWriteQueue(preferencesPath, async () => {
+    const current = await readOpenCodeManagedRuntimePreferences(profileRootPath)
+    const preferences: OpenCodeManagedRuntimePreferences = {
+      ...current,
+      schemaVersion: 2,
+      defaultModelId: null,
+      updatedAt: new Date().toISOString(),
+    }
+    await writePreferencesFile(preferencesPath, preferences)
+    return preferences
+  })
+}
+
 export async function setOpenCodeManagedGlobalDefaultModel(
   dataRootPath: string,
   defaultModelId: string,
