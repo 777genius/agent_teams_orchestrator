@@ -9,6 +9,10 @@ import {
 } from './OpenCodePassiveStatusProductionReader.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
 import {
+  isOpenCodeCanonicalProviderId,
+  normalizeOpenCodePassiveModelRef,
+} from './OpenCodePassiveStatusContract.js'
+import {
   decodeOpenCodeRedactedSnapshotV1,
   type OpenCodeRedactedSnapshotProviderV1,
   type OpenCodeRedactedSnapshotV1,
@@ -84,13 +88,16 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     for (const model of inventory.models) {
       const parsed = parseOpenCodeExactProviderModelRef(model)
       if (!parsed) continue
+      const normalized = normalizeOpenCodePassiveModelRef(parsed.raw)
+      if (!normalized) continue
       const values = modelIds.get(parsed.providerId) ?? []
-      values.push(parsed.raw)
+      values.push(normalized)
       modelIds.set(parsed.providerId, values)
     }
     const providerIds = new Set(
       [...inventory.availableProviders, ...configuredProviderIds, ...connected.keys(), ...modelIds.keys()]
-        .filter(providerId => tryCreateOpenCodeCanonicalProviderId(providerId) === providerId),
+        .filter(providerId => tryCreateOpenCodeCanonicalProviderId(providerId) === providerId
+          && isOpenCodeCanonicalProviderId(providerId)),
     )
     await this.#update(inventory.projectPath, signal, (snapshot, now) => {
       if (!inventory.probeError) snapshot.binary = observation(
@@ -123,8 +130,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
             modelIds.has(providerId) ? 'available' : 'unavailable',
             'catalog_snapshot', now,
           )
-          if (modelIds.has(providerId)) provider.modelIds = [...new Set(modelIds.get(providerId))]
-          else delete provider.modelIds
+          replaceModelRefs(provider, modelIds.has(providerId) ? modelIds.get(providerId) : undefined)
         }
       }
     })
@@ -134,6 +140,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     projectPath: string; providerId: string; configured?: boolean; connected?: boolean
     catalogAvailable?: boolean; executionVerified?: boolean; modelIds?: readonly string[]
   }, signal = new AbortController().signal): Promise<void> {
+    if (!isOpenCodeCanonicalProviderId(input.providerId)) return
     await this.#update(input.projectPath, signal, (snapshot, now) => {
       const provider = getOrCreateProvider(snapshot, input.providerId)
       if (input.configured !== undefined) provider.configured = observation(
@@ -149,7 +156,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       if (input.executionVerified !== undefined) provider.executionVerified = observation(
         input.executionVerified ? 'verified' : 'rejected', 'execution_snapshot', now,
       )
-      if (input.modelIds) provider.modelIds = [...new Set(input.modelIds)]
+      if (input.modelIds) replaceModelRefs(provider, input.modelIds)
     })
   }
 
@@ -186,6 +193,23 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
   }
 }
 
+function normalizeModelRefs(values: readonly string[]): string[] {
+  const retained = new Set<string>()
+  for (const value of values) {
+    const normalized = normalizeOpenCodePassiveModelRef(value)
+    if (normalized) retained.add(normalized)
+  }
+  return [...retained]
+}
+
+function replaceModelRefs(provider: OpenCodeRedactedSnapshotProviderV1, values: readonly string[] | undefined): void {
+  if (values === undefined) delete provider.modelIds
+  else provider.modelIds = normalizeModelRefs(values)
+  delete provider.modelIdsTotal
+  delete provider.modelIdsTruncated
+  delete provider.modelIdsFingerprint
+}
+
 function legacyCompleteness(inventory: OpenCodeInventorySnapshot): OpenCodeInventoryCompleteness {
   const aggregate = inventory.probeError ? 'failed' as const : 'complete' as const
   return {
@@ -206,7 +230,8 @@ function getManagedConfiguredProviderIds(inventory: OpenCodeInventorySnapshot): 
   const value = inventory.profile?.managedConfig.provider
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return configured
   for (const providerId of Object.keys(value)) {
-    if (tryCreateOpenCodeCanonicalProviderId(providerId) === providerId) configured.add(providerId)
+    if (tryCreateOpenCodeCanonicalProviderId(providerId) === providerId
+      && isOpenCodeCanonicalProviderId(providerId)) configured.add(providerId)
   }
   return configured
 }

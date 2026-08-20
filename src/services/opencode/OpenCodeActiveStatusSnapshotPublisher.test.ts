@@ -76,6 +76,75 @@ function productionReader(clock: { now: number }, stored: () => string | null) {
 }
 
 describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
+  test('publishes case-preserving multi-segment exact refs while omitting malformed catalog entries', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile('kiro', 'xai'),
+      connectedProviders: [],
+      availableProviders: ['kiro', 'xai'],
+      models: [
+        'kiro/anthropic/claude',
+        'xai/org/Team:Model-v2',
+        'xai/org/Team:Model-v2',
+        'xai/org/token/secret',
+        'xai/https://user:password@example.invalid/model',
+        'xai/org/Mödel',
+      ],
+    }))
+
+    const status = await productionReader(clock, harness.stored).reader.read({
+      projectPath: '/project/secret-name', providerIds: ['kiro', 'xai'], timeoutMs: 50,
+    })
+    expect(status.providers.map(provider => [provider.providerId, provider.knownModelIds])).toEqual([
+      ['kiro', ['kiro/anthropic/claude']],
+      ['xai', ['xai/org/Team:Model-v2']],
+    ])
+    expect(harness.stored()).not.toContain('password')
+    expect(harness.stored()).not.toContain('token/secret')
+    expect(harness.stored()).not.toContain('Mödel')
+    expect(status.authorization).toBe('unknown')
+    expect(status.launchReadiness).toBe('not_authorized')
+  })
+
+  test('real encoder and production directory retain a deterministic cross-provider 256-ref projection', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    const deepinfraModels = Array.from({ length: 140 }, (_, index) => `deepinfra/org/Model-${String(index).padStart(3, '0')}`)
+    const kiroModels = Array.from({ length: 140 }, (_, index) => `kiro/anthropic/Claude-${String(index).padStart(3, '0')}`)
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile('deepinfra', 'kiro', 'xai'),
+      connectedProviders: [],
+      availableProviders: ['deepinfra', 'kiro', 'xai'],
+      models: [...kiroModels].reverse().concat(['xai/org/Team:Model-v2'], [...deepinfraModels].reverse()),
+    }))
+
+    clock.now = 301_001
+    await harness.publisher.publishProviderUpdate({
+      projectPath: '/project/secret-name', providerId: 'xai', executionVerified: true,
+    })
+    const status = await productionReader(clock, harness.stored).reader.read({
+      projectPath: '/project/secret-name', providerIds: ['deepinfra', 'kiro', 'xai'], timeoutMs: 50,
+    })
+    expect(status.providers.flatMap(provider => provider.knownModelIds ?? [])).toHaveLength(256)
+    expect(status.providers.find(provider => provider.providerId === 'deepinfra')?.knownModelIds).toEqual(deepinfraModels)
+    expect(status.providers.find(provider => provider.providerId === 'kiro')).toMatchObject({
+      knownModelIds: kiroModels.slice(0, 116), knownModelIdsTotal: 140, knownModelIdsTruncated: true,
+      catalogAvailable: { freshness: 'stale', authority: 'catalog_snapshot' },
+    })
+    expect(status.providers.find(provider => provider.providerId === 'xai')).toMatchObject({
+      knownModelIdsTotal: 1, knownModelIdsTruncated: true,
+    })
+
+    const retained = buildOpenCodePassiveProviderDirectory(status, { query: 'Claude-115' })
+    const omitted = buildOpenCodePassiveProviderDirectory(status, { query: 'Claude-116' })
+    expect(retained.entries.map(entry => entry.providerId)).toEqual(['kiro'])
+    expect(omitted.entries).toEqual([])
+    expect(retained.entries[0]?.actions.every(action => !action.enabled)).toBe(true)
+    expect(status.authorization).toBe('unknown')
+    expect(status.launchReadiness).toBe('not_authorized')
+  })
+
   test('publishes redacted active authority, retains it on transient updates, and passive status has zero write/probe effects', async () => {
     const clock = { now: 1_000 }
     const harness = publisherHarness(clock)

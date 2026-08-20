@@ -8,6 +8,7 @@ import {
   isOpenCodeCanonicalProviderId,
   isOpenCodeOpaqueSha256,
   isOpenCodePassiveBinaryVersion,
+  normalizeOpenCodePassiveModelRef,
   type OpenCodeBinaryStatus,
   type OpenCodeCatalogStatus,
   type OpenCodeConfiguredStatus,
@@ -147,8 +148,9 @@ export function encodeOpenCodeRedactedSnapshotV1(value: OpenCodeRedactedSnapshot
   catch { return invalid() }
   if (text.length > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
     || Buffer.byteLength(text, 'utf8') > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
-    try { text = JSON.stringify(omitStoredModelIds(preflight.value)) }
-    catch { return invalid() }
+    const fitted = fitStoredModelPrefix(preflight.value)
+    if (!fitted) return { ok: false, issueCode: 'snapshot_oversized' }
+    text = fitted.text
   }
   if (text.length > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
     || Buffer.byteLength(text, 'utf8') > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
@@ -171,7 +173,6 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
   const binary = binaryCopy && decodeObservation(binaryCopy, decodeBinary, 'binary_metadata', isUnknownBinary, top.capturedAt)
   if (!binary) return invalid()
   const providers: OpenCodeRedactedSnapshotProviderV1[] = []
-  let modelCount = 0
   for (const providerInput of providersInput) {
     const provider = captureRecord(providerInput, providerKeys, 5)
     if (!provider || !isOpenCodeCanonicalProviderId(provider.providerId)) return invalid()
@@ -193,25 +194,29 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       const models = captureArray(provider.modelIds, OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS)
       if (models === 'count') return countExceeded()
       if (!models) return invalid()
-      if (!models.every(isOpenCodeCanonicalModelId) || new Set(models).size !== models.length) return invalid()
-      const sorted = [...models as string[]].sort(codeUnitCompare)
+      const unique = new Set<string>()
+      for (const model of models) {
+        const normalized = normalizeOpenCodePassiveModelRef(model)
+        if (normalized) unique.add(normalized)
+      }
+      const sorted = [...unique].sort(codeUnitCompare)
       owned.modelIds = sorted
-      owned.modelIdsTotal = sorted.length
-      owned.modelIdsTruncated = false
-      owned.modelIdsFingerprint = modelIdsFingerprint(sorted)
+      const suppliedMetadata = readModelMetadata(provider, sorted.length)
+      if (suppliedMetadata && suppliedMetadata.modelIdsTruncated) Object.assign(owned, suppliedMetadata)
+      else {
+        owned.modelIdsTotal = sorted.length
+        owned.modelIdsTruncated = false
+        owned.modelIdsFingerprint = modelIdsFingerprint(sorted)
+      }
+    } else {
+      const suppliedMetadata = readModelMetadata(provider, 0)
+      if (suppliedMetadata) Object.assign(owned, suppliedMetadata)
     }
     providers.push(owned)
   }
   if (new Set(providers.map(provider => provider.providerId)).size !== providers.length) return invalid()
   providers.sort((left, right) => codeUnitCompare(left.providerId, right.providerId))
-  const totalModels = providers.reduce((total, provider) => total + (provider.modelIds?.length ?? 0), 0)
-  if (totalModels > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) {
-    for (const provider of providers) {
-      if (!provider.modelIds) continue
-      delete provider.modelIds
-      provider.modelIdsTruncated = (provider.modelIdsTotal ?? 0) > 0
-    }
-  }
+  retainModelPrefix(providers, OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS)
   const ownedProviders = providers.map(provider => inertRecord({
     ...provider,
     ...(provider.modelIds ? { modelIds: inertArray(provider.modelIds) } : {}),
@@ -323,17 +328,63 @@ function modelIdsFingerprint(modelIds: readonly string[]): `sha256:${string}` {
     .update(modelIds.join('\0')).digest('hex')}`
 }
 
-function omitStoredModelIds(snapshot: OpenCodeRedactedSnapshotV1): OpenCodeRedactedSnapshotV1 {
+function readModelMetadata(
+  provider: Record<string, unknown>,
+  retained: number,
+): Pick<OpenCodeRedactedSnapshotProviderV1, 'modelIdsTotal' | 'modelIdsTruncated' | 'modelIdsFingerprint'> | null {
+  if (!Number.isSafeInteger(provider.modelIdsTotal)
+    || (provider.modelIdsTotal as number) < retained
+    || (provider.modelIdsTotal as number) > OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS
+    || typeof provider.modelIdsTruncated !== 'boolean'
+    || provider.modelIdsTruncated !== ((provider.modelIdsTotal as number) > retained)
+    || !isOpenCodeOpaqueSha256(provider.modelIdsFingerprint)) return null
   return {
-    ...snapshot,
-    providers: snapshot.providers.map(provider => provider.modelIds === undefined ? provider : {
-      ...provider,
-      modelIds: undefined,
-      modelIdsTotal: provider.modelIdsTotal ?? provider.modelIds.length,
-      modelIdsTruncated: (provider.modelIdsTotal ?? provider.modelIds.length) > 0,
-      modelIdsFingerprint: provider.modelIdsFingerprint ?? modelIdsFingerprint(provider.modelIds),
-    }),
+    modelIdsTotal: provider.modelIdsTotal as number,
+    modelIdsTruncated: provider.modelIdsTruncated,
+    modelIdsFingerprint: provider.modelIdsFingerprint,
   }
+}
+
+/** Provider/model order is already code-unit sorted, making this a stable global prefix. */
+function retainModelPrefix(providers: OpenCodeRedactedSnapshotProviderV1[], maximum: number): void {
+  let remaining = maximum
+  for (const provider of providers) {
+    if (provider.modelIds === undefined) continue
+    const retained = provider.modelIds.slice(0, remaining)
+    remaining -= retained.length
+    const total = provider.modelIdsTotal ?? provider.modelIds.length
+    if (retained.length > 0 || total === 0) provider.modelIds = retained
+    else delete provider.modelIds
+    provider.modelIdsTotal = total
+    provider.modelIdsTruncated = total > retained.length
+    provider.modelIdsFingerprint ??= modelIdsFingerprint(provider.modelIds ?? [])
+  }
+}
+
+function fitStoredModelPrefix(snapshot: OpenCodeRedactedSnapshotV1): { value: OpenCodeRedactedSnapshotV1; text: string } | null {
+  const available = snapshot.providers.reduce((total, provider) => total + (provider.modelIds?.length ?? 0), 0)
+  let low = 0
+  let high = available
+  let best: { value: OpenCodeRedactedSnapshotV1; text: string } | null = null
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2)
+    const candidate: OpenCodeRedactedSnapshotV1 = {
+      ...snapshot,
+      providers: snapshot.providers.map(provider => ({
+        ...provider,
+        ...(provider.modelIds === undefined ? {} : { modelIds: [...provider.modelIds] }),
+      })),
+    }
+    retainModelPrefix(candidate.providers, midpoint)
+    let text: string
+    try { text = JSON.stringify(candidate) } catch { return null }
+    if (text.length <= OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
+      && Buffer.byteLength(text, 'utf8') <= OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
+      best = { value: candidate, text }
+      low = midpoint + 1
+    } else high = midpoint - 1
+  }
+  return best
 }
 
 /** Separate mutation boundary; the passive reader intentionally cannot receive this port. */

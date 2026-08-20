@@ -25,6 +25,9 @@ describe('OpenCode passive capability decoder', () => {
   test('accepts canonical identifiers but rejects path, traversal, control and credential-like identifiers', () => {
     expect(isOpenCodeCanonicalProviderId('deepinfra')).toBe(true)
     expect(isOpenCodeCanonicalModelId('deepinfra/llama-4')).toBe(true)
+    expect(isOpenCodeCanonicalModelId('kiro/anthropic/claude')).toBe(true)
+    expect(isOpenCodeCanonicalModelId('xai/org/Team:Model-v2')).toBe(true)
+    expect(isOpenCodeCanonicalModelId('deepinfra/model@rev.8+stable')).toBe(true)
     for (const value of ['etc/passwd', '../model', '/root', './relative', 'ghp_abcd', 'xoxb-abcd', 'rk_live_abcd', 'sk-abcd', 'bearer-token', 'api-key', 'secret-value', 'token.value', 'deepinfra/../../passwd', 'model\nname', 'aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG']) {
       expect(isOpenCodeCanonicalProviderId(value)).toBe(false)
       expect(isOpenCodeCanonicalModelId(value)).toBe(false)
@@ -113,13 +116,19 @@ describe('OpenCode passive capability decoder', () => {
     ] as const
     for (const [payload, length, accepted] of boundaryMatrix) {
       expect(payload).toHaveLength(length)
-      expect(isOpenCodeCanonicalModelId(payload)).toBe(accepted)
+      expect(isOpenCodeCanonicalModelId(payload)).toBe(false)
       expect(isOpenCodeCanonicalModelId(`deepinfra/${payload}`)).toBe(accepted)
       expect(isOpenCodePassiveBinaryVersion(`1.2.3+${payload}`)).toBe(accepted)
     }
     for (const model of ['deepinfra/claude-sonnet-latest', 'deepinfra/model-name.v2', 'deepinfra/versioncandidate', 'deepinfra/deepinframodellatest']) {
       expect(isOpenCodeCanonicalModelId(model)).toBe(true)
     }
+    for (const unsafe of [
+      'deepinfra/etc/passwd', 'deepinfra/home/alice/model', 'deepinfra/model?token=value',
+      'deepinfra/model#fragment', 'deepinfra/https://example.invalid/model',
+      'deepinfra/127.0.0.1:8080/model', 'deepinfra/user:password@example.invalid/model',
+      'deepinfra/org/Team\u0000Model', 'deepinfra/org/Mödel', 'deepinfra/org/token/value',
+    ]) expect(isOpenCodeCanonicalModelId(unsafe)).toBe(false)
     for (const version of ['1.2.3+linux.amd64', '1.2.3+versioncandidate', '1.2.3+claudesonnetlatest']) {
       expect(isOpenCodePassiveBinaryVersion(version)).toBe(true)
     }

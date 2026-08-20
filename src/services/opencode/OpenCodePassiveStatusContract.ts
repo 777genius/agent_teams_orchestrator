@@ -1,9 +1,15 @@
 import { types as nodeTypes } from 'node:util'
 
+import { isOpenCodeCredentialOrAuthorityLike } from './OpenCodeProviderIdentity.js'
+
 export const OPEN_CODE_PASSIVE_STATUS_CONTRACT_VERSION = 1 as const
 export const OPEN_CODE_PASSIVE_CAPABILITY_VERSION = 1 as const
 /** Shared request, directory and stored-snapshot provider capacity. */
 export const OPEN_CODE_PASSIVE_MAX_PROVIDERS = 64 as const
+/** Exact provider/model refs retained by passive evidence are ASCII and bounded. */
+export const OPEN_CODE_PASSIVE_MODEL_REF_MAX_CODE_UNITS = 256 as const
+export const OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENTS = 8 as const
+export const OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENT_CODE_UNITS = 128 as const
 
 export type OpenCodePassiveFreshness = 'fresh' | 'stale' | 'unknown'
 export type OpenCodePassiveCondition = 'normal' | 'degraded'
@@ -104,10 +110,32 @@ export function isOpenCodeCanonicalProviderId(value: unknown): value is string {
 }
 
 export function isOpenCodeCanonicalModelId(value: unknown): value is string {
-  if (typeof value !== 'string') return false
-  if (value.length > 129) return false
+  return normalizeOpenCodePassiveModelRef(value) !== null
+}
+
+/**
+ * Shared redaction boundary for searchable exact launch refs. It validates but
+ * never case-folds: passive search owns any display-only normalization.
+ * Model segments allow ASCII alphanumerics separated by `.`, `_`, `:`, `+`,
+ * `@`, or `-`; `/` separates bounded provider/model namespace segments.
+ * Malformed catalog entries return null so publishers/encoders can omit that
+ * entry without discarding unrelated, already-redacted status evidence.
+ */
+export function normalizeOpenCodePassiveModelRef(value: unknown): string | null {
+  if (typeof value !== 'string'
+    || value.length === 0
+    || value.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_CODE_UNITS
+    || value !== value.trim()
+    || /[^\x21-\x7e]/.test(value)
+    || /[\\?#=%&]/.test(value)
+    || isOpenCodeCredentialOrAuthorityLike(value)) return null
   const parts = value.split('/')
-  return parts.length === 1 ? canonicalIdentifierPart(parts[0]) : parts.length === 2 && isOpenCodeCanonicalProviderId(parts[0]) && canonicalIdentifierPart(parts[1])
+  if (parts.length < 2 || parts.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENTS
+    || !isOpenCodeCanonicalProviderId(parts[0])) return null
+  for (const part of parts.slice(1)) {
+    if (!safeModelRefSegment(part)) return null
+  }
+  return value
 }
 
 // Raw provider names are accepted only from this reviewed registry. Custom
@@ -133,6 +161,17 @@ const explicitlySafeIdentifiers = new Set([
   // rejection below.
   'xiaomi-token-plan-ams', 'xiaomi-token-plan-sgp', 'xiaomi-token-plan-cn',
 ])
+const pathLikeModelSegments = new Set([
+  '.', '..', 'etc', 'home', 'passwd', 'root', 'tmp', 'usr', 'var', 'users',
+])
+function safeModelRefSegment(value: string): boolean {
+  if (value.length === 0 || value.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENT_CODE_UNITS) return false
+  if (!/^[A-Za-z0-9]+(?:[._:+@-][A-Za-z0-9]+)*$/.test(value)) return false
+  if (pathLikeModelSegments.has(value.toLowerCase()) || containsSensitiveComponent(value)) return false
+  const components = value.split(identifierSeparators)
+  return !looksLikeCredential(value.replace(/[._+:@-]/g, ''), false)
+    && components.every(component => !looksLikeCredential(component))
+}
 function canonicalIdentifierPart(value: string): boolean {
   if (value.length === 0 || value.length > 64) return false
   return /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(value)

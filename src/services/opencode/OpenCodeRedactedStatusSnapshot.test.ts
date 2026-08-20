@@ -55,6 +55,39 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(Object.keys(JSON.parse(text))).toEqual(['schemaVersion', 'projectScope', 'capturedAt', 'binary', 'providers'])
   })
 
+  test('round trips realistic exact refs and deterministically projects the first 256 valid unique refs', () => {
+    const provider = snapshot().providers[0]
+    const deepinfraModels = Array.from({ length: 140 }, (_, index) => `deepinfra/org/Model-${String(index).padStart(3, '0')}`)
+    const kiroModels = Array.from({ length: 140 }, (_, index) => `kiro/anthropic/Claude-${String(index).padStart(3, '0')}`)
+    const candidate = snapshot()
+    candidate.providers = [
+      { ...structuredClone(provider), providerId: 'xai', modelIds: ['xai/org/Team:Model-v2', 'xai/org/Team:Model-v2', 'xai/org/token/secret'] },
+      { ...structuredClone(provider), providerId: 'kiro', modelIds: [...kiroModels].reverse() },
+      { ...structuredClone(provider), providerId: 'deepinfra', modelIds: [...deepinfraModels].reverse() },
+    ]
+
+    const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
+    expect(encoded.ok).toBe(true)
+    if (!encoded.ok || !encoded.bytes) throw new Error('fixture did not encode')
+    expect(encoded.value.providers.map(item => item.providerId)).toEqual(['deepinfra', 'kiro', 'xai'])
+    expect(encoded.value.providers.flatMap(item => item.modelIds ?? [])).toEqual([
+      ...deepinfraModels,
+      ...kiroModels.slice(0, OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS - deepinfraModels.length),
+    ])
+    expect(encoded.value.providers[1]).toMatchObject({ modelIdsTotal: 140, modelIdsTruncated: true })
+    expect(encoded.value.providers[2]).toMatchObject({ modelIdsTotal: 1, modelIdsTruncated: true })
+    expect(new TextDecoder().decode(encoded.bytes)).not.toContain('token/secret')
+
+    const reordered = structuredClone(candidate)
+    reordered.providers.reverse()
+    for (const item of reordered.providers) item.modelIds?.reverse()
+    const encodedAgain = encodeOpenCodeRedactedSnapshotV1(reordered)
+    expect(encodedAgain.ok).toBe(true)
+    if (!encodedAgain.ok || !encodedAgain.bytes) throw new Error('fixture did not encode')
+    expect(encodedAgain.bytes).toEqual(encoded.bytes)
+    expect(decodeOpenCodeRedactedSnapshotV1(encoded.bytes)).toEqual({ ok: true, value: encoded.value })
+  })
+
   test('fails closed for malformed, future-schema and oversized bytes with fixed codes', () => {
     expect(decodeOpenCodeRedactedSnapshotV1('{')).toEqual({ ok: false, issueCode: 'snapshot_invalid_json' })
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify({ schemaVersion: 2 }))).toEqual({ ok: false, issueCode: 'snapshot_invalid_schema' })
@@ -73,7 +106,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     tooManyProviders.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS + 1 }, (_, index) => ({ ...snapshot().providers[0], providerId: `p${index}` }))
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(tooManyProviders))).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
     const tooManyModels = snapshot()
-    tooManyModels.providers[0].modelIds = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS + 1 }, (_, index) => `model-${index}`)
+    tooManyModels.providers[0].modelIds = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS + 1 }, (_, index) => `deepinfra/model-${index}`)
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(tooManyModels))).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
     const invalid = snapshot()
     invalid.providers[0].configured.validUntil = 99
@@ -109,7 +142,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(encodeOpenCodeRedactedSnapshotV1(maximum)).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
   })
 
-  test('omits oversized catalogs with stable truncation count and fingerprint metadata', () => {
+  test('retains a stable bounded prefix for oversized catalogs with truncation metadata', () => {
     const candidate = snapshot()
     candidate.providers[0].modelIds = Array.from({ length: 257 }, (_, index) => `deepinfra/model-${index}`)
     const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
@@ -119,7 +152,9 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
       modelIdsTotal: 257,
       modelIdsTruncated: true,
     })
-    expect(encoded.value.providers[0].modelIds).toBeUndefined()
+    expect(encoded.value.providers[0].modelIds).toEqual(
+      [...candidate.providers[0].modelIds].sort().slice(0, OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS),
+    )
     expect(encoded.value.providers[0].modelIdsFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
 
     const large = snapshot()
@@ -128,6 +163,7 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(largeEncoded.ok).toBe(true)
     if (!largeEncoded.ok) throw new Error(largeEncoded.issueCode)
     expect(largeEncoded.value.providers[0]).toMatchObject({ modelIdsTotal: 5_000, modelIdsTruncated: true })
+    expect(largeEncoded.value.providers[0].modelIds).toHaveLength(OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS)
 
     const reversed = snapshot()
     reversed.providers[0].modelIds = [...candidate.providers[0].modelIds].reverse()
@@ -343,18 +379,18 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
 
   test('blocks lowercase high-entropy boundary payloads in model, version, encode and decode paths', () => {
     for (const payload of ['qmxncbvlasdkfjwu', 'qmxncbvlasdkfjwuepz', 'abcdefghijklmnopqrst', 'abcdefghijklmnopqrstuvwx']) {
-      for (const mutate of [
-        (candidate: OpenCodeRedactedSnapshotV1) => { candidate.binary.value.version = `1.2.3+${payload}` },
-        (candidate: OpenCodeRedactedSnapshotV1) => { candidate.providers[0].modelIds = [`deepinfra/${payload}`] },
-      ]) {
-        const candidate = snapshot()
-        mutate(candidate)
-        const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
-        expect(encoded).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
-        expect('bytes' in encoded).toBe(false)
-        expect(JSON.stringify(encoded)).not.toContain(payload)
-        expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(candidate))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
-      }
+      const invalidVersion = snapshot()
+      invalidVersion.binary.value.version = `1.2.3+${payload}`
+      expect(encodeOpenCodeRedactedSnapshotV1(invalidVersion)).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
+
+      const malformedCatalogEntry = snapshot()
+      malformedCatalogEntry.providers[0].modelIds = [`deepinfra/${payload}`, 'deepinfra/safe-model']
+      const encoded = encodeOpenCodeRedactedSnapshotV1(malformedCatalogEntry)
+      expect(encoded.ok).toBe(true)
+      if (!encoded.ok || !encoded.bytes) throw new Error('fixture did not encode')
+      expect(encoded.value.providers[0].modelIds).toEqual(['deepinfra/safe-model'])
+      expect(new TextDecoder().decode(encoded.bytes)).not.toContain(payload)
+      expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(malformedCatalogEntry))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
     }
   })
 
@@ -367,10 +403,16 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
         candidate => { candidate.providers[0].modelIds = [`deepinfra/${sensitive.toLowerCase()}`] },
         candidate => { candidate.providers[0].modelIds = [`${sensitive.toLowerCase()}/llama-4`] },
       ]
-      for (const mutate of mutations) {
+      for (const [index, mutate] of mutations.entries()) {
         const candidate = snapshot()
         mutate(candidate)
-        expect(encodeOpenCodeRedactedSnapshotV1(candidate)).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
+        const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
+        if (index < 2) expect(encoded).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
+        else {
+          expect(encoded.ok).toBe(true)
+          if (!encoded.ok || !encoded.bytes) throw new Error('fixture did not encode')
+          expect(new TextDecoder().decode(encoded.bytes)).not.toContain(sensitive.toLowerCase())
+        }
         expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(candidate))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
       }
     }
