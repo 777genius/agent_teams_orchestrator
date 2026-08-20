@@ -37,6 +37,16 @@ export type OpenCodeScopedProfilePlan = {
   abortSignal?: AbortSignal
 }
 
+export type OpenCodeCurrentScopedProfilePlan = Omit<
+  OpenCodeScopedProfilePlan,
+  'providerId' | 'modelId' | 'projectPath' | 'abortSignal'
+> & {
+  providerId: string
+  modelId: string | null
+  projectPath: string
+  evidence: OpenCodeScopedProfilePlanningEvidence
+}
+
 /**
  * Immutable evidence supplied to the pure scoped planner.  Values which can
  * contain credentials are accepted only as already-redacted SHA-256 digests;

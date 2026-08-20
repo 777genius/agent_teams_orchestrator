@@ -130,6 +130,10 @@ import {
   readOpenCodePassiveProviderDirectory,
 } from '../../../../services/opencode/OpenCodePassiveProviderDirectory.js'
 import type { OpenCodePassiveStatusV1 } from '../../../../services/opencode/OpenCodePassiveStatusContract.js'
+import {
+  openCodeActiveStatusSnapshotPublisher,
+  type OpenCodeActiveStatusPublisherPort,
+} from '../../../../services/opencode/OpenCodeActiveStatusSnapshotPublisher.js'
 
 type OpenCodeInventoryServiceLike = {
   probe(
@@ -176,6 +180,7 @@ type OpenCodeProviderManagementAdapterDeps = {
     timeoutMs: number
   }) => Promise<OpenCodePassiveStatusV1>
   passiveStatusTimeoutMs?: number
+  activeStatusPublisher?: OpenCodeActiveStatusPublisherPort
   inventoryService?: OpenCodeInventoryServiceLike
   hostManager?: OpenCodeHostManagerLike
   clientFactory?: OpenCodeClientFactoryLike
@@ -516,12 +521,17 @@ function normalizeDirectoryCursor(value: string | null | undefined): number {
   return Number.isFinite(normalized) && normalized > 0 ? normalized : 0
 }
 
-function normalizeProviderId(value: string | null | undefined): string | null {
-  const normalized = value?.trim()
-  if (!normalized) return null
-  const canonical = canonicalizeOpenCodeProviderId(normalized)
-  if (!canonical) return null
-  return /^[a-z0-9][a-z0-9._-]*$/i.test(canonical) ? canonical : null
+function normalizeProviderId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  try {
+    const normalized = value.trim()
+    if (!normalized) return null
+    const canonical = canonicalizeOpenCodeProviderId(normalized)
+    if (!canonical) return null
+    return /^[a-z0-9][a-z0-9._-]*$/.test(canonical) ? canonical : null
+  } catch {
+    return null
+  }
 }
 
 function normalizePositiveLimit(value: number | null | undefined): number | null {
@@ -2951,6 +2961,14 @@ export class OpenCodeProviderManagementAdapter
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
 
+  private getActiveStatusPublisher(): OpenCodeActiveStatusPublisherPort {
+    return this.deps.activeStatusPublisher ?? openCodeActiveStatusSnapshotPublisher
+  }
+
+  private async publishProviderStatus(input: Parameters<OpenCodeActiveStatusPublisherPort['publishProviderUpdate']>[0]): Promise<void> {
+    await this.getActiveStatusPublisher().publishProviderUpdate(input).catch(() => undefined)
+  }
+
   private async retainProviderManagementHost(
     hostManager: OpenCodeHostManagerLike,
     host: OpenCodeHostHandle,
@@ -3338,6 +3356,14 @@ export class OpenCodeProviderManagementAdapter
       }
 
       if (probeResult.outcome === 'available') {
+        await this.publishProviderStatus({
+          projectPath: input.inventory.projectPath,
+          providerId: input.providerId,
+          configured: true,
+          connected: true,
+          executionVerified: true,
+          modelIds: [validationModelId],
+        })
         return { ok: true, value: validationModelId }
       }
 
@@ -3883,6 +3909,12 @@ export class OpenCodeProviderManagementAdapter
       const scoped = await (this.deps.providerCatalog ?? openCodeProviderCatalogService)
         .loadCatalog({ providerId, projectPath: input.projectPath })
       const catalog = scoped.catalog
+      await this.publishProviderStatus({
+        projectPath: scoped.projectPath,
+        providerId,
+        catalogAvailable: true,
+        modelIds: catalog.models.map(model => `${providerId}/${model.id}`),
+      })
       const preferencesResult = await safeRead(() =>
         this.getManagedPreferences().read(scoped.profileRootPath)
       )

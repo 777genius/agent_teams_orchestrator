@@ -117,6 +117,21 @@ describe('OpenCodeClientFactory permissions API', () => {
     ])
   })
 
+  test('physically deletes an exact session through the encoded OpenCode endpoint', async () => {
+    const requests: Array<{ url: string; method: string | undefined }> = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async (input, init) => {
+        requests.push({ url: String(input), method: init?.method })
+        return new Response('true', { status: 200, headers: { 'content-type': 'application/json' } })
+      },
+    })
+    await expect(factory.create('http://127.0.0.1:4096').deleteSession('session/owned'))
+      .resolves.toBe(true)
+    expect(requests).toEqual([{
+      url: 'http://127.0.0.1:4096/session/session%2Fowned', method: 'DELETE',
+    }])
+  })
+
   test('lists pending permissions from the SDK v2 endpoint without trailing slash', async () => {
     const paths: string[] = []
     const factory = new OpenCodeClientFactory({

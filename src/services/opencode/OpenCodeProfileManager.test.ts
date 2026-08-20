@@ -45,6 +45,8 @@ import {
 } from './OpenCodeManagedPaths.js'
 import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPolicy.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { prepareOpenCodeProviderCatalogProductionProfile } from './OpenCodeProviderCatalogProduction.js'
+import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
 
 const pureDigest = (value: string): string => createHash('sha256').update(value).digest('hex')
 const fakePluginTree = [{
@@ -316,6 +318,45 @@ async function buildDeepinfraPlannedInput(
 }
 
 describe('OpenCodeProfileManager immutable planned preparation', () => {
+  test('production catalog composition captures current evidence through the actual manager and policy', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-catalog-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      const prepared = await prepareOpenCodeProviderCatalogProductionProfile(fixture.manager, {
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-a',
+        projectPath: tempDir,
+      })
+      expect(prepared.providerId).toBe('deepinfra')
+      expect(prepared.purpose).toBe('provider-catalog')
+      expect(prepared.scopedPlanDigest).toMatch(/^[a-f0-9]{64}$/)
+
+      const launchAuthorization = await authorizeOpenCodeLaunchScopedProfile(fixture.manager, {
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'launch-attempt-a', projectPath: tempDir,
+      })
+      expect(launchAuthorization.expected.purpose).toBe('launch')
+      expect(launchAuthorization.input.runtimeInstanceId).toBe('launch-attempt-a')
+      expect(launchAuthorization.effectivePlanDigest).toMatch(/^[a-f0-9]{64}$/)
+
+      const first = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-b',
+        projectPath: tempDir,
+      })
+      await writeFile(path.join(tempDir, 'AGENTS.md'), 'fresh attempt evidence\n')
+      const second = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-c',
+        projectPath: tempDir,
+      })
+      expect(fixture.manager.planScopedProfile(second).digest)
+        .not.toBe(fixture.manager.planScopedProfile(first).digest)
+      await expect(fixture.manager.prepareScopedProfile(first, fixture.manager.planScopedProfile(first)))
+        .rejects.toThrow('evidence drifted')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test.each(['root', 'nested'] as const)(
     'rejects a replaced %s project parent after capture and before descriptor-relative copy',
     async replacement => {
@@ -727,16 +768,32 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
-  test('creates Windows scoped managed directories without traversing reparse-point ancestry', async () => {
+  test('uses only a trusted pre-provisioned Windows tree and rejects a swap at the former mkdir boundary', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-windows-v2-'))
     const boundary = path.join(tempDir, 'managed')
     const target = path.join(boundary, 'one', 'two')
     const outside = path.join(tempDir, 'outside')
+    const displacedBoundary = path.join(tempDir, 'managed-original')
     try {
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32'))
+        .rejects.toThrow('trusted and pre-existing')
+      await mkdir(target, { recursive: true })
+      await mkdir(outside)
       await ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32')
       expect((await stat(target)).isDirectory()).toBe(true)
 
-      await mkdir(outside)
+      let swapped = false
+      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, async componentPath => {
+        if (componentPath !== boundary || swapped) return
+        swapped = true
+        await rename(boundary, displacedBoundary)
+        await symlink(outside, boundary, 'dir')
+      }, 'win32')).rejects.toThrow('ancestry is not canonical')
+      expect(swapped).toBe(true)
+      expect(await readdir(outside)).toEqual([])
+      await rm(boundary)
+      await rename(displacedBoundary, boundary)
+
       await symlink(outside, path.join(boundary, 'linked'), 'dir')
       await expect(ensureOpenCodeManagedDirectoryPath(
         path.join(boundary, 'linked', 'child'),

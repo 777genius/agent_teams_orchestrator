@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { join, posix, win32 } from 'node:path'
 
 import {
   OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES,
+  deriveOpenCodeLaunchNamespacePaths,
   OpenCodeLaunchAttemptStore,
   OpenCodeLaunchFileJournalPersistence,
   OpenCodeLaunchJournalError,
@@ -50,6 +51,16 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
 }
 
 describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
+  test('derives the secure namespace with the injected host path strategy and no descriptor filesystem', async () => {
+    expect(deriveOpenCodeLaunchNamespacePaths('/var/app/attempt.json', posix)).toMatchObject({
+      directory: '/var/app', lock: '/var/app/attempt.json.lease',
+    })
+    expect(deriveOpenCodeLaunchNamespacePaths('C:\\App\\attempt.json', win32)).toMatchObject({
+      directory: 'C:\\App', lock: 'C:\\App\\attempt.json.lease',
+    })
+    expect(await readFile(new URL('./OpenCodeLaunchAttemptStore.ts', import.meta.url), 'utf8'))
+      .not.toContain('/proc/self/fd')
+  })
   test('atomically persists a mode-0600 file and leaves no temporary journal', async () => {
     const directory = await workspaceTemp('journal')
     const path = join(directory, 'attempt.json')
@@ -105,6 +116,30 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       const context = { deadlineAtMs: Date.now() + 1_000, monotonicNow: Date.now, signal: new AbortController().signal }
       await expect(new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
         .inspect(identity, context)).rejects.toMatchObject({ code: 'foreign' })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  test('compares retained and visible identity when O_NOFOLLOW is unavailable', async () => {
+    const directory = await workspaceTemp('read-fallback-swap')
+    const path = join(directory, 'attempt.json')
+    const foreign = join(directory, 'foreign.json')
+    const displaced = join(directory, 'attempt-original.json')
+    try {
+      await writeFile(foreign, '{"foreign":true}', { mode: 0o600 })
+      const writer = new OpenCodeLaunchFileJournalPersistence(path)
+      await writer.replaceAndSync(new TextEncoder().encode('{"version":1}'))
+      let swapped = false
+      const reader = new OpenCodeLaunchFileJournalPersistence(path, {
+        readNoFollowAvailable: false,
+        afterReadHandleOpened: async openedPath => {
+          if (openedPath !== path || swapped) return
+          swapped = true
+          await rename(path, displaced)
+          await symlink(foreign, path)
+        },
+      })
+      await expect(reader.read()).rejects.toMatchObject({ code: 'foreign' })
+      expect(swapped).toBe(true)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
