@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
@@ -40,6 +40,58 @@ function encoded(value: OpenCodeRedactedSnapshotV1): string {
 }
 
 describe('OpenCode passive snapshot writer lease', () => {
+  test('reclaims a simulated crashed binary owner and completes the next publication', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-crashed-'))
+    const lease = path.join(root, 'locks', 'binary.snapshot.lease.lock')
+    try {
+      await mkdir(lease, { recursive: true })
+      await writeFile(path.join(lease, 'active.json'), JSON.stringify({
+        pid: 991_443, birthIdentity: 'dead-process-birth',
+        token: '00000000-0000-4000-8000-000000000443',
+      }))
+      const writer = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        leaseOwnerIsAlive: owner => owner.birthIdentity !== 'dead-process-birth',
+        leaseWait: async () => undefined,
+      })
+      await writer.write(snapshot(4_430), new AbortController().signal)
+      expect(await readFile(path.join(root, 'binary.snapshot.json'), 'utf8'))
+        .toBe(encoded(snapshot(4_430)))
+      expect(await readdir(path.join(root, 'locks'))).toEqual([])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('retries transient Windows-style cleanup failures without deleting a successor', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-eperm-'))
+    try {
+      let cleanupAttempts = 0
+      const writer = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        leaseCleanupRename: async (source, destination) => {
+          cleanupAttempts += 1
+          if (cleanupAttempts < 3) throw Object.assign(new Error('injected Windows cleanup denial'), { code: 'EPERM' })
+          await rename(source, destination)
+        },
+      })
+      await writer.write(snapshot(4_431), new AbortController().signal)
+      expect(cleanupAttempts).toBe(3)
+      let persistentAttempts = 0
+      await expect(new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        leaseCleanupRename: async () => {
+          persistentAttempts += 1
+          throw Object.assign(new Error('injected persistent Windows cleanup denial'), { code: 'EPERM' })
+        },
+      }).write(snapshot(4_432), new AbortController().signal)).rejects.toMatchObject({ code: 'EPERM' })
+      expect(persistentAttempts).toBe(3)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(snapshot(4_433), new AbortController().signal)
+      expect(await readFile(path.join(root, 'binary.snapshot.json'), 'utf8'))
+        .toBe(encoded(snapshot(4_433)))
+      expect(await readdir(path.join(root, 'locks'))).toEqual([])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   test('two production publisher instances retain independent observations under one scope lease', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-lease-'))
     try {
