@@ -1,7 +1,11 @@
 import { expect, test } from 'bun:test'
+import path from 'node:path'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 
 import {
   createOpenCodeOwnedMemberSession,
+  OpenCodeProofSessionCleanupLedger,
   reconcileOpenCodeOwnedMemberSession,
 } from './OpenCodeLaunchAttemptProductionSession.js'
 import type { OpenCodeOpaqueIdentity } from './OpenCodeBridgeContractV2.js'
@@ -77,4 +81,67 @@ test('reconciliation proves absence and never deletes a foreign or reused determ
     deleteSession: async () => { deletes += 1; return true },
   })).toBe('absent')
   expect(deletes).toBe(0)
+})
+
+test('proof cleanup ownership is durable before POST and a lost response is reconciled without another create', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-cleanup-'))
+  try {
+    const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'))
+    const ownership = { attemptId: 'attempt-a', hostKeyIdentity: identity,
+      authoritativeSessionId: 'session-deterministic', ownershipTitle: 'agent-teams-proof:attempt-a:digest' }
+    const first = await ledger.register(ownership)
+    expect(first.created).toBe(true)
+    expect((await ledger.read())?.state).toBe('registered')
+
+    const remote = new Map([[ownership.authoritativeSessionId, {
+      id: ownership.authoritativeSessionId, title: ownership.ownershipTitle,
+    }]])
+    const outcome = await reconcileOpenCodeOwnedMemberSession({
+      authoritativeSessionId: ownership.authoritativeSessionId,
+      ownershipTitle: ownership.ownershipTitle,
+      getSession: async id => {
+        const session = remote.get(id)
+        if (!session) throw new Error('request failed (404 Not Found)')
+        return session
+      },
+      deleteSession: async id => remote.delete(id),
+    })
+    await ledger.recordState(ownership, outcome)
+    expect(outcome).toBe('deleted')
+    expect((await ledger.read())?.state).toBe('deleted')
+    expect((await ledger.register(ownership)).created).toBe(false)
+    expect(remote.size).toBe(0)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('proof cleanup ledger truthfully retains inconclusive and foreign outcomes', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'opencode-proof-cleanup-'))
+  try {
+    const ledger = new OpenCodeProofSessionCleanupLedger(path.join(directory, 'proof.json'))
+    const ownership = { attemptId: 'attempt-a', hostKeyIdentity: identity,
+      authoritativeSessionId: 'session-deterministic', ownershipTitle: 'agent-teams-proof:attempt-a:digest' }
+    await ledger.register(ownership)
+    expect(await reconcileOpenCodeOwnedMemberSession({
+      authoritativeSessionId: ownership.authoritativeSessionId,
+      ownershipTitle: ownership.ownershipTitle,
+      getSession: async () => { throw new Error('inconclusive GET') },
+      deleteSession: async () => true,
+    })).toBe('unresolved')
+    await ledger.recordState(ownership, 'unresolved')
+    expect((await ledger.read())?.state).toBe('unresolved')
+    let deleteCalls = 0
+    expect(await reconcileOpenCodeOwnedMemberSession({
+      authoritativeSessionId: ownership.authoritativeSessionId,
+      ownershipTitle: ownership.ownershipTitle,
+      getSession: async () => ({ id: ownership.authoritativeSessionId, title: ownership.ownershipTitle }),
+      deleteSession: async () => { deleteCalls += 1; throw new Error('inconclusive DELETE') },
+    })).toBe('unresolved')
+    expect(deleteCalls).toBe(1)
+    await ledger.recordState(ownership, 'foreign')
+    expect((await ledger.read())?.state).toBe('foreign')
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
