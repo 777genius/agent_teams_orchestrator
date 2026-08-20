@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { lstat, mkdir, rmdir, utimes } from 'node:fs/promises'
+import { lstat, mkdir, rmdir, stat, utimes } from 'node:fs/promises'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { ensureOpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
@@ -21,9 +21,14 @@ type SnapshotWriterDeps = Readonly<{
   safeStorageHooks?: {
     afterRootOpened?: () => void | Promise<void>
     afterProjectSnapshotPublished?: () => void | Promise<void>
+    afterBinarySnapshotRenamed?: () => void | Promise<void>
+    afterLeaseDirectoryCreated?: (leaseName: string) => void | Promise<void>
+    afterLeaseWait?: (leaseName: string) => void | Promise<void>
   }
   leaseWaitTimeoutMs?: number
   leaseStaleMs?: number
+  leaseNow?: () => number
+  leaseWait?: (signal: AbortSignal, delayMs: number) => Promise<void>
 }>
 
 /** Explicit update-path writer. It is intentionally never owned or called by readStatus. */
@@ -35,6 +40,8 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
   readonly #safeStorageHooks: NonNullable<SnapshotWriterDeps['safeStorageHooks']>
   readonly #leaseWaitTimeoutMs: number
   readonly #leaseStaleMs: number
+  readonly #leaseNow: () => number
+  readonly #leaseWait: (signal: AbortSignal, delayMs: number) => Promise<void>
 
   constructor(deps: SnapshotWriterDeps = {}) {
     if ((deps.makeDirectory === undefined) !== (deps.writeAtomic === undefined)) {
@@ -52,6 +59,8 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
     this.#safeStorageHooks = deps.safeStorageHooks ?? {}
     this.#leaseWaitTimeoutMs = deps.leaseWaitTimeoutMs ?? 2_000
     this.#leaseStaleMs = deps.leaseStaleMs ?? 30_000
+    this.#leaseNow = deps.leaseNow ?? Date.now
+    this.#leaseWait = deps.leaseWait ?? waitForLease
   }
 
   async write(snapshot: OpenCodeRedactedSnapshotV1, signal: AbortSignal): Promise<void> {
@@ -74,23 +83,31 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
     const root = await ensureOpenCodeSafePublicationDirectory(this.#rootDirectory)
     try {
       await this.#safeStorageHooks.afterRootOpened?.()
-      const snapshots = await root.ensureChildDirectory('snapshots')
-      try {
-        const snapshotName = `${encoded.value.projectScope.slice(7)}.json`
-        const previousSnapshot = await snapshots.readBoundedRegularFile(snapshotName, OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
-        const previousBinary = await root.readBoundedRegularFile('binary.snapshot.json', OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
+      // Publishers always acquire their scope lease first. Taking the single
+      // shared-binary lease only here gives every writer the same scope ->
+      // binary acquisition order and makes verification plus rollback one
+      // cross-process transaction without placing a lock on passive reads.
+      await this.#withLease(root, 'binary.snapshot.lease', 'binary', signal, async () => {
+        const snapshots = await root.ensureChildDirectory('snapshots')
         try {
-          if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-          await snapshots.writeFileAtomic(snapshotName, owned, 0o600, signal)
-          await this.#safeStorageHooks.afterProjectSnapshotPublished?.()
-          if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-          await root.writeFileAtomic('binary.snapshot.json', owned, 0o600, signal)
-        } catch (error) {
-          await restorePublishedFile(snapshots, snapshotName, previousSnapshot)
-          await restorePublishedFile(root, 'binary.snapshot.json', previousBinary)
-          throw error
-        }
-      } finally { await snapshots.close() }
+          const snapshotName = `${encoded.value.projectScope.slice(7)}.json`
+          const previousSnapshot = await snapshots.readBoundedRegularFile(snapshotName, OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
+          const previousBinary = await root.readBoundedRegularFile('binary.snapshot.json', OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
+          try {
+            if (signal.aborted) throw new Error('Passive snapshot update cancelled')
+            await snapshots.writeFileAtomic(snapshotName, owned, 0o600, signal)
+            await this.#safeStorageHooks.afterProjectSnapshotPublished?.()
+            if (signal.aborted) throw new Error('Passive snapshot update cancelled')
+            await root.writeFileAtomic('binary.snapshot.json', owned, 0o600, signal, {
+              afterRenameBeforeVerification: this.#safeStorageHooks.afterBinarySnapshotRenamed,
+            })
+          } catch (error) {
+            await restorePublishedFile(snapshots, snapshotName, previousSnapshot)
+            await restorePublishedFile(root, 'binary.snapshot.json', previousBinary)
+            throw error
+          }
+        } finally { await snapshots.close() }
+      })
     } finally { await root.close() }
   }
 
@@ -101,49 +118,80 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
   ): Promise<T> {
     if (this.#legacyInjectedStorage) return operation()
     const root = await ensureOpenCodeSafePublicationDirectory(this.#rootDirectory)
-    let locks
     try {
-      locks = await root.ensureChildDirectory('locks')
-      const name = `${scope.slice(7)}.lease`
-      const leasePath = locks.child(`${name}.lock`)
-      const deadline = Date.now() + this.#leaseWaitTimeoutMs
-      let acquired = false
-      while (!acquired) {
+      return await this.#withLease(root, `${scope.slice(7)}.lease`, 'scope', signal, operation)
+    } finally {
+      await root.close()
+    }
+  }
+
+  async #withLease<T>(
+    root: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>>,
+    name: string,
+    kind: 'scope' | 'binary',
+    signal: AbortSignal,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const locks = await root.ensureChildDirectory('locks')
+    try {
+      const lockName = `${name}.lock`
+      const leasePath = locks.child(lockName)
+      const deadline = this.#leaseNow() + this.#leaseWaitTimeoutMs
+      for (;;) {
         if (signal.aborted) throw new Error('Passive snapshot update cancelled')
         try {
           await mkdir(leasePath, { mode: 0o700 })
-          acquired = true
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
           const metadata = await lstat(leasePath).catch(() => null)
           if (metadata && metadata.isDirectory() && !metadata.isSymbolicLink()
-            && metadata.mtimeMs < Date.now() - this.#leaseStaleMs) {
-            await rmdir(leasePath).catch(() => undefined)
-            continue
+            && metadata.mtimeMs < this.#leaseNow() - this.#leaseStaleMs) {
+            // Recheck the path identity immediately before recovery so a
+            // replaced lease is not removed on the basis of stale metadata.
+            const current = await lstat(leasePath).catch(() => null)
+            if (current && current.isDirectory() && !current.isSymbolicLink()
+              && current.dev === metadata.dev && current.ino === metadata.ino
+              && current.mtimeMs < this.#leaseNow() - this.#leaseStaleMs) {
+              const recovered = await rmdir(leasePath).then(() => true, () => false)
+              if (recovered) continue
+            }
           }
-          if (Date.now() >= deadline) throw Object.assign(new Error('Passive snapshot scope lease is held by a live owner'), { code: 'ELOCKED' })
-          await waitForLease(signal, 25)
+          if (this.#leaseNow() >= deadline) throw Object.assign(
+            new Error(`Passive snapshot ${kind} lease is held by a live owner`), { code: 'ELOCKED' },
+          )
+          await this.#safeStorageHooks.afterLeaseWait?.(name)
+          await this.#leaseWait(signal, 25)
+          continue
         }
+        await this.#safeStorageHooks.afterLeaseDirectoryCreated?.(name)
+        break
       }
       let leaseDirectory
-      try { leaseDirectory = await locks.openChildDirectory(`${name}.lock`) }
+      try { leaseDirectory = await locks.openChildDirectory(lockName) }
       catch (error) { await rmdir(leasePath).catch(() => undefined); throw error }
+      const heartbeatIntervalMs = Math.max(1, Math.min(1_000, Math.floor(this.#leaseStaleMs / 3)))
       const heartbeat = setInterval(() => {
-        const now = new Date()
+        const now = new Date(this.#leaseNow())
         void utimes(leaseDirectory.descriptorPath(), now, now).catch(() => undefined)
-      }, 1_000)
+      }, heartbeatIntervalMs)
       heartbeat.unref?.()
       try {
         if (signal.aborted) throw new Error('Passive snapshot update cancelled')
         return await operation()
       } finally {
         clearInterval(heartbeat)
+        const held = await stat(leaseDirectory.descriptorPath()).catch(() => null)
+        const current = await lstat(leasePath).catch(() => null)
         await leaseDirectory.close()
-        await rmdir(leasePath).catch(() => undefined)
+        // A stale-owner recovery may have replaced our pathname. Never remove
+        // a successor's lease while unwinding the older operation.
+        if (held && current && current.isDirectory() && !current.isSymbolicLink()
+          && held.dev === current.dev && held.ino === current.ino) {
+          await rmdir(leasePath).catch(() => undefined)
+        }
       }
     } finally {
-      await locks?.close().catch(() => undefined)
-      await root.close()
+      await locks.close().catch(() => undefined)
     }
   }
 }

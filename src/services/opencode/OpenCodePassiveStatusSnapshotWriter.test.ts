@@ -10,13 +10,14 @@ import { readBoundedSnapshotText } from './OpenCodePassiveStatusProductionReader
 
 const canonical = '/canonical/project'
 const scope = `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonical).digest('hex')}` as const
+const otherScope = `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update('/other/project').digest('hex')}` as const
 const observation = <T>(value: T, authority: any, at: number) => ({
   value, authority, freshness: 'fresh' as const, condition: 'normal' as const,
   observedAt: at, validUntil: at + 1_000, issueCode: 'none' as const,
 })
-function snapshot(at: number): OpenCodeRedactedSnapshotV1 {
+function snapshot(at: number, projectScope: `sha256:${string}` = scope): OpenCodeRedactedSnapshotV1 {
   return {
-    schemaVersion: 1, projectScope: scope, capturedAt: at,
+    schemaVersion: 1, projectScope, capturedAt: at,
     binary: observation({ presence: 'present' as const, version: '1.2.3' }, 'binary_metadata', at),
     providers: [{
       providerId: 'deepinfra',
@@ -26,6 +27,11 @@ function snapshot(at: number): OpenCodeRedactedSnapshotV1 {
       executionVerified: observation('verified' as const, 'execution_snapshot', at),
     }],
   }
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  return { promise: new Promise<void>(done => { resolve = done }), resolve }
 }
 function encoded(value: OpenCodeRedactedSnapshotV1): string {
   const result = encodeOpenCodeRedactedSnapshotV1(value)
@@ -55,7 +61,7 @@ describe('OpenCode passive snapshot writer lease', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('recovers an abandoned stale owner but cancellation cannot enter a foreign live lease', async () => {
+  test('recovers an abandoned stale owner using a fake clock', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-stale-'))
     const leaseName = `${scope.slice(7)}.lease`
     const leasePath = path.join(root, 'locks', leaseName)
@@ -63,29 +69,138 @@ describe('OpenCode passive snapshot writer lease', () => {
       await mkdir(path.join(root, 'locks'))
       await writeFile(leasePath, '')
       await mkdir(`${leasePath}.lock`)
-      const stale = new Date(Date.now() - 60_000)
+      const stale = new Date(1_000)
       await utimes(`${leasePath}.lock`, stale, stale)
-      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      const writer = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        leaseNow: () => 60_000,
+        leaseStaleMs: 1_000,
+      })
       let recovered = false
       await writer.withScopeLease(scope, new AbortController().signal, async () => { recovered = true })
       expect(recovered).toBe(true)
+      expect(await readdir(path.join(root, 'locks'))).toEqual([leaseName])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
 
-      await mkdir(`${leasePath}.lock`)
+  test('serializes the same scope and cancels or times out waiters without real sleeps', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-lease-wait-'))
+    try {
+      const held = deferred()
+      const release = deferred()
+      const first = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .withScopeLease(scope, new AbortController().signal, async () => {
+          held.resolve()
+          await release.promise
+        })
+      await held.promise
+
+      const waiting = deferred()
+      const retry = deferred()
+      let secondEntered = false
+      const secondWriter = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        safeStorageHooks: { afterLeaseWait: name => {
+          if (name === `${scope.slice(7)}.lease`) waiting.resolve()
+        } },
+        leaseWait: async () => retry.promise,
+      })
+      const second = secondWriter.withScopeLease(scope, new AbortController().signal, async () => {
+        secondEntered = true
+      })
+      await waiting.promise
+      expect(secondEntered).toBe(false)
+      release.resolve()
+      await first
+      retry.resolve()
+      await second
+      expect(secondEntered).toBe(true)
+
+      const liveLease = `${path.join(root, 'locks', `${scope.slice(7)}.lease`)}.lock`
+      await mkdir(liveLease)
       const controller = new AbortController()
+      const cancellationObserved = deferred()
+      const enterCancellationWait = deferred()
       let entered = false
-      const pending = writer.withScopeLease(scope, controller.signal, async () => { entered = true })
-      setTimeout(() => controller.abort('cancelled'), 25)
+      const cancellingWriter = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        safeStorageHooks: { afterLeaseWait: async () => {
+          cancellationObserved.resolve()
+          await enterCancellationWait.promise
+        } },
+        leaseWait: signal => signal.aborted
+          ? Promise.reject(new Error('Passive snapshot update cancelled'))
+          : new Promise((_, reject) => signal.addEventListener(
+            'abort', () => reject(new Error('Passive snapshot update cancelled')), { once: true },
+          )),
+      })
+      const pending = cancellingWriter.withScopeLease(scope, controller.signal, async () => { entered = true })
+      await cancellationObserved.promise
+      controller.abort('cancelled')
+      enterCancellationWait.resolve()
       await expect(pending).rejects.toThrow('cancelled')
       expect(entered).toBe(false)
 
+      let now = 0
       const boundedWriter = new OpenCodePassiveStatusSnapshotWriter({
         rootDirectory: root,
-        leaseWaitTimeoutMs: 1,
+        leaseWaitTimeoutMs: 10,
+        leaseNow: () => now,
+        leaseWait: async () => { now = 10 },
       })
       await expect(boundedWriter.withScopeLease(
         scope, new AbortController().signal, async () => { entered = true },
       )).rejects.toMatchObject({ code: 'ELOCKED' })
       expect(entered).toBe(false)
+      await rm(liveLease, { recursive: true, force: true })
+      expect(await readdir(path.join(root, 'locks'))).toEqual([])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('a failed binary verification rolls back before another scope publishes', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-binary-lease-'))
+    try {
+      const signal = new AbortController().signal
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000), signal)
+      const renamed = deferred()
+      const failVerification = deferred()
+      const writerA = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        safeStorageHooks: { afterBinarySnapshotRenamed: async () => {
+          renamed.resolve()
+          await failVerification.promise
+          throw new Error('injected binary verification failure')
+        } },
+      })
+      const publicationA = writerA.withScopeLease(scope, signal, () => writerA.write(snapshot(2_000), signal))
+      await renamed.promise
+
+      const binaryLeaseBlocked = deferred()
+      const retryBinaryLease = deferred()
+      const writerB = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        safeStorageHooks: { afterLeaseWait: name => {
+          if (name === 'binary.snapshot.lease') binaryLeaseBlocked.resolve()
+        } },
+        leaseWait: async () => retryBinaryLease.promise,
+      })
+      const publicationB = writerB.withScopeLease(
+        otherScope, signal, () => writerB.write(snapshot(3_000, otherScope), signal),
+      )
+      await binaryLeaseBlocked.promise
+
+      failVerification.resolve()
+      await expect(publicationA).rejects.toThrow('injected binary verification failure')
+      retryBinaryLease.resolve()
+      await publicationB
+
+      expect(await readFile(path.join(root, 'snapshots', `${scope.slice(7)}.json`), 'utf8'))
+        .toBe(encoded(snapshot(1_000)))
+      expect(await readFile(path.join(root, 'snapshots', `${otherScope.slice(7)}.json`), 'utf8'))
+        .toBe(encoded(snapshot(3_000, otherScope)))
+      expect(await readFile(path.join(root, 'binary.snapshot.json'), 'utf8'))
+        .toBe(encoded(snapshot(3_000, otherScope)))
+      expect(await readdir(path.join(root, 'locks'))).toEqual([])
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
@@ -105,6 +220,31 @@ describe('OpenCode passive snapshot writer lease', () => {
       expect(await readFile(path.join(root, 'binary.snapshot.json'), 'utf8'))
         .toBe(encoded(snapshot(1_000)))
     } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('rejects a binary lease symlink swap without publishing outside the root', async () => {
+    if (process.platform === 'win32') return
+    const parent = await mkdtemp(path.join(process.cwd(), '.opencode-passive-lease-swap-'))
+    const root = path.join(parent, 'owned')
+    const outside = path.join(parent, 'outside')
+    const displaced = path.join(parent, 'displaced-lease')
+    const leasePath = path.join(root, 'locks', 'binary.snapshot.lease.lock')
+    try {
+      await Promise.all([mkdir(root), mkdir(outside)])
+      const writer = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        safeStorageHooks: { afterLeaseDirectoryCreated: async name => {
+          if (name !== 'binary.snapshot.lease') return
+          await rename(leasePath, displaced)
+          await symlink(outside, leasePath, 'dir')
+        } },
+      })
+      await expect(writer.write(snapshot(1_000), new AbortController().signal)).rejects.toThrow(
+        'safe publication primitive is unavailable',
+      )
+      expect(await readdir(outside)).toEqual([])
+      expect((await readdir(root)).sort()).toEqual(['locks'])
+    } finally { await rm(parent, { recursive: true, force: true }) }
   })
 
   test('a root swap after descriptor acquisition causes no outside mutation', async () => {

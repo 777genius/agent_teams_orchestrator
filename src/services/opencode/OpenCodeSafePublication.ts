@@ -213,6 +213,7 @@ export class OpenCodeSafePublicationDirectory {
     content: string | Uint8Array,
     mode = 0o600,
     abortSignal?: AbortSignal,
+    testHooks?: { afterRenameBeforeVerification?: () => void | Promise<void> },
   ): Promise<void> {
     await this.#assertWindowsRoot()
     const finalName = childName(name)
@@ -239,6 +240,7 @@ export class OpenCodeSafePublicationDirectory {
           : new Error('OpenCode safe publication cancelled')
       }
       await rename(temporaryPath, this.child(finalName)).catch(fail)
+      await testHooks?.afterRenameBeforeVerification?.()
       const publishedHandle = await open(
         this.child(finalName), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
       ).catch(fail)
