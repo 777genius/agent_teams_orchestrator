@@ -94,7 +94,12 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
   hooks: OpenCodeWindowsManagedDirectoryHooks = {},
   trustedRoot: string = path.dirname(ownershipBoundary),
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => {
+    if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode managed directory creation cancelled')
+  }
+  assertActive()
   resolved = path.resolve(resolved)
   ownershipBoundary = path.resolve(ownershipBoundary)
   trustedRoot = path.resolve(trustedRoot)
@@ -135,11 +140,13 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
   try {
     let current = trustedRoot
     for (const component of boundaryFromTrustedRoot.split(path.sep).filter(Boolean)) {
+      assertActive()
       const componentPath = path.join(current, component)
       let componentIdentity = await captureDirectoryIdentity(componentPath)
       if (!componentIdentity) {
         const mutation = { kind: 'managed-root' as const, parentPath: current, componentPath }
         await hooks.beforeMutation?.(mutation)
+        assertActive()
         await assertIdentitiesUnchanged(identities)
         try { await mkdir(path.join(current, component), { mode: 0o700 }) } catch (error) {
           if (errnoCode(error) !== 'EEXIST') throw error
@@ -150,6 +157,7 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
         }
         created.push({ path: componentPath, identity: componentIdentity, parents: new Map(identities) })
         await hooks.afterMutation?.(mutation)
+        assertActive()
         await assertIdentitiesUnchanged(identities)
       }
       identities.set(componentPath, componentIdentity)
@@ -159,6 +167,7 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
 
     current = ownershipBoundary
     for (const component of relative.split(path.sep).filter(Boolean)) {
+      assertActive()
       const componentPath = path.join(current, component)
       let componentIdentity = await captureDirectoryIdentity(componentPath)
       if (!componentIdentity) {
@@ -168,6 +177,7 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
           componentPath,
         }
         await hooks.beforeMutation?.(mutation)
+        assertActive()
         await assertIdentitiesUnchanged(identities)
         try {
           await mkdir(path.join(current, component), { mode: 0o700 })
@@ -180,6 +190,7 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
         }
         created.push({ path: componentPath, identity: componentIdentity, parents: new Map(identities) })
         await hooks.afterMutation?.(mutation)
+        assertActive()
         await assertIdentitiesUnchanged(identities)
       }
       identities.set(componentPath, componentIdentity)
@@ -187,6 +198,7 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
       current = componentPath
     }
 
+    assertActive()
     await assertIdentitiesUnchanged(identities)
   } catch (error) {
     await rollback()

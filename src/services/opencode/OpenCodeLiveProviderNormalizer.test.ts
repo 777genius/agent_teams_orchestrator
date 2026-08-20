@@ -82,6 +82,28 @@ describe('normalizeOpenCodeScopedProviderCatalogResponse', () => {
     })).toThrow(OpenCodeProviderCatalogContractError)
   })
 
+  test('keeps every supported Bedrock family while dropping authority-shaped siblings', () => {
+    const valid = [
+      'global.anthropic.claude-opus-4-6-v2:3',
+      'amazon.nova-pro-v1:7',
+      'meta.llama3-3-70b-instruct-v1:2',
+      'cohere.command-r-plus-v1:0',
+      'ai21.jamba-1-5-large-v1:0',
+      'mistral.pixtral-large-2502-v1:0',
+    ]
+    const rejected = [
+      'anthropic.claude-localhost-v1:0',
+      'anthropic.claude-example-com-v1:443',
+      'amazon.nova-127-0-0-1-v1:0',
+      'meta.llama3-user@localhost-v1:0',
+    ]
+    const models = Object.fromEntries([...valid, ...rejected].map(id => [id, { id }]))
+    expect(normalizeOpenCodeScopedProviderCatalogResponse({
+      requestedProviderId: 'amazon-bedrock',
+      response: { all: [{ id: 'amazon-bedrock', models }] },
+    }).models.map(model => model.id).sort()).toEqual(valid.sort())
+  })
+
   test('retains only the exact canonical requested provider and whitelisted model metadata', () => {
     const catalog = normalizeOpenCodeScopedProviderCatalogResponse({
       requestedProviderId: 'Amazon Q Developer / Kiro',

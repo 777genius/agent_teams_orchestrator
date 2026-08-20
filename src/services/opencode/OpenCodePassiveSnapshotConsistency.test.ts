@@ -42,6 +42,19 @@ function snapshot(at: number, connected: boolean, version: string, generation?: 
 }
 
 function deferred() { let resolve!: () => void; return { promise: new Promise<void>(done => { resolve = done }), resolve } }
+async function appendLegacy(root: string, value: OpenCodeRedactedSnapshotV1, sequence: number) {
+  const generation = `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`
+  const scoped = path.join(root, 'scopes', value.projectScope.slice(7))
+  await mkdir(path.join(scoped, 'commits'), { recursive: true })
+  await mkdir(path.join(scoped, 'generations', generation), { recursive: true })
+  await writeFile(path.join(root, 'immutable-v2.marker'), OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT)
+  const text = JSON.stringify(value)
+  await writeFile(path.join(scoped, 'generations', generation, 'project.snapshot.json'), text)
+  await writeFile(path.join(scoped, 'generations', generation, 'binary.snapshot.json'), text)
+  await writeFile(path.join(scoped, 'commits', `${String(sequence).padStart(16, '0')}.${generation}.json`), JSON.stringify({
+    schemaVersion: 2, scope: value.projectScope, generation, domainGeneration: sequence,
+  }))
+}
 async function status(root: string, providerIds = ['deepinfra']) {
   return new OpenCodePassiveStatusProductionReader({ rootDirectory: root, now: () => 10_000,
     canonicalizePath: async () => canonical }).reader.read({ projectPath: canonical, providerIds, timeoutMs: 5_000 })
@@ -119,6 +132,150 @@ describe('OpenCode passive SQLite transaction consistency', () => {
       finally { row.close(false) }
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+
+  test('a failed legacy read never marks migration complete and a repaired immutable store imports on restart', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-retry-migration-'))
+    const generation = '00000000-0000-4000-8000-000000000007'
+    const scoped = path.join(root, 'scopes', scope.slice(7))
+    try {
+      await mkdir(path.join(scoped, 'commits'), { recursive: true })
+      await writeFile(path.join(root, 'immutable-v2.marker'), OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT)
+      await writeFile(path.join(scoped, 'commits', `0000000000000007.${generation}.json`), '{broken')
+      const mutation = { projectScope: scope, capturedAt: 8,
+        providers: [{ providerId: 'deepinfra', lastConnected: direct({ state: 'not_connected' as const }, 'auth_metadata', 8) }],
+      } as const
+      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .mutate(mutation, new AbortController().signal)).rejects.toThrow('legacy')
+      const failed = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try {
+        expect(failed.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_migrations').get()!.count).toBe(0)
+        expect(failed.query<{ migrated: number }, []>('SELECT legacy_migrated AS migrated FROM passive_meta').get()!.migrated).toBe(0)
+      } finally { failed.close(false) }
+      const repairedBase = snapshot(7, true, '1.0.0', 7)
+      const repaired: OpenCodeRedactedSnapshotV1 = { ...repairedBase, providers: [{
+        ...repairedBase.providers[0], configured: direct('configured', 'config_metadata', 7, 7),
+      }] }
+      await appendLegacy(root, repaired, 7)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate(mutation, new AbortController().signal)
+      const selected = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+      expect(selected?.value.providers[0].configured.value).toBe('configured')
+      expect(selected?.value.providers[0].lastConnected.value.state).toBe('not_connected')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('migration merges independent legacy evidence and rolling writers fail closed then reconcile newer negatives', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-rolling-'))
+    const legacy = (sequence: number, configured: 'configured' | 'not_configured', configuredGeneration: number,
+      catalog: 'available' | 'unknown', catalogGeneration?: number): OpenCodeRedactedSnapshotV1 => ({
+      schemaVersion: 1, projectScope: scope, capturedAt: sequence,
+      binary: direct({ presence: 'present' as const, version: '1.0.0' }, 'binary_metadata', sequence, sequence),
+      providers: [{ providerId: 'deepinfra',
+        configured: direct(configured, 'config_metadata', sequence, configuredGeneration),
+        lastConnected: unknown({ state: 'unknown' }),
+        catalogAvailable: catalog === 'available'
+          ? direct('available', 'catalog_snapshot', sequence, catalogGeneration)
+          : unknown('unknown'),
+        ...(catalog === 'available' ? { modelIds: ['deepinfra/llama'] } : {}),
+        executionVerified: unknown('unknown') }],
+    })
+    try {
+      await appendLegacy(root, legacy(10, 'configured', 10, 'unknown'), 10)
+      await appendLegacy(root, legacy(20, 'not_configured', 5, 'available', 20), 20)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate({
+        projectScope: scope, capturedAt: 20,
+        providers: [{ providerId: 'deepinfra', lastConnected: direct({ state: 'not_connected' as const }, 'auth_metadata', 20) }],
+      }, new AbortController().signal)
+      const migrated = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+      expect(migrated?.value.providers[0].configured.value).toBe('configured')
+      expect(migrated?.value.providers[0].catalogAvailable.value).toBe('available')
+      // Legacy catalog availability can migrate, but model authority without
+      // the current project/provider/fingerprint binding must remain inert.
+      expect(migrated?.value.providers[0].modelIds).toBeUndefined()
+
+      await appendLegacy(root, legacy(30, 'not_configured', 30, 'available', 20), 30)
+      expect(await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)).toBeNull()
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate({
+        projectScope: scope, capturedAt: 30,
+        binary: direct({ presence: 'present' as const, version: '2.0.0' }, 'binary_metadata', 30),
+      }, new AbortController().signal)
+      const reconciled = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+      expect(reconciled?.value.providers[0].configured.value).toBe('not_configured')
+      expect(reconciled?.value.providers[0].catalogAvailable.value).toBe('available')
+      expect(reconciled?.value.binary.value.version).toBe('2.0.0')
+      expect(await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)).not.toBeNull()
+
+      const repeatedBase = legacy(40, 'not_configured', 30, 'unknown')
+      const repeated: OpenCodeRedactedSnapshotV1 = { ...repeatedBase, providers: [{
+        ...repeatedBase.providers[0],
+        catalogAvailable: direct('unavailable', 'catalog_snapshot', 40, 40),
+      }] }
+      await appendLegacy(root, repeated, 40)
+      expect(await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)).toBeNull()
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate({
+        projectScope: scope, capturedAt: 40,
+        binary: direct({ presence: 'present' as const, version: '3.0.0' }, 'binary_metadata', 40),
+      }, new AbortController().signal)
+      const repeatedReconciliation = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+      expect(repeatedReconciliation?.value.providers[0].configured.value).toBe('not_configured')
+      expect(repeatedReconciliation?.value.providers[0].catalogAvailable.value).toBe('unavailable')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 15_000)
+
+  test('logical observation time survives backward, frozen, restart and forward clocks without reauthorizing unchanged facts', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-clock-'))
+    const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+    try {
+      await writer.mutate({ projectScope: scope, capturedAt: 1_000_000,
+        providers: [{ providerId: 'deepinfra', configured: direct('configured', 'config_metadata', 1_000_000) }],
+      }, new AbortController().signal)
+      await writer.mutate({ projectScope: scope, capturedAt: 100,
+        binary: direct({ presence: 'present' as const, version: '2.0.0' }, 'binary_metadata', 100),
+      }, new AbortController().signal)
+      const rolledBack = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+      expect(rolledBack.value.capturedAt).toBe(1_000_000)
+      expect(rolledBack.value.binary.observedAt).toBe(1_000_000)
+      expect(rolledBack.value.binary.validUntil).toBe(1_300_000)
+      const configuredGeneration = rolledBack.value.providers[0].configured.evidenceGeneration
+      await writer.mutate({ projectScope: scope, capturedAt: 100,
+        providers: [{ providerId: 'deepinfra', lastConnected: direct({ state: 'not_connected' as const }, 'auth_metadata', 100) }],
+      }, new AbortController().signal)
+      const frozen = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+      expect(frozen.value.providers[0].configured.evidenceGeneration).toBe(configuredGeneration)
+      expect(frozen.value.providers[0].lastConnected.observedAt).toBe(1_000_000)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate({ projectScope: scope, capturedAt: 2_000_000,
+        binary: direct({ presence: 'present' as const, version: '3.0.0' }, 'binary_metadata', 2_000_000),
+      }, new AbortController().signal)
+      const forward = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+      expect(forward.value.capturedAt).toBe(2_000_000)
+      expect(forward.value.binary.validUntil).toBe(2_300_000)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 15_000)
+
+  test('global scope, history and migration rows remain strictly bounded with deterministic eviction', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-global-bound-'))
+    try {
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, scheduleMaintenance: () => undefined })
+      for (let index = 0; index < 1_024; index += 1) {
+        const distinct = `sha256:${createHash('sha256').update(`scope-${index}`).digest('hex')}` as const
+        await writer.mutate({ projectScope: distinct, capturedAt: index,
+          binary: direct({ presence: 'present' as const, version: `${index}.0.0` }, 'binary_metadata', index),
+        }, new AbortController().signal)
+      }
+      await maintainOpenCodePassiveStore(root)
+      const db = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try {
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_current').get()!.count).toBeLessThanOrEqual(128)
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_transactions').get()!.count).toBeLessThanOrEqual(256)
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_legacy_state').get()!.count).toBeLessThanOrEqual(128)
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_migrations').get()!.count).toBeLessThanOrEqual(128)
+        expect(db.query<{ page_count: number }, []>('PRAGMA page_count').get()!.page_count).toBeLessThan(1_024)
+      } finally { db.close(false) }
+      const active = `sha256:${createHash('sha256').update('scope-1023').digest('hex')}` as const
+      expect((await readOpenCodePassiveSnapshot(root, active, new AbortController().signal))?.value.binary.value.version).toBe('1023.0.0')
+      const evicted = `sha256:${createHash('sha256').update('scope-0').digest('hex')}` as const
+      expect(await readOpenCodePassiveSnapshot(root, evicted, new AbortController().signal)).toBeNull()
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 180_000)
 
   test('forged generations are replaced internally and corrupt durable authority fails closed', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-forged-'))

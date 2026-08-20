@@ -149,3 +149,23 @@ test('Windows later failure rolls back reachable components created in this atte
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('Windows attempt abort between components rolls back only its owned directories', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-managed-abort-'))
+  const controller = new AbortController()
+  const reason = new Error('catalog profile deadline')
+  try {
+    const boundary = path.join(root, 'trusted')
+    const target = path.join(boundary, 'profiles', 'attempt')
+    await mkdir(boundary)
+    await expect(ensureOpenCodeWindowsManagedDirectoryPath(target, boundary, undefined, {
+      afterMutation: mutation => {
+        if (path.basename(mutation.componentPath) === 'profiles') controller.abort(reason)
+      },
+    }, undefined, controller.signal)).rejects.toBe(reason)
+    expect(await lstat(path.join(boundary, 'profiles')).catch(() => null)).toBeNull()
+    expect((await lstat(boundary)).isDirectory()).toBe(true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

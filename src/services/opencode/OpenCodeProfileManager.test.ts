@@ -757,6 +757,28 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     },
   )
 
+  test('attempt abort at the verified project-tree barrier prevents the final profile rename', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-abort-before-publish-'))
+    const project = path.join(root, 'project')
+    const target = path.join(root, 'snapshots', 'project-behavior')
+    const controller = new AbortController()
+    const reason = new Error('catalog profile deadline')
+    try {
+      await mkdir(path.join(project, '.opencode'), { recursive: true })
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(path.join(project, '.opencode', 'fixture.ts'), 'export default true\n')
+      await expect(publishOpenCodeProjectBehaviorSnapshotForTest(project, target, {
+        abortSignal: controller.signal,
+        afterTemporaryTreeVerified: () => controller.abort(reason),
+      })).rejects.toBe(reason)
+      expect(await lstat(target).catch(() => null)).toBeNull()
+      expect((await readdir(path.dirname(target))).filter(name => name.includes('.snapshot-'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('freezes and verifies the complete temporary project tree before rename and remains retryable', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return
     const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-freeze-before-publish-'))

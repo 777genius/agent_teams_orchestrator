@@ -64,7 +64,7 @@ describe('OpenCode transactional storage integration isolation', () => {
       ).get()!
       before.close(false)
 
-      const allocation = allocateOpenCodeProviderCatalogAttempt(`${canonical}\0deepinfra`, 1_000)
+      const allocation = await allocateOpenCodeProviderCatalogAttempt(`${canonical}\0deepinfra`, 1_000)
       expect(allocation.requestGeneration).toBeGreaterThan(0)
       const catalogPath = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v2', 'attempts.sqlite')
       expect(catalogPath).not.toBe(passivePath)

@@ -403,18 +403,23 @@ function safeModels(value: unknown, providerId: string): readonly OpenCodeSafeCa
   const modelEntries = Object.entries(models)
   if (modelEntries.length > OPEN_CODE_MAX_CATALOG_MODELS) contractViolation()
   const safe: OpenCodeSafeCatalogModel[] = []
+  let rejectedBedrockIdentity = false
   for (const [key, value] of modelEntries) {
-    const raw = safeRecord(value, { maxKeys: 256, budget })
-    if (!raw) contractViolation()
     let modelId: ReturnType<typeof createOpenCodeExactProviderModelRef>['modelId']
     try {
       modelId = createOpenCodeExactProviderModelRef(providerId, key).modelId
-      const rawId = own(raw, 'id')
-      if (rawId.present && (typeof rawId.value !== 'string' || rawId.value !== modelId)) contractViolation()
-    } catch (error) {
-      if (error instanceof OpenCodeProviderCatalogContractError) throw error
-      contractViolation()
+    } catch {
+      // Runtime catalogs are mixed and provider-owned. Reject the malformed
+      // identity itself without allowing one authority-shaped sibling to
+      // suppress every otherwise valid model in the selected provider.
+      if (providerId !== 'amazon-bedrock') contractViolation()
+      rejectedBedrockIdentity = true
+      continue
     }
+    const raw = safeRecord(value, { maxKeys: 256, budget })
+    if (!raw) contractViolation()
+    const rawId = own(raw, 'id')
+    if (rawId.present && (typeof rawId.value !== 'string' || rawId.value !== modelId)) contractViolation()
     safe.push(Object.freeze({
       id: modelId,
       displayName: (() => {
@@ -433,6 +438,7 @@ function safeModels(value: unknown, providerId: string): readonly OpenCodeSafeCa
       capabilities: safeCapabilities(raw, budget),
     }))
   }
+  if (rejectedBedrockIdentity && safe.length === 0) contractViolation()
   safe.sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
   return Object.freeze(safe)
 }

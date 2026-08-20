@@ -549,7 +549,10 @@ export async function ensureOpenCodeManagedDirectoryPath(
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
   platform: NodeJS.Platform = process.platform,
   trustedRootPath?: string,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const resolved = path.resolve(targetPath)
   const ownershipBoundary = path.resolve(ownershipBoundaryPath)
   const relative = path.relative(ownershipBoundary, resolved)
@@ -564,8 +567,9 @@ export async function ensureOpenCodeManagedDirectoryPath(
     // Standard Node APIs cannot safely
     // create through a potentially replaceable Windows reparse-point ancestry.
     await ensureOpenCodeWindowsManagedDirectoryPath(
-      resolved, ownershipBoundary, afterComponentOpened, {}, trustedRootPath,
+      resolved, ownershipBoundary, afterComponentOpened, {}, trustedRootPath, abortSignal,
     )
+    assertActive()
     return
   }
 
@@ -581,6 +585,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
     try {
       let logicalPath = parsed.root
       for (const part of relativeParts) {
+        assertActive()
         logicalPath = path.join(logicalPath, part)
         const descriptorChild = path.join(descriptorRoot, String(parent.fd), part)
         let child: FileHandle | null = null
@@ -593,6 +598,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
             })
           }
           try {
+            assertActive()
             await mkdir(descriptorChild, { mode: 0o700 })
           } catch (mkdirError) {
             if (getErrnoCode(mkdirError) !== 'EEXIST') throw mkdirError
@@ -617,6 +623,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
             throw new Error('OpenCode scoped managed path ancestry is not safely app-owned [redacted]')
           }
           if (notify) await afterComponentOpened?.(logicalPath)
+          assertActive()
           await parent.close()
           parent = child
           child = null
@@ -633,6 +640,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
 
   const createdIdentity = await walk(true, true)
   const reachableIdentity = await walk(false, false)
+  assertActive()
   if (createdIdentity[0] !== reachableIdentity[0] || createdIdentity[1] !== reachableIdentity[1]) {
     throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
   }
@@ -749,7 +757,10 @@ async function publishImmutableUserPluginSnapshot(
   sourcePath: string,
   targetPath: string,
   expectedEntries: readonly string[],
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
   targetPath = publicationDirectory.child(path.basename(targetPath))
   try {
@@ -778,6 +789,7 @@ async function publishImmutableUserPluginSnapshot(
   const temporaryPath = `${targetPath}.snapshot-${process.pid}-${randomUUID()}`
   const copiedEntries: string[] = []
   const copyDirectory = async (sourceDirectory: string, targetDirectory: string): Promise<void> => {
+    assertActive()
     const sourceMetadata = await lstat(sourceDirectory)
     if (!sourceMetadata.isDirectory() || sourceMetadata.isSymbolicLink()) {
       throw new Error('OpenCode user plugin directory changed during snapshot')
@@ -786,6 +798,7 @@ async function publishImmutableUserPluginSnapshot(
     const dirents = await readdir(sourceDirectory, { withFileTypes: true })
     dirents.sort((left, right) => left.name.localeCompare(right.name))
     for (const dirent of dirents) {
+      assertActive()
       if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
       const sourceEntry = path.join(sourceDirectory, dirent.name)
       const targetEntry = path.join(targetDirectory, dirent.name)
@@ -806,6 +819,7 @@ async function publishImmutableUserPluginSnapshot(
         const relativePath = path.relative(sourcePath, sourceEntry)
         copiedEntries.push(`${path.join('plugins', relativePath)}:${hashBuffer(bytes)}`)
         await writeFile(targetEntry, bytes, { flag: 'wx', mode: 0o400 })
+        assertActive()
       } finally {
         await sourceHandle.close()
       }
@@ -815,10 +829,12 @@ async function publishImmutableUserPluginSnapshot(
 
   try {
     await copyDirectory(sourcePath, temporaryPath)
+    assertActive()
     if (canonicalSerializeOpenCodePolicyIdentity(copiedEntries)
       !== canonicalSerializeOpenCodePolicyIdentity(expectedEntries)) {
       throw new Error('OpenCode user plugin bytes changed during snapshot')
     }
+    assertActive()
     await rename(temporaryPath, targetPath).catch(async error => {
       if (getErrnoCode(error) !== 'EEXIST' || !(await verifyTarget())) throw error
     })
@@ -834,7 +850,10 @@ async function publishImmutableUserPluginSnapshot(
 async function publishImmutablePluginDependencySnapshot(
   targetPath: string,
   plugins: OpenCodePlanScopedProfileInput['evidence']['plugins'],
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
   targetPath = publicationDirectory.child(path.basename(targetPath))
   try {
@@ -873,20 +892,24 @@ async function publishImmutablePluginDependencySnapshot(
   try {
     await mkdir(temporaryPath, { mode: 0o700 })
     for (const [relativePath, entry] of entries) {
+      assertActive()
       const destination = path.join(temporaryPath, relativePath)
       if (!destination.startsWith(`${temporaryPath}${path.sep}`)) {
         throw new Error('OpenCode plugin dependency snapshot path escaped its root')
       }
       await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
       await writeFile(destination, entry.bytes, { flag: 'wx', mode: entry.mode })
+      assertActive()
     }
     const freeze = async (directory: string): Promise<void> => {
+      assertActive()
       for (const entry of await readdir(directory, { withFileTypes: true })) {
         if (entry.isDirectory()) await freeze(path.join(directory, entry.name))
       }
       await chmod(directory, 0o500)
     }
     await freeze(temporaryPath)
+    assertActive()
     await rename(temporaryPath, targetPath).catch(async error => {
       if (getErrnoCode(error) !== 'EEXIST' || !(await verify())) throw error
     })
@@ -1446,7 +1469,10 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
     afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
   },
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const retained = capture.windows
   if (!retained) throw new Error('OpenCode Windows project behavior capture is missing')
   const expectedFiles = new Map<string, string>()
@@ -1568,12 +1594,15 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
   try {
     if (await verifyTree(targetPath)) return
     await mkdir(temporaryPath, { mode: 0o700 })
+    assertActive()
     await testHooks?.afterCaptureBeforeCopy?.()
     await revalidateSource()
     for (const directory of Array.from(expectedTargetDirectories).sort()) {
+      assertActive()
       if (directory) await mkdir(path.join(temporaryPath, directory), { recursive: true, mode: 0o700 })
     }
     for (const [relativeSource, digest] of expectedFiles) {
+      assertActive()
       const bytes = retained.fileBytes.get(relativeSource)
       if (!bytes || hashBuffer(bytes) !== digest) {
         throw new Error('OpenCode Windows project behavior capture is incomplete')
@@ -1585,7 +1614,9 @@ async function publishImmutableWindowsProjectBehaviorSnapshot(
     await revalidateSource()
     await verifyTree(temporaryPath)
     await testHooks?.afterTemporaryTreeVerified?.(temporaryPath)
+    assertActive()
     await verifyTree(temporaryPath)
+    assertActive()
     await rename(temporaryPath, targetPath).catch(async error => {
       if (!['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '') || !(await verifyTree(targetPath))) {
         throw error
@@ -1608,9 +1639,14 @@ async function publishImmutableProjectBehaviorSnapshot(
     afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
   },
+  abortSignal?: AbortSignal,
 ): Promise<void> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   if (capture?.windows) {
-    await publishImmutableWindowsProjectBehaviorSnapshot(capture, targetPath, expectedEntries, testHooks)
+    await publishImmutableWindowsProjectBehaviorSnapshot(
+      capture, targetPath, expectedEntries, testHooks, abortSignal,
+    )
     return
   }
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
@@ -1936,14 +1972,17 @@ async function publishImmutableProjectBehaviorSnapshot(
   }
   try {
     await mkdir(temporaryPath, { mode: 0o700 })
+    assertActive()
     await testHooks?.afterCaptureBeforeCopy?.()
     await revalidateCapturedDirectoryEntrySets()
     for (const relativeDirectory of Array.from(expectedTargetDirectories).sort()) {
+      assertActive()
       if (relativeDirectory) {
         await mkdir(path.join(temporaryPath, relativeDirectory), { recursive: true, mode: 0o700 })
       }
     }
     for (const [relativeSource, digest] of expectedFiles) {
+      assertActive()
       const relativeTarget = targetName(relativeSource)
       const targetFile = path.join(temporaryPath, relativeTarget)
       await mkdir(path.dirname(targetFile), { recursive: true, mode: 0o700 })
@@ -1960,6 +1999,7 @@ async function publishImmutableProjectBehaviorSnapshot(
     publishedIdentity = await verifyTree(temporaryPath)
     if (!publishedIdentity) throw new Error('OpenCode temporary project behavior snapshot disappeared')
     await testHooks?.afterTemporaryTreeVerified?.(temporaryPath)
+    assertActive()
     const sourceIdentityBeforeRename = await verifyTree(temporaryPath)
     if (!sourceIdentityBeforeRename
       || sourceIdentityBeforeRename.dev !== publishedIdentity.dev
@@ -1967,6 +2007,7 @@ async function publishImmutableProjectBehaviorSnapshot(
       throw new Error('OpenCode temporary project behavior snapshot pathname changed before publication')
     }
     let renamed = false
+    assertActive()
     await rename(temporaryPath, targetPath).then(() => {
       renamed = true
     }).catch(async error => {
@@ -2024,6 +2065,7 @@ export async function publishOpenCodeProjectBehaviorSnapshotForTest(
     afterCaptureBeforeCopy?: () => void | Promise<void>
     afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
+    abortSignal?: AbortSignal
   },
 ): Promise<void> {
   const capture = await captureProjectBehaviorMetadata(projectPath)
@@ -2033,6 +2075,7 @@ export async function publishOpenCodeProjectBehaviorSnapshotForTest(
       targetPath,
       capture.behaviorEntryManifest,
       testHooks,
+      testHooks?.abortSignal,
     )
   } finally {
     await capture.close()
@@ -2625,9 +2668,10 @@ async function publishImmutableBridgeFile(
   filePath: string,
   content: string,
   mode: number,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   await withOpenCodeSafePublicationDirectory(path.dirname(filePath), directory =>
-    directory.publishImmutableFile(path.basename(filePath), content, mode))
+    directory.publishImmutableFile(path.basename(filePath), content, mode, undefined, abortSignal))
 }
 
 export async function fingerprintOpenCodeNativeCredentialBridge(
@@ -2669,13 +2713,17 @@ export function ensureOpenCodeNativeCliCredentialBridge(
   hostEnv: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
   selectedProviderId: 'kiro' | 'cursor-acp',
+  abortSignal?: AbortSignal,
 ): Promise<OpenCodeNativeCliCredentialBridge>
 export async function ensureOpenCodeNativeCliCredentialBridge(
   profileRootPath: string,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
   selectedProviderId: 'kiro' | 'cursor-acp' | null = null,
+  abortSignal?: AbortSignal,
 ): Promise<OpenCodeNativeCliCredentialBridge> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const hostHomePath = (
     platform === 'win32'
       ? hostEnv.USERPROFILE?.trim() || hostEnv.HOME?.trim()
@@ -2684,7 +2732,9 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   const hostPath = hostEnv.PATH ?? ''
   const cursorAgentCommand = hostEnv.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
   const binPath = path.join(profileRootPath, 'native-subscription-cli-bin')
-  await ensureOpenCodeManagedDirectoryPath(profileRootPath, profileRootPath)
+  await ensureOpenCodeManagedDirectoryPath(
+    profileRootPath, profileRootPath, undefined, process.platform, undefined, abortSignal,
+  )
   const existingBin = await lstat(binPath).catch(error => {
     if (getErrnoCode(error) === 'ENOENT') return null
     throw error
@@ -2692,7 +2742,9 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
   if (existingBin && (!existingBin.isDirectory() || existingBin.isSymbolicLink())) {
     throw new Error('OpenCode native credential bridge parent is not canonical [redacted]')
   }
-  if (!existingBin) await ensureOpenCodeManagedDirectoryPath(binPath, profileRootPath)
+  if (!existingBin) await ensureOpenCodeManagedDirectoryPath(
+    binPath, profileRootPath, undefined, process.platform, undefined, abortSignal,
+  )
   await assertCanonicalOwnedPathComponents(binPath, profileRootPath)
   const cursorResourceExhaustedPreloadPath = path.join(binPath, 'cursor-resource-exhausted-preload.cjs')
   if (selectedProviderId === null || selectedProviderId === 'cursor-acp') {
@@ -2700,6 +2752,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       cursorResourceExhaustedPreloadPath,
       buildCursorAgentResourceExhaustedPreloadScript(),
       0o400,
+      abortSignal,
     )
   }
 
@@ -2725,7 +2778,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
         'exit /b %ERRORLEVEL%',
         '',
       ].join('\r\n')
-      await publishImmutableBridgeFile(bridgePath, content, 0o500)
+      await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal)
       return bridgePath
     }
 
@@ -2747,7 +2800,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       `exec ${quotePosixShellValue(hostCommand)} "$@"`,
       '',
     ].join('\n')
-    await publishImmutableBridgeFile(bridgePath, content, 0o500)
+    await publishImmutableBridgeFile(bridgePath, content, 0o500, abortSignal)
     return bridgePath
   }
 
@@ -2759,6 +2812,7 @@ export async function ensureOpenCodeNativeCliCredentialBridge(
       ? writeBridge('kiro-cli')
       : Promise.resolve(null),
   ])
+  assertActive()
   await chmod(binPath, 0o500)
   return { binPath, cursorAgentExecutablePath, kiroCliExecutablePath, hostHomePath }
 }
@@ -3226,7 +3280,10 @@ async function publishImmutableNativeExecutable(
   sourcePath: string,
   profileRootPath: string,
   fingerprint: string,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
+  const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
+  assertActive()
   const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
   let bytes: Buffer | null = null
   try {
@@ -3245,7 +3302,9 @@ async function publishImmutableNativeExecutable(
   if (!bytes) throw new Error('OpenCode native executable could not be captured')
   const root = path.join(profileRootPath, 'native-executables')
   const targetDirectory = path.join(root, fingerprint)
-  await ensureOpenCodeManagedDirectoryPath(targetDirectory, profileRootPath)
+  await ensureOpenCodeManagedDirectoryPath(
+    targetDirectory, profileRootPath, undefined, process.platform, undefined, abortSignal,
+  )
   for (const directory of [profileRootPath, root, targetDirectory]) {
     const metadata = await lstat(directory)
     const canonical = await realpath(directory).catch(() => null)
@@ -3256,7 +3315,8 @@ async function publishImmutableNativeExecutable(
   }
   const targetPath = path.join(targetDirectory, path.basename(sourcePath))
   await withOpenCodeSafePublicationDirectory(targetDirectory, directory =>
-    directory.publishImmutableFile(path.basename(targetPath), bytes!, 0o500))
+    directory.publishImmutableFile(path.basename(targetPath), bytes!, 0o500, undefined, abortSignal))
+  assertActive()
   await chmod(targetDirectory, 0o500)
   if (await fingerprintScopedBinary(targetPath) !== fingerprint) {
     throw new Error('OpenCode immutable native executable verification failed')
@@ -3881,6 +3941,7 @@ export class OpenCodeProfileManager {
     )
     await ensureOpenCodeManagedDirectoryPath(
       earlyPreparationLockRoot, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
+      preparationSignal,
     )
     assertPreparationActive()
     const earlyPreparationLockPath = path.join(
@@ -3889,7 +3950,7 @@ export class OpenCodeProfileManager {
     )
     const earlyLockDirectory = await OpenCodeSafePublicationDirectory.open(earlyPreparationLockRoot)
     const earlyLockName = path.basename(earlyPreparationLockPath)
-    await earlyLockDirectory.ensureRegularFile(earlyLockName).catch(async error => {
+    await earlyLockDirectory.ensureRegularFile(earlyLockName, 0o600, preparationSignal).catch(async error => {
       await earlyLockDirectory.close()
       throw error
     })
@@ -3954,6 +4015,7 @@ export class OpenCodeProfileManager {
           nativeTargetSourceExecutablePath,
           path.join(this.paths.data, 'opencode', 'scoped-native-proof'),
           nativeTargetExecutableFingerprint,
+          preparationSignal,
         )
       : null
     assertPreparationActive()
@@ -4231,21 +4293,22 @@ export class OpenCodeProfileManager {
     return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
       if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
       await ensureOpenCodeManagedDirectoryPath(
-        homePath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
+        homePath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot, preparationSignal,
       )
       await ensureOpenCodeManagedDirectoryPath(
-        tmpPath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
+        tmpPath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot, preparationSignal,
       )
       await ensureOpenCodeManagedDirectoryPath(
         path.join(xdgConfigHome, 'opencode'), this.paths.data, undefined, this.platform,
-        this.paths.dataTrustedRoot,
+        this.paths.dataTrustedRoot, preparationSignal,
       )
       await ensureOpenCodeManagedDirectoryPath(
         path.dirname(managedAuthPath), this.paths.data, undefined, this.platform,
-        this.paths.dataTrustedRoot,
+        this.paths.dataTrustedRoot, preparationSignal,
       )
       await ensureOpenCodeManagedDirectoryPath(
         xdgCacheHome, this.paths.cache, undefined, this.platform, this.paths.cacheTrustedRoot,
+        preparationSignal,
       )
       await assertCanonicalOwnedPathComponents(pluginNodeModulesPath, this.paths.data)
       const projectBehaviorSnapshotPath = path.join(
@@ -4256,7 +4319,7 @@ export class OpenCodeProfileManager {
         path.dirname(preparationLockPath),
       )
       const scopedLockName = path.basename(preparationLockPath)
-      await scopedLockDirectory.ensureRegularFile(scopedLockName).catch(async error => {
+      await scopedLockDirectory.ensureRegularFile(scopedLockName, 0o600, preparationSignal).catch(async error => {
         await scopedLockDirectory.close()
         throw error
       })
@@ -4289,6 +4352,7 @@ export class OpenCodeProfileManager {
             userPluginDirectory,
             path.join(xdgConfigHome, 'opencode', 'plugins'),
             automaticUserPluginEntries,
+            preparationSignal,
           )
           assertPreparationActive()
         }
@@ -4299,6 +4363,7 @@ export class OpenCodeProfileManager {
           await publishImmutablePluginDependencySnapshot(
             pluginNodeModulesPath,
             plan.evidence.plugins,
+            preparationSignal,
           )
           assertPreparationActive()
         }
@@ -4306,6 +4371,8 @@ export class OpenCodeProfileManager {
           behaviorCapture,
           projectBehaviorSnapshotPath,
           expectedEntryManifest.projectBehaviorEntryManifest,
+          undefined,
+          preparationSignal,
         )
         assertPreparationActive()
         const nativeTargetExecutablePath = nativeProofExecutablePath
@@ -4313,6 +4380,7 @@ export class OpenCodeProfileManager {
               nativeProofExecutablePath,
               profileRootPath,
               nativeTargetExecutableFingerprint,
+              preparationSignal,
             )
           : null
         assertPreparationActive()
@@ -4334,6 +4402,7 @@ export class OpenCodeProfileManager {
             bridgeHostEnvironment,
             process.platform,
             nativeBridgeProviderId,
+            preparationSignal,
           )
           assertPreparationActive()
           const executablePath = nativeBridgeProviderId === 'kiro'

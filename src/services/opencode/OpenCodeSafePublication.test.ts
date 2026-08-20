@@ -83,6 +83,23 @@ describe('OpenCodeSafePublication', () => {
     }
   })
 
+  test('immutable publication observes the exact attempt abort before its final link', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-immutable-abort-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    const controller = new AbortController()
+    const reason = new Error('catalog profile attempt expired')
+    try {
+      await expect(directory.publishImmutableFile('native-bridge', 'complete', 0o500, {
+        afterTemporaryWrite: () => controller.abort(reason),
+      }, controller.signal)).rejects.toBe(reason)
+      expect(await readdir(root)).toEqual([])
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('atomic publication cancellation preserves the complete old file and removes its temp', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-cancel-'))

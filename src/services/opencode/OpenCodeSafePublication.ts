@@ -273,8 +273,10 @@ export class OpenCodeSafePublicationDirectory {
     await this.#assertWindowsRoot()
   }
 
-  async ensureRegularFile(name: string, mode = 0o600): Promise<void> {
+  async ensureRegularFile(name: string, mode = 0o600, abortSignal?: AbortSignal): Promise<void> {
+    if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     await this.#assertWindowsRoot()
+    if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     const handle = await open(
       this.child(name),
       fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0),
@@ -287,6 +289,7 @@ export class OpenCodeSafePublicationDirectory {
         || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())
       ) fail()
       await handle.chmod(mode)
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     } finally {
       await handle.close()
     }
@@ -355,7 +358,9 @@ export class OpenCodeSafePublicationDirectory {
     content: string | Uint8Array,
     mode: number,
     testHooks?: { afterTemporaryWrite?: () => void | Promise<void> },
+    abortSignal?: AbortSignal,
   ): Promise<void> {
+    if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
     await this.#assertWindowsRoot()
     const finalName = childName(name)
     const target = this.child(finalName)
@@ -371,6 +376,7 @@ export class OpenCodeSafePublicationDirectory {
       )
       await created.writeFile(expected)
       await testHooks?.afterTemporaryWrite?.()
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
       await created.chmod(mode)
       await created.sync()
       const createdIdentity = await created.stat()
@@ -380,6 +386,7 @@ export class OpenCodeSafePublicationDirectory {
       try {
         // link(2) is an atomic no-replace publication: the final name never
         // refers to an inode until all immutable bytes have been synchronized.
+        if (abortSignal?.aborted) throw abortSignal.reason ?? new Error('OpenCode safe publication cancelled')
         await link(temporaryPath, target)
         await this.#handle?.sync().catch(fail)
       } catch (error) {

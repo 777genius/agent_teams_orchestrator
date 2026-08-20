@@ -158,10 +158,26 @@ export function createOpenCodeExactProviderModelRef(
   })
 }
 
-/** Positive grammar for the Bedrock families present in this repository. */
+const BEDROCK_INFERENCE_PREFIX = '(?:(?:us|eu|apac|global)\\.)?'
+const BEDROCK_VERSION = '-v\\d+(?::\\d+)?'
+const BEDROCK_FAMILY = new RegExp(
+  `^${BEDROCK_INFERENCE_PREFIX}(?:`
+  + `anthropic\\.claude(?:-[A-Za-z0-9]+)*${BEDROCK_VERSION}`
+  + `|amazon\\.(?:nova|titan)(?:-[A-Za-z0-9]+)+${BEDROCK_VERSION}`
+  + `|meta\\.llama(?:[0-9]+)?(?:-[A-Za-z0-9]+)+${BEDROCK_VERSION}`
+  + `|cohere\\.command(?:-[A-Za-z0-9]+)+${BEDROCK_VERSION}`
+  + `|ai21\\.(?:jamba|jurassic)(?:-[A-Za-z0-9]+)+${BEDROCK_VERSION}`
+  + `|mistral\\.(?:mistral|mixtral|pixtral)(?:-[A-Za-z0-9]+)+${BEDROCK_VERSION}`
+  + ')$',
+)
+const BEDROCK_AUTHORITY_SENTINEL = /(?:^|[-.])(?:localhost|host|username|user|example(?:-com)?|invalid|localdomain)(?:[-.]|$)/i
+const BEDROCK_IP_SENTINEL = /(?:^|[-.])(?:\d{1,3}[-.]){3}\d{1,3}(?:[-.]|$)/
+
+/** Positive grammar for every Bedrock family supported by this repository. */
 export function isOpenCodeBedrockModelId(value: unknown): value is string {
-  if (typeof value !== 'string' || value.includes('/')) return false
-  return /^(?:(?:us|eu|apac)\.)?anthropic\.claude(?:-[A-Za-z0-9]+)*-v\d+:\d+$/.test(value)
+  if (typeof value !== 'string' || value.includes('/') || value.includes('@')
+    || BEDROCK_AUTHORITY_SENTINEL.test(value) || BEDROCK_IP_SENTINEL.test(value)) return false
+  return BEDROCK_FAMILY.test(value)
 }
 
 function createOpenCodeCanonicalModelIdForProvider(
