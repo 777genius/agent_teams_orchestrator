@@ -11,14 +11,26 @@ import {
   type OpenCodePassiveRouteDeadlineDeps,
   type OpenCodePassiveRouteRead,
 } from './OpenCodePassiveRouteDeadline.js'
+import { getOpenCodeCuratedSubscriptionProviderIds } from './OpenCodeCuratedSubscriptionCatalog.js'
 
-export const OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS = Object.freeze([
+const OPEN_CODE_PASSIVE_BASE_PROVIDER_IDS = [
   'amazon-bedrock', 'anthropic', 'azure', 'cerebras', 'cloudflare-ai-gateway',
   'cohere', 'cursor', 'cursor-acp', 'deepinfra', 'fireworks-ai', 'github-copilot',
   'google', 'groq', 'kiro', 'llama.cpp', 'llmgateway', 'lmstudio', 'mistral',
   'ollama', 'openai', 'opencode', 'openrouter', 'perplexity', 'togetherai',
   'venice', 'vertexai', 'xai',
-] as const)
+] as const
+
+// Passive status stays bounded to the summary allowlist, but the allowlist
+// must include every app-supported curated subscription route. The curated
+// catalog is authoritative so newly supported ids cannot become invisible in
+// stored evidence merely because this read-only summary was not hand-edited.
+export const OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS: readonly string[] = Object.freeze(
+  Array.from(new Set([
+    ...OPEN_CODE_PASSIVE_BASE_PROVIDER_IDS,
+    ...getOpenCodeCuratedSubscriptionProviderIds(),
+  ])),
+)
 
 export type OpenCodePassiveProviderDirectoryInput = Readonly<{
   projectPath: string

@@ -1,7 +1,8 @@
 import { constants } from 'node:fs'
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, stat, unlink } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, realpath, rename, rmdir, stat, unlink } from 'node:fs/promises'
 import path, { basename, dirname, join, parse, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { dlopen, FFIType, ptr, read } from 'bun:ffi'
 import type { PlatformPath } from 'node:path'
 
 import {
@@ -140,11 +141,15 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     private readonly filePath: string,
     private readonly testHooks: {
       processBirth?: (pid: number) => Promise<string>
-      syncLeaseDirectory?: (handle: Awaited<ReturnType<typeof open>>) => Promise<void>
+      syncLeaseDirectory?: (handle: NamespaceHandle) => Promise<void>
       beforeLeaseDirectoryRemove?: () => Promise<void>
       afterLeaseDirectoryDetach?: () => Promise<void>
       readNoFollowAvailable?: boolean
       afterReadHandleOpened?: (path: string) => Promise<void>
+      /** Test-only boundary after the selected backend has anchored or accepted its root. */
+      afterNamespaceAnchored?: () => Promise<void>
+      /** Test-only platform selection; production always uses process.platform. */
+      platform?: NodeJS.Platform
     } = {},
   ) {
     if (!filePath) throw new TypeError('journal path is required')
@@ -155,10 +160,10 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     const namespace = await this.getNamespace()
     await verifyNamespace(namespace)
     try {
-      const markerBytes = await readNoFollow(namespace.marker, 1024, this.testHooks)
+      const markerBytes = await readNoFollow(namespace.backend, namespace.marker, 1024, this.testHooks)
       const marker = JSON.parse(new TextDecoder().decode(markerBytes)) as unknown
       if (!validCommitMarker(marker)) throw new OpenCodeLaunchJournalError('corrupt', 'invalid commit marker')
-      const bytes = await readNoFollow(namespace.slots[marker.slot], OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES,
+      const bytes = await readNoFollow(namespace.backend, namespace.slots[marker.slot], OPEN_CODE_LAUNCH_JOURNAL_MAX_BYTES,
         this.testHooks)
       if (sha256(bytes) !== marker.digest) throw new OpenCodeLaunchJournalError('corrupt', 'candidate digest mismatch')
       ensureContext(context)
@@ -174,11 +179,11 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     ensureContext(context)
     const namespace = await this.getNamespace()
     await verifyNamespace(namespace)
-    await rejectSymlink(namespace.marker)
+    await rejectSymlink(namespace.backend, namespace.marker)
     let currentSlot: 0 | 1 = 1
     try {
       const marker = JSON.parse(new TextDecoder().decode(
-        await readNoFollow(namespace.marker, 1024, this.testHooks),
+        await readNoFollow(namespace.backend, namespace.marker, 1024, this.testHooks),
       )) as unknown
       if (!validCommitMarker(marker)) throw new OpenCodeLaunchJournalError('corrupt', 'invalid commit marker')
       currentSlot = marker.slot
@@ -199,7 +204,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     const namespace = await this.getNamespace()
     await verifyNamespace(namespace)
     try {
-      const bytes = await readNoFollow(namespace.fence, 128, this.testHooks)
+      const bytes = await readNoFollow(namespace.backend, namespace.fence, 128, this.testHooks)
       const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown
       if (!validFenceAnchor(value)) throw new OpenCodeLaunchJournalError('corrupt', 'invalid fence anchor')
       return value.fence
@@ -224,24 +229,24 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
   async acquireExclusive(context: OpenCodeLaunchStoreContext): Promise<(context?: OpenCodeLaunchStoreContext) => Promise<void>> {
     const namespace = await this.getNamespace()
     await verifyNamespace(namespace)
-    await rejectSymlink(namespace.marker)
+    await rejectSymlink(namespace.backend, namespace.marker)
     const lock = namespace.lock
-    await rejectSymlink(lock)
+    await rejectSymlink(namespace.backend, lock)
     while (true) {
       ensureContext(context)
       const token = randomUUID()
       const staging = `${lock}.${token}.pending`
       let published = false
-      let ownerHandle: Awaited<ReturnType<typeof open>> | undefined
-      let stagingIdentity: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>> | undefined
+      let ownerHandle: NamespaceHandle | undefined
+      let stagingIdentity: NamespaceStat | undefined
       let ownerRecord: LockOwner | undefined
       try {
-        await mkdir(staging, { mode: 0o700 })
-        stagingIdentity = await stat(staging)
+        await namespace.backend.mkdir(staging, 0o700)
+        stagingIdentity = await namespace.backend.stat(staging)
         const owner = join(staging, 'owner.json')
         ownerRecord = { version: 1 as const, pid: process.pid,
           processBirth: await (this.testHooks.processBirth ?? processBirth)(process.pid), token }
-        ownerHandle = await openNoFollowExclusive(owner)
+        ownerHandle = await openNoFollowExclusive(namespace.backend, owner)
         try {
           await ownerHandle.writeFile(JSON.stringify(ownerRecord))
           await ownerHandle.sync()
@@ -250,15 +255,15 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
           ownerHandle = undefined
           throw error
         }
-        await syncDirectory(staging)
-        const visibleStaging = await stat(staging)
+        await namespace.backend.syncDirectory(staging)
+        const visibleStaging = await namespace.backend.stat(staging)
         if (!sameFileIdentity(visibleStaging, stagingIdentity)) {
           throw new OpenCodeLaunchJournalError('foreign', 'lease staging directory identity changed')
         }
-        await rename(staging, lock)
+        await namespace.backend.rename(staging, lock)
         published = true
         const lockIdentity = stagingIdentity
-        const visibleLock = await stat(lock)
+        const visibleLock = await namespace.backend.stat(lock)
         if (!sameFileIdentity(visibleLock, lockIdentity)) {
           throw new OpenCodeLaunchJournalError('foreign', 'published lease directory identity changed')
         }
@@ -288,21 +293,21 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         }
       } catch (error) {
         if (published && ownerHandle) {
-          await releaseOwnedLock(namespace, lock, ownerRecord!, ownerHandle, await stat(lock),
+          await releaseOwnedLock(namespace, lock, ownerRecord!, ownerHandle, await namespace.backend.stat(lock),
             this.testHooks.beforeLeaseDirectoryRemove).catch(() => undefined)
         }
         if (!published && ownerHandle && stagingIdentity) {
           await ownerHandle.close().catch(() => undefined)
-          await unlink(join(staging, 'owner.json')).catch(() => undefined)
-          const visible = await stat(staging).catch(() => undefined)
-          if (visible && sameFileIdentity(visible, stagingIdentity)) await rmdir(staging).catch(() => undefined)
+          await namespace.backend.unlink(join(staging, 'owner.json')).catch(() => undefined)
+          const visible = await namespace.backend.stat(staging).catch(() => undefined)
+          if (visible && sameFileIdentity(visible, stagingIdentity)) await namespace.backend.rmdir(staging).catch(() => undefined)
         }
         if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
         await verifyNamespace(namespace)
-        await rejectSymlink(lock)
+        await rejectSymlink(namespace.backend, lock)
         const owner = join(lock, 'owner.json')
         try {
-          const parsed = JSON.parse(new TextDecoder().decode(await readNoFollow(owner, 4096))) as unknown
+          const parsed = JSON.parse(new TextDecoder().decode(await readNoFollow(namespace.backend, owner, 4096))) as unknown
           if (validLockOwner(parsed)) {
             try { process.kill(parsed.pid as number, 0) }
             catch (killError) {
@@ -336,10 +341,21 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       throw new OpenCodeLaunchJournalError('foreign', 'journal parent directory is a symlink')
     }
     const identity = await stat(directory)
-    const marker = paths.marker
+    const marker = basename(paths.marker)
+    const platform = this.testHooks.platform ?? process.platform
+    // Node does not expose openat(2). On Unix the backend retains the directory descriptor and
+    // performs every child operation through *at(2). This does not use a descriptor filesystem
+    // and remains attached if any pathname ancestor is renamed.
+    // Windows does not give cwd the same rename-stable contract. Its backend therefore accepts
+    // only the freshly canonicalized, private directory as a trusted root and revalidates that
+    // root around every operation. This intentionally is not described as atomic against an
+    // administrator replacing the trusted root; normal first-use is preserved.
+    const backend: NamespaceBackend = platform === 'linux' || platform === 'darwin'
+      ? await RetainedDirectoryBackend.create(directory, identity)
+      : new TrustedRootPathBackend(directory, identity)
+    await this.testHooks.afterNamespaceAnchored?.()
     this.namespace = {
-      directory, canonicalDirectory: directory,
-      device: identity.dev, inode: identity.ino, marker,
+      backend, marker,
       slots: [`${marker}.slot0`, `${marker}.slot1`], fence: `${marker}.fence`, lock: `${marker}.lease`,
     }
     return this.namespace
@@ -392,22 +408,197 @@ async function createCanonicalPrivateDirectory(directory: string): Promise<void>
 }
 
 type CanonicalNamespace = {
-  directory: string
-  canonicalDirectory: string
-  device: number | bigint
-  inode: number | bigint
+  backend: NamespaceBackend
   marker: string
   slots: readonly [string, string]
   fence: string
   lock: string
 }
 
-async function verifyNamespace(namespace: CanonicalNamespace): Promise<void> {
-  const current = await lstat(namespace.canonicalDirectory)
-  if (current.isSymbolicLink() || !current.isDirectory()
-    || current.dev !== namespace.device || current.ino !== namespace.inode) {
-    throw new OpenCodeLaunchJournalError('foreign', 'journal directory identity changed')
+type NamespaceStat = {
+  dev: number | bigint; ino: number | bigint; mode: number; size: number
+  isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean
+}
+
+type NamespaceHandle = {
+  stat(): Promise<NamespaceStat>
+  writeFile(data: string | Uint8Array): Promise<void>
+  readFile(): Promise<Uint8Array>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+
+interface NamespaceBackend {
+  readonly kind: 'retained-directory' | 'trusted-root'
+  lstat(name: string): Promise<NamespaceStat>
+  stat(name: string): Promise<NamespaceStat>
+  mkdir(name: string, mode: number): Promise<void>
+  open(name: string, flags: number, mode?: number): Promise<NamespaceHandle>
+  rename(from: string, to: string): Promise<void>
+  unlink(name: string): Promise<void>
+  rmdir(name: string): Promise<void>
+  syncDirectory(name?: string): Promise<void>
+  displayPath(name: string): string
+  verifyRoot(): Promise<void>
+}
+
+function normalizedStat(value: {
+  dev: number | bigint; ino: number | bigint; mode: number; size: number
+  isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean
+}): NamespaceStat {
+  const file = value.isFile(); const directory = value.isDirectory(); const symlink = value.isSymbolicLink()
+  return { dev: value.dev, ino: value.ino, mode: value.mode, size: value.size,
+    isFile: () => file, isDirectory: () => directory, isSymbolicLink: () => symlink }
+}
+
+class TrustedRootPathBackend implements NamespaceBackend {
+  readonly kind = 'trusted-root' as const
+  constructor(private readonly root: string, private readonly identity: { dev: number | bigint; ino: number | bigint }) {}
+  displayPath(name: string) { return join(this.root, name) }
+  async verifyRoot() {
+    const current = await lstat(this.root)
+    if (current.isSymbolicLink() || !current.isDirectory() || !sameFileIdentity(current, this.identity)) {
+      throw new OpenCodeLaunchJournalError('foreign', 'trusted journal root identity changed')
+    }
   }
+  async lstat(name: string) { await this.verifyRoot(); return normalizedStat(await lstat(this.displayPath(name))) }
+  async stat(name: string) { await this.verifyRoot(); return normalizedStat(await stat(this.displayPath(name))) }
+  async mkdir(name: string, mode: number) { await this.verifyRoot(); await mkdir(this.displayPath(name), { mode }) }
+  async open(name: string, flags: number, mode?: number): Promise<NamespaceHandle> {
+    await this.verifyRoot(); return await open(this.displayPath(name), flags, mode)
+  }
+  async rename(from: string, to: string) { await this.verifyRoot(); await rename(this.displayPath(from), this.displayPath(to)) }
+  async unlink(name: string) { await this.verifyRoot(); await unlink(this.displayPath(name)) }
+  async rmdir(name: string) { await this.verifyRoot(); await rmdir(this.displayPath(name)) }
+  async syncDirectory(name = '.') { await this.verifyRoot(); await syncDirectory(this.displayPath(name)) }
+}
+
+type NativeSymbols = ReturnType<typeof dlopen>
+let nativeSymbols: NativeSymbols | undefined
+
+function unixSymbols(): NativeSymbols {
+  if (nativeSymbols) return nativeSymbols
+  const args = { openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    mkdirat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    renameat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+    unlinkat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    fstat: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+    fstatat: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    read: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+    write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+    fsync: { args: [FFIType.i32], returns: FFIType.i32 },
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+    [process.platform === 'darwin' ? '__error' : '__errno_location']: { args: [], returns: FFIType.ptr } } as any
+  const libraries = process.platform === 'darwin' ? ['/usr/lib/libSystem.B.dylib'] : ['libc.so.6', 'libc.so']
+  let failure: unknown
+  for (const library of libraries) {
+    try { nativeSymbols = dlopen(library, args); return nativeSymbols }
+    catch (error) { failure = error }
+  }
+  throw failure
+}
+
+const ERRNO_NAMES: Record<number, string> = process.platform === 'darwin'
+  ? { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 13: 'EACCES', 17: 'EEXIST', 20: 'ENOTDIR', 21: 'EISDIR',
+    22: 'EINVAL', 45: 'ENOTSUP', 62: 'ELOOP', 66: 'ENOTEMPTY' }
+  : { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 13: 'EACCES', 17: 'EEXIST', 20: 'ENOTDIR', 21: 'EISDIR',
+    22: 'EINVAL', 39: 'ENOTEMPTY', 40: 'ELOOP', 95: 'ENOTSUP' }
+function nativeError(operation: string): NodeJS.ErrnoException {
+  const symbols = unixSymbols().symbols as any
+  const errnoPointer = process.platform === 'darwin' ? symbols.__error() : symbols.__errno_location()
+  const errno = read.i32(errnoPointer, 0)
+  const error = new Error(`${operation} failed: ${ERRNO_NAMES[errno] ?? `errno ${errno}`}`) as NodeJS.ErrnoException
+  error.code = ERRNO_NAMES[errno]; error.errno = errno
+  return error
+}
+function cPath(name: string): Buffer {
+  if (!name || name.startsWith('/') || name.split(/[\\/]/).includes('..') || name.includes('\0')) {
+    throw new OpenCodeLaunchJournalError('foreign', 'invalid descriptor-relative journal name')
+  }
+  return Buffer.from(`${name}\0`)
+}
+
+class RetainedDirectoryBackend implements NamespaceBackend {
+  readonly kind = 'retained-directory' as const
+  private constructor(private readonly root: string, private readonly rootHandle: Awaited<ReturnType<typeof open>>) {}
+  static async create(root: string, expected: { dev: number | bigint; ino: number | bigint }): Promise<RetainedDirectoryBackend> {
+    const handle = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
+    const actual = await handle.stat()
+    if (!actual.isDirectory() || !sameFileIdentity(actual, expected)) {
+      await handle.close()
+      throw new OpenCodeLaunchJournalError('foreign', 'journal root changed while retaining descriptor')
+    }
+    unixSymbols()
+    return new RetainedDirectoryBackend(root, handle)
+  }
+  displayPath(name: string) { return join(this.root, name) }
+  async verifyRoot() { const value = await this.rootHandle.stat(); if (!value.isDirectory()) throw new OpenCodeLaunchJournalError('foreign', 'retained journal root is not a directory') }
+  private result(value: number | bigint, operation: string): number { const numeric = Number(value); if (numeric < 0) throw nativeError(operation); return numeric }
+  private async fdStat(fd: number): Promise<NamespaceStat> {
+    const buffer = Buffer.alloc(256); this.result((unixSymbols().symbols as any).fstat(fd, ptr(buffer)), 'fstat'); return decodeNativeStat(buffer)
+  }
+  async lstat(name: string) { return this.statAt(name, process.platform === 'darwin' ? 0x20 : 0x100) }
+  async stat(name: string) { return this.statAt(name, 0) }
+  private async statAt(name: string, flags: number): Promise<NamespaceStat> {
+    const buffer = Buffer.alloc(256); this.result((unixSymbols().symbols as any).fstatat(this.rootHandle.fd, ptr(cPath(name)), ptr(buffer), flags), 'fstatat'); return decodeNativeStat(buffer)
+  }
+  async mkdir(name: string, mode: number) { this.result((unixSymbols().symbols as any).mkdirat(this.rootHandle.fd, ptr(cPath(name)), mode), 'mkdirat') }
+  async open(name: string, flags: number, mode = 0): Promise<NamespaceHandle> {
+    const fd = this.result((unixSymbols().symbols as any).openat(this.rootHandle.fd, ptr(cPath(name)), flags, mode), 'openat')
+    return new NativeNamespaceHandle(fd, this)
+  }
+  async rename(from: string, to: string) { this.result((unixSymbols().symbols as any).renameat(this.rootHandle.fd, ptr(cPath(from)), this.rootHandle.fd, ptr(cPath(to))), 'renameat') }
+  async unlink(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), 0), 'unlinkat') }
+  async rmdir(name: string) { this.result((unixSymbols().symbols as any).unlinkat(this.rootHandle.fd, ptr(cPath(name)), process.platform === 'darwin' ? 0x80 : 0x200), 'unlinkat') }
+  async syncDirectory(name = '.') {
+    const handle = name === '.' ? undefined : await this.open(name, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
+    const fd = handle ? (handle as NativeNamespaceHandle).fd : this.rootHandle.fd
+    try { this.result((unixSymbols().symbols as any).fsync(fd), 'fsync') }
+    catch (error) { if (!UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error }
+    finally { await handle?.close() }
+  }
+  statFd(fd: number) { return this.fdStat(fd) }
+}
+
+class NativeNamespaceHandle implements NamespaceHandle {
+  constructor(readonly fd: number, private readonly backend: RetainedDirectoryBackend) {}
+  stat() { return this.backend.statFd(this.fd) }
+  async writeFile(data: string | Uint8Array) {
+    const bytes = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data)
+    let offset = 0
+    while (offset < bytes.length) {
+      const count = Number((unixSymbols().symbols as any).write(this.fd, ptr(bytes.subarray(offset)), bytes.length - offset))
+      if (count < 0) throw nativeError('write'); offset += count
+    }
+  }
+  async readFile() {
+    const chunks: Buffer[] = []
+    while (true) {
+      const chunk = Buffer.alloc(64 * 1024); const count = Number((unixSymbols().symbols as any).read(this.fd, ptr(chunk), chunk.length))
+      if (count < 0) throw nativeError('read'); if (count === 0) break; chunks.push(chunk.subarray(0, count))
+    }
+    return new Uint8Array(Buffer.concat(chunks))
+  }
+  async sync() { if ((unixSymbols().symbols as any).fsync(this.fd) < 0) throw nativeError('fsync') }
+  async close() { if ((unixSymbols().symbols as any).close(this.fd) < 0) throw nativeError('close') }
+}
+
+function decodeNativeStat(buffer: Buffer): NamespaceStat {
+  let dev: bigint; let ino: bigint; let mode: number; let size: number
+  if (process.platform === 'darwin') {
+    dev = BigInt(buffer.readUInt32LE(0)); mode = buffer.readUInt16LE(4); ino = buffer.readBigUInt64LE(8); size = Number(buffer.readBigInt64LE(96))
+  } else if (process.arch === 'arm64') {
+    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); mode = buffer.readUInt32LE(16); size = Number(buffer.readBigInt64LE(48))
+  } else {
+    dev = buffer.readBigUInt64LE(0); ino = buffer.readBigUInt64LE(8); mode = buffer.readUInt32LE(24); size = Number(buffer.readBigInt64LE(48))
+  }
+  const kind = mode & 0o170000
+  return { dev, ino, mode, size, isFile: () => kind === 0o100000, isDirectory: () => kind === 0o040000,
+    isSymbolicLink: () => kind === 0o120000 }
+}
+
+async function verifyNamespace(namespace: CanonicalNamespace): Promise<void> {
+  await namespace.backend.verifyRoot()
 }
 
 function sameFileIdentity(
@@ -417,26 +608,27 @@ function sameFileIdentity(
   return left.dev === right.dev && left.ino === right.ino
 }
 
-async function rejectSymlink(path: string): Promise<void> {
-  try { if ((await lstat(path)).isSymbolicLink()) throw new OpenCodeLaunchJournalError('foreign', 'journal path is a symlink') }
+async function rejectSymlink(backend: NamespaceBackend, name: string): Promise<void> {
+  try { if ((await backend.lstat(name)).isSymbolicLink()) throw new OpenCodeLaunchJournalError('foreign', 'journal path is a symlink') }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
 }
 
 async function readNoFollow(
-  path: string,
+  backend: NamespaceBackend,
+  name: string,
   maxBytes = 4096,
   hooks: {
     readNoFollowAvailable?: boolean
     afterReadHandleOpened?: (path: string) => Promise<void>
   } = {},
 ): Promise<Uint8Array> {
-  await rejectSymlink(path)
+  await rejectSymlink(backend, name)
   const noFollow = hooks.readNoFollowAvailable === false ? 0 : (constants.O_NOFOLLOW ?? 0)
-  const handle = await open(path, constants.O_RDONLY | noFollow)
+  const handle = await backend.open(name, constants.O_RDONLY | noFollow)
   try {
     const retained = await handle.stat()
-    await hooks.afterReadHandleOpened?.(path)
-    const visible = await lstat(path)
+    await hooks.afterReadHandleOpened?.(backend.displayPath(name))
+    const visible = await backend.lstat(name)
     if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)) {
       throw new OpenCodeLaunchJournalError('foreign', 'durable record identity changed while opening')
     }
@@ -447,11 +639,11 @@ async function readNoFollow(
   } finally { await handle.close() }
 }
 
-async function openNoFollowExclusive(path: string): Promise<Awaited<ReturnType<typeof open>>> {
-  await rejectSymlink(path)
-  const handle = await open(path,
+async function openNoFollowExclusive(backend: NamespaceBackend, name: string): Promise<NamespaceHandle> {
+  await rejectSymlink(backend, name)
+  const handle = await backend.open(name,
     constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
-  const [retained, visible] = await Promise.all([handle.stat(), lstat(path)])
+  const [retained, visible] = await Promise.all([handle.stat(), backend.lstat(name)])
   if (!retained.isFile() || visible.isSymbolicLink() || !sameFileIdentity(retained, visible)) {
     await handle.close().catch(() => undefined)
     throw new OpenCodeLaunchJournalError('foreign', 'exclusive durable record identity changed')
@@ -462,7 +654,6 @@ async function openNoFollowExclusive(path: string): Promise<Awaited<ReturnType<t
 const UNSUPPORTED_DIRECTORY_SYNC = new Set(['EACCES', 'EBADF', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM'])
 async function syncDirectory(
   directory: string,
-  hook?: (handle: Awaited<ReturnType<typeof open>>) => Promise<void>,
 ): Promise<void> {
   let handle: Awaited<ReturnType<typeof open>>
   try { handle = await open(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0)) }
@@ -470,20 +661,20 @@ async function syncDirectory(
     if (UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) return
     throw error
   }
-  try {
-    if (hook) await hook(handle)
-    else await handle.sync()
-  } catch (error) {
-    if (!UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error
-  } finally { await handle.close().catch(() => undefined) }
+  try { await handle.sync() }
+  catch (error) { if (!UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error }
+  finally { await handle.close().catch(() => undefined) }
 }
 
 async function syncNamespace(
   namespace: CanonicalNamespace,
-  hook?: (handle: Awaited<ReturnType<typeof open>>) => Promise<void>,
+  hook?: (handle: NamespaceHandle) => Promise<void>,
 ): Promise<void> {
   await verifyNamespace(namespace)
-  await syncDirectory(namespace.directory, hook)
+  if (hook) {
+    const handle = await namespace.backend.open('.', constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0))
+    try { await hook(handle) } finally { await handle.close().catch(() => undefined) }
+  } else await namespace.backend.syncDirectory()
   await verifyNamespace(namespace)
 }
 
@@ -495,25 +686,25 @@ async function atomicReplace(
 ): Promise<void> {
   ensureContext(context)
   await verifyNamespace(namespace)
-  await rejectSymlink(target)
-  const temporary = join(namespace.directory, `.${basename(target)}.${randomUUID()}.tmp`)
-  let handle
+  await rejectSymlink(namespace.backend, target)
+  const temporary = `.${basename(target)}.${randomUUID()}.tmp`
+  let handle: NamespaceHandle | undefined
   try {
-    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    handle = await namespace.backend.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
     await handle.writeFile(bytes)
     await handle.sync()
     const temporaryIdentity = await handle.stat()
     await verifyNamespace(namespace)
-    await rejectSymlink(target)
-    const visibleTemporary = await stat(temporary)
+    await rejectSymlink(namespace.backend, target)
+    const visibleTemporary = await namespace.backend.stat(temporary)
     if (!sameFileIdentity(visibleTemporary, temporaryIdentity)) {
       throw new OpenCodeLaunchJournalError('foreign', 'temporary durable record identity changed')
     }
     // This is the last check before the irreversible namespace publication. There is no
     // post-publication deadline check that could turn committed authority into a thrown timeout.
     ensureContext(context)
-    await rename(temporary, target)
-    const visibleTarget = await stat(target)
+    await namespace.backend.rename(temporary, target)
+    const visibleTarget = await namespace.backend.stat(target)
     if (!sameFileIdentity(visibleTarget, temporaryIdentity)) {
       throw new OpenCodeLaunchJournalError('foreign', 'published durable record identity changed')
     }
@@ -521,7 +712,7 @@ async function atomicReplace(
     await handle.close(); handle = undefined
   } catch (error) {
     if (handle) await handle.close().catch(() => undefined)
-    await unlink(temporary).catch(() => undefined)
+    await namespace.backend.unlink(temporary).catch(() => undefined)
     throw error
   }
 }
@@ -557,18 +748,10 @@ function sameLockOwner(left: LockOwner, right: LockOwner): boolean {
 function sha256(bytes: Uint8Array): string { return createHash('sha256').update(bytes).digest('hex') }
 
 async function processBirth(pid: number): Promise<string> {
-  if (process.platform === 'linux') {
-    const value = await readFile(`/proc/${pid}/stat`, 'utf8')
-    const close = value.lastIndexOf(')')
-    const fields = value.slice(close + 2).split(' ')
-    const birth = fields[19]
-    if (!birth || !/^\d+$/.test(birth)) throw new Error('process birth identity unavailable')
-    return birth
-  }
-  // Other supported platforms do not expose another process's creation time through
-  // portable Node APIs. The owner can still publish a stable birth identity, while a
-  // live PID that may have been reused is conservatively never reaped. Dead PIDs are
-  // recovered by the kill(0) branch above on every platform.
+  // Portable Node APIs expose liveness, but not creation time for an arbitrary PID. Every
+  // acquisition by this process publishes the same boot-relative token. A live foreign PID
+  // without an injected platform identity is deliberately never reaped; an ESRCH owner is
+  // still recovered before this function is consulted.
   if (pid !== process.pid) throw new Error('foreign process birth identity unavailable')
   return PORTABLE_PROCESS_BIRTH
 }
@@ -582,8 +765,8 @@ async function releaseOwnedLockByPath(
   beforeDirectoryRemove?: () => Promise<void>,
   afterDirectoryDetach?: () => Promise<void>,
 ): Promise<void> {
-  const identity = await stat(lock)
-  const ownerHandle = await open(join(lock, 'owner.json'), constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+  const identity = await namespace.backend.stat(lock)
+  const ownerHandle = await namespace.backend.open(join(lock, 'owner.json'), constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
   await releaseOwnedLock(namespace, lock, owner, ownerHandle, identity, beforeDirectoryRemove, afterDirectoryDetach)
 }
 
@@ -593,19 +776,19 @@ async function releaseOwnedLock(
   namespace: CanonicalNamespace,
   lock: string,
   expectedOwner: LockOwner,
-  ownerHandle: Awaited<ReturnType<typeof open>>,
-  identity: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
+  ownerHandle: NamespaceHandle,
+  identity: NamespaceStat,
   beforeDirectoryRemove?: () => Promise<void>,
   afterDirectoryDetach?: () => Promise<void>,
 ): Promise<void> {
   try {
     await verifyNamespace(namespace)
-    const current = await stat(lock)
+    const current = await namespace.backend.stat(lock)
     if (!sameFileIdentity(current, identity)) {
       throw new OpenCodeLaunchJournalError('fenced', 'lease directory identity changed')
     }
     const owner = join(lock, 'owner.json')
-    const [retainedOwner, visibleOwner] = await Promise.all([ownerHandle.stat(), lstat(owner)])
+    const [retainedOwner, visibleOwner] = await Promise.all([ownerHandle.stat(), namespace.backend.lstat(owner)])
     if (!retainedOwner.isFile() || visibleOwner.isSymbolicLink()
       || !sameFileIdentity(retainedOwner, visibleOwner)) {
       throw new OpenCodeLaunchJournalError('fenced', 'lease owner identity changed')
@@ -613,12 +796,12 @@ async function releaseOwnedLock(
     await beforeDirectoryRemove?.()
     // Re-read the complete durable owner tuple at the actual removal transition. Checking only a
     // token (or checking before an awaitable cleanup hook) can remove a replacement process's lock.
-    const parsed = JSON.parse(new TextDecoder().decode(await readNoFollow(owner, 4096))) as unknown
+    const parsed = JSON.parse(new TextDecoder().decode(await readNoFollow(namespace.backend, owner, 4096))) as unknown
     if (!validLockOwner(parsed) || !sameLockOwner(parsed, expectedOwner)) {
       throw new OpenCodeLaunchJournalError('fenced', 'lock ownership tuple changed')
     }
-    const beforeRemove = await stat(lock)
-    const ownerBeforeRemove = await lstat(owner)
+    const beforeRemove = await namespace.backend.stat(lock)
+    const ownerBeforeRemove = await namespace.backend.lstat(owner)
     if (!sameFileIdentity(beforeRemove, identity) || ownerBeforeRemove.isSymbolicLink()
       || !sameFileIdentity(ownerBeforeRemove, retainedOwner)) {
       throw new OpenCodeLaunchJournalError('fenced', 'lease directory changed during release')
@@ -627,20 +810,20 @@ async function releaseOwnedLock(
     // A contender can publish immediately afterward, but cleanup below targets
     // only this acquisition's unique tombstone and retained descriptor.
     const detached = `${lock}.${expectedOwner.token}.releasing`
-    await rename(lock, detached)
-    const visibleDetached = await stat(detached)
+    await namespace.backend.rename(lock, detached)
+    const visibleDetached = await namespace.backend.stat(detached)
     if (!sameFileIdentity(visibleDetached, identity)) {
       throw new OpenCodeLaunchJournalError('fenced', 'detached lease directory identity changed')
     }
     await syncNamespace(namespace)
     await afterDirectoryDetach?.()
     const detachedOwner = join(detached, 'owner.json')
-    const visibleDetachedOwner = await lstat(detachedOwner)
+    const visibleDetachedOwner = await namespace.backend.lstat(detachedOwner)
     if (visibleDetachedOwner.isSymbolicLink() || !sameFileIdentity(visibleDetachedOwner, retainedOwner)) {
       throw new OpenCodeLaunchJournalError('fenced', 'detached lease owner identity changed')
     }
-    await unlink(detachedOwner)
-    await rmdir(detached)
+    await namespace.backend.unlink(detachedOwner)
+    await namespace.backend.rmdir(detached)
     await syncNamespace(namespace)
   } finally {
     await ownerHandle.close().catch(() => undefined)

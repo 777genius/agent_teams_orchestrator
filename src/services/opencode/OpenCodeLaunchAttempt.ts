@@ -592,21 +592,29 @@ export class OpenCodeLaunchAttempt {
             if (host) {
               let cleanupHostChain: Promise<void> | undefined
               let releaseHostChain: Promise<void> | undefined
-              const releaseHost = (physicalOnly: boolean): Promise<void> => {
+              const releaseHost = (): Promise<void> => {
                 if (releaseHostChain) return releaseHostChain
                 releaseHostChain = (async () => {
                   const releaseController = new AbortController()
                   const physicalRelease = this.ports.host.releaseOperationHost({
                     host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs, signal: releaseController.signal,
                   })
-                  if (physicalOnly) await physicalRelease.catch(() => undefined)
-                  else await this.ports.deadline.run(
-                    physicalRelease, policy.absoluteDeadlineAtMs, releaseController.signal,
-                  ).catch(async () => { releaseController.abort(); await physicalRelease.catch(() => undefined) })
+                  try {
+                    await this.ports.deadline.run(
+                      physicalRelease, policy.absoluteDeadlineAtMs, releaseController.signal,
+                    )
+                  } catch {
+                    cleanup = 'timed_out'
+                    // The physical release may ignore cancellation.  Abort its supplied signal and
+                    // observe its eventual settlement without extending the caller's absolute
+                    // deadline.  In particular, never await it again after the bounded race lost.
+                    releaseController.abort(new DeadlineError())
+                    void physicalRelease.then(() => undefined, () => undefined)
+                  }
                 })()
                 return releaseHostChain
               }
-              const cleanupHost = (physicalOnly = false): Promise<void> => {
+              const cleanupHost = (): Promise<void> => {
                 if (cleanupHostChain) return cleanupHostChain
                 cleanupHostChain = (async () => {
                   const uncommitted = owned.filter(resource =>
@@ -617,37 +625,31 @@ export class OpenCodeLaunchAttempt {
                       resources: resource, deadlineAtMs: policy.absoluteDeadlineAtMs,
                       signal: cleanupController.signal,
                     })
-                    if (physicalOnly) await abortOperation.catch(() => undefined)
-                    else await this.ports.deadline.run(
+                    await this.ports.deadline.run(
                       abortOperation, policy.absoluteDeadlineAtMs, cleanupController.signal,
                     ).catch(() => undefined)
                   }
                   let cleanupPhysicallyCompleted = false
                   try {
-                  // Keep the physical promise separate from its caller-facing deadline. If the
-                  // deadline wrapper rejects, this chain still reaps the already-started cleanup
-                  // before releasing the retained operation host. A never-settling cleanup thus
-                  // intentionally retains the host.
-                  const physicalCleanup = this.ports.ownership.cleanupOwned({
-                    resources: uncommitted,
-                    host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs,
-                    attemptSignal: controller.signal, signal: cleanupController.signal,
-                  })
-                    if (physicalOnly) cleanup = await physicalCleanup
-                    else {
-                      try {
-                        cleanup = await this.ports.deadline.run(
-                          physicalCleanup, policy.absoluteDeadlineAtMs, cleanupController.signal)
-                      } catch {
-                        cleanup = 'timed_out'
-                        cleanupController.abort()
-                        // The caller remains bounded. Physical fulfillment continues the one-shot
-                        // chain; rejection conservatively retains the host.
-                        void physicalCleanup.then(
-                          outcome => outcome === 'complete' ? releaseHost(true) : undefined,
-                          () => undefined,
-                        ).catch(() => undefined)
-                      }
+                    // Keep physical settlement separate from its caller-facing deadline so late
+                    // completion can be diagnosed/reaped without delaying the launch result.
+                    const physicalCleanup = this.ports.ownership.cleanupOwned({
+                      resources: uncommitted,
+                      host: host!, deadlineAtMs: policy.absoluteDeadlineAtMs,
+                      attemptSignal: controller.signal, signal: cleanupController.signal,
+                    })
+                    try {
+                      cleanup = await this.ports.deadline.run(
+                        physicalCleanup, policy.absoluteDeadlineAtMs, cleanupController.signal)
+                    } catch {
+                      cleanup = 'timed_out'
+                      cleanupController.abort(new DeadlineError())
+                      // Register a one-shot late reaper. It may request release if physical cleanup
+                      // eventually proves completeness, but release itself remains deadline bounded.
+                      void physicalCleanup.then(
+                        outcome => outcome === 'complete' ? releaseHost() : undefined,
+                        () => undefined,
+                      ).catch(() => undefined)
                     }
                     cleanupPhysicallyCompleted = cleanup === 'complete'
                   } catch {
@@ -655,7 +657,7 @@ export class OpenCodeLaunchAttempt {
                     // the host is the conservative outcome; reconciliation may reap it later.
                     cleanup = 'timed_out'
                   }
-                  if (cleanupPhysicallyCompleted) await releaseHost(physicalOnly)
+                  if (cleanupPhysicallyCompleted) await releaseHost()
                   for (const resource of uncommitted) {
                     const cleanupClaimToken = claimTokens.get(resource.memberIdentity)
                     if (!cleanupClaimToken) continue
@@ -671,7 +673,7 @@ export class OpenCodeLaunchAttempt {
               if (deferredAuthoritySettlement) {
                 cleanup = 'timed_out'
                 void deferredAuthoritySettlement.then(
-                  () => cleanupHost(true), () => cleanupHost(true),
+                  () => cleanupHost(), () => cleanupHost(),
                 ).catch(() => undefined)
               } else await cleanupHost()
             }

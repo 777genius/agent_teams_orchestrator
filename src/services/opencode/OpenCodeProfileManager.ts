@@ -59,6 +59,7 @@ import {
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
   resolveClaudeMultimodelPaths,
 } from './OpenCodeManagedPaths.js'
+import { ensureOpenCodeWindowsManagedDirectoryPath } from './OpenCodeWindowsManagedDirectory.js'
 import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
@@ -536,56 +537,6 @@ async function assertCanonicalOwnedPathComponents(
   }
 }
 
-async function ensureWindowsManagedDirectoryPath(
-  resolved: string,
-  ownershipBoundary: string,
-  afterComponentOpened?: (componentPath: string) => void | Promise<void>,
-): Promise<void> {
-  // Node does not expose a Windows equivalent of mkdirat/openat with a held,
-  // no-follow directory handle.  Consequently a check-then-mkdir walk cannot
-  // be made safe against a junction swap.  Windows support is deliberately
-  // limited to a trusted, pre-provisioned app root and pre-existing children;
-  // installers may create that private tree, while this runtime only verifies
-  // and uses it.  Never weaken this to recursive or component-wise mkdir.
-  const parsed = path.parse(resolved)
-  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
-  const boundaryMetadata = await lstat(ownershipBoundary, { bigint: true }).catch(error => {
-    if (getErrnoCode(error) === 'ENOENT') return null
-    throw error
-  })
-  if (!boundaryMetadata?.isDirectory() || boundaryMetadata.isSymbolicLink()) {
-    throw new Error('OpenCode Windows managed root must be trusted and pre-existing [redacted]')
-  }
-
-  const walk = async (notify: boolean): Promise<bigint[]> => {
-    const identities: bigint[] = []
-    let current = parsed.root
-    for (const part of relativeParts) {
-      current = path.join(current, part)
-      const metadata = await lstat(current, { bigint: true }).catch(error => {
-        if (getErrnoCode(error) === 'ENOENT') return null
-        throw error
-      })
-      if (!metadata) {
-        throw new Error('OpenCode Windows managed path must be pre-provisioned [redacted]')
-      }
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
-      }
-      if (notify) await afterComponentOpened?.(current)
-      identities.push(metadata.dev, metadata.ino)
-    }
-    return identities
-  }
-
-  const createdIdentities = await walk(true)
-  const reachableIdentities = await walk(false)
-  if (createdIdentities.length !== reachableIdentities.length
-    || createdIdentities.some((identity, index) => identity !== reachableIdentities[index])) {
-    throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
-  }
-}
-
 /**
  * Creates a managed directory one component at a time relative to a held
  * no-follow directory descriptor. The optional callback is a deterministic
@@ -608,9 +559,9 @@ export async function ensureOpenCodeManagedDirectoryPath(
     throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
   }
   if (platform === 'win32') {
-    // See ensureWindowsManagedDirectoryPath: standard Node APIs cannot safely
+    // Standard Node APIs cannot safely
     // create through a potentially replaceable Windows reparse-point ancestry.
-    await ensureWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
+    await ensureOpenCodeWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
     return
   }
 
@@ -967,7 +918,243 @@ type OpenCodeProjectBehaviorCapture = {
   directories: Map<string, { handle: FileHandle; identity: ProjectBehaviorDirectoryIdentity }>
   directoryEntryManifests: Map<string, string[]>
   files: Map<string, { parentDirectory: string; name: string; identity: ProjectBehaviorFileIdentity }>
+  windows: null | {
+    identities: Map<string, WindowsProjectBehaviorPathIdentity>
+    directoryManifests: Map<string, string[]>
+    fileBytes: Map<string, Buffer>
+  }
   close(): Promise<void>
+}
+
+type WindowsProjectBehaviorPathIdentity = {
+  dev: bigint
+  ino: bigint
+  size: bigint
+  mtimeNs: bigint
+  ctimeNs: bigint
+  directory: boolean
+}
+
+function windowsCanonicalPath(value: string): string {
+  return path.resolve(value)
+    .replace(/^\\\\\?\\/, '')
+    .replace(/[\\/]+$/, '')
+    .toLowerCase()
+}
+
+function windowsProjectBehaviorIdentity(
+  metadata: {
+    dev: bigint
+    ino: bigint
+    size: bigint
+    mtimeNs: bigint
+    ctimeNs: bigint
+    isDirectory(): boolean
+  },
+): WindowsProjectBehaviorPathIdentity {
+  return {
+    dev: metadata.dev,
+    ino: metadata.ino,
+    size: metadata.size,
+    mtimeNs: metadata.mtimeNs,
+    ctimeNs: metadata.ctimeNs,
+    directory: metadata.isDirectory(),
+  }
+}
+
+function sameWindowsProjectBehaviorIdentity(
+  left: WindowsProjectBehaviorPathIdentity,
+  right: WindowsProjectBehaviorPathIdentity,
+): boolean {
+  if (left.dev !== right.dev || left.ino !== right.ino || left.directory !== right.directory) {
+    return false
+  }
+  // Ancestor and captured-directory timestamps may change when an unrelated
+  // sibling is created. Directory membership is validated separately through
+  // exact manifests; only regular-file byte identities require all timestamps.
+  return left.directory || (
+    left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+  )
+}
+
+/**
+ * Windows has no Node-exposed openat/no-follow traversal. Planning therefore
+ * uses a strictly read-only, double-validated walk: every existing component
+ * must be a canonical non-reparse directory, every file handle must match its
+ * lstat identity, and the complete ancestry and directory manifests must be
+ * unchanged after the read. Any identity or canonical-path ambiguity fails
+ * closed. This function deliberately performs no mkdir, write, probe, or
+ * subprocess work.
+ */
+async function captureWindowsProjectBehaviorMetadata(
+  projectPath: string,
+): Promise<OpenCodeProjectBehaviorCapture> {
+  const resolvedProjectPath = path.resolve(projectPath)
+  const identities = new Map<string, WindowsProjectBehaviorPathIdentity>()
+  const directoryManifests = new Map<string, string[]>()
+  const entries: string[] = []
+  const behaviorSources = new Set<string>()
+  const fileBytes = new Map<string, Buffer>()
+
+  const assertCanonicalEntry = async (
+    targetPath: string,
+    expectedKind: 'directory' | 'file',
+    allowMissing = false,
+  ): Promise<WindowsProjectBehaviorPathIdentity | null> => {
+    const metadata = await lstat(targetPath, { bigint: true }).catch(error => {
+      if (allowMissing && getErrnoCode(error) === 'ENOENT') return null
+      throw error
+    })
+    if (!metadata) return null
+    const validKind = expectedKind === 'directory' ? metadata.isDirectory() : metadata.isFile()
+    if (!validKind || metadata.isSymbolicLink()) {
+      throw new Error('OpenCode Windows project behavior path contains a reparse point or unsupported entry')
+    }
+    const canonical = await realpath(targetPath).catch(error => {
+      throw new Error('OpenCode Windows project behavior path is not canonical', { cause: error })
+    })
+    if (windowsCanonicalPath(canonical) !== windowsCanonicalPath(targetPath)) {
+      throw new Error('OpenCode Windows project behavior path is not canonical')
+    }
+    const identity = windowsProjectBehaviorIdentity(metadata)
+    // A zero device+inode pair cannot prove that two path observations refer
+    // to the same object. Do not weaken the race check on such filesystems.
+    if (identity.dev === 0n && identity.ino === 0n) {
+      throw new Error('OpenCode Windows project behavior identity is ambiguous')
+    }
+    return identity
+  }
+
+  const parsed = path.parse(resolvedProjectPath)
+  let current = parsed.root
+  for (const component of resolvedProjectPath.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component)
+    const identity = await assertCanonicalEntry(current, 'directory', true)
+    if (!identity) {
+      return {
+        projectBehaviorFingerprint: hashString(''),
+        behaviorSources: [],
+        behaviorEntryManifest: [],
+        resolvedProjectPath,
+        fdRoot: '',
+        rootHandle: null,
+        directories: new Map(),
+        directoryEntryManifests: new Map(),
+        files: new Map(),
+        windows: { identities, directoryManifests, fileBytes },
+        close: async () => undefined,
+      }
+    }
+    identities.set(current, identity)
+  }
+
+  const captureFile = async (absolutePath: string, relativePath: string): Promise<boolean> => {
+    const before = await assertCanonicalEntry(absolutePath, 'file', true)
+    if (!before) return false
+    const handle = await open(absolutePath, fsConstants.O_RDONLY)
+    try {
+      const openedBefore = windowsProjectBehaviorIdentity(await handle.stat({ bigint: true }))
+      if (!sameWindowsProjectBehaviorIdentity(before, openedBefore) || openedBefore.directory) {
+        throw new Error('OpenCode Windows project behavior entry changed before capture')
+      }
+      const bytes = await handle.readFile()
+      const openedAfter = windowsProjectBehaviorIdentity(await handle.stat({ bigint: true }))
+      const reachableAfter = await assertCanonicalEntry(absolutePath, 'file')
+      if (!reachableAfter
+        || !sameWindowsProjectBehaviorIdentity(before, openedAfter)
+        || !sameWindowsProjectBehaviorIdentity(before, reachableAfter)) {
+        throw new Error('OpenCode Windows project behavior entry changed during capture')
+      }
+      entries.push(`file:${relativePath}:${hashBuffer(bytes)}`)
+      behaviorSources.add(relativePath)
+      identities.set(absolutePath, before)
+      fileBytes.set(relativePath, bytes)
+      return true
+    } finally {
+      await handle.close()
+    }
+  }
+
+  const captureDirectory = async (absoluteDirectory: string, relativeDirectory: string): Promise<void> => {
+    const directoryIdentity = await assertCanonicalEntry(absoluteDirectory, 'directory')
+    if (!directoryIdentity) throw new Error('OpenCode Windows project behavior directory disappeared')
+    identities.set(absoluteDirectory, directoryIdentity)
+    entries.push(`directory:${relativeDirectory}`)
+    const dirents = await readdir(absoluteDirectory, { withFileTypes: true })
+    dirents.sort((left, right) => left.name.localeCompare(right.name))
+    const manifest: string[] = []
+    for (const dirent of dirents) {
+      if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') continue
+      const absolutePath = path.join(absoluteDirectory, dirent.name)
+      const relativePath = path.join(relativeDirectory, dirent.name)
+      if (dirent.isDirectory() && !dirent.isSymbolicLink()) {
+        manifest.push(`directory:${dirent.name}`)
+        await captureDirectory(absolutePath, relativePath)
+      } else if (dirent.isFile() && !dirent.isSymbolicLink()) {
+        manifest.push(`file:${dirent.name}`)
+        await captureFile(absolutePath, relativePath)
+      } else {
+        throw new Error('OpenCode Windows project behavior path contains a reparse point or unsupported entry')
+      }
+    }
+    directoryManifests.set(absoluteDirectory, manifest.sort())
+  }
+
+  for (const relativePath of PROJECT_BEHAVIOR_FILES) {
+    const absolutePath = path.join(resolvedProjectPath, ...relativePath.split('/'))
+    const parentPath = path.dirname(absolutePath)
+    const parent = await assertCanonicalEntry(parentPath, 'directory', true)
+    if (!parent) continue
+    identities.set(parentPath, parent)
+    await captureFile(absolutePath, relativePath)
+  }
+  for (const relativeDirectory of PROJECT_BEHAVIOR_DIRS) {
+    const absoluteDirectory = path.join(resolvedProjectPath, ...relativeDirectory.split('/'))
+    const directory = await assertCanonicalEntry(absoluteDirectory, 'directory', true)
+    if (!directory) continue
+    await captureDirectory(absoluteDirectory, relativeDirectory)
+  }
+
+  for (const [absolutePath, expected] of identities) {
+    const actual = await assertCanonicalEntry(
+      absolutePath,
+      expected.directory ? 'directory' : 'file',
+    )
+    if (!actual || !sameWindowsProjectBehaviorIdentity(actual, expected)) {
+      throw new Error('OpenCode Windows project behavior ancestry changed during capture')
+    }
+  }
+  for (const [absoluteDirectory, expected] of directoryManifests) {
+    const actual = (await readdir(absoluteDirectory, { withFileTypes: true }))
+      .filter(entry => entry.name !== '.DS_Store' && entry.name !== '.git' && entry.name !== 'node_modules')
+      .map(entry => entry.isDirectory() && !entry.isSymbolicLink()
+        ? `directory:${entry.name}`
+        : entry.isFile() && !entry.isSymbolicLink()
+          ? `file:${entry.name}`
+          : `unsupported:${entry.name}`)
+      .sort()
+    if (canonicalSerializeOpenCodePolicyIdentity(actual)
+      !== canonicalSerializeOpenCodePolicyIdentity(expected)) {
+      throw new Error('OpenCode Windows project behavior directory changed during capture')
+    }
+  }
+
+  entries.sort()
+  return {
+    projectBehaviorFingerprint: hashString(entries.join('\n')),
+    behaviorSources: Array.from(behaviorSources).sort(),
+    behaviorEntryManifest: entries,
+    resolvedProjectPath,
+    fdRoot: '',
+    rootHandle: null,
+    directories: new Map(),
+    directoryEntryManifests: new Map(),
+    files: new Map(),
+    windows: { identities, directoryManifests, fileBytes },
+    close: async () => undefined,
+  }
 }
 
 function sameProjectBehaviorDirectoryIdentity(
@@ -998,7 +1185,9 @@ function sameProjectBehaviorFileIdentity(
 
 async function captureProjectBehaviorMetadata(
   projectPath: string,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<OpenCodeProjectBehaviorCapture> {
+  if (platform === 'win32') return captureWindowsProjectBehaviorMetadata(projectPath)
   if (process.platform !== 'linux' && process.platform !== 'darwin') {
     throw new Error('OpenCode descriptor-relative project capture is unsupported [redacted]')
   }
@@ -1039,6 +1228,7 @@ async function captureProjectBehaviorMetadata(
         directories,
         directoryEntryManifests,
         files,
+        windows: null,
         close,
       }
     }
@@ -1218,16 +1408,20 @@ async function captureProjectBehaviorMetadata(
     directories,
     directoryEntryManifests,
     files,
+    windows: null,
     close,
   }
 }
 
-export async function collectProjectBehaviorMetadata(projectPath: string): Promise<{
+export async function collectProjectBehaviorMetadata(
+  projectPath: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<{
   projectBehaviorFingerprint: string
   behaviorSources: string[]
   behaviorEntryManifest: string[]
 }> {
-  const capture = await captureProjectBehaviorMetadata(projectPath)
+  const capture = await captureProjectBehaviorMetadata(projectPath, platform)
   try {
     return {
       projectBehaviorFingerprint: capture.projectBehaviorFingerprint,
@@ -1236,6 +1430,168 @@ export async function collectProjectBehaviorMetadata(projectPath: string): Promi
     }
   } finally {
     await capture.close()
+  }
+}
+
+async function publishImmutableWindowsProjectBehaviorSnapshot(
+  capture: OpenCodeProjectBehaviorCapture,
+  targetPath: string,
+  expectedEntries: readonly string[],
+  testHooks?: {
+    afterCaptureBeforeCopy?: () => void | Promise<void>
+    afterTemporaryTreeVerified?: (temporaryPath: string) => void | Promise<void>
+    afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
+  },
+): Promise<void> {
+  const retained = capture.windows
+  if (!retained) throw new Error('OpenCode Windows project behavior capture is missing')
+  const expectedFiles = new Map<string, string>()
+  const expectedDirectories = new Set<string>()
+  for (const entry of expectedEntries) {
+    if (entry.startsWith('directory:')) {
+      expectedDirectories.add(entry.slice('directory:'.length))
+      continue
+    }
+    const separator = entry.lastIndexOf(':')
+    const relativePath = entry.slice('file:'.length, separator)
+    const digest = entry.slice(separator + 1)
+    if (!entry.startsWith('file:') || !relativePath || !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new Error('OpenCode project behavior manifest entry is invalid')
+    }
+    expectedFiles.set(relativePath, digest)
+  }
+  const targetName = (relativeSource: string): string => {
+    if (relativeSource === 'opencode.json' || relativeSource === 'opencode.jsonc') {
+      return path.join('_source-config', `root-${relativeSource}`)
+    }
+    if (relativeSource === '.opencode/opencode.json' || relativeSource === '.opencode/opencode.jsonc') {
+      return path.join('_source-config', `project-${path.basename(relativeSource)}`)
+    }
+    return relativeSource.startsWith('.opencode/')
+      ? relativeSource.slice('.opencode/'.length)
+      : relativeSource
+  }
+  const expectedTargetFiles = new Map(Array.from(expectedFiles, ([source, digest]) => [
+    targetName(source), digest,
+  ]))
+  const expectedTargetDirectories = new Set<string>([''])
+  for (const directory of expectedDirectories) expectedTargetDirectories.add(targetName(directory))
+  for (const file of expectedTargetFiles.keys()) {
+    let directory = path.dirname(file)
+    while (directory !== '.') {
+      expectedTargetDirectories.add(directory)
+      const parent = path.dirname(directory)
+      if (parent === directory) break
+      directory = parent
+    }
+  }
+  const revalidateSource = async (): Promise<void> => {
+    for (const [sourcePath, expected] of retained.identities) {
+      const metadata = await lstat(sourcePath, { bigint: true }).catch(() => null)
+      if (!metadata) throw new Error('OpenCode Windows project behavior ancestry changed before materialization')
+      const actual = windowsProjectBehaviorIdentity(metadata)
+      const canonical = await realpath(sourcePath).catch(() => null)
+      if (!canonical || windowsCanonicalPath(canonical) !== windowsCanonicalPath(sourcePath)
+        || !sameWindowsProjectBehaviorIdentity(actual, expected)) {
+        throw new Error('OpenCode Windows project behavior ancestry changed before materialization')
+      }
+    }
+    for (const [directoryPath, expected] of retained.directoryManifests) {
+      const actual = (await readdir(directoryPath, { withFileTypes: true }))
+        .filter(entry => entry.name !== '.DS_Store' && entry.name !== '.git' && entry.name !== 'node_modules')
+        .map(entry => entry.isDirectory() && !entry.isSymbolicLink()
+          ? `directory:${entry.name}`
+          : entry.isFile() && !entry.isSymbolicLink()
+            ? `file:${entry.name}`
+            : `unsupported:${entry.name}`)
+        .sort()
+      if (canonicalSerializeOpenCodePolicyIdentity(actual)
+        !== canonicalSerializeOpenCodePolicyIdentity(expected)) {
+        throw new Error('OpenCode Windows project behavior directory changed before materialization')
+      }
+    }
+  }
+  const verifyTree = async (root: string): Promise<boolean> => {
+    const metadata = await lstat(root, { bigint: true }).catch(() => null)
+    if (!metadata) return false
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error('OpenCode Windows project behavior snapshot has unsupported type')
+    }
+    const actualFiles: string[] = []
+    const actualDirectories: string[] = []
+    const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+      actualDirectories.push(relativeDirectory)
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name)
+        const relative = relativeDirectory ? path.join(relativeDirectory, entry.name) : entry.name
+        const childMetadata = await lstat(absolute, { bigint: true })
+        if (entry.isDirectory() && !entry.isSymbolicLink() && childMetadata.isDirectory()) {
+          await walk(absolute, relative)
+        } else if (entry.isFile() && !entry.isSymbolicLink() && childMetadata.isFile()) {
+          const handle = await open(absolute, fsConstants.O_RDONLY)
+          try {
+            const before = windowsProjectBehaviorIdentity(await handle.stat({ bigint: true }))
+            const bytes = await handle.readFile()
+            const after = windowsProjectBehaviorIdentity(await handle.stat({ bigint: true }))
+            if (!sameWindowsProjectBehaviorIdentity(before, after)
+              || hashBuffer(bytes) !== expectedTargetFiles.get(relative)) {
+              throw new Error('OpenCode Windows project behavior snapshot fingerprint mismatch')
+            }
+          } finally {
+            await handle.close()
+          }
+          actualFiles.push(relative)
+        } else {
+          throw new Error('OpenCode Windows project behavior snapshot contains a reparse point')
+        }
+      }
+    }
+    await walk(root, '')
+    if (canonicalSerializeOpenCodePolicyIdentity(actualFiles.sort())
+      !== canonicalSerializeOpenCodePolicyIdentity(Array.from(expectedTargetFiles.keys()).sort())
+      || canonicalSerializeOpenCodePolicyIdentity(actualDirectories.sort())
+        !== canonicalSerializeOpenCodePolicyIdentity(Array.from(expectedTargetDirectories).sort())) {
+      throw new Error('OpenCode Windows project behavior snapshot contains unexpected entries')
+    }
+    return true
+  }
+
+  const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
+  targetPath = publicationDirectory.child(path.basename(targetPath))
+  const temporaryPath = publicationDirectory.child(
+    `${path.basename(targetPath)}.snapshot-${process.pid}-${randomUUID()}`,
+  )
+  try {
+    if (await verifyTree(targetPath)) return
+    await mkdir(temporaryPath, { mode: 0o700 })
+    await testHooks?.afterCaptureBeforeCopy?.()
+    await revalidateSource()
+    for (const directory of Array.from(expectedTargetDirectories).sort()) {
+      if (directory) await mkdir(path.join(temporaryPath, directory), { recursive: true, mode: 0o700 })
+    }
+    for (const [relativeSource, digest] of expectedFiles) {
+      const bytes = retained.fileBytes.get(relativeSource)
+      if (!bytes || hashBuffer(bytes) !== digest) {
+        throw new Error('OpenCode Windows project behavior capture is incomplete')
+      }
+      const destination = path.join(temporaryPath, targetName(relativeSource))
+      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+      await writeFile(destination, bytes, { flag: 'wx', mode: 0o400 })
+    }
+    await revalidateSource()
+    await verifyTree(temporaryPath)
+    await testHooks?.afterTemporaryTreeVerified?.(temporaryPath)
+    await verifyTree(temporaryPath)
+    await rename(temporaryPath, targetPath).catch(async error => {
+      if (!['EEXIST', 'ENOTEMPTY'].includes(getErrnoCode(error) ?? '') || !(await verifyTree(targetPath))) {
+        throw error
+      }
+    })
+    await testHooks?.afterRenameBeforeFinalVerify?.(targetPath)
+    await verifyTree(targetPath)
+  } finally {
+    await rm(temporaryPath, { recursive: true, force: true }).catch(() => undefined)
+    await publicationDirectory.close()
   }
 }
 
@@ -1249,6 +1605,10 @@ async function publishImmutableProjectBehaviorSnapshot(
     afterRenameBeforeFinalVerify?: (targetPath: string) => void | Promise<void>
   },
 ): Promise<void> {
+  if (capture?.windows) {
+    await publishImmutableWindowsProjectBehaviorSnapshot(capture, targetPath, expectedEntries, testHooks)
+    return
+  }
   const publicationDirectory = await OpenCodeSafePublicationDirectory.open(path.dirname(targetPath))
   targetPath = publicationDirectory.child(path.basename(targetPath))
   try {
@@ -2661,6 +3021,112 @@ async function collectScopedPreservedPlugins(
   ]
 }
 
+function exactScopedPluginPackage(spec: string): { name: string; version: string } {
+  const match = spec.match(/^(@[^/@]+\/[^/@]+|[^@/]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/)
+  if (!match) throw new Error('OpenCode scoped plugin requires an exact immutable package version')
+  return { name: match[1]!, version: match[2]! }
+}
+
+async function captureScopedPluginPlanningEvidence(
+  plugins: readonly OpenCodePreservedPlugin[],
+  packagesRoot: string,
+): Promise<OpenCodePlanScopedProfileInput['evidence']['plugins']> {
+  const captured = new Map<string, Omit<OpenCodePlanScopedProfileInput['evidence']['plugins'][number], 'provenance'>>()
+  for (const plugin of plugins) {
+    const prior = captured.get(plugin.spec)
+    if (prior) continue
+    const exact = exactScopedPluginPackage(plugin.spec)
+    const sourceRoot = path.join(packagesRoot, plugin.spec)
+    const entries: OpenCodePlanScopedProfileInput['evidence']['plugins'][number]['immutableTreeEntries'] = []
+    let entryCount = 0
+    let byteCount = 0
+    const visit = async (directory: string, relative: string): Promise<void> => {
+      const before = await lstat(directory, { bigint: true })
+      if (!before.isDirectory() || before.isSymbolicLink()) {
+        throw new Error('OpenCode scoped plugin cache contains an unsupported directory [redacted]')
+      }
+      const children = await readdir(directory, { withFileTypes: true })
+      children.sort((left, right) => left.name.localeCompare(right.name))
+      for (const child of children) {
+        if (child.name === '.DS_Store' || child.name === '.git') continue
+        if (++entryCount > 20_000) throw new Error('OpenCode scoped plugin cache is too large [redacted]')
+        const childPath = path.join(directory, child.name)
+        const childRelative = relative ? `${relative}/${child.name}` : child.name
+        if (child.isDirectory()) {
+          await visit(childPath, childRelative)
+          continue
+        }
+        if (!child.isFile()) {
+          throw new Error('OpenCode scoped plugin cache contains an unsupported entry [redacted]')
+        }
+        const handle = await open(childPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+        try {
+          const retainedBefore = await handle.stat({ bigint: true })
+          if (!retainedBefore.isFile()) throw new Error('OpenCode scoped plugin cache file is not regular')
+          const bytes = await handle.readFile()
+          const retainedAfter = await handle.stat({ bigint: true })
+          const visible = await lstat(childPath, { bigint: true })
+          if (visible.isSymbolicLink() || retainedBefore.dev !== retainedAfter.dev
+            || retainedBefore.ino !== retainedAfter.ino || retainedBefore.size !== retainedAfter.size
+            || retainedBefore.mtimeNs !== retainedAfter.mtimeNs || retainedBefore.ctimeNs !== retainedAfter.ctimeNs
+            || retainedAfter.dev !== visible.dev || retainedAfter.ino !== visible.ino) {
+            throw new Error('OpenCode scoped plugin cache changed during capture [redacted]')
+          }
+          byteCount += bytes.length
+          if (byteCount > 64 * 1024 * 1024) {
+            throw new Error('OpenCode scoped plugin cache exceeds the evidence limit [redacted]')
+          }
+          entries.push({
+            path: `${exact.name}/${childRelative}`,
+            bytesBase64: bytes.toString('base64'),
+            mode: (Number(retainedAfter.mode) & 0o111) === 0 ? 0o400 : 0o500,
+          })
+        } finally {
+          await handle.close()
+        }
+      }
+      const after = await lstat(directory, { bigint: true })
+      if (!after.isDirectory() || after.isSymbolicLink()
+        || before.dev !== after.dev || before.ino !== after.ino
+        || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+        throw new Error('OpenCode scoped plugin cache directory changed during capture [redacted]')
+      }
+    }
+    await visit(sourceRoot, '')
+    const manifestEntry = entries.find(entry => entry.path === `${exact.name}/package.json`)
+    if (!manifestEntry) throw new Error('OpenCode scoped plugin cache manifest is unavailable [redacted]')
+    const manifestBytes = Buffer.from(manifestEntry.bytesBase64, 'base64')
+    let manifest: Record<string, unknown>
+    try { manifest = JSON.parse(manifestBytes.toString('utf8')) as Record<string, unknown> }
+    catch { throw new Error('OpenCode scoped plugin cache manifest is invalid [redacted]') }
+    if (manifest.name !== exact.name || manifest.version !== exact.version) {
+      throw new Error('OpenCode scoped plugin cache does not match its exact spec [redacted]')
+    }
+    entries.sort((left, right) => left.path.localeCompare(right.path))
+    const dependencyTreeFingerprint = canonicalFingerprint(entries.map(entry => ({
+      path: entry.path,
+      mode: entry.mode,
+      fingerprint: hashBuffer(Buffer.from(entry.bytesBase64, 'base64')),
+    })))
+    const packageIntegrity = `sha512-${createHash('sha512')
+      .update(dependencyTreeFingerprint).digest('base64')}`
+    const lockBindingFingerprint = canonicalFingerprint({
+      packageName: exact.name,
+      version: exact.version,
+      packageIntegrity,
+      manifestFingerprint: hashBuffer(manifestBytes),
+      dependencyTreeFingerprint,
+    })
+    captured.set(plugin.spec, {
+      spec: plugin.spec,
+      dependencyTreeFingerprint,
+      resolvedIdentity: `sha256:${lockBindingFingerprint}`,
+      immutableTreeEntries: entries,
+    })
+  }
+  return plugins.map(plugin => ({ ...captured.get(plugin.spec)!, provenance: plugin.provenance }))
+}
+
 function getScopedPluginConfigCandidates(
   projectPath: string,
   env: NodeJS.ProcessEnv,
@@ -2918,6 +3384,8 @@ export class OpenCodeProfileManager {
 
   private readonly paths = resolveClaudeMultimodelPaths()
 
+  constructor(private readonly platform: NodeJS.Platform = process.platform) {}
+
   /**
    * Captures the mutable production inputs which the pure policy deliberately
    * cannot read.  The returned snapshot is single-attempt data: production
@@ -2942,7 +3410,7 @@ export class OpenCodeProfileManager {
       || path.join(os.homedir(), '.config')
     const [behavior, binaryFingerprint, preservedPlugins, automaticUserPluginEntries] =
       await Promise.all([
-        collectProjectBehaviorMetadata(projectPath),
+        collectProjectBehaviorMetadata(projectPath, this.platform),
         fingerprintScopedBinary(binaryPath),
         collectScopedPreservedPlugins(projectPath, hostEnvironment),
         collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
@@ -2964,9 +3432,14 @@ export class OpenCodeProfileManager {
         binary: binaryFingerprint, layout: canonicalFingerprint(null),
       },
     })
-    if (policyProbe.plugins.length > 0) {
-      throw new Error('OpenCode configured plugin immutable planning evidence is unavailable [redacted]')
-    }
+    const planningPlugins = await captureScopedPluginPlanningEvidence(
+      policyProbe.plugins,
+      path.join(this.paths.cache, 'opencode', 'shared-cache', 'opencode', 'packages'),
+    ).catch(error => {
+      throw new Error('OpenCode configured plugin immutable planning evidence is unavailable [redacted]', {
+        cause: error,
+      })
+    })
 
     const globalAuthPath = this.getGlobalAuthPath()
     const sourceAuthPaths = Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()]))
@@ -2977,16 +3450,82 @@ export class OpenCodeProfileManager {
       (providerId === 'kiro' && isKiroCliAuthMarker(selectedCredentialCandidate ?? null))
       || (providerId === 'cursor-acp' && isCursorAgentAuthMarker(selectedCredentialCandidate ?? null))
     ) ? undefined : selectedCredentialCandidate
-    if (providerId === 'kiro' || providerId === 'cursor-acp') {
-      throw new Error('OpenCode native provider immutable planning evidence is unavailable [redacted]')
-    }
     const selectedAuth = selectedCredential ? { [providerId.toLowerCase()]: selectedCredential } : {}
-    const selectedAuthFingerprint = canonicalFingerprint(selectedAuth)
-    const nativeAccountIdentityFingerprint = selectedCredential
+    let scopedSelectedAuth = selectedAuth
+    let nativeAccountIdentityFingerprint = selectedCredential
       ? canonicalFingerprint({ providerId, selectedAuth })
       : canonicalFingerprint(null)
-    const nativeTargetExecutableFingerprint = canonicalFingerprint(null)
-    const nativeBridgeInputFingerprint = canonicalFingerprint(null)
+    let nativeAccountIdentitySource: 'official-provider-cli' | 'managed-auth' = 'managed-auth'
+    const nativeCredentialHostHomePath = (
+      process.platform === 'win32'
+        ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim()
+        : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim()
+    ) || os.homedir()
+    const nativeTargetCommand = providerId === 'cursor-acp'
+      ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+      : providerId === 'kiro' ? 'kiro-cli' : null
+    const nativeTargetExecutablePath = nativeTargetCommand
+      ? await resolveNativeTargetExecutable(nativeTargetCommand, hostEnvironment, process.platform)
+      : null
+    if (nativeTargetCommand && !nativeTargetExecutablePath) {
+      throw new Error('OpenCode selected native provider executable could not be resolved')
+    }
+    const nativeTargetExecutableFingerprint = nativeTargetExecutablePath
+      ? await fingerprintScopedBinary(nativeTargetExecutablePath)
+      : canonicalFingerprint(null)
+    const nativeAccountEvidence = await fingerprintNativeAccountEvidence(
+      providerId,
+      nativeCredentialHostHomePath,
+    )
+    let nativeCredentialProofFingerprint = canonicalFingerprint(null)
+    const nativeProofProviderId: 'kiro' | 'cursor-acp' | null = providerId === 'kiro'
+      ? 'kiro'
+      : providerId === 'cursor-acp' ? 'cursor-acp' : null
+    if (nativeProofProviderId && (nativeProofProviderId === 'kiro' || !selectedCredential)) {
+      const nativeProof = await probeNativeCredentialIdentity(
+        nativeProofProviderId,
+        nativeTargetExecutablePath!,
+        process.platform,
+        hostEnvironment,
+      ).catch(() => ({ reportsAuthenticated: false, accountIdentity: null }))
+      nativeCredentialProofFingerprint = canonicalFingerprint({
+        providerId,
+        accountIdentity: nativeProof.accountIdentity,
+        credentialEvidence: nativeAccountEvidence.definitive ? nativeAccountEvidence.fingerprint : null,
+      })
+      if (!nativeProof.reportsAuthenticated || nativeProof.accountIdentity === null) {
+        throw new Error('OpenCode native provider authenticated account identity could not be established')
+      }
+      nativeAccountIdentitySource = 'official-provider-cli'
+      nativeAccountIdentityFingerprint = canonicalFingerprint({
+        providerId,
+        accountIdentity: nativeProof.accountIdentity,
+      })
+      if (!selectedCredential) {
+        scopedSelectedAuth = providerId === 'kiro'
+          ? { kiro: { type: 'oauth', access: 'authenticated', refresh: '', expires: Number.MAX_SAFE_INTEGER } }
+          : { 'cursor-acp': { type: 'api', key: CURSOR_AGENT_AUTH_MARKER, expires: Number.MAX_SAFE_INTEGER } }
+      }
+    }
+    const selectedAuthFingerprint = canonicalFingerprint(scopedSelectedAuth)
+    const nativeBridgeInputFingerprint = canonicalFingerprint(
+      nativeProofProviderId
+        ? {
+            providerId,
+            platform: process.platform,
+            home: process.platform === 'win32'
+              ? hostEnvironment.USERPROFILE?.trim() || hostEnvironment.HOME?.trim() || os.homedir()
+              : hostEnvironment.HOME?.trim() || hostEnvironment.USERPROFILE?.trim() || os.homedir(),
+            path: hostEnvironment.PATH ?? '',
+            cursorAgentExecutable: providerId === 'cursor-acp'
+              ? hostEnvironment.CURSOR_AGENT_EXECUTABLE?.trim() || 'cursor-agent'
+              : null,
+            credentialProof: nativeCredentialProofFingerprint,
+            accountEvidence: nativeAccountEvidence.fingerprint,
+            targetExecutable: nativeTargetExecutableFingerprint,
+          }
+        : null,
+    )
     const providerEnvironmentFingerprint = canonicalFingerprint({
       inherited: fingerprintOpenCodeScopedInheritedEnvironment(hostEnvironment),
       nativeBridgeInputs: nativeBridgeInputFingerprint,
@@ -3043,7 +3582,10 @@ export class OpenCodeProfileManager {
     }
     const providers = asRecord(managedConfig.provider)
     managedConfig.provider = providers[providerId] ? { [providerId]: providers[providerId] } : {}
-    managedConfig.plugin = []
+    managedConfig.plugin = planningPlugins.map(plugin => {
+      const exact = exactScopedPluginPackage(plugin.spec)
+      return `file:./node_modules/${exact.name}`
+    })
     if (signal?.aborted) throwOpenCodeAbortReason(signal)
     return cloneAndDeepFreezeScopedInput({
       purpose: requestedSnapshot.purpose,
@@ -3059,11 +3601,11 @@ export class OpenCodeProfileManager {
         binaryFingerprint,
         configFingerprint: buildManagedConfigFingerprint(managedConfig),
         nativeAccountIdentityFingerprint,
-        nativeAccountIdentitySource: 'managed-auth' as const,
+        nativeAccountIdentitySource,
         nativeTargetExecutableFingerprint,
         profileLayoutFingerprint: canonicalFingerprint(OPEN_CODE_SCOPED_PROFILE_LAYOUT_GENERATION),
         automaticUserPluginFingerprint,
-        plugins: [],
+        plugins: planningPlugins,
       },
     })
   }
@@ -3256,7 +3798,9 @@ export class OpenCodeProfileManager {
       'opencode',
       'scoped-preparation-locks',
     )
-    await ensureOpenCodeManagedDirectoryPath(earlyPreparationLockRoot, this.paths.data)
+    await ensureOpenCodeManagedDirectoryPath(
+      earlyPreparationLockRoot, this.paths.data, undefined, this.platform,
+    )
     const earlyPreparationLockPath = path.join(
       earlyPreparationLockRoot,
       `${canonicalFingerprint({ projectPath, purpose: plan.purpose, providerId, modelId })}.lock`,
@@ -3279,7 +3823,7 @@ export class OpenCodeProfileManager {
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
       || path.join(os.homedir(), '.config')
     const userPluginDirectory = path.join(userConfigRoot, 'opencode', 'plugins')
-    behaviorCapture = await captureProjectBehaviorMetadata(projectPath)
+    behaviorCapture = await captureProjectBehaviorMetadata(projectPath, this.platform)
     const behavior = behaviorCapture
     const [binaryFingerprint, preservedPlugins, automaticUserPluginEntries] = await Promise.all([
       fingerprintScopedBinary(binaryPath),
@@ -3591,13 +4135,17 @@ export class OpenCodeProfileManager {
     const preparationLockPath = path.join(profileRootPath, `prepare-${policy.identity.operationKey.split(':').at(-1)!}.lock`)
 
     return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
-      await ensureOpenCodeManagedDirectoryPath(homePath, this.paths.data)
-      await ensureOpenCodeManagedDirectoryPath(tmpPath, this.paths.data)
+      await ensureOpenCodeManagedDirectoryPath(homePath, this.paths.data, undefined, this.platform)
+      await ensureOpenCodeManagedDirectoryPath(tmpPath, this.paths.data, undefined, this.platform)
       await ensureOpenCodeManagedDirectoryPath(
-        path.join(xdgConfigHome, 'opencode'), this.paths.data,
+        path.join(xdgConfigHome, 'opencode'), this.paths.data, undefined, this.platform,
       )
-      await ensureOpenCodeManagedDirectoryPath(path.dirname(managedAuthPath), this.paths.data)
-      await ensureOpenCodeManagedDirectoryPath(xdgCacheHome, this.paths.cache)
+      await ensureOpenCodeManagedDirectoryPath(
+        path.dirname(managedAuthPath), this.paths.data, undefined, this.platform,
+      )
+      await ensureOpenCodeManagedDirectoryPath(
+        xdgCacheHome, this.paths.cache, undefined, this.platform,
+      )
       await assertCanonicalOwnedPathComponents(pluginNodeModulesPath, this.paths.data)
       const projectBehaviorSnapshotPath = path.join(
         profileRootPath,

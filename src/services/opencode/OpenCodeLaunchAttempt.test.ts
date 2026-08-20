@@ -948,4 +948,21 @@ describe('OpenCodeLaunchAttempt partial success, ambiguity, continuation and cle
     expect(result.absoluteDeadlineAtMs).toBe(10_000)
     expect(subject.persistence.json().events.at(-1)).toMatchObject({ type: 'member_failed' })
   })
+
+  test('returns at the absolute deadline when physical host release never settles', async () => {
+    const subject = setup()
+    let releaseSignal: AbortSignal | undefined
+    subject.ports.host.releaseOperationHost = input => {
+      releaseSignal = input.signal
+      subject.setNow(input.deadlineAtMs)
+      return new Promise<void>(() => undefined)
+    }
+    const result = await subject.launch.run({
+      request: request(), members: [members[0]], requestedBudgetMs: 10_000,
+    })
+    expect(result.status).toBe('succeeded')
+    expect(result.cleanup).toBe('timed_out')
+    expect(result.absoluteDeadlineAtMs).toBe(10_000)
+    expect(releaseSignal?.aborted).toBe(true)
+  })
 })

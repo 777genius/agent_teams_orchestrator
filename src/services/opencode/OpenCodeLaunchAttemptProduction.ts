@@ -7,7 +7,6 @@ import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import {
   OpenCodeLaunchAttempt,
@@ -49,7 +48,10 @@ import {
 } from './OpenCodeLaunchProductionGuards.js'
 import {
   createOpenCodeOwnedMemberSession,
+  OpenCodeProofSessionCleanupLedger,
   reconcileOpenCodeOwnedMemberSession,
+  type OpenCodeOwnedSessionReconciliation,
+  type OpenCodeProofSessionCleanupRecord,
 } from './OpenCodeLaunchAttemptProductionSession.js'
 import {
   authorizeOpenCodeLaunchScopedProfile,
@@ -192,13 +194,17 @@ class OpenCodeProductionLaunchRuntime {
     const profiles = new Map<OpenCodeOpaqueIdentity, OpenCodeScopedPreparedProfile>()
     const hosts = new Map<OpenCodeOpaqueIdentity, OpenCodeHostHandle>()
     const records = new Map<OpenCodeOpaqueIdentity, OpenCodeSessionRecord>()
-    const proofSessions = new Map<OpenCodeOpaqueIdentity, {
-      sessionId: string; messageId: string; ownershipTitle: string
+    const memberOwnershipTitles = new Map<OpenCodeOpaqueIdentity, string>()
+    const proofSessions = new Map<OpenCodeOpaqueIdentity, OpenCodeProofSessionCleanupRecord & {
+      messageId?: string
     }>()
     let currentSnapshot: OpenCodeProvisioningSnapshot | null = null
     const launchDirectory = path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'launch-attempts')
     const mutationLedger = new OpenCodeLaunchMutationLedger(path.join(launchDirectory, 'member-claims'))
     const journalPath = path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.journal`)
+    const proofCleanupLedger = new OpenCodeProofSessionCleanupLedger(
+      path.join(launchDirectory, `${command.request.launchAttempt.attemptId}.proof-cleanup.json`),
+    )
     const attemptStore = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(journalPath))
     const targetByMember = new Map(command.members.map(member => [member.memberIdentity,
       OpenCodeLaunchMutationLedger.targetDigest({
@@ -353,21 +359,29 @@ class OpenCodeProductionLaunchRuntime {
           const proofSession = proofSessions.get(input.host.hostKeyIdentity)
           if (proofSession) {
             const handle = hostFor(input.host)
-            const client = openCodeClientFactory.create(handle.baseUrl)
-            await client.abortSession(proofSession.sessionId).catch(() => false)
+            const client = openCodeClientFactory.create(handle.baseUrl, {
+              signal: input.signal,
+              remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
+            })
             const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
-              authoritativeSessionId: proofSession.sessionId,
+              authoritativeSessionId: proofSession.authoritativeSessionId,
               ownershipTitle: proofSession.ownershipTitle,
               getSession: id => client.getSession(id),
               deleteSession: id => client.deleteSession(id),
             }).catch(() => 'unresolved' as const)
-            if (proofCleanup === 'foreign' || proofCleanup === 'unresolved') {
+            const persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup)
+              .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
+            proofSessions.set(input.host.hostKeyIdentity, { ...persisted,
+              ...(proofSession.messageId ? { messageId: proofSession.messageId } : {}) })
+            if (persisted.state === 'foreign' || persisted.state === 'unresolved'
+              || persisted.state === 'registered' || persisted.state === 'owned') {
               throw new Error('OpenCode proof session cleanup could not prove absence')
             }
             proofSessions.delete(input.host.hostKeyIdentity)
           }
-          await openCodeHostManager.releaseHost(hostFor(input.host).hostKey,
-            { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive() })
+          await bounded(openCodeHostManager.releaseHost(hostFor(input.host).hostKey,
+            { keepPersistentAlive: retainedSessionLeases.shouldKeepHostAlive() }),
+          input.deadlineAtMs, input.signal)
         },
       },
       mcp: { verifyAppMcp: async input => {
@@ -391,33 +405,66 @@ class OpenCodeProductionLaunchRuntime {
           payloadHash: input.request.launchAttempt.payloadHash,
         })).digest('hex')
         const proofSessionId = `ses_${proofDigest.slice(0, 26)}`
-        const ownershipTitle = `agent-teams-proof:${input.request.launchAttempt.attemptId}:${proofDigest}`
+        const proofOwnershipToken = createHash('sha256')
+          .update(input.request.launchAttempt.proofNonce)
+          .digest('hex')
+        const ownershipTitle = `agent-teams-proof:${input.request.launchAttempt.attemptId}:${proofDigest}:${proofOwnershipToken}`
+        const proofOwnership = {
+          attemptId: input.request.launchAttempt.attemptId,
+          hostKeyIdentity: input.host.hostKeyIdentity,
+          authoritativeSessionId: proofSessionId,
+          ownershipTitle,
+        }
         try {
           const existing = await client.getSession(proofSessionId)
-          if (existing.id === proofSessionId && existing.title === ownershipTitle) {
-            await reconcileOpenCodeOwnedMemberSession({
-              authoritativeSessionId: proofSessionId, ownershipTitle,
-              getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
-            })
-          }
+          const registration = await proofCleanupLedger.register(proofOwnership)
+          proofSessions.set(input.host.hostKeyIdentity, registration.record)
+          const collisionState: OpenCodeOwnedSessionReconciliation =
+            existing.id === proofSessionId && existing.title === ownershipTitle
+              ? await reconcileOpenCodeOwnedMemberSession({
+                authoritativeSessionId: proofSessionId, ownershipTitle,
+                getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
+              }).catch(() => 'unresolved' as const)
+              : 'foreign'
+          await proofCleanupLedger.recordState(proofOwnership, collisionState)
+          proofSessions.set(input.host.hostKeyIdentity, { ...registration.record, state: collisionState })
           throw new Error('OpenCode proof session id is already present')
         } catch (error) {
           if (!isNotFound(error)) throw error
+        }
+        // The exact cleanup identity is durable before the only create POST. If this
+        // record already existed, this invocation is reconciliation-only and must
+        // never create the deterministic session a second time.
+        const registration = await proofCleanupLedger.register(proofOwnership)
+        proofSessions.set(input.host.hostKeyIdentity, registration.record)
+        if (!registration.created) {
+          const observed = await reconcileOpenCodeOwnedMemberSession({
+            authoritativeSessionId: proofSessionId, ownershipTitle,
+            getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
+          }).catch(() => 'unresolved' as const)
+          const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
+          proofSessions.set(input.host.hostKeyIdentity, persisted)
+          throw new Error(`OpenCode proof session requires cleanup reconciliation (${observed})`)
         }
         let session: Awaited<ReturnType<typeof client.createSession>>
         try {
           session = await client.createSession({ id: proofSessionId, title: ownershipTitle })
         } catch (error) {
-          await reconcileOpenCodeOwnedMemberSession({
+          const observed = await reconcileOpenCodeOwnedMemberSession({
             authoritativeSessionId: proofSessionId, ownershipTitle,
             getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
-          }).catch(() => 'unresolved')
+          }).catch(() => 'unresolved' as const)
+          const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
+            .catch(() => ({ ...registration.record, state: 'unresolved' as const }))
+          proofSessions.set(input.host.hostKeyIdentity, persisted)
           throw error
         }
         try {
           if (session.id !== proofSessionId || session.title !== ownershipTitle) {
             throw new Error('OpenCode proof session ownership response mismatched')
           }
+          const ownedProof = await proofCleanupLedger.recordState(proofOwnership, 'owned')
+          proofSessions.set(input.host.hostKeyIdentity, ownedProof)
           const prompt = `Return exactly this nonce and nothing else: ${input.request.launchAttempt.proofNonce}`
           const response = await client.sendSessionMessage(session.id, {
             agent: 'teammate-model-probe', model: modelParts(command.selectedModel),
@@ -448,9 +495,7 @@ class OpenCodeProductionLaunchRuntime {
           const assistantMessageIdentity = messageIdentity(response)
           const rawMessageId = response.info?.id
           if (typeof rawMessageId !== 'string' || !rawMessageId) throw new Error('OpenCode proof message id is absent')
-          proofSessions.set(input.host.hostKeyIdentity, {
-            sessionId: session.id, messageId: rawMessageId, ownershipTitle,
-          })
+          proofSessions.set(input.host.hostKeyIdentity, { ...ownedProof, messageId: rawMessageId })
           const proof: OpenCodeLaunchAttemptResponse = {
             launchAttempt: {
               contractVersion: 1, attemptId: input.request.launchAttempt.attemptId,
@@ -483,11 +528,13 @@ class OpenCodeProductionLaunchRuntime {
           return { response: proof, authIdentity: input.profile.authIdentity,
             configIdentity: input.profile.configIdentity, binaryIdentity: input.profile.binaryIdentity }
         } catch (error) {
-          await client.abortSession(session.id).catch(() => false)
-          await reconcileOpenCodeOwnedMemberSession({
+          const observed = await reconcileOpenCodeOwnedMemberSession({
             authoritativeSessionId: proofSessionId, ownershipTitle,
             getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
-          }).catch(() => 'unresolved')
+          }).catch(() => 'unresolved' as const)
+          const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
+            .catch(() => ({ ...registration.record, state: 'unresolved' as const }))
+          proofSessions.set(input.host.hostKeyIdentity, persisted)
           throw error
         }
       },
@@ -498,7 +545,9 @@ class OpenCodeProductionLaunchRuntime {
           signal: input.signal, remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
         })
         const retainedProof = proofSessions.get(input.host.hostKeyIdentity)
-        if (!retainedProof || !client.getSessionMessage) throw new Error('OpenCode retained proof is unavailable')
+        if (!retainedProof?.messageId || retainedProof.state !== 'owned' || !client.getSessionMessage) {
+          throw new Error('OpenCode retained proof is unavailable')
+        }
         const [mcp, allTools, observedAuthFingerprint, observedBinaryFingerprint,
           observedProfileIdentity, observedPluginFingerprint, observedCacheIdentity,
           observedConfig, observedProofMessage] = await Promise.all([
@@ -510,7 +559,7 @@ class OpenCodeProductionLaunchRuntime {
           immutableTreeFingerprint(prepared.pluginNodeModulesPath),
           pathIdentity(prepared.xdgCacheHome),
           client.getConfig(),
-          client.getSessionMessage(retainedProof.sessionId, retainedProof.messageId),
+          client.getSessionMessage(retainedProof.authoritativeSessionId, retainedProof.messageId),
         ])
         if (!observedProofMessage) throw new Error('OpenCode retained proof message disappeared')
         const proofInfo = observedProofMessage.info ?? {}
@@ -600,7 +649,9 @@ class OpenCodeProductionLaunchRuntime {
           })
           const target = targetByMember.get(input.memberIdentity)!
           const authoritativeSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
-          const ownershipTitle = `agent-teams-launch:${command.request.launchAttempt.attemptId}:${input.memberIdentity}`
+          const memberOwnershipToken = createHash('sha256').update(input.claimToken).digest('hex')
+          const ownershipTitle = `agent-teams-launch:${command.request.launchAttempt.attemptId}:${input.memberIdentity}:${memberOwnershipToken}`
+          memberOwnershipTitles.set(input.memberIdentity, ownershipTitle)
           const now = new Date().toISOString()
           let record: OpenCodeSessionRecord = {
             teamId: command.teamId, laneId: command.laneId, memberName: member.name,
@@ -681,10 +732,10 @@ class OpenCodeProductionLaunchRuntime {
         },
       },
       ownership: {
-        abortOwned: async input => {
-          const record = records.get(input.resources.memberIdentity)
-          if (record) await openCodeSessionBridge.abort(record).catch(() => false)
-        },
+        // Physical cleanup below first verifies the remote title and then
+        // deletes the exact attempt-owned session. An unconditional abort by
+        // deterministic id could affect a foreign session that reused the id.
+        abortOwned: async () => {},
         cleanupOwned: async input => {
           let complete = true
           for (const resource of input.resources) {
@@ -693,10 +744,11 @@ class OpenCodeProductionLaunchRuntime {
             const handle = Array.from(hosts.values()).find(candidate => candidate.hostKey === record.hostKey)
             if (!handle) { complete = false; continue }
             const client = openCodeClientFactory.create(handle.baseUrl, {
-              signal: new AbortController().signal,
+              signal: input.signal,
               remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
             })
-            const ownershipTitle = `agent-teams-launch:${command.request.launchAttempt.attemptId}:${resource.memberIdentity}`
+            const ownershipTitle = memberOwnershipTitles.get(resource.memberIdentity)
+            if (!ownershipTitle) { complete = false; continue }
             const remoteCleanup = await reconcileOpenCodeOwnedMemberSession({
               authoritativeSessionId: record.opencodeSessionId,
               ownershipTitle,

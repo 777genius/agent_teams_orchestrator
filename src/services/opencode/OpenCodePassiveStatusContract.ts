@@ -112,13 +112,21 @@ const trustedProviderIds = new Set([
   'google', 'groq', 'kiro', 'llama.cpp', 'llmgateway', 'lmstudio', 'mistral',
   'ollama', 'openai', 'opencode', 'openrouter', 'perplexity', 'togetherai',
   'venice', 'vertexai', 'xai',
+  'xiaomi-token-plan-ams', 'xiaomi-token-plan-sgp', 'xiaomi-token-plan-cn',
+  'minimax-coding-plan', 'zai-coding-plan', 'kimi-for-coding',
 ])
 
 const identifierSeparators = /[./_+:-]+/
 const sensitiveIdentifierPart = /(?:^|[./_+:-])(api(?:[-_]?key)?|authorization|auth(?:entication)?|bearer|credential|ghp|passwd|password|private[-_]?key|rk[-_]?live|secret|session|sk|token|xoxb)(?:$|[./_+:-])/i
 const credentialPrefix = /^(?:ghp|rk(?:live)?|sk|xoxb)[a-z0-9]/i
 const concatenatedSensitiveTerm = /(?:api(?:key)?|authorization|authentication|auth|bearer|credential|ghp|passwd|password|privatekey|rklive|secret|session|sk|token|xoxb)([a-z0-9]+)/ig
-const explicitlySafeIdentifiers = new Set(['anthropic'])
+const explicitlySafeIdentifiers = new Set([
+  'anthropic',
+  // Reviewed provider ids whose official product name contains "token"; only
+  // these exact allowlisted identifiers bypass the generic credential-word
+  // rejection below.
+  'xiaomi-token-plan-ams', 'xiaomi-token-plan-sgp', 'xiaomi-token-plan-cn',
+])
 function canonicalIdentifierPart(value: string): boolean {
   if (value.length === 0 || value.length > 64) return false
   return /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(value)

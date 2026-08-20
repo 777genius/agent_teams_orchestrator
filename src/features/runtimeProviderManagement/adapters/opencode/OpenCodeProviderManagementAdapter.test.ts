@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from '../../../../services/opencode/OpenCodeLiveProviderNormalizer.js'
+import {
+  getOpenCodeGlobalManagedPreferencesPath,
+  readOpenCodeGlobalManagedRuntimePreferences,
+} from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -6164,6 +6171,103 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(deprecatedDefault.value.defaultModelId).toBe('google/old-model')
     expect(deprecatedDefault.value.models.find(model => model.modelId === 'google/old-model'))
       .toMatchObject({ default: true, catalogStatus: 'deprecated' })
+  })
+
+  test('uses a project managed default before the all-projects global default', async () => {
+    const reads: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('google', {
+        'project-model': {},
+        'global-old-model': { status: 'deprecated' },
+      }, false),
+      managedPreferences: {
+        read: async profileRootPath => {
+          reads.push(`project:${profileRootPath}`)
+          return {
+            schemaVersion: 2,
+            defaultModelId: 'google/project-model',
+            modelLimitOverrides: {},
+            updatedAt: null,
+          }
+        },
+        readGlobal: async dataRootPath => {
+          reads.push(`global:${dataRootPath}`)
+          return {
+            schemaVersion: 2,
+            defaultModelId: 'google/global-old-model',
+            modelLimitOverrides: {},
+            updatedAt: null,
+          }
+        },
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModelId).toBe('google/project-model')
+    expect(result.value.models.find(model => model.modelId === 'google/project-model'))
+      .toMatchObject({ default: true })
+    expect(result.value.models.find(model => model.modelId === 'google/global-old-model'))
+      .toBeUndefined()
+    expect(reads.some(value => value === 'project:/tmp/profile')).toBe(true)
+    expect(reads.some(value => value.startsWith('global:'))).toBe(true)
+  })
+
+  test('falls back to the all-projects default and keeps a matching deprecated model visible', async () => {
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: providerCatalog('google', {
+        'active-model': {},
+        'global-old-model': { status: 'deprecated' },
+      }, false),
+      managedPreferences: {
+        read: async () => ({
+          schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+        }),
+        readGlobal: async () => ({
+          schemaVersion: 2,
+          defaultModelId: 'google/global-old-model',
+          modelLimitOverrides: {},
+          updatedAt: null,
+        }),
+        setDefaultModel: async () => {},
+      },
+    })
+
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.defaultModelId).toBe('google/global-old-model')
+    expect(result.value.models.find(model => model.modelId === 'google/global-old-model'))
+      .toMatchObject({ default: true, catalogStatus: 'deprecated' })
+  })
+
+  test('ignores a malformed all-projects preference without hiding catalog models', async () => {
+    const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-malformed-global-preference-'))
+    try {
+      const globalPath = getOpenCodeGlobalManagedPreferencesPath(dataRoot)
+      await mkdir(path.dirname(globalPath), { recursive: true })
+      await writeFile(globalPath, '{ malformed json', 'utf8')
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('google', { 'active-model': {} }, false),
+        managedPreferences: {
+          read: async () => ({
+            schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+          }),
+          readGlobal: async () => readOpenCodeGlobalManagedRuntimePreferences(dataRoot),
+          setDefaultModel: async () => {},
+        },
+      })
+
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'google' })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.defaultModelId).toBeNull()
+      expect(result.value.models.map(model => model.modelId)).toEqual(['google/active-model'])
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true })
+    }
   })
 
   test('loads provider-scoped models reported only by the live provider catalog', async () => {
