@@ -222,7 +222,8 @@ export async function readOpenCodePassiveSnapshot(
     verifySchema(database)
     database.exec('BEGIN')
     try {
-      if (!await legacyStateMatches(database, rootDirectory, scope)) {
+      const legacyCapturedAt = await matchingLegacyCapturedAt(database, rootDirectory, scope)
+      if (legacyCapturedAt === null) {
         database.exec('COMMIT')
         return null
       }
@@ -232,9 +233,16 @@ export async function readOpenCodePassiveSnapshot(
       // transaction pins its version. Retention can now proceed independently.
       await options.afterSelected?.()
       if (signal.aborted) throw cancelled()
-      const value = decodeDurable(row.payload, row.transactionId, scope)
+      let value = decodeDurable(row.payload, row.transactionId, scope)
+      let text = row.payload
+      if (value && legacyCapturedAt !== undefined && value.capturedAt < legacyCapturedAt) {
+        value = { ...value, capturedAt: legacyCapturedAt }
+        const encoded = encodeOpenCodeRedactedSnapshotV1(value)
+        if (!encoded.ok || !encoded.bytes) value = null
+        else text = new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
+      }
       database.exec('COMMIT')
-      return value ? { transactionId: row.transactionId, text: row.payload, value } : null
+      return value ? { transactionId: row.transactionId, text, value } : null
     } catch (error) { rollback(database); throw error }
   } finally { database.close(false) }
 }
@@ -416,7 +424,12 @@ async function reconcileLegacy(
   if (legacy.kind === 'invalid') throw new Error('Passive legacy snapshot store is invalid')
   const prior = stored ? decodeLegacyProvenance(stored.provenance) : null
   if (stored && !prior) throw new Error('Passive legacy migration watermark is invalid')
-  if (stored?.fingerprint === legacy.fingerprint) return { snapshot: current, changedDomains: new Set() }
+  if (stored?.fingerprint === legacy.fingerprint) {
+    const snapshot = current && legacy.snapshot && current.capturedAt < legacy.snapshot.capturedAt
+      ? { ...current, capturedAt: legacy.snapshot.capturedAt }
+      : current
+    return { snapshot, changedDomains: new Set() }
+  }
 
   let result = current
   let changedDomains = new Set<string>()
@@ -449,23 +462,30 @@ async function reconcileLegacy(
   return { snapshot: result, changedDomains }
 }
 
-async function legacyStateMatches(database: Database, root: string, scope: `sha256:${string}`): Promise<boolean> {
+async function matchingLegacyCapturedAt(
+  database: Database,
+  root: string,
+  scope: `sha256:${string}`,
+): Promise<number | undefined | null> {
   let stored: { fingerprint: string } | null
   try {
     stored = database.query<{ fingerprint: string }, [string]>(
       'SELECT fingerprint FROM passive_legacy_state WHERE scope = ?',
     ).get(scope)
   } catch (error) {
-    if (error instanceof Error && /no such table/i.test(error.message)) return !await hasLegacyArtifacts(root)
+    if (error instanceof Error && /no such table/i.test(error.message)) {
+      return await hasLegacyArtifacts(root) ? null : undefined
+    }
     throw error
   }
-  if (!stored) return !await hasLegacyArtifacts(root)
+  if (!stored) return await hasLegacyArtifacts(root) ? null : undefined
   if (stored.fingerprint.startsWith('mirror:')) {
     try { lstatSync(path.join(root, OPEN_CODE_PASSIVE_TRANSACTION_MARKER)) }
-    catch (error) { if (isMissing(error)) return true; return false }
+    catch (error) { if (isMissing(error)) return undefined; return null }
   }
   const legacy = await readLegacySnapshot(root, scope)
-  return legacy.kind === 'valid' && legacy.fingerprint === stored.fingerprint
+  if (legacy.kind !== 'valid' || legacy.fingerprint !== stored.fingerprint) return null
+  return legacy.snapshot?.capturedAt
 }
 
 async function hasLegacyArtifacts(root: string): Promise<boolean> {
@@ -719,7 +739,9 @@ function overlayLegacySnapshot(
     }
     if (source.fingerprint !== undefined) provider.fingerprint = source.fingerprint
   }
-  if (changedDomains.size > 0) next.capturedAt = Math.max(next.capturedAt, legacy.capturedAt)
+  // A cumulative immutable publication advances its logical clock even when
+  // it only republishes identical domain evidence.
+  next.capturedAt = Math.max(next.capturedAt, legacy.capturedAt)
   next.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
   return { snapshot: next, changedDomains }
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { constants as fsConstants } from 'node:fs'
+import { constants as fsConstants, fsyncSync, renameSync, unlinkSync } from 'node:fs'
 import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -301,25 +301,39 @@ export class OpenCodeSafePublicationDirectory {
     content: string | Uint8Array,
     mode = 0o600,
     abortSignal?: AbortSignal,
-    testHooks?: { afterRenameBeforeVerification?: () => void | Promise<void> },
+    testHooks?: {
+      afterRenameBeforeVerification?: () => void | Promise<void>
+      afterRollbackOwnershipCaptured?: () => void | Promise<void>
+    },
   ): Promise<void> {
     await this.#assertWindowsRoot()
     const finalName = childName(name)
     const temporaryName = childName(`.${finalName}.tmp.${process.pid}.${randomUUID()}`)
     const temporaryPath = this.child(temporaryName)
+    const backupName = childName(`.${finalName}.rollback.${process.pid}.${randomUUID()}`)
+    const backupPath = this.child(backupName)
+    const quarantinePath = this.child(`.${finalName}.quarantine.${process.pid}.${randomUUID()}`)
     let handle: FileHandle | null = null
+    let temporaryIdentity: Awaited<ReturnType<FileHandle['stat']>> | null = null
+    let priorLinked = false
+    let published = false
     try {
       handle = await open(
         temporaryPath,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+        fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL
           | (fsConstants.O_NOFOLLOW ?? 0),
         mode,
       ).catch(fail)
       await handle.writeFile(content)
       await handle.chmod(mode)
       await handle.sync()
-      const temporaryIdentity = await handle.stat()
-      if (!temporaryIdentity.isFile() || !modeMatches(temporaryIdentity.mode, mode)) fail()
+      temporaryIdentity = await handle.stat()
+      const expectedBytes = Buffer.from(content)
+      const temporaryBytes = Buffer.alloc(expectedBytes.length + 1)
+      const temporaryRead = await handle.read(temporaryBytes, 0, temporaryBytes.length, 0)
+      if (!temporaryIdentity.isFile() || !modeMatches(temporaryIdentity.mode, mode)
+        || temporaryRead.bytesRead !== expectedBytes.length
+        || !temporaryBytes.subarray(0, temporaryRead.bytesRead).equals(expectedBytes)) fail()
       await handle.close()
       handle = null
       if (abortSignal?.aborted) {
@@ -327,28 +341,65 @@ export class OpenCodeSafePublicationDirectory {
           ? abortSignal.reason
           : new Error('OpenCode safe publication cancelled')
       }
-      await rename(temporaryPath, this.child(finalName)).catch(fail)
-      await testHooks?.afterRenameBeforeVerification?.()
-      const publishedHandle = await open(
-        this.child(finalName), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
-      ).catch(fail)
+      // Preserve the complete prior inode before the sole visibility
+      // transition. A failed attempt can restore it without reconstructing
+      // bytes or touching a successor-owned inode.
       try {
-        const published = await publishedHandle.stat()
-        const publishedBytes = await publishedHandle.readFile()
-        if (
-          !published.isFile() || published.isSymbolicLink()
-          || published.dev !== temporaryIdentity.dev || published.ino !== temporaryIdentity.ino
-          || !modeMatches(published.mode, mode)
-          || !publishedBytes.equals(Buffer.from(content))
-        ) fail()
-      } finally {
-        await publishedHandle.close()
+        const prior = await lstat(this.child(finalName))
+        if (!prior.isFile() || prior.isSymbolicLink()
+          || (typeof process.getuid === 'function' && prior.uid !== process.getuid())) fail()
+        await link(this.child(finalName), backupPath)
+        const backup = await lstat(backupPath)
+        if (!backup.isFile() || backup.isSymbolicLink()
+          || backup.dev !== prior.dev || backup.ino !== prior.ino) fail()
+        priorLinked = true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') fail()
       }
-      await this.#handle?.sync().catch(fail)
       await this.#assertWindowsRoot()
+      if (abortSignal?.aborted) {
+        throw abortSignal.reason instanceof Error
+          ? abortSignal.reason
+          : new Error('OpenCode safe publication cancelled')
+      }
+      renameSync(temporaryPath, this.child(finalName))
+      published = true
+      if (this.#handle) fsyncSync(this.#handle.fd)
+      if (testHooks?.afterRenameBeforeVerification) {
+        await testHooks.afterRenameBeforeVerification()
+        if (abortSignal?.aborted) {
+          throw abortSignal.reason instanceof Error
+            ? abortSignal.reason
+            : new Error('OpenCode safe publication cancelled')
+        }
+      }
+      if (priorLinked) unlinkSync(backupPath)
     } catch (error) {
       if (handle) await handle.close().catch(() => undefined)
       await unlink(temporaryPath).catch(() => undefined)
+      if (published && temporaryIdentity) {
+        // Atomically capture the currently visible inode, then restore with a
+        // no-replace link so a successor always wins the namespace race.
+        try {
+          await rename(this.child(finalName), quarantinePath)
+          const quarantined = await lstat(quarantinePath)
+          const owned = quarantined.isFile() && !quarantined.isSymbolicLink()
+            && quarantined.dev === temporaryIdentity.dev && quarantined.ino === temporaryIdentity.ino
+          if (owned) await testHooks?.afterRollbackOwnershipCaptured?.()
+          const restore = owned ? (priorLinked ? backupPath : null) : quarantinePath
+          if (restore) {
+            try { await link(restore, this.child(finalName)) }
+            catch (restoreError) {
+              if ((restoreError as NodeJS.ErrnoException).code !== 'EEXIST') fail()
+            }
+          }
+          await this.#handle?.sync().catch(fail)
+        } catch (rollbackError) {
+          if ((rollbackError as NodeJS.ErrnoException).code !== 'ENOENT') throw rollbackError
+        }
+      }
+      await unlink(quarantinePath).catch(() => undefined)
+      await unlink(backupPath).catch(() => undefined)
       throw error
     }
   }

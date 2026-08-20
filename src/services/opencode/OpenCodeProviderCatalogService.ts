@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  closeSync, constants as fsConstants, fstatSync, lstatSync, mkdirSync, openSync,
-  realpathSync, renameSync, unlinkSync,
+  closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs'
-import { open, readdir, unlink, writeFile } from 'node:fs/promises'
+import { link, open, readFile, readdir, unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { types as nodeUtilTypes } from 'node:util'
 import { Database } from 'bun:sqlite'
 
@@ -39,12 +40,16 @@ const FIXED_FAILURE = 'OpenCode provider catalog is temporarily unavailable.'
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const customPersistenceCommitQueues = new WeakMap<Function, Map<string, Promise<boolean>>>()
 const defaultPersistenceCommitQueues = new Map<string, Promise<boolean>>()
-const ATTEMPT_SCHEMA_VERSION = 44304
+const ATTEMPT_SCHEMA_VERSION = 44305
 const ATTEMPT_ROW_CAPACITY = 64
 const ATTEMPT_TABLE_SQL = `CREATE TABLE allocation_ticket (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
       started_at INTEGER NOT NULL CHECK(started_at >= 0)
+    )`
+const ATTEMPT_STATE_SQL = `CREATE TABLE allocation_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      generation INTEGER NOT NULL CHECK(generation >= 0)
     )`
 let durableAttemptDatabase: {
   filePath: string
@@ -122,6 +127,10 @@ export type OpenCodeProviderCatalogServiceDeps = {
   clearTimer?: typeof clearTimeout
   /** Deterministic fake-only barrier immediately before the durable finalization gate. */
   beforeFinalPublication?: () => void | Promise<void>
+  /** Deterministic fake-only barrier after commit bytes are written, before sync/rename. */
+  beforeVisibilitySync?: () => void | Promise<void>
+  /** Deterministic fake-only barrier after retention authority removal and sync. */
+  afterRetentionAuthorityRemoval?: () => void | Promise<void>
   allocateAttempt?: (scope: string, startedAt: number) => Readonly<{
     requestGeneration: number
     attemptIdentity: `sha256:${string}`
@@ -160,15 +169,25 @@ type Options = Readonly<{
 
 type Flight = {
   controller: AbortController
+  deadline: number
   abortKind: 'no-waiters' | 'timeout' | null
   settled: boolean
   waiters: Set<symbol>
   promise: Promise<OpenCodeProviderCatalogLoadResult>
-  finalizingPublication: boolean
 }
 
-function fixedCatalogFailure(): Error {
-  return new Error(FIXED_FAILURE)
+export class OpenCodeProviderCatalogUnavailableError extends Error {
+  readonly code = 'OPENCODE_PROVIDER_CATALOG_UNAVAILABLE' as const
+  constructor(readonly outcome: 'superseded' | 'transient' = 'transient') {
+    super(FIXED_FAILURE)
+    this.name = 'OpenCodeProviderCatalogUnavailableError'
+  }
+}
+
+function fixedCatalogFailure(
+  outcome: 'superseded' | 'transient' = 'transient',
+): OpenCodeProviderCatalogUnavailableError {
+  return new OpenCodeProviderCatalogUnavailableError(outcome)
 }
 
 function hash(value: string): string {
@@ -440,8 +459,163 @@ function isSqliteBusy(error: unknown): boolean {
   return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED'
 }
 
+async function allocateWindowsCatalogAttempt(
+  scope: string,
+  startedAt: number,
+  deadline: number,
+): Promise<Readonly<{ requestGeneration: number; attemptIdentity: `sha256:${string}` }>> {
+  const systemRoot = process.env.SystemRoot
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) throw fixedCatalogFailure()
+  const executable = path.win32.join(
+    systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+  )
+  const executableMetadata = lstatSync(executable)
+  if (!executableMetadata.isFile() || executableMetadata.isSymbolicLink()
+    || realpathSync(executable).toLowerCase() !== path.win32.resolve(executable).toLowerCase()) {
+    throw fixedCatalogFailure()
+  }
+  const budgetMs = Math.floor(Math.max(0, deadline - performance.now()))
+  if (budgetMs <= 0) throw fixedCatalogFailure()
+  // Windows cannot safely hand SQLite a descriptor-relative mutable database
+  // and sidecars. Use a kernel named mutex plus HKCU registry QWORD instead:
+  // neither authority is pathname-following, and the redundant digest rejects
+  // partial writes or external state tampering before the next mutation.
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$schema = 44305
+function Get-StateDigest([long]$generation) {
+  $bytes = [Text.Encoding]::UTF8.GetBytes("$($schema):$($generation)")
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+  finally { $sha.Dispose() }
+}
+$mutex = [Threading.Mutex]::new($false, 'Local\777genius.AgentTeamsOrchestrator.CatalogAllocation.v44305')
+$owned = $false
+try {
+  $owned = $mutex.WaitOne([int]$env:CATALOG_ALLOCATION_BUDGET_MS)
+  if (-not $owned) { exit 4 }
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(
+    'Software\777genius\AgentTeamsOrchestrator\CatalogAllocation', $true)
+  try {
+    $storedSchema = $key.GetValue('SchemaVersion', $null)
+    $storedGeneration = $key.GetValue('Generation', $null)
+    $storedDigest = $key.GetValue('StateDigest', $null)
+    if ($null -eq $storedSchema -and $null -eq $storedGeneration -and $null -eq $storedDigest) {
+      $generation = [long]0
+    } elseif ([int]$storedSchema -eq $schema -and $storedGeneration -is [long] -and
+      [long]$storedGeneration -ge 0 -and $storedDigest -is [string]) {
+      $generation = [long]$storedGeneration
+      $expected = Get-StateDigest $generation
+      if ($storedDigest -ne $expected) { exit 5 }
+    } else { exit 5 }
+    if ($generation -ge 9007199254740990) { exit 5 }
+    $generation += 1
+    $digest = Get-StateDigest $generation
+    $key.SetValue('SchemaVersion', $schema, [Microsoft.Win32.RegistryValueKind]::DWord)
+    $key.SetValue('Generation', $generation, [Microsoft.Win32.RegistryValueKind]::QWord)
+    $key.SetValue('StateDigest', $digest, [Microsoft.Win32.RegistryValueKind]::String)
+    $key.Flush()
+    [Console]::Out.WriteLine($generation)
+  } finally { $key.Dispose() }
+} finally {
+  if ($owned) { $mutex.ReleaseMutex() }
+  $mutex.Dispose()
+}`
+  const child = Bun.spawn({
+    cmd: [executable, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
+    env: { SystemRoot: systemRoot, CATALOG_ALLOCATION_BUDGET_MS: String(budgetMs) },
+    stdin: 'ignore', stdout: 'pipe', stderr: 'ignore',
+  })
+  const timer = setTimeout(() => child.kill('SIGKILL'), budgetMs)
+  timer.unref?.()
+  const [exitCode, stdout] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+  ]).finally(() => clearTimeout(timer))
+  const requestGeneration = Number(stdout.trim())
+  if (exitCode !== 0 || !Number.isSafeInteger(requestGeneration) || requestGeneration < 1
+    || performance.now() >= deadline) throw fixedCatalogFailure()
+  return Object.freeze({
+    requestGeneration,
+    attemptIdentity: redactedFingerprint(
+      'opencode-catalog-attempt-windows-v1',
+      boundedIdentityMaterial([scope, requestGeneration, startedAt, randomUUID()]),
+    ),
+  })
+}
+
 function normalizeSqliteSchema(sql: string): string {
   return sql.replace(/\s+/g, ' ').trim().replace(/;$/, '')
+}
+
+function assertAttemptDatabaseChildren(rootReceipt: ManagedRootReceipt): void {
+  assertManagedRootReceiptSync(rootReceipt)
+  for (const name of ['attempts.sqlite', 'attempts.sqlite-wal', 'attempts.sqlite-shm', 'attempts.sqlite-journal']) {
+    const child = path.join(rootReceipt.path, name)
+    try {
+      const metadata = lstatSync(child)
+      if (!metadata.isFile() || metadata.isSymbolicLink()
+        || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())) {
+        throw fixedCatalogFailure()
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  for (const name of readdirSync(rootReceipt.path)) {
+    if (!/^\.allocation-generation-[1-9]\d*$/.test(name)) continue
+    const metadata = lstatSync(path.join(rootReceipt.path, name))
+    if (!metadata.isFile() || metadata.isSymbolicLink()
+      || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())) throw fixedCatalogFailure()
+  }
+}
+
+function attemptGenerationMarkers(rootReceipt: ManagedRootReceipt): number[] {
+  assertAttemptDatabaseChildren(rootReceipt)
+  return readdirSync(rootReceipt.path).flatMap(name => {
+    const matched = /^\.allocation-generation-([1-9]\d*)$/.exec(name)
+    if (!matched) return []
+    const generation = Number(matched[1])
+    if (!Number.isSafeInteger(generation)) throw fixedCatalogFailure()
+    return [generation]
+  }).sort((left, right) => left - right)
+}
+
+function validateAttemptGenerationMarker(rootReceipt: ManagedRootReceipt, generation: number): void {
+  const markers = attemptGenerationMarkers(rootReceipt)
+  if (generation === 0 ? markers.length !== 0 : markers.at(-1) !== generation) throw fixedCatalogFailure()
+}
+
+function stageAttemptGenerationMarker(rootReceipt: ManagedRootReceipt, generation: number): void {
+  const descriptor = openManagedRootDescriptor(rootReceipt)
+  try {
+    const marker = path.join(descriptor.path, `.allocation-generation-${generation}`)
+    let fd: number
+    try {
+      fd = openSync(marker, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+        | (fsConstants.O_NOFOLLOW ?? 0), 0o600)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      const metadata = lstatSync(marker)
+      if (!metadata.isFile() || metadata.isSymbolicLink()) throw fixedCatalogFailure()
+      return
+    }
+    closeSync(fd)
+  } finally {
+    if (descriptor.fd !== null) closeSync(descriptor.fd)
+  }
+}
+
+function cleanupAttemptGenerationMarkers(rootReceipt: ManagedRootReceipt, generation: number): void {
+  const descriptor = openManagedRootDescriptor(rootReceipt)
+  try {
+    for (const marker of attemptGenerationMarkers(rootReceipt)) {
+      if (marker >= generation) continue
+      try { unlinkSync(path.join(descriptor.path, `.allocation-generation-${marker}`)) } catch {}
+    }
+  } finally {
+    if (descriptor.fd !== null) closeSync(descriptor.fd)
+  }
 }
 
 function validateAttemptDatabase(database: Database): number {
@@ -458,7 +632,9 @@ function validateAttemptDatabase(database: Database): number {
         SELECT count(*) AS count FROM sqlite_schema WHERE name NOT LIKE 'sqlite_autoindex_%'
       `).get()?.count
       if (currentVersion !== 0 || currentObjects !== 0) throw fixedCatalogFailure()
-      database.exec(`${ATTEMPT_TABLE_SQL}; PRAGMA user_version = ${ATTEMPT_SCHEMA_VERSION}; COMMIT`)
+      database.exec(`${ATTEMPT_TABLE_SQL}; ${ATTEMPT_STATE_SQL};
+        INSERT INTO allocation_state(singleton, generation) VALUES (1, 0);
+        PRAGMA user_version = ${ATTEMPT_SCHEMA_VERSION}; COMMIT`)
     } catch (error) {
       try { database.exec('ROLLBACK') } catch {}
       throw error
@@ -470,12 +646,16 @@ function validateAttemptDatabase(database: Database): number {
     SELECT type, name, tbl_name, sql FROM sqlite_schema
     WHERE name NOT LIKE 'sqlite_autoindex_%' ORDER BY type, name
   `).all()
-  if (validatedObjects.length !== 2) throw fixedCatalogFailure()
+  if (validatedObjects.length !== 3) throw fixedCatalogFailure()
   const allocation = validatedObjects.find(object => object.name === 'allocation_ticket')
+  const state = validatedObjects.find(object => object.name === 'allocation_state')
   const sequence = validatedObjects.find(object => object.name === 'sqlite_sequence')
   if (!allocation || allocation.type !== 'table' || allocation.tbl_name !== 'allocation_ticket'
     || typeof allocation.sql !== 'string'
     || normalizeSqliteSchema(allocation.sql) !== normalizeSqliteSchema(ATTEMPT_TABLE_SQL)
+    || !state || state.type !== 'table' || state.tbl_name !== 'allocation_state'
+    || typeof state.sql !== 'string'
+    || normalizeSqliteSchema(state.sql) !== normalizeSqliteSchema(ATTEMPT_STATE_SQL)
     || !sequence || sequence.type !== 'table' || sequence.tbl_name !== 'sqlite_sequence'
     || sequence.sql !== 'CREATE TABLE sqlite_sequence(name,seq)'
     || validatedObjects.some(object => object.type === 'trigger' || object.type === 'index')) {
@@ -488,6 +668,34 @@ function validateAttemptDatabase(database: Database): number {
     !== JSON.stringify([['id', 'INTEGER', 0, 1], ['scope_hash', 'TEXT', 1, 0], ['started_at', 'INTEGER', 1, 0]])) {
     throw fixedCatalogFailure()
   }
+  const stateColumns = database.query<{
+    name: string; type: string; notnull: number; pk: number
+  }, []>('PRAGMA table_info(allocation_state)').all()
+  if (JSON.stringify(stateColumns.map(column => [column.name, column.type, column.notnull, column.pk]))
+    !== JSON.stringify([['singleton', 'INTEGER', 0, 1], ['generation', 'INTEGER', 1, 0]])) {
+    throw fixedCatalogFailure()
+  }
+  const ledger = database.query<{
+    generation: number; count: number; minimum: number | null; maximum: number | null; total: number | null
+  }, []>(`SELECT s.generation, count(t.id) AS count, min(t.id) AS minimum,
+      max(t.id) AS maximum, sum(t.id) AS total
+    FROM allocation_state s LEFT JOIN allocation_ticket t ON true
+    WHERE s.singleton = 1 GROUP BY s.generation`).get()
+  const sequences = database.query<{ name: string; seq: number }, []>(
+    'SELECT name, seq FROM sqlite_sequence ORDER BY name',
+  ).all()
+  if (!ledger || !Number.isSafeInteger(ledger.generation) || ledger.generation < 0
+    || sequences.some(sequenceRow => sequenceRow.name !== 'allocation_ticket')
+    || (ledger.generation === 0
+      ? ledger.count !== 0 || sequences.length !== 0
+      : (() => {
+        const expectedCount = Math.min(ATTEMPT_ROW_CAPACITY, ledger.generation)
+        const expectedMinimum = ledger.generation - expectedCount + 1
+        const expectedTotal = expectedCount * (expectedMinimum + ledger.generation) / 2
+        return ledger.count !== expectedCount || ledger.minimum !== expectedMinimum
+          || ledger.maximum !== ledger.generation || ledger.total !== expectedTotal
+          || sequences.length !== 1 || sequences[0]?.seq !== ledger.generation
+      })())) throw fixedCatalogFailure()
   const integrity = database.query<{ quick_check: string }, []>('PRAGMA quick_check(1)').get()?.quick_check
   if (integrity !== 'ok') throw fixedCatalogFailure()
   const schemaVersion = database.query<{ schema_version: number }, []>('PRAGMA schema_version').get()?.schema_version
@@ -506,12 +714,14 @@ function openAttemptDatabase(rootReceipt: ManagedRootReceipt): Database {
     && durableAttemptDatabase?.rootDescriptor !== undefined) closeSync(durableAttemptDatabase.rootDescriptor)
   durableAttemptDatabase = null
   assertManagedRootReceiptSync(rootReceipt)
+  assertAttemptDatabaseChildren(rootReceipt)
   const descriptor = openManagedRootDescriptor(rootReceipt)
   const database = new Database(path.join(descriptor.path, 'attempts.sqlite'), { create: true, strict: true })
   try {
     database.exec('PRAGMA busy_timeout = 0')
     database.exec('PRAGMA journal_mode = WAL')
     database.exec('PRAGMA synchronous = NORMAL')
+    assertAttemptDatabaseChildren(rootReceipt)
     const schemaVersion = validateAttemptDatabase(database)
     durableAttemptDatabase = {
       filePath: databasePath, database, rootReceipt, rootDescriptor: descriptor.fd, schemaVersion,
@@ -529,26 +739,56 @@ function openAttemptDatabase(rootReceipt: ManagedRootReceipt): Database {
  * SQLite lock waits are disabled; contention retries yield to the event loop
  * and are bounded by the caller's exact remaining attempt budget.
  */
-export async function allocateOpenCodeProviderCatalogAttempt(
+export async function runOpenCodeProviderCatalogAttemptAllocationWorkerOperation(
   scope: string,
   startedAt: number,
-  controls: Readonly<{ deadline?: number; abortSignal?: AbortSignal }> = {},
+  controls: Readonly<{
+    deadline?: number
+    abortSignal?: AbortSignal
+    cacheHome?: string
+    windowsPlatformAuthority?: boolean
+    testStallPhase?: 'open' | 'commit'
+    testGate?: Readonly<{ phase: 'open' | 'commit'; path: string }>
+  }> = {},
 ): Promise<Readonly<{
   requestGeneration: number
   attemptIdentity: `sha256:${string}`
 }>> {
   const deadline = controls.deadline ?? Number.POSITIVE_INFINITY
   if (!boundedString(scope) || !Number.isSafeInteger(startedAt) || startedAt < 0) throw fixedCatalogFailure()
-  const cacheHome = catalogCacheHome()
+  if (process.platform === 'win32') {
+    if (!controls.windowsPlatformAuthority || controls.testGate || controls.testStallPhase) {
+      // Deterministic file-sandbox controls never downgrade the production
+      // Windows registry authority to a raw-path test fallback.
+      throw fixedCatalogFailure()
+    }
+    return allocateWindowsCatalogAttempt(scope, startedAt, deadline)
+  }
+  const cacheHome = controls.cacheHome ?? catalogCacheHome()
   const root = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v2')
   const expectedDatabasePath = path.join(root, 'attempts.sqlite')
   const rootReceipt = durableAttemptDatabase?.filePath === expectedDatabasePath
     ? durableAttemptDatabase.rootReceipt
     : captureManagedRootSync(root)
+  const workerBoundary = (phase: 'open' | 'commit'): void => {
+    if (controls.testStallPhase === phase) {
+      const state = new Int32Array(new SharedArrayBuffer(4))
+      Atomics.wait(state, 0, 0)
+    }
+    if (controls.testGate?.phase === phase) {
+      writeFileSync(`${controls.testGate.path}.entered`, '', { flag: 'wx', mode: 0o600 })
+      const sleeper = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(`${controls.testGate.path}.release`)) Atomics.wait(sleeper, 0, 0, 1)
+    }
+  }
   for (;;) {
     if (controls.abortSignal?.aborted || performance.now() >= deadline) throw fixedCatalogFailure()
     let database: Database | null = null
     try {
+      workerBoundary('open')
+      // The deterministic race hook above is before the final child check, so
+      // a path swap is rejected before SQLite is allowed to open or mutate it.
+      assertAttemptDatabaseChildren(rootReceipt)
       database = openAttemptDatabase(rootReceipt)
       const current = database.query<{ user_version: number; schema_version: number }, []>(`
         SELECT user_version, schema_version FROM pragma_user_version(), pragma_schema_version()
@@ -560,15 +800,44 @@ export async function allocateOpenCodeProviderCatalogAttempt(
       }
       if (performance.now() >= deadline) throw fixedCatalogFailure()
       database.exec('BEGIN IMMEDIATE')
+      // Revalidate inside the same write transaction that advances the
+      // allocator. A reset sequence, deleted ticket or forged retained row can
+      // never be accepted between the outer validation and commit.
+      validateAttemptDatabase(database)
+      const state = database.query<{ generation: number }, []>(
+        'SELECT generation FROM allocation_state WHERE singleton = 1',
+      ).get()
+      if (!state || !Number.isSafeInteger(state.generation) || state.generation < 0) {
+        throw fixedCatalogFailure()
+      }
+      validateAttemptGenerationMarker(rootReceipt, state.generation)
       const row = database.query<{ id: number }, [string, number]>(`
         INSERT INTO allocation_ticket(scope_hash, started_at) VALUES (?1, ?2)
         RETURNING id
       `).get(hash(scope), startedAt)
-      if (!row || !Number.isSafeInteger(row.id) || row.id < 1) throw fixedCatalogFailure()
+      if (!row || !Number.isSafeInteger(row.id) || row.id !== state.generation + 1) {
+        throw fixedCatalogFailure()
+      }
+      const advanced = database.query(
+        'UPDATE allocation_state SET generation = ?1 WHERE singleton = 1 AND generation = ?2',
+      ).run(row.id, state.generation)
+      if (advanced.changes !== 1) throw fixedCatalogFailure()
       database.query('DELETE FROM allocation_ticket WHERE id <= ?1').run(
         Math.max(0, row.id - ATTEMPT_ROW_CAPACITY),
       )
+      validateAttemptDatabase(database)
+      workerBoundary('commit')
+      // This is the last path boundary before the SQLite commit can create or
+      // update a journal/WAL sidecar. Reject a child or managed-root swap here;
+      // POSIX then continues through the held descriptor-root path.
+      assertManagedRootReceiptSync(rootReceipt)
+      assertAttemptDatabaseChildren(rootReceipt)
+      if (controls.abortSignal?.aborted || performance.now() >= deadline) {
+        throw fixedCatalogFailure()
+      }
+      stageAttemptGenerationMarker(rootReceipt, row.id)
       database.exec('COMMIT')
+      cleanupAttemptGenerationMarkers(rootReceipt, row.id)
       const attemptIdentity = redactedFingerprint('opencode-catalog-attempt-v3', boundedIdentityMaterial([
         scope, row.id, startedAt, randomUUID(),
       ]))
@@ -581,6 +850,264 @@ export async function allocateOpenCodeProviderCatalogAttempt(
       await new Promise<void>(resolve => setTimeout(resolve, 0))
     }
   }
+}
+
+type AllocationWorkerReply = Readonly<{
+  id: string
+  result?: Readonly<{ requestGeneration: number; attemptIdentity: `sha256:${string}` }>
+  failed?: true
+}>
+
+type AllocationWorkerProcess = Readonly<{
+  pid: number
+  stdin: { write(value: string): number; end(): void }
+  stdout: ReadableStream<Uint8Array>
+  exited: Promise<number>
+  kill(signal?: number | NodeJS.Signals): void
+  unref(): void
+}>
+
+let allocationWorker: AllocationWorkerProcess | null = null
+let allocationWorkerTermination: Promise<void> = Promise.resolve()
+let allocationWorkerTerminating = false
+let allocationWorkerTerminationEpoch = 0
+let allocationWorkerActiveId: string | null = null
+let allocationWorkerIdleTimer: ReturnType<typeof setTimeout> | null = null
+const allocationWorkerRequests = new Map<string, {
+  resolve(value: Readonly<{ requestGeneration: number; attemptIdentity: `sha256:${string}` }>): void
+  reject(): void
+  timer: ReturnType<typeof setTimeout>
+  abortSignal?: AbortSignal
+  abortListener?: () => void
+  payload: Readonly<{
+    id: string
+    scope: string
+    startedAt: number
+    budgetMs: number
+    cacheHome: string
+    windowsPlatformAuthority: boolean
+    testStallPhase?: 'open' | 'commit'
+    testGate?: Readonly<{ phase: 'open' | 'commit'; path: string }>
+  }>
+}>()
+
+function terminateAllocationWorker(): void {
+  if (allocationWorkerIdleTimer) clearTimeout(allocationWorkerIdleTimer)
+  allocationWorkerIdleTimer = null
+  const worker = allocationWorker
+  allocationWorker = null
+  const activeId = allocationWorkerActiveId
+  allocationWorkerActiveId = null
+  if (worker) {
+    allocationWorkerTerminating = true
+    allocationWorkerTerminationEpoch += 1
+    try { worker.stdin.end() } catch {}
+    try { worker.kill('SIGKILL') } catch {}
+    const terminated = new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        try { process.kill(worker.pid, 'SIGKILL') } catch {}
+        resolve()
+      }, 250)
+      timer.unref?.()
+      void worker.exited.then(
+        () => { clearTimeout(timer); resolve() },
+        () => { clearTimeout(timer); resolve() },
+      )
+    })
+    allocationWorkerTermination = Promise.all([
+      allocationWorkerTermination.catch(() => undefined), terminated,
+    ]).then(() => undefined)
+  }
+  if (activeId) {
+    const request = allocationWorkerRequests.get(activeId)
+    if (request) {
+      allocationWorkerRequests.delete(activeId)
+      clearTimeout(request.timer)
+      if (request.abortSignal && request.abortListener) {
+        request.abortSignal.removeEventListener('abort', request.abortListener)
+      }
+      request.reject()
+    }
+  }
+  const terminationEpoch = allocationWorkerTerminationEpoch
+  void allocationWorkerTermination.then(() => {
+    if (terminationEpoch !== allocationWorkerTerminationEpoch) return
+    allocationWorkerTerminating = false
+    pumpAllocationWorker()
+  })
+}
+
+function pumpAllocationWorker(): void {
+  if (allocationWorkerIdleTimer) clearTimeout(allocationWorkerIdleTimer)
+  allocationWorkerIdleTimer = null
+  if (allocationWorkerActiveId || allocationWorkerTerminating) return
+  const next = allocationWorkerRequests.entries().next().value as
+    | [string, (typeof allocationWorkerRequests extends Map<string, infer V> ? V : never)]
+    | undefined
+  if (!next) return
+  const [id, request] = next
+  allocationWorkerActiveId = id
+  try {
+    getAllocationWorker().stdin.write(`${JSON.stringify(request.payload)}\n`)
+  } catch {
+    terminateAllocationWorker()
+  }
+}
+
+function acceptAllocationWorkerReply(unsafeReply: unknown): void {
+  const reply = snapshotRecord(unsafeReply) as AllocationWorkerReply | null
+  if (!reply || typeof reply.id !== 'string') return terminateAllocationWorker()
+  const request = allocationWorkerRequests.get(reply.id)
+  if (!request || allocationWorkerActiveId !== reply.id) return terminateAllocationWorker()
+  if (reply.failed || !reply.result) {
+    // A failed native/schema operation cannot leave a cached SQLite handle
+    // or transaction in the authority process. SIGKILL is the preemptible
+    // cleanup boundary; a repaired request starts in a fresh authority.
+    terminateAllocationWorker()
+    return
+  }
+  allocationWorkerRequests.delete(reply.id)
+  allocationWorkerActiveId = null
+  clearTimeout(request.timer)
+  if (request.abortSignal && request.abortListener) {
+    request.abortSignal.removeEventListener('abort', request.abortListener)
+  }
+  request.resolve(reply.result)
+  if (allocationWorkerRequests.size > 0) pumpAllocationWorker()
+  else {
+    allocationWorkerIdleTimer = setTimeout(terminateAllocationWorker, 25)
+    allocationWorkerIdleTimer.unref?.()
+  }
+}
+
+function getAllocationWorker(): AllocationWorkerProcess {
+  if (allocationWorker) return allocationWorker
+  const sourceRuntime = /(?:^|[\\/])bun(?:\.exe)?$/i.test(process.execPath)
+  const workerPath = fileURLToPath(new URL(
+    import.meta.url.endsWith('.ts')
+      ? './OpenCodeProviderCatalogAllocationWorker.ts'
+      : './OpenCodeProviderCatalogAllocationWorker.js',
+    import.meta.url,
+  ))
+  const workerCommand = sourceRuntime
+    ? [process.execPath, workerPath]
+    : [path.join(path.dirname(process.execPath),
+      `opencode-catalog-allocation-worker${process.platform === 'win32' ? '.exe' : ''}`)]
+  const worker = Bun.spawn({
+    cmd: workerCommand,
+    stdin: 'pipe', stdout: 'pipe', stderr: 'ignore',
+  }) as unknown as AllocationWorkerProcess
+  worker.unref()
+  allocationWorker = worker
+  void (async () => {
+    const reader = worker.stdout.getReader()
+    const decoder = new TextDecoder()
+    let pending = ''
+    try {
+      for (;;) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        pending += decoder.decode(chunk.value, { stream: true })
+        for (;;) {
+          const newline = pending.indexOf('\n')
+          if (newline < 0) break
+          const line = pending.slice(0, newline)
+          pending = pending.slice(newline + 1)
+          if (!line) continue
+          try { acceptAllocationWorkerReply(JSON.parse(line)) }
+          catch { terminateAllocationWorker() }
+        }
+      }
+    } catch {}
+  })()
+  void worker.exited.then(() => {
+    if (allocationWorker === worker) terminateAllocationWorker()
+  })
+  return worker
+}
+
+/**
+ * Runs every synchronous SQLite open/schema/check/transaction/commit in a
+ * terminable worker. The caller's event loop retains ownership of the absolute
+ * deadline and can preempt a native call instead of checking elapsed time only
+ * after that call eventually returns.
+ */
+export function allocateOpenCodeProviderCatalogAttempt(
+  scope: string,
+  startedAt: number,
+  controls: Readonly<{
+    deadline?: number
+    abortSignal?: AbortSignal
+    /** Deterministic worker-boundary fault injection; test code only. */
+    testStallPhase?: 'open' | 'commit'
+    /** Deterministic no-follow swap gate; test code only. */
+    testGate?: Readonly<{ phase: 'open' | 'commit'; path: string }>
+    /** Explicit deterministic sandbox authority; test code only. */
+    cacheHome?: string
+  }> = {},
+): Promise<Readonly<{
+  requestGeneration: number
+  attemptIdentity: `sha256:${string}`
+}>> {
+  if (!boundedString(scope) || !Number.isSafeInteger(startedAt) || startedAt < 0
+    || controls.abortSignal?.aborted) return Promise.reject(fixedCatalogFailure())
+  let cacheHome: string
+  try {
+    cacheHome = controls.cacheHome === undefined
+      ? catalogCacheHome()
+      : assertAbsoluteManagedPath(controls.cacheHome, 'OpenCode catalog test cache home')
+  } catch { return Promise.reject(fixedCatalogFailure()) }
+  const remaining = Math.max(0, Math.min(
+    MAX_TIMEOUT_MS,
+    (controls.deadline ?? performance.now() + DEFAULT_TIMEOUT_MS) - performance.now(),
+  ))
+  if (remaining <= 0) return Promise.reject(fixedCatalogFailure())
+  return new Promise((resolve, reject) => {
+    const id = randomUUID()
+    const rejectFixed = () => reject(fixedCatalogFailure())
+    const timer = setTimeout(() => {
+      if (!allocationWorkerRequests.has(id)) return
+      // A native call may have stalled the worker. Termination is the bounded,
+      // preemptible cleanup boundary and rejects every queued owner safely.
+      if (allocationWorkerActiveId === id) terminateAllocationWorker()
+      else {
+        const queued = allocationWorkerRequests.get(id)
+        allocationWorkerRequests.delete(id)
+        if (queued?.abortSignal && queued.abortListener) {
+          queued.abortSignal.removeEventListener('abort', queued.abortListener)
+        }
+        queued?.reject()
+      }
+    }, remaining)
+    timer.unref?.()
+    const request = {
+      resolve,
+      reject: rejectFixed,
+      timer,
+      abortSignal: controls.abortSignal,
+      abortListener: undefined as (() => void) | undefined,
+      payload: {
+        id, scope, startedAt, budgetMs: remaining, cacheHome,
+        windowsPlatformAuthority: controls.cacheHome === undefined,
+        testStallPhase: controls.testStallPhase,
+        testGate: controls.testGate,
+      },
+    }
+    if (controls.abortSignal) {
+      request.abortListener = () => {
+        if (!allocationWorkerRequests.has(id)) return
+        if (allocationWorkerActiveId === id) terminateAllocationWorker()
+        else {
+          allocationWorkerRequests.delete(id)
+          clearTimeout(request.timer)
+          request.reject()
+        }
+      }
+      controls.abortSignal.addEventListener('abort', request.abortListener, { once: true })
+    }
+    allocationWorkerRequests.set(id, request)
+    pumpAllocationWorker()
+  })
 }
 
 function catalogCacheHome(): string {
@@ -681,7 +1208,11 @@ async function defaultPublishPointer(
   cacheKey: string,
   value: unknown,
   maxEntries: number,
-): Promise<void> {
+  abortSignal?: AbortSignal,
+  deadline = Number.POSITIVE_INFINITY,
+  beforeVisibility?: () => void | Promise<void>,
+  afterRetentionAuthorityRemoval?: () => void | Promise<void>,
+): Promise<boolean> {
   const encoded = JSON.stringify(value)
   if (new TextEncoder().encode(encoded).byteLength > MAX_PERSISTED_BYTES) throw fixedCatalogFailure()
   const pointer = decodeCommittedPointer(value)
@@ -689,52 +1220,212 @@ async function defaultPublishPointer(
   const receipt = captureManagedRootSync(await cacheRootPath())
   const descriptor = openManagedRootDescriptor(receipt)
   const root = descriptor.path
+  const lockPath = path.join(root, '.publication.lock')
+  const ownerToken = randomUUID()
+  const ownerPath = path.join(root, `.publication.owner.${process.pid}.${ownerToken}.json`)
+  let ownsLock = false
+  const processIdentity = async (pid: number): Promise<string | null> => {
+    if (process.platform !== 'linux') return pid === process.pid
+      ? `${process.pid}:${process.uptime()}`
+      : null
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
+      const close = stat.lastIndexOf(')')
+      const fields = stat.slice(close + 2).split(' ')
+      const startTime = fields[19]
+      return /^\d+$/.test(startTime ?? '') ? `linux:${pid}:${startTime}` : null
+    } catch { return null }
+  }
+  const thisProcessIdentity = await processIdentity(process.pid)
+  if (!thisProcessIdentity) throw fixedCatalogFailure()
+  const ownerHandle = await open(ownerPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600)
   try {
-  const allFiles = await readdir(root).catch(() => [])
+    await ownerHandle.writeFile(JSON.stringify({
+      pid: process.pid, token: ownerToken, processIdentity: thisProcessIdentity,
+    }))
+    await ownerHandle.sync()
+  } finally { await ownerHandle.close() }
+  try {
+  // The hard link is an atomic no-replace mutex whose owner bytes are already
+  // complete and durable. There is no mkdir -> owner.json crash window.
+  for (;;) {
+    if (abortSignal?.aborted || performance.now() >= deadline) throw fixedCatalogFailure()
+    try {
+      await link(ownerPath, lockPath)
+      const [ownerMetadata, lockMetadata] = [lstatSync(ownerPath), lstatSync(lockPath)]
+      if (!ownerMetadata.isFile() || !lockMetadata.isFile()
+        || ownerMetadata.isSymbolicLink() || lockMetadata.isSymbolicLink()
+        || ownerMetadata.dev !== lockMetadata.dev || ownerMetadata.ino !== lockMetadata.ino) {
+        throw fixedCatalogFailure()
+      }
+      ownsLock = true
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw fixedCatalogFailure()
+      try {
+        const lockMetadata = lstatSync(lockPath)
+        if (!lockMetadata.isFile() || lockMetadata.isSymbolicLink()) throw fixedCatalogFailure()
+        const held = await open(lockPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+        let owner: { pid?: unknown; token?: unknown; processIdentity?: unknown }
+        try {
+          const heldMetadata = await held.stat()
+          if (heldMetadata.dev !== lockMetadata.dev || heldMetadata.ino !== lockMetadata.ino) {
+            throw fixedCatalogFailure()
+          }
+          owner = JSON.parse((await held.readFile()).toString())
+        } finally { await held.close() }
+        if (!Number.isSafeInteger(owner.pid) || (owner.pid as number) < 1
+          || typeof owner.token !== 'string' || typeof owner.processIdentity !== 'string') {
+          throw fixedCatalogFailure()
+        }
+        const liveIdentity = await processIdentity(owner.pid as number)
+        let alive = true
+        try { process.kill(owner.pid as number, 0) }
+        catch (killError) {
+          if ((killError as NodeJS.ErrnoException).code === 'ESRCH') alive = false
+          else throw fixedCatalogFailure()
+        }
+        // A matching birth identity is a live owner. A dead PID or a reused
+        // PID with a different birth identity is a provably stale lock.
+        if (alive && (liveIdentity === null || liveIdentity === owner.processIdentity)) {
+          await new Promise<void>(resolve => setTimeout(resolve, 1))
+          continue
+        }
+        const current = lstatSync(lockPath)
+        if (current.dev !== lockMetadata.dev || current.ino !== lockMetadata.ino) continue
+        await unlink(lockPath)
+        const staleOwnerPath = path.join(
+          root, `.publication.owner.${owner.pid as number}.${owner.token}.json`,
+        )
+        try {
+          const staleOwner = lstatSync(staleOwnerPath)
+          if (staleOwner.isFile() && !staleOwner.isSymbolicLink()
+            && staleOwner.dev === lockMetadata.dev && staleOwner.ino === lockMetadata.ino) {
+            await unlink(staleOwnerPath)
+          }
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
+        }
+        if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+        continue
+      } catch (lockError) {
+        if ((lockError as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw fixedCatalogFailure()
+      }
+    }
+  }
+  if (abortSignal?.aborted || performance.now() >= deadline) throw fixedCatalogFailure()
+  let allFiles = await readdir(root).catch(() => [])
+  // A retention crash may leave a non-authoritative reclaim marker after the
+  // commit name was removed. Finish that exact attempt-owned cleanup before
+  // considering current winners.
+  for (const file of allFiles.filter(file => /^[0-9a-f]{64}\..+\.reclaim\.json$/.test(file))) {
+    const pointerToReclaim = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
+    if (!pointerToReclaim) throw fixedCatalogFailure()
+    await unlink(path.join(root,
+      `${file.slice(0, 64)}.${pointerToReclaim.attemptId}.stage.json`)).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
+    })
+    await unlink(path.join(root, file))
+    if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+  }
+  allFiles = await readdir(root).catch(() => [])
   const decoded = (await Promise.all(allFiles
     .filter(file => /^[0-9a-f]{64}\..+\.commit\.json$/.test(file))
     .map(async file => ({ file, keyHash: file.slice(0, 64),
       pointer: decodeCommittedPointer(await readJsonFile(path.join(root, file))) }))))
     .filter((entry): entry is { file: string; keyHash: string; pointer: CommittedPointer } => entry.pointer !== null)
-  decoded.sort((left, right) => compareCommittedPointers(right.pointer, left.pointer))
-  const capacity = Math.max(1, maxEntries)
-  const retained = decoded.slice(0, Math.max(0, capacity - 1))
-  const evicted = decoded.slice(retained.length)
+  const existingForKey = decoded
+    .filter(entry => entry.keyHash === hash(cacheKey))
+    .sort((left, right) => compareCommittedPointers(right.pointer, left.pointer))[0]
+  if (existingForKey && (compareCommittedPointers(existingForKey.pointer, pointer) > 0
+    || (existingForKey.pointer.requestGeneration === pointer.requestGeneration
+      && existingForKey.pointer.attemptIdentity !== pointer.attemptIdentity))) {
+    throw fixedCatalogFailure()
+  }
   const unlinkRequired = async (filePath: string): Promise<void> => {
     try { await unlink(filePath) } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
     }
   }
-  const retainedAttempts = new Set(retained.map(entry => `${entry.keyHash}.${entry.pointer.attemptId}`))
-  const committedAttempts = new Set(decoded.map(entry => `${entry.keyHash}.${entry.pointer.attemptId}`))
-  const candidateAttempt = `${hash(cacheKey)}.${pointer.attemptId}`
+  const unlinkRequiredSync = (filePath: string): void => {
+    try { unlinkSync(filePath) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
+    }
+  }
+  // An uncommitted stage can belong to a live publisher in another process.
+  // Never infer it obsolete from this candidate's generation. Only retention
+  // of a proven committed loser may remove its exactly named stage below.
   for (const file of allFiles.filter(file => /^[0-9a-f]{64}\..+\.stage\.json$/.test(file))) {
-    const attempt = file.slice(0, -'.stage.json'.length)
-    if (attempt === candidateAttempt || retainedAttempts.has(attempt) || committedAttempts.has(attempt)) continue
     const envelope = snapshotRecord(await readJsonFile(path.join(root, file)))
     const evidence = envelope && snapshotRecord(envelope.catalogEvidence)
-    if (evidence && Number.isSafeInteger(evidence.requestGeneration)
-      && (evidence.requestGeneration as number) >= pointer.requestGeneration) continue
+    if (evidence && Number.isSafeInteger(evidence.requestGeneration)) continue
     await unlinkRequired(path.join(root, file))
   }
-  // Finish fallible crash cleanup before touching a valid winner. Reclaim a
-  // winner's stage first so a cleanup failure cannot remove its commit while
-  // leaving an apparently usable orphan envelope behind.
-  for (const entry of evicted) {
-    await unlinkRequired(path.join(root, `${entry.keyHash}.${entry.pointer.attemptId}.stage.json`))
-    await unlinkRequired(path.join(root, entry.file))
-  }
   const target = defaultCommitFilePath(root, cacheKey, pointer)
+  const published = [...decoded.filter(entry => entry.file !== path.basename(target)), {
+    file: path.basename(target), keyHash: hash(cacheKey), pointer,
+  }].sort((left, right) => compareCommittedPointers(right.pointer, left.pointer))
+  const evicted = published.slice(Math.max(1, maxEntries))
+  // Decide retention before the candidate has any authoritative name. An
+  // already-superseded global-capacity loser is never visible, even briefly.
+  if (evicted.some(entry => entry.file === path.basename(target))) return false
   const temporary = `${target}.tmp-${process.pid}-${randomUUID()}`
-  await writeFile(temporary, encoded, { flag: 'wx', mode: 0o600 })
+  const temporaryHandle = await open(temporary, 'wx', 0o600)
+  try {
+    await temporaryHandle.writeFile(encoded)
+    await beforeVisibility?.()
+    await temporaryHandle.sync()
+  } finally {
+    await temporaryHandle.close()
+  }
   assertManagedRootReceiptSync(receipt)
-  // Sole visibility transition. There is deliberately no await or fallible
-  // retention/validation work after this rename.
+  // A synchronous time/cancellation fence immediately precedes the sole
+  // visibility transition. A native sync that overruns the attempt budget can
+  // therefore never rename a commit after the public deadline wins.
+  if (abortSignal?.aborted || performance.now() >= deadline) {
+    try { unlinkSync(temporary) } catch {}
+    throw fixedCatalogFailure()
+  }
   try { renameSync(temporary, target) } catch (error) {
     try { unlinkSync(temporary) } catch { /* descriptor-owned temporary may already be absent */ }
     throw error
   }
+  if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+  // Only after the successor is durable and visible may capacity reclaim old
+  // winners. Recompute from the authority while holding the same lock.
+  for (const entry of evicted) {
+    try {
+      // Remove authority first and make that loss durable. A crash can leave an
+      // reclaim marker, but can never leave an authoritative commit with no stage.
+      const commitPath = path.join(root, entry.file)
+      const reclaimPath = commitPath.replace(/\.commit\.json$/, '.reclaim.json')
+      renameSync(commitPath, reclaimPath)
+      if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+      if (afterRetentionAuthorityRemoval) await afterRetentionAuthorityRemoval()
+      unlinkRequiredSync(path.join(root, `${entry.keyHash}.${entry.pointer.attemptId}.stage.json`))
+      unlinkRequiredSync(reclaimPath)
+    } catch {
+      // Publication is already committed. Any reclaim marker is restart-safe;
+      // stop at the first I/O failure and finish it under the next lock owner.
+      break
+    }
+  }
+  if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+  return true
   } finally {
+    if (ownsLock) {
+      try {
+        const [ownerMetadata, lockMetadata] = [lstatSync(ownerPath), lstatSync(lockPath)]
+        if (ownerMetadata.isFile() && lockMetadata.isFile()
+          && ownerMetadata.dev === lockMetadata.dev && ownerMetadata.ino === lockMetadata.ino) {
+          unlinkSync(lockPath)
+        }
+      } catch {}
+    }
+    try { unlinkSync(ownerPath) } catch {}
     if (descriptor.fd !== null) {
       try { closeSync(descriptor.fd) } catch { /* publication outcome is already determined */ }
     }
@@ -1091,10 +1782,21 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       : defaultStagePersisted(key, attemptId, envelope)
   }
 
-  private publish(key: string, pointer: CommittedPointer, maxEntries: number): Promise<void> {
+  private publish(
+    key: string,
+    pointer: CommittedPointer,
+    maxEntries: number,
+    abortSignal?: AbortSignal,
+    deadline?: number,
+    beforeVisibility?: () => void | Promise<void>,
+    afterRetentionAuthorityRemoval?: () => void | Promise<void>,
+  ): Promise<boolean> {
     return this.deps.writePersisted
-      ? this.deps.writePersisted(pointerStorageKey(key), pointer)
-      : defaultPublishPointer(key, pointer, maxEntries)
+      ? this.deps.writePersisted(pointerStorageKey(key), pointer).then(() => true)
+      : defaultPublishPointer(
+          key, pointer, maxEntries, abortSignal, deadline, beforeVisibility,
+          afterRetentionAuthorityRemoval,
+        )
   }
 
   private async revokePublishedPointer(
@@ -1248,11 +1950,22 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           this.discardStage(params.key, attemptId)
           return false
         }
-        params.flight.finalizingPublication = true
         try {
-          await this.publish(params.key, candidatePointer, params.maxEntries)
+          const retained = await this.publish(
+            params.key, candidatePointer, params.maxEntries, params.signal, params.flight.deadline,
+            this.deps.beforeVisibilitySync,
+            this.deps.afterRetentionAuthorityRemoval,
+          )
+          if (!retained) {
+            this.discardStage(params.key, attemptId)
+            return false
+          }
         } catch {
-          params.flight.finalizingPublication = false
+          this.discardStage(params.key, attemptId)
+          return false
+        }
+        if (!this.hasCommitAuthority(params)) {
+          await defaultDiscardPointer(params.key, candidatePointer)
           this.discardStage(params.key, attemptId)
           return false
         }
@@ -1456,7 +2169,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         acquiredHostKey = null
         if (hostKey) await this.release(hostKey)
         if (signal.aborted) throw fixedCatalogFailure()
-        if (!await this.commitCatalog({
+        const committed = await this.commitCatalog({
           key,
           identity,
           profileRootPath,
@@ -1468,7 +2181,49 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           maxEntries,
           signal,
           flight: params.flight,
-        })) throw fixedCatalogFailure()
+        })
+        if (!committed) {
+          // Publication is authoritative. If this candidate lost, it may only
+          // return the durable winner for this exact cache identity; it must
+          // never return or remember its own non-retained bytes.
+          const winnerPointer = decodeCommittedPointer(await this.readPointer(key).catch(() => null))
+          const winner = winnerPointer
+            ? decodePersistedCatalog(
+                await this.readStage(key, winnerPointer.attemptId).catch(() => null), identity,
+              )
+            : null
+          if (winnerPointer && winner
+            && winner.catalog.generation === winnerPointer.generation
+            && winner.catalogEvidence.requestGeneration === winnerPointer.requestGeneration
+            && winner.catalogEvidence.attemptIdentity === winnerPointer.attemptIdentity
+            && winner.catalogEvidence.startedAt === winnerPointer.attemptStartedAt
+            && winner.catalogExpiresAt === winnerPointer.catalogExpiresAt
+            && `sha256:${hash(winner.catalog.recordId)}` === winnerPointer.envelopeHash) {
+            const durableCatalog = refreshCatalog(
+              winner.catalog, Math.max(observedAtMs, winner.catalogObservedAt), ttlMs, maxStaleMs,
+            )
+            if (durableCatalog) {
+              this.remember({
+                key, identity, profileRootPath, projectPath, catalog: durableCatalog,
+                catalogEvidence: winner.catalogEvidence,
+                catalogObservedAt: winner.catalogObservedAt,
+                catalogExpiresAt: winner.catalogExpiresAt,
+                lastUsedAt: observedAtMs,
+              }, maxEntries)
+              return Object.freeze({
+                catalog: durableCatalog,
+                catalogEvidence: winner.catalogEvidence,
+                catalogObservedAt: winner.catalogObservedAt,
+                catalogExpiresAt: winner.catalogExpiresAt,
+                catalogProvenance: 'cache-hit' as const,
+                profileRootPath,
+                projectPath,
+                diagnostics: Object.freeze([]),
+              })
+            }
+          }
+          throw fixedCatalogFailure('superseded')
+        }
         this.sampleClock(observedAtMs)
         return Object.freeze({ catalog, catalogEvidence: params.catalogEvidence,
           catalogObservedAt: observedAtMs, catalogExpiresAt: Math.min(MAX_EPOCH_MS, observedAtMs + ttlMs),
@@ -1486,11 +2241,14 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         signal.addEventListener('abort', () => reject(fixedCatalogFailure()), { once: true })
       })
       return await Promise.race([operation, aborted])
-    } catch {
+    } catch (error) {
       if (params.flight.abortKind === 'no-waiters') throw fixedCatalogFailure()
       clock = this.sampleClock(clock)
       const stale = prior ? refreshCatalog(prior.catalog, clock, ttlMs, maxStaleMs) : null
-      if (!stale) throw fixedCatalogFailure()
+      if (!stale) {
+        if (error instanceof OpenCodeProviderCatalogUnavailableError) throw error
+        throw fixedCatalogFailure()
+      }
       return Object.freeze({
         catalog: stale,
         catalogEvidence: prior!.catalogEvidence,
@@ -1524,10 +2282,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       const clearTimer = this.deps.clearTimer ?? clearTimeout
       const deadline = new Promise<never>((_resolve, reject) => {
         deadlineTimer = setTimer(() => {
-          // The production publisher performs all fallible work before its
-          // atomic rename. Once that final gate is entered the operation owns
-          // completion; a public timeout can no longer overtake visibility.
-          if (ownedFlight?.finalizingPublication) return
+          // Publication remains revocable at its attempt-owned visibility
+          // edge; the one-shot deadline is authoritative through retention.
           if (ownedFlight) ownedFlight.abortKind = 'timeout'
           attemptController.abort(fixedCatalogFailure())
           reject(fixedCatalogFailure())
@@ -1596,11 +2352,11 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         )
         const created = {
           controller: attemptController,
+          deadline: monotonicDeadline,
           abortKind: null,
           settled: false,
           waiters: new Set<symbol>(),
           promise: Promise.resolve(null as unknown as OpenCodeProviderCatalogLoadResult),
-          finalizingPublication: false,
         }
         created.promise = this.runExactLoad({
           key,
@@ -1637,7 +2393,6 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       })
       const cancel = () => {
         if (callerCancelled) return
-        if (activeFlight.finalizingPublication) return
         callerCancelled = true
         activeFlight.waiters.delete(waiter)
         rejectLocalCancellation?.()
@@ -1654,7 +2409,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           localCancellation,
           ...(ownedFlight ? [] : [deadline]),
         ])
-        if (input.abortSignal?.aborted && !activeFlight.finalizingPublication) throw fixedCatalogFailure()
+        if (input.abortSignal?.aborted) throw fixedCatalogFailure()
         this.sampleClock(afterProfile)
         return result
       } finally {
@@ -1662,7 +2417,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         input.abortSignal?.removeEventListener('abort', cancel)
         activeFlight.waiters.delete(waiter)
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof OpenCodeProviderCatalogUnavailableError) throw error
       throw fixedCatalogFailure()
     } finally {
       const input = snapshotRecord(unsafeInput)

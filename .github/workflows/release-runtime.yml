@@ -268,7 +268,13 @@ jobs:
           rm -rf release
           mkdir -p release/runtime
           cp "$src" "release/runtime/${{ matrix.binary_name }}"
+          # Copy allocation worker adjacent to the main executable. The compiled
+          # runtime resolves it from dirname(process.execPath).
+          worker_src="dist/opencode-catalog-allocation-worker"
+          [[ -f "$worker_src" ]] || { echo "Compiled allocation worker not found"; exit 1; }
+          cp "$worker_src" release/runtime/opencode-catalog-allocation-worker
           chmod +x "release/runtime/${{ matrix.binary_name }}"
+          chmod +x release/runtime/opencode-catalog-allocation-worker
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
@@ -286,6 +292,9 @@ jobs:
           rm -rf release
           mkdir -p release/runtime
           cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
+          # Copy allocation worker adjacent to the main executable.
+          test -f dist/opencode-catalog-allocation-worker.exe
+          cp dist/opencode-catalog-allocation-worker.exe release/runtime/opencode-catalog-allocation-worker.exe
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
@@ -310,9 +319,28 @@ jobs:
           Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
+          # Copy allocation worker adjacent to the main executable.
+          $workerSource = "dist/opencode-catalog-allocation-worker.exe"
+          if (-not (Test-Path $workerSource)) {
+            throw "Compiled allocation worker not found"
+          }
+          Copy-Item $workerSource "release/runtime/opencode-catalog-allocation-worker.exe"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
+
+      - name: Verify deterministic archive layout
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$ARCHIVE_NAME" in
+            *.tar.gz) tar -tzf "release/$ARCHIVE_NAME" ;;
+            *.zip) unzip -Z1 "release/$ARCHIVE_NAME" ;;
+            *) echo "Unsupported archive extension: $ARCHIVE_NAME" >&2; exit 1 ;;
+          esac | bun run ./scripts/release-archive-layout.ts "$RELEASE_PLATFORM"
 
       - name: Rename archive to versioned asset name
         id: versioned-archive

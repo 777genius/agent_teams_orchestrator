@@ -40,6 +40,7 @@ import {
   OpenCodeSafePublicationDirectory,
   withOpenCodeSafePublicationDirectory,
 } from './OpenCodeSafePublication.js'
+import { commitOpenCodeScopedProfileAuth } from './OpenCodeScopedProfileAuthPublication.js'
 import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
@@ -3968,6 +3969,7 @@ export class OpenCodeProfileManager {
     })
     assertPreparationActive()
     let behaviorCapture: OpenCodeProjectBehaviorCapture | null = null
+    let profileTransactionCommitted = false
     try {
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
       || path.join(os.homedir(), '.config')
@@ -4415,32 +4417,18 @@ export class OpenCodeProfileManager {
           }
         }
         const managedAuthContent = JSON.stringify(scopedSelectedAuth, null, 2)
-        const managedAuthFingerprint = await withOpenCodeSafePublicationDirectory(
-          path.dirname(managedAuthPath),
-          async directory => {
-            await directory.writeFileAtomic(
-              path.basename(managedAuthPath), managedAuthContent, 0o600, preparationSignal,
-            )
-            const managedAuthHandle = await open(
-              directory.child(path.basename(managedAuthPath)),
-              fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
-            )
-            try {
-              const managedAuthBytes = await managedAuthHandle.readFile()
-              if (
-                canonicalFingerprint(JSON.parse(managedAuthBytes.toString()))
-                  !== selectedAuthBaselineFingerprint
-              ) throw new Error('OpenCode scoped auth artifact changed before binding')
-              return hashBuffer(managedAuthBytes)
-            } finally {
-              await managedAuthHandle.close()
-            }
-          },
-        )
-        assertPreparationActive()
+        const managedAuthBytes = Buffer.from(managedAuthContent)
+        if (canonicalFingerprint(JSON.parse(managedAuthContent))
+          !== selectedAuthBaselineFingerprint) {
+          throw new Error('OpenCode scoped auth artifact changed before binding')
+        }
+        const managedAuthFingerprint = hashBuffer(managedAuthBytes)
         const nativeCredentialBridgeFingerprint = await fingerprintOpenCodeNativeCredentialBridge(
           nativeCredentialBridge,
         )
+        assertPreparationActive()
+        const resolvedBinaryPath = await realpath(binaryPath).catch(() => path.resolve(binaryPath))
+        assertPreparationActive()
         const env: NodeJS.ProcessEnv = applyOpenCodeAutoUpdatePolicy({
           ...selectScopedInheritedEnvironment(hostEnvironment),
           HOME: homePath,
@@ -4500,7 +4488,7 @@ export class OpenCodeProfileManager {
           expectedEntryManifest,
           expectedEntryManifestFingerprint,
           automaticUserPluginFingerprint,
-          binaryPath: await realpath(binaryPath).catch(() => path.resolve(binaryPath)),
+          binaryPath: resolvedBinaryPath,
           binaryFingerprint,
           pluginNodeModulesPath,
           preparationLockPath,
@@ -4525,16 +4513,38 @@ export class OpenCodeProfileManager {
           nativeCredentialBridge,
           env,
         }
-        return preparedProfile
+        // Auth is the sole mutable visibility point. Every fingerprint, path
+        // resolution and profile object field above is complete before this
+        // final abort-aware atomic write, so no awaited post-write phase can
+        // reject the attempt and strand its visible auth artifact.
+        const committedProfile = await commitOpenCodeScopedProfileAuth({
+          managedAuthPath,
+          managedAuthBytes,
+          preparedProfile,
+          abortSignal: preparationSignal,
+        })
+        profileTransactionCommitted = true
+        return committedProfile
       } finally {
-        await releaseScopedLock()
-        await scopedLockDirectory.close()
+        if (profileTransactionCommitted) {
+          await releaseScopedLock().catch(() => undefined)
+          await scopedLockDirectory.close().catch(() => undefined)
+        } else {
+          await releaseScopedLock()
+          await scopedLockDirectory.close()
+        }
       }
     }, preparationSignal)
     } finally {
-      await behaviorCapture?.close()
-      await releaseEarlyPreparationLock()
-      await earlyLockDirectory.close()
+      if (profileTransactionCommitted) {
+        await behaviorCapture?.close().catch(() => undefined)
+        await releaseEarlyPreparationLock().catch(() => undefined)
+        await earlyLockDirectory.close().catch(() => undefined)
+      } else {
+        await behaviorCapture?.close()
+        await releaseEarlyPreparationLock()
+        await earlyLockDirectory.close()
+      }
     }
   }
 

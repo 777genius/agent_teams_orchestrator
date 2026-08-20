@@ -393,6 +393,14 @@ function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {
 }
 
 if (compile) {
+  const workerOutfile = join(dirname(outfile),
+    `opencode-catalog-allocation-worker${compileTarget.includes('windows') ? '.exe' : ''}`)
+  runBuild(extendBuildArgs([
+    'bun', 'build', './src/services/opencode/OpenCodeProviderCatalogAllocationWorker.ts',
+    '--compile', '--target', compileTarget, '--format', 'esm', '--outfile', workerOutfile,
+    '--minify', '--packages', 'bundle', '--conditions', 'bun',
+  ]))
+  if (existsSync(workerOutfile)) chmodSync(workerOutfile, 0o755)
   const cmd = extendBuildArgs([
     'bun',
     'build',
@@ -427,6 +435,7 @@ if (compile) {
     'bun',
     'build',
     './src/entrypoints/cli.tsx',
+    './src/services/opencode/OpenCodeProviderCatalogAllocationWorker.ts',
     '--target',
     'bun',
     '--format',

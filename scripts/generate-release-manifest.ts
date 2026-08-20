@@ -7,6 +7,7 @@ type AssetDescriptor = {
   file: string;
   archiveKind: 'tar.gz' | 'zip';
   binaryName: string;
+  workerName: string;
 };
 
 const releaseDir = path.join(process.cwd(), 'release-flat');
@@ -30,30 +31,35 @@ const assets: AssetDescriptor[] = [
     file: `agent-teams-runtime-darwin-arm64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
+    workerName: 'opencode-catalog-allocation-worker',
   },
   {
     platform: 'darwin-x64',
     file: `agent-teams-runtime-darwin-x64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
+    workerName: 'opencode-catalog-allocation-worker',
   },
   {
     platform: 'linux-x64',
     file: `agent-teams-runtime-linux-x64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
+    workerName: 'opencode-catalog-allocation-worker',
   },
   {
     platform: 'win32-arm64',
     file: `agent-teams-runtime-win32-arm64-v${runtimeVersion}.zip`,
     archiveKind: 'zip',
     binaryName: 'claude-multimodel.exe',
+    workerName: 'opencode-catalog-allocation-worker.exe',
   },
   {
     platform: 'win32-x64',
     file: `agent-teams-runtime-win32-x64-v${runtimeVersion}.zip`,
     archiveKind: 'zip',
     binaryName: 'claude-multimodel.exe',
+    workerName: 'opencode-catalog-allocation-worker.exe',
   },
 ];
 
@@ -64,7 +70,9 @@ const manifest = {
   sourceRepository: process.env.GITHUB_REPOSITORY,
   sourceRef: process.env.RUNTIME_SOURCE_REF ?? process.env.GITHUB_REF_NAME,
   sourceCommit: process.env.RUNTIME_SOURCE_COMMIT ?? process.env.GITHUB_SHA,
-  assets: {} as Record<string, { file: string; archiveKind: string; binaryName: string; sha256: string }>,
+  assets: {} as Record<string, {
+    file: string; archiveKind: string; binaryName: string; workerName: string; sha256: string
+  }>,
 };
 
 let sums = '';
@@ -76,6 +84,7 @@ for (const asset of assets) {
     file: asset.file,
     archiveKind: asset.archiveKind,
     binaryName: asset.binaryName,
+    workerName: asset.workerName,
     sha256,
   };
   sums += `${sha256}  ${asset.file}\n`;

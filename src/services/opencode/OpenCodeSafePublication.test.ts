@@ -120,6 +120,74 @@ describe('OpenCodeSafePublication', () => {
     }
   })
 
+  test('abort immediately after visibility restores only the attempt-owned prior artifact', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-visible-abort-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await directory.writeFileAtomic('auth.json', '{"generation":"old"}', 0o600)
+      const cancellation = new AbortController()
+      await expect(directory.writeFileAtomic(
+        'auth.json', '{"generation":"aborted"}', 0o600, cancellation.signal,
+        { afterRenameBeforeVerification: () => cancellation.abort(new Error('visibility abort')) },
+      )).rejects.toThrow('visibility abort')
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"generation":"old"}')
+      expect((await readdir(root)).filter(name => name.includes('.tmp.') || name.includes('.rollback.')))
+        .toEqual([])
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('an aborted visible attempt never rolls back over a successor-owned inode', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-successor-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await directory.writeFileAtomic('auth.json', '{"generation":"old"}', 0o600)
+      const cancellation = new AbortController()
+      await expect(directory.writeFileAtomic(
+        'auth.json', '{"generation":"aborted"}', 0o600, cancellation.signal,
+        { afterRenameBeforeVerification: async () => {
+          await directory.writeFileAtomic('auth.json', '{"generation":"successor"}', 0o600)
+          cancellation.abort(new Error('visibility abort'))
+        } },
+      )).rejects.toThrow('visibility abort')
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"generation":"successor"}')
+      expect((await readdir(root)).filter(name => name.includes('.tmp.') || name.includes('.rollback.')))
+        .toEqual([])
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('rollback ownership capture cannot rename prior auth over successor B', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-owned-rollback-'))
+    const directory = await OpenCodeSafePublicationDirectory.open(root)
+    try {
+      await directory.writeFileAtomic('auth.json', '{"generation":"old"}', 0o600)
+      const cancellation = new AbortController()
+      await expect(directory.writeFileAtomic(
+        'auth.json', '{"generation":"attempt-a"}', 0o600, cancellation.signal,
+        {
+          afterRenameBeforeVerification: () => cancellation.abort(new Error('abort A')),
+          afterRollbackOwnershipCaptured: () => directory.writeFileAtomic(
+            'auth.json', '{"generation":"successor-b"}', 0o600,
+          ),
+        },
+      )).rejects.toThrow('abort A')
+      expect(await readFile(path.join(root, 'auth.json'), 'utf8')).toBe('{"generation":"successor-b"}')
+      expect((await readdir(root)).filter(name => name.includes('.rollback.')
+        || name.includes('.quarantine.') || name.includes('.tmp.'))).toEqual([])
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('concurrent readers observe only complete old or new atomic auth bytes', async () => {
     if (process.platform !== 'linux' && process.platform !== 'darwin') return
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-atomic-reader-'))

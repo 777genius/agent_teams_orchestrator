@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, realpath, rename, rm, stat, symlink, utimes } from 'node:fs/promises'
+import {
+  link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, utimes,
+  writeFile,
+} from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Database } from 'bun:sqlite'
 
 import {
@@ -117,7 +121,9 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
   }
 }
 
-describe('OpenCodeProviderCatalogService', () => {
+// These tests deliberately rotate one process-global cache-home boundary.
+// Serial execution is part of their isolation contract.
+describe.serial('OpenCodeProviderCatalogService', () => {
   test('one absolute deadline aborts a forever-hanging profile in controlled fake time', async () => {
     let fire!: () => void
     let preparedSignal!: AbortSignal
@@ -208,7 +214,7 @@ describe('OpenCodeProviderCatalogService', () => {
     while (allocation < 1) await Promise.resolve()
     const winner = await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     releaseOld()
-    await expect(late).rejects.toThrow('temporarily unavailable')
+    expect((await late).catalog.models.map(model => model.id)).toEqual(['winner'])
     expect(winner.catalogEvidence.requestGeneration).toBe(2)
     const restarted = fixture({ ...common, now: () => 900,
       fetchProviderCatalog: async () => { throw new Error('winner must hydrate') } })
@@ -243,7 +249,7 @@ describe('OpenCodeProviderCatalogService', () => {
     await oldStaged
     const winner = await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     releaseOldStage()
-    await expect(late).rejects.toThrow('temporarily unavailable')
+    expect((await late).catalog.models.map(model => model.id)).toEqual(['winner'])
     expect(winner.catalog.models.map(model => model.id)).toEqual(['winner'])
     const restarted = fixture({ allocateAttempt, readPersisted, timeoutMs: 5_000,
       writePersisted: async (key, value) => { values.set(key, value) },
@@ -311,7 +317,7 @@ describe('OpenCodeProviderCatalogService', () => {
     while (allocation < 1) await Promise.resolve()
     await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     releaseOld()
-    await expect(late).rejects.toThrow('temporarily unavailable')
+    expect((await late).catalog.models.map(model => model.id)).toEqual(['winner'])
     const restored = await fixture({ ...common,
       fetchProviderCatalog: async () => { throw new Error('must hydrate winner') } })
       .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
@@ -369,6 +375,31 @@ describe('OpenCodeProviderCatalogService', () => {
     }
   })
 
+  test('stalled SQLite open and commit boundaries are preempted and leave no allocation child or transaction', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-worker-stall-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      const first = await allocateOpenCodeProviderCatalogAttempt('seed', 1)
+      let durableGeneration = first.requestGeneration
+      for (const phase of ['open', 'commit'] as const) {
+        const started = performance.now()
+        await expect(allocateOpenCodeProviderCatalogAttempt(`stall-${phase}`, 2, {
+          deadline: performance.now() + 30,
+          testStallPhase: phase,
+        })).rejects.toThrow('temporarily unavailable')
+        expect(performance.now() - started).toBeLessThan(150)
+        const recovered = await allocateOpenCodeProviderCatalogAttempt(`recovered-${phase}`, 3)
+        durableGeneration += 1
+        expect(recovered.requestGeneration).toBe(durableGeneration)
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('attempt allocator fails closed on version and trigger tampering, then recovers after repair', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-schema-'))
     const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
@@ -378,7 +409,7 @@ describe('OpenCodeProviderCatalogService', () => {
       const database = new Database(path.join(root, 'opencode', 'provider-catalog-attempts-v2', 'attempts.sqlite'))
       database.exec('PRAGMA user_version = 1')
       await expect(allocateOpenCodeProviderCatalogAttempt('scope-b', 2)).rejects.toThrow('temporarily unavailable')
-      database.exec('PRAGMA user_version = 44304')
+      database.exec('PRAGMA user_version = 44305')
       const repaired = await allocateOpenCodeProviderCatalogAttempt('scope-b', 2)
       expect(repaired.requestGeneration).toBeGreaterThan(first.requestGeneration)
       database.exec(`CREATE TRIGGER malicious_generation AFTER INSERT ON allocation_ticket
@@ -408,6 +439,120 @@ describe('OpenCodeProviderCatalogService', () => {
       database.close()
       expect((await allocateOpenCodeProviderCatalogAttempt('scope-recovered', 6)).requestGeneration)
         .toBeGreaterThan(afterTriggerRepair.requestGeneration)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  test('attempt allocator rejects deleted rows, forged state, and reset sqlite_sequence without generation reuse', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-ledger-rows-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      await allocateOpenCodeProviderCatalogAttempt('one', 1)
+      const second = await allocateOpenCodeProviderCatalogAttempt('two', 2)
+      const database = new Database(path.join(root, 'opencode', 'provider-catalog-attempts-v2', 'attempts.sqlite'))
+      const row = database.query('SELECT id, scope_hash, started_at FROM allocation_ticket WHERE id = 2').get() as {
+        id: number; scope_hash: string; started_at: number
+      }
+      database.exec('DELETE FROM allocation_ticket WHERE id = 2')
+      await expect(allocateOpenCodeProviderCatalogAttempt('deleted-row', 3)).rejects.toThrow('temporarily unavailable')
+      database.query('INSERT INTO allocation_ticket(id, scope_hash, started_at) VALUES (?1, ?2, ?3)')
+        .run(row.id, row.scope_hash, row.started_at)
+      database.exec("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'allocation_ticket'")
+      await expect(allocateOpenCodeProviderCatalogAttempt('reset-sequence', 3)).rejects.toThrow('temporarily unavailable')
+      database.query("UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'allocation_ticket'").run(2)
+      database.exec('UPDATE allocation_state SET generation = 443 WHERE singleton = 1')
+      await expect(allocateOpenCodeProviderCatalogAttempt('forged-state', 3)).rejects.toThrow('temporarily unavailable')
+      database.exec('UPDATE allocation_state SET generation = 2 WHERE singleton = 1')
+      database.close()
+      expect((await allocateOpenCodeProviderCatalogAttempt('repaired', 3)).requestGeneration)
+        .toBe(second.requestGeneration + 1)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 10_000)
+
+  test('attempt database and WAL children reject external symlinks and a gated identity swap before mutation', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-child-symlink-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    const ledgerRoot = path.join(root, 'opencode', 'provider-catalog-attempts-v2')
+    const outsideText = path.join(root, 'outside.txt')
+    try {
+      await mkdir(ledgerRoot, { recursive: true })
+      await writeFile(outsideText, 'untouched')
+      await symlink(outsideText, path.join(ledgerRoot, 'attempts.sqlite'))
+      await expect(allocateOpenCodeProviderCatalogAttempt('main-link', 1, { cacheHome: root }))
+        .rejects.toThrow('temporarily unavailable')
+      expect(await readFile(outsideText, 'utf8')).toBe('untouched')
+      await unlink(path.join(ledgerRoot, 'attempts.sqlite'))
+      await allocateOpenCodeProviderCatalogAttempt('seed', 1, { cacheHome: root })
+      await expect(allocateOpenCodeProviderCatalogAttempt('stop-worker', 2, {
+        deadline: performance.now() + 30, testStallPhase: 'open', cacheHome: root,
+      })).rejects.toThrow('temporarily unavailable')
+      await writeFile(outsideText, 'still-untouched')
+      await unlink(path.join(ledgerRoot, 'attempts.sqlite-wal')).catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      })
+      await symlink(outsideText, path.join(ledgerRoot, 'attempts.sqlite-wal'))
+      await expect(allocateOpenCodeProviderCatalogAttempt('wal-link', 2, { cacheHome: root }))
+        .rejects.toThrow('temporarily unavailable')
+      expect(await readFile(outsideText, 'utf8')).toBe('still-untouched')
+      await unlink(path.join(ledgerRoot, 'attempts.sqlite-wal'))
+      await expect(allocateOpenCodeProviderCatalogAttempt('deleted-wal', 2, { cacheHome: root }))
+        .rejects.toThrow('temporarily unavailable')
+      // This authority deliberately remains failed closed: removing its WAL
+      // after a committed marker must never reset generation. Use a distinct
+      // deterministic authority for the coordinated main-file swap.
+      const swapHome = path.join(root, 'swap-cache')
+      const swapLedgerRoot = path.join(swapHome, 'opencode', 'provider-catalog-attempts-v2')
+      await allocateOpenCodeProviderCatalogAttempt('swap-seed', 1, { cacheHome: swapHome })
+
+      const outsideDatabasePath = path.join(root, 'outside.sqlite')
+      const outsideDatabase = new Database(outsideDatabasePath, { create: true })
+      outsideDatabase.exec('CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES (\'unchanged\')')
+      outsideDatabase.close()
+      const gate = path.join(root, 'swap-gate')
+      const pending = allocateOpenCodeProviderCatalogAttempt('swap', 2, {
+        deadline: performance.now() + 1_000, testGate: { phase: 'open', path: gate }, cacheHome: swapHome,
+      })
+      while (!await stat(`${gate}.entered`).catch(() => null)) await new Promise<void>(resolve => setImmediate(resolve))
+      await rename(path.join(swapLedgerRoot, 'attempts.sqlite'), path.join(swapLedgerRoot, 'attempts.sqlite.saved'))
+      await symlink(outsideDatabasePath, path.join(swapLedgerRoot, 'attempts.sqlite'))
+      await writeFile(`${gate}.release`, '')
+      await expect(pending).rejects.toThrow('temporarily unavailable')
+      const verifiedOutside = new Database(outsideDatabasePath)
+      expect(verifiedOutside.query('SELECT value FROM marker').get()).toEqual({ value: 'unchanged' })
+      verifiedOutside.close()
+      await unlink(path.join(swapLedgerRoot, 'attempts.sqlite'))
+      await rename(path.join(swapLedgerRoot, 'attempts.sqlite.saved'), path.join(swapLedgerRoot, 'attempts.sqlite'))
+
+      const commitSwapHome = path.join(root, 'commit-swap-cache')
+      const commitSwapLedger = path.join(commitSwapHome, 'opencode', 'provider-catalog-attempts-v2')
+      await allocateOpenCodeProviderCatalogAttempt('commit-swap-seed', 1, { cacheHome: commitSwapHome })
+      const commitGate = path.join(root, 'commit-swap-gate')
+      const commitPending = allocateOpenCodeProviderCatalogAttempt('commit-swap', 2, {
+        deadline: performance.now() + 1_000,
+        testGate: { phase: 'commit', path: commitGate },
+        cacheHome: commitSwapHome,
+      })
+      while (!await stat(`${commitGate}.entered`).catch(() => null)) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+      await rename(path.join(commitSwapLedger, 'attempts.sqlite'),
+        path.join(commitSwapLedger, 'attempts.sqlite.saved'))
+      await symlink(outsideDatabasePath, path.join(commitSwapLedger, 'attempts.sqlite'))
+      await writeFile(`${commitGate}.release`, '')
+      await expect(commitPending).rejects.toThrow('temporarily unavailable')
+      const commitVerifiedOutside = new Database(outsideDatabasePath)
+      expect(commitVerifiedOutside.query('SELECT value FROM marker').get()).toEqual({ value: 'unchanged' })
+      commitVerifiedOutside.close()
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
       else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
@@ -520,6 +665,213 @@ describe('OpenCodeProviderCatalogService', () => {
       })
       expect((await restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/race' }))
         .catalog.models.map(model => model.id)).toEqual(['winner'])
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('deadline stalled immediately before commit sync cannot publish after public rejection', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-pre-sync-deadline-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    let fireDeadline!: () => void
+    let enterGate!: () => void
+    let releaseGate!: () => void
+    const entered = new Promise<void>(resolve => { enterGate = resolve })
+    const gate = new Promise<void>(resolve => { releaseGate = resolve })
+    try {
+      const f = fixture({
+        readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+        timeoutMs: 1_000,
+        setTimer: ((callback: () => void) => {
+          fireDeadline = callback
+          return { unref() {} } as unknown as ReturnType<typeof setTimeout>
+        }) as typeof setTimeout,
+        clearTimer: (() => undefined) as typeof clearTimeout,
+        beforeVisibilitySync: async () => { enterGate(); await gate },
+      })
+      const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/pre-sync' })
+      await entered
+      fireDeadline()
+      await expect(pending).rejects.toThrow('temporarily unavailable')
+      const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
+      expect((await readdir(catalogRoot)).some(file => file.endsWith('.commit.json'))).toBe(false)
+      releaseGate()
+      for (let attempt = 0; attempt < 50; attempt += 1) await new Promise<void>(resolve => setImmediate(resolve))
+      expect((await readdir(catalogRoot)).some(file => file.endsWith('.commit.json'))).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('cross-process publication fencing preserves the global winner and bounded larger-capacity set', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-cross-process-'))
+    const helper = fileURLToPath(new URL('./OpenCodeProviderCatalogCrossProcessFixture.ts', import.meta.url))
+    const launch = (
+      generation: number,
+      model: string,
+      projectPath: string,
+      maxEntries: number,
+      gate = '',
+      retentionGate = '',
+      visibilityGate = '',
+    ) => {
+      const child = Bun.spawn({
+        cmd: [
+          process.execPath, helper, root, String(generation), model, projectPath, String(maxEntries),
+          gate, retentionGate, visibilityGate,
+        ],
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      })
+      return {
+        child,
+        result: (async () => {
+          const [exitCode, stdout, stderr] = await Promise.all([
+            child.exited,
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ])
+          expect(exitCode, stderr).toBe(0)
+          return JSON.parse(stdout) as {
+            outcome: 'success' | 'rejected'; model?: string; type?: 'superseded' | 'transient'
+          }
+        })(),
+      }
+    }
+    try {
+      const gate = path.join(root, 'old-publication')
+      const old = launch(1, 'late-old', '/same', 1, gate)
+      while (!await stat(`${gate}.entered`).catch(() => null)) await new Promise<void>(resolve => setImmediate(resolve))
+      expect(await launch(2, 'winner', '/same', 1).result).toEqual({ outcome: 'success', model: 'winner' })
+      await writeFile(`${gate}.release`, '')
+      expect(await old.result).toEqual({ outcome: 'success', model: 'winner' })
+
+      const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
+      expect((await readdir(catalogRoot)).filter(file => file.endsWith('.commit.json'))).toHaveLength(1)
+      const parallel = await Promise.all([
+        launch(3, 'three', '/three', 3).result,
+        launch(4, 'four', '/four', 3).result,
+        launch(5, 'five', '/five', 3).result,
+      ])
+      expect(parallel.every(result => result.outcome === 'success')).toBe(true)
+      const files = await readdir(catalogRoot)
+      const commitFiles = files.filter(file => file.endsWith('.commit.json'))
+      expect(commitFiles).toHaveLength(3)
+      const pointers = await Promise.all(commitFiles.map(async file => JSON.parse(
+        await readFile(path.join(catalogRoot, file), 'utf8'),
+      ) as { requestGeneration: number; attemptId: string }))
+      expect(pointers.map(pointer => pointer.requestGeneration).sort((a, b) => a - b)).toEqual([3, 4, 5])
+      const stages = await Promise.all(pointers.map(async pointer => {
+        const file = files.find(name => name.endsWith(`.${pointer.attemptId}.stage.json`))!
+        return JSON.parse(await readFile(path.join(catalogRoot, file), 'utf8')) as {
+          catalog: { models: Array<{ id: string }> }
+        }
+      }))
+      expect(stages.flatMap(stage => stage.catalog.models.map(modelEntry => modelEntry.id)).sort())
+        .toEqual(['five', 'four', 'three'])
+
+      const capacityOneGate = path.join(root, 'capacity-one-old-a')
+      const capacityOneVisibility = path.join(root, 'capacity-one-old-a-visibility')
+      const capacityOneOld = launch(
+        6, 'old-a', '/key-a', 1, capacityOneGate, '', capacityOneVisibility,
+      )
+      while (!await stat(`${capacityOneGate}.entered`).catch(() => null)) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+      expect(await launch(7, 'new-b', '/key-b', 1).result)
+        .toEqual({ outcome: 'success', model: 'new-b' })
+      await writeFile(`${capacityOneGate}.release`, '')
+      expect(await capacityOneOld.result).toEqual({ outcome: 'rejected', type: 'superseded' })
+      expect(await stat(`${capacityOneVisibility}.entered`).catch(() => null)).toBeNull()
+
+      const capacityTwoGate = path.join(root, 'capacity-two-old-a')
+      const capacityTwoOld = launch(8, 'retained-a', '/key-c', 2, capacityTwoGate)
+      while (!await stat(`${capacityTwoGate}.entered`).catch(() => null)) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+      expect(await launch(9, 'newer-b', '/key-d', 2).result)
+        .toEqual({ outcome: 'success', model: 'newer-b' })
+      await writeFile(`${capacityTwoGate}.release`, '')
+      expect(await capacityTwoOld.result).toEqual({ outcome: 'success', model: 'retained-a' })
+      const finalPointers = await Promise.all((await readdir(catalogRoot))
+        .filter(file => file.endsWith('.commit.json'))
+        .map(async file => JSON.parse(await readFile(path.join(catalogRoot, file), 'utf8')) as {
+          requestGeneration: number
+        }))
+      expect(finalPointers.map(pointer => pointer.requestGeneration).sort((a, b) => a - b))
+        .toEqual([8, 9])
+
+      expect(await launch(10, 'retention-seed', '/retention-seed', 1).result)
+        .toEqual({ outcome: 'success', model: 'retention-seed' })
+      const retentionGate = path.join(root, 'retention-authority-removed')
+      const crashingPublisher = Bun.spawn({
+        cmd: [
+          process.execPath, helper, root, '11', 'crashing-successor', '/retention-crash', '1', '',
+          retentionGate,
+        ],
+        stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+      })
+      while (!await stat(`${retentionGate}.entered`).catch(() => null)) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+      }
+      const liveLockPath = path.join(catalogRoot, '.publication.lock')
+      const liveOwner = JSON.parse(await readFile(liveLockPath, 'utf8')) as {
+        pid: number; token: string; processIdentity: string
+      }
+      const liveOwnerPath = path.join(
+        catalogRoot, `.publication.owner.${liveOwner.pid}.${liveOwner.token}.json`,
+      )
+      const [liveLockMetadata, liveOwnerMetadata] = await Promise.all([
+        lstat(liveLockPath), lstat(liveOwnerPath),
+      ])
+      expect(liveLockMetadata.isFile()).toBe(true)
+      expect(liveLockMetadata.ino).toBe(liveOwnerMetadata.ino)
+      expect(liveOwner.processIdentity.length).toBeGreaterThan(0)
+      crashingPublisher.kill('SIGKILL')
+      await crashingPublisher.exited
+      const crashedFiles = await readdir(catalogRoot)
+      expect(crashedFiles.some(file => file.endsWith('.reclaim.json'))).toBe(true)
+      expect(crashedFiles.some(file => file.endsWith('.stage.json'))).toBe(true)
+      expect(await launch(12, 'recovered-retention', '/retention-recovery', 1).result)
+        .toEqual({ outcome: 'success', model: 'recovered-retention' })
+      const recoveredFiles = await readdir(catalogRoot)
+      expect(recoveredFiles.filter(file => file.endsWith('.commit.json'))).toHaveLength(1)
+      expect(recoveredFiles.some(file => file.endsWith('.reclaim.json'))).toBe(false)
+      expect(recoveredFiles.filter(file => file.endsWith('.stage.json'))).toHaveLength(1)
+      expect(recoveredFiles.some(file => file.startsWith('.publication.'))).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  test('publication mutex reaps a reused PID identity without treating it as a live owner', async () => {
+    if (process.platform !== 'linux') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-pid-reuse-lock-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
+    try {
+      await mkdir(catalogRoot, { recursive: true })
+      const token = '00000000-0000-4000-8000-000000000443'
+      const ownerPath = path.join(catalogRoot, `.publication.owner.${process.pid}.${token}.json`)
+      await writeFile(ownerPath, JSON.stringify({
+        pid: process.pid,
+        token,
+        processIdentity: `linux:${process.pid}:reused-birth`,
+      }), { mode: 0o600 })
+      await link(ownerPath, path.join(catalogRoot, '.publication.lock'))
+      const f = fixture({
+        readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+        allocateAttempt: () => ({ requestGeneration: 1,
+          attemptIdentity: `sha256:${'1'.padStart(64, '0')}` }),
+      })
+      expect((await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/pid-reuse' }))
+        .catalog.models).not.toHaveLength(0)
+      expect((await readdir(catalogRoot)).some(file => file.startsWith('.publication.'))).toBe(false)
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
       else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous

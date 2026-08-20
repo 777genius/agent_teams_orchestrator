@@ -12,10 +12,16 @@ import {
   openCodePassiveDatabasePath,
   readOpenCodePassiveSnapshot,
 } from './OpenCodePassiveSnapshotStore.js'
-import { OpenCodePassiveStatusProductionReader } from './OpenCodePassiveStatusProductionReader.js'
+import {
+  OpenCodePassiveStatusProductionReader,
+  readBoundedSnapshotText,
+} from './OpenCodePassiveStatusProductionReader.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
 import { OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT } from './OpenCodePassiveSnapshotTransaction.js'
-import type { OpenCodeRedactedSnapshotV1 } from './OpenCodeRedactedStatusSnapshot.js'
+import {
+  decodeOpenCodeRedactedSnapshotV1,
+  type OpenCodeRedactedSnapshotV1,
+} from './OpenCodeRedactedStatusSnapshot.js'
 
 const canonical = '/canonical/project'
 const scope = `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonical).digest('hex')}` as const
@@ -42,8 +48,12 @@ function snapshot(at: number, connected: boolean, version: string, generation?: 
 }
 
 function deferred() { let resolve!: () => void; return { promise: new Promise<void>(done => { resolve = done }), resolve } }
-async function appendLegacy(root: string, value: OpenCodeRedactedSnapshotV1, sequence: number) {
-  const generation = `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`
+async function appendLegacy(
+  root: string,
+  value: OpenCodeRedactedSnapshotV1,
+  sequence: number,
+  generation = `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`,
+) {
   const scoped = path.join(root, 'scopes', value.projectScope.slice(7))
   await mkdir(path.join(scoped, 'commits'), { recursive: true })
   await mkdir(path.join(scoped, 'generations', generation), { recursive: true })
@@ -162,6 +172,75 @@ describe('OpenCode passive SQLite transaction consistency', () => {
       expect(selected?.value.providers[0].lastConnected.value.state).toBe('not_connected')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+
+  test('identical cumulative evidence advances migrated logical time in both UUID orders and across replay', async () => {
+    const lower = '00000000-0000-4000-8000-000000000031'
+    const higher = '00000000-0000-4000-8000-000000000032'
+    for (const descendingUuids of [false, true]) {
+      const root = await mkdtemp(path.join(process.cwd(), `.passive-sqlite-cumulative-clock-${descendingUuids}-`))
+      const firstGeneration = descendingUuids ? higher : lower
+      const secondGeneration = descendingUuids ? lower : higher
+      const first = snapshot(1, true, '1.0.0', 1)
+      first.providers[0].configured = direct('configured', 'config_metadata', 1, 1)
+      const second = structuredClone(first)
+      second.capturedAt = 100
+      try {
+        await appendLegacy(root, first, 1, firstGeneration)
+        await appendLegacy(root, second, 2, secondGeneration)
+        const directText = await readBoundedSnapshotText(
+          path.join(root, 'snapshots', `${scope.slice(7)}.json`), new AbortController().signal,
+        )
+        const directRead = directText === null ? null : decodeOpenCodeRedactedSnapshotV1(directText)
+        expect(directRead?.ok && directRead.value.capturedAt).toBe(100)
+
+        const scoped = path.join(root, 'scopes', scope.slice(7))
+        await rm(path.join(scoped, 'commits', `0000000000000002.${secondGeneration}.json`))
+        await rm(path.join(scoped, 'generations', secondGeneration), { recursive: true })
+        const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        await writer.mutate({ projectScope: scope, capturedAt: 2,
+          providers: [{ providerId: 'deepinfra', lastConnected: direct({ state: 'not_connected' as const }, 'auth_metadata', 2) }],
+        }, new AbortController().signal)
+        const initial = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+        const binaryGeneration = initial.value.binary.evidenceGeneration
+        const configuredGeneration = initial.value.providers[0].configured.evidenceGeneration
+
+        await appendLegacy(root, second, 2, secondGeneration)
+        await writer.mutate({ projectScope: scope, capturedAt: 3 }, new AbortController().signal)
+        const reconciled = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+        expect(reconciled.value.capturedAt).toBeGreaterThanOrEqual(100)
+        expect(reconciled.value.binary.evidenceGeneration).toBe(binaryGeneration)
+        expect(reconciled.value.providers[0].configured.evidenceGeneration).toBe(configuredGeneration)
+
+        const deployed = new Database(openCodePassiveDatabasePath(root))
+        try {
+          const row = deployed.query<{ id: number; payload: string }, [string]>(`SELECT t.id, t.payload
+            FROM passive_current c JOIN passive_transactions t ON t.id = c.transaction_id
+            WHERE c.scope = ?`).get(scope)!
+          const stale = JSON.parse(row.payload) as OpenCodeRedactedSnapshotV1
+          stale.capturedAt = 3
+          deployed.query('UPDATE passive_transactions SET payload = ? WHERE id = ?')
+            .run(JSON.stringify(stale), row.id)
+        } finally { deployed.close(false) }
+        const restarted = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+        expect(restarted.value.capturedAt).toBeGreaterThanOrEqual(100)
+
+        await writer.mutate({ projectScope: scope, capturedAt: 3,
+          providers: [{ providerId: 'deepinfra', executionVerified: direct('verified' as const, 'execution_snapshot', 3) }],
+        }, new AbortController().signal)
+        const persisted = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+        expect(persisted.value.capturedAt).toBeGreaterThanOrEqual(100)
+        expect(persisted.value.providers[0].executionVerified.observedAt).toBeGreaterThanOrEqual(100)
+        const executionGeneration = persisted.value.providers[0].executionVerified.evidenceGeneration
+
+        await appendLegacy(root, second, 2, secondGeneration)
+        const replayed = (await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal))!
+        expect(replayed.value.capturedAt).toBeGreaterThanOrEqual(100)
+        expect(replayed.value.providers[0].executionVerified.evidenceGeneration).toBe(executionGeneration)
+        expect(replayed.value.binary.evidenceGeneration).toBe(binaryGeneration)
+        expect(replayed.value.providers[0].configured.evidenceGeneration).toBe(configuredGeneration)
+      } finally { await rm(root, { recursive: true, force: true }) }
+    }
+  }, 15_000)
 
   test('migration merges independent legacy evidence and rolling writers fail closed then reconcile newer negatives', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-rolling-'))
