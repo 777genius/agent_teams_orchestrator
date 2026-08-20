@@ -70,6 +70,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
   async publishInventory(inventory: OpenCodeInventorySnapshot, signal = new AbortController().signal): Promise<void> {
     if (inventory.probeError || signal.aborted) return
     const connected = new Map(inventory.connectedProviders.map(provider => [provider.id, provider]))
+    const configuredProviderIds = getManagedConfiguredProviderIds(inventory)
     const modelIds = new Map<string, string[]>()
     for (const model of inventory.models) {
       const parsed = parseOpenCodeExactProviderModelRef(model)
@@ -79,7 +80,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       modelIds.set(parsed.providerId, values)
     }
     const providerIds = new Set(
-      [...inventory.availableProviders, ...connected.keys(), ...modelIds.keys()]
+      [...inventory.availableProviders, ...configuredProviderIds, ...connected.keys(), ...modelIds.keys()]
         .filter(providerId => tryCreateOpenCodeCanonicalProviderId(providerId) === providerId),
     )
     await this.#update(inventory.projectPath, signal, (snapshot, now) => {
@@ -87,12 +88,24 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         { presence: inventory.detected ? 'present' as const : 'absent' as const, version: inventory.version },
         'binary_metadata', now,
       )
-      for (const providerId of providerIds) {
+      const knownProviderIds = new Set([
+        ...snapshot.providers.map(provider => provider.providerId),
+        ...providerIds,
+      ])
+      for (const providerId of knownProviderIds) {
         const provider = getOrCreateProvider(snapshot, providerId)
-        if (connected.has(providerId)) {
-          provider.configured = observation('configured', 'config_metadata', now)
-          provider.lastConnected = observation({ state: 'connected', at: now }, 'auth_metadata', now)
+        if (inventory.profile) {
+          provider.configured = observation(
+            configuredProviderIds.has(providerId) ? 'configured' : 'not_configured',
+            'config_metadata', now,
+          )
         }
+        provider.lastConnected = observation(
+          connected.has(providerId)
+            ? { state: 'connected' as const, at: now }
+            : { state: 'not_connected' as const },
+          'auth_metadata', now,
+        )
         if (inventory.detected) provider.catalogAvailable = observation(
           modelIds.has(providerId) || inventory.availableProviders.includes(providerId) ? 'available' : 'unavailable',
           'catalog_snapshot', now,
@@ -140,6 +153,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       if (!Number.isSafeInteger(now) || now < 0) return
       const loaded = await this.#load(scope, signal)
       const snapshot = loaded ?? emptySnapshot(scope, now)
+      ageExpiredObservations(snapshot, now)
       snapshot.capturedAt = now
       mutate(snapshot, now)
       snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
@@ -159,6 +173,34 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
 
 function projectScope(canonicalPath: string): `sha256:${string}` {
   return `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonicalPath).digest('hex')}`
+}
+
+function getManagedConfiguredProviderIds(inventory: OpenCodeInventorySnapshot): Set<string> {
+  const configured = new Set<string>()
+  const value = inventory.profile?.managedConfig.provider
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return configured
+  for (const providerId of Object.keys(value)) {
+    if (tryCreateOpenCodeCanonicalProviderId(providerId) === providerId) configured.add(providerId)
+  }
+  return configured
+}
+
+function ageExpiredObservations(snapshot: OpenCodeRedactedSnapshotV1, now: number): void {
+  const observations = [
+    snapshot.binary,
+    ...snapshot.providers.flatMap(provider => [
+      provider.configured,
+      provider.lastConnected,
+      provider.catalogAvailable,
+      provider.executionVerified,
+    ]),
+  ]
+  for (const retained of observations) {
+    if (retained.freshness !== 'fresh' || retained.validUntil === null || retained.validUntil >= now) continue
+    retained.freshness = 'stale'
+    retained.condition = 'degraded'
+    retained.issueCode = 'expired'
+  }
 }
 
 function observation<T>(value: T, authority: any, now: number): any {
