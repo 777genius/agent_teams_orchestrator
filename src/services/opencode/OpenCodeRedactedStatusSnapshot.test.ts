@@ -90,6 +90,55 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(wrongAuthority))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
   })
 
+  test('shares the 64-provider request capacity and preserves 33-provider authoritative snapshots', () => {
+    const provider = snapshot().providers[0]
+    const at33 = snapshot()
+    at33.providers = Array.from({ length: 33 }, (_, index) => ({
+      ...structuredClone(provider),
+      providerId: index === 0 ? 'deepinfra' : `sha256:${index.toString(16).padStart(64, '0')}`,
+    }))
+    expect(encodeOpenCodeRedactedSnapshotV1(at33).ok).toBe(true)
+    const maximum = snapshot()
+    maximum.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS }, (_, index) => ({
+      ...structuredClone(provider),
+      providerId: `sha256:${(index + 1).toString(16).padStart(64, '0')}`,
+      modelIds: undefined,
+    }))
+    expect(encodeOpenCodeRedactedSnapshotV1(maximum).ok).toBe(true)
+    maximum.providers.push({ ...structuredClone(provider), providerId: `sha256:${'f'.repeat(64)}` })
+    expect(encodeOpenCodeRedactedSnapshotV1(maximum)).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
+  })
+
+  test('omits oversized catalogs with stable truncation count and fingerprint metadata', () => {
+    const candidate = snapshot()
+    candidate.providers[0].modelIds = Array.from({ length: 257 }, (_, index) => `deepinfra/model-${index}`)
+    const encoded = encodeOpenCodeRedactedSnapshotV1(candidate)
+    expect(encoded.ok).toBe(true)
+    if (!encoded.ok) throw new Error(encoded.issueCode)
+    expect(encoded.value.providers[0]).toMatchObject({
+      modelIdsTotal: 257,
+      modelIdsTruncated: true,
+    })
+    expect(encoded.value.providers[0].modelIds).toBeUndefined()
+    expect(encoded.value.providers[0].modelIdsFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
+
+    const large = snapshot()
+    large.providers[0].modelIds = Array.from({ length: 5_000 }, (_, index) => `deepinfra/large-${index}`)
+    const largeEncoded = encodeOpenCodeRedactedSnapshotV1(large)
+    expect(largeEncoded.ok).toBe(true)
+    if (!largeEncoded.ok) throw new Error(largeEncoded.issueCode)
+    expect(largeEncoded.value.providers[0]).toMatchObject({ modelIdsTotal: 5_000, modelIdsTruncated: true })
+
+    const reversed = snapshot()
+    reversed.providers[0].modelIds = [...candidate.providers[0].modelIds].reverse()
+    const reversedEncoded = encodeOpenCodeRedactedSnapshotV1(reversed)
+    expect(reversedEncoded.ok).toBe(true)
+    if (!reversedEncoded.ok) throw new Error(reversedEncoded.issueCode)
+    expect(reversedEncoded.value.providers[0].modelIdsFingerprint)
+      .toBe(encoded.value.providers[0].modelIdsFingerprint)
+    expect(new TextDecoder().decode(reversedEncoded.bytes)).toBe(new TextDecoder().decode(encoded.bytes))
+  })
+
   test('rejects duplicate keys, excessive depth and unknown fields before schema decoding', () => {
     expect(decodeOpenCodeRedactedSnapshotV1('{"schemaVersion":1,"schemaVersion":1}')).toEqual({ ok: false, issueCode: 'snapshot_duplicate_key' })
     const deep = `${'['.repeat(OPEN_CODE_REDACTED_SNAPSHOT_MAX_JSON_DEPTH + 1)}0${']'.repeat(OPEN_CODE_REDACTED_SNAPSHOT_MAX_JSON_DEPTH + 1)}`

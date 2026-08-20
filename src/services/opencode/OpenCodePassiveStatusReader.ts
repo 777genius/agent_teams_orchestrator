@@ -3,6 +3,7 @@ import { types as nodeTypes } from 'node:util'
 
 import {
   isOpenCodeCanonicalProviderId,
+  OPEN_CODE_PASSIVE_MAX_PROVIDERS,
   isOpenCodePassiveBinaryVersion,
   type OpenCodeBinaryStatus,
   type OpenCodeCatalogStatus,
@@ -278,7 +279,7 @@ function captureProviderIds(value: unknown): unknown[] | null {
     // This remains a small fixed upper bound (never a full-inventory fanout),
     // while leaving room for the canonical passive base set plus every curated
     // subscription provider.
-    if (length < 0 || length > 64) return null
+    if (length < 0 || length > OPEN_CODE_PASSIVE_MAX_PROVIDERS) return null
     const result: unknown[] = []
     for (let index = 0; index < length; index += 1) {
       const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index))

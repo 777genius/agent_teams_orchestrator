@@ -68,6 +68,8 @@ export type OpenCodeScopedProfilePlanningEvidence = {
   automaticUserPluginFingerprint?: string
   plugins: readonly {
     spec: string
+    /** Name read from the locally resolved root manifest; never inferred from mutable spec syntax. */
+    packageName?: string
     provenance: 'user' | 'project' | 'environment' | 'app-managed'
     /** Exact immutable package/local tree bytes, including transitive dependencies. */
     dependencyTreeFingerprint: string
@@ -106,6 +108,7 @@ export type OpenCodeScopedProfilePlanContract = {
   automaticUserPluginFingerprint: string
   plugins: readonly {
     spec: string
+    packageName: string
     provenance: 'user' | 'project' | 'environment' | 'app-managed'
     dependencyTreeFingerprint: string
     packageIntegrity: string
@@ -259,6 +262,25 @@ export type OpenCodeModelMetadata = {
   raw: Record<string, unknown>
 }
 
+export type OpenCodeInventoryEvidenceState = 'complete' | 'partial' | 'skipped' | 'failed'
+
+export type OpenCodeInventoryEvidenceDimension<Provenance extends string> = {
+  state: OpenCodeInventoryEvidenceState
+  provenance: Provenance
+}
+
+/**
+ * Per-dimension authority carried by active inventory. Empty arrays are only
+ * authoritative when their corresponding dimension is complete.
+ */
+export type OpenCodeInventoryCompleteness = {
+  profileConfig: OpenCodeInventoryEvidenceDimension<'managed_profile'>
+  managedAuth: OpenCodeInventoryEvidenceDimension<'managed_auth_store'>
+  environmentAuth: OpenCodeInventoryEvidenceDimension<'provider_environment'>
+  providerInventory: OpenCodeInventoryEvidenceDimension<'provider_cli'>
+  modelCatalog: OpenCodeInventoryEvidenceDimension<'model_cli'>
+}
+
 export type OpenCodeInventorySnapshot = {
   detected: boolean
   binaryPath: string | null
@@ -273,6 +295,8 @@ export type OpenCodeInventorySnapshot = {
   authStorePath: string | null
   probeError: string | null
   diagnostics: string[]
+  /** Required from production probes; optional only for legacy/test adapters. */
+  completeness?: OpenCodeInventoryCompleteness
 }
 
 export type OpenCodeConfigResponse = {

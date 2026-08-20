@@ -21,6 +21,7 @@ export type OpenCodePluginProvenance = 'user' | 'project' | 'environment' | 'app
 
 export type OpenCodePreservedPlugin = {
   spec: string
+  packageName?: string
   provenance: Exclude<OpenCodePluginProvenance, 'app-managed'>
 }
 
@@ -494,7 +495,14 @@ export function planScopedProfile(
     if (!['user', 'project', 'environment', 'app-managed'].includes(plugin.provenance)) {
       throw new Error('OpenCode scoped plugin provenance is invalid')
     }
-    const exactPackage = exactRegistryPackageFromSpec(spec)
+    // Older exact-pin callers did not carry the manifest-derived name. Keep
+    // that compatibility path narrow; mutable ordinary specs must always be
+    // resolved by capture and provide an explicit local-tree package name.
+    const packageName = plugin.packageName?.trim()
+      || exactRegistryPackageFromSpec(spec).name
+    if (!packageName || packageNameFromSnapshotRoot(packageName) !== packageName) {
+      throw new Error('OpenCode scoped plugin resolved package name is invalid')
+    }
     const seenTreePaths = new Set<string>()
     const treeBytes = new Map<string, Buffer>()
     const treeIdentity = plugin.immutableTreeEntries.map(entry => {
@@ -525,7 +533,6 @@ export function planScopedProfile(
     if (planningFingerprint(treeIdentity) !== plugin.dependencyTreeFingerprint) {
       throw new Error('OpenCode scoped plugin dependency tree fingerprint mismatch')
     }
-    const packageName = exactPackage.name
     if (!treeIdentity.some(entry =>
       entry.path === `${packageName}/package.json` || entry.path.startsWith(`${packageName}/`)
     )) throw new Error('OpenCode scoped plugin package root is absent from its dependency tree')
@@ -539,8 +546,9 @@ export function planScopedProfile(
     } catch {
       throw new Error('OpenCode scoped plugin package manifest is invalid')
     }
-    if (rootManifest.name !== packageName || rootManifest.version !== exactPackage.version) {
-      throw new Error('OpenCode scoped plugin package manifest does not match its exact spec')
+    if (rootManifest.name !== packageName
+      || typeof rootManifest.version !== 'string' || !rootManifest.version.trim()) {
+      throw new Error('OpenCode scoped plugin package manifest does not match its resolved tree')
     }
     assertCompletePluginPackageClosure(packageName, treeBytes)
     const manifestFingerprint = createHash('sha256').update(rootManifestBytes).digest('hex')
@@ -549,7 +557,7 @@ export function planScopedProfile(
       .digest('base64')}`
     const lockBindingFingerprint = planningFingerprint({
       packageName,
-      version: exactPackage.version,
+      version: rootManifest.version,
       packageIntegrity,
       manifestFingerprint,
       dependencyTreeFingerprint: plugin.dependencyTreeFingerprint,
@@ -560,6 +568,7 @@ export function planScopedProfile(
     }
     return {
       spec,
+      packageName,
       provenance: plugin.provenance,
       dependencyTreeFingerprint: plugin.dependencyTreeFingerprint,
       packageIntegrity,
@@ -582,12 +591,12 @@ export function planScopedProfile(
   }
   if (plugins.some(plugin =>
     plugin.provenance === 'app-managed'
-    && unrelatedManagedPackages.has(packageNameFromSpec(plugin.spec)))) {
+    && unrelatedManagedPackages.has(plugin.packageName))) {
     throw new Error('OpenCode scoped plan contains an unrelated app-managed plugin')
   }
   if (
     selectedManagedPackage
-    && !plugins.some(plugin => packageNameFromSpec(plugin.spec) === selectedManagedPackage)
+    && !plugins.some(plugin => plugin.packageName === selectedManagedPackage)
   ) {
     throw new Error('OpenCode selected provider plugin immutable evidence is unavailable')
   }
@@ -651,7 +660,7 @@ function resolvePlugins(
 ): OpenCodePolicyPlugin[] {
   const plugins: OpenCodePolicyPlugin[] = preservedPlugins.map(plugin => ({
     spec: plugin.spec,
-    packageName: packageNameFromSpec(plugin.spec),
+    packageName: plugin.packageName ?? packageNameFromSpec(plugin.spec),
     provenance: plugin.provenance,
   }))
   const managedSpec = providerId ? APP_MANAGED_PLUGIN_BY_PROVIDER[providerId] : undefined

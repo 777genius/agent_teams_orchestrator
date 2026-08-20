@@ -276,39 +276,15 @@ test('#443 containment: passive catalog uses profile plus live API without verbo
   }
 })
 
-test('RED/#436/#443: production exposes a public parameterized purpose-composition adapter', async () => {
-  const production = await import('../src/services/opencode/OpenCodeProvisioningProbe.js') as Record<string, unknown>
-  type PublicPurposeAdapterFactory = (options: {
-    selected: { projectPath: string; provider: string; model: string }
-    ports: {
-      cli(args: readonly string[]): Promise<void>
-      plugin(provider: string): Promise<void>
-      host(operation: string): Promise<void>
-    }
-  }) => {
-    status(): Promise<unknown>
-    catalog(): Promise<unknown>
-    launch(): Promise<unknown>
-  }
-  const factory = production.createOpenCodePurposeCompositionAdapter as PublicPurposeAdapterFactory | undefined
-
-  expect(
-    typeof factory,
-    'Phase 1 seam missing: export createOpenCodePurposeCompositionAdapter(selected provider/model + observable callable ports)',
-  ).toBe('function')
-
-  // Once Phase 1 adds the public seam, this unchanged assertion binds the same selected target
-  // to callable CLI/plugin/host ports without reaching a private method by cast.
-  const calls: string[] = []
-  const adapter = factory!({
-    selected: { projectPath: '/test-sandbox/project', provider: 'deepinfra', model: 'deepinfra/model' },
-    ports: {
-      cli: async args => { calls.push(`cli:${args.join(' ')}`) },
-      plugin: async provider => { calls.push(`plugin:${provider}`) },
-      host: async operation => { calls.push(`host:${operation}`) },
-    },
-  })
-  await adapter.launch()
-  expect(calls.some(call => call.includes('models --verbose') || call.includes('full'))).toBe(false)
-  expect(calls.some(call => /plugin:(kiro|cursor)/.test(call))).toBe(false)
+test('#443 evidence imports the production status/catalog/launch composers and no purpose facade', async () => {
+  const [status, catalog, launch, provisioning] = await Promise.all([
+    import('../src/services/opencode/OpenCodePassiveCommandStatusRoute.js'),
+    import('../src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.js'),
+    import('../src/services/opencode/OpenCodeLaunchAttemptProductionComposition.js'),
+    import('../src/services/opencode/OpenCodeProvisioningProbe.js') as Promise<Record<string, unknown>>,
+  ])
+  expect(typeof status.executeOpenCodePassiveCommandStatusEnvelope).toBe('function')
+  expect(typeof catalog.OpenCodeProviderManagementAdapter).toBe('function')
+  expect(typeof launch.createOpenCodeLaunchAttemptProductionBridge).toBe('function')
+  expect(provisioning.createOpenCodePurposeCompositionAdapter).toBeUndefined()
 })

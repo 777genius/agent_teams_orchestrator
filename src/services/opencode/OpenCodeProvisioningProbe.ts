@@ -10,12 +10,7 @@ import {
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
 import {
   canonicalizeOpenCodeProviderId,
-  parseOpenCodeExactProviderModelRef,
 } from './OpenCodeProviderIdentity.js'
-import {
-  OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
-  OpenCodePassiveStatusProductionReader,
-} from './OpenCodePassiveStatusProductionReader.js'
 import {
   mergeOpenCodeModelMetadata,
   normalizeOpenCodeLiveConfigProvidersResponse,
@@ -442,59 +437,3 @@ export class OpenCodeProvisioningProbe {
 }
 
 export const openCodeProvisioningProbe = new OpenCodeProvisioningProbe()
-
-export type OpenCodePurposeCompositionAdapterOptions = Readonly<{
-  selected: Readonly<{
-    projectPath: string
-    provider: string
-    model: string
-  }>
-  ports: Readonly<{
-    /** S2 selected-provider catalog port. */
-    cli(args: readonly string[]): Promise<void>
-    /** S1 immutable managed-plugin/native-bridge materialization port. */
-    plugin(provider: string): Promise<void>
-    /** S3 ledger-first retained-host launch port. */
-    host(operation: string): Promise<void>
-  }>
-}>
-
-/**
- * Public purpose composition seam used by production fakes and app wiring.
- * It deliberately exposes only the three reviewed purpose boundaries: passive
- * S4 status, selected-provider S2 catalog, and S1/S3 launch materialization.
- */
-export function createOpenCodePurposeCompositionAdapter(
-  options: OpenCodePurposeCompositionAdapterOptions,
-): {
-  status(): Promise<Awaited<ReturnType<OpenCodePassiveStatusProductionReader['reader']['read']>>>
-  catalog(): Promise<void>
-  launch(): Promise<void>
-} {
-  const projectPath = options.selected.projectPath.trim()
-  const providerId = canonicalizeOpenCodeProviderId(options.selected.provider)
-  const model = parseOpenCodeExactProviderModelRef(options.selected.model)
-  if (!projectPath || !providerId || !model || model.providerId !== providerId) {
-    throw new TypeError('OpenCode purpose composition requires one exact project/provider/model selection')
-  }
-  const ports = Object.freeze({
-    cli: options.ports.cli.bind(options.ports),
-    plugin: options.ports.plugin.bind(options.ports),
-    host: options.ports.host.bind(options.ports),
-  })
-
-  return Object.freeze({
-    status: () => new OpenCodePassiveStatusProductionReader().reader.read({
-      projectPath,
-      providerIds: Object.freeze([providerId]),
-      timeoutMs: OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS,
-    }),
-    catalog: () => ports.cli(Object.freeze(['models', '--provider', providerId])),
-    launch: async () => {
-      if (providerId === 'kiro' || providerId === 'cursor-acp') {
-        await ports.plugin(providerId)
-      }
-      await ports.host(`launch:${providerId}:${model.raw}`)
-    },
-  })
-}

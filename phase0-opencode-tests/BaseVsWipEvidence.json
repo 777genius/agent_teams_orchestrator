@@ -1,6 +1,8 @@
 {
-  "schema": 2,
+  "schema": 3,
   "baseRevision": "73993bad8ff96dc08086b5ecf125084e1df4a08f",
-  "purpose": "The executable test creates disposable base and patch-bound WIP git checkouts, runs this unchanged production regression command in both, and compares generated evidence inside its temporary sandbox.",
-  "command": "bun test phase0-opencode-tests/OpenCodeStatusCatalogLaunch.regression.test.ts"
+  "reviewedLatestCommit": "6294d48a6b977b11863dcb6d0944f2dedb688da7",
+  "reviewedLatestTree": "0b8ce21881b3449a676431045b0dfbaa6488e12b",
+  "purpose": "The executable verifier binds the canonical base through the reviewed latest tree to exact committed base...HEAD production bytes; working-tree patches never supply acceptance evidence.",
+  "command": "bun test phase0-opencode-tests/BaseVsWipEvidence.test.ts"
 }

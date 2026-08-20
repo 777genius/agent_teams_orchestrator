@@ -148,6 +148,13 @@ type OpenCodeHostManagerDeps = {
   beforePersistentRegistryWrite?: () => Promise<void>
   afterPersistentRegistryWrite?: () => Promise<void>
   scopedTransportOwnerKey?: Buffer
+  platform?: NodeJS.Platform
+  windowsOwnerKeyProtection?: OpenCodeWindowsOwnerKeyProtection
+}
+
+export type OpenCodeWindowsOwnerKeyProtection = {
+  get: (identity: { service: string; name: string }) => Promise<string | null>
+  set: (identity: { service: string; name: string; value: string }) => Promise<void>
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -372,6 +379,10 @@ function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function canonicalWindowsPath(value: string): string {
+  return path.resolve(value).replace(/^\\\\\?\\/, '').replace(/[\\/]+$/, '').toLowerCase()
+}
+
 export type VerifiedScopedBinary = {
   profile: OpenCodeScopedPreparedProfile
   fileHandle: FileHandle
@@ -407,13 +418,94 @@ type StageScopedHostBinaryTestHooks = {
 // load the same owner-only capability key from their separate key store.
 const scopedTransportOwnerKeys = new Map<string, Buffer>()
 
-function loadScopedTransportOwnerKey(registryPath: string, heldParentPath?: string): Buffer {
+async function loadScopedTransportOwnerKey(
+  registryPath: string,
+  heldParentPath?: string,
+  platform: NodeJS.Platform = process.platform,
+  windowsProtection?: OpenCodeWindowsOwnerKeyProtection,
+): Promise<Buffer> {
   const cached = scopedTransportOwnerKeys.get(registryPath)
-  if (cached) return cached
-  if (process.platform !== 'linux' && process.platform !== 'darwin') {
+  if (cached && !windowsProtection) return cached
+  if (platform === 'win32') {
+    // Bun.secrets maps to Windows Credential Manager: the 32-byte capability
+    // is protected to the current Windows account and never appears in the
+    // filesystem. The app-root record is only an atomic identity binding, so
+    // a copied, rotated or corrupt credential/record pair fails closed.
+    const protection = windowsProtection ?? {
+      get: identity => Bun.secrets.get(identity),
+      set: identity => Bun.secrets.set(identity),
+    }
+    const registryIdentity = hashText(path.resolve(registryPath))
+    const credentialIdentity = {
+      service: 'claude-multimodel-opencode-host-owner-v1',
+      name: registryIdentity,
+    }
+    const registryParent = heldParentPath ?? path.dirname(registryPath)
+    const parentBefore = await lstat(registryParent, { bigint: true })
+    const parentCanonical = await realpath(registryParent)
+    if (!parentBefore.isDirectory() || parentBefore.isSymbolicLink()
+      || canonicalWindowsPath(parentCanonical) !== canonicalWindowsPath(registryParent)
+      || (parentBefore.dev === 0n && parentBefore.ino === 0n)) {
+      throw new Error('OpenCode scoped capability parent is not canonical [redacted]')
+    }
+    const storePath = path.join(registryParent, 'host-capabilities')
+    await ensureOpenCodeManagedDirectoryPath(storePath, registryParent, undefined, 'win32')
+    const parentAfter = await lstat(registryParent, { bigint: true })
+    if (parentAfter.dev !== parentBefore.dev || parentAfter.ino !== parentBefore.ino) {
+      throw new Error('OpenCode scoped capability parent changed during creation [redacted]')
+    }
+    const store = await OpenCodeSafePublicationDirectory.open(storePath)
+    try {
+      const recordName = `${registryIdentity}.owner-key.json`
+      const recordPath = store.child(recordName)
+      const existing = await lstat(recordPath).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      })
+      if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
+        throw new Error('OpenCode scoped capability owner record is foreign or corrupt [redacted]')
+      }
+      let secret = await protection.get(credentialIdentity)
+      if (!existing) {
+        if (!secret) {
+          secret = randomBytes(32).toString('base64')
+          await protection.set({ ...credentialIdentity, value: secret })
+        }
+        const key = Buffer.from(secret, 'base64')
+        if (key.length !== 32 || key.toString('base64') !== secret) {
+          throw new Error('OpenCode scoped capability owner protection is invalid [redacted]')
+        }
+        const record = JSON.stringify({
+          schema: 'opencode-windows-owner-key-v1',
+          registryIdentity,
+          ownerKeyFingerprint: hashText(secret),
+        })
+        await store.publishImmutableFile(recordName, record, 0o600)
+      }
+      const held = await open(recordPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+      try {
+        const metadata = await held.stat({ bigint: true })
+        const parsed = JSON.parse((await held.readFile()).toString('utf8')) as Record<string, unknown>
+        if (!metadata.isFile() || metadata.isSymbolicLink()
+          || parsed.schema !== 'opencode-windows-owner-key-v1'
+          || parsed.registryIdentity !== registryIdentity
+          || typeof parsed.ownerKeyFingerprint !== 'string'
+          || !secret || hashText(secret) !== parsed.ownerKeyFingerprint) {
+          throw new Error('OpenCode scoped capability owner record is foreign or corrupt [redacted]')
+        }
+        const key = Buffer.from(secret, 'base64')
+        if (key.length !== 32 || key.toString('base64') !== secret) {
+          throw new Error('OpenCode scoped capability owner key is invalid [redacted]')
+        }
+        if (!windowsProtection) scopedTransportOwnerKeys.set(registryPath, key)
+        return key
+      } finally { await held.close() }
+    } finally { await store.close() }
+  }
+  if (platform !== 'linux' && platform !== 'darwin') {
     throw new Error('OpenCode scoped capability store is unsupported [redacted]')
   }
-  const fdRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'
+  const fdRoot = platform === 'linux' ? '/proc/self/fd' : '/dev/fd'
   const registryParent = heldParentPath ?? path.dirname(registryPath)
   const parentDescriptor = openSync(
     registryParent,
@@ -1335,6 +1427,7 @@ export class OpenCodeHostManager {
   private readonly pendingHostGenerations = new Map<string, symbol>()
   private readonly scopedStagingGenerations = new Map<string, symbol>()
   private activeRegistryDirectory: OpenCodeSafePublicationDirectory | null = null
+  private durableScopedTransportOwnerKey: Buffer | null = null
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
 
@@ -1345,11 +1438,23 @@ export class OpenCodeHostManager {
       }
       return this.deps.scopedTransportOwnerKey
     }
+    if (!this.durableScopedTransportOwnerKey) {
+      throw new Error('OpenCode scoped durable owner key was not loaded [redacted]')
+    }
+    return this.durableScopedTransportOwnerKey
+  }
+
+  private async ensureScopedTransportOwnerKeyLoaded(): Promise<void> {
+    if (this.deps.scopedTransportOwnerKey || this.durableScopedTransportOwnerKey) return
     const registryPath = this.persistentRegistryPath
     if (!registryPath) throw new Error('OpenCode scoped durable transport is disabled [redacted]')
-    return loadScopedTransportOwnerKey(
+    this.durableScopedTransportOwnerKey = await loadScopedTransportOwnerKey(
       registryPath,
-      this.activeRegistryDirectory?.descriptorPath(),
+      (this.deps.platform ?? process.platform) === 'win32'
+        ? path.dirname(registryPath)
+        : this.activeRegistryDirectory?.descriptorPath(),
+      this.deps.platform ?? process.platform,
+      this.deps.windowsOwnerKeyProtection,
     )
   }
 
@@ -1901,13 +2006,15 @@ export class OpenCodeHostManager {
       const lockName = `${path.basename(registryPath)}.lock`
       await directory.ensureRegularFile(lockName)
       let release: (() => Promise<void>) | undefined
+      const previousDirectory = this.activeRegistryDirectory
+      this.activeRegistryDirectory = directory
       try {
         release = await lockfile.lock(directory.child(lockName), PERSISTENT_REGISTRY_LOCK_OPTIONS)
-        const previousDirectory = this.activeRegistryDirectory
-        this.activeRegistryDirectory = directory
-        try { return await callback() } finally { this.activeRegistryDirectory = previousDirectory }
+        await this.ensureScopedTransportOwnerKeyLoaded()
+        return await callback()
       } finally {
         if (release) await release()
+        this.activeRegistryDirectory = previousDirectory
       }
     })
   }

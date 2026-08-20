@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
+import type { OpenCodeLaunchMemberRecovery } from './OpenCodeLaunchMutationLedger.js'
 import {
   decodeOpenCodeLaunchAttemptResponse,
   encodeOpenCodeLaunchAttemptRequest,
@@ -137,7 +138,8 @@ export type OpenCodeLaunchAttemptPorts = {
       attemptId: string; payloadHash: string; inputDigest: string; generation: number; fence: number
       acquisitionToken: string; claimToken: string
       memberIdentity: OpenCodeOpaqueIdentity; deadlineAtMs: number; signal: AbortSignal
-    } & ({ transition: 'cancel' } | { transition: 'commit'; linkage: OpenCodeLaunchMemberLinkage })):
+    } & ({ transition: 'cancel' } | { transition: 'commit'; linkage: OpenCodeLaunchMemberLinkage;
+      recovery?: OpenCodeLaunchMemberRecovery })):
       Promise<'cancelled' | 'committed' | 'fenced' | 'unknown'>
     /** Includes session create, noReply bootstrap, and truthful durable linkage commit. */
     createBootstrapAndCommit(input: {
@@ -157,7 +159,8 @@ export type OpenCodeLaunchAttemptPorts = {
       /** Must be awaited immediately before every irreversible mutation and its durable commit. */
       revalidateBeforeCommit(): Promise<void>
       /** The durable session commit point must CAS the still-live claim token. */
-      commitIfClaimLive(linkage: OpenCodeLaunchMemberLinkage): Promise<'committed' | 'fenced' | 'unknown'>
+      commitIfClaimLive(linkage: OpenCodeLaunchMemberLinkage, recovery?: OpenCodeLaunchMemberRecovery):
+        Promise<'committed' | 'fenced' | 'unknown'>
     }): Promise<OpenCodeLaunchMaterializeResult>
   }
   ownership: {
@@ -462,7 +465,7 @@ export class OpenCodeLaunchAttempt {
                   deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
                   registerOwned: resource => { registerOwned(resource, memberIdentity) },
                   revalidateBeforeCommit: revalidateMember,
-                  commitIfClaimLive: async linkage => {
+                  commitIfClaimLive: async (linkage, recovery) => {
                     validateLinkage(linkage, memberIdentity)
                     if (claimCommitStarted) throw new OpenCodeLaunchAttemptError('member.claimCommitDuplicate')
                     claimCommitStarted = true
@@ -474,7 +477,7 @@ export class OpenCodeLaunchAttempt {
                     const transition = await this.ports.sessions.transitionMemberClaim({
                       attemptId: attempt.attemptId, payloadHash: attempt.payloadHash, inputDigest,
                       generation: lease.generation, fence: lease.fence, acquisitionToken: lease.acquisitionToken,
-                      claimToken, memberIdentity, linkage, transition: 'commit',
+                      claimToken, memberIdentity, linkage, recovery, transition: 'commit',
                       deadlineAtMs: budget.memberDeadlineAtMs, signal: controller.signal,
                     })
                     const result = transition === 'cancelled' ? 'fenced' : transition

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
@@ -19,6 +19,31 @@ describe('OpenCodeSafePublication', () => {
       await directory.writeFileAtomic('registry.json', '{"safe":true}', 0o600)
       expect(await readdir(outside)).toEqual([])
       expect(await readFile(path.join(displaced, 'registry.json'), 'utf8')).toBe('{"safe":true}')
+    } finally {
+      await directory.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('a coordinated parent swap cannot redirect a bounded regular-file read', async () => {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-safe-read-swap-'))
+    const owned = path.join(root, 'owned')
+    const displaced = path.join(root, 'displaced')
+    const outside = path.join(root, 'outside')
+    await Promise.all([mkdir(owned), mkdir(outside)])
+    await writeFile(path.join(owned, 'snapshot.json'), 'trusted')
+    await writeFile(path.join(outside, 'snapshot.json'), 'attacker')
+    const directory = await OpenCodeSafePublicationDirectory.open(owned)
+    try {
+      const value = await directory.readBoundedRegularFile(
+        'snapshot.json', 64, undefined, { afterPathIdentityCaptured: async () => {
+          await rename(owned, displaced)
+          await symlink(outside, owned, 'dir')
+        } },
+      )
+      expect(value).toBe('trusted')
+      expect(await readFile(path.join(outside, 'snapshot.json'), 'utf8')).toBe('attacker')
     } finally {
       await directory.close()
       await rm(root, { recursive: true, force: true })

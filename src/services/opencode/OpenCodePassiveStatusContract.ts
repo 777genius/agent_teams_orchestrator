@@ -2,6 +2,8 @@ import { types as nodeTypes } from 'node:util'
 
 export const OPEN_CODE_PASSIVE_STATUS_CONTRACT_VERSION = 1 as const
 export const OPEN_CODE_PASSIVE_CAPABILITY_VERSION = 1 as const
+/** Shared request, directory and stored-snapshot provider capacity. */
+export const OPEN_CODE_PASSIVE_MAX_PROVIDERS = 64 as const
 
 export type OpenCodePassiveFreshness = 'fresh' | 'stale' | 'unknown'
 export type OpenCodePassiveCondition = 'normal' | 'degraded'

@@ -13,6 +13,12 @@ import {
   OpenCodeLaunchJournalError,
   type OpenCodeLaunchStoreContext,
 } from './OpenCodeLaunchAttemptStore.js'
+import type { OpenCodeSessionRecord } from './types.js'
+
+export type OpenCodeLaunchMemberRecovery = {
+  ownershipTitle: string
+  sessionRecord: OpenCodeSessionRecord
+}
 
 export type OpenCodeLaunchMutationIdentity = {
   attemptId: string
@@ -31,6 +37,7 @@ export type OpenCodeLaunchMutationClaimRecord = OpenCodeLaunchMutationIdentity &
   idempotencyIdentity: string
   state: 'claimed' | 'unknown' | 'committed'
   linkage?: OpenCodeLaunchMemberLinkage
+  recovery?: OpenCodeLaunchMemberRecovery
 }
 type ClaimRecord = OpenCodeLaunchMutationClaimRecord
 
@@ -89,6 +96,7 @@ export class OpenCodeLaunchMutationLedger {
     transition: 'unknown' | 'commit',
     linkage: OpenCodeLaunchMemberLinkage | undefined,
     context: OpenCodeLaunchStoreContext,
+    recovery?: OpenCodeLaunchMemberRecovery,
   ): Promise<'committed' | 'cancelled' | 'fenced' | 'unknown'> {
     return this.withLock(targetDigest, context, async persistence => {
       const current = await this.readUnlocked(persistence, targetDigest, context)
@@ -97,8 +105,9 @@ export class OpenCodeLaunchMutationLedger {
         return linkage && current.linkage && sameLinkage(current.linkage, linkage) ? 'committed' : 'fenced'
       }
       if (current.state === 'unknown' && transition === 'commit') return 'fenced'
+      if (transition === 'commit' && !recovery) throw new TypeError('launch mutation recovery metadata is required')
       const next: ClaimRecord = transition === 'commit'
-        ? { ...current, state: 'committed', linkage }
+        ? { ...current, state: 'committed', linkage, recovery }
         : { ...current, state: 'unknown' }
       validateClaimRecord(next)
       await persistence.replaceAndSync(new TextEncoder().encode(JSON.stringify(next)), context)
@@ -137,7 +146,7 @@ function validateClaimRecord(value: unknown): asserts value is ClaimRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw corrupt()
   const record = value as Record<string, unknown>
   const allowed = new Set(['version', 'targetDigest', 'idempotencyIdentity', 'state', 'attemptId', 'payloadHash',
-    'inputDigest', 'generation', 'fence', 'acquisitionToken', 'claimToken', 'memberIdentity', 'linkage'])
+    'inputDigest', 'generation', 'fence', 'acquisitionToken', 'claimToken', 'memberIdentity', 'linkage', 'recovery'])
   if (Object.keys(record).some(key => !allowed.has(key)) || record.version !== 1
     || !DIGEST.test(String(record.targetDigest)) || !TOKEN.test(String(record.idempotencyIdentity))
     || !['claimed', 'unknown', 'committed'].includes(String(record.state))
@@ -147,8 +156,23 @@ function validateClaimRecord(value: unknown): asserts value is ClaimRecord {
     || !Number.isSafeInteger(record.fence) || !TOKEN.test(String(record.acquisitionToken))
     || !TOKEN.test(String(record.claimToken)) || !isOpenCodeOpaqueIdentity(record.memberIdentity)) throw corrupt()
   if (record.state === 'committed') {
-    if (!record.linkage || !sameLinkageShape(record.linkage, record.memberIdentity as string)) throw corrupt()
-  } else if (record.linkage !== undefined) throw corrupt()
+    if (!record.linkage || !sameLinkageShape(record.linkage, record.memberIdentity as string)
+      || (record.recovery !== undefined && !sameRecoveryShape(record.recovery))) throw corrupt()
+  } else if (record.linkage !== undefined || record.recovery !== undefined) throw corrupt()
+}
+
+function sameRecoveryShape(value: unknown): value is OpenCodeLaunchMemberRecovery {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const recovery = value as Record<string, unknown>
+  if (Object.keys(recovery).length !== 2 || typeof recovery.ownershipTitle !== 'string'
+    || !recovery.sessionRecord || typeof recovery.sessionRecord !== 'object'
+    || Array.isArray(recovery.sessionRecord)) return false
+  const record = recovery.sessionRecord as Record<string, unknown>
+  return typeof record.teamId === 'string' && typeof record.memberName === 'string'
+    && record.providerId === 'opencode' && typeof record.selectedModel === 'string'
+    && typeof record.projectPath === 'string' && typeof record.profileRootKey === 'string'
+    && typeof record.hostKey === 'string' && typeof record.opencodeSessionId === 'string'
+    && record.appManagedBootstrap !== null && typeof record.appManagedBootstrap === 'object'
 }
 
 function sameAuthority(left: ClaimRecord, right: OpenCodeLaunchMutationIdentity): boolean {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { lstat, open, realpath } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
@@ -16,6 +16,7 @@ import {
   OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES,
   type OpenCodeRedactedSnapshotV1,
 } from './OpenCodeRedactedStatusSnapshot.js'
+import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 export const OPEN_CODE_PASSIVE_STATUS_DEFAULT_TIMEOUT_MS = 250
 export const OPEN_CODE_PASSIVE_STATUS_STORE_DIRECTORY = 'opencode/passive-status/v1'
 export const OPEN_CODE_PASSIVE_STATUS_MAX_CACHED_SCOPES = 32
@@ -399,24 +400,26 @@ function normalizeWindowsProjectPath(projectPath: string): string {
   return withoutTrailingSeparators.toLowerCase()
 }
 
-async function readBoundedSnapshotText(filePath: string, signal: AbortSignal): Promise<string | null> {
-  let handle
+export async function readBoundedSnapshotText(filePath: string, signal: AbortSignal): Promise<string | null> {
+  const isBinary = path.basename(filePath) === 'binary.snapshot.json'
+  const rootPath = isBinary ? path.dirname(filePath) : path.dirname(path.dirname(filePath))
+  try { await lstat(rootPath) }
+  catch (error) { if (isMissingFile(error)) return null; throw error }
+  let root: OpenCodeSafePublicationDirectory | null = null
+  let snapshots: OpenCodeSafePublicationDirectory | null = null
   try {
-    handle = await open(filePath, 'r')
+    root = await OpenCodeSafePublicationDirectory.open(rootPath)
     if (signal.aborted) throw cancelledError()
-    const metadata = await handle.stat()
-    if (signal.aborted) throw cancelledError()
-    if (!metadata.isFile() || metadata.size > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) return null
-    const bytes = new Uint8Array(OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES + 1)
-    const result = await handle.read(bytes, 0, bytes.byteLength, 0)
-    if (signal.aborted) throw new Error('cancelled')
-    if (result.bytesRead > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) return null
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, result.bytesRead))
+    if (isBinary) return await root.readBoundedRegularFile('binary.snapshot.json', OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES, signal)
+    try { snapshots = await root.openChildDirectory('snapshots') }
+    catch (error) { if (isMissingFile(error)) return null; throw error }
+    return await snapshots.readBoundedRegularFile(path.basename(filePath), OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES, signal)
   } catch (error) {
     if (isMissingFile(error)) return null
     throw error
   } finally {
-    await handle?.close().catch(() => undefined)
+    await snapshots?.close().catch(() => undefined)
+    await root?.close().catch(() => undefined)
   }
 }
 

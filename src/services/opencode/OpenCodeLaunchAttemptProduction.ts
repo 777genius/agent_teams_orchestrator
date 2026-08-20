@@ -48,7 +48,9 @@ import {
 } from './OpenCodeLaunchProductionGuards.js'
 import {
   createOpenCodeOwnedMemberSession,
+  commitOpenCodeMemberProjection,
   OpenCodeProofSessionCleanupLedger,
+  recoverOpenCodeCommittedMemberProjection,
   reconcileOpenCodeOwnedMemberSession,
   type OpenCodeOwnedSessionReconciliation,
   type OpenCodeProofSessionCleanupRecord,
@@ -243,6 +245,22 @@ class OpenCodeProductionLaunchRuntime {
         command.outerRemainingBudgetMs ?? command.requestedBudgetMs,
         computeOpenCodeLaunchCommandImmutableDigest(command)),
     }, { deadlineAtMs: preflightDeadlineAtMs, signal: preflightSignal, monotonicNow: launchMonotonicNow })
+    let recoveryHost: Promise<OpenCodeHostHandle> | undefined
+    const getRecoveryHost = (): Promise<OpenCodeHostHandle> => {
+      recoveryHost ??= (async () => {
+        const authorization = this.authorizedPlans.get(command)
+        if (!authorization) throw new Error('OpenCode authorized recovery profile plan is absent')
+        const prepared = await prepareAuthorizedOpenCodeLaunchScopedProfile(
+          openCodeProfileManager as unknown as OpenCodePlanScopedProfileManagerPort,
+          { ...authorization, input: { ...authorization.input, abortSignal: preflightSignal } },
+        )
+        return openCodeHostManager.ensureScopedHost({ preparedProfile: prepared,
+          expectedHostKey: prepared.plannedHostKey,
+          healthTimeoutMs: Math.max(1, preflightDeadlineAtMs - launchMonotonicNow()),
+          abortSignal: preflightSignal })
+      })()
+      return recoveryHost
+    }
     const priorClaims = await Promise.all(command.members.map(async member => {
       const target = targetByMember.get(member.memberIdentity)!
       const claim = await mutationLedger.read(target, { deadlineAtMs: preflightDeadlineAtMs,
@@ -253,20 +271,54 @@ class OpenCodeProductionLaunchRuntime {
         || claim.memberIdentity !== member.memberIdentity) {
         throw new Error('OpenCode durable command ledger identity mismatch')
       }
-      const record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
-      const linkage = record ? linkageFor(member.memberIdentity, record) : null
-      if (claim.state === 'committed'
-        && (!claim.linkage || !linkage || JSON.stringify(claim.linkage) !== JSON.stringify(linkage))) {
-        throw new Error('OpenCode durable command ledger/session linkage mismatch')
+      let record = await openCodeSessionStore.get(command.teamId, command.laneId, member.name)
+      let linkage = record ? linkageFor(member.memberIdentity, record) : null
+      let reconciliationError: string | null = null
+      if (claim.state === 'committed' && (!claim.linkage || !linkage
+        || JSON.stringify(claim.linkage) !== JSON.stringify(linkage))) {
+        if (record) reconciliationError = 'local_metadata'
+        else try {
+          const host = await getRecoveryHost()
+          if (!claim.recovery || host.hostKey !== claim.recovery.sessionRecord.hostKey) {
+            reconciliationError = 'local_metadata'
+          } else {
+            const client = openCodeClientFactory.create(host.baseUrl, {
+              signal: preflightSignal,
+              remainingMs: () => Math.max(0, preflightDeadlineAtMs - launchMonotonicNow()),
+            })
+            if (!client.getSessionMessage) reconciliationError = 'transport'
+            else {
+              const recovered = await recoverOpenCodeCommittedMemberProjection({
+                claim, teamId: command.teamId, laneId: command.laneId, memberName: member.name,
+                selectedModel: command.selectedModel,
+                expectedBootstrapText: bootstrapText(command, member.name,
+                  claim.idempotencyIdentity, member.prompt),
+                getSession: id => client.getSession(id),
+                getSessionMessage: (id, messageId) => client.getSessionMessage!(id, messageId),
+                upsert: value => openCodeSessionStore.upsert(value),
+              })
+              if (recovered.status === 'recovered') {
+                record = recovered.record; linkage = recovered.linkage
+              } else reconciliationError = recovered.reason
+            }
+          }
+        } catch { reconciliationError = 'transport' }
       }
-      return { member, claim, record, linkage }
+      return { member, claim, record, linkage, reconciliationError }
     }))
-    const uncertain = priorClaims.some(item => item.claim?.state === 'claimed' || item.claim?.state === 'unknown')
-    const completed = priorClaims.length > 0 && priorClaims.every(item => item.claim?.state === 'committed')
+    if (recoveryHost) {
+      const host = await recoveryHost.catch(() => null)
+      if (host) await bounded(openCodeHostManager.releaseHost(host.hostKey, { keepPersistentAlive: true }),
+        preflightDeadlineAtMs, preflightSignal).catch(() => undefined)
+    }
+    const uncertain = priorClaims.some(item => item.claim?.state === 'claimed' || item.claim?.state === 'unknown'
+      || item.reconciliationError !== null)
+    const completed = priorClaims.length > 0 && priorClaims.every(item => item.claim?.state === 'committed'
+      && item.linkage !== null)
     if (uncertain || completed) {
       const committed = priorClaims.flatMap(item => item.claim?.state === 'committed' && item.linkage
         ? [item.linkage] : [])
-      const pending = priorClaims.filter(item => item.claim?.state !== 'committed')
+      const pending = priorClaims.filter(item => item.claim?.state !== 'committed' || !item.linkage)
         .map(item => item.member.memberIdentity)
       const result = {
         generation: command.request.launchAttempt.generation,
@@ -283,8 +335,9 @@ class OpenCodeProductionLaunchRuntime {
         data: { runId: command.runId, providerId: 'opencode', selectedModel: command.selectedModel,
           members: Object.fromEntries(priorClaims.map(item => [item.member.name, {
             sessionId: item.record?.opencodeSessionId ?? `pending:${item.member.memberIdentity}`,
-            launchState: item.claim?.state === 'committed' ? 'created' : 'failed',
-            evidence: [], diagnostics: [],
+            launchState: item.claim?.state === 'committed' && item.linkage ? 'created' : 'failed',
+            evidence: [], diagnostics: item.reconciliationError
+              ? [`committed projection reconciliation unresolved: ${item.reconciliationError}`] : [],
           }])), launchAttempt: result },
       }
     }
@@ -358,19 +411,23 @@ class OpenCodeProductionLaunchRuntime {
         releaseOperationHost: async input => {
           const proofSession = proofSessions.get(input.host.hostKeyIdentity)
           if (proofSession) {
-            const handle = hostFor(input.host)
-            const client = openCodeClientFactory.create(handle.baseUrl, {
-              signal: input.signal,
-              remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
-            })
-            const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
-              authoritativeSessionId: proofSession.authoritativeSessionId,
-              ownershipTitle: proofSession.ownershipTitle,
-              getSession: id => client.getSession(id),
-              deleteSession: id => client.deleteSession(id),
-            }).catch(() => 'unresolved' as const)
-            const persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup)
-              .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
+            let persisted = proofSession
+            if (proofSession.state !== 'absent' && proofSession.state !== 'deleted'
+              && proofSession.state !== 'foreign') {
+              const handle = hostFor(input.host)
+              const client = openCodeClientFactory.create(handle.baseUrl, {
+                signal: input.signal,
+                remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
+              })
+              const proofCleanup = await reconcileOpenCodeOwnedMemberSession({
+                authoritativeSessionId: proofSession.authoritativeSessionId,
+                ownershipTitle: proofSession.ownershipTitle,
+                getSession: id => client.getSession(id),
+                deleteSession: id => client.deleteSession(id),
+              }).catch(() => 'unresolved' as const)
+              persisted = await proofCleanupLedger.recordState(proofSession, proofCleanup)
+                .catch(() => ({ ...proofSession, state: 'unresolved' as const }))
+            }
             proofSessions.set(input.host.hostKeyIdentity, { ...persisted,
               ...(proofSession.messageId ? { messageId: proofSession.messageId } : {}) })
             if (persisted.state === 'foreign' || persisted.state === 'unresolved'
@@ -400,25 +457,38 @@ class OpenCodeProductionLaunchRuntime {
         const client = openCodeClientFactory.create(handle.baseUrl, {
           signal: input.signal, remainingMs: () => Math.max(0, input.deadlineAtMs - launchMonotonicNow()),
         })
-        const proofDigest = createHash('sha256').update(JSON.stringify({
-          kind: 'launch-proof', attemptId: input.request.launchAttempt.attemptId,
-          payloadHash: input.request.launchAttempt.payloadHash,
-        })).digest('hex')
-        const proofSessionId = `ses_${proofDigest.slice(0, 26)}`
         const proofOwnershipToken = createHash('sha256')
           .update(input.request.launchAttempt.proofNonce)
           .digest('hex')
-        const ownershipTitle = `agent-teams-proof:${input.request.launchAttempt.attemptId}:${proofDigest}:${proofOwnershipToken}`
-        const proofOwnership = {
+        const registration = await proofCleanupLedger.reconcileAndRegister({
           attemptId: input.request.launchAttempt.attemptId,
+          requestGeneration: input.request.launchAttempt.generation,
           hostKeyIdentity: input.host.hostKeyIdentity,
-          authoritativeSessionId: proofSessionId,
-          ownershipTitle,
+          ownership: generation => {
+            const proofDigest = createHash('sha256').update(JSON.stringify({
+              kind: 'launch-proof', attemptId: input.request.launchAttempt.attemptId,
+              payloadHash: input.request.launchAttempt.payloadHash, generation,
+            })).digest('hex')
+            return {
+              authoritativeSessionId: `ses_${proofDigest.slice(0, 26)}`,
+              ownershipTitle: `agent-teams-proof:${input.request.launchAttempt.attemptId}:${generation}:${proofDigest}:${proofOwnershipToken}`,
+            }
+          },
+          reconcile: prior => reconcileOpenCodeOwnedMemberSession({
+            authoritativeSessionId: prior.authoritativeSessionId,
+            ownershipTitle: prior.ownershipTitle,
+            getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
+          }).catch(() => 'unresolved' as const),
+        })
+        const proofOwnership = registration.record
+        const proofSessionId = proofOwnership.authoritativeSessionId
+        const ownershipTitle = proofOwnership.ownershipTitle
+        proofSessions.set(input.host.hostKeyIdentity, proofOwnership)
+        if (!registration.created) {
+          throw new Error(`OpenCode prior proof generation requires cleanup reconciliation (${registration.priorOutcome})`)
         }
         try {
           const existing = await client.getSession(proofSessionId)
-          const registration = await proofCleanupLedger.register(proofOwnership)
-          proofSessions.set(input.host.hostKeyIdentity, registration.record)
           const collisionState: OpenCodeOwnedSessionReconciliation =
             existing.id === proofSessionId && existing.title === ownershipTitle
               ? await reconcileOpenCodeOwnedMemberSession({
@@ -427,24 +497,10 @@ class OpenCodeProductionLaunchRuntime {
               }).catch(() => 'unresolved' as const)
               : 'foreign'
           await proofCleanupLedger.recordState(proofOwnership, collisionState)
-          proofSessions.set(input.host.hostKeyIdentity, { ...registration.record, state: collisionState })
+          proofSessions.set(input.host.hostKeyIdentity, { ...proofOwnership, state: collisionState })
           throw new Error('OpenCode proof session id is already present')
         } catch (error) {
           if (!isNotFound(error)) throw error
-        }
-        // The exact cleanup identity is durable before the only create POST. If this
-        // record already existed, this invocation is reconciliation-only and must
-        // never create the deterministic session a second time.
-        const registration = await proofCleanupLedger.register(proofOwnership)
-        proofSessions.set(input.host.hostKeyIdentity, registration.record)
-        if (!registration.created) {
-          const observed = await reconcileOpenCodeOwnedMemberSession({
-            authoritativeSessionId: proofSessionId, ownershipTitle,
-            getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
-          }).catch(() => 'unresolved' as const)
-          const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
-          proofSessions.set(input.host.hostKeyIdentity, persisted)
-          throw new Error(`OpenCode proof session requires cleanup reconciliation (${observed})`)
         }
         let session: Awaited<ReturnType<typeof client.createSession>>
         try {
@@ -455,7 +511,7 @@ class OpenCodeProductionLaunchRuntime {
             getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
           }).catch(() => 'unresolved' as const)
           const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
-            .catch(() => ({ ...registration.record, state: 'unresolved' as const }))
+            .catch(() => ({ ...proofOwnership, state: 'unresolved' as const }))
           proofSessions.set(input.host.hostKeyIdentity, persisted)
           throw error
         }
@@ -533,7 +589,7 @@ class OpenCodeProductionLaunchRuntime {
             getSession: id => client.getSession(id), deleteSession: id => client.deleteSession(id),
           }).catch(() => 'unresolved' as const)
           const persisted = await proofCleanupLedger.recordState(proofOwnership, observed)
-            .catch(() => ({ ...registration.record, state: 'unresolved' as const }))
+            .catch(() => ({ ...proofOwnership, state: 'unresolved' as const }))
           proofSessions.set(input.host.hostKeyIdentity, persisted)
           throw error
         }
@@ -634,7 +690,8 @@ class OpenCodeProductionLaunchRuntime {
           return mutationLedger.transition(target, input,
             input.transition === 'commit' ? 'commit' : 'unknown',
             input.transition === 'commit' ? input.linkage : undefined,
-            { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow })
+            { deadlineAtMs: input.deadlineAtMs, signal: input.signal, monotonicNow: launchMonotonicNow },
+            input.transition === 'commit' ? input.recovery : undefined)
         },
         createBootstrapAndCommit: async input => {
           const member = memberByIdentity.get(input.memberIdentity)
@@ -710,7 +767,10 @@ class OpenCodeProductionLaunchRuntime {
             model: modelParts(command.selectedModel), parts: [{ type: 'text', text }],
           })
           const written = await client.getSessionMessage?.(record.opencodeSessionId, messageID)
-          if (!written || readOpenCodeExactMessageText(written) !== text) {
+          const writtenInfo = written?.info ?? {}
+          if (!written || readOpenCodeExactMessageText(written) !== text
+            || (writtenInfo.providerID ?? writtenInfo.providerId) !== modelParts(command.selectedModel).providerID
+            || (writtenInfo.modelID ?? writtenInfo.modelId) !== modelParts(command.selectedModel).modelID) {
             throw new Error('OpenCode noReply bootstrap durable verification failed')
           }
           await input.revalidateBeforeCommit()
@@ -721,11 +781,11 @@ class OpenCodeProductionLaunchRuntime {
               model: command.selectedModel, agent: 'teammate-bootstrap',
             }, updatedAt: new Date().toISOString() }
           const linkage = linkageFor(input.memberIdentity, record)!
-          if (await input.commitIfClaimLive(linkage) === 'committed') {
-            retainedSessionLeases.commit(input.memberIdentity)
-            // The CAS ledger above is authoritative. This ordinary store is a
-            // repairable projection and can never authorize a duplicate create.
-            await openCodeSessionStore.upsert(record); records.set(input.memberIdentity, record)
+          if (await commitOpenCodeMemberProjection({
+            commit: () => input.commitIfClaimLive(linkage, { ownershipTitle, sessionRecord: record }),
+            onCommitted: () => retainedSessionLeases.commit(input.memberIdentity),
+            upsert: async () => { await openCodeSessionStore.upsert(record); records.set(input.memberIdentity, record) },
+          }) === 'committed') {
             return { outcome: 'applied', linkage, owned }
           }
           return { outcome: 'unknown_transport', owned }

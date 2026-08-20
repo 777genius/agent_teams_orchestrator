@@ -206,6 +206,23 @@ describe('OpenCodeOperationPolicy', () => {
     }
   })
 
+  test('accepts ordinary mutable specs only when bound to an explicit resolved local tree name', () => {
+    for (const spec of [
+      'opencode-kiro', 'opencode-kiro@latest', 'file:../plugin',
+      'https://plugins.example.invalid/plugin.tgz',
+    ]) {
+      const input = fakeScopedPlanInput()
+      input.evidence.plugins[0] = {
+        ...input.evidence.plugins[0]!, spec, packageName: 'opencode-kiro', provenance: 'user',
+      }
+      const planned = planScopedProfile(input)
+      expect(planned.plugins[0]).toMatchObject({
+        spec, provenance: 'user', executionSpecifier: 'file:./node_modules/opencode-kiro',
+      })
+      expect(planned.plugins[0]!.resolvedIdentity).toBe(input.evidence.plugins[0]!.resolvedIdentity)
+    }
+  })
+
   test('derives package integrity, manifest digest, and lock binding and rejects missing closure', () => {
     const planned = planScopedProfile(fakeScopedPlanInput())
     expect(planned.plugins[0]!.packageIntegrity).toMatch(/^sha512-/)

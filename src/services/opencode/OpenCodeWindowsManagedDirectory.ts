@@ -93,22 +93,29 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
   ownershipBoundary: string,
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
   hooks: OpenCodeWindowsManagedDirectoryHooks = {},
+  trustedRoot: string = path.dirname(ownershipBoundary),
 ): Promise<void> {
   resolved = path.resolve(resolved)
   ownershipBoundary = path.resolve(ownershipBoundary)
+  trustedRoot = path.resolve(trustedRoot)
   const relative = path.relative(ownershipBoundary, resolved)
   if (relative !== '' && (
     relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
   )) throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
 
-  const boundaryParent = path.dirname(ownershipBoundary)
-  const boundaryName = path.basename(ownershipBoundary)
-  const boundaryParentIdentity = await captureDirectoryIdentity(boundaryParent)
-  if (!boundaryParentIdentity) {
-    throw new Error('OpenCode Windows managed root parent must be trusted and pre-existing [redacted]')
+  const boundaryFromTrustedRoot = path.relative(trustedRoot, ownershipBoundary)
+  if (boundaryFromTrustedRoot !== '' && (
+    boundaryFromTrustedRoot === '..' || boundaryFromTrustedRoot.startsWith(`..${path.sep}`)
+    || path.isAbsolute(boundaryFromTrustedRoot)
+  )) {
+    throw new Error('OpenCode Windows trusted managed root is invalid [redacted]')
+  }
+  const trustedRootIdentity = await captureDirectoryIdentity(trustedRoot)
+  if (!trustedRootIdentity) {
+    throw new Error('OpenCode Windows managed trusted OS root must be pre-existing [redacted]')
   }
 
-  const identities = new Map<string, DirectoryIdentity>([[boundaryParent, boundaryParentIdentity]])
+  const identities = new Map<string, DirectoryIdentity>([[trustedRoot, trustedRootIdentity]])
   const created: Array<{ path: string; identity: DirectoryIdentity; parents: Map<string, DirectoryIdentity> }> = []
   const rollback = async (): Promise<void> => {
     for (const entry of created.reverse()) {
@@ -126,32 +133,31 @@ export async function ensureOpenCodeWindowsManagedDirectoryPath(
   }
 
   try {
-    let boundaryIdentity = await captureDirectoryIdentity(ownershipBoundary)
-    if (!boundaryIdentity) {
-      const mutation = {
-        kind: 'managed-root' as const,
-        parentPath: boundaryParent,
-        componentPath: ownershipBoundary,
+    let current = trustedRoot
+    for (const component of boundaryFromTrustedRoot.split(path.sep).filter(Boolean)) {
+      const componentPath = path.join(current, component)
+      let componentIdentity = await captureDirectoryIdentity(componentPath)
+      if (!componentIdentity) {
+        const mutation = { kind: 'managed-root' as const, parentPath: current, componentPath }
+        await hooks.beforeMutation?.(mutation)
+        await assertIdentitiesUnchanged(identities)
+        try { await mkdir(path.join(current, component), { mode: 0o700 }) } catch (error) {
+          if (errnoCode(error) !== 'EEXIST') throw error
+        }
+        componentIdentity = await captureDirectoryIdentity(componentPath)
+        if (!componentIdentity) {
+          throw new Error('OpenCode Windows managed root changed during creation [redacted]')
+        }
+        created.push({ path: componentPath, identity: componentIdentity, parents: new Map(identities) })
+        await hooks.afterMutation?.(mutation)
+        await assertIdentitiesUnchanged(identities)
       }
-      await hooks.beforeMutation?.(mutation)
-      await assertIdentitiesUnchanged(identities)
-      try {
-        await mkdir(path.join(boundaryParent, boundaryName), { mode: 0o700 })
-      } catch (error) {
-        if (errnoCode(error) !== 'EEXIST') throw error
-      }
-      boundaryIdentity = await captureDirectoryIdentity(ownershipBoundary)
-      if (!boundaryIdentity) {
-        throw new Error('OpenCode Windows managed root changed during creation [redacted]')
-      }
-      created.push({ path: ownershipBoundary, identity: boundaryIdentity, parents: new Map(identities) })
-      await hooks.afterMutation?.(mutation)
-      await assertIdentitiesUnchanged(identities)
+      identities.set(componentPath, componentIdentity)
+      await afterComponentOpened?.(componentPath)
+      current = componentPath
     }
-    identities.set(ownershipBoundary, boundaryIdentity)
-    await afterComponentOpened?.(ownershipBoundary)
 
-    let current = ownershipBoundary
+    current = ownershipBoundary
     for (const component of relative.split(path.sep).filter(Boolean)) {
       const componentPath = path.join(current, component)
       let componentIdentity = await captureDirectoryIdentity(componentPath)

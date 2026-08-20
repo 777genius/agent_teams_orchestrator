@@ -486,6 +486,104 @@ describe('OpenCodeHostManager scoped S1 contract', () => {
     }
   })
 
+  test('win32 production-style scoped host persists protected owner identity and adopts after restart', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-win-owner-key-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const hostKey = deriveOpenCodeScopedHostKey(profile)
+    const protectedSecrets = new Map<string, string>()
+    const protection = {
+      get: async ({ service, name }: { service: string; name: string }) =>
+        protectedSecrets.get(`${service}:${name}`) ?? null,
+      set: async ({ service, name, value }: { service: string; name: string; value: string }) => {
+        protectedSecrets.set(`${service}:${name}`, value)
+      },
+    }
+    let spawns = 0
+    const dependencies = () => ({
+      platform: 'win32' as const,
+      windowsOwnerKeyProtection: protection,
+      persistentRegistryPath: registryPath,
+      allocateLoopbackPort: async () => 44142,
+      spawnHostProcess: () => { spawns += 1; return createMockChildProcess(54142).child },
+      fetchJson: async (url: string) => url.endsWith('/global/health')
+        ? { status: 200, data: { healthy: true } }
+        : { status: 200, data: {} },
+      isProcessAlive: () => true,
+      readProcessStartTimeMs: async () => 4_242,
+      readProcessCommandLine: async () =>
+        'opencode serve --hostname 127.0.0.1 --port 44142',
+      sleepMs: async () => {},
+    })
+    try {
+      await new OpenCodeHostManager(dependencies()).ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })
+      const records = await readdir(path.join(tempDir, 'host-capabilities'))
+      expect(records).toHaveLength(1)
+      const ownerRecord = await readFile(
+        path.join(tempDir, 'host-capabilities', records[0]!), 'utf8',
+      )
+      expect(ownerRecord).toContain('opencode-windows-owner-key-v1')
+      expect([...protectedSecrets.values()].every(secret => !ownerRecord.includes(secret))).toBe(true)
+
+      const restarted = new OpenCodeHostManager(dependencies())
+      const adopted = await restarted.ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })
+      expect(adopted.diagnostics.join(' ')).toContain('adopted persistent')
+      expect(spawns).toBe(1)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('win32 owner-key backend rejects foreign rotation and corrupt root record', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-win-owner-reject-'))
+    const registryPath = path.join(tempDir, 'registry.json')
+    const profile = scopedProfile('launch', { projectPath: tempDir })
+    const hostKey = deriveOpenCodeScopedHostKey(profile)
+    const protectedSecrets = new Map<string, string>()
+    const protection = {
+      get: async ({ service, name }: { service: string; name: string }) =>
+        protectedSecrets.get(`${service}:${name}`) ?? null,
+      set: async ({ service, name, value }: { service: string; name: string; value: string }) => {
+        protectedSecrets.set(`${service}:${name}`, value)
+      },
+    }
+    let spawns = 0
+    const dependencies = () => ({
+      platform: 'win32' as const, windowsOwnerKeyProtection: protection,
+      persistentRegistryPath: registryPath,
+      allocateLoopbackPort: async () => 44143,
+      spawnHostProcess: () => { spawns += 1; return createMockChildProcess(54143).child },
+      fetchJson: async () => ({ status: 200, data: { healthy: true } }),
+      isProcessAlive: () => true, readProcessStartTimeMs: async () => 4_243,
+      readProcessCommandLine: async () => 'opencode serve --hostname 127.0.0.1 --port 44143',
+      sleepMs: async () => {},
+    })
+    try {
+      await new OpenCodeHostManager(dependencies()).ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })
+      const [credential] = [...protectedSecrets.keys()]
+      protectedSecrets.set(credential!, Buffer.alloc(32, 9).toString('base64'))
+      await expect(new OpenCodeHostManager(dependencies()).ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })).rejects.toThrow('scoped host startup failed')
+      expect(spawns).toBe(1)
+
+      const [record] = await readdir(path.join(tempDir, 'host-capabilities'))
+      await writeFile(path.join(tempDir, 'host-capabilities', record!), '{"schema":"foreign"}')
+      await expect(new OpenCodeHostManager(dependencies()).ensureScopedHost({
+        preparedProfile: profile, expectedHostKey: hostKey,
+      })).rejects.toThrow('scoped host startup failed')
+      expect(spawns).toBe(1)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('adopted disposal aborts before termination when any canonical registry field changes', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-adopted-dispose-cas-'))
     const registryPath = path.join(tempDir, 'registry.json')
