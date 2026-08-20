@@ -5,10 +5,12 @@ import type {
   OpenCodePassiveProviderStatus,
   OpenCodePassiveStatusV1,
 } from './OpenCodePassiveStatusContract.js'
+import { isOpenCodeCanonicalProviderId } from './OpenCodePassiveStatusContract.js'
 import {
   OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS,
   readOpenCodePassiveProviderDirectory,
 } from './OpenCodePassiveProviderDirectory.js'
+import { getOpenCodeCuratedSubscriptionProviderIds } from './OpenCodeCuratedSubscriptionCatalog.js'
 
 const unknown = <T>(value: T): OpenCodePassiveObservation<T> => ({
   value,
@@ -45,6 +47,20 @@ function passive(): OpenCodePassiveStatusV1 {
 }
 
 describe('OpenCode passive provider-directory summary route', () => {
+  test('covers the complete canonical curated subscription catalog without inventory fanout', () => {
+    const curated = getOpenCodeCuratedSubscriptionProviderIds()
+    expect(curated).toEqual(expect.arrayContaining([
+      'xiaomi-token-plan-ams',
+      'minimax-coding-plan',
+      'zai-coding-plan',
+      'kimi-for-coding',
+    ]))
+    expect(OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS).toEqual(expect.arrayContaining(curated))
+    expect(curated.every(isOpenCodeCanonicalProviderId)).toBe(true)
+    expect(new Set(OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS).size)
+      .toBe(OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS.length)
+  })
+
   test('derives a redacted bounded view through the passive read seam only', async () => {
     const prohibitedCalls = new Map<string, number>()
     const prohibited = [

@@ -57,6 +57,7 @@ import {
 import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeRuntimeDeadline.js'
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
+  readOpenCodeGlobalManagedRuntimePreferences,
   readOpenCodeManagedRuntimePreferences,
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
@@ -225,6 +226,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   }
   managedPreferences?: {
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
+    readGlobal?(dataRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
     setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
     setModelLimits?(
@@ -3123,9 +3125,11 @@ export class OpenCodeProviderManagementAdapter
       ? {
           ...configured,
           read: configured.read ?? readOpenCodeManagedRuntimePreferences,
+          readGlobal: configured.readGlobal ?? readOpenCodeGlobalManagedRuntimePreferences,
         }
       : {
         read: readOpenCodeManagedRuntimePreferences,
+        readGlobal: readOpenCodeGlobalManagedRuntimePreferences,
         setDefaultModel: setOpenCodeManagedDefaultModel,
         setModelLimits: setOpenCodeManagedModelLimits,
         setAllProjectsDefaultModel: (modelId: string) =>
@@ -3915,14 +3919,20 @@ export class OpenCodeProviderManagementAdapter
         catalogAvailable: true,
         modelIds: catalog.models.map(model => `${providerId}/${model.id}`),
       })
-      const preferencesResult = await safeRead(() =>
-        this.getManagedPreferences().read(scoped.profileRootPath)
-      )
+      const managedPreferences = this.getManagedPreferences()
+      const [preferencesResult, globalPreferencesResult] = await Promise.all([
+        safeRead(() => managedPreferences.read(scoped.profileRootPath)),
+        safeRead(() => managedPreferences.readGlobal(resolveClaudeMultimodelPaths().data)),
+      ])
       const preferences = preferencesResult.ok ? preferencesResult.value : null
+      const globalPreferences = globalPreferencesResult.ok ? globalPreferencesResult.value : null
       const overrides: Readonly<Record<string, OpenCodeManagedModelLimitOverride>> =
-        preferences?.modelLimitOverrides ?? Object.freeze({})
+        Object.freeze({
+          ...(globalPreferences?.modelLimitOverrides ?? {}),
+          ...(preferences?.modelLimitOverrides ?? {}),
+        })
       const configuredDefault = parseOpenCodeExactProviderModelRef(
-        preferences?.defaultModelId ?? '',
+        preferences?.defaultModelId ?? globalPreferences?.defaultModelId ?? '',
       )
       const defaultModelId = configuredDefault?.providerId === providerId
         ? configuredDefault.raw
@@ -3974,6 +3984,7 @@ export class OpenCodeProviderManagementAdapter
           diagnostics: Object.freeze([
             ...scoped.diagnostics,
             ...safeReadDiagnostics(preferencesResult),
+            ...safeReadDiagnostics(globalPreferencesResult),
           ]),
         },
       }

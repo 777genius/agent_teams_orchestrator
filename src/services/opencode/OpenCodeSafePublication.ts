@@ -18,16 +18,41 @@ function childName(value: string): string {
   return value
 }
 
-export class OpenCodeSafePublicationDirectory {
-  readonly #handle: FileHandle
-  readonly #root: string
+function modeMatches(actual: number, expected: number): boolean {
+  // Windows exposes only a coarse read-only bit through chmod/stat, so POSIX
+  // mode equality cannot serve as a verifier at this platform boundary.
+  return process.platform === 'win32' || (actual & 0o777) === expected
+}
 
-  private constructor(handle: FileHandle) {
+export class OpenCodeSafePublicationDirectory {
+  readonly #handle: FileHandle | null
+  readonly #root: string
+  readonly #windowsIdentity: { dev: bigint; ino: bigint } | null
+
+  private constructor(
+    handle: FileHandle | null,
+    root?: string,
+    windowsIdentity: { dev: bigint; ino: bigint } | null = null,
+  ) {
     this.#handle = handle
-    this.#root = descriptorRoot(handle.fd)
+    this.#root = root ?? descriptorRoot(handle!.fd)
+    this.#windowsIdentity = windowsIdentity
   }
 
   static async open(directoryPath: string): Promise<OpenCodeSafePublicationDirectory> {
+    if (process.platform === 'win32') {
+      const resolved = path.resolve(directoryPath)
+      const before = await lstat(resolved, { bigint: true }).catch(fail)
+      const canonical = await realpath(resolved).catch(fail)
+      if (!before.isDirectory() || before.isSymbolicLink()
+        || canonical.replace(/^\\\\\?\\/, '').toLowerCase()
+          !== resolved.replace(/^\\\\\?\\/, '').toLowerCase()
+        || (before.dev === 0n && before.ino === 0n)) fail()
+      return new OpenCodeSafePublicationDirectory(null, resolved, {
+        dev: before.dev,
+        ino: before.ino,
+      })
+    }
     descriptorRoot(0)
     const resolved = path.resolve(directoryPath)
     const before = await lstat(resolved).catch(fail)
@@ -58,12 +83,24 @@ export class OpenCodeSafePublicationDirectory {
     return path.join(this.#root, childName(name))
   }
 
+  async #assertWindowsRoot(): Promise<void> {
+    if (!this.#windowsIdentity) return
+    const metadata = await lstat(this.#root, { bigint: true }).catch(fail)
+    const canonical = await realpath(this.#root).catch(fail)
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()
+      || metadata.dev !== this.#windowsIdentity.dev
+      || metadata.ino !== this.#windowsIdentity.ino
+      || canonical.replace(/^\\\\\?\\/, '').toLowerCase()
+        !== this.#root.replace(/^\\\\\?\\/, '').toLowerCase()) fail()
+  }
+
   /** Descriptor-root path for composing additional no-follow directory operations. */
   descriptorPath(): string {
     return this.#root
   }
 
   async ensureRegularFile(name: string, mode = 0o600): Promise<void> {
+    await this.#assertWindowsRoot()
     const handle = await open(
       this.child(name),
       fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0),
@@ -79,6 +116,7 @@ export class OpenCodeSafePublicationDirectory {
     } finally {
       await handle.close()
     }
+    await this.#assertWindowsRoot()
   }
 
   async writeFileAtomic(
@@ -87,6 +125,7 @@ export class OpenCodeSafePublicationDirectory {
     mode = 0o600,
     abortSignal?: AbortSignal,
   ): Promise<void> {
+    await this.#assertWindowsRoot()
     const finalName = childName(name)
     const temporaryName = childName(`.${finalName}.tmp.${process.pid}.${randomUUID()}`)
     const temporaryPath = this.child(temporaryName)
@@ -102,7 +141,7 @@ export class OpenCodeSafePublicationDirectory {
       await handle.chmod(mode)
       await handle.sync()
       const temporaryIdentity = await handle.stat()
-      if (!temporaryIdentity.isFile() || (temporaryIdentity.mode & 0o777) !== mode) fail()
+      if (!temporaryIdentity.isFile() || !modeMatches(temporaryIdentity.mode, mode)) fail()
       await handle.close()
       handle = null
       if (abortSignal?.aborted) {
@@ -120,13 +159,14 @@ export class OpenCodeSafePublicationDirectory {
         if (
           !published.isFile() || published.isSymbolicLink()
           || published.dev !== temporaryIdentity.dev || published.ino !== temporaryIdentity.ino
-          || (published.mode & 0o777) !== mode
+          || !modeMatches(published.mode, mode)
           || !publishedBytes.equals(Buffer.from(content))
         ) fail()
       } finally {
         await publishedHandle.close()
       }
-      await this.#handle.sync().catch(fail)
+      await this.#handle?.sync().catch(fail)
+      await this.#assertWindowsRoot()
     } catch (error) {
       if (handle) await handle.close().catch(() => undefined)
       await unlink(temporaryPath).catch(() => undefined)
@@ -140,6 +180,7 @@ export class OpenCodeSafePublicationDirectory {
     mode: number,
     testHooks?: { afterTemporaryWrite?: () => void | Promise<void> },
   ): Promise<void> {
+    await this.#assertWindowsRoot()
     const finalName = childName(name)
     const target = this.child(finalName)
     const expected = Buffer.from(content)
@@ -157,14 +198,14 @@ export class OpenCodeSafePublicationDirectory {
       await created.chmod(mode)
       await created.sync()
       const createdIdentity = await created.stat()
-      if (!createdIdentity.isFile() || (createdIdentity.mode & 0o777) !== mode) fail()
+      if (!createdIdentity.isFile() || !modeMatches(createdIdentity.mode, mode)) fail()
       await created.close()
       created = null
       try {
         // link(2) is an atomic no-replace publication: the final name never
         // refers to an inode until all immutable bytes have been synchronized.
         await link(temporaryPath, target)
-        await this.#handle.sync().catch(fail)
+        await this.#handle?.sync().catch(fail)
       } catch (error) {
         if ((error as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') throw error
       }
@@ -179,16 +220,17 @@ export class OpenCodeSafePublicationDirectory {
       const metadata = await held.stat()
       const actual = await held.readFile()
       if (
-        !metadata.isFile() || !actual.equals(expected) || (metadata.mode & 0o777) !== mode
+        !metadata.isFile() || !actual.equals(expected) || !modeMatches(metadata.mode, mode)
         || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())
       ) fail()
     } finally {
       await held.close()
     }
+    await this.#assertWindowsRoot()
   }
 
   async close(): Promise<void> {
-    await this.#handle.close()
+    await this.#handle?.close()
   }
 }
 

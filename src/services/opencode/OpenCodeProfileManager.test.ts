@@ -46,7 +46,10 @@ import {
 import { canonicalSerializeOpenCodePolicyIdentity } from './OpenCodeOperationPolicy.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { prepareOpenCodeProviderCatalogProductionProfile } from './OpenCodeProviderCatalogProduction.js'
-import { authorizeOpenCodeLaunchScopedProfile } from './OpenCodePlanScopedProfile.js'
+import {
+  authorizeOpenCodeLaunchScopedProfile,
+  prepareAuthorizedOpenCodeLaunchScopedProfile,
+} from './OpenCodePlanScopedProfile.js'
 
 const pureDigest = (value: string): string => createHash('sha256').update(value).digest('hex')
 const fakePluginTree = [{
@@ -318,6 +321,78 @@ async function buildDeepinfraPlannedInput(
 }
 
 describe('OpenCodeProfileManager immutable planned preparation', () => {
+  test('Windows read-only capture composes through production catalog and launch planning without effects', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-current-plan-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const manager = new OpenCodeProfileManager('win32')
+    try {
+      await writeFile(path.join(tempDir, 'AGENTS.md'), 'windows scoped behavior\n')
+      const catalogInput = {
+        purpose: 'provider-catalog' as const,
+        providerId: 'deepinfra',
+        runtimeInstanceId: 'windows-catalog-attempt',
+        projectPath: tempDir,
+      }
+      let catalogPrepared = false
+      await prepareOpenCodeProviderCatalogProductionProfile({
+        captureCurrentScopedProfilePlan: input => manager.captureCurrentScopedProfilePlan(input),
+        planScopedProfile: input => manager.planScopedProfile(input),
+        prepareScopedProfile: async current => {
+          catalogPrepared = true
+          expect(current.evidence.projectBehaviorFingerprint).toMatch(/^[a-f0-9]{64}$/)
+          return current as never
+        },
+      }, catalogInput)
+      expect(catalogPrepared).toBe(true)
+
+      const launch = await authorizeOpenCodeLaunchScopedProfile(manager, {
+        purpose: 'launch',
+        providerId: 'deepinfra',
+        modelId: 'deepinfra/model',
+        runtimeInstanceId: 'windows-launch-attempt',
+        projectPath: tempDir,
+      })
+      expect(launch.expected.projectBehaviorFingerprint).toMatch(/^[a-f0-9]{64}$/)
+      expect(launch.expected.purpose).toBe('launch')
+      expect(await lstat(process.env.CLAUDE_MULTIMODEL_DATA_HOME!).catch(() => null)).toBeNull()
+      expect(await lstat(process.env.FAKE_NATIVE_PROBE_LOG!).catch(() => null)).toBeNull()
+
+      const firstUseCatalog = await prepareOpenCodeProviderCatalogProductionProfile(manager, {
+        ...catalogInput,
+        runtimeInstanceId: 'windows-first-use-catalog',
+      })
+      expect(firstUseCatalog.scopeSchema).toBe('opencode-scoped-profile-v1')
+      expect((await lstat(firstUseCatalog.profileRootPath)).isDirectory()).toBe(true)
+      const firstUseLaunchAuthorization = await authorizeOpenCodeLaunchScopedProfile(manager, {
+        purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+        runtimeInstanceId: 'windows-first-use-launch', projectPath: tempDir,
+      })
+      const firstUseLaunch = await prepareAuthorizedOpenCodeLaunchScopedProfile(
+        manager, firstUseLaunchAuthorization,
+      )
+      expect(firstUseLaunch.purpose).toBe('launch')
+      expect((await lstat(firstUseLaunch.xdgCacheHome)).isDirectory()).toBe(true)
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows read-only behavior capture rejects a reparse-aware ambiguous path', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-windows-reparse-'))
+    const project = path.join(root, 'project')
+    const outside = path.join(root, 'outside')
+    try {
+      await Promise.all([mkdir(project), mkdir(outside)])
+      await writeFile(path.join(outside, 'AGENTS.md'), 'must not be captured\n')
+      await symlink(outside, path.join(project, '.opencode'))
+      await expect(collectProjectBehaviorMetadata(project, 'win32'))
+        .rejects.toThrow(/reparse point|canonical/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('production catalog composition captures current evidence through the actual manager and policy', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-catalog-plan-'))
     const fixture = await createScopedTestManager(tempDir)
@@ -351,6 +426,46 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         .not.toBe(fixture.manager.planScopedProfile(first).digest)
       await expect(fixture.manager.prepareScopedProfile(first, fixture.manager.planScopedProfile(first)))
         .rejects.toThrow('evidence drifted')
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('actual production manager preserves and prepares a DeepInfra user plugin', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-deepinfra-plugin-'))
+    const fixture = await createScopedTestManager(tempDir)
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
+      const packageRoot = path.join(
+        process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+        'opencode', 'shared-cache', 'opencode', 'packages', 'ordinary-user-choice@1.2.3',
+      )
+      await mkdir(packageRoot, { recursive: true })
+      await writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+        name: 'ordinary-user-choice', version: '1.2.3',
+      }))
+      await writeFile(path.join(packageRoot, 'index.js'), 'export default {}\n')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'deepinfra-user-plugin-attempt', projectPath: tempDir,
+      })
+      expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
+        ['ordinary-user-choice@1.2.3', 'project'],
+      ])
+      const expected = fixture.manager.planScopedProfile(current)
+      const prepared = await fixture.manager.prepareScopedProfile(current, expected)
+      expect(prepared.policy.plugins).toEqual([{
+        spec: 'ordinary-user-choice@1.2.3',
+        packageName: 'ordinary-user-choice',
+        provenance: 'project',
+      }])
+      expect(prepared.managedConfig.plugin).toEqual([
+        'file:./node_modules/ordinary-user-choice',
+      ])
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })
@@ -399,6 +514,42 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         'file:./node_modules/ordinary-user-choice',
         'file:./node_modules/opencode-kiro',
       ])
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('actual production manager rejects unrelated app-managed plugin evidence', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-unrelated-managed-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packageCacheRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const writeCachedPackage = async (spec: string, name: string, version: string): Promise<void> => {
+      const root = path.join(packageCacheRoot, spec)
+      await mkdir(root, { recursive: true })
+      await writeFile(path.join(root, 'package.json'), JSON.stringify({ name, version }))
+    }
+    try {
+      await writeCachedPackage('opencode-kiro@0.4.0', 'opencode-kiro', '0.4.0')
+      await writeCachedPackage('@rama_nigg/open-cursor@2.5.2', '@rama_nigg/open-cursor', '2.5.2')
+      const kiro = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'kiro-attempt',
+        projectPath: tempDir,
+      })
+      const cursor = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'cursor-acp', runtimeInstanceId: 'cursor-attempt',
+        projectPath: tempDir,
+      })
+      const unrelated = cursor.evidence.plugins.find(plugin => plugin.provenance === 'app-managed')!
+      const injected = {
+        ...kiro,
+        evidence: { ...kiro.evidence, plugins: [...kiro.evidence.plugins, unrelated] },
+      }
+      expect(() => fixture.manager.planScopedProfile(injected))
+        .toThrow('app-managed plugin pin is invalid')
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })
@@ -816,18 +967,15 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
-  test('uses only a trusted pre-provisioned Windows tree and rejects a swap at the former mkdir boundary', async () => {
+  test('creates a trusted Windows tree on first use and rejects a swap at the mkdir boundary', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-windows-v2-'))
     const boundary = path.join(tempDir, 'managed')
     const target = path.join(boundary, 'one', 'two')
     const outside = path.join(tempDir, 'outside')
     const displacedBoundary = path.join(tempDir, 'managed-original')
     try {
-      await expect(ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32'))
-        .rejects.toThrow('trusted and pre-existing')
-      await mkdir(target, { recursive: true })
-      await mkdir(outside)
       await ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32')
+      await mkdir(outside)
       expect((await stat(target)).isDirectory()).toBe(true)
 
       let swapped = false

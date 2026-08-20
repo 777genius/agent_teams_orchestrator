@@ -1,4 +1,4 @@
-import { lstat } from 'node:fs/promises'
+import { lstat, mkdir, realpath, rmdir } from 'node:fs/promises'
 import path from 'node:path'
 
 function errnoCode(error: unknown): string | undefined {
@@ -7,51 +7,183 @@ function errnoCode(error: unknown): string | undefined {
     : undefined
 }
 
+type DirectoryIdentity = {
+  dev: bigint
+  ino: bigint
+}
+
+export type OpenCodeWindowsManagedDirectoryMutation = {
+  kind: 'managed-root' | 'descendant'
+  parentPath: string
+  componentPath: string
+}
+
 /**
- * Standard Node APIs provide no Windows mkdirat/openat equivalent with a held,
- * no-follow directory handle. Runtime support is therefore bounded to a
- * trusted, pre-provisioned app root and its already-existing descendants.
+ * Test seam around the only path-based mutation in the Windows implementation.
+ * Node exposes neither mkdirat nor a no-follow handle-relative Windows mkdir,
+ * so production keeps this boundary deliberately narrow and validates the
+ * complete trusted ancestry immediately before and after it.
+ */
+export type OpenCodeWindowsManagedDirectoryHooks = {
+  beforeMutation?: (mutation: OpenCodeWindowsManagedDirectoryMutation) => void | Promise<void>
+  afterMutation?: (mutation: OpenCodeWindowsManagedDirectoryMutation) => void | Promise<void>
+}
+
+function canonicalWindowsPath(value: string): string {
+  return path.resolve(value)
+    .replace(/^\\\\\?\\/, '')
+    .replace(/[\\/]+$/, '')
+    .toLowerCase()
+}
+
+function sameIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+async function captureDirectoryIdentity(directoryPath: string): Promise<DirectoryIdentity | null> {
+  const metadata = await lstat(directoryPath, { bigint: true }).catch(error => {
+    if (errnoCode(error) === 'ENOENT') return null
+    throw error
+  })
+  if (!metadata) return null
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
+  }
+  const canonical = await realpath(directoryPath).catch(error => {
+    throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]', {
+      cause: error,
+    })
+  })
+  if (canonicalWindowsPath(canonical) !== canonicalWindowsPath(directoryPath)) {
+    throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
+  }
+  const identity = { dev: metadata.dev, ino: metadata.ino }
+  if (identity.dev === 0n && identity.ino === 0n) {
+    throw new Error('OpenCode Windows managed path identity is ambiguous [redacted]')
+  }
+  return identity
+}
+
+async function assertIdentitiesUnchanged(
+  expected: ReadonlyMap<string, DirectoryIdentity>,
+): Promise<void> {
+  for (const [directoryPath, identity] of expected) {
+    const actual = await captureDirectoryIdentity(directoryPath)
+    if (!actual || !sameIdentity(actual, identity)) {
+      throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+    }
+  }
+}
+
+/**
+ * Establishes the app-owned managed root once, then creates runtime-generated
+ * descendants one component at a time. Existing components must be canonical
+ * non-reparse directories. Each mutation is surrounded by full ancestry
+ * identity checks, and created empty components are rolled back when they are
+ * still reachable through the unchanged trusted ancestry.
+ *
+ * This is intentionally the complete Windows platform boundary. Standard Node
+ * cannot make the final mkdir handle-relative, so the checks do not claim an
+ * atomic guarantee that the runtime cannot provide. A detected swap never
+ * causes cleanup through the swapped path, which avoids mutating an external
+ * reparse target.
  */
 export async function ensureOpenCodeWindowsManagedDirectoryPath(
   resolved: string,
   ownershipBoundary: string,
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
+  hooks: OpenCodeWindowsManagedDirectoryHooks = {},
 ): Promise<void> {
-  const parsed = path.parse(resolved)
-  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
-  const boundaryMetadata = await lstat(ownershipBoundary, { bigint: true }).catch(error => {
-    if (errnoCode(error) === 'ENOENT') return null
-    throw error
-  })
-  if (!boundaryMetadata?.isDirectory() || boundaryMetadata.isSymbolicLink()) {
-    throw new Error('OpenCode Windows managed root must be trusted and pre-existing [redacted]')
+  resolved = path.resolve(resolved)
+  ownershipBoundary = path.resolve(ownershipBoundary)
+  const relative = path.relative(ownershipBoundary, resolved)
+  if (relative !== '' && (
+    relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+  )) throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
+
+  const boundaryParent = path.dirname(ownershipBoundary)
+  const boundaryName = path.basename(ownershipBoundary)
+  const boundaryParentIdentity = await captureDirectoryIdentity(boundaryParent)
+  if (!boundaryParentIdentity) {
+    throw new Error('OpenCode Windows managed root parent must be trusted and pre-existing [redacted]')
   }
 
-  const walk = async (notify: boolean): Promise<bigint[]> => {
-    const identities: bigint[] = []
-    let current = parsed.root
-    for (const part of relativeParts) {
-      current = path.join(current, part)
-      const metadata = await lstat(current, { bigint: true }).catch(error => {
-        if (errnoCode(error) === 'ENOENT') return null
-        throw error
-      })
-      if (!metadata) {
-        throw new Error('OpenCode Windows managed path must be pre-provisioned [redacted]')
+  const identities = new Map<string, DirectoryIdentity>([[boundaryParent, boundaryParentIdentity]])
+  const created: Array<{ path: string; identity: DirectoryIdentity; parents: Map<string, DirectoryIdentity> }> = []
+  const rollback = async (): Promise<void> => {
+    for (const entry of created.reverse()) {
+      try {
+        await assertIdentitiesUnchanged(entry.parents)
+        const reachable = await captureDirectoryIdentity(entry.path)
+        if (!reachable || !sameIdentity(reachable, entry.identity)) continue
+        await rmdir(entry.path)
+      } catch {
+        // Never traverse or delete through ancestry whose identity changed.
+        // The original empty directory may remain under a displaced trusted
+        // root, but an external reparse target is left completely untouched.
       }
-      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
-      }
-      if (notify) await afterComponentOpened?.(current)
-      identities.push(metadata.dev, metadata.ino)
     }
-    return identities
   }
 
-  const observedIdentities = await walk(true)
-  const reachableIdentities = await walk(false)
-  if (observedIdentities.length !== reachableIdentities.length
-    || observedIdentities.some((identity, index) => identity !== reachableIdentities[index])) {
-    throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+  try {
+    let boundaryIdentity = await captureDirectoryIdentity(ownershipBoundary)
+    if (!boundaryIdentity) {
+      const mutation = {
+        kind: 'managed-root' as const,
+        parentPath: boundaryParent,
+        componentPath: ownershipBoundary,
+      }
+      await hooks.beforeMutation?.(mutation)
+      await assertIdentitiesUnchanged(identities)
+      try {
+        await mkdir(path.join(boundaryParent, boundaryName), { mode: 0o700 })
+      } catch (error) {
+        if (errnoCode(error) !== 'EEXIST') throw error
+      }
+      boundaryIdentity = await captureDirectoryIdentity(ownershipBoundary)
+      if (!boundaryIdentity) {
+        throw new Error('OpenCode Windows managed root changed during creation [redacted]')
+      }
+      created.push({ path: ownershipBoundary, identity: boundaryIdentity, parents: new Map(identities) })
+      await hooks.afterMutation?.(mutation)
+      await assertIdentitiesUnchanged(identities)
+    }
+    identities.set(ownershipBoundary, boundaryIdentity)
+    await afterComponentOpened?.(ownershipBoundary)
+
+    let current = ownershipBoundary
+    for (const component of relative.split(path.sep).filter(Boolean)) {
+      const componentPath = path.join(current, component)
+      let componentIdentity = await captureDirectoryIdentity(componentPath)
+      if (!componentIdentity) {
+        const mutation = {
+          kind: 'descendant' as const,
+          parentPath: current,
+          componentPath,
+        }
+        await hooks.beforeMutation?.(mutation)
+        await assertIdentitiesUnchanged(identities)
+        try {
+          await mkdir(path.join(current, component), { mode: 0o700 })
+        } catch (error) {
+          if (errnoCode(error) !== 'EEXIST') throw error
+        }
+        componentIdentity = await captureDirectoryIdentity(componentPath)
+        if (!componentIdentity) {
+          throw new Error('OpenCode Windows managed path changed during creation [redacted]')
+        }
+        created.push({ path: componentPath, identity: componentIdentity, parents: new Map(identities) })
+        await hooks.afterMutation?.(mutation)
+        await assertIdentitiesUnchanged(identities)
+      }
+      identities.set(componentPath, componentIdentity)
+      await afterComponentOpened?.(componentPath)
+      current = componentPath
+    }
+
+    await assertIdentitiesUnchanged(identities)
+  } catch (error) {
+    await rollback()
+    throw error
   }
 }

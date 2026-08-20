@@ -275,7 +275,10 @@ function captureProviderIds(value: unknown): unknown[] | null {
     const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, 'length')
     if (!lengthDescriptor || !('value' in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value)) return null
     const length = lengthDescriptor.value as number
-    if (length < 0 || length > 32) return null
+    // This remains a small fixed upper bound (never a full-inventory fanout),
+    // while leaving room for the canonical passive base set plus every curated
+    // subscription provider.
+    if (length < 0 || length > 64) return null
     const result: unknown[] = []
     for (let index = 0; index < length; index += 1) {
       const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index))

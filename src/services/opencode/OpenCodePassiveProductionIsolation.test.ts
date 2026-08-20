@@ -7,7 +7,10 @@ import {
   executeOpenCodePassiveCommandStatusEnvelope,
   type OpenCodePassiveCommandStatusOutcome,
 } from './OpenCodePassiveCommandStatusRoute.js'
-import { readOpenCodePassiveProviderDirectory } from './OpenCodePassiveProviderDirectory.js'
+import {
+  OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS,
+  readOpenCodePassiveProviderDirectory,
+} from './OpenCodePassiveProviderDirectory.js'
 import {
   createOpenCodePassiveReadSuccess,
   OpenCodePassiveStatusReader,
@@ -127,15 +130,16 @@ describe('connected OpenCode passive production dispatchers', () => {
       metadata: { hasKnownModels: false, configuredAuthless: false },
     })
     expect(directory.result.entries[0]?.actions.every(action => !action.enabled)).toBe(true)
+    const expectedProviderReads = OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS.length * 3
     expect(calls).toEqual({
       passive: 3,
       binaryRead: 3,
       scopeRead: 3,
       snapshotRead: 3,
-      configRead: 81,
-      authRead: 81,
-      catalogRead: 81,
-      executionRead: 81,
+      configRead: expectedProviderReads,
+      authRead: expectedProviderReads,
+      catalogRead: expectedProviderReads,
+      executionRead: expectedProviderReads,
       inventory: 0,
       profile: 0,
       host: 0,
