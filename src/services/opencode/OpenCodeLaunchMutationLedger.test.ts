@@ -23,6 +23,20 @@ const context = () => ({
 const linkage: OpenCodeLaunchMemberLinkage = {
   memberIdentity, sessionIdentity: oid('2'), bootstrapMessageIdentity: oid('3'), commitIdentity: oid('4'),
 }
+const recovery = {
+  ownershipTitle: 'agent-teams-launch:owned',
+  sessionRecord: {
+    teamId: 'team', laneId: 'primary', memberName: 'alice', providerId: 'opencode' as const,
+    selectedModel: 'openrouter/model', projectPath: '/fake/project', profileRootKey: 'profile', hostKey: 'host',
+    resolvedBehaviorFingerprint: null, opencodeSessionId: OpenCodeLaunchMutationLedger.idempotencyIdentity(target),
+    lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
+    sourceAuthFingerprint: null, managedAuthFingerprint: null, projectBehaviorFingerprint: 'behavior',
+    appManagedBootstrap: { schemaVersion: 1 as const, messageID: 'msg', contextHash: 'a'.repeat(64),
+      briefingHash: 'b'.repeat(64), injectionVerifiedAt: new Date(0).toISOString(),
+      model: 'openrouter/model', agent: 'teammate-bootstrap' },
+    staleReason: null, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
+  },
+}
 
 describe('OpenCodeLaunchMutationLedger', () => {
   test('fresh install securely creates its namespace and permits the first durable claim', async () => {
@@ -61,9 +75,9 @@ describe('OpenCodeLaunchMutationLedger', () => {
       const afterCrash = new OpenCodeLaunchMutationLedger(join(root, 'claims'))
       expect(await afterCrash.claim(target, identity('123e4567-e89b-42d3-a456-426614174002', 'claim-b'), context()))
         .toBe('reconciliation_required')
-      expect(await afterCrash.transition(target, identity('123e4567-e89b-42d3-a456-426614174002', 'claim-b'), 'commit', linkage, context()))
+      expect(await afterCrash.transition(target, identity('123e4567-e89b-42d3-a456-426614174002', 'claim-b'), 'commit', linkage, context(), recovery))
         .toBe('fenced')
-      expect(await first.transition(target, identity('123e4567-e89b-42d3-a456-426614174001', 'claim-a'), 'commit', linkage, context()))
+      expect(await first.transition(target, identity('123e4567-e89b-42d3-a456-426614174001', 'claim-a'), 'commit', linkage, context(), recovery))
         .toBe('committed')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
