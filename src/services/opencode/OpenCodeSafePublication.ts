@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
-import { link, lstat, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { link, lstat, mkdir, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 
 function fail(): never {
@@ -97,6 +97,95 @@ export class OpenCodeSafePublicationDirectory {
   /** Descriptor-root path for composing additional no-follow directory operations. */
   descriptorPath(): string {
     return this.#root
+  }
+
+  async openChildDirectory(name: string): Promise<OpenCodeSafePublicationDirectory> {
+    await this.#assertWindowsRoot()
+    const child = this.child(name)
+    if (process.platform === 'win32') return OpenCodeSafePublicationDirectory.open(child)
+    let handle: FileHandle
+    try {
+      handle = await open(
+        child,
+        fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0),
+      )
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error
+      fail()
+    }
+    try {
+      const metadata = await handle.stat()
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()
+        || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())) fail()
+      await this.#assertWindowsRoot()
+      return new OpenCodeSafePublicationDirectory(handle)
+    } catch (error) {
+      await handle.close().catch(() => undefined)
+      throw error
+    }
+  }
+
+  async ensureChildDirectory(name: string, mode = 0o700): Promise<OpenCodeSafePublicationDirectory> {
+    await this.#assertWindowsRoot()
+    const child = this.child(name)
+    try { await mkdir(child, { mode }) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    const opened = await this.openChildDirectory(name)
+    await this.#assertWindowsRoot()
+    return opened
+  }
+
+  async readBoundedRegularFile(
+    name: string,
+    maximumBytes: number,
+    abortSignal?: AbortSignal,
+    testHooks?: { afterPathIdentityCaptured?: () => void | Promise<void> },
+  ): Promise<string | null> {
+    await this.#assertWindowsRoot()
+    const target = this.child(name)
+    let before
+    try { before = await lstat(target, { bigint: true }) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
+    if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(maximumBytes)) fail()
+    if (process.platform === 'win32') {
+      const canonical = (await realpath(target).catch(fail)).replace(/^\\\\\?\\/, '').toLowerCase()
+      const expected = path.resolve(target).replace(/^\\\\\?\\/, '').toLowerCase()
+      if (canonical !== expected || (before.dev === 0n && before.ino === 0n)) fail()
+    }
+    await testHooks?.afterPathIdentityCaptured?.()
+    const held = await open(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)).catch(fail)
+    try {
+      const opened = await held.stat({ bigint: true })
+      if (!opened.isFile() || opened.isSymbolicLink()
+        || opened.dev !== before.dev || opened.ino !== before.ino) fail()
+      if (abortSignal?.aborted) throw new Error('OpenCode safe publication cancelled')
+      const bytes = Buffer.alloc(maximumBytes + 1)
+      const result = await held.read(bytes, 0, bytes.length, 0)
+      if (result.bytesRead > maximumBytes) return null
+      const afterHeld = await held.stat({ bigint: true })
+      const afterPath = await lstat(target, { bigint: true }).catch(fail)
+      if (!afterPath.isFile() || afterPath.isSymbolicLink()
+        || afterHeld.dev !== opened.dev || afterHeld.ino !== opened.ino
+        || afterPath.dev !== opened.dev || afterPath.ino !== opened.ino
+        || afterHeld.size !== opened.size) fail()
+      await this.#assertWindowsRoot()
+      if (abortSignal?.aborted) throw new Error('OpenCode safe publication cancelled')
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, result.bytesRead))
+    } finally {
+      await held.close()
+    }
+  }
+
+  async removeRegularFile(name: string): Promise<void> {
+    await this.#assertWindowsRoot()
+    const target = this.child(name)
+    let metadata
+    try { metadata = await lstat(target) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error }
+    if (!metadata.isFile() || metadata.isSymbolicLink()) fail()
+    await unlink(target)
+    await this.#handle?.sync().catch(fail)
+    await this.#assertWindowsRoot()
   }
 
   async ensureRegularFile(name: string, mode = 0o600): Promise<void> {
@@ -231,6 +320,41 @@ export class OpenCodeSafePublicationDirectory {
 
   async close(): Promise<void> {
     await this.#handle?.close()
+  }
+}
+
+/** Creates only missing descendants beneath the nearest canonical existing ancestor. */
+export async function ensureOpenCodeSafePublicationDirectory(
+  directoryPath: string,
+): Promise<OpenCodeSafePublicationDirectory> {
+  const resolved = path.resolve(directoryPath)
+  const missing: string[] = []
+  let cursor = resolved
+  for (;;) {
+    try {
+      const metadata = await lstat(cursor)
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()
+        || await realpath(cursor) !== cursor) fail()
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      const parent = path.dirname(cursor)
+      if (parent === cursor) fail()
+      missing.unshift(path.basename(cursor))
+      cursor = parent
+    }
+  }
+  let directory = await OpenCodeSafePublicationDirectory.open(cursor)
+  try {
+    for (const component of missing) {
+      const child = await directory.ensureChildDirectory(component)
+      await directory.close()
+      directory = child
+    }
+    return directory
+  } catch (error) {
+    await directory.close().catch(() => undefined)
+    throw error
   }
 }
 

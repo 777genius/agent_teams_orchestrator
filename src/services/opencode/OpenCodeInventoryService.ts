@@ -41,6 +41,7 @@ import type {
   OpenCodeAgentSummary,
   OpenCodeConnectedProvider,
   OpenCodeInventorySnapshot,
+  OpenCodeInventoryCompleteness,
   OpenCodeModelMetadata,
   OpenCodePreparedProfile,
   OpenCodeToolApprovalMode,
@@ -632,6 +633,13 @@ export function buildOpenCodeInventoryTimeoutSnapshot(input: {
     authStorePath: null,
     probeError: message,
     diagnostics,
+    completeness: {
+      profileConfig: { state: 'failed', provenance: 'managed_profile' },
+      managedAuth: { state: 'failed', provenance: 'managed_auth_store' },
+      environmentAuth: { state: 'failed', provenance: 'provider_environment' },
+      providerInventory: { state: 'failed', provenance: 'provider_cli' },
+      modelCatalog: { state: 'failed', provenance: 'model_cli' },
+    },
   }
 }
 
@@ -970,7 +978,7 @@ export class OpenCodeInventoryService {
     snapshot: OpenCodeInventorySnapshot,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (signal?.aborted || snapshot.probeError) return
+    if (signal?.aborted) return
     await this.activeStatusPublisher.publishInventory(snapshot, signal).catch(() => undefined)
   }
 
@@ -1038,6 +1046,7 @@ export class OpenCodeInventoryService {
         authStorePath: null,
         probeError: null,
         diagnostics: ['Passive OpenCode summary has no active inventory authority'],
+        completeness: skippedInventoryCompleteness(),
       }
     }
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
@@ -1064,6 +1073,7 @@ export class OpenCodeInventoryService {
         authStorePath: null,
         probeError: null,
         diagnostics: ['OpenCode CLI not detected on PATH'],
+        completeness: skippedInventoryCompleteness(),
       }
       if (cacheEnabled) {
         this.cache.set(cacheKey, {
@@ -1162,19 +1172,19 @@ export class OpenCodeInventoryService {
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
+    const readAuth = async (
+      authPath: string | null | undefined,
+      scopes: Array<'managed' | 'local'>,
+    ) => {
+      if (!authPath) return []
+      try { return await readOpenCodeAuthProviderSummaries(authPath, scopes) }
+      catch { return [] }
+    }
     const globalAuthProviderIds = new Set(
-      (profile.globalAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
-            () => [],
-          )
-        : []
-      ).map(provider => provider.id),
+      (await readAuth(profile.globalAuthPath, ['managed'])).map(provider => provider.id),
     )
     const sourceAuthProviderIds = new Set(
-      (profile.sourceAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
-        : []
-      ).map(provider => provider.id),
+      (await readAuth(profile.sourceAuthPath, ['local'])).map(provider => provider.id),
     )
     const credentialScopesForProvider = (providerId: string): Array<'managed' | 'local'> => {
       const scopes: Array<'managed' | 'local'> = []
@@ -1182,9 +1192,11 @@ export class OpenCodeInventoryService {
       if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
       return scopes.length > 0 ? scopes : ['managed']
     }
-    const managedAuthProviders = (
-      await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
-    ).map(provider => ({
+    let managedAuthComplete = true
+    const managedAuthRows = await readOpenCodeAuthProviderSummaries(
+      profile.managedAuthPath, ['managed'],
+    ).catch(() => { managedAuthComplete = false; return [] })
+    const managedAuthProviders = managedAuthRows.map(provider => ({
       ...provider,
       credentialScopes: credentialScopesForProvider(provider.id),
     }))
@@ -1271,6 +1283,22 @@ export class OpenCodeInventoryService {
       authStorePath: providerParse.authStorePath ?? profile.managedAuthPath,
       probeError: diagnostics.length > 0 ? (diagnostics[0] ?? 'OpenCode probe failed') : null,
       diagnostics,
+      completeness: {
+        profileConfig: { state: 'complete', provenance: 'managed_profile' },
+        managedAuth: { state: managedAuthComplete ? 'complete' : 'partial', provenance: 'managed_auth_store' },
+        environmentAuth: {
+          state: mode === 'profile' ? 'skipped' : providersResult.code === 0 ? 'complete' : 'failed',
+          provenance: 'provider_environment',
+        },
+        providerInventory: {
+          state: mode === 'profile' ? 'skipped' : providersResult.code === 0 ? 'complete' : 'failed',
+          provenance: 'provider_cli',
+        },
+        modelCatalog: {
+          state: mode === 'full' ? finalModelsResult.code === 0 ? 'complete' : 'failed' : 'skipped',
+          provenance: 'model_cli',
+        },
+      },
     }
 
     if (cacheEnabled && !options.abortSignal?.aborted) {
@@ -1282,6 +1310,16 @@ export class OpenCodeInventoryService {
 
     await this.publishAuthoritativeSnapshot(snapshot, options.abortSignal)
     return snapshot
+  }
+}
+
+function skippedInventoryCompleteness(): OpenCodeInventoryCompleteness {
+  return {
+    profileConfig: { state: 'skipped', provenance: 'managed_profile' },
+    managedAuth: { state: 'skipped', provenance: 'managed_auth_store' },
+    environmentAuth: { state: 'skipped', provenance: 'provider_environment' },
+    providerInventory: { state: 'skipped', provenance: 'provider_cli' },
+    modelCatalog: { state: 'skipped', provenance: 'model_cli' },
   }
 }
 

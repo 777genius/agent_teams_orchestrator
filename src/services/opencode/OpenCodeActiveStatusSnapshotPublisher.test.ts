@@ -10,6 +10,16 @@ import {
 } from './OpenCodeRedactedStatusSnapshot.js'
 import type { OpenCodeInventorySnapshot } from './types.js'
 
+function completeness(states: Partial<Record<keyof NonNullable<OpenCodeInventorySnapshot['completeness']>, 'complete' | 'partial' | 'skipped' | 'failed'>> = {}): NonNullable<OpenCodeInventorySnapshot['completeness']> {
+  return {
+    profileConfig: { state: states.profileConfig ?? 'complete', provenance: 'managed_profile' },
+    managedAuth: { state: states.managedAuth ?? 'complete', provenance: 'managed_auth_store' },
+    environmentAuth: { state: states.environmentAuth ?? 'complete', provenance: 'provider_environment' },
+    providerInventory: { state: states.providerInventory ?? 'complete', provenance: 'provider_cli' },
+    modelCatalog: { state: states.modelCatalog ?? 'complete', provenance: 'model_cli' },
+  }
+}
+
 function managedProfile(...providerIds: string[]): NonNullable<OpenCodeInventorySnapshot['profile']> {
   return {
     managedConfig: {
@@ -29,6 +39,7 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
     availableProviders: ['deepinfra'],
     models: ['deepinfra/llama-4'],
     modelMetadata: [], agents: [], authStorePath: '/secret/auth.json', probeError: null, diagnostics: [],
+    completeness: completeness(),
     ...overrides,
   }
 }
@@ -79,7 +90,10 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(harness.stored()).not.toContain('/secret/auth.json')
     expect(harness.stored()).not.toContain('/redacted/by-publisher')
 
-    await harness.publisher.publishInventory(inventory({ probeError: 'transient timeout' }))
+    await harness.publisher.publishInventory(inventory({
+      probeError: 'transient timeout',
+      completeness: completeness({ profileConfig: 'failed', managedAuth: 'failed', environmentAuth: 'failed', providerInventory: 'failed', modelCatalog: 'failed' }),
+    }))
     expect(harness.writes()).toBe(2)
 
     clock.now = 2_000
@@ -191,6 +205,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     clock.now = 4_000
     await harness.publisher.publishInventory(inventory({
       connectedProviders: [], availableProviders: [], models: [], probeError: 'temporary provider timeout',
+      completeness: completeness({ profileConfig: 'failed', managedAuth: 'partial', environmentAuth: 'partial', providerInventory: 'partial', modelCatalog: 'partial' }),
     }))
     expect(harness.writes()).toBe(writesBeforeTransient)
     decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
@@ -198,5 +213,105 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     if (!decoded.ok) throw new Error(decoded.issueCode)
     expect(decoded.value.providers.find(provider => provider.providerId === 'deepinfra')?.lastConnected)
       .toMatchObject({ value: { state: 'connected', at: 3_000 }, observedAt: 3_000 })
+  })
+
+  test('merges profile, provider and catalog authority independently across profile-only and failed probes', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory())
+
+    clock.now = 2_000
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile(), connectedProviders: [], availableProviders: [], models: [],
+      completeness: completeness({ managedAuth: 'complete', environmentAuth: 'skipped', providerInventory: 'skipped', modelCatalog: 'skipped' }),
+    }))
+    let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    let deepinfra = decoded.value.providers.find(provider => provider.providerId === 'deepinfra')!
+    expect(deepinfra.configured).toMatchObject({ value: 'not_configured', observedAt: 2_000 })
+    expect(deepinfra.lastConnected).toMatchObject({ value: { state: 'connected', at: 1_000 }, observedAt: 1_000 })
+    expect(deepinfra.catalogAvailable).toMatchObject({ value: 'available', observedAt: 1_000 })
+    expect(deepinfra.modelIds).toEqual(['deepinfra/llama-4'])
+
+    clock.now = 3_000
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile('ollama'), connectedProviders: [], availableProviders: [], models: [],
+      probeError: 'catalog failed',
+      completeness: completeness({ providerInventory: 'partial', environmentAuth: 'partial', modelCatalog: 'failed' }),
+    }))
+    decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    deepinfra = decoded.value.providers.find(provider => provider.providerId === 'deepinfra')!
+    expect(deepinfra.configured).toMatchObject({ value: 'not_configured', observedAt: 3_000 })
+    expect(deepinfra.lastConnected).toMatchObject({ value: { state: 'connected' }, observedAt: 1_000 })
+    expect(deepinfra.catalogAvailable).toMatchObject({ value: 'available', observedAt: 1_000 })
+    expect(decoded.value.providers.find(provider => provider.providerId === 'ollama')?.configured)
+      .toMatchObject({ value: 'configured', observedAt: 3_000 })
+  })
+
+  test('complete authoritative disconnect forgets stale catalog IDs while partial refresh retains them', async () => {
+    const clock = { now: 1_000 }
+    const harness = publisherHarness(clock)
+    await harness.publisher.publishInventory(inventory())
+    clock.now = 2_000
+    await harness.publisher.publishInventory(inventory({
+      connectedProviders: [], availableProviders: [], models: [],
+      completeness: completeness({ providerInventory: 'partial', modelCatalog: 'partial' }),
+    }))
+    let decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers[0]).toMatchObject({
+      lastConnected: { value: { state: 'connected' }, observedAt: 1_000 },
+      catalogAvailable: { value: 'available', observedAt: 1_000 },
+      modelIds: ['deepinfra/llama-4'],
+    })
+    clock.now = 3_000
+    await harness.publisher.publishInventory(inventory({
+      profile: managedProfile(), connectedProviders: [], availableProviders: [], models: [],
+    }))
+    decoded = decodeOpenCodeRedactedSnapshotV1(harness.stored()!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers[0]).toMatchObject({
+      configured: { value: 'not_configured', observedAt: 3_000 },
+      lastConnected: { value: { state: 'not_connected' }, observedAt: 3_000 },
+      catalogAvailable: { value: 'unavailable', observedAt: 3_000 },
+    })
+    expect(decoded.value.providers[0].modelIds).toBeUndefined()
+  })
+
+  test('cross-instance scope lease keeps independent DeepInfra and Ollama observations', async () => {
+    let stored: string | null = null
+    let tail = Promise.resolve()
+    const withScopeLease = async <T>(_scope: `sha256:${string}`, _signal: AbortSignal, operation: () => Promise<T>): Promise<T> => {
+      const previous = tail
+      let release!: () => void
+      tail = new Promise<void>(resolve => { release = resolve })
+      await previous
+      try { return await operation() } finally { release() }
+    }
+    const make = () => new OpenCodeActiveStatusSnapshotPublisher({
+      now: () => 1_000,
+      canonicalizePath: async () => '/canonical/project',
+      readSnapshot: async () => { await Promise.resolve(); return stored },
+      withScopeLease,
+      writer: { write: async snapshot => {
+        await Promise.resolve()
+        const encoded = encodeOpenCodeRedactedSnapshotV1(snapshot)
+        if (!encoded.ok || !encoded.bytes) throw new Error('invalid')
+        stored = new TextDecoder().decode(encoded.bytes)
+      } },
+    })
+    await Promise.all([
+      make().publishProviderUpdate({ projectPath: '/p', providerId: 'deepinfra', connected: true }),
+      make().publishProviderUpdate({ projectPath: '/p', providerId: 'ollama', configured: true }),
+    ])
+    const decoded = decodeOpenCodeRedactedSnapshotV1(stored!)
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok) throw new Error(decoded.issueCode)
+    expect(decoded.value.providers.map(provider => provider.providerId)).toEqual(['deepinfra', 'ollama'])
   })
 })

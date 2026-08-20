@@ -6,6 +6,7 @@ import type {
 } from '../../features/runtimeProviderManagement/domain/types.js'
 import { OpenCodePassiveStatusProductionReader } from './OpenCodePassiveStatusProductionReader.js'
 import type { OpenCodePassiveStatusV1 } from './OpenCodePassiveStatusContract.js'
+import { OPEN_CODE_PASSIVE_MAX_PROVIDERS } from './OpenCodePassiveStatusContract.js'
 import {
   readOpenCodePassiveStatusWithinRouteDeadline,
   type OpenCodePassiveRouteDeadlineDeps,
@@ -31,6 +32,10 @@ export const OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS: readonly string[] = Objec
     ...getOpenCodeCuratedSubscriptionProviderIds(),
   ])),
 )
+
+if (OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS.length > OPEN_CODE_PASSIVE_MAX_PROVIDERS) {
+  throw new Error('OpenCode passive provider directory exceeds the shared request capacity')
+}
 
 export type OpenCodePassiveProviderDirectoryInput = Readonly<{
   projectPath: string

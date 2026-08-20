@@ -25,6 +25,7 @@ import type {
   OpenCodePassiveProviderStatus,
   OpenCodePassiveStatusV1,
 } from '../../../../services/opencode/OpenCodePassiveStatusContract.js'
+import { OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS } from '../../../../services/opencode/OpenCodePassiveProviderDirectory.js'
 
 function passiveObservation<T>(value: T): OpenCodePassiveObservation<T> {
   return { value, authority: 'none', freshness: 'unknown', condition: 'degraded', observedAt: null, validUntil: null, issueCode: 'read_timeout' }
@@ -1707,7 +1708,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(inventoryModes).toEqual([])
     expect(ensureHostCalls).toBe(0)
     expect(clientFactoryCalls).toBe(0)
-    expect(result.value.entries).toHaveLength(27)
+    expect(result.value.entries.map(entry => entry.providerId)).toEqual(OPEN_CODE_PASSIVE_DIRECTORY_PROVIDER_IDS)
     expect(result.value.entries.find(entry => entry.providerId === 'deepinfra')).toMatchObject({
       state: 'not-connected',
       connectedAuthHint: null,

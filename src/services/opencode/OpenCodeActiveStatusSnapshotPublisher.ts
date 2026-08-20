@@ -1,21 +1,20 @@
 import { createHash } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
 
 import { parseOpenCodeExactProviderModelRef, tryCreateOpenCodeCanonicalProviderId } from './OpenCodeProviderIdentity.js'
 import {
   canonicalizeOpenCodePassiveProjectPath,
   getOpenCodePassiveSnapshotPath,
   getOpenCodePassiveStatusRootDirectory,
+  readBoundedSnapshotText,
 } from './OpenCodePassiveStatusProductionReader.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
 import {
   decodeOpenCodeRedactedSnapshotV1,
-  OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES,
   type OpenCodeRedactedSnapshotProviderV1,
   type OpenCodeRedactedSnapshotV1,
   type OpenCodeRedactedSnapshotWriterPort,
 } from './OpenCodeRedactedStatusSnapshot.js'
-import type { OpenCodeInventorySnapshot } from './types.js'
+import type { OpenCodeInventoryCompleteness, OpenCodeInventorySnapshot } from './types.js'
 
 const ACTIVE_EVIDENCE_TTL_MS = 5 * 60_000
 
@@ -38,6 +37,7 @@ type PublisherDeps = Readonly<{
   now?: () => number
   canonicalizePath?: (projectPath: string, signal: AbortSignal) => Promise<string>
   readSnapshot?: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
+  withScopeLease?: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
 }>
 
 /** Mutation-only bridge from successful active observations to the passive redacted store. */
@@ -47,6 +47,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
   readonly #now: () => number
   readonly #canonicalizePath: (projectPath: string, signal: AbortSignal) => Promise<string>
   readonly #readSnapshot: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
+  readonly #withScopeLease: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
   readonly #tails = new Map<string, Promise<void>>()
 
   constructor(deps: PublisherDeps = {}) {
@@ -56,20 +57,28 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     this.#canonicalizePath = deps.canonicalizePath ?? canonicalizeOpenCodePassiveProjectPath
     this.#readSnapshot = deps.readSnapshot ?? (async (scope, signal) => {
       if (signal.aborted) throw new Error('cancelled')
-      try {
-        const bytes = await readFile(getOpenCodePassiveSnapshotPath(this.#rootDirectory, scope))
-        if (bytes.byteLength > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) return null
-        return bytes.toString('utf8')
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-        throw error
-      }
+      return readBoundedSnapshotText(
+        getOpenCodePassiveSnapshotPath(this.#rootDirectory, scope), signal,
+      )
     })
+    this.#withScopeLease = deps.withScopeLease
+      ?? (this.#writer.withScopeLease?.bind(this.#writer) as typeof this.#withScopeLease | undefined)
+      ?? (async (_scope, _signal, operation) => operation())
   }
 
   async publishInventory(inventory: OpenCodeInventorySnapshot, signal = new AbortController().signal): Promise<void> {
-    if (inventory.probeError || signal.aborted) return
+    if (signal.aborted) return
+    const completeness = inventory.completeness ?? legacyCompleteness(inventory)
     const connected = new Map(inventory.connectedProviders.map(provider => [provider.id, provider]))
+    const usable = (state: string) => state === 'complete' || state === 'partial'
+    const usableConnected = new Map([...connected].filter(([, provider]) => provider.source === 'environment'
+      ? usable(completeness.environmentAuth.state)
+      : usable(completeness.managedAuth.state) || usable(completeness.providerInventory.state)))
+    if (inventory.probeError
+      && completeness.profileConfig.state !== 'complete'
+      && completeness.providerInventory.state !== 'complete'
+      && completeness.modelCatalog.state !== 'complete'
+      && usableConnected.size === 0) return
     const configuredProviderIds = getManagedConfiguredProviderIds(inventory)
     const modelIds = new Map<string, string[]>()
     for (const model of inventory.models) {
@@ -84,7 +93,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         .filter(providerId => tryCreateOpenCodeCanonicalProviderId(providerId) === providerId),
     )
     await this.#update(inventory.projectPath, signal, (snapshot, now) => {
-      snapshot.binary = observation(
+      if (!inventory.probeError) snapshot.binary = observation(
         { presence: inventory.detected ? 'present' as const : 'absent' as const, version: inventory.version },
         'binary_metadata', now,
       )
@@ -94,23 +103,29 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       ])
       for (const providerId of knownProviderIds) {
         const provider = getOrCreateProvider(snapshot, providerId)
-        if (inventory.profile) {
+        if (completeness.profileConfig.state === 'complete' && inventory.profile) {
           provider.configured = observation(
             configuredProviderIds.has(providerId) ? 'configured' : 'not_configured',
             'config_metadata', now,
           )
         }
-        provider.lastConnected = observation(
-          connected.has(providerId)
-            ? { state: 'connected' as const, at: now }
-            : { state: 'not_connected' as const },
-          'auth_metadata', now,
-        )
-        if (inventory.detected) provider.catalogAvailable = observation(
-          modelIds.has(providerId) || inventory.availableProviders.includes(providerId) ? 'available' : 'unavailable',
-          'catalog_snapshot', now,
-        )
-        if (modelIds.has(providerId)) provider.modelIds = [...new Set(modelIds.get(providerId))]
+        if (usableConnected.has(providerId)) {
+          provider.lastConnected = observation(
+            { state: 'connected' as const, at: now }, 'auth_metadata', now,
+          )
+        } else if (completeness.providerInventory.state === 'complete') {
+          provider.lastConnected = observation(
+            { state: 'not_connected' as const }, 'auth_metadata', now,
+          )
+        }
+        if (completeness.modelCatalog.state === 'complete') {
+          provider.catalogAvailable = observation(
+            modelIds.has(providerId) ? 'available' : 'unavailable',
+            'catalog_snapshot', now,
+          )
+          if (modelIds.has(providerId)) provider.modelIds = [...new Set(modelIds.get(providerId))]
+          else delete provider.modelIds
+        }
       }
     })
   }
@@ -147,7 +162,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     const canonical = await this.#canonicalizePath(projectPath, signal)
     const scope = projectScope(canonical)
     const previous = this.#tails.get(scope) ?? Promise.resolve()
-    const next = previous.catch(() => undefined).then(async () => {
+    const next = previous.catch(() => undefined).then(async () => this.#withScopeLease(scope, signal, async () => {
       if (signal.aborted) return
       const now = this.#now()
       if (!Number.isSafeInteger(now) || now < 0) return
@@ -158,7 +173,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       mutate(snapshot, now)
       snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
       await this.#writer.write(snapshot, signal)
-    })
+    }))
     this.#tails.set(scope, next)
     try { await next } finally { if (this.#tails.get(scope) === next) this.#tails.delete(scope) }
   }
@@ -168,6 +183,17 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     if (text === null) return null
     const decoded = decodeOpenCodeRedactedSnapshotV1(text)
     return decoded.ok && decoded.value.projectScope === scope ? structuredClone(decoded.value) : null
+  }
+}
+
+function legacyCompleteness(inventory: OpenCodeInventorySnapshot): OpenCodeInventoryCompleteness {
+  const aggregate = inventory.probeError ? 'failed' as const : 'complete' as const
+  return {
+    profileConfig: { state: inventory.profile ? 'complete' : aggregate, provenance: 'managed_profile' },
+    managedAuth: { state: aggregate, provenance: 'managed_auth_store' },
+    environmentAuth: { state: aggregate, provenance: 'provider_environment' },
+    providerInventory: { state: aggregate, provenance: 'provider_cli' },
+    modelCatalog: { state: aggregate, provenance: 'model_cli' },
   }
 }
 

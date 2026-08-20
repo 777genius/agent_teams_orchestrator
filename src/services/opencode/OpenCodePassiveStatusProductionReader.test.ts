@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import type { OpenCodePassiveObservation } from './OpenCodePassiveStatusContract.js'
@@ -381,6 +381,57 @@ describe('OpenCode passive status production adapters', () => {
     expect(writes[0].text).toBe(writes[1].text)
     for (const forbidden of ['/canonical/a', 'api-key', 'token', 'secret']) {
       expect(writes[0].text).not.toContain(forbidden)
+    }
+  })
+
+  test('production writer and reader use bounded no-follow regular-file storage', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-store-'))
+    try {
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      await writer.write(snapshot(), new AbortController().signal)
+      const persisted = await readFile(path.join(root, 'snapshots', `${snapshot().projectScope.slice(7)}.json`), 'utf8')
+      expect(persisted).toBe(encoded(snapshot()))
+      const reader = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: root,
+        now: () => 1_000,
+        canonicalizePath: async () => '/canonical/a',
+      })
+      const status = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 1_000 })
+      expect(status.providers[0].configured.value).toBe('configured')
+
+      await writeFile(path.join(root, 'binary.snapshot.json'), 'x'.repeat(65_537))
+      const bounded = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/missing',
+      })
+      const boundedStatus = await bounded.reader.read({ projectPath: '/a', providerIds: [], timeoutMs: 100 })
+      expect(boundedStatus.binary.value.presence).toBe('unknown')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('snapshot component and final-file symlinks never reach or mutate outside storage', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-symlink-'))
+    const outside = await mkdtemp(path.join(process.cwd(), '.opencode-passive-outside-'))
+    try {
+      await symlink(outside, path.join(root, 'snapshots'), 'dir')
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      await expect(writer.write(snapshot(), new AbortController().signal)).rejects.toThrow()
+      expect(await readdir(outside)).toEqual([])
+
+      await rm(path.join(root, 'snapshots'), { force: true })
+      await mkdir(path.join(root, 'snapshots'))
+      const target = path.join(outside, 'outside.json')
+      await writeFile(target, encoded(snapshot()))
+      await symlink(target, path.join(root, 'snapshots', `${snapshot().projectScope.slice(7)}.json`))
+      const reader = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/a',
+      })
+      const status = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 100 })
+      expect(status.providers[0].configured.value).toBe('unknown')
+      expect(await readFile(target, 'utf8')).toBe(encoded(snapshot()))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
     }
   })
 })

@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { types as nodeTypes } from 'node:util'
 
 import {
@@ -14,17 +15,22 @@ import {
   type OpenCodeLastConnectedStatus,
   type OpenCodePassiveObservation,
   type OpenCodePassiveProviderStatus,
+  OPEN_CODE_PASSIVE_MAX_PROVIDERS,
 } from './OpenCodePassiveStatusContract.js'
 
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES = 65_536
-export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS = 32
+export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS = OPEN_CODE_PASSIVE_MAX_PROVIDERS
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS = 256
+export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS = 16_384
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_JSON_DEPTH = 16
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_SCALAR_CODE_UNITS = 129
 
 export type OpenCodeRedactedSnapshotProviderV1 = OpenCodePassiveProviderStatus & {
   fingerprint?: `sha256:${string}`
   modelIds?: string[]
+  modelIdsTotal?: number
+  modelIdsTruncated?: boolean
+  modelIdsFingerprint?: `sha256:${string}`
 }
 export type OpenCodeRedactedSnapshotV1 = {
   schemaVersion: 1
@@ -50,7 +56,7 @@ const freshness = ['fresh', 'stale', 'unknown'] as const
 const conditions = ['normal', 'degraded'] as const
 const issues = ['none', 'unknown', 'expired', 'read_timeout', 'read_cancelled', 'read_failed', 'invalid_payload', 'unsupported_version', 'scope_unavailable'] as const
 const topKeys = ['schemaVersion', 'projectScope', 'capturedAt', 'binary', 'providers'] as const
-const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'modelIds'] as const
+const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'modelIds', 'modelIdsTotal', 'modelIdsTruncated', 'modelIdsFingerprint'] as const
 const observationKeys = ['value', 'authority', 'freshness', 'condition', 'observedAt', 'validUntil', 'issueCode'] as const
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!
@@ -111,6 +117,21 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
       if (modelCount > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) return countExceeded()
       decoded.modelIds = [...provider.modelIds]
     }
+    const metadataPresent = provider.modelIdsTotal !== undefined
+      || provider.modelIdsTruncated !== undefined || provider.modelIdsFingerprint !== undefined
+    if (metadataPresent) {
+      if (!Number.isSafeInteger(provider.modelIdsTotal) || provider.modelIdsTotal < 0
+        || typeof provider.modelIdsTruncated !== 'boolean'
+        || !isOpenCodeOpaqueSha256(provider.modelIdsFingerprint)) return invalid()
+      const retained = decoded.modelIds?.length ?? 0
+      if (provider.modelIdsTotal < retained
+        || provider.modelIdsTruncated !== (provider.modelIdsTotal > retained)) return invalid()
+      if (!provider.modelIdsTruncated
+        && provider.modelIdsFingerprint !== modelIdsFingerprint(decoded.modelIds ?? [])) return invalid()
+      decoded.modelIdsTotal = provider.modelIdsTotal
+      decoded.modelIdsTruncated = provider.modelIdsTruncated
+      decoded.modelIdsFingerprint = provider.modelIdsFingerprint
+    }
     providers.push(decoded)
   }
   if (new Set(providers.map(provider => provider.providerId)).size !== providers.length) return invalid()
@@ -124,8 +145,15 @@ export function encodeOpenCodeRedactedSnapshotV1(value: OpenCodeRedactedSnapshot
   let text: string
   try { text = JSON.stringify(preflight.value) }
   catch { return invalid() }
-  if (text.length > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) return { ok: false, issueCode: 'snapshot_oversized' }
-  if (Buffer.byteLength(text, 'utf8') > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) return { ok: false, issueCode: 'snapshot_oversized' }
+  if (text.length > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
+    || Buffer.byteLength(text, 'utf8') > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
+    try { text = JSON.stringify(omitStoredModelIds(preflight.value)) }
+    catch { return invalid() }
+  }
+  if (text.length > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
+    || Buffer.byteLength(text, 'utf8') > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
+    return { ok: false, issueCode: 'snapshot_oversized' }
+  }
   const bytes = new TextEncoder().encode(text)
   const decoded = decodeOpenCodeRedactedSnapshotV1(bytes)
   return decoded.ok ? { ...decoded, bytes } : decoded
@@ -162,18 +190,33 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       owned.fingerprint = provider.fingerprint
     }
     if (provider.modelIds !== undefined) {
-      const models = captureArray(provider.modelIds, OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS)
+      const models = captureArray(provider.modelIds, OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS)
       if (models === 'count') return countExceeded()
       if (!models) return invalid()
-      modelCount += models.length
-      if (modelCount > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) return countExceeded()
       if (!models.every(isOpenCodeCanonicalModelId) || new Set(models).size !== models.length) return invalid()
-      owned.modelIds = inertArray(models as string[])
+      const sorted = [...models as string[]].sort(codeUnitCompare)
+      owned.modelIds = sorted
+      owned.modelIdsTotal = sorted.length
+      owned.modelIdsTruncated = false
+      owned.modelIdsFingerprint = modelIdsFingerprint(sorted)
     }
-    providers.push(inertRecord(owned as unknown as Record<string, unknown>) as OpenCodeRedactedSnapshotProviderV1)
+    providers.push(owned)
   }
   if (new Set(providers.map(provider => provider.providerId)).size !== providers.length) return invalid()
-  return { ok: true, value: inertRecord({ schemaVersion: 1, projectScope: top.projectScope, capturedAt: top.capturedAt, binary, providers: inertArray(providers) }) as OpenCodeRedactedSnapshotV1 }
+  providers.sort((left, right) => codeUnitCompare(left.providerId, right.providerId))
+  const totalModels = providers.reduce((total, provider) => total + (provider.modelIds?.length ?? 0), 0)
+  if (totalModels > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) {
+    for (const provider of providers) {
+      if (!provider.modelIds) continue
+      delete provider.modelIds
+      provider.modelIdsTruncated = (provider.modelIdsTotal ?? 0) > 0
+    }
+  }
+  const ownedProviders = providers.map(provider => inertRecord({
+    ...provider,
+    ...(provider.modelIds ? { modelIds: inertArray(provider.modelIds) } : {}),
+  } as unknown as Record<string, unknown>) as OpenCodeRedactedSnapshotProviderV1)
+  return { ok: true, value: inertRecord({ schemaVersion: 1, projectScope: top.projectScope, capturedAt: top.capturedAt, binary, providers: inertArray(ownedProviders) }) as OpenCodeRedactedSnapshotV1 }
 }
 
 function copyObservation(value: unknown, kind: 'binary' | 'connected' | 'scalar'): Record<string, unknown> | null {
@@ -271,9 +314,32 @@ function freezeSnapshot(snapshot: OpenCodeRedactedSnapshotV1): OpenCodeRedactedS
   return Object.freeze(snapshot)
 }
 
+function codeUnitCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function modelIdsFingerprint(modelIds: readonly string[]): `sha256:${string}` {
+  return `sha256:${createHash('sha256').update('opencode-passive-model-ids-v1\0')
+    .update(modelIds.join('\0')).digest('hex')}`
+}
+
+function omitStoredModelIds(snapshot: OpenCodeRedactedSnapshotV1): OpenCodeRedactedSnapshotV1 {
+  return {
+    ...snapshot,
+    providers: snapshot.providers.map(provider => provider.modelIds === undefined ? provider : {
+      ...provider,
+      modelIds: undefined,
+      modelIdsTotal: provider.modelIdsTotal ?? provider.modelIds.length,
+      modelIdsTruncated: (provider.modelIdsTotal ?? provider.modelIds.length) > 0,
+      modelIdsFingerprint: provider.modelIdsFingerprint ?? modelIdsFingerprint(provider.modelIds),
+    }),
+  }
+}
+
 /** Separate mutation boundary; the passive reader intentionally cannot receive this port. */
 export interface OpenCodeRedactedSnapshotWriterPort {
   write(snapshot: OpenCodeRedactedSnapshotV1, signal: AbortSignal): Promise<void>
+  withScopeLease?<T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>): Promise<T>
 }
 
 function decodeObservation<T>(
