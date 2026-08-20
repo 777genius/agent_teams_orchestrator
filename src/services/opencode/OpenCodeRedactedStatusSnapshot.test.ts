@@ -156,12 +156,20 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(wrongAuthority))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
   })
 
+  test('binds every catalog model reference to its owning provider', () => {
+    const mismatched = snapshot()
+    mismatched.providers[0].modelIds = ['openai/gpt-5']
+    expect(encodeOpenCodeRedactedSnapshotV1(mismatched)).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
+    expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(mismatched))).toEqual({ ok: false, issueCode: 'snapshot_invalid_field' })
+  })
+
   test('shares the 64-provider request capacity and preserves 33-provider authoritative snapshots', () => {
     const provider = snapshot().providers[0]
     const at33 = snapshot()
     at33.providers = Array.from({ length: 33 }, (_, index) => ({
       ...structuredClone(provider),
       providerId: index === 0 ? 'deepinfra' : `sha256:${index.toString(16).padStart(64, '0')}`,
+      modelIds: index === 0 ? provider.modelIds : undefined,
     }))
     expect(encodeOpenCodeRedactedSnapshotV1(at33).ok).toBe(true)
     const maximum = snapshot()

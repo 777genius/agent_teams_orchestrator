@@ -1,18 +1,29 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
-import { OpenCodePassiveStatusProductionReader, readBoundedSnapshotText } from './OpenCodePassiveStatusProductionReader.js'
+import {
+  OPEN_CODE_PASSIVE_DATABASE,
+  maintainOpenCodePassiveStore,
+  openCodePassiveDatabasePath,
+  readOpenCodePassiveSnapshot,
+} from './OpenCodePassiveSnapshotStore.js'
+import { OpenCodePassiveStatusProductionReader } from './OpenCodePassiveStatusProductionReader.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
+import { OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT } from './OpenCodePassiveSnapshotTransaction.js'
 import type { OpenCodeRedactedSnapshotV1 } from './OpenCodeRedactedStatusSnapshot.js'
 
 const canonical = '/canonical/project'
 const scope = `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonical).digest('hex')}` as const
-const observation = <T>(value: T, authority: any, at: number) => ({ value, authority,
-  freshness: 'fresh' as const, condition: 'normal' as const, observedAt: at,
-  validUntil: at + 300_000, issueCode: 'none' as const })
+const direct = <T>(value: T, authority: any, at: number, evidenceGeneration?: number) => ({
+  value, authority, freshness: 'fresh' as const, condition: 'normal' as const,
+  observedAt: at, validUntil: at + 300_000, issueCode: 'none' as const,
+  ...(evidenceGeneration === undefined ? {} : { evidenceGeneration }),
+})
 const unknown = <T>(value: T) => ({ value, authority: 'none' as const, freshness: 'unknown' as const,
   condition: 'degraded' as const, observedAt: null, validUntil: null, issueCode: 'unknown' as const })
 const digest = (character: string): `sha256:${string}` => `sha256:${character.repeat(64)}`
@@ -22,43 +33,115 @@ const catalogEvidence = (generation: number, marker: string) => ({
   configFingerprint: digest('c'), authFingerprint: digest('d'),
 })
 
-function transaction(at: number, configured: boolean, version: string): OpenCodeRedactedSnapshotV1 {
+function snapshot(at: number, connected: boolean, version: string, generation?: number): OpenCodeRedactedSnapshotV1 {
   return { schemaVersion: 1, projectScope: scope, capturedAt: at,
-    binary: observation({ presence: 'present' as const, version }, 'binary_metadata', at),
-    providers: [{ providerId: 'deepinfra',
-      configured: observation(configured ? 'configured' as const : 'not_configured' as const, 'config_metadata', at),
-      lastConnected: unknown({ state: 'unknown' as const }), catalogAvailable: unknown('unknown' as const),
-      executionVerified: unknown('unknown' as const) }] }
+    binary: direct({ presence: 'present' as const, version }, 'binary_metadata', at, generation),
+    providers: [{ providerId: 'deepinfra', configured: unknown('unknown'),
+      lastConnected: direct(connected ? { state: 'connected' as const, at } : { state: 'not_connected' as const }, 'auth_metadata', at, generation),
+      catalogAvailable: unknown('unknown'), executionVerified: unknown('unknown') }] }
 }
 
-function deferred() {
-  let resolve!: () => void
-  return { promise: new Promise<void>(done => { resolve = done }), resolve }
-}
-
-async function status(root: string, providerIds = ['deepinfra', 'ollama']) {
+function deferred() { let resolve!: () => void; return { promise: new Promise<void>(done => { resolve = done }), resolve } }
+async function status(root: string, providerIds = ['deepinfra']) {
   return new OpenCodePassiveStatusProductionReader({ rootDirectory: root, now: () => 10_000,
     canonicalizePath: async () => canonical }).reader.read({ projectPath: canonical, providerIds, timeoutMs: 5_000 })
 }
 
-describe('OpenCode passive append-only consistency', () => {
-  test('separate production publishers preserve independent same-scope facts without a coordinator', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-consistency-publishers-'))
+describe('OpenCode passive SQLite transaction consistency', () => {
+  test('32 real processes allocate unique monotonic generations and merge same-scope mutations', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-processes-'))
     try {
-      const make = () => new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 1_000,
-        canonicalizePath: async () => canonical, readSnapshot: async () => null })
-      await Promise.all([
-        make().publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: true }),
-        make().publishProviderUpdate({ projectPath: canonical, providerId: 'ollama', configured: true }),
-      ])
-      const result = await status(root)
-      expect(result.providers.find(provider => provider.providerId === 'deepinfra')?.lastConnected.value.state).toBe('connected')
-      expect(result.providers.find(provider => provider.providerId === 'ollama')?.configured.value).toBe('configured')
+      const moduleUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveSnapshotStore.ts')).href
+      const children = Array.from({ length: 32 }, (_, index) => {
+        const providerId = `sha256:${createHash('sha256').update(`process-${index}`).digest('hex')}`
+        const source = `import { mutateOpenCodePassiveSnapshot } from ${JSON.stringify(moduleUrl)};
+          const observation={value:'configured',authority:'config_metadata',freshness:'fresh',condition:'normal',observedAt:1000,validUntil:301000,issueCode:'none'};
+          const id=await mutateOpenCodePassiveSnapshot({rootDirectory:${JSON.stringify(root)}},{projectScope:${JSON.stringify(scope)},capturedAt:1000,providers:[{providerId:${JSON.stringify(providerId)},configured:observation}]},new AbortController().signal);
+          console.log(id);`
+        return Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+      })
+      const exits = await Promise.all(children.map(child => child.exited))
+      const errors = await Promise.all(children.map(async child => new Response(child.stderr).text()))
+      expect(exits.every(code => code === 0), errors.filter(Boolean).join('\n')).toBe(true)
+      const ids = await Promise.all(children.map(async child => Number((await new Response(child.stdout).text()).trim())))
+      expect(new Set(ids).size).toBe(32)
+      expect(ids.every(Number.isSafeInteger)).toBe(true)
+      const selected = await readOpenCodePassiveSnapshot(root, scope, new AbortController().signal)
+      expect(selected?.value.providers.map(provider => provider.providerId)).toHaveLength(32)
+      const db = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try {
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_transactions').get()?.count).toBe(2)
+        expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_current').get()?.count).toBe(1)
+      } finally { db.close(false) }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 30_000)
+
+  test('a crashed owner rolls back without a lock and restart advances authority', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-crash-'))
+    try {
+      const moduleUrl = pathToFileURL(path.join(process.cwd(), 'src/services/opencode/OpenCodePassiveSnapshotStore.ts')).href
+      const source = `import { mutateOpenCodePassiveSnapshot } from ${JSON.stringify(moduleUrl)};
+        const o={value:'configured',authority:'config_metadata',freshness:'fresh',condition:'normal',observedAt:1,validUntil:300001,issueCode:'none'};
+        await mutateOpenCodePassiveSnapshot({rootDirectory:${JSON.stringify(root)},hooks:{afterGenerationDirectoryCreated(){process.exit(77)}}},{projectScope:${JSON.stringify(scope)},capturedAt:1,providers:[{providerId:'deepinfra',configured:o}]},new AbortController().signal);`
+      const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'ignore', stderr: 'pipe' })
+      expect(await child.exited).toBe(77)
+      await new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 2_000,
+        canonicalizePath: async () => canonical }).publishProviderUpdate({ projectPath: canonical,
+          providerId: 'deepinfra', connected: false })
+      expect((await status(root)).providers[0].lastConnected.value.state).toBe('not_connected')
+      expect((await readdir(root)).filter(name => name.startsWith(OPEN_CODE_PASSIVE_DATABASE)).length).toBeLessThanOrEqual(4)
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('catalog racing an auth mutation cannot publish stale refs or erase execution rejection', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-consistency-domains-'))
+  test('legacy generation 5000 is fenced before a disconnect and survives restart', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-legacy-'))
+    const generation = '00000000-0000-4000-8000-000000000443'
+    try {
+      const scoped = path.join(root, 'scopes', scope.slice(7))
+      await mkdir(path.join(scoped, 'commits'), { recursive: true })
+      await mkdir(path.join(scoped, 'generations', generation), { recursive: true })
+      await writeFile(path.join(root, 'immutable-v2.marker'), OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT)
+      await writeFile(path.join(scoped, 'commits', `0000000000005000.${generation}.json`), JSON.stringify({
+        schemaVersion: 2, scope, generation, domainGeneration: 5000,
+      }))
+      const legacy = JSON.stringify(snapshot(1_000, true, '1.0.0'))
+      await writeFile(path.join(scoped, 'generations', generation, 'project.snapshot.json'), legacy)
+      await writeFile(path.join(scoped, 'generations', generation, 'binary.snapshot.json'), legacy)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).mutate({ projectScope: scope,
+        capturedAt: 2_000, binary: direct({ presence: 'present' as const, version: '2.0.0' }, 'binary_metadata', 2_000),
+        providers: [{ providerId: 'deepinfra', lastConnected: direct({ state: 'not_connected' as const }, 'auth_metadata', 2_000) }],
+      }, new AbortController().signal)
+      const restarted = await status(root)
+      expect(restarted.providers[0].lastConnected.value.state).toBe('not_connected')
+      expect(restarted.binary.value.version).toBe('2.0.0')
+      const row = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try { expect(row.query<{ id: number }, []>('SELECT max(id) AS id FROM passive_transactions').get()!.id).toBeGreaterThan(5000) }
+      finally { row.close(false) }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('forged generations are replaced internally and corrupt durable authority fails closed', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-forged-'))
+    try {
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(snapshot(1_000, true, '1.0.0', Number.MAX_SAFE_INTEGER), new AbortController().signal)
+      await new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 500,
+        canonicalizePath: async () => canonical }).publishProviderUpdate({ projectPath: canonical,
+          providerId: 'deepinfra', connected: false })
+      expect((await status(root)).providers[0].lastConnected.value.state).toBe('not_connected')
+      const db = new Database(openCodePassiveDatabasePath(root))
+      try {
+        const row = db.query<{ id: number; payload: string }, []>('SELECT id, payload FROM passive_transactions ORDER BY id DESC LIMIT 1').get()!
+        const malformed = JSON.parse(row.payload); malformed.providers[0].lastConnected.evidenceGeneration = Number.MAX_SAFE_INTEGER
+        db.query('UPDATE passive_transactions SET payload = ? WHERE id = ?').run(JSON.stringify(malformed), row.id)
+      } finally { db.close(false) }
+      expect((await status(root)).providers[0].lastConnected.value.state).toBe('unknown')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('catalog, auth and execution publishers preserve each domain in serialized transactions', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-domains-'))
+    const selected = deferred(); const release = deferred()
     try {
       const seed = new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 1_000,
         canonicalizePath: async () => canonical })
@@ -66,19 +149,26 @@ describe('OpenCode passive append-only consistency', () => {
       await seed.publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: true })
       await seed.publishCatalogResult({ projectPath: canonical, evidence: catalogEvidence(1, 'a'),
         catalogAvailable: true, modelIds: ['deepinfra/old'] })
-      const stale = await readBoundedSnapshotText(path.join(root, 'snapshots', `${scope.slice(7)}.json`), new AbortController().signal)
-      const make = () => new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 1_000,
-        canonicalizePath: async () => canonical, readSnapshot: async () => stale })
-      await Promise.all([
-        make().publishCatalogResult({ projectPath: canonical, evidence: catalogEvidence(2, 'e'),
-          catalogAvailable: true, modelIds: ['deepinfra/new'] }),
-        (async () => {
-          const publisher = make()
-          await publisher.publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: false })
-          await publisher.publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: false })
-        })(),
-      ])
-      const result = await status(root, ['deepinfra'])
+
+      const catalog = new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 2_000,
+        canonicalizePath: async () => canonical, writer: new OpenCodePassiveStatusSnapshotWriter({
+          rootDirectory: root, safeStorageHooks: { afterGenerationDirectoryCreated: async () => {
+            selected.resolve(); await release.promise
+          } },
+        }) })
+      const catalogUpdate = catalog.publishCatalogResult({ projectPath: canonical,
+        evidence: { ...catalogEvidence(2, 'e'), startedAt: 2_000 },
+        catalogAvailable: true, modelIds: ['deepinfra/new'] })
+      await selected.promise
+      const state = new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 2_001,
+        canonicalizePath: async () => canonical })
+      const stateUpdate = (async () => {
+        await state.publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: false })
+        await state.publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: false })
+      })()
+      release.resolve()
+      await Promise.all([catalogUpdate, stateUpdate])
+      const result = await status(root)
       expect(result.providers[0].lastConnected.value.state).toBe('not_connected')
       expect(result.providers[0].executionVerified.value).toBe('rejected')
       expect(result.providers[0].catalogAvailable.value).toBe('available')
@@ -86,118 +176,66 @@ describe('OpenCode passive append-only consistency', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('equal and backward clocks plus late completion obey claimed evidence generation', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-consistency-order-'))
-    const claimed = deferred(); const release = deferred()
+  test('selected reads and paused writers remain valid across maintenance without grace clocks', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-stable-read-'))
     try {
-      const oldWriter = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        afterGenerationDirectoryCreated: async () => { claimed.resolve(); await release.promise },
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
+      const selected = deferred(); const release = deferred()
+      const held = readOpenCodePassiveSnapshot(root, scope, new AbortController().signal, { afterSelected: async () => {
+        selected.resolve(); await release.promise
       } })
-      const oldSnapshot = transaction(2_000, true, '1.0.0')
-      oldSnapshot.providers[0].lastConnected = observation(
-        { state: 'connected' as const, at: 2_000 }, 'auth_metadata', 2_000,
-      )
-      oldSnapshot.providers[0].executionVerified = observation('verified' as const, 'execution_snapshot', 2_000)
-      const oldUpdate = oldWriter.write(oldSnapshot, new AbortController().signal)
-      await claimed.promise
-      const newer = new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 1_000,
-        canonicalizePath: async () => canonical, readSnapshot: async () => null })
-      await newer.publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: false })
-      await newer.publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: false })
-      release.resolve(); await oldUpdate
-      const frozen = () => new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root, now: () => 1_000,
-        canonicalizePath: async () => canonical })
-      await frozen().publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: true })
-      await frozen().publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: true })
-      await frozen().publishProviderUpdate({ projectPath: canonical, providerId: 'deepinfra', connected: false })
-      await frozen().publishExecutionUpdate({ projectPath: canonical, providerId: 'deepinfra', executionVerified: false })
-      const result = await status(root, ['deepinfra'])
-      expect(result.providers[0].lastConnected.value.state).toBe('not_connected')
-      expect(result.providers[0].executionVerified.value).toBe('rejected')
+      await selected.promise
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(2_000, false, '2.0.0'), new AbortController().signal)
+      await maintainOpenCodePassiveStore(root)
+      release.resolve()
+      expect((await held)?.value.binary.value.version).toBe('1.0.0')
+
+      const paused = deferred(); const resume = deferred()
+      const pending = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
+        afterGenerationDirectoryCreated: async () => { paused.resolve(); await resume.promise },
+      } }).write(snapshot(3_000, true, '3.0.0'), new AbortController().signal)
+      await paused.promise
+      await maintainOpenCodePassiveStore(root)
+      resume.resolve(); await pending
+      expect((await status(root)).binary.value.version).toBe('3.0.0')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('one read uses one selected transaction when publication occurs mid-read', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-consistency-pair-'))
-    let once = false
+  test('one production read derives binary and provider facts from the same transaction identity', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-coherent-'))
+    let published = false
     try {
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-        .write(transaction(1_000, true, '1.0.0'), new AbortController().signal)
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000, true, '1.0.0'), new AbortController().signal)
       const reader = new OpenCodePassiveStatusProductionReader({ rootDirectory: root, now: () => 2_000,
         canonicalizePath: async () => canonical, afterCommittedTransactionSelected: async () => {
-          if (once) return
-          once = true
-          await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-            .write(transaction(2_000, false, '2.0.0'), new AbortController().signal)
+          if (published) return
+          published = true
+          await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(2_000, false, '2.0.0'), new AbortController().signal)
         } })
-      const selected = await reader.reader.read({ projectPath: canonical, providerIds: ['deepinfra'], timeoutMs: 5_000 })
-      expect(selected.binary.value.version).toBe('1.0.0')
-      expect(selected.providers[0].configured.value).toBe('configured')
-      const latest = await status(root, ['deepinfra'])
+      const held = await reader.reader.read({ projectPath: canonical, providerIds: ['deepinfra'], timeoutMs: 5_000 })
+      expect(held.binary.value.version).toBe('1.0.0')
+      expect(held.providers[0].lastConnected.value.state).toBe('connected')
+      const latest = await status(root)
       expect(latest.binary.value.version).toBe('2.0.0')
-      expect(latest.providers[0].configured.value).toBe('not_configured')
+      expect(latest.providers[0].lastConnected.value.state).toBe('not_connected')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('retention is bounded, grace protects selected readers, and cleanup failure is telemetry-only', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-consistency-retention-'))
-    const queued: Array<() => void> = []; let cleanupError = false
-    const now = Date.now()
+  test('commit-time retention stays bounded when every scheduled maintenance fails', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-bounded-'))
+    let failures = 0
     try {
-      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, now: () => now + 180_000,
-        retentionCount: 2, readerGraceMs: 120_001, scheduleMaintenance: operation => queued.push(operation) })
-      for (let index = 1; index <= 4; index += 1) {
-        await writer.write(transaction(index * 1_000, index % 2 === 0, `${index}.0.0`), new AbortController().signal)
-      }
-      await writer.maintain(scope)
-      const scoped = path.join(root, 'scopes', scope.slice(7))
-      expect((await readdir(path.join(scoped, 'commits'))).length).toBe(2)
-      expect((await readdir(path.join(scoped, 'generations'))).length).toBe(2)
-      expect((await status(root, ['deepinfra'])).binary.value.version).toBe('4.0.0')
-
-      const selected = deferred(); const release = deferred()
-      const inFlight = new OpenCodePassiveStatusProductionReader({ rootDirectory: root, now: () => 10_000,
-        canonicalizePath: async () => canonical, afterCommittedTransactionSelected: async () => {
-          selected.resolve(); await release.promise
-        } }).reader.read({ projectPath: canonical, providerIds: ['deepinfra'], timeoutMs: 5_000 })
-      await selected.promise
-      const graceWriter = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root,
-        retentionCount: 2, readerGraceMs: 120_001, scheduleMaintenance: () => undefined })
-      for (let index = 5; index <= 7; index += 1) {
-        await graceWriter.write(transaction(index * 1_000, true, `${index}.0.0`), new AbortController().signal)
-      }
-      await graceWriter.maintain(scope)
-      release.resolve()
-      expect((await inFlight).binary.value.version).toBe('4.0.0')
-      await writer.maintain(scope)
-      expect((await readdir(path.join(scoped, 'commits'))).length).toBe(2)
-
-      const failing = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root,
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root,
         scheduleMaintenance: operation => operation(), safeStorageHooks: {
-          beforeCleanup: () => { throw new Error('cleanup unavailable') }, cleanupFailed: () => { cleanupError = true },
+          beforeCleanup: () => { throw new Error('checkpoint unavailable') }, cleanupFailed: () => { failures += 1 },
         } })
-      await failing.write(transaction(8_000, true, '8.0.0'), new AbortController().signal)
+      for (let index = 1; index <= 40; index += 1) await writer.write(snapshot(index, index % 2 === 0, `${index}.0.0`), new AbortController().signal)
       await Promise.resolve()
-      expect(cleanupError).toBe(true)
-      expect((await status(root, ['deepinfra'])).binary.value.version).toBe('8.0.0')
+      expect(failures).toBe(40)
+      const db = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try { expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM passive_transactions').get()!.count).toBe(2) }
+      finally { db.close(false) }
+      expect((await readdir(root)).filter(name => name.startsWith(OPEN_CODE_PASSIVE_DATABASE)).length).toBeLessThanOrEqual(4)
     } finally { await rm(root, { recursive: true, force: true }) }
-  })
-
-  test('first publication fsyncs every created POSIX ancestor before exposing the commit', async () => {
-    if (process.platform === 'win32') return
-    const parent = await mkdtemp(path.join(process.cwd(), '.passive-consistency-fsync-'))
-    const root = path.join(parent, 'new', 'ancestry', 'store')
-    const order: string[] = []
-    try {
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        ancestorDirectorySynced: directory => {
-          const name = path.basename(directory)
-          order.push(/^[0-9]{16}\./.test(name) ? 'GENERATION' : name)
-        },
-        afterCommitPublished: () => { order.push('COMMIT') },
-      } }).write(transaction(1_000, true, '1.0.0'), new AbortController().signal)
-      expect(order).toEqual(['new', 'ancestry', 'store', 'scopes', scope.slice(7), 'generations', 'commits',
-        'GENERATION', 'COMMIT'])
-    } finally { await rm(parent, { recursive: true, force: true }) }
-  })
+  }, 30_000)
 })

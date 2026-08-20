@@ -1,6 +1,9 @@
 import { types as nodeTypes } from 'node:util'
 
-import { isOpenCodeCredentialOrAuthorityLike } from './OpenCodeProviderIdentity.js'
+import {
+  isOpenCodeBedrockModelId,
+  isOpenCodeCredentialOrAuthorityLike,
+} from './OpenCodeProviderIdentity.js'
 
 export const OPEN_CODE_PASSIVE_STATUS_CONTRACT_VERSION = 1 as const
 export const OPEN_CODE_PASSIVE_CAPABILITY_VERSION = 1 as const
@@ -132,16 +135,14 @@ export function normalizeOpenCodePassiveModelRef(value: unknown): string | null 
   const parts = value.split('/')
   if (parts.length < 2 || parts.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENTS
     || !isOpenCodeCanonicalProviderId(parts[0])) return null
-  // Bedrock inference-profile/model identifiers legitimately end in `:0`.
-  // Authority detection is applied to the model portion with that one
-  // provider-aware exception, never to the enclosing exact ref as a URL.
+  const bedrockModel = parts[0] === 'amazon-bedrock'
+    && parts.length === 2
+    && isOpenCodeBedrockModelId(parts[1])
   if (isOpenCodeCredentialOrAuthorityLike(parts.slice(1).join('/'), {
-    allowHostPort: parts[0] === 'amazon-bedrock' && /(?:^|[-.])v\d+:\d+$/.test(parts.at(-1)!),
+    allowHostPort: bedrockModel,
   })) return null
   for (const part of parts.slice(1)) {
-    if (parts[0] === 'amazon-bedrock'
-      && /(?:^|[-.])v\d+:\d+$/.test(part)
-      && /^[A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*:[0-9]+$/.test(part)) continue
+    if (bedrockModel && part === parts[1]) continue
     if (!safeModelRefSegment(part)) return null
   }
   return value

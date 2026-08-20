@@ -68,6 +68,28 @@ describe('OpenCodeActiveStatusSnapshotPublisher catalog evidence', () => {
       catalogAvailable: true, modelIds: ['deepinfra/new'] })
     expect((await h.read(['deepinfra'])).providers[0].knownModelIds).toEqual(['deepinfra/new'])
   })
+  test('mutation fence rejects exact equality after restart while preserving disconnect evidence and allowing a gap', async () => {
+    const clock = { now: 1_000 }
+    const seed = { text: null as string | null }
+    let h = harness(clock, seed)
+    const fifth = evidence('deepinfra', 5, 900, '5')
+    await h.publisher.publishCatalogResult({ projectPath: '/project', evidence: fifth,
+      catalogAvailable: true, modelIds: ['deepinfra/old'] })
+    await h.publisher.publishProviderUpdate({
+      projectPath: '/project', providerId: 'deepinfra', connected: false,
+    })
+    h = harness(clock, seed)
+    await h.publisher.publishCatalogResult({ projectPath: '/project', evidence: fifth,
+      catalogAvailable: true, modelIds: ['deepinfra/equal-late'] })
+    const fenced = await h.read(['deepinfra'])
+    expect(fenced.providers[0].knownModelIds).toBeUndefined()
+    expect(fenced.providers[0].lastConnected.value).toEqual({ state: 'not_connected' })
+    await h.publisher.publishCatalogResult({ projectPath: '/project',
+      evidence: evidence('deepinfra', 7, 1_000, '7'), catalogAvailable: false, modelIds: [] })
+    const afterGap = await h.read(['deepinfra'])
+    expect(afterGap.providers[0].catalogAvailable.value).toBe('unavailable')
+    expect(afterGap.providers[0].lastConnected.value).toEqual({ state: 'not_connected' })
+  })
   test('pre-prepare durable attempt order fences a late old fingerprint across restart publishers', async () => {
     let generation = 0
     let prepareCalls = 0

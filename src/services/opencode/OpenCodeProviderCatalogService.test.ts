@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, realpath, rm, stat, symlink, utimes } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import {
+  allocateOpenCodeProviderCatalogAttempt,
   OpenCodeProviderCatalogService,
   type OpenCodeProviderCatalogServiceDeps,
 } from './OpenCodeProviderCatalogService.js'
@@ -66,6 +67,7 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
   let now = 1_000
   const plans: Array<Record<string, unknown>> = []
   const writes: Array<{ key: string; value: unknown }> = []
+  const persisted = new Map<string, unknown>()
   const releases: string[] = []
   let config = 'config-a'
   let auth = 'auth-a'
@@ -99,8 +101,8 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
       new URL(baseUrl).port === '48001' ? 'kiro'
         : new URL(baseUrl).port === '48002' ? 'cursor-acp' : 'deepinfra',
     ),
-    readPersisted: async () => null,
-    writePersisted: async (key, value) => { writes.push({ key, value }) },
+    readPersisted: async key => persisted.get(key) ?? null,
+    writePersisted: async (key, value) => { writes.push({ key, value }); persisted.set(key, value) },
     ...overrides,
   }
   return {
@@ -213,6 +215,78 @@ describe('OpenCodeProviderCatalogService', () => {
     expect(restored.catalog.models.map(model => model.id)).toEqual(['winner'])
     expect(JSON.stringify([...persistence.values.values()])).not.toContain('"old"')
   })
+  test('an older instance revalidates after staging and cannot publish over a newer winner', async () => {
+    const values = new Map<string, unknown>()
+    let allocation = 0
+    let releaseOldStage!: () => void
+    let oldStageStarted!: () => void
+    const oldStaged = new Promise<void>(resolve => { oldStageStarted = resolve })
+    const allocateAttempt = () => ({ requestGeneration: ++allocation,
+      attemptIdentity: `sha256:${allocation.toString(16).padStart(64, '0')}` as const })
+    const readPersisted = async (key: string) => values.get(key) ?? null
+    const old = fixture({ allocateAttempt, readPersisted,
+      writePersisted: async (key, value) => {
+        values.set(key, value)
+        if (key.includes('.stage.')) {
+          oldStageStarted()
+          await new Promise<void>(resolve => { releaseOldStage = resolve })
+        }
+      },
+      fetchProviderCatalog: async () => response('deepinfra', 'late-old'),
+    })
+    const newer = fixture({ allocateAttempt, readPersisted,
+      writePersisted: async (key, value) => { values.set(key, value) },
+      fetchProviderCatalog: async () => response('deepinfra', 'winner'),
+    })
+    const late = old.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    await oldStaged
+    const winner = await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    releaseOldStage()
+    await expect(late).rejects.toThrow('temporarily unavailable')
+    expect(winner.catalog.models.map(model => model.id)).toEqual(['winner'])
+    const restarted = fixture({ allocateAttempt, readPersisted,
+      writePersisted: async (key, value) => { values.set(key, value) },
+      fetchProviderCatalog: async () => { throw new Error('must hydrate winner') },
+    })
+    expect((await restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+      .catalog.models.map(model => model.id)).toEqual(['winner'])
+  })
+  test('maxEntries retention uses durable order instead of frozen or backward mtimes across restart', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-retention-order-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    let allocation = 0
+    let now = 1_000
+    const common: OpenCodeProviderCatalogServiceDeps = {
+      readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+      allocateAttempt: () => ({ requestGeneration: ++allocation,
+        attemptIdentity: `sha256:${allocation.toString(16).padStart(64, '0')}` }),
+      now: () => now, timeoutMs: 1_000, maxEntries: 1,
+    }
+    try {
+      await fixture({ ...common,
+        fetchProviderCatalog: async () => response('deepinfra', 'old') })
+        .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/retention' })
+      const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
+      for (const file of (await readdir(catalogRoot)).filter(file => file.endsWith('.commit.json'))) {
+        await utimes(path.join(catalogRoot, file), new Date(2_000_000_000_000), new Date(2_000_000_000_000))
+      }
+      now += 11
+      await fixture({ ...common,
+        fetchProviderCatalog: async () => response('deepinfra', 'winner') })
+        .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/retention' })
+      const commits = (await readdir(catalogRoot)).filter(file => file.endsWith('.commit.json'))
+      expect(commits).toHaveLength(1)
+      const restored = await fixture({ ...common,
+        fetchProviderCatalog: async () => { throw new Error('must hydrate durable winner') } })
+        .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/retention' })
+      expect(restored.catalog.models.map(model => model.id)).toEqual(['winner'])
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   test('durable attempt order is independent of identical frozen clocks', async () => {
     const persistence = memoryPersistence()
@@ -257,12 +331,79 @@ describe('OpenCodeProviderCatalogService', () => {
     const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
     process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
     try {
-      const first = fixture({ allocateAttempt: undefined })
+      const first = fixture({ allocateAttempt: undefined, timeoutMs: 1_000 })
       const one = await first.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/durable' })
-      const restarted = fixture({ allocateAttempt: undefined })
+      const restarted = fixture({ allocateAttempt: undefined, timeoutMs: 1_000 })
       const two = await restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/durable' })
       expect(two.catalogEvidence.requestGeneration).toBe(one.catalogEvidence.requestGeneration + 1)
       expect(two.catalogEvidence.attemptIdentity).not.toBe(one.catalogEvidence.attemptIdentity)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+  test('durable allocation remains bounded after thousands of attempts, junk crash artifacts and restart', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-attempt-bound-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      const scope = '/canonical/project\0deepinfra'
+      let allocation = allocateOpenCodeProviderCatalogAttempt(scope, 1_000)
+      for (let index = 0; index < 1_024; index += 1) {
+        allocation = allocateOpenCodeProviderCatalogAttempt(scope, 1_000)
+      }
+      expect(allocation.requestGeneration).toBe(1_025)
+      const allocationRoot = path.join(root, 'opencode', 'provider-catalog-attempts-v2')
+      await mkdir(path.join(allocationRoot, 'crashed-unrelated.ticket'), { recursive: true })
+      const restarted = allocateOpenCodeProviderCatalogAttempt(scope, 900)
+      expect(restarted.requestGeneration).toBe(1_026)
+      const modulePath = path.join(import.meta.dir, 'OpenCodeProviderCatalogService.ts')
+      const children = Array.from({ length: 8 }, () => Bun.spawn([
+        process.execPath,
+        '-e',
+        `import { allocateOpenCodeProviderCatalogAttempt as allocate } from ${JSON.stringify(modulePath)}; console.log(allocate(${JSON.stringify(scope)}, 800).requestGeneration)`,
+      ], {
+        env: { ...process.env, CLAUDE_MULTIMODEL_CACHE_HOME: root },
+        stdout: 'pipe', stderr: 'pipe',
+      }))
+      const concurrent = await Promise.all(children.map(async child => {
+        const [exitCode, stdout, stderr] = await Promise.all([
+          child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+        ])
+        if (exitCode !== 0) throw new Error(`fake allocator child failed: ${stderr}`)
+        return Number(stdout.trim())
+      }))
+      expect(concurrent.sort((left, right) => left - right)).toEqual(
+        Array.from({ length: 8 }, (_, index) => 1_027 + index),
+      )
+      expect(allocateOpenCodeProviderCatalogAttempt(scope, 700).requestGeneration).toBe(1_035)
+      const files = await readdir(allocationRoot)
+      expect(files.filter(file => file.startsWith('attempts.sqlite')).length).toBeLessThanOrEqual(3)
+      expect((await stat(path.join(allocationRoot, 'attempts.sqlite'))).size).toBeLessThan(1_000_000)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+  test('an armed deadline that expires during synchronous durable allocation prevents preparation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-attempt-deadline-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    let prepares = 0
+    try {
+      const f = fixture({
+        allocateAttempt: undefined,
+        timeoutMs: 1,
+        prepareProfile: async plan => {
+          prepares += 1
+          return profile({ providerId: plan.providerId, projectPath: '/deadline' })
+        },
+      })
+      await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/deadline' }))
+        .rejects.toThrow('temporarily unavailable')
+      expect(prepares).toBe(0)
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
       else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
@@ -369,7 +510,7 @@ describe('OpenCodeProviderCatalogService', () => {
     expect(f.writes.filter(write => write.key.endsWith('.current'))).toHaveLength(3)
   })
 
-  test('enforces the configured in-memory cache size bound', async () => {
+  test('enforces the configured in-memory cache size bound while durable cache can hydrate an eviction', async () => {
     let fetches = 0
     const f = fixture({
       maxEntries: 1,
@@ -381,7 +522,7 @@ describe('OpenCodeProviderCatalogService', () => {
     await f.service.loadCatalog({ providerId: 'kiro', projectPath: '/p' })
     await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     await f.service.loadCatalog({ providerId: 'kiro', projectPath: '/p' })
-    expect(fetches).toBe(3)
+    expect(fetches).toBe(2)
   })
 
   test('config and auth rotations miss cache and create distinct cache identities', async () => {
@@ -422,11 +563,15 @@ describe('OpenCodeProviderCatalogService', () => {
   })
 
   test('ignores corrupt persistence and persists only a redacted immutable contract', async () => {
-    const f = fixture({ readPersisted: async () => ({ schema: 'bad', token: 'secret' }) })
+    const persistence = memoryPersistence()
+    const f = fixture({
+      ...persistence,
+      readPersisted: async key => persistence.values.get(key) ?? { schema: 'bad', token: 'secret' },
+    })
     const result = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
 
     expect(result.catalog.models).toHaveLength(1)
-    expect(JSON.stringify(f.writes[0]!.value)).not.toContain('secret')
+    expect(JSON.stringify([...persistence.values.values()])).not.toContain('secret')
     expect(Object.isFrozen(result.catalog)).toBe(true)
     expect(Object.isFrozen(result.catalog.models[0]!.capabilities)).toBe(true)
   })
@@ -608,6 +753,28 @@ describe('OpenCodeProviderCatalogService', () => {
     expect(writes.some(key => key.endsWith('.current'))).toBe(false)
   })
 
+  test('a publish is rejected when its durable stage disappears before verification', async () => {
+    const persistence = memoryPersistence()
+    const writes = persistence.writePersisted
+    const f = fixture({
+      ...persistence,
+      writePersisted: async (key, value) => {
+        await writes(key, value)
+        if (key.endsWith('.current')) {
+          for (const stageKey of [...persistence.values.keys()].filter(candidate => candidate.includes('.stage.'))) {
+            persistence.values.delete(stageKey)
+          }
+        }
+      },
+    })
+    await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+      .rejects.toThrow('temporarily unavailable')
+    expect([...persistence.values.keys()].some(key => key.endsWith('.current'))).toBe(false)
+    const restarted = fixture({ ...persistence })
+    await expect(restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+      .resolves.toMatchObject({ catalogProvenance: 'fresh-live' })
+  })
+
   test('timeout retains a bounded stale catalog without granting launch authorization', async () => {
     let hang = false
     const f = fixture({
@@ -734,8 +901,10 @@ describe('OpenCodeProviderCatalogService', () => {
     }
     for (const persisted of [proxy, withToJSON]) {
       let fetches = 0
+      const replacement = memoryPersistence()
       const f = fixture({
-        readPersisted: async () => persisted,
+        ...replacement,
+        readPersisted: async key => replacement.values.get(key) ?? persisted,
         fetchProviderCatalog: async () => { fetches += 1; return response('deepinfra') },
       })
       await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))

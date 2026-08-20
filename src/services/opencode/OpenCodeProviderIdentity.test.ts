@@ -116,15 +116,22 @@ describe('branded OpenCode provider identity boundary', () => {
   })
 
   test('accepts only structurally versioned Bedrock :0 refs, not authorities', () => {
-    const ref = 'amazon-bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
-    expect(parseOpenCodeExactProviderModelRef(ref)?.raw).toBe(ref)
-    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/api.example.invalid-v1:443')).toBeNull()
-    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/user@api.example.invalid-v1:0')).toBeNull()
-    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/[2001:db8::1]-v1:0')).toBeNull()
-    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/api.example.invalid:443/model')).toBeNull()
-    expect(parseOpenCodeExactProviderModelRef(
+    for (const ref of [
+      'amazon-bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+      'amazon-bedrock/anthropic.claude-v2:1',
+      'amazon-bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    ]) expect(parseOpenCodeExactProviderModelRef(ref)?.raw).toBe(ref)
+    for (const ref of [
+      'amazon-bedrock/api.example.invalid-v1:0',
+      'amazon-bedrock/api.example.invalid-v1:443',
+      'amazon-bedrock/anthropic.claude.example.invalid-v1:0',
+      'amazon-bedrock/localhost-v1:0',
+      'amazon-bedrock/127.0.0.1-v1:0',
+      'amazon-bedrock/user@api.example.invalid-v1:0',
+      'amazon-bedrock/[2001:db8::1]-v1:0',
+      'amazon-bedrock/api.example.invalid:443/model',
       'amazon-bedrock/api.example.invalid:443/us.anthropic.claude-v1:0',
-    )).toBeNull()
+    ]) expect(parseOpenCodeExactProviderModelRef(ref)).toBeNull()
   })
 
   test('rejects endpoint and userinfo shaped exact refs without provider fallback', () => {

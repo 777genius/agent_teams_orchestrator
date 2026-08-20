@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs'
-import { open, readdir, stat, unlink } from 'node:fs/promises'
+import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs'
+import { open, readdir, unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { types as nodeUtilTypes } from 'node:util'
+import { Database } from 'bun:sqlite'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from './OpenCodeLiveProviderNormalizer.js'
@@ -34,6 +35,7 @@ const MAX_IDENTITY_STRING = 16_384
 const FIXED_FAILURE = 'OpenCode provider catalog is temporarily unavailable.'
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const customPersistenceCommitQueues = new WeakMap<Function, Map<string, Promise<boolean>>>()
+let durableAttemptDatabase: { filePath: string; database: Database } | null = null
 
 export type OpenCodeProviderCatalogLoadInput = Readonly<{
   providerId: string
@@ -102,7 +104,7 @@ export type OpenCodeProviderCatalogServiceDeps = {
   setTimer?: typeof setTimeout
   clearTimer?: typeof clearTimeout
   /** Synchronous because request authority must exist before profile preparation awaits. */
-  allocateAttempt?: (scope: string, startedAt: number) => Readonly<{
+  allocateAttempt?: (scope: string, startedAt: number, busyTimeoutMs?: number) => Readonly<{
     requestGeneration: number
     attemptIdentity: `sha256:${string}`
   }>
@@ -336,59 +338,79 @@ function createCatalogPublicationEvidence(
 }
 
 /**
- * Cross-process monotonic allocation. The tiny synchronous critical section is
- * intentional: no request may enter asynchronous profile preparation without
- * first receiving durable authority for its project/provider scope.
+ * Cross-process monotonic allocation. SQLite supplies the crash-safe atomic
+ * increment that a directory of one ticket per attempt cannot provide without
+ * unbounded scans and storage. One row is updated per scope, and the database,
+ * WAL and shared-memory sidecars are the only durable allocator files.
  */
-function allocateDurableAttempt(scope: string, startedAt: number): Readonly<{
+export function allocateOpenCodeProviderCatalogAttempt(scope: string, startedAt: number, busyTimeoutMs = 250): Readonly<{
   requestGeneration: number
   attemptIdentity: `sha256:${string}`
 }> {
-  const cacheHome = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
-    ?? (process.platform === 'win32'
-      ? path.join(process.env.LOCALAPPDATA ?? os.tmpdir(), 'claude-multimodel-nodejs', 'Cache')
-      : process.platform === 'darwin'
-        ? path.join(os.homedir(), 'Library', 'Caches', 'claude-multimodel-nodejs')
-        : path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'claude-multimodel-nodejs'))
-  const root = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v1')
-  mkdirSync(root, { recursive: true, mode: 0o700 })
-  const key = hash(scope)
-  const ledgerPath = path.join(root, `${key}.json`)
-  const ticketRoot = path.join(root, key)
-  mkdirSync(ticketRoot, { recursive: true, mode: 0o700 })
-  let legacyGeneration = 0
+  if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) throw fixedCatalogFailure()
+  const boundedBusyTimeout = Math.min(250, busyTimeoutMs)
+  const cacheHome = catalogCacheHome()
+  const root = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v2')
+  const databasePath = path.join(root, 'attempts.sqlite')
+  let requestGeneration: number | null = null
   try {
-    const decoded = JSON.parse(readFileSync(ledgerPath, 'utf8')) as unknown
-    const record = snapshotRecord(decoded)
-    if (record?.schema !== 'opencode-catalog-attempt-ledger-v1'
-      || !Number.isSafeInteger(record.generation) || (record.generation as number) < 1) {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+    for (const directory of [cacheHome, path.join(cacheHome, 'opencode'), root]) {
+      assertSafeCatalogAllocatorDirectory(directory)
+    }
+    assertSafeCatalogAllocatorArtifacts(databasePath)
+    protectCatalogAllocatorArtifacts(databasePath)
+    if (durableAttemptDatabase?.filePath !== databasePath) {
+      durableAttemptDatabase?.database.close()
+      durableAttemptDatabase = null
+      const database = new Database(databasePath, { create: true, strict: true })
+      const tables = database.query<{ name: string }, []>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      ).all().map(row => row.name)
+      if (tables.length > 0 && (tables.length !== 2
+        || tables[0] !== 'allocator_meta' || tables[1] !== 'scope_generation')) {
+        database.close(false)
+        throw fixedCatalogFailure()
+      }
+      // WAL/NORMAL preserves atomic process-crash recovery without imposing one
+      // blocking fsync on the event loop for every allocated ordinal.
+      database.exec(`PRAGMA busy_timeout = ${boundedBusyTimeout}; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`)
+      database.exec(`CREATE TABLE IF NOT EXISTS allocator_meta (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1), schema_version INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO allocator_meta VALUES (1, 1);
+      CREATE TABLE IF NOT EXISTS scope_generation (
+        scope_hash TEXT PRIMARY KEY NOT NULL,
+        generation INTEGER NOT NULL CHECK(generation >= 1)
+      ) WITHOUT ROWID`)
+      durableAttemptDatabase = { filePath: databasePath, database }
+      protectCatalogAllocatorArtifacts(databasePath)
+    }
+    const database = durableAttemptDatabase.database
+    database.exec(`PRAGMA busy_timeout = ${boundedBusyTimeout}`)
+    const schema = database.query<{ version: number }, []>(
+      'SELECT schema_version AS version FROM allocator_meta WHERE singleton = 1',
+    ).get()
+    if (schema?.version !== 1) throw fixedCatalogFailure()
+    database.exec('BEGIN IMMEDIATE')
+    const row = database.query<{ generation: number }, [string]>(`
+      INSERT INTO scope_generation(scope_hash, generation) VALUES (?1, 1)
+      ON CONFLICT(scope_hash) DO UPDATE SET generation = generation + 1
+        WHERE generation < 9007199254740991
+      RETURNING generation
+    `).get(hash(scope))
+    if (!row || !Number.isSafeInteger(row.generation) || row.generation < 1) {
+      database.exec('ROLLBACK')
       throw fixedCatalogFailure()
     }
-    legacyGeneration = record.generation as number
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
+    requestGeneration = row.generation
+    database.exec('COMMIT')
+    protectCatalogAllocatorArtifacts(databasePath)
+  } catch {
+    try { durableAttemptDatabase?.database.exec('ROLLBACK') } catch { /* transaction was not open */ }
+    throw fixedCatalogFailure()
   }
-  let requestGeneration: number
-  for (;;) {
-    let previous = legacyGeneration
-    for (const file of readdirSync(ticketRoot)) {
-      const match = /^([1-9]\d*)\.ticket$/.exec(file)
-      if (!match) continue
-      const candidate = Number(match[1])
-      if (Number.isSafeInteger(candidate)) previous = Math.max(previous, candidate)
-    }
-    requestGeneration = previous + 1
-    if (!Number.isSafeInteger(requestGeneration)) throw fixedCatalogFailure()
-    try {
-      // mkdir is the compare-and-claim primitive. A crashed allocator leaves a
-      // consumed ordinal, never a lease that another process must wait for or
-      // recover. Contenders that race for the same ordinal simply rescan.
-      mkdirSync(path.join(ticketRoot, `${requestGeneration}.ticket`), { mode: 0o700 })
-      break
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw fixedCatalogFailure()
-    }
-  }
+  if (requestGeneration === null) throw fixedCatalogFailure()
   const nonce = randomUUID()
   const attemptIdentity = redactedFingerprint('opencode-catalog-attempt-v2', boundedIdentityMaterial([
     scope, requestGeneration, startedAt, nonce,
@@ -396,9 +418,40 @@ function allocateDurableAttempt(scope: string, startedAt: number): Readonly<{
   return Object.freeze({ requestGeneration, attemptIdentity })
 }
 
+function assertSafeCatalogAllocatorDirectory(root: string): void {
+  const stat = lstatSync(root)
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw fixedCatalogFailure()
+  chmodSync(root, 0o700)
+}
+
+function assertSafeCatalogAllocatorArtifacts(databasePath: string): void {
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    const artifact = `${databasePath}${suffix}`
+    if (!existsSync(artifact)) continue
+    const stat = lstatSync(artifact)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw fixedCatalogFailure()
+  }
+}
+
+function protectCatalogAllocatorArtifacts(databasePath: string): void {
+  assertSafeCatalogAllocatorArtifacts(databasePath)
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    const artifact = `${databasePath}${suffix}`
+    if (existsSync(artifact)) chmodSync(artifact, 0o600)
+  }
+}
+
+function catalogCacheHome(): string {
+  return process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    ?? (process.platform === 'win32'
+      ? path.join(process.env.LOCALAPPDATA ?? os.tmpdir(), 'claude-multimodel-nodejs', 'Cache')
+      : process.platform === 'darwin'
+        ? path.join(os.homedir(), 'Library', 'Caches', 'claude-multimodel-nodejs')
+        : path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'claude-multimodel-nodejs'))
+}
+
 async function cacheRootPath(): Promise<string> {
-  const { resolveClaudeMultimodelPaths } = await import('./OpenCodeManagedPaths.js')
-  return path.join(resolveClaudeMultimodelPaths().cache, 'opencode', 'provider-catalog-v2')
+  return path.join(catalogCacheHome(), 'opencode', 'provider-catalog-v2')
 }
 
 async function cacheFilePath(cacheKey: string): Promise<string> {
@@ -437,7 +490,6 @@ async function defaultReadPointer(cacheKey: string): Promise<unknown | null> {
   const prefix = `${hash(cacheKey)}.`
   const candidates = (await readdir(root).catch(() => []))
     .filter(file => file.startsWith(prefix) && file.endsWith('.commit.json'))
-    .slice(0, MAX_ENTRIES + 32)
   let winner: CommittedPointer | null = null
   for (const file of candidates) {
     const candidate = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
@@ -471,23 +523,19 @@ async function defaultPublishPointer(
   const root = await cacheRootPath()
   await writeJsonFileAtomic(defaultCommitFilePath(root, cacheKey, pointer), pointer, { mode: 0o600 })
   const allFiles = await readdir(root).catch(() => [])
-  const files = allFiles
-    .filter(file => /^[0-9a-f]{64}\.[1-9]\d*\.[0-9a-f]{16}\.commit\.json$/.test(file))
-  if (files.length <= maxEntries) return
-  const ordered = await Promise.all(files.map(async file => ({
-    file,
-    modifiedAt: (await stat(path.join(root, file)).catch(() => null))?.mtimeMs ?? 0,
-  })))
-  ordered.sort((left, right) => left.modifiedAt - right.modifiedAt)
-  const evicted = ordered.slice(0, Math.max(0, ordered.length - maxEntries))
-  // Eviction and orphan cleanup are bounded and deliberately outside the
-  // durable commit critical path.
-  void Promise.all(evicted.flatMap(entry => {
-    const fileHash = entry.file.slice(0, 64)
-    return [entry.file, ...allFiles.filter(file =>
-      file.startsWith(`${fileHash}.`) && file.endsWith('.stage.json')
-    )].slice(0, 34).map(file => unlink(path.join(root, file)).catch(() => undefined))
-  })).catch(() => undefined)
+  const prefix = `${hash(cacheKey)}.`
+  const decoded = (await Promise.all(allFiles
+    .filter(file => file.startsWith(prefix) && file.endsWith('.commit.json'))
+    .map(async file => ({ file, pointer: decodeCommittedPointer(await readJsonFile(path.join(root, file))) }))))
+    .filter((entry): entry is { file: string; pointer: CommittedPointer } => entry.pointer !== null)
+  decoded.sort((left, right) => compareCommittedPointers(right.pointer, left.pointer))
+  // Retention is per durable cache identity and ordered by the allocation
+  // ordinal. mtime is neither an ordering authority nor a safe race signal.
+  for (const entry of decoded.slice(Math.max(1, maxEntries))) {
+    const winner = decodeCommittedPointer(await defaultReadPointer(cacheKey))
+    if (!winner || compareCommittedPointers(entry.pointer, winner) >= 0) continue
+    await unlink(path.join(root, entry.file)).catch(() => undefined)
+  }
 }
 
 function defaultCommitFilePath(root: string, cacheKey: string, pointer: CommittedPointer): string {
@@ -505,25 +553,36 @@ async function defaultCleanupStages(cacheKey: string, currentAttemptId: string):
   const allFiles = await readdir(root).catch(() => [])
   const files = allFiles
     .filter(file => file.startsWith(prefix) && file.endsWith('.stage.json'))
-  const orphans = files.filter(file => file !== `${prefix}${currentAttemptId}.stage.json`)
-  const ordered = await Promise.all(orphans.map(async file => ({
-    file,
-    modifiedAt: (await stat(path.join(root, file)).catch(() => null))?.mtimeMs ?? 0,
-  })))
-  ordered.sort((left, right) => left.modifiedAt - right.modifiedAt)
-  await Promise.all(ordered.slice(0, 32).map(entry =>
-    unlink(path.join(root, entry.file)).catch(() => undefined)
-  ))
   const winner = decodeCommittedPointer(await defaultReadPointer(cacheKey))
   if (!winner) return
+  const orphans = files.filter(file => file !== `${prefix}${currentAttemptId}.stage.json`)
+  let removed = 0
+  for (const file of orphans) {
+    if (removed >= 32) break
+    const envelope = snapshotRecord(await readJsonFile(path.join(root, file)))
+    const evidence = envelope && snapshotRecord(envelope.catalogEvidence)
+    if (!evidence || !Number.isSafeInteger(evidence.requestGeneration)
+      || (evidence.requestGeneration as number) >= winner.requestGeneration) continue
+    // Re-read immediately before deletion. A concurrent/future stage is never
+    // inferred obsolete from the old winner snapshot.
+    const currentWinner = decodeCommittedPointer(await defaultReadPointer(cacheKey))
+    if (!currentWinner
+      || (evidence.requestGeneration as number) >= currentWinner.requestGeneration) continue
+    await unlink(path.join(root, file)).catch(() => undefined)
+    removed += 1
+  }
   const obsoleteCommits: string[] = []
   for (const file of allFiles.filter(file => file.startsWith(prefix) && file.endsWith('.commit.json'))) {
     const candidate = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
     if (candidate && compareCommittedPointers(candidate, winner) < 0) obsoleteCommits.push(file)
   }
-  await Promise.all(obsoleteCommits.slice(0, 32).map(file =>
-    unlink(path.join(root, file)).catch(() => undefined)
-  ))
+  for (const file of obsoleteCommits.slice(0, 32)) {
+    const candidate = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
+    const currentWinner = decodeCommittedPointer(await defaultReadPointer(cacheKey))
+    if (candidate && currentWinner && compareCommittedPointers(candidate, currentWinner) < 0) {
+      await unlink(path.join(root, file)).catch(() => undefined)
+    }
+  }
 }
 
 function identityPayload(catalog: OpenCodeScopedProviderCatalog): OpenCodeCatalogRecordIdentityPayload {
@@ -581,6 +640,13 @@ function committedPointer(attemptId: string, catalog: OpenCodeScopedProviderCata
 
 function compareCommittedPointers(left: CommittedPointer, right: CommittedPointer): number {
   return left.requestGeneration - right.requestGeneration
+}
+
+function sameCommittedPointer(left: CommittedPointer, right: CommittedPointer): boolean {
+  return left.requestGeneration === right.requestGeneration
+    && left.attemptIdentity === right.attemptIdentity
+    && left.attemptId === right.attemptId
+    && left.envelopeHash === right.envelopeHash
 }
 
 function decodeCommittedPointer(value: unknown): CommittedPointer | null {
@@ -924,6 +990,17 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         this.discardStage(params.key, attemptId)
         return false
       }
+      // Another service instance may have published while this stage write was
+      // pending. Revalidate durable order before adding our commit record.
+      const winnerAfterStage = decodeCommittedPointer(
+        await this.readPointer(params.key).catch(() => null),
+      )
+      if (winnerAfterStage && (compareCommittedPointers(winnerAfterStage, candidatePointer) > 0
+        || (winnerAfterStage.requestGeneration === candidatePointer.requestGeneration
+          && winnerAfterStage.attemptIdentity !== candidatePointer.attemptIdentity))) {
+        this.discardStage(params.key, attemptId)
+        return false
+      }
       // Atomic publication is the sole durable commit point. The immediately
       // preceding guard prevents a withdrawn, timed-out, or superseded flight
       // whose stage write ignored cancellation from becoming current.
@@ -948,7 +1025,20 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         return false
       }
       const durableWinner = decodeCommittedPointer(await this.readPointer(params.key).catch(() => null))
-      if (durableWinner && compareCommittedPointers(durableWinner, candidatePointer) > 0) {
+      const durableStage = decodePersistedCatalog(
+        await this.readStage(params.key, attemptId).catch(() => null),
+        params.identity,
+      )
+      if (!durableWinner || !sameCommittedPointer(durableWinner, candidatePointer)
+        || !durableStage
+        || durableStage.catalog.generation !== candidatePointer.generation
+        || durableStage.catalogEvidence.requestGeneration !== candidatePointer.requestGeneration
+        || durableStage.catalogEvidence.attemptIdentity !== candidatePointer.attemptIdentity) {
+        if (!this.deps.writePersisted) {
+          await defaultDiscardPointer(params.key, candidatePointer)
+        } else if (durableWinner && sameCommittedPointer(durableWinner, candidatePointer)) {
+          await this.revokePublishedPointer(params.key, previousPointer, params.maxEntries)
+        }
         this.discardStage(params.key, attemptId)
         return false
       }
@@ -1157,6 +1247,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       const attemptController = new AbortController()
       const reserveMs = Math.min(250, Math.floor(selectedOptions.timeoutMs / 10))
       const workBudgetMs = Math.max(0, selectedOptions.timeoutMs - reserveMs)
+      const monotonicDeadline = performance.now() + workBudgetMs
       const setTimer = this.deps.setTimer ?? setTimeout
       const clearTimer = this.deps.clearTimer ?? clearTimeout
       const deadline = new Promise<never>((_resolve, reject) => {
@@ -1185,7 +1276,21 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       const requestScope = boundedIdentityMaterial([
         canonicalProjectPath, providerId,
       ])
-      const allocation = (this.deps.allocateAttempt ?? allocateDurableAttempt)(requestScope, startedAt)
+      const remainingAllocationBudget = Math.max(0, Math.min(
+        250,
+        Math.floor(monotonicDeadline - performance.now()),
+      ))
+      const allocation = (this.deps.allocateAttempt ?? allocateOpenCodeProviderCatalogAttempt)(
+        requestScope,
+        startedAt,
+        remainingAllocationBudget,
+      )
+      // Synchronous durable allocation cannot allow an already-armed timer to
+      // be starved into authorizing later profile mutations.
+      if (performance.now() >= monotonicDeadline) {
+        attemptController.abort(fixedCatalogFailure())
+        throw fixedCatalogFailure()
+      }
       if (attemptController.signal.aborted) throw fixedCatalogFailure()
       if (!Number.isSafeInteger(allocation.requestGeneration) || allocation.requestGeneration < 1
         || !/^sha256:[0-9a-f]{64}$/.test(allocation.attemptIdentity)) throw fixedCatalogFailure()

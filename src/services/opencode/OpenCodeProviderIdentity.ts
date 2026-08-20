@@ -149,7 +149,7 @@ export function createOpenCodeExactProviderModelRef(
 ): OpenCodeScopedProviderModelRef {
   const canonicalProviderId = createOpenCodeCanonicalProviderId(providerId)
   const canonicalModelId = canonicalProviderId === 'amazon-bedrock'
-    ? createOpenCodeCanonicalModelIdForProvider(modelId, bedrockVersionSuffix(modelId))
+    ? createOpenCodeCanonicalModelIdForProvider(modelId)
     : createOpenCodeCanonicalModelId(modelId)
   return Object.freeze({
     providerId: canonicalProviderId,
@@ -158,18 +158,18 @@ export function createOpenCodeExactProviderModelRef(
   })
 }
 
-function bedrockVersionSuffix(value: string): boolean {
-  const last = value.slice(value.lastIndexOf('/') + 1)
-  return /(?:^|[-.])v\d+:0$/.test(last)
+/** Positive grammar for the Bedrock families present in this repository. */
+export function isOpenCodeBedrockModelId(value: unknown): value is string {
+  if (typeof value !== 'string' || value.includes('/')) return false
+  return /^(?:(?:us|eu|apac)\.)?anthropic\.claude(?:-[A-Za-z0-9]+)*-v\d+:\d+$/.test(value)
 }
 
 function createOpenCodeCanonicalModelIdForProvider(
   value: string | OpenCodeCanonicalModelId,
-  allowHostPort: boolean,
 ): OpenCodeCanonicalModelId {
   const segments = typeof value === 'string' ? value.split('/') : []
   const finalSegment = segments.at(-1) ?? ''
-  const safeBedrockSuffix = allowHostPort && /(?:^|[-.])v\d+:0$/.test(finalSegment)
+  const safeBedrockSuffix = isOpenCodeBedrockModelId(finalSegment)
   if (typeof value !== 'string' || value.length === 0 || value !== value.trim()
     || CONTROL_OR_WHITESPACE.test(value) || !MODEL_ID.test(value)
     || value.startsWith('/') || value.endsWith('/') || value.includes('//')

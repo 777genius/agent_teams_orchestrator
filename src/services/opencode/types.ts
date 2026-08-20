@@ -89,6 +89,12 @@ export type OpenCodePlanScopedProfileInput = Omit<OpenCodeScopedProfilePlan, 'ab
   evidence: OpenCodeScopedProfilePlanningEvidence
 }
 
+/** Preparation carries cancellation beside the immutable input consumed by the pure planner. */
+export type OpenCodeScopedProfilePreparationInput = Omit<
+  OpenCodePlanScopedProfileInput,
+  'abortSignal'
+> & { abortSignal?: AbortSignal }
+
 /** Pure, redacted and read-only contract passed from planning to preparation. */
 export type OpenCodeScopedProfilePlanContract = {
   schema: 'opencode-scoped-profile-plan-v1'

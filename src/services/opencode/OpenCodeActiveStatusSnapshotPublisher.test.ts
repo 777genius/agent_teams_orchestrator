@@ -196,7 +196,7 @@ describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production b
     await harness.publisher.publishInventory(inventory())
     await harness.publisher.publishProviderUpdate({
       projectPath: '/project/secret-name', providerId: 'deepinfra', executionVerified: true,
-      modelIds: ['deepinfra/llama-4'],
+      catalogAvailable: true, modelIds: ['deepinfra/llama-4'],
     })
     expect(harness.writes()).toBe(4)
     expect(harness.stored()).not.toContain('/project/secret-name')

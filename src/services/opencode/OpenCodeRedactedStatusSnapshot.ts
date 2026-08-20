@@ -148,8 +148,12 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
       if (new Set(provider.modelIds).size !== provider.modelIds.length) return invalid()
       modelCount += provider.modelIds.length
       if (modelCount > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) return countExceeded()
+      if (!provider.modelIds.every(modelId => parseOpenCodeExactProviderModelRef(modelId)?.providerId === provider.providerId)) return invalid()
+      if (new Set(provider.modelIds).size !== provider.modelIds.length) return invalid()
       decoded.modelIds = [...provider.modelIds]
     }
+    if (decoded.modelIds?.length && (catalogAvailable.value !== 'available'
+      || catalogAvailable.authority !== 'catalog_snapshot')) return invalid()
     const metadataPresent = provider.modelIdsTotal !== undefined
       || provider.modelIdsTruncated !== undefined || provider.modelIdsFingerprint !== undefined
     if (metadataPresent) {
@@ -248,7 +252,9 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       const unique = new Set<string>()
       for (const model of models) {
         const normalized = normalizeOpenCodePassiveModelRef(model)
-        if (normalized && parseOpenCodeExactProviderModelRef(normalized)?.providerId === provider.providerId) unique.add(normalized)
+        if (!normalized) continue
+        if (parseOpenCodeExactProviderModelRef(normalized)?.providerId !== provider.providerId) return invalid()
+        unique.add(normalized)
       }
       const sorted = [...unique].sort(codeUnitCompare)
       owned.modelIds = sorted
@@ -263,6 +269,8 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       const suppliedMetadata = readModelMetadata(provider, 0)
       if (suppliedMetadata) Object.assign(owned, suppliedMetadata)
     }
+    if (owned.modelIds?.length && (catalogAvailable.value !== 'available'
+      || catalogAvailable.authority !== 'catalog_snapshot')) return invalid()
     providers.push(owned)
   }
   if (new Set(providers.map(provider => provider.providerId)).size !== providers.length) return invalid()
@@ -513,7 +521,36 @@ function fitStoredModelPrefix(snapshot: OpenCodeRedactedSnapshotV1): { value: Op
 /** Separate mutation boundary; the passive reader intentionally cannot receive this port. */
 export interface OpenCodeRedactedSnapshotWriterPort {
   write(snapshot: OpenCodeRedactedSnapshotV1, signal: AbortSignal): Promise<void>
+  mutate?(mutation: OpenCodeRedactedSnapshotMutation, signal: AbortSignal): Promise<void>
+  /** Runs a domain-aware update while the durable store owns its write transaction. */
+  update?(
+    projectScope: `sha256:${string}`,
+    capturedAt: number,
+    mutate: (snapshot: OpenCodeRedactedSnapshotV1) => void,
+    signal: AbortSignal,
+  ): Promise<void>
 }
+
+export type OpenCodeRedactedProviderMutation = Readonly<{
+  providerId: string
+  configured?: OpenCodeRedactedSnapshotProviderV1['configured']
+  lastConnected?: OpenCodeRedactedSnapshotProviderV1['lastConnected']
+  catalog?: Readonly<{
+    available: OpenCodeRedactedSnapshotProviderV1['catalogAvailable']
+    modelIds?: readonly string[]
+  }>
+  executionVerified?: OpenCodeRedactedSnapshotProviderV1['executionVerified']
+}>
+
+/** Caller intent only. Durable causal authority is deliberately absent. */
+export type OpenCodeRedactedSnapshotMutation = Readonly<{
+  projectScope: `sha256:${string}`
+  capturedAt: number
+  binary?: OpenCodeRedactedSnapshotV1['binary']
+  /** Complete-domain negative evidence applied to providers already durable. */
+  providerDefaults?: Omit<OpenCodeRedactedProviderMutation, 'providerId'>
+  providers?: readonly OpenCodeRedactedProviderMutation[]
+}>
 
 function decodeObservation<T>(
   value: unknown,

@@ -1,190 +1,109 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
+import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
+import { openCodePassiveDatabasePath } from './OpenCodePassiveSnapshotStore.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
-import { OpenCodePassiveStatusProductionReader, readBoundedSnapshotText } from './OpenCodePassiveStatusProductionReader.js'
 import type { OpenCodeRedactedSnapshotV1 } from './OpenCodeRedactedStatusSnapshot.js'
 
-const canonical = '/canonical/project'
-const scopeFor = (value: string) => `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(value).digest('hex')}` as const
-const scope = scopeFor(canonical)
-const otherScope = scopeFor('/other/project')
-const observation = <T>(value: T, authority: any, at: number) => ({
-  value, authority, freshness: 'fresh' as const, condition: 'normal' as const,
-  observedAt: at, validUntil: at + 10_000, issueCode: 'none' as const,
-})
-function snapshot(at: number, projectScope: `sha256:${string}` = scope): OpenCodeRedactedSnapshotV1 {
-  return {
-    schemaVersion: 1, projectScope, capturedAt: at,
-    binary: observation({ presence: 'present' as const, version: `${Math.floor(at / 1_000)}.2.3` }, 'binary_metadata', at),
-    providers: [{
-      providerId: 'deepinfra',
-      configured: observation('configured' as const, 'config_metadata', at),
-      lastConnected: observation({ state: 'connected' as const, at }, 'auth_metadata', at),
-      catalogAvailable: observation('available' as const, 'catalog_snapshot', at),
-      executionVerified: observation('verified' as const, 'execution_snapshot', at),
-    }],
-  }
-}
-function deferred() {
-  let resolve!: () => void
-  return { promise: new Promise<void>(done => { resolve = done }), resolve }
-}
-async function read(root: string, canonicalPath = canonical, at = 9_000) {
-  return new OpenCodePassiveStatusProductionReader({
-    rootDirectory: root, now: () => at, canonicalizePath: async () => canonicalPath,
-  }).reader.read({ projectPath: canonicalPath, providerIds: ['deepinfra'], timeoutMs: 1_000 })
-}
+const scope = `sha256:${createHash('sha256').update('writer').digest('hex')}` as const
+const observation = <T>(value: T, authority: any, evidenceGeneration?: number) => ({ value, authority,
+  freshness: 'fresh' as const, condition: 'normal' as const, observedAt: 1, validUntil: 300_001,
+  issueCode: 'none' as const, ...(evidenceGeneration === undefined ? {} : { evidenceGeneration }) })
+const unknown = <T>(value: T) => ({ value, authority: 'none' as const, freshness: 'unknown' as const,
+  condition: 'degraded' as const, observedAt: null, validUntil: null, issueCode: 'unknown' as const })
+function snapshot(): OpenCodeRedactedSnapshotV1 { return { schemaVersion: 1, projectScope: scope, capturedAt: 1,
+  binary: observation({ presence: 'present' as const, version: '1.0.0' }, 'binary_metadata', 999),
+  providers: [{ providerId: 'deepinfra', configured: observation('configured', 'config_metadata', 999),
+    lastConnected: unknown({ state: 'unknown' }), catalogAvailable: unknown('unknown'), executionVerified: unknown('unknown') }] } }
 
-const describeSupportedPersistence = process.platform === 'win32' ? describe.skip : describe
-
-describeSupportedPersistence('OpenCode passive immutable snapshot publication', () => {
-  test('has no reclaimable correctness pathname and concurrent scopes cannot lose one another', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-scopes-'))
-    try {
-      await Promise.all([
-        new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000), new AbortController().signal),
-        new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(2_000, otherScope), new AbortController().signal),
-      ])
-      expect((await readdir(root)).sort()).not.toContain('locks')
-      expect((await readdir(path.join(root, 'scopes'))).sort()).toEqual([otherScope.slice(7), scope.slice(7)].sort())
-      expect((await read(root)).providers[0].configured.observedAt).toBe(1_000)
-      expect((await read(root, '/other/project')).providers[0].configured.observedAt).toBe(2_000)
-    } finally { await rm(root, { recursive: true, force: true }) }
+describe('OpenCode passive transaction writer boundary', () => {
+  test('rejects native Windows capability before any injected storage I/O', async () => {
+    let touched = false
+    const writer = new OpenCodePassiveStatusSnapshotWriter({ platform: 'win32', rootDirectory: 'C:\\forbidden',
+      makeDirectory: async () => { touched = true }, writeAtomic: async () => { touched = true } })
+    await expect(writer.write(snapshot(), new AbortController().signal)).rejects.toThrow('unavailable on this platform')
+    expect(touched).toBe(false)
   })
 
-  test('same-scope late old completion is fenced by authoritative domain generation', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-order-'))
-    const oldPaused = deferred(); const releaseOld = deferred()
-    try {
-      const old = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        beforeCommitPublished: async () => { oldPaused.resolve(); await releaseOld.promise },
-      }}).write(snapshot(1_000), new AbortController().signal)
-      await oldPaused.promise
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-        .write(snapshot(2_000), new AbortController().signal)
-      releaseOld.resolve(); await old
-      const result = await read(root)
-      expect(result.providers[0].configured.observedAt).toBe(2_000)
-      expect(result.binary.value.version).toBe('2.2.3')
-      expect((await readdir(path.join(root, 'scopes', scope.slice(7), 'commits'))).length).toBe(2)
-    } finally { await rm(root, { recursive: true, force: true }) }
-  })
-
-  test('every pre-commit crash stage hides the half pair and durability hooks are ordered', async () => {
-    const stages = ['afterTransactionMarker', 'afterGenerationDirectoryCreated', 'afterProjectSnapshotPublished',
-      'afterBinarySnapshotPublished', 'afterGenerationParentSynced', 'beforeCommitPublished'] as const
-    for (const stage of stages) {
-      const root = await mkdtemp(path.join(process.cwd(), `.passive-v2-crash-${stage}-`))
+  test('rejects database and sidecar symlinks instead of following them', async () => {
+    if (process.platform === 'win32') return
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-link-'))
+      const outside = path.join(root, 'outside')
       try {
-        await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000), new AbortController().signal)
-        await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-          [stage]: () => { throw new Error(`crash:${stage}`) },
-        }}).write(snapshot(2_000), new AbortController().signal)).rejects.toThrow(`crash:${stage}`)
-        expect((await read(root)).providers[0].configured.observedAt).toBe(1_000)
+        await writeFile(outside, '')
+        await symlink(outside, `${openCodePassiveDatabasePath(root)}${suffix}`)
+        await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+          .write(snapshot(), new AbortController().signal)).rejects.toThrow('unsafe')
       } finally { await rm(root, { recursive: true, force: true }) }
     }
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-durability-'))
+  })
+
+  test('fails closed on an existing foreign schema without migrating or deleting it', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-schema-'))
+    try {
+      await mkdir(root, { recursive: true })
+      const databasePath = openCodePassiveDatabasePath(root)
+      const database = new Database(databasePath)
+      try { database.exec('CREATE TABLE foreign_authority(secret TEXT); INSERT INTO foreign_authority VALUES (\'retained\')') }
+      finally { database.close(false) }
+      await chmod(databasePath, 0o600)
+      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+        .write(snapshot(), new AbortController().signal)).rejects.toThrow('schema is invalid')
+      const retained = new Database(databasePath, { readonly: true })
+      try { expect(retained.query<{ secret: string }, []>('SELECT secret FROM foreign_authority').get()?.secret).toBe('retained') }
+      finally { retained.close(false) }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('publisher omits cross-provider catalog refs from the durable transaction', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-owner-'))
+    const publisher = new OpenCodeActiveStatusSnapshotPublisher({ rootDirectory: root,
+      canonicalizePath: async () => '/canonical', now: () => 1 })
+    try {
+      await publisher.publishCatalogResult({ projectPath: '/p', catalogAvailable: true,
+        modelIds: ['openai/gpt-5', 'deepinfra/llama'], evidence: {
+          providerId: 'deepinfra', requestGeneration: 1, startedAt: 1,
+          attemptIdentity: `sha256:${'a'.repeat(64)}`,
+          binaryFingerprint: `sha256:${'b'.repeat(64)}`,
+          configFingerprint: `sha256:${'c'.repeat(64)}`,
+          authFingerprint: `sha256:${'d'.repeat(64)}`,
+        } })
+      const database = new Database(openCodePassiveDatabasePath(root), { readonly: true })
+      try {
+        const payload = database.query<{ payload: string }, []>('SELECT payload FROM passive_transactions ORDER BY id DESC LIMIT 1').get()!.payload
+        expect(payload).toContain('deepinfra/llama')
+        expect(payload).not.toContain('openai/gpt-5')
+      } finally { database.close(false) }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('mutation callers cannot supply durable evidence generations', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-forged-mutation-'))
+    try {
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      await expect(writer.mutate({ projectScope: scope, capturedAt: 1,
+        binary: observation({ presence: 'present' as const, version: '1.0.0' }, 'binary_metadata', Number.MAX_SAFE_INTEGER),
+      }, new AbortController().signal)).rejects.toThrow('cannot supply durable authority')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('first initialization durably syncs created ancestors before publication', async () => {
+    if (process.platform === 'win32') return
+    const parent = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-init-'))
+    const root = path.join(parent, 'new', 'nested', 'store')
     const order: string[] = []
     try {
       await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        afterGenerationDirectoryCreated: () => { order.push('generation-parent-entry-fsynced') },
-        afterProjectSnapshotPublished: () => { order.push('project-file-fsynced') },
-        afterBinarySnapshotPublished: () => { order.push('binary-file-fsynced') },
-        afterGenerationParentSynced: () => { order.push('generation-fsynced-before-commit') },
-        beforeCommitPublished: () => { order.push('commit-begins') },
-        afterCommitPublished: () => { order.push('commit-file-and-directory-fsynced') },
-      }}).write(snapshot(1_000), new AbortController().signal)
-      expect(order).toEqual(['generation-parent-entry-fsynced', 'project-file-fsynced', 'binary-file-fsynced',
-        'generation-fsynced-before-commit', 'commit-begins', 'commit-file-and-directory-fsynced'])
-    } finally { await rm(root, { recursive: true, force: true }) }
-  })
-
-  test('a reader selected before two later commits remains readable because publication never cleans generations', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-pin-'))
-    try {
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000), new AbortController().signal)
-      const held = await readBoundedSnapshotText(path.join(root, 'snapshots', `${scope.slice(7)}.json`), new AbortController().signal)
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(2_000), new AbortController().signal)
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(3_000), new AbortController().signal)
-      expect(held).toContain('"capturedAt":1000')
-      const generations = path.join(root, 'scopes', scope.slice(7), 'generations')
-      expect((await readdir(generations)).length).toBe(3)
-      for (const name of await readdir(generations)) expect((await readdir(path.join(generations, name))).sort())
-        .toEqual(['binary.snapshot.json', 'project.snapshot.json'])
-    } finally { await rm(root, { recursive: true, force: true }) }
-  })
-
-  test('corrupt or oversize transactional records fail closed and only truly absent state uses legacy mirrors', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-corrupt-'))
-    try {
-      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root }).write(snapshot(1_000), new AbortController().signal)
-      const commits = path.join(root, 'scopes', scope.slice(7), 'commits')
-      const committedName = (await readdir(commits))[0]
-      await writeFile(path.join(commits,
-        `.${committedName}.immutable.${process.pid}.00000000-0000-4000-8000-000000000443`), '{interrupted')
-      expect((await read(root)).providers[0].configured.observedAt).toBe(1_000)
-      await writeFile(path.join(commits, '0000000000002000.00000000-0000-4000-8000-000000000443.json'), '{bad')
-      expect((await read(root)).providers[0].configured.value).toBe('unknown')
-      await writeFile(path.join(commits, '0000000000003000.00000000-0000-4000-8000-000000000444.json'), 'x'.repeat(4_097))
-      expect((await read(root)).providers[0].configured.value).toBe('unknown')
-    } finally { await rm(root, { recursive: true, force: true }) }
-
-    const legacy = await mkdtemp(path.join(process.cwd(), '.passive-v2-legacy-'))
-    try {
-      await mkdir(path.join(legacy, 'snapshots'))
-      const data = JSON.stringify(snapshot(1_000))
-      await writeFile(path.join(legacy, 'snapshots', `${scope.slice(7)}.json`), data)
-      await writeFile(path.join(legacy, 'binary.snapshot.json'), data)
-      expect((await read(legacy)).providers[0].configured.observedAt).toBe(1_000)
-      await writeFile(path.join(legacy, 'committed.json'), '{bad')
-      expect((await read(legacy)).providers[0].configured.value).toBe('unknown')
-    } finally { await rm(legacy, { recursive: true, force: true }) }
-  })
-
-  test('every scope path boundary rejects preexisting symlink or Windows junction substitution', async () => {
-    for (const boundary of ['scopes', `scopes/${scope.slice(7)}`, `scopes/${scope.slice(7)}/generations`,
-      `scopes/${scope.slice(7)}/commits`]) {
-      const parent = await mkdtemp(path.join(process.cwd(), '.passive-v2-links-'))
-      const root = path.join(parent, 'root'); const outside = path.join(parent, 'outside')
-      try {
-        await mkdir(root); await mkdir(outside)
-        const target = path.join(root, boundary); await mkdir(path.dirname(target), { recursive: true })
-        await symlink(outside, target, process.platform === 'win32' ? 'junction' : 'dir')
-        await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-          .write(snapshot(1_000), new AbortController().signal)).rejects.toThrow()
-        expect(await readdir(outside)).toEqual([])
-      } finally { await rm(parent, { recursive: true, force: true }) }
-    }
-  })
-
-  test('a root substitution after acquisition cannot redirect publication outside the proven root', async () => {
-    const parent = await mkdtemp(path.join(process.cwd(), '.passive-v2-root-swap-'))
-    const root = path.join(parent, 'root'); const displaced = path.join(parent, 'displaced'); const outside = path.join(parent, 'outside')
-    try {
-      await mkdir(root); await mkdir(outside)
-      const publication = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        afterRootOpened: async () => {
-          await rename(root, displaced)
-          await symlink(outside, root, process.platform === 'win32' ? 'junction' : 'dir')
-        },
-      }}).write(snapshot(1_000), new AbortController().signal)
-      if (process.platform === 'win32') await expect(publication).rejects.toThrow('safe publication primitive')
-      else await publication
-      expect(await readdir(outside)).toEqual([])
+        ancestorDirectorySynced: directory => { order.push(path.basename(directory)) },
+        afterTransactionMarker: () => { order.push('DATABASE_DURABLE') },
+        afterCommitPublished: () => { order.push('COMMIT') },
+      } }).write(snapshot(), new AbortController().signal)
+      expect(order).toEqual(['new', 'nested', 'store', 'DATABASE_DURABLE', 'COMMIT'])
     } finally { await rm(parent, { recursive: true, force: true }) }
-  })
-
-  test('cancellation before the commit point exposes nothing', async () => {
-    const root = await mkdtemp(path.join(process.cwd(), '.passive-v2-cancel-'))
-    const controller = new AbortController()
-    try {
-      await expect(new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, safeStorageHooks: {
-        afterProjectSnapshotPublished: () => controller.abort(),
-      }}).write(snapshot(1_000), controller.signal)).rejects.toThrow('cancelled')
-      expect((await read(root)).providers[0].configured.value).toBe('unknown')
-    } finally { await rm(root, { recursive: true, force: true }) }
   })
 })

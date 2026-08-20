@@ -20,6 +20,7 @@ import {
   decodeOpenCodeRedactedSnapshotV1,
   catalogProjectionIdentity,
   type OpenCodeRedactedSnapshotProviderV1,
+  type OpenCodeRedactedSnapshotMutation,
   type OpenCodeRedactedSnapshotV1,
   type OpenCodeRedactedSnapshotWriterPort,
 } from './OpenCodeRedactedStatusSnapshot.js'
@@ -126,6 +127,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         ...providerIds,
       ])
       for (const providerId of knownProviderIds) {
+        const providerExisted = snapshot.providers.some(provider => provider.providerId === providerId)
         const provider = getOrCreateProvider(snapshot, providerId)
         const priorConfigured = provider.configured.value
         const priorConnected = provider.lastConnected.value.state
@@ -149,11 +151,13 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
             { state: 'not_connected' as const }, 'auth_metadata', now,
           )
         }
-        if (provider.configured.value !== priorConfigured
+        if (providerExisted && (provider.configured.value !== priorConfigured
           || provider.lastConnected.value.state !== priorConnected
-          || evidenceFingerprint !== priorFingerprint) {
+          || evidenceFingerprint !== priorFingerprint)) {
           provider.fingerprint = evidenceFingerprint
           invalidateCatalogEvidence(provider)
+        } else if (!providerExisted) {
+          provider.fingerprint = evidenceFingerprint
         }
         if (inventoryBinaryFingerprint && provider.catalogBinaryFingerprint
           && inventoryBinaryFingerprint !== provider.catalogBinaryFingerprint) {
@@ -169,7 +173,17 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
           replaceModelRefs(provider, [])
         }
       }
-    })
+    }, now => ({
+      ...(completeness.profileConfig.state === 'complete' && inventory.profile ? {
+        configured: observation('not_configured', 'config_metadata', now),
+      } : {}),
+      ...(completeness.providerInventory.state === 'complete' ? {
+        lastConnected: observation({ state: 'not_connected' as const }, 'auth_metadata', now),
+      } : {}),
+      ...(completeness.modelCatalog.state === 'complete' ? {
+        catalog: { available: observation('unavailable', 'catalog_snapshot', now) },
+      } : {}),
+    }))
   }
 
   async publishProviderUpdate(input: {
@@ -245,6 +259,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     projectPath: string,
     signal: AbortSignal,
     mutate: (snapshot: OpenCodeRedactedSnapshotV1, now: number) => void,
+    defaults?: (now: number) => OpenCodeRedactedSnapshotMutation['providerDefaults'],
   ): Promise<void> {
     // Persistence-unavailable is a typed transient result. Gate before path
     // canonicalization or compatibility reads so native Windows does zero I/O.
@@ -257,6 +272,22 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       if (signal.aborted) return
       const now = this.#now()
       if (!Number.isSafeInteger(now) || now < 0) return
+      if (this.#writer.update) {
+        await this.#writer.update(scope, now, snapshot => {
+          const evidenceTime = Math.max(now, snapshot.capturedAt)
+          ageExpiredObservations(snapshot, evidenceTime)
+          snapshot.capturedAt = evidenceTime
+          mutate(snapshot, evidenceTime)
+          snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
+        }, signal)
+        return
+      }
+      if (this.#writer.mutate) {
+        const delta = emptySnapshot(scope, now)
+        mutate(delta, now)
+        await this.#writer.mutate(toMutation(delta, defaults?.(now)), signal)
+        return
+      }
       const loaded = await this.#load(scope, signal)
       const snapshot = loaded ?? emptySnapshot(scope, now)
       const evidenceTime = Math.max(now, snapshot.capturedAt)
@@ -315,7 +346,9 @@ function isSuperseded(
   provider: OpenCodeRedactedSnapshotProviderV1,
   evidence: OpenCodeCatalogPublicationEvidence,
 ): boolean {
-  if ((provider.catalogFenceGeneration ?? 0) > evidence.requestGeneration) return true
+  // Mutation fences are inclusive: the fenced ordinal may already have been
+  // allocated and can finish after this publisher is restarted.
+  if ((provider.catalogFenceGeneration ?? 0) >= evidence.requestGeneration) return true
   if (provider.catalogRequestGeneration === undefined) return false
   if (evidence.requestGeneration !== provider.catalogRequestGeneration) {
     return evidence.requestGeneration < provider.catalogRequestGeneration
@@ -333,7 +366,7 @@ function invalidateCatalogEvidence(provider: OpenCodeRedactedSnapshotProviderV1)
   // late, including after the publisher is restarted from this snapshot.
   provider.catalogFenceGeneration = Math.min(
     Number.MAX_SAFE_INTEGER,
-    Math.max(provider.catalogFenceGeneration ?? 0, provider.catalogRequestGeneration ?? 0) + 1,
+    Math.max(provider.catalogFenceGeneration ?? 0, provider.catalogRequestGeneration ?? 0, 1),
   )
   delete provider.catalogIdentity
   delete provider.catalogAttemptIdentity
@@ -400,7 +433,29 @@ function ageExpiredObservations(snapshot: OpenCodeRedactedSnapshotV1, now: numbe
 function observation<T>(value: T, authority: any, now: number): any {
   return { value, authority, freshness: 'fresh', condition: 'normal', observedAt: now,
     validUntil: Math.min(Number.MAX_SAFE_INTEGER, now + ACTIVE_EVIDENCE_TTL_MS), issueCode: 'none',
-    evidenceGeneration: 0 }
+  }
+}
+
+function toMutation(
+  snapshot: OpenCodeRedactedSnapshotV1,
+  providerDefaults: OpenCodeRedactedSnapshotMutation['providerDefaults'],
+): OpenCodeRedactedSnapshotMutation {
+  return {
+    projectScope: snapshot.projectScope,
+    capturedAt: snapshot.capturedAt,
+    ...(snapshot.binary.authority === 'none' ? {} : { binary: snapshot.binary }),
+    ...(providerDefaults ? { providerDefaults } : {}),
+    providers: snapshot.providers.map(provider => ({
+      providerId: provider.providerId,
+      ...(provider.configured.authority === 'none' ? {} : { configured: provider.configured }),
+      ...(provider.lastConnected.authority === 'none' ? {} : { lastConnected: provider.lastConnected }),
+      ...(provider.catalogAvailable.authority === 'none' ? {} : { catalog: {
+        available: provider.catalogAvailable,
+        ...(provider.modelIds ? { modelIds: provider.modelIds } : {}),
+      } }),
+      ...(provider.executionVerified.authority === 'none' ? {} : { executionVerified: provider.executionVerified }),
+    })),
+  }
 }
 
 function catalogObservation<T>(value: T, observedAt: number, validUntil: number, stale: boolean): any {

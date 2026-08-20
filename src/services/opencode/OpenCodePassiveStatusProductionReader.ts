@@ -20,6 +20,10 @@ import {
 import { OpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import { getOpenCodePassiveSnapshotPersistenceCapability } from './OpenCodePassiveSnapshotPersistencePolicy.js'
 import {
+  openCodePassiveDatabaseExists,
+  readOpenCodePassiveSnapshot,
+} from './OpenCodePassiveSnapshotStore.js'
+import {
   decodeOpenCodePassiveSnapshotCommit,
   OPEN_CODE_PASSIVE_COMMIT_MAX_BYTES,
   OPEN_CODE_PASSIVE_COMMIT_NAME_PATTERN,
@@ -72,6 +76,7 @@ type ProductionReaderDeps = Readonly<{
 export class OpenCodePassiveStatusProductionReader {
   readonly reader: OpenCodePassiveStatusReader
   readonly #rootDirectory: string
+  readonly #platform: NodeJS.Platform
   readonly #now: () => number
   readonly #canonicalizePath: (projectPath: string, signal: AbortSignal) => Promise<string>
   readonly #readBoundedText: (filePath: string, signal: AbortSignal) => Promise<string | null>
@@ -83,14 +88,17 @@ export class OpenCodePassiveStatusProductionReader {
   readonly #lastSnapshots = new Map<`sha256:${string}`, LoadedSnapshot>()
 
   constructor(deps: ProductionReaderDeps = {}) {
+    this.#platform = deps.platform ?? process.platform
     const persistenceSupported = getOpenCodePassiveSnapshotPersistenceCapability(
-      deps.platform ?? process.platform,
+      this.#platform,
     ).supported
     this.#rootDirectory = persistenceSupported
       ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
       : ''
     this.#now = deps.now ?? Date.now
-    this.#canonicalizePath = deps.canonicalizePath ?? canonicalizeOpenCodePassiveProjectPath
+    this.#canonicalizePath = deps.canonicalizePath ?? (this.#platform === 'win32'
+      ? async () => { throw new Error('Passive transactional persistence is unsupported on native Windows') }
+      : canonicalizeOpenCodePassiveProjectPath)
     this.#readBoundedText = deps.readBoundedText ?? readBoundedSnapshotText
     this.#transactionalStorage = deps.readBoundedText === undefined
     this.#afterCommittedTransactionSelected = deps.afterCommittedTransactionSelected ?? (() => undefined)
@@ -101,7 +109,9 @@ export class OpenCodePassiveStatusProductionReader {
       handoff: OpenCodePassiveReadHandoff<string | null>,
     ) => {
       const cached = this.#lastSnapshots.get(projectScope)
-      if (cached) {
+      // Injected adapters have no transaction identity spanning their separate
+      // ports; retain their historical cache semantics for contract tests.
+      if (!this.#transactionalStorage && cached) {
         handoff(createOpenCodePassiveReadSuccess(cached.text, cached.value.capturedAt, Number.MAX_SAFE_INTEGER))
         return
       }
@@ -336,6 +346,14 @@ export class OpenCodePassiveStatusProductionReader {
   }
 
   async #readCommitted(scope: `sha256:${string}`, _binary: boolean, signal: AbortSignal): Promise<LoadedSnapshot | null> {
+    if (this.#platform === 'win32') throw new Error('Passive transactional persistence is unsupported on native Windows')
+    if (await openCodePassiveDatabaseExists(this.#rootDirectory)) {
+      const selected = await readOpenCodePassiveSnapshot(this.#rootDirectory, scope, signal, {
+        platform: this.#platform,
+        afterSelected: this.#afterCommittedTransactionSelected,
+      })
+      return selected && Object.freeze({ text: selected.text, value: selected.value })
+    }
     const state = await this.#storeState(signal)
     if (signal.aborted) throw cancelledError()
     if (state === 'legacy') return this.#readAndDecode(snapshotPath(this.#rootDirectory, scope), signal, scope)
@@ -561,6 +579,7 @@ function normalizeWindowsProjectPath(projectPath: string): string {
 }
 
 export async function readBoundedSnapshotText(filePath: string, signal: AbortSignal): Promise<string | null> {
+  if (process.platform === 'win32') throw new Error('Passive transactional persistence is unsupported on native Windows')
   const isBinary = path.basename(filePath) === 'binary.snapshot.json'
   const rootPath = isBinary ? path.dirname(filePath) : path.dirname(path.dirname(filePath))
   try { await lstat(rootPath) }
@@ -568,6 +587,11 @@ export async function readBoundedSnapshotText(filePath: string, signal: AbortSig
   let root: OpenCodeSafePublicationDirectory | null = null
   let snapshots: OpenCodeSafePublicationDirectory | null = null
   try {
+    if (await openCodePassiveDatabaseExists(rootPath)) {
+      if (isBinary) return null
+      const scope = `sha256:${path.basename(filePath, '.json')}` as const
+      return (await readOpenCodePassiveSnapshot(rootPath, scope, signal))?.text ?? null
+    }
     root = await OpenCodeSafePublicationDirectory.open(rootPath)
     if (signal.aborted) throw cancelledError()
     const names = await root.childNames()

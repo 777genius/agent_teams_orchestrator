@@ -84,6 +84,7 @@ import type {
   OpenCodePreparedProfile,
   OpenCodeCurrentScopedProfilePlan,
   OpenCodeScopedPreparedProfile,
+  OpenCodeScopedProfilePreparationInput,
   OpenCodeScopedProfilePlan,
   OpenCodePlanScopedProfileInput,
   OpenCodeScopedProfilePlanContract,
@@ -3791,13 +3792,19 @@ export class OpenCodeProfileManager {
    * created, and preparation writes only the selected provider's staged auth.
    */
   async prepareScopedProfile(
-    plan: OpenCodePlanScopedProfileInput,
+    plan: OpenCodeScopedProfilePreparationInput,
     expectedPlan: OpenCodeScopedProfilePlanContract,
   ): Promise<OpenCodeScopedPreparedProfile> {
     // These are caller-owned objects. Snapshot both synchronously before the
     // first await and deliberately shadow the parameters so no continuation
     // can observe caller mutation after preparation yields.
-    plan = cloneAndDeepFreezeScopedInput(plan)
+    const preparationSignal = plan.abortSignal
+    const assertPreparationActive = () => {
+      if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
+    }
+    assertPreparationActive()
+    const { abortSignal: _abortSignal, ...planWithoutSignal } = plan
+    plan = cloneAndDeepFreezeScopedInput(planWithoutSignal) as OpenCodePlanScopedProfileInput
     expectedPlan = cloneAndDeepFreezeScopedInput(expectedPlan)
     if (!plan || typeof plan !== 'object') {
       throw new Error('OpenCode scoped profile plan is required')
@@ -3808,7 +3815,7 @@ export class OpenCodeProfileManager {
     if (!expectedPlan) {
       throw new Error('OpenCode scoped preparation requires expectedPlan')
     }
-    const actualPlan = planScopedProfile(plan)
+    const actualPlan = planScopedProfile(plan as OpenCodePlanScopedProfileInput)
     if (
       canonicalSerializeOpenCodePolicyIdentity(actualPlan)
         !== canonicalSerializeOpenCodePolicyIdentity(expectedPlan)
@@ -3857,6 +3864,7 @@ export class OpenCodeProfileManager {
     const hostEnvironment = { ...process.env }
 
     const projectPath = await normalizeScopedProjectPath(plan.projectPath)
+    assertPreparationActive()
     const binaryPath = resolveOpenCodeBinaryPath()
     if (!binaryPath) throw new Error('OpenCode binary is required for scoped profile preparation')
     await Promise.all([
@@ -3865,6 +3873,7 @@ export class OpenCodeProfileManager {
       assertCanonicalOwnedPathComponents(path.join(this.paths.data, 'opencode'), this.paths.data),
       assertCanonicalOwnedPathComponents(path.join(this.paths.cache, 'opencode'), this.paths.cache),
     ])
+    assertPreparationActive()
     const earlyPreparationLockRoot = path.join(
       this.paths.data,
       'opencode',
@@ -3873,6 +3882,7 @@ export class OpenCodeProfileManager {
     await ensureOpenCodeManagedDirectoryPath(
       earlyPreparationLockRoot, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
     )
+    assertPreparationActive()
     const earlyPreparationLockPath = path.join(
       earlyPreparationLockRoot,
       `${canonicalFingerprint({ projectPath, purpose: plan.purpose, providerId, modelId })}.lock`,
@@ -3883,13 +3893,19 @@ export class OpenCodeProfileManager {
       await earlyLockDirectory.close()
       throw error
     })
-    const releaseEarlyPreparationLock = await lockfile.lock(
+    const earlyLockAcquisition = lockfile.lock(
       earlyLockDirectory.child(earlyLockName),
       OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+    )
+    const releaseEarlyPreparationLock = await raceOpenCodeAbortSignal(
+      earlyLockAcquisition,
+      preparationSignal,
     ).catch(async error => {
+      void earlyLockAcquisition.then(release => release()).catch(() => undefined)
       await earlyLockDirectory.close()
       throw error
     })
+    assertPreparationActive()
     let behaviorCapture: OpenCodeProjectBehaviorCapture | null = null
     try {
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
@@ -3902,6 +3918,7 @@ export class OpenCodeProfileManager {
       collectScopedPreservedPlugins(projectPath, hostEnvironment),
       collectBehaviorDirectoryEntries(path.join(userConfigRoot, 'opencode'), 'plugins'),
     ])
+    assertPreparationActive()
     const automaticUserPluginFingerprint = canonicalFingerprint(automaticUserPluginEntries)
     if (expectedPlan && (
       expectedPlan.canonicalProjectPathFingerprint !== canonicalFingerprint(projectPath)
@@ -3939,6 +3956,7 @@ export class OpenCodeProfileManager {
           nativeTargetExecutableFingerprint,
         )
       : null
+    assertPreparationActive()
     const nativeAccountEvidence = await fingerprintNativeAccountEvidence(
       providerId,
       nativeCredentialHostHomePath,
@@ -4211,6 +4229,7 @@ export class OpenCodeProfileManager {
     const preparationLockPath = path.join(profileRootPath, `prepare-${policy.identity.operationKey.split(':').at(-1)!}.lock`)
 
     return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
+      if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
       await ensureOpenCodeManagedDirectoryPath(
         homePath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
       )
@@ -4241,20 +4260,26 @@ export class OpenCodeProfileManager {
         await scopedLockDirectory.close()
         throw error
       })
-      const releaseScopedLock = await lockfile.lock(
+      const scopedLockAcquisition = lockfile.lock(
         scopedLockDirectory.child(scopedLockName),
         OPEN_CODE_PROFILE_SYMLINK_LOCK_OPTIONS,
+      )
+      const releaseScopedLock = await raceOpenCodeAbortSignal(
+        scopedLockAcquisition,
+        preparationSignal,
       ).catch(async error => {
+        void scopedLockAcquisition.then(release => release()).catch(() => undefined)
         await scopedLockDirectory.close()
         throw error
       })
       try {
+        assertPreparationActive()
         // No user/project bytes are published before the cross-process lock.
         // Contending preparers therefore cannot expose a half-owned snapshot.
         // Re-derive every immutable tree fingerprint, package closure,
         // resolved identity, digest, and host key at the publication boundary.
         // Only the authorized expected-plan snapshot may authorize these bytes.
-        const publicationPlan = planScopedProfile(plan)
+        const publicationPlan = planScopedProfile(plan as OpenCodePlanScopedProfileInput)
         if (
           canonicalSerializeOpenCodePolicyIdentity(publicationPlan)
             !== canonicalSerializeOpenCodePolicyIdentity(expectedPlan)
@@ -4265,6 +4290,7 @@ export class OpenCodeProfileManager {
             path.join(xdgConfigHome, 'opencode', 'plugins'),
             automaticUserPluginEntries,
           )
+          assertPreparationActive()
         }
         if (expectedPlan && 'evidence' in plan) {
           // Materialize only caller-captured regular bytes. No package manager,
@@ -4274,12 +4300,14 @@ export class OpenCodeProfileManager {
             pluginNodeModulesPath,
             plan.evidence.plugins,
           )
+          assertPreparationActive()
         }
         await publishImmutableProjectBehaviorSnapshot(
           behaviorCapture,
           projectBehaviorSnapshotPath,
           expectedEntryManifest.projectBehaviorEntryManifest,
         )
+        assertPreparationActive()
         const nativeTargetExecutablePath = nativeProofExecutablePath
           ? await publishImmutableNativeExecutable(
               nativeProofExecutablePath,
@@ -4287,6 +4315,7 @@ export class OpenCodeProfileManager {
               nativeTargetExecutableFingerprint,
             )
           : null
+        assertPreparationActive()
         let nativeCredentialBridge: OpenCodeScopedPreparedProfile['nativeCredentialBridge'] = null
         const nativeBridgeProviderId: 'kiro' | 'cursor-acp' | null = providerId === 'kiro'
           ? 'kiro'
@@ -4306,6 +4335,7 @@ export class OpenCodeProfileManager {
             process.platform,
             nativeBridgeProviderId,
           )
+          assertPreparationActive()
           const executablePath = nativeBridgeProviderId === 'kiro'
             ? bridge.kiroCliExecutablePath!
             : bridge.cursorAgentExecutablePath!
@@ -4320,7 +4350,7 @@ export class OpenCodeProfileManager {
           path.dirname(managedAuthPath),
           async directory => {
             await directory.writeFileAtomic(
-              path.basename(managedAuthPath), managedAuthContent, 0o600, plan.abortSignal,
+              path.basename(managedAuthPath), managedAuthContent, 0o600, preparationSignal,
             )
             const managedAuthHandle = await open(
               directory.child(path.basename(managedAuthPath)),
@@ -4338,6 +4368,7 @@ export class OpenCodeProfileManager {
             }
           },
         )
+        assertPreparationActive()
         const nativeCredentialBridgeFingerprint = await fingerprintOpenCodeNativeCredentialBridge(
           nativeCredentialBridge,
         )
@@ -4430,7 +4461,7 @@ export class OpenCodeProfileManager {
         await releaseScopedLock()
         await scopedLockDirectory.close()
       }
-    })
+    }, preparationSignal)
     } finally {
       await behaviorCapture?.close()
       await releaseEarlyPreparationLock()

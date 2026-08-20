@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
@@ -11,6 +12,7 @@ import {
   OpenCodePassiveStatusProductionReader,
 } from './OpenCodePassiveStatusProductionReader.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
+import { openCodePassiveDatabasePath } from './OpenCodePassiveSnapshotStore.js'
 import {
   encodeOpenCodeRedactedSnapshotV1,
   type OpenCodeRedactedSnapshotV1,
@@ -488,13 +490,11 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
     }
   })
 
-  test('production writer and reader use bounded no-follow regular-file storage', async () => {
+  test('production writer and reader use one bounded durable transaction row', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-store-'))
     try {
       const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
       await writer.write(snapshot(), new AbortController().signal)
-      const persisted = await readFile(path.join(root, 'snapshots', `${snapshot().projectScope.slice(7)}.json`), 'utf8')
-      expect(persisted).toBe(encoded(snapshot()))
       const reader = new OpenCodePassiveStatusProductionReader({
         rootDirectory: root,
         now: () => 1_000,
@@ -503,10 +503,9 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
       const status = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 1_000 })
       expect(status.providers[0].configured.value).toBe('configured')
 
-      const scoped = path.join(root, 'scopes', snapshot().projectScope.slice(7))
-      const commitName = (await readdir(path.join(scoped, 'commits')))[0]
-      const commit = JSON.parse(await readFile(path.join(scoped, 'commits', commitName), 'utf8')) as { generation: string }
-      await writeFile(path.join(scoped, 'generations', commit.generation, 'binary.snapshot.json'), 'x'.repeat(65_537))
+      const db = new Database(openCodePassiveDatabasePath(root))
+      try { db.exec("UPDATE passive_transactions SET payload = 'corrupt' WHERE id = (SELECT transaction_id FROM passive_current LIMIT 1)") }
+      finally { db.close(false) }
       const bounded = new OpenCodePassiveStatusProductionReader({
         rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/missing',
       })
@@ -515,31 +514,22 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('snapshot component and final-file symlinks never reach or mutate outside storage', async () => {
+  test('legacy component symlinks are never traversed by the SQLite store', async () => {
     if (process.platform === 'win32') return
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-symlink-'))
     const outside = await mkdtemp(path.join(process.cwd(), '.opencode-passive-outside-'))
     try {
       await symlink(outside, path.join(root, 'scopes'), 'dir')
       const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
-      await expect(writer.write(snapshot(), new AbortController().signal)).rejects.toThrow()
-      expect(await readdir(outside)).toEqual([])
-
-      await rm(path.join(root, 'scopes'), { force: true })
       await writer.write(snapshot(), new AbortController().signal)
-      const scoped = path.join(root, 'scopes', snapshot().projectScope.slice(7))
-      const commitName = (await readdir(path.join(scoped, 'commits')))[0]
-      const commit = JSON.parse(await readFile(path.join(scoped, 'commits', commitName), 'utf8')) as { generation: string }
-      const projectSnapshot = path.join(scoped, 'generations', commit.generation, 'project.snapshot.json')
+      expect(await readdir(outside)).toEqual([])
       const target = path.join(outside, 'outside.json')
       await writeFile(target, encoded(snapshot()))
-      await rm(projectSnapshot)
-      await symlink(target, projectSnapshot)
       const reader = new OpenCodePassiveStatusProductionReader({
         rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/a',
       })
       const status = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 100 })
-      expect(status.providers[0].configured.value).toBe('unknown')
+      expect(status.providers[0].configured.value).toBe('configured')
       expect(await readFile(target, 'utf8')).toBe(encoded(snapshot()))
     } finally {
       await rm(root, { recursive: true, force: true })

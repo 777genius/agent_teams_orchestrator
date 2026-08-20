@@ -15,7 +15,7 @@ export type OpenCodeProviderCatalogProductionProfileManager = {
   ): Promise<OpenCodeCurrentScopedProfilePlan>
   planScopedProfile(input: OpenCodeCurrentScopedProfilePlan): OpenCodeScopedProfilePlanContract
   prepareScopedProfile(
-    input: OpenCodeCurrentScopedProfilePlan,
+    input: OpenCodeCurrentScopedProfilePlan & { abortSignal?: AbortSignal },
     expectedPlan: OpenCodeScopedProfilePlanContract,
   ): Promise<OpenCodeScopedPreparedProfile>
 }
@@ -27,5 +27,5 @@ export async function prepareOpenCodeProviderCatalogProductionProfile(
 ): Promise<OpenCodeScopedPreparedProfile> {
   const current = await manager.captureCurrentScopedProfilePlan(input)
   const expectedPlan = manager.planScopedProfile(current)
-  return manager.prepareScopedProfile(current, expectedPlan)
+  return manager.prepareScopedProfile({ ...current, abortSignal: input.abortSignal }, expectedPlan)
 }
