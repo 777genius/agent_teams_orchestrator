@@ -372,6 +372,31 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       )
       expect(firstUseLaunch.purpose).toBe('launch')
       expect((await lstat(firstUseLaunch.xdgCacheHome)).isDirectory()).toBe(true)
+
+      const localAppData = path.join(tempDir, 'LocalAppData')
+      await mkdir(localAppData)
+      delete process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV]
+      delete process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV]
+      process.env.LOCALAPPDATA = localAppData
+      const nestedFirstUseManager = new OpenCodeProfileManager('win32')
+      const nestedCatalog = await prepareOpenCodeProviderCatalogProductionProfile(
+        nestedFirstUseManager,
+        { ...catalogInput, runtimeInstanceId: 'windows-nested-env-paths-catalog' },
+      )
+      expect(nestedCatalog.profileRootPath).toStartWith(path.join(
+        localAppData, 'claude-multimodel-nodejs', 'Data',
+      ))
+      const nestedLaunchAuthorization = await authorizeOpenCodeLaunchScopedProfile(
+        nestedFirstUseManager,
+        { purpose: 'launch', providerId: 'deepinfra', modelId: 'deepinfra/model',
+          runtimeInstanceId: 'windows-nested-env-paths-launch', projectPath: tempDir },
+      )
+      const nestedLaunch = await prepareAuthorizedOpenCodeLaunchScopedProfile(
+        nestedFirstUseManager, nestedLaunchAuthorization,
+      )
+      expect(nestedLaunch.xdgCacheHome).toStartWith(path.join(
+        localAppData, 'claude-multimodel-nodejs', 'Cache',
+      ))
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })
@@ -466,6 +491,112 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       expect(prepared.managedConfig.plugin).toEqual([
         'file:./node_modules/ordinary-user-choice',
       ])
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production planning resolves ordinary mutable specs only from verified local trees', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-mutable-plugins-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packagesRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    const urlSpec = 'https://plugins.example.invalid/releases/url-plugin.tgz'
+    const writeResolved = async (
+      directory: string, name: string, version: string, source?: string,
+    ): Promise<void> => {
+      await mkdir(directory, { recursive: true })
+      await writeFile(path.join(directory, 'package.json'), JSON.stringify({
+        name, version, ...(source ? { opencodeSpec: source } : {}),
+      }))
+      await writeFile(path.join(directory, 'index.js'), `export default ${JSON.stringify(name)}\n`)
+    }
+    try {
+      await mkdir(path.join(process.env.XDG_CONFIG_HOME!, 'opencode'), { recursive: true })
+      await writeFile(
+        path.join(process.env.XDG_CONFIG_HOME!, 'opencode', 'opencode.json'),
+        JSON.stringify({ plugin: ['user-plugin'] }),
+      )
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({
+        plugin: ['tag-plugin@latest', 'file:./resolved/file-plugin', urlSpec],
+      }))
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ plugin: ['environment-plugin@next'] })
+      await writeResolved(path.join(packagesRoot, 'installed-user'), 'user-plugin', '1.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-tag'), 'tag-plugin', '2.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-env'), 'environment-plugin', '3.0.0')
+      await writeResolved(path.join(packagesRoot, 'installed-url'), 'url-plugin', '4.0.0', urlSpec)
+      await writeResolved(path.join(tempDir, 'resolved', 'file-plugin'), 'file-plugin', '5.0.0')
+
+      const current = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'mutable-plugin-attempt', projectPath: tempDir,
+      })
+      expect(current.evidence.plugins.map(plugin =>
+        [plugin.spec, plugin.packageName, plugin.provenance])).toEqual([
+        ['user-plugin', 'user-plugin', 'user'],
+        ['tag-plugin@latest', 'tag-plugin', 'project'],
+        ['file:./resolved/file-plugin', 'file-plugin', 'project'],
+        [urlSpec, 'url-plugin', 'project'],
+        ['environment-plugin@next', 'environment-plugin', 'environment'],
+      ])
+      const firstExpected = fixture.manager.planScopedProfile(current)
+      await writeFile(path.join(packagesRoot, 'installed-tag', 'index.js'), 'export default "changed"\n')
+      const changedCurrent = await fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'mutable-plugin-changed-attempt', projectPath: tempDir,
+      })
+      const expected = fixture.manager.planScopedProfile(changedCurrent)
+      expect(expected.digest).not.toBe(firstExpected.digest)
+      const prepared = await fixture.manager.prepareScopedProfile(changedCurrent, expected)
+      expect(prepared.managedConfig.plugin).toEqual([
+        'file:./node_modules/user-plugin',
+        'file:./node_modules/tag-plugin',
+        'file:./node_modules/file-plugin',
+        'file:./node_modules/url-plugin',
+        'file:./node_modules/environment-plugin',
+      ])
+      for (const plugin of expected.plugins) {
+        expect(await readFile(
+          path.join(prepared.pluginNodeModulesPath, plugin.packageName, 'package.json'), 'utf8',
+        )).toContain(`"name":"${plugin.packageName}"`)
+      }
+    } finally {
+      fixture.restore()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('production mutable plugin capture rejects unresolved content and symlink escapes', async () => {
+    if (process.platform === 'win32') return
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-plugin-reject-'))
+    const fixture = await createScopedTestManager(tempDir)
+    const packagesRoot = path.join(
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME!,
+      'opencode', 'shared-cache', 'opencode', 'packages',
+    )
+    try {
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({ plugin: ['missing-plugin'] }))
+      await expect(fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'missing-plugin-attempt', projectPath: tempDir,
+      })).rejects.toThrow('immutable planning evidence is unavailable')
+
+      await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({ plugin: ['linked-plugin'] }))
+      const linkedRoot = path.join(packagesRoot, 'installed-linked')
+      const outside = path.join(tempDir, 'outside.js')
+      await mkdir(linkedRoot, { recursive: true })
+      await writeFile(path.join(linkedRoot, 'package.json'), JSON.stringify({
+        name: 'linked-plugin', version: '1.0.0',
+      }))
+      await writeFile(outside, 'external bytes\n')
+      await symlink(outside, path.join(linkedRoot, 'index.js'))
+      await expect(fixture.manager.captureCurrentScopedProfilePlan({
+        purpose: 'provider-catalog', providerId: 'deepinfra',
+        runtimeInstanceId: 'linked-plugin-attempt', projectPath: tempDir,
+      })).rejects.toThrow('immutable planning evidence is unavailable')
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })

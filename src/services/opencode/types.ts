@@ -68,6 +68,8 @@ export type OpenCodeScopedProfilePlanningEvidence = {
   automaticUserPluginFingerprint?: string
   plugins: readonly {
     spec: string
+    /** Name read from the locally resolved root manifest; never inferred from mutable spec syntax. */
+    packageName?: string
     provenance: 'user' | 'project' | 'environment' | 'app-managed'
     /** Exact immutable package/local tree bytes, including transitive dependencies. */
     dependencyTreeFingerprint: string
@@ -106,6 +108,7 @@ export type OpenCodeScopedProfilePlanContract = {
   automaticUserPluginFingerprint: string
   plugins: readonly {
     spec: string
+    packageName: string
     provenance: 'user' | 'project' | 'environment' | 'app-managed'
     dependencyTreeFingerprint: string
     packageIntegrity: string

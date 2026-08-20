@@ -547,6 +547,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
   ownershipBoundaryPath: string,
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
   platform: NodeJS.Platform = process.platform,
+  trustedRootPath?: string,
 ): Promise<void> {
   const resolved = path.resolve(targetPath)
   const ownershipBoundary = path.resolve(ownershipBoundaryPath)
@@ -561,7 +562,9 @@ export async function ensureOpenCodeManagedDirectoryPath(
   if (platform === 'win32') {
     // Standard Node APIs cannot safely
     // create through a potentially replaceable Windows reparse-point ancestry.
-    await ensureOpenCodeWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
+    await ensureOpenCodeWindowsManagedDirectoryPath(
+      resolved, ownershipBoundary, afterComponentOpened, {}, trustedRootPath,
+    )
     return
   }
 
@@ -3021,22 +3024,82 @@ async function collectScopedPreservedPlugins(
   ]
 }
 
-function exactScopedPluginPackage(spec: string): { name: string; version: string } {
-  const match = spec.match(/^(@[^/@]+\/[^/@]+|[^@/]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/)
-  if (!match) throw new Error('OpenCode scoped plugin requires an exact immutable package version')
-  return { name: match[1]!, version: match[2]! }
+function packageNameHintFromPluginSpec(spec: string): string | null {
+  const normalized = spec.trim().replace(/^npm:/, '')
+  if (/^(?:file:|https?:|git(?:\+|:)|github:|workspace:|link:|\.\.?[\\/]|[A-Za-z]:[\\/])/i.test(normalized)) {
+    return null
+  }
+  if (normalized.startsWith('@')) {
+    const slash = normalized.indexOf('/')
+    if (slash < 2) return null
+    const separator = normalized.indexOf('@', slash)
+    return separator < 0 ? normalized : normalized.slice(0, separator)
+  }
+  const separator = normalized.indexOf('@')
+  const name = separator < 0 ? normalized : normalized.slice(0, separator)
+  return /^[^/@]+$/.test(name) ? name : null
+}
+
+async function resolveInstalledScopedPluginRoot(
+  spec: string,
+  packagesRoot: string,
+  projectPath: string,
+): Promise<{ root: string; name: string; version: string }> {
+  const directLocal = spec.startsWith('file:')
+    ? path.resolve(projectPath, spec.slice('file:'.length))
+    : /^(?:\.\.?[\\/]|[A-Za-z]:[\\/])/.test(spec) ? path.resolve(projectPath, spec) : null
+  const roots: string[] = []
+  if (directLocal) roots.push(directLocal)
+  roots.push(path.join(packagesRoot, spec))
+  const top = await readdir(packagesRoot, { withFileTypes: true }).catch(() => [])
+  for (const entry of top) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+    const entryPath = path.join(packagesRoot, entry.name)
+    if (entry.name.startsWith('@')) {
+      const scoped = await readdir(entryPath, { withFileTypes: true }).catch(() => [])
+      roots.push(...scoped.filter(child => child.isDirectory() && !child.isSymbolicLink())
+        .map(child => path.join(entryPath, child.name)))
+    } else roots.push(entryPath)
+  }
+  const hint = packageNameHintFromPluginSpec(spec)
+  const matching: Array<{ root: string; name: string; version: string; exact: boolean }> = []
+  for (const root of Array.from(new Set(roots.map(candidate => path.resolve(candidate))))) {
+    try {
+      const rootMetadata = await lstat(root)
+      if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) continue
+      const manifestHandle = await open(
+        path.join(root, 'package.json'), fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+      )
+      const manifestBytes = await manifestHandle.readFile().finally(() => manifestHandle.close())
+      const manifest = JSON.parse(manifestBytes.toString('utf8')) as Record<string, unknown>
+      const name = typeof manifest.name === 'string' ? manifest.name.trim() : ''
+      const version = typeof manifest.version === 'string' ? manifest.version.trim() : ''
+      const declaredSources = [manifest._resolved, manifest._from, manifest.opencodeSpec]
+        .filter((value): value is string => typeof value === 'string')
+      const exact = root === path.resolve(directLocal ?? path.join(packagesRoot, spec))
+        || declaredSources.includes(spec)
+      if (name && version && (exact || name === hint)) matching.push({ root, name, version, exact })
+    } catch {
+      // An unreadable or malformed candidate is not resolved local content.
+    }
+  }
+  const preferred = matching.filter(candidate => candidate.exact)
+  const selected = preferred.length === 1 ? preferred[0] : matching.length === 1 ? matching[0] : null
+  if (!selected) throw new Error('OpenCode scoped plugin resolved local tree is unavailable or ambiguous [redacted]')
+  return selected
 }
 
 async function captureScopedPluginPlanningEvidence(
   plugins: readonly OpenCodePreservedPlugin[],
   packagesRoot: string,
+  projectPath: string,
 ): Promise<OpenCodePlanScopedProfileInput['evidence']['plugins']> {
   const captured = new Map<string, Omit<OpenCodePlanScopedProfileInput['evidence']['plugins'][number], 'provenance'>>()
   for (const plugin of plugins) {
     const prior = captured.get(plugin.spec)
     if (prior) continue
-    const exact = exactScopedPluginPackage(plugin.spec)
-    const sourceRoot = path.join(packagesRoot, plugin.spec)
+    const resolvedPackage = await resolveInstalledScopedPluginRoot(plugin.spec, packagesRoot, projectPath)
+    const sourceRoot = resolvedPackage.root
     const entries: OpenCodePlanScopedProfileInput['evidence']['plugins'][number]['immutableTreeEntries'] = []
     let entryCount = 0
     let byteCount = 0
@@ -3077,7 +3140,7 @@ async function captureScopedPluginPlanningEvidence(
             throw new Error('OpenCode scoped plugin cache exceeds the evidence limit [redacted]')
           }
           entries.push({
-            path: `${exact.name}/${childRelative}`,
+            path: `${resolvedPackage.name}/${childRelative}`,
             bytesBase64: bytes.toString('base64'),
             mode: (Number(retainedAfter.mode) & 0o111) === 0 ? 0o400 : 0o500,
           })
@@ -3093,14 +3156,14 @@ async function captureScopedPluginPlanningEvidence(
       }
     }
     await visit(sourceRoot, '')
-    const manifestEntry = entries.find(entry => entry.path === `${exact.name}/package.json`)
+    const manifestEntry = entries.find(entry => entry.path === `${resolvedPackage.name}/package.json`)
     if (!manifestEntry) throw new Error('OpenCode scoped plugin cache manifest is unavailable [redacted]')
     const manifestBytes = Buffer.from(manifestEntry.bytesBase64, 'base64')
     let manifest: Record<string, unknown>
     try { manifest = JSON.parse(manifestBytes.toString('utf8')) as Record<string, unknown> }
     catch { throw new Error('OpenCode scoped plugin cache manifest is invalid [redacted]') }
-    if (manifest.name !== exact.name || manifest.version !== exact.version) {
-      throw new Error('OpenCode scoped plugin cache does not match its exact spec [redacted]')
+    if (manifest.name !== resolvedPackage.name || manifest.version !== resolvedPackage.version) {
+      throw new Error('OpenCode scoped plugin local tree changed during capture [redacted]')
     }
     entries.sort((left, right) => left.path.localeCompare(right.path))
     const dependencyTreeFingerprint = canonicalFingerprint(entries.map(entry => ({
@@ -3111,14 +3174,15 @@ async function captureScopedPluginPlanningEvidence(
     const packageIntegrity = `sha512-${createHash('sha512')
       .update(dependencyTreeFingerprint).digest('base64')}`
     const lockBindingFingerprint = canonicalFingerprint({
-      packageName: exact.name,
-      version: exact.version,
+      packageName: resolvedPackage.name,
+      version: resolvedPackage.version,
       packageIntegrity,
       manifestFingerprint: hashBuffer(manifestBytes),
       dependencyTreeFingerprint,
     })
     captured.set(plugin.spec, {
       spec: plugin.spec,
+      packageName: resolvedPackage.name,
       dependencyTreeFingerprint,
       resolvedIdentity: `sha256:${lockBindingFingerprint}`,
       immutableTreeEntries: entries,
@@ -3382,9 +3446,11 @@ export async function revalidateOpenCodeScopedPreparedProfileInputs(
 export class OpenCodeProfileManager {
   private static readonly profilePreparationLocks = new Map<string, Promise<void>>()
 
-  private readonly paths = resolveClaudeMultimodelPaths()
+  private readonly paths
 
-  constructor(private readonly platform: NodeJS.Platform = process.platform) {}
+  constructor(private readonly platform: NodeJS.Platform = process.platform) {
+    this.paths = resolveClaudeMultimodelPaths(process.env, platform)
+  }
 
   /**
    * Captures the mutable production inputs which the pure policy deliberately
@@ -3432,14 +3498,22 @@ export class OpenCodeProfileManager {
         binary: binaryFingerprint, layout: canonicalFingerprint(null),
       },
     })
-    const planningPlugins = await captureScopedPluginPlanningEvidence(
+    const capturedPlanningPlugins = await captureScopedPluginPlanningEvidence(
       policyProbe.plugins,
       path.join(this.paths.cache, 'opencode', 'shared-cache', 'opencode', 'packages'),
+      projectPath,
     ).catch(error => {
       throw new Error('OpenCode configured plugin immutable planning evidence is unavailable [redacted]', {
         cause: error,
       })
     })
+    // A user-owned resolved tree keeps collision ownership even when its
+    // mutable spec syntax did not reveal the package name before capture.
+    const ordinaryPackageNames = new Set(capturedPlanningPlugins
+      .filter(plugin => plugin.provenance !== 'app-managed')
+      .map(plugin => plugin.packageName))
+    const planningPlugins = capturedPlanningPlugins.filter(plugin =>
+      plugin.provenance !== 'app-managed' || !ordinaryPackageNames.has(plugin.packageName))
 
     const globalAuthPath = this.getGlobalAuthPath()
     const sourceAuthPaths = Array.from(new Set([globalAuthPath, ...this.getSourceAuthPaths()]))
@@ -3582,10 +3656,8 @@ export class OpenCodeProfileManager {
     }
     const providers = asRecord(managedConfig.provider)
     managedConfig.provider = providers[providerId] ? { [providerId]: providers[providerId] } : {}
-    managedConfig.plugin = planningPlugins.map(plugin => {
-      const exact = exactScopedPluginPackage(plugin.spec)
-      return `file:./node_modules/${exact.name}`
-    })
+    managedConfig.plugin = planningPlugins.map(plugin =>
+      `file:./node_modules/${plugin.packageName}`)
     if (signal?.aborted) throwOpenCodeAbortReason(signal)
     return cloneAndDeepFreezeScopedInput({
       purpose: requestedSnapshot.purpose,
@@ -3799,7 +3871,7 @@ export class OpenCodeProfileManager {
       'scoped-preparation-locks',
     )
     await ensureOpenCodeManagedDirectoryPath(
-      earlyPreparationLockRoot, this.paths.data, undefined, this.platform,
+      earlyPreparationLockRoot, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
     )
     const earlyPreparationLockPath = path.join(
       earlyPreparationLockRoot,
@@ -3993,7 +4065,11 @@ export class OpenCodeProfileManager {
         await readSafeOpenCodeRuntimeConfigFile(configPath),
       )
     }
-    const policyPreservedPlugins = preservedPlugins
+    const policyPreservedPlugins = preservedPlugins.map(plugin => ({
+      ...plugin,
+      packageName: expectedPlan?.plugins.find(planned =>
+        planned.spec === plugin.spec && planned.provenance === plugin.provenance)?.packageName,
+    }))
     const providerEnvironmentFingerprint = canonicalFingerprint({
       inherited: fingerprintOpenCodeScopedInheritedEnvironment(hostEnvironment),
       nativeBridgeInputs: nativeBridgeInputFingerprint,
@@ -4135,16 +4211,22 @@ export class OpenCodeProfileManager {
     const preparationLockPath = path.join(profileRootPath, `prepare-${policy.identity.operationKey.split(':').at(-1)!}.lock`)
 
     return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
-      await ensureOpenCodeManagedDirectoryPath(homePath, this.paths.data, undefined, this.platform)
-      await ensureOpenCodeManagedDirectoryPath(tmpPath, this.paths.data, undefined, this.platform)
+      await ensureOpenCodeManagedDirectoryPath(
+        homePath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
+      )
+      await ensureOpenCodeManagedDirectoryPath(
+        tmpPath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot,
+      )
       await ensureOpenCodeManagedDirectoryPath(
         path.join(xdgConfigHome, 'opencode'), this.paths.data, undefined, this.platform,
+        this.paths.dataTrustedRoot,
       )
       await ensureOpenCodeManagedDirectoryPath(
         path.dirname(managedAuthPath), this.paths.data, undefined, this.platform,
+        this.paths.dataTrustedRoot,
       )
       await ensureOpenCodeManagedDirectoryPath(
-        xdgCacheHome, this.paths.cache, undefined, this.platform,
+        xdgCacheHome, this.paths.cache, undefined, this.platform, this.paths.cacheTrustedRoot,
       )
       await assertCanonicalOwnedPathComponents(pluginNodeModulesPath, this.paths.data)
       const projectBehaviorSnapshotPath = path.join(
