@@ -99,6 +99,14 @@ export class OpenCodeSafePublicationDirectory {
     return this.#root
   }
 
+  /** Stable identity captured by the opened directory, even when Windows uses its shared pathname. */
+  async stableIdentity(): Promise<Readonly<{ dev: bigint; ino: bigint }>> {
+    if (this.#windowsIdentity) return this.#windowsIdentity
+    const metadata = await this.#handle!.stat({ bigint: true }).catch(fail)
+    if (!metadata.isDirectory()) fail()
+    return { dev: metadata.dev, ino: metadata.ino }
+  }
+
   async openChildDirectory(name: string): Promise<OpenCodeSafePublicationDirectory> {
     await this.#assertWindowsRoot()
     const child = this.child(name)

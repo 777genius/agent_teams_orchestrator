@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink } from 'node:fs/promises'
 import path from 'node:path'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
@@ -61,26 +61,59 @@ describe('OpenCode passive snapshot writer lease', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
-  test('recovers an abandoned stale owner using a fake clock', async () => {
+  test('never displaces an aged owner, so it cannot resume over a newer publication', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-stale-'))
-    const leaseName = `${scope.slice(7)}.lease`
-    const leasePath = path.join(root, 'locks', leaseName)
     try {
-      await mkdir(path.join(root, 'locks'))
-      await writeFile(leasePath, '')
-      await mkdir(`${leasePath}.lock`)
-      const stale = new Date(1_000)
-      await utimes(`${leasePath}.lock`, stale, stale)
-      const writer = new OpenCodePassiveStatusSnapshotWriter({
-        rootDirectory: root,
-        leaseNow: () => 60_000,
-        leaseStaleMs: 1_000,
+      const signal = new AbortController().signal
+      const acquired = deferred()
+      const resume = deferred()
+      const writerA = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      const publicationA = writerA.withScopeLease(scope, signal, async () => {
+        acquired.resolve()
+        await resume.promise
+        await writerA.write(snapshot(2_000), signal)
       })
-      let recovered = false
-      await writer.withScopeLease(scope, new AbortController().signal, async () => { recovered = true })
-      expect(recovered).toBe(true)
-      expect(await readdir(path.join(root, 'locks'))).toEqual([leaseName])
+      await acquired.promise
+
+      let now = 60_000
+      let writerBEntered = false
+      const writerB = new OpenCodePassiveStatusSnapshotWriter({
+        rootDirectory: root,
+        leaseNow: () => now,
+        leaseWaitTimeoutMs: 10,
+        leaseWait: async () => { now = 60_010 },
+      })
+      await expect(writerB.withScopeLease(scope, signal, async () => {
+        writerBEntered = true
+        await writerB.write(snapshot(3_000), signal)
+      })).rejects.toMatchObject({ code: 'ELOCKED' })
+      expect(writerBEntered).toBe(false)
+
+      resume.resolve()
+      await publicationA
+      await writerB.withScopeLease(scope, signal, () => writerB.write(snapshot(3_000), signal))
+      expect(await readFile(path.join(root, 'snapshots', `${scope.slice(7)}.json`), 'utf8'))
+        .toBe(encoded(snapshot(3_000)))
+      expect(await readFile(path.join(root, 'binary.snapshot.json'), 'utf8'))
+        .toBe(encoded(snapshot(3_000)))
+      expect(await readdir(path.join(root, 'locks'))).toEqual([])
     } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('cleanup uses the acquired identity and cannot delete a replacement lease', async () => {
+    const parent = await mkdtemp(path.join(process.cwd(), '.opencode-passive-lease-cleanup-'))
+    const root = path.join(parent, 'owned')
+    const displaced = path.join(parent, 'displaced-lease')
+    const leasePath = path.join(root, 'locks', `${scope.slice(7)}.lease.lock`)
+    try {
+      await mkdir(root)
+      const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
+      await writer.withScopeLease(scope, new AbortController().signal, async () => {
+        await rename(leasePath, displaced)
+        await mkdir(leasePath)
+      })
+      expect(await readdir(path.join(root, 'locks'))).toEqual([`${scope.slice(7)}.lease.lock`])
+    } finally { await rm(parent, { recursive: true, force: true }) }
   })
 
   test('serializes the same scope and cancels or times out waiters without real sleeps', async () => {

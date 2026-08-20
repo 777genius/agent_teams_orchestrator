@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { lstat, mkdir, rmdir, stat, utimes } from 'node:fs/promises'
+import { lstat, mkdir, rmdir } from 'node:fs/promises'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { ensureOpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
@@ -26,7 +26,6 @@ type SnapshotWriterDeps = Readonly<{
     afterLeaseWait?: (leaseName: string) => void | Promise<void>
   }
   leaseWaitTimeoutMs?: number
-  leaseStaleMs?: number
   leaseNow?: () => number
   leaseWait?: (signal: AbortSignal, delayMs: number) => Promise<void>
 }>
@@ -39,7 +38,6 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
   readonly #legacyInjectedStorage: boolean
   readonly #safeStorageHooks: NonNullable<SnapshotWriterDeps['safeStorageHooks']>
   readonly #leaseWaitTimeoutMs: number
-  readonly #leaseStaleMs: number
   readonly #leaseNow: () => number
   readonly #leaseWait: (signal: AbortSignal, delayMs: number) => Promise<void>
 
@@ -47,7 +45,7 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
     if ((deps.makeDirectory === undefined) !== (deps.writeAtomic === undefined)) {
       throw new TypeError('Passive snapshot test storage requires both directory and atomic-write ports')
     }
-    for (const value of [deps.leaseWaitTimeoutMs, deps.leaseStaleMs]) {
+    for (const value of [deps.leaseWaitTimeoutMs]) {
       if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
         throw new TypeError('Passive snapshot lease bounds must be positive safe integers')
       }
@@ -58,7 +56,6 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
     this.#writeAtomic = deps.writeAtomic ?? ((filePath, data) => writeFileAtomic(filePath, data, { mode: 0o600 }))
     this.#safeStorageHooks = deps.safeStorageHooks ?? {}
     this.#leaseWaitTimeoutMs = deps.leaseWaitTimeoutMs ?? 2_000
-    this.#leaseStaleMs = deps.leaseStaleMs ?? 30_000
     this.#leaseNow = deps.leaseNow ?? Date.now
     this.#leaseWait = deps.leaseWait ?? waitForLease
   }
@@ -143,19 +140,8 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
           await mkdir(leasePath, { mode: 0o700 })
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-          const metadata = await lstat(leasePath).catch(() => null)
-          if (metadata && metadata.isDirectory() && !metadata.isSymbolicLink()
-            && metadata.mtimeMs < this.#leaseNow() - this.#leaseStaleMs) {
-            // Recheck the path identity immediately before recovery so a
-            // replaced lease is not removed on the basis of stale metadata.
-            const current = await lstat(leasePath).catch(() => null)
-            if (current && current.isDirectory() && !current.isSymbolicLink()
-              && current.dev === metadata.dev && current.ino === metadata.ino
-              && current.mtimeMs < this.#leaseNow() - this.#leaseStaleMs) {
-              const recovered = await rmdir(leasePath).then(() => true, () => false)
-              if (recovered) continue
-            }
-          }
+          // Lease directories are never displaced: timeout and cancellation
+          // bound a waiter without allowing two owners to overlap.
           if (this.#leaseNow() >= deadline) throw Object.assign(
             new Error(`Passive snapshot ${kind} lease is held by a live owner`), { code: 'ELOCKED' },
           )
@@ -169,24 +155,19 @@ export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnap
       let leaseDirectory
       try { leaseDirectory = await locks.openChildDirectory(lockName) }
       catch (error) { await rmdir(leasePath).catch(() => undefined); throw error }
-      const heartbeatIntervalMs = Math.max(1, Math.min(1_000, Math.floor(this.#leaseStaleMs / 3)))
-      const heartbeat = setInterval(() => {
-        const now = new Date(this.#leaseNow())
-        void utimes(leaseDirectory.descriptorPath(), now, now).catch(() => undefined)
-      }, heartbeatIntervalMs)
-      heartbeat.unref?.()
+      let acquiredIdentity: Readonly<{ dev: bigint; ino: bigint }> | null = null
       try {
+        acquiredIdentity = await leaseDirectory.stableIdentity()
         if (signal.aborted) throw new Error('Passive snapshot update cancelled')
         return await operation()
       } finally {
-        clearInterval(heartbeat)
-        const held = await stat(leaseDirectory.descriptorPath()).catch(() => null)
-        const current = await lstat(leasePath).catch(() => null)
+        const current = await lstat(leasePath, { bigint: true }).catch(() => null)
         await leaseDirectory.close()
-        // A stale-owner recovery may have replaced our pathname. Never remove
-        // a successor's lease while unwinding the older operation.
-        if (held && current && current.isDirectory() && !current.isSymbolicLink()
-          && held.dev === current.dev && held.ino === current.ino) {
+        // Compare against the identity captured at acquisition. On Windows a
+        // descriptor path is the shared pathname and may already name a
+        // successor by cleanup time.
+        if (acquiredIdentity && current && current.isDirectory() && !current.isSymbolicLink()
+          && acquiredIdentity.dev === current.dev && acquiredIdentity.ino === current.ino) {
           await rmdir(leasePath).catch(() => undefined)
         }
       }
