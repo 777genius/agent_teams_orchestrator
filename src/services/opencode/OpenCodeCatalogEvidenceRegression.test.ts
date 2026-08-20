@@ -93,11 +93,13 @@ describe('OpenCodeActiveStatusSnapshotPublisher catalog evidence', () => {
   test('pre-prepare durable attempt order fences a late old fingerprint across restart publishers', async () => {
     let generation = 0
     let prepareCalls = 0
+    let oldHostWaiting!: () => void
+    const oldHostReady = new Promise<void>(resolve => { oldHostWaiting = resolve })
     let releaseOld!: () => void
     const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
     const persisted = new Map<string, unknown>()
     const deps: OpenCodeProviderCatalogServiceDeps = {
-      now: () => 1_000, ttlMs: 10, maxStaleMs: 1_000, timeoutMs: 1_000,
+      now: () => 1_000, ttlMs: 10, maxStaleMs: 1_000, timeoutMs: 5_000,
       canonicalizeProjectPath: async () => '/canonical/project',
       allocateAttempt: () => {
         generation += 1
@@ -107,35 +109,49 @@ describe('OpenCodeActiveStatusSnapshotPublisher catalog evidence', () => {
       prepareProfile: async plan => {
         prepareCalls += 1
         const old = prepareCalls === 1
-        if (old) await oldGate
         return { scopeSchema: 'opencode-scoped-profile-v1', purpose: 'provider-catalog',
           providerId: plan.providerId, projectPath: '/canonical/project', profileRootPath: '/profile',
           binaryFingerprint: old ? 'binary-old' : 'binary-new',
           managedConfigFingerprint: old ? 'config-old' : 'config-new', selectedAuthBaselineFingerprint: 'auth',
           policy: { inventory: 'selected-provider-only', inventoryFallback: 'forbidden', launchAuthorization: 'forbidden' } }
       },
-      ensureHost: async ({ preparedProfile }) => ({ hostKey: preparedProfile.binaryFingerprint,
-        baseUrl: preparedProfile.binaryFingerprint === 'binary-old' ? 'http://127.0.0.1:48001' : 'http://127.0.0.1:48002' }),
+      ensureHost: async ({ preparedProfile }) => {
+        if (preparedProfile.binaryFingerprint === 'binary-old') {
+          oldHostWaiting()
+          await oldGate
+        }
+        return { hostKey: preparedProfile.binaryFingerprint,
+          baseUrl: preparedProfile.binaryFingerprint === 'binary-old' ? 'http://127.0.0.1:48001' : 'http://127.0.0.1:48002' }
+      },
       releaseHost: async () => {},
-      fetchProviderCatalog: async ({ baseUrl }) => ({ all: [{ id: 'deepinfra', name: 'DeepInfra',
-        models: { [baseUrl.endsWith('48001') ? 'old' : 'new']: { name: 'model' } } }], connected: ['deepinfra'] }),
+      fetchProviderCatalog: async ({ baseUrl }) => {
+        return { all: [{ id: 'deepinfra', name: 'DeepInfra',
+          models: { [baseUrl.endsWith('48001') ? 'old' : 'new']: { name: 'model' } } }], connected: ['deepinfra'] }
+      },
       readPersisted: async (key: string) => persisted.get(key) ?? null,
       writePersisted: async (key: string, value: unknown) => { persisted.set(key, value) },
       deletePersisted: async (key: string) => { persisted.delete(key) },
     }
     const oldPromise = new OpenCodeProviderCatalogService(deps).loadCatalog({ providerId: 'deepinfra', projectPath: '/project' })
-    await Promise.resolve()
-    const newer = await new OpenCodeProviderCatalogService(deps).loadCatalog({ providerId: 'deepinfra', projectPath: '/project' })
+    const oldOutcome = oldPromise.then(
+      () => 'resolved',
+      error => error instanceof Error && 'outcome' in error ? error.outcome : 'unknown',
+    )
+    await oldHostReady
+    const newerPromise = new OpenCodeProviderCatalogService(deps).loadCatalog({ providerId: 'deepinfra', projectPath: '/project' })
+    const newer = await newerPromise
     releaseOld()
-    const older = await oldPromise
-    expect([older.catalogEvidence.requestGeneration, newer.catalogEvidence.requestGeneration]).toEqual([1, 2])
+    expect(await oldOutcome).toBe('superseded')
+    expect(newer.catalogEvidence.requestGeneration).toBe(2)
 
     const clock = { now: 1_005 }; const seed = { text: null as string | null }
     await harness(clock, seed).publisher.publishCatalogResult({ projectPath: '/project', evidence: newer.catalogEvidence,
       observedAt: newer.catalogObservedAt, expiresAt: newer.catalogExpiresAt, provenance: newer.catalogProvenance,
       catalogAvailable: true, modelIds: ['deepinfra/new'] })
-    await harness(clock, seed).publisher.publishCatalogResult({ projectPath: '/project', evidence: older.catalogEvidence,
-      observedAt: older.catalogObservedAt, expiresAt: older.catalogExpiresAt, provenance: older.catalogProvenance,
+    const lateOldEvidence = { ...newer.catalogEvidence, requestGeneration: 1,
+      attemptIdentity: digest('1') }
+    await harness(clock, seed).publisher.publishCatalogResult({ projectPath: '/project', evidence: lateOldEvidence,
+      observedAt: newer.catalogObservedAt, expiresAt: newer.catalogExpiresAt, provenance: newer.catalogProvenance,
       catalogAvailable: true, modelIds: ['deepinfra/old'] })
     expect((await harness(clock, seed).read(['deepinfra'])).providers[0].knownModelIds).toEqual(['deepinfra/new'])
   })

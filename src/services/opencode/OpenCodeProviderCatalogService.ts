@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync,
+  readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { link, open, readFile, readdir, unlink } from 'node:fs/promises'
 import os from 'node:os'
@@ -10,7 +10,6 @@ import { fileURLToPath } from 'node:url'
 import { types as nodeUtilTypes } from 'node:util'
 import { Database } from 'bun:sqlite'
 
-import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from './OpenCodeLiveProviderNormalizer.js'
 import {
   createOpenCodeCatalogRecordId,
@@ -40,6 +39,9 @@ const FIXED_FAILURE = 'OpenCode provider catalog is temporarily unavailable.'
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const customPersistenceCommitQueues = new WeakMap<Function, Map<string, Promise<boolean>>>()
 const defaultPersistenceCommitQueues = new Map<string, Promise<boolean>>()
+type AdmissionHead = Readonly<{ generation: number; scopeHash: string; cacheKey?: string }>
+const customAdmissionHeads = new WeakMap<Function, AdmissionHead>()
+const defaultAdmissionHeads = new Map<string, AdmissionHead>()
 const ATTEMPT_SCHEMA_VERSION = 44305
 const ATTEMPT_ROW_CAPACITY = 64
 const ATTEMPT_TABLE_SQL = `CREATE TABLE allocation_ticket (
@@ -56,6 +58,7 @@ let durableAttemptDatabase: {
   database: Database
   rootReceipt: ManagedRootReceipt
   rootDescriptor: number | null
+  databaseDescriptor: number
   schemaVersion: number
 } | null = null
 
@@ -104,6 +107,9 @@ export type OpenCodeProviderCatalogServiceDeps = {
     projectPath?: string | null
     abortSignal?: AbortSignal
   }) => Promise<OpenCodeScopedPreparedProfile>
+  /** Transaction hooks paired with prepareProfile; deterministic fakes may inject cleanup stalls. */
+  finalizePreparedProfile?: (profile: OpenCodeScopedPreparedProfile) => Promise<void>
+  rollbackPreparedProfile?: (profile: OpenCodeScopedPreparedProfile) => Promise<void>
   ensureHost?: (input: {
     preparedProfile: OpenCodeScopedPreparedProfile
     resolveConfigFingerprint: false
@@ -129,6 +135,10 @@ export type OpenCodeProviderCatalogServiceDeps = {
   beforeFinalPublication?: () => void | Promise<void>
   /** Deterministic fake-only barrier after commit bytes are written, before sync/rename. */
   beforeVisibilitySync?: () => void | Promise<void>
+  /** Deterministic fake-only stage-directory sync fault boundary. */
+  beforeStageDirectorySync?: () => void | Promise<void>
+  /** Deterministic fake-only post-rename fault boundary. */
+  afterCommitVisibility?: () => void | Promise<void>
   /** Deterministic fake-only barrier after retention authority removal and sync. */
   afterRetentionAuthorityRemoval?: () => void | Promise<void>
   allocateAttempt?: (scope: string, startedAt: number) => Readonly<{
@@ -174,6 +184,7 @@ type Flight = {
   settled: boolean
   waiters: Set<symbol>
   promise: Promise<OpenCodeProviderCatalogLoadResult>
+  visibleCommit: boolean
 }
 
 export class OpenCodeProviderCatalogUnavailableError extends Error {
@@ -436,7 +447,11 @@ function assertManagedRootReceiptSync(receipt: ManagedRootReceipt): void {
 function openManagedRootDescriptor(receipt: ManagedRootReceipt): { fd: number | null; path: string } {
   assertManagedRootReceiptSync(receipt)
   if (process.platform !== 'linux' && process.platform !== 'darwin') {
-    return { fd: null, path: receipt.path }
+    // A raw pathname is not a held authority and cannot close a junction or
+    // reparse-point swap. Windows allocation uses the registry authority;
+    // filesystem-backed publication fails closed until it has an equivalent
+    // handle-relative implementation.
+    throw fixedCatalogFailure()
   }
   const fd = openSync(receipt.path,
     fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0))
@@ -618,6 +633,75 @@ function cleanupAttemptGenerationMarkers(rootReceipt: ManagedRootReceipt, genera
   }
 }
 
+function latestDurableAdmission(): AdmissionHead | null {
+  const root = captureManagedRootSync(path.join(
+    catalogCacheHome(), 'opencode', 'provider-catalog-attempts-v2',
+  ))
+  const database = openAttemptDatabase(root)
+  validateAttemptDatabase(database)
+  const latest = database.query<{ id: number; scope_hash: string }, []>(
+    'SELECT id, scope_hash FROM allocation_ticket ORDER BY id DESC LIMIT 1',
+  ).get()
+  if (!latest || !Number.isSafeInteger(latest.id) || latest.id < 1
+    || !/^[0-9a-f]{64}$/.test(latest.scope_hash)) return null
+  let cacheKey: string | undefined
+  try {
+    const encoded = readFileSync(path.join(root.path, `.allocation-admitted-${latest.id}`), 'utf8')
+    const [scopeHash, boundKey, ...extra] = encoded.split(':')
+    if (scopeHash !== latest.scope_hash || extra.length > 0
+      || !/^[0-9a-f]{64}$/.test(boundKey ?? '')) throw fixedCatalogFailure()
+    cacheKey = boundKey
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  return { generation: latest.id, scopeHash: latest.scope_hash, ...(cacheKey ? { cacheKey } : {}) }
+}
+
+function bindDurableAdmission(generation: number, scopeHash: string, cacheKey: string): void {
+  const receipt = captureManagedRootSync(path.join(
+    catalogCacheHome(), 'opencode', 'provider-catalog-attempts-v2',
+  ))
+  const descriptor = openManagedRootDescriptor(receipt)
+  const markerName = `.allocation-admitted-${generation}`
+  const markerPath = path.join(descriptor.path, markerName)
+  const temporary = path.join(descriptor.path,
+    `.${markerName}.bind.${process.pid}.${randomUUID()}`)
+  let handle: number | null = null
+  try {
+    const database = openAttemptDatabase(receipt)
+    validateAttemptDatabase(database)
+    const owned = database.query<{ scope_hash: string }, [number]>(
+      'SELECT scope_hash FROM allocation_ticket WHERE id = ?1',
+    ).get(generation)
+    if (owned?.scope_hash !== scopeHash) return
+    try {
+      const current = readFileSync(markerPath, 'utf8')
+      if (current !== scopeHash && current !== `${scopeHash}:${cacheKey}`) throw fixedCatalogFailure()
+      if (current === `${scopeHash}:${cacheKey}`) return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    handle = openSync(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+      | (fsConstants.O_NOFOLLOW ?? 0), 0o600)
+    writeFileSync(handle, `${scopeHash}:${cacheKey}`)
+    fsyncSync(handle)
+    closeSync(handle)
+    handle = null
+    // The generation-specific name is attempt-owned. A newer admission uses
+    // another name and can never be replaced by this exact-key binding.
+    renameSync(temporary, markerPath)
+    fsyncSync(descriptor.fd!)
+  } catch (error) {
+    try { unlinkSync(temporary) } catch {}
+    // A later generation may already have reclaimed this marker. Its absence
+    // is authoritative and must not be recreated by the older attempt.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  } finally {
+    if (handle !== null) closeSync(handle)
+    if (descriptor.fd !== null) closeSync(descriptor.fd)
+  }
+}
+
 function validateAttemptDatabase(database: Database): number {
   const version = database.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version
   const objects = database.query<{ type: string; name: string; tbl_name: string; sql: string | null }, []>(`
@@ -707,28 +791,54 @@ function openAttemptDatabase(rootReceipt: ManagedRootReceipt): Database {
   const databasePath = path.join(rootReceipt.path, 'attempts.sqlite')
   if (durableAttemptDatabase?.filePath === databasePath) {
     assertManagedRootReceiptSync(durableAttemptDatabase.rootReceipt)
+    const held = fstatSync(durableAttemptDatabase.databaseDescriptor, { bigint: true })
+    const named = lstatSync(databasePath, { bigint: true })
+    if (!held.isFile() || !named.isFile() || named.isSymbolicLink()
+      || held.dev !== named.dev || held.ino !== named.ino) throw fixedCatalogFailure()
+    assertAttemptDatabaseChildren(rootReceipt)
     return durableAttemptDatabase.database
   }
   durableAttemptDatabase?.database.close()
+  if (durableAttemptDatabase) closeSync(durableAttemptDatabase.databaseDescriptor)
   if (durableAttemptDatabase?.rootDescriptor !== null
     && durableAttemptDatabase?.rootDescriptor !== undefined) closeSync(durableAttemptDatabase.rootDescriptor)
   durableAttemptDatabase = null
   assertManagedRootReceiptSync(rootReceipt)
   assertAttemptDatabaseChildren(rootReceipt)
   const descriptor = openManagedRootDescriptor(rootReceipt)
-  const database = new Database(path.join(descriptor.path, 'attempts.sqlite'), { create: true, strict: true })
+  let databaseDescriptor: number | null = null
+  let database: Database | null = null
   try {
+    databaseDescriptor = openSync(path.join(descriptor.path, 'attempts.sqlite'),
+      fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0), 0o600)
+    const heldBefore = fstatSync(databaseDescriptor, { bigint: true })
+    if (!heldBefore.isFile() || (typeof process.getuid === 'function'
+      && heldBefore.uid !== BigInt(process.getuid()))) throw fixedCatalogFailure()
+    // SQLite opens the exact already-held inode. Its VFS canonicalizes this
+    // descriptor reference for WAL/journal siblings beneath the held root.
+    database = new Database(
+      `${process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'}/${databaseDescriptor}`,
+      { create: false, strict: true },
+    )
+    const namedAfterOpen = lstatSync(databasePath, { bigint: true })
+    if (!namedAfterOpen.isFile() || namedAfterOpen.isSymbolicLink()
+      || namedAfterOpen.dev !== heldBefore.dev || namedAfterOpen.ino !== heldBefore.ino) {
+      throw fixedCatalogFailure()
+    }
+    assertAttemptDatabaseChildren(rootReceipt)
     database.exec('PRAGMA busy_timeout = 0')
     database.exec('PRAGMA journal_mode = WAL')
     database.exec('PRAGMA synchronous = NORMAL')
     assertAttemptDatabaseChildren(rootReceipt)
     const schemaVersion = validateAttemptDatabase(database)
     durableAttemptDatabase = {
-      filePath: databasePath, database, rootReceipt, rootDescriptor: descriptor.fd, schemaVersion,
+      filePath: databasePath, database, rootReceipt, rootDescriptor: descriptor.fd,
+      databaseDescriptor, schemaVersion,
     }
     return database
   } catch (error) {
-    database.close()
+    database?.close()
+    if (databaseDescriptor !== null) closeSync(databaseDescriptor)
     if (descriptor.fd !== null) closeSync(descriptor.fd)
     throw error
   }
@@ -865,6 +975,7 @@ type AllocationWorkerProcess = Readonly<{
   exited: Promise<number>
   kill(signal?: number | NodeJS.Signals): void
   unref(): void
+  executableFds?: readonly number[]
 }>
 
 let allocationWorker: AllocationWorkerProcess | null = null
@@ -989,14 +1100,36 @@ function getAllocationWorker(): AllocationWorkerProcess {
       : './OpenCodeProviderCatalogAllocationWorker.js',
     import.meta.url,
   ))
-  const workerCommand = sourceRuntime
-    ? [process.execPath, workerPath]
-    : [path.join(path.dirname(process.execPath),
-      `opencode-catalog-allocation-worker${process.platform === 'win32' ? '.exe' : ''}`)]
+  const executableFds: number[] = []
+  let workerCommand: string[]
+  if (sourceRuntime) {
+    workerCommand = [process.execPath, workerPath]
+  } else {
+    if (process.platform !== 'linux' && process.platform !== 'darwin') throw fixedCatalogFailure()
+    const packagedWorker = path.join(path.dirname(process.execPath), 'opencode-catalog-allocation-worker')
+    const workerFd = openSync(packagedWorker,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    try {
+      const held = fstatSync(workerFd, { bigint: true })
+      const named = lstatSync(packagedWorker, { bigint: true })
+      if (!held.isFile() || !named.isFile() || named.isSymbolicLink()
+        || held.dev !== named.dev || held.ino !== named.ino
+        || (typeof process.getuid === 'function' && held.uid !== BigInt(process.getuid()))) {
+        throw fixedCatalogFailure()
+      }
+      executableFds.push(workerFd)
+      workerCommand = [`${process.platform === 'linux'
+        ? `/proc/${process.pid}/fd` : '/dev/fd'}/${workerFd}`]
+    } catch (error) {
+      closeSync(workerFd)
+      throw error
+    }
+  }
   const worker = Bun.spawn({
     cmd: workerCommand,
     stdin: 'pipe', stdout: 'pipe', stderr: 'ignore',
   }) as unknown as AllocationWorkerProcess
+  ;(worker as { executableFds?: number[] }).executableFds = executableFds
   worker.unref()
   allocationWorker = worker
   void (async () => {
@@ -1021,6 +1154,9 @@ function getAllocationWorker(): AllocationWorkerProcess {
     } catch {}
   })()
   void worker.exited.then(() => {
+    for (const fd of worker.executableFds ?? []) {
+      try { closeSync(fd) } catch {}
+    }
     if (allocationWorker === worker) terminateAllocationWorker()
   })
   return worker
@@ -1051,6 +1187,14 @@ export function allocateOpenCodeProviderCatalogAttempt(
 }>> {
   if (!boundedString(scope) || !Number.isSafeInteger(startedAt) || startedAt < 0
     || controls.abortSignal?.aborted) return Promise.reject(fixedCatalogFailure())
+  if (process.platform === 'win32') {
+    if (controls.cacheHome !== undefined || controls.testGate || controls.testStallPhase) {
+      return Promise.reject(fixedCatalogFailure())
+    }
+    return allocateWindowsCatalogAttempt(
+      scope, startedAt, controls.deadline ?? performance.now() + DEFAULT_TIMEOUT_MS,
+    )
+  }
   let cacheHome: string
   try {
     cacheHome = controls.cacheHome === undefined
@@ -1189,15 +1333,38 @@ async function defaultReadStage(cacheKey: string, attemptId: string): Promise<un
   return readJsonFile(await stagedFilePath(cacheKey, attemptId))
 }
 
-async function defaultStagePersisted(cacheKey: string, attemptId: string, value: unknown): Promise<void> {
+async function defaultStagePersisted(
+  cacheKey: string,
+  attemptId: string,
+  value: unknown,
+  beforeDirectorySync?: () => void | Promise<void>,
+): Promise<void> {
   const encoded = JSON.stringify(value)
   if (new TextEncoder().encode(encoded).byteLength > MAX_PERSISTED_BYTES) throw fixedCatalogFailure()
   const root = captureManagedRootSync(await cacheRootPath())
   const descriptor = openManagedRootDescriptor(root)
+  const target = path.join(descriptor.path, `${hash(cacheKey)}.${attemptId}.stage.json`)
+  const temporary = `${target}.tmp-${process.pid}-${randomUUID()}`
+  let staged: Awaited<ReturnType<typeof open>> | null = null
   try {
-    await writeJsonFileAtomic(
-      path.join(descriptor.path, `${hash(cacheKey)}.${attemptId}.stage.json`), value, { mode: 0o600 },
-    )
+    staged = await open(temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+      0o600)
+    await staged.writeFile(encoded)
+    await staged.sync()
+    await staged.close()
+    staged = null
+    renameSync(temporary, target)
+    // The stage inode and the directory entry that names it are durable before
+    // a commit pointer can be constructed. A restart therefore cannot retain
+    // a pointer whose stage existed only in the page cache.
+    await beforeDirectorySync?.()
+    if (descriptor.fd === null) throw fixedCatalogFailure()
+    fsyncSync(descriptor.fd)
+  } catch (error) {
+    await staged?.close().catch(() => undefined)
+    try { unlinkSync(temporary) } catch {}
+    throw error
   } finally {
     if (descriptor.fd !== null) closeSync(descriptor.fd)
   }
@@ -1212,6 +1379,8 @@ async function defaultPublishPointer(
   deadline = Number.POSITIVE_INFINITY,
   beforeVisibility?: () => void | Promise<void>,
   afterRetentionAuthorityRemoval?: () => void | Promise<void>,
+  afterCommitVisibility?: () => void | Promise<void>,
+  onVisibleCommit?: () => void,
 ): Promise<boolean> {
   const encoded = JSON.stringify(value)
   if (new TextEncoder().encode(encoded).byteLength > MAX_PERSISTED_BYTES) throw fixedCatalogFailure()
@@ -1312,7 +1481,58 @@ async function defaultPublishPointer(
         continue
       } catch (lockError) {
         if ((lockError as NodeJS.ErrnoException).code === 'ENOENT') continue
-        throw fixedCatalogFailure()
+        // The owner file is complete and synchronized before it is linked as
+        // the lock. Empty, corrupt, non-regular, or otherwise unverifiable
+        // lock bytes cannot be a valid owner and must not wedge publication.
+        // Quarantine by atomic rename, then restore a valid live object if a
+        // race moved one; a replacement at the lock name always wins.
+        const quarantine = path.join(root,
+          `.publication.recovery.${process.pid}.${randomUUID()}.json`)
+        try {
+          renameSync(lockPath, quarantine)
+        } catch (recoveryError) {
+          if ((recoveryError as NodeJS.ErrnoException).code === 'ENOENT') continue
+          await new Promise<void>(resolve => setTimeout(resolve, 1))
+          continue
+        }
+        let restoreLive = false
+        try {
+          const quarantined = lstatSync(quarantine)
+          if (quarantined.isFile() && !quarantined.isSymbolicLink()) {
+            const bytes = await readFile(quarantine, 'utf8')
+            const candidate = JSON.parse(bytes) as { pid?: unknown; processIdentity?: unknown }
+            if (Number.isSafeInteger(candidate.pid) && (candidate.pid as number) > 0
+              && typeof candidate.processIdentity === 'string') {
+              let alive = true
+              try { process.kill(candidate.pid as number, 0) }
+              catch (killError) {
+                if ((killError as NodeJS.ErrnoException).code === 'ESRCH') alive = false
+                else alive = true
+              }
+              const liveIdentity = await processIdentity(candidate.pid as number)
+              restoreLive = alive && (liveIdentity === null
+                || liveIdentity === candidate.processIdentity)
+            }
+          }
+        } catch { restoreLive = false }
+        if (restoreLive) {
+          try { await link(quarantine, lockPath) }
+          catch (restoreError) {
+            if ((restoreError as NodeJS.ErrnoException).code !== 'EEXIST') {
+              // Keep retrying under the absolute deadline. The quarantined
+              // live inode remains recoverable and never authorizes deletion
+              // of an unrelated replacement.
+              await new Promise<void>(resolve => setTimeout(resolve, 1))
+            }
+          }
+        }
+        try {
+          const quarantined = lstatSync(quarantine)
+          if (quarantined.isDirectory() && !quarantined.isSymbolicLink()) rmdirSync(quarantine)
+          else unlinkSync(quarantine)
+        } catch {}
+        if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+        continue
       }
     }
   }
@@ -1343,6 +1563,13 @@ async function defaultPublishPointer(
   if (existingForKey && (compareCommittedPointers(existingForKey.pointer, pointer) > 0
     || (existingForKey.pointer.requestGeneration === pointer.requestGeneration
       && existingForKey.pointer.attemptIdentity !== pointer.attemptIdentity))) {
+    throw fixedCatalogFailure()
+  }
+  const globallyNewest = decoded
+    .sort((left, right) => compareCommittedPointers(right.pointer, left.pointer))[0]
+  if (globallyNewest && compareCommittedPointers(globallyNewest.pointer, pointer) > 0) {
+    // Global admission order is a publication fence, not an eviction hint.
+    // Capacity can never turn an older different-key request into success.
     throw fixedCatalogFailure()
   }
   const unlinkRequired = async (filePath: string): Promise<void> => {
@@ -1393,7 +1620,14 @@ async function defaultPublishPointer(
     try { unlinkSync(temporary) } catch { /* descriptor-owned temporary may already be absent */ }
     throw error
   }
-  if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+  onVisibleCommit?.()
+  // The rename is the observable commit point. From here onward every error
+  // is cleanup/durability reporting only and cannot turn a visible success
+  // into a rejected request with an observable commit.
+  try { await afterCommitVisibility?.() } catch { /* injected post-commit error */ }
+  if (descriptor.fd !== null) {
+    try { fsyncSync(descriptor.fd) } catch { /* visible commit remains authoritative */ }
+  }
   // Only after the successor is durable and visible may capacity reclaim old
   // winners. Recompute from the authority while holding the same lock.
   for (const entry of evicted) {
@@ -1413,7 +1647,9 @@ async function defaultPublishPointer(
       break
     }
   }
-  if (descriptor.fd !== null) fsyncSync(descriptor.fd)
+  if (descriptor.fd !== null) {
+    try { fsyncSync(descriptor.fd) } catch { /* post-commit cleanup is best effort */ }
+  }
   return true
   } finally {
     if (ownsLock) {
@@ -1735,6 +1971,46 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
 
   constructor(private readonly deps: OpenCodeProviderCatalogServiceDeps = {}) {}
 
+  private admit(requestGeneration: number, scopeHash: string): void {
+    const admission = Object.freeze({ generation: requestGeneration, scopeHash })
+    if (this.deps.allocateAttempt) {
+      const current = customAdmissionHeads.get(this.deps.allocateAttempt)
+      if (!current || current.generation < requestGeneration) {
+        customAdmissionHeads.set(this.deps.allocateAttempt, admission)
+      }
+    } else {
+      const authority = catalogCacheHome()
+      const current = defaultAdmissionHeads.get(authority)
+      if (!current || current.generation < requestGeneration) defaultAdmissionHeads.set(authority, admission)
+    }
+  }
+
+  private bindAdmission(requestGeneration: number, scopeHash: string, key: string): void {
+    if (this.deps.allocateAttempt) {
+      const current = customAdmissionHeads.get(this.deps.allocateAttempt)
+      if (current?.generation === requestGeneration && current.scopeHash === scopeHash) {
+        customAdmissionHeads.set(this.deps.allocateAttempt,
+          Object.freeze({ ...current, cacheKey: key }))
+      }
+      return
+    }
+    bindDurableAdmission(requestGeneration, scopeHash, key)
+    const authority = catalogCacheHome()
+    const current = defaultAdmissionHeads.get(authority)
+    if (current?.generation === requestGeneration && current.scopeHash === scopeHash) {
+      defaultAdmissionHeads.set(authority, Object.freeze({ ...current, cacheKey: key }))
+    }
+  }
+
+  private newestAdmission(): AdmissionHead | null {
+    if (this.deps.allocateAttempt) return customAdmissionHeads.get(this.deps.allocateAttempt) ?? null
+    const authority = catalogCacheHome()
+    let durable: AdmissionHead | null = null
+    try { durable = latestDurableAdmission() } catch { throw fixedCatalogFailure() }
+    const memory = defaultAdmissionHeads.get(authority) ?? null
+    return (memory?.generation ?? 0) >= (durable?.generation ?? 0) ? memory : durable
+  }
+
   private sampleClock(previous?: number): number {
     let value: unknown
     try { value = this.deps.now?.() ?? Date.now() } catch { throw fixedCatalogFailure() }
@@ -1779,7 +2055,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
   private stage(key: string, attemptId: string, envelope: unknown): Promise<void> {
     return this.deps.writePersisted
       ? this.deps.writePersisted(stageStorageKey(key, attemptId), envelope)
-      : defaultStagePersisted(key, attemptId, envelope)
+      : defaultStagePersisted(key, attemptId, envelope, this.deps.beforeStageDirectorySync)
   }
 
   private publish(
@@ -1790,12 +2066,15 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     deadline?: number,
     beforeVisibility?: () => void | Promise<void>,
     afterRetentionAuthorityRemoval?: () => void | Promise<void>,
+    afterCommitVisibility?: () => void | Promise<void>,
+    onVisibleCommit?: () => void,
   ): Promise<boolean> {
     return this.deps.writePersisted
       ? this.deps.writePersisted(pointerStorageKey(key), pointer).then(() => true)
       : defaultPublishPointer(
           key, pointer, maxEntries, abortSignal, deadline, beforeVisibility,
-          afterRetentionAuthorityRemoval,
+          afterRetentionAuthorityRemoval, afterCommitVisibility,
+          onVisibleCommit,
         )
   }
 
@@ -1885,6 +2164,9 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       ?? Promise.resolve()
     const commit = previous.catch(() => undefined).then(async () => {
       if (!this.hasCommitAuthority(params)) return false
+      const admitted = this.newestAdmission()
+      if (admitted && params.catalogEvidence.requestGeneration < admitted.generation
+        && admitted.cacheKey !== params.key) return false
       const envelope = persistedEnvelope(params.identity, {
         catalog: params.catalog,
         catalogEvidence: params.catalogEvidence,
@@ -1918,6 +2200,13 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // persistence adapter was completing. It must never enter memory; the
       // newer per-key queued commit, if any, is necessarily written after it.
       if (!this.hasCommitAuthority(params)) {
+        this.discardStage(params.key, attemptId)
+        return false
+      }
+      const admittedAfterStage = this.newestAdmission()
+      if (admittedAfterStage
+        && params.catalogEvidence.requestGeneration < admittedAfterStage.generation
+        && admittedAfterStage.cacheKey !== params.key) {
         this.discardStage(params.key, attemptId)
         return false
       }
@@ -1955,6 +2244,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
             params.key, candidatePointer, params.maxEntries, params.signal, params.flight.deadline,
             this.deps.beforeVisibilitySync,
             this.deps.afterRetentionAuthorityRemoval,
+            this.deps.afterCommitVisibility,
+            () => { params.flight.visibleCommit = true },
           )
           if (!retained) {
             this.discardStage(params.key, attemptId)
@@ -2266,6 +2557,9 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null
     let externalAbort: (() => void) | null = null
     let ownedFlight: Flight | null = null
+    let rawPreparedProfile: OpenCodeScopedPreparedProfile | null = null
+    let profileAuthFinalized = false
+    let attemptController: AbortController | null = null
     try {
       const selectedOptions = options(this.deps)
       const input = snapshotInput(unsafeInput)
@@ -2274,7 +2568,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // allocation, profile preparation, cache hydration, or native/provider
       // work. A small cleanup reserve aborts owned work before the public
       // timeout boundary; no retry or fallback creates another budget.
-      const attemptController = new AbortController()
+      attemptController = new AbortController()
       const reserveMs = Math.min(250, Math.floor(selectedOptions.timeoutMs / 10))
       const workBudgetMs = Math.max(0, selectedOptions.timeoutMs - reserveMs)
       const monotonicDeadline = performance.now() + workBudgetMs
@@ -2282,6 +2576,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       const clearTimer = this.deps.clearTimer ?? clearTimeout
       const deadline = new Promise<never>((_resolve, reject) => {
         deadlineTimer = setTimer(() => {
+          if (ownedFlight?.visibleCommit) return
           // Publication remains revocable at its attempt-owned visibility
           // edge; the one-shot deadline is authoritative through retention.
           if (ownedFlight) ownedFlight.abortKind = 'timeout'
@@ -2322,6 +2617,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (attemptController.signal.aborted) throw fixedCatalogFailure()
       if (!Number.isSafeInteger(allocation.requestGeneration) || allocation.requestGeneration < 1
         || !/^sha256:[0-9a-f]{64}$/.test(allocation.attemptIdentity)) throw fixedCatalogFailure()
+      this.admit(allocation.requestGeneration, hash(requestScope))
       const prepareProfile = this.deps.prepareProfile ?? (async plan => {
         const manager = this.deps.profileManager ?? (await import('./OpenCodeProfileManager.js'))
           .openCodeProfileManager as unknown as OpenCodeProviderCatalogProductionProfileManager
@@ -2337,10 +2633,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         projectPath: canonicalProjectPath,
         abortSignal: attemptController.signal,
       }))
+      rawPreparedProfile = rawProfile
       if (attemptController.signal.aborted) throw fixedCatalogFailure()
       const afterProfile = this.sampleClock(startedAt)
       const profile = snapshotProfile(rawProfile, providerId, canonicalProjectPath)
       const key = cacheKeyFor(profile.identity)
+      this.bindAdmission(allocation.requestGeneration, hash(requestScope), key)
       let flight = this.inFlight.get(key)
       if (flight?.controller.signal.aborted) {
         if (this.inFlight.get(key) === flight) this.inFlight.delete(key)
@@ -2357,6 +2655,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           settled: false,
           waiters: new Set<symbol>(),
           promise: Promise.resolve(null as unknown as OpenCodeProviderCatalogLoadResult),
+          visibleCommit: false,
         }
         created.promise = this.runExactLoad({
           key,
@@ -2411,6 +2710,13 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         ])
         if (input.abortSignal?.aborted) throw fixedCatalogFailure()
         this.sampleClock(afterProfile)
+        const finalizeProfile = this.deps.finalizePreparedProfile ?? (async prepared => {
+          if (this.deps.prepareProfile) return
+          const publication = await import('./OpenCodeScopedProfileAuthPublication.js')
+          await publication.finalizeOpenCodeScopedProfileAuth(prepared)
+        })
+        await finalizeProfile(rawProfile)
+        profileAuthFinalized = true
         return result
       } finally {
         rejectLocalCancellation = null
@@ -2418,6 +2724,26 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         activeFlight.waiters.delete(waiter)
       }
     } catch (error) {
+      if (!this.deps.prepareProfile && attemptController) {
+        const publication = await import('./OpenCodeScopedProfileAuthPublication.js')
+        await publication.rollbackOpenCodeScopedProfileAuthSignal(attemptController.signal)
+          .catch(() => undefined)
+      }
+      if (!profileAuthFinalized && rawPreparedProfile) {
+        // Rejecting the enclosing catalog attempt owns rollback. Abort first so
+        // no later host/publication phase can regain authority while cleanup
+        // is stalled; then await ownership-safe auth restoration before the
+        // public rejection becomes observable.
+        if (ownedFlight && ownedFlight.waiters.size === 0) {
+          ownedFlight.controller.abort(fixedCatalogFailure())
+        }
+        const rollbackProfile = this.deps.rollbackPreparedProfile ?? (async prepared => {
+          if (this.deps.prepareProfile) return
+          const publication = await import('./OpenCodeScopedProfileAuthPublication.js')
+          await publication.rollbackOpenCodeScopedProfileAuth(prepared)
+        })
+        await rollbackProfile(rawPreparedProfile).catch(() => undefined)
+      }
       if (error instanceof OpenCodeProviderCatalogUnavailableError) throw error
       throw fixedCatalogFailure()
     } finally {

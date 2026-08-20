@@ -3,6 +3,11 @@ import { constants as fsConstants, fsyncSync, renameSync, unlinkSync } from 'nod
 import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 
+export type OpenCodeSafePublicationTransaction = Readonly<{
+  commit(): Promise<void>
+  rollback(): Promise<void>
+}>
+
 function fail(): never {
   throw new Error('OpenCode safe publication primitive is unavailable [redacted]')
 }
@@ -304,6 +309,7 @@ export class OpenCodeSafePublicationDirectory {
     testHooks?: {
       afterRenameBeforeVerification?: () => void | Promise<void>
       afterRollbackOwnershipCaptured?: () => void | Promise<void>
+      retainTransaction?: (transaction: OpenCodeSafePublicationTransaction) => void
     },
   ): Promise<void> {
     await this.#assertWindowsRoot()
@@ -373,22 +379,73 @@ export class OpenCodeSafePublicationDirectory {
             : new Error('OpenCode safe publication cancelled')
         }
       }
-      if (priorLinked) unlinkSync(backupPath)
+      if (testHooks?.retainTransaction) {
+        let settled = false
+        const finish = async (rollback: boolean): Promise<void> => {
+          if (settled) return
+          settled = true
+          try {
+            if (rollback && temporaryIdentity) {
+              // Capture and prove the currently named object before changing
+              // its visibility. A successor or any verification failure is a
+              // no-op with respect to the current auth path.
+              try {
+                await link(this.child(finalName), quarantinePath)
+                const captured = await lstat(quarantinePath)
+                if (captured.isFile() && !captured.isSymbolicLink()
+                  && captured.dev === temporaryIdentity.dev && captured.ino === temporaryIdentity.ino) {
+                  const current = await lstat(this.child(finalName))
+                  if (current.isFile() && !current.isSymbolicLink()
+                    && current.dev === temporaryIdentity.dev && current.ino === temporaryIdentity.ino) {
+                    await unlink(this.child(finalName))
+                    if (priorLinked) {
+                      try { await link(backupPath, this.child(finalName)) }
+                      catch (restoreError) {
+                        if ((restoreError as NodeJS.ErrnoException).code !== 'EEXIST') fail()
+                      }
+                    }
+                  }
+                }
+              } catch (rollbackError) {
+                if ((rollbackError as NodeJS.ErrnoException).code !== 'ENOENT') throw rollbackError
+              }
+            }
+          } finally {
+            await unlink(quarantinePath).catch(() => undefined)
+            await unlink(backupPath).catch(() => undefined)
+            await this.#handle?.sync().catch(fail)
+          }
+        }
+        testHooks.retainTransaction(Object.freeze({
+          commit: () => finish(false),
+          rollback: () => finish(true),
+        }))
+      } else if (priorLinked) unlinkSync(backupPath)
     } catch (error) {
       if (handle) await handle.close().catch(() => undefined)
       await unlink(temporaryPath).catch(() => undefined)
       if (published && temporaryIdentity) {
-        // Atomically capture the currently visible inode, then restore with a
-        // no-replace link so a successor always wins the namespace race.
+        // Establish ownership without first renaming or removing the current
+        // auth path. A hard link captures the object named at that instant;
+        // lstat/link failures leave the visible name completely untouched.
         try {
-          await rename(this.child(finalName), quarantinePath)
+          await link(this.child(finalName), quarantinePath)
           const quarantined = await lstat(quarantinePath)
           const owned = quarantined.isFile() && !quarantined.isSymbolicLink()
             && quarantined.dev === temporaryIdentity.dev && quarantined.ino === temporaryIdentity.ino
-          if (owned) await testHooks?.afterRollbackOwnershipCaptured?.()
-          const restore = owned ? (priorLinked ? backupPath : null) : quarantinePath
-          if (restore) {
-            try { await link(restore, this.child(finalName)) }
+          if (owned) {
+            await testHooks?.afterRollbackOwnershipCaptured?.()
+            // Recheck the pathname after the deterministic/concurrent boundary.
+            // A successor that won remains continuously visible and is never
+            // moved merely so rollback can discover who owned it.
+            const current = await lstat(this.child(finalName))
+            if (current.isFile() && !current.isSymbolicLink()
+              && current.dev === temporaryIdentity.dev && current.ino === temporaryIdentity.ino) {
+              await unlink(this.child(finalName))
+            }
+          }
+          if (owned && priorLinked) {
+            try { await link(backupPath, this.child(finalName)) }
             catch (restoreError) {
               if ((restoreError as NodeJS.ErrnoException).code !== 'EEXIST') fail()
             }

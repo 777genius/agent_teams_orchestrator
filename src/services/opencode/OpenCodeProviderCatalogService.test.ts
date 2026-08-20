@@ -323,6 +323,73 @@ describe.serial('OpenCodeProviderCatalogService', () => {
       .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     expect(restored.catalog.models.map(model => model.id)).toEqual(['winner'])
   })
+
+  test('a different-key candidate older than the newest admitted request never stages or succeeds', async () => {
+    let generation = 0
+    let fetches = 0
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    const allocateAttempt = () => ({ requestGeneration: ++generation,
+      attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` as const })
+    const persistence = memoryPersistence()
+    const common: OpenCodeProviderCatalogServiceDeps = {
+      ...persistence, allocateAttempt, timeoutMs: 5_000, maxEntries: 64,
+      fetchProviderCatalog: async () => {
+        fetches += 1
+        if (fetches === 1) { await oldGate; return response('deepinfra', 'older') }
+        return new Promise<never>(() => {})
+      },
+    }
+    const older = fixture(common).service.loadCatalog({ providerId: 'deepinfra', projectPath: '/older-key' })
+    while (fetches < 1) await Promise.resolve()
+    const cancelNewer = new AbortController()
+    const newer = fixture(common).service.loadCatalog({
+      providerId: 'deepinfra', projectPath: '/newer-key', abortSignal: cancelNewer.signal,
+    })
+    while (generation < 2 || fetches < 2) await Promise.resolve()
+    releaseOld()
+    await expect(older).rejects.toMatchObject({ outcome: 'superseded' })
+    expect([...persistence.values.keys()].some(key => key.includes('.stage.'))).toBe(false)
+    cancelNewer.abort()
+    await expect(newer).rejects.toThrow('temporarily unavailable')
+  })
+
+  test('global admission distinguishes exact auth-rotated keys within one project scope', async () => {
+    let generation = 0
+    let selectedAuth = 'auth-a'
+    let fetches = 0
+    let releaseOlder!: () => void
+    const olderGate = new Promise<void>(resolve => { releaseOlder = resolve })
+    const allocateAttempt = () => ({ requestGeneration: ++generation,
+      attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` as const })
+    const persistence = memoryPersistence()
+    const common: OpenCodeProviderCatalogServiceDeps = {
+      ...persistence,
+      allocateAttempt,
+      timeoutMs: 5_000,
+      prepareProfile: async plan => profile({
+        providerId: plan.providerId, projectPath: plan.projectPath ?? '/same', auth: selectedAuth,
+      }),
+      fetchProviderCatalog: async () => {
+        fetches += 1
+        if (fetches === 1) { await olderGate; return response('deepinfra', 'auth-a-model') }
+        return new Promise<never>(() => {})
+      },
+    }
+    const older = fixture(common).service.loadCatalog({ providerId: 'deepinfra', projectPath: '/same' })
+    while (fetches < 1) await Promise.resolve()
+    selectedAuth = 'auth-b'
+    const cancelNewer = new AbortController()
+    const newer = fixture(common).service.loadCatalog({
+      providerId: 'deepinfra', projectPath: '/same', abortSignal: cancelNewer.signal,
+    })
+    while (generation < 2 || fetches < 2) await Promise.resolve()
+    releaseOlder()
+    await expect(older).rejects.toMatchObject({ outcome: 'superseded' })
+    expect([...persistence.values.keys()].some(key => key.includes('.stage.'))).toBe(false)
+    cancelNewer.abort()
+    await expect(newer).rejects.toThrow('temporarily unavailable')
+  })
   test('accepts production epoch time and rejects nonfinite or out-of-Date-range clocks', async () => {
     const production = fixture({ now: undefined, timeoutMs: 1_000 })
     const result = await production.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
@@ -752,12 +819,11 @@ describe.serial('OpenCodeProviderCatalogService', () => {
 
       const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
       expect((await readdir(catalogRoot)).filter(file => file.endsWith('.commit.json'))).toHaveLength(1)
-      const parallel = await Promise.all([
-        launch(3, 'three', '/three', 3).result,
-        launch(4, 'four', '/four', 3).result,
-        launch(5, 'five', '/five', 3).result,
-      ])
-      expect(parallel.every(result => result.outcome === 'success')).toBe(true)
+      const ordered = []
+      for (const [generation, model, project] of [
+        [3, 'three', '/three'], [4, 'four', '/four'], [5, 'five', '/five'],
+      ] as const) ordered.push(await launch(generation, model, project, 3).result)
+      expect(ordered.every(result => result.outcome === 'success')).toBe(true)
       const files = await readdir(catalogRoot)
       const commitFiles = files.filter(file => file.endsWith('.commit.json'))
       expect(commitFiles).toHaveLength(3)
@@ -796,14 +862,14 @@ describe.serial('OpenCodeProviderCatalogService', () => {
       expect(await launch(9, 'newer-b', '/key-d', 2).result)
         .toEqual({ outcome: 'success', model: 'newer-b' })
       await writeFile(`${capacityTwoGate}.release`, '')
-      expect(await capacityTwoOld.result).toEqual({ outcome: 'success', model: 'retained-a' })
+      expect(await capacityTwoOld.result).toEqual({ outcome: 'rejected', type: 'superseded' })
       const finalPointers = await Promise.all((await readdir(catalogRoot))
         .filter(file => file.endsWith('.commit.json'))
         .map(async file => JSON.parse(await readFile(path.join(catalogRoot, file), 'utf8')) as {
           requestGeneration: number
         }))
       expect(finalPointers.map(pointer => pointer.requestGeneration).sort((a, b) => a - b))
-        .toEqual([8, 9])
+        .toEqual([7, 9])
 
       expect(await launch(10, 'retention-seed', '/retention-seed', 1).result)
         .toEqual({ outcome: 'success', model: 'retention-seed' })
@@ -876,6 +942,31 @@ describe.serial('OpenCodeProviderCatalogService', () => {
       if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
       else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
       await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('empty, corrupt and invalid publication locks are recovered without wedging later attempts', async () => {
+    for (const artifact of ['empty', 'corrupt', 'directory'] as const) {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-corrupt-lock-'))
+      const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+      try {
+        const catalogRoot = path.join(root, 'opencode', 'provider-catalog-v2')
+        await mkdir(catalogRoot, { recursive: true })
+        const lockPath = path.join(catalogRoot, '.publication.lock')
+        if (artifact === 'directory') await mkdir(lockPath)
+        else await writeFile(lockPath, artifact === 'empty' ? '' : '{not-json')
+        const result = await fixture({
+          readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+          timeoutMs: 5_000,
+        }).service.loadCatalog({ providerId: 'deepinfra', projectPath: '/corrupt-lock' })
+        expect(result.catalogProvenance).toBe('fresh-live')
+        expect(await stat(path.join(catalogRoot, '.publication.lock')).catch(() => null)).toBeNull()
+      } finally {
+        if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+        else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+        await rm(root, { recursive: true, force: true })
+      }
     }
   })
 
@@ -1308,6 +1399,74 @@ describe.serial('OpenCodeProviderCatalogService', () => {
     expect(writes).toHaveLength(1)
     expect(writes[0]).toContain('.stage.')
     expect(writes.some(key => key.endsWith('.current'))).toBe(false)
+  })
+
+  test('a stage-directory sync failure cannot expose a commit pointer', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-stage-sync-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      const f = fixture({
+        readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+        beforeStageDirectorySync: () => { throw new Error('injected stage directory sync failure') },
+      })
+      await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/stage-sync' }))
+        .rejects.toThrow('temporarily unavailable')
+      const files = await readdir(path.join(root, 'opencode', 'provider-catalog-v2'))
+      expect(files.some(file => file.endsWith('.commit.json'))).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('a post-visibility sync or cleanup error cannot reject an observable commit', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-visible-success-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      const result = await fixture({
+        readPersisted: undefined, writePersisted: undefined, deletePersisted: undefined,
+        afterCommitVisibility: () => { throw new Error('injected post-visibility failure') },
+      }).service.loadCatalog({ providerId: 'deepinfra', projectPath: '/visible-success' })
+      expect(result.catalogProvenance).toBe('fresh-live')
+      const files = await readdir(path.join(root, 'opencode', 'provider-catalog-v2'))
+      expect(files.filter(file => file.endsWith('.commit.json'))).toHaveLength(1)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('catalog rejection waits for auth rollback and never exposes staged authorization', async () => {
+    let authVisible = false
+    let releaseRollback!: () => void
+    let enteredRollback!: () => void
+    const rollbackEntered = new Promise<void>(resolve => { enteredRollback = resolve })
+    const rollbackGate = new Promise<void>(resolve => { releaseRollback = resolve })
+    const f = fixture({
+      prepareProfile: async plan => {
+        authVisible = true
+        return profile({ providerId: plan.providerId, projectPath: plan.projectPath ?? '/p' })
+      },
+      rollbackPreparedProfile: async () => {
+        enteredRollback()
+        await rollbackGate
+        authVisible = false
+      },
+      fetchProviderCatalog: async () => { throw new Error('deterministic catalog rejection') },
+    })
+    let settled = false
+    const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/auth-rollback' })
+      .finally(() => { settled = true })
+    await rollbackEntered
+    expect(authVisible).toBe(true)
+    expect(settled).toBe(false)
+    releaseRollback()
+    await expect(pending).rejects.toThrow('temporarily unavailable')
+    expect(authVisible).toBe(false)
   })
 
   test('a publish is rejected when its durable stage disappears before verification', async () => {
