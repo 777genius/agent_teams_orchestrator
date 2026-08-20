@@ -1423,6 +1423,10 @@ export class OpenCodeProfileManager {
       ...managedRuntimePreferences.modelLimitOverrides,
     }
     const importedRuntimeConfig = await readSafeOpenCodeRuntimeConfigImport(process.env)
+    const importedConfigDefaultModelId =
+      typeof importedRuntimeConfig.model === 'string'
+        ? importedRuntimeConfig.model.trim() || null
+        : null
     const appMcpConfig =
       options.includeAppMcp === false
         ? null
@@ -1593,6 +1597,7 @@ export class OpenCodeProfileManager {
       profileRootPath,
       projectDefaultModelId: managedRuntimePreferences.defaultModelId,
       allProjectsDefaultModelId: globalRuntimePreferences.defaultModelId,
+      importedConfigDefaultModelId,
       effectiveManagedDefaultModelId,
       effectiveManagedDefaultSource,
       projectBehaviorFingerprint,
