@@ -24,7 +24,7 @@ import {
   type OpenCodeRedactedSnapshotV1,
 } from './OpenCodeRedactedStatusSnapshot.js'
 
-export type OpenCodePassiveReadFailure = Readonly<{ ok: false; kind: 'timeout' | 'cancelled' | 'transient' | 'invalid' }>
+export type OpenCodePassiveReadFailure = Readonly<{ ok: false; kind: 'timeout' | 'cancelled' | 'transient' | 'invalid' | 'unsupported' }>
 export type OpenCodePassiveReadSuccess<T> = Readonly<{ ok: true; value: T; observedAt: number; validUntil: number }>
 export type OpenCodePassiveReadResult<T> = OpenCodePassiveReadSuccess<T> | OpenCodePassiveReadFailure
 export type OpenCodePassiveReadHandoff<T> = (result: OpenCodePassiveReadResult<T>) => void
@@ -91,6 +91,7 @@ export type OpenCodePassiveStatusReadRequest = {
   timeoutMs: number
   signal?: AbortSignal
 }
+export const OPEN_CODE_PASSIVE_STATUS_MAX_READER_DEADLINE_MS = 60_000
 
 type ProviderReadKind = 'configured' | 'lastConnected' | 'catalogAvailable' | 'executionVerified'
 type Completion =
@@ -126,7 +127,10 @@ export class OpenCodePassiveStatusReader {
     const projectPath = request.projectPath
     const requestedProviderIds = request.providerIds
     const requestSignal = request.signal
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError('Passive status timeout must be a positive safe integer')
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0
+      || timeoutMs > OPEN_CODE_PASSIVE_STATUS_MAX_READER_DEADLINE_MS) {
+      throw new TypeError('Passive status timeout must be a positive bounded safe integer')
+    }
     if (typeof projectPath !== 'string' || projectPath.length === 0 || projectPath.length > 32_768 || projectPath.includes('\0')) throw new TypeError('Passive status project path must be a bounded string')
     const capturedProviderIds = captureProviderIds(requestedProviderIds)
     if (!capturedProviderIds) throw new TypeError('Passive status provider IDs must be a bounded inert array')
@@ -260,7 +264,11 @@ export class OpenCodePassiveStatusReader {
 
     const snapshot = projectScope === null ? null : decodeSnapshot(completions, projectScope, completedAt)
     const binaryFallbackIssue = endReason ?? 'read_failed'
-    const projectFallbackIssue = projectScope === null ? 'scope_unavailable' : endReason ?? 'read_failed'
+    const projectFallbackIssue = projectScope === null
+      ? scopeResult?.ok === false && scopeResult.kind === 'unsupported'
+        ? 'unsupported_safe_persistence'
+        : 'scope_unavailable'
+      : endReason ?? 'read_failed'
     const binaryCompletion = clockInvalid ? undefined : completions.find(item => item.target === 'binary') as Extract<Completion, { target: 'binary' }> | undefined
     const binary = resolveBinary(binaryCompletion?.result, snapshot?.binary, completedAt, binaryFallbackIssue)
     const providers = providerIds.map(providerId => {
@@ -305,7 +313,7 @@ function opaqueInputPathIdentity(projectPath: string): `sha256:${string}` {
 function normalizeFailure(value: unknown): OpenCodePassiveReadFailure | null {
   if (value === null || typeof value !== 'object' || !ownedReadResults.has(value)) return null
   const record = exactDataRecord(value, ['ok', 'kind'])
-  if (!record || record.ok !== false || !['timeout', 'cancelled', 'transient', 'invalid'].includes(record.kind as string)) return null
+  if (!record || record.ok !== false || !['timeout', 'cancelled', 'transient', 'invalid', 'unsupported'].includes(record.kind as string)) return null
   return { ok: false, kind: record.kind as OpenCodePassiveReadFailure['kind'] }
 }
 function normalizedSuccess<T>(value: unknown, settledAt: number, normalizeValue: (value: unknown) => T | null): OpenCodePassiveReadResult<T> {
@@ -451,7 +459,15 @@ function resultIssue(result: OpenCodePassiveReadResult<unknown> | undefined, fal
   if (!result) return fallback
   if (result.ok === true) return 'invalid_payload'
   const failure = result as OpenCodePassiveReadFailure
-  return failure.kind === 'timeout' ? 'read_timeout' : failure.kind === 'cancelled' ? 'read_cancelled' : failure.kind === 'invalid' ? 'invalid_payload' : 'read_failed'
+  return failure.kind === 'timeout'
+    ? 'read_timeout'
+    : failure.kind === 'cancelled'
+      ? 'read_cancelled'
+      : failure.kind === 'invalid'
+        ? 'invalid_payload'
+        : failure.kind === 'unsupported'
+          ? 'unsupported_safe_persistence'
+          : 'read_failed'
 }
 function validProducerTimes(result: OpenCodePassiveReadSuccess<unknown>, now: number): boolean {
   return Number.isSafeInteger(result.observedAt) && result.observedAt >= 0 && result.observedAt <= now && Number.isSafeInteger(result.validUntil) && result.validUntil >= result.observedAt

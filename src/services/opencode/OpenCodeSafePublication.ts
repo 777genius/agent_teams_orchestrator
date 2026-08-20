@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
-import { link, lstat, mkdir, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises'
+import { link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 
 function fail(): never {
@@ -141,6 +141,83 @@ export class OpenCodeSafePublicationDirectory {
     const opened = await this.openChildDirectory(name)
     await this.#assertWindowsRoot()
     return opened
+  }
+
+  /** Passive-store seam: persist a newly-created child entry before continuing. */
+  async ensureChildDirectoryDurable(
+    name: string,
+    mode = 0o700,
+    afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
+  ): Promise<OpenCodeSafePublicationDirectory> {
+    await this.#assertWindowsRoot()
+    const child = this.child(name)
+    let created = false
+    try { await mkdir(child, { mode }); created = true }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    // Sync even after EEXIST: a concurrent creator may not yet have persisted
+    // the entry, while this publication can still be the first to return.
+    await this.sync()
+    if (created) await afterCreatedEntrySynced?.(child)
+    const opened = await this.openChildDirectory(name)
+    await this.#assertWindowsRoot()
+    return opened
+  }
+
+  /** Atomically claims a never-before-used child name and persists that claim. */
+  async createChildDirectoryExclusive(
+    name: string,
+    mode = 0o700,
+    afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
+  ): Promise<OpenCodeSafePublicationDirectory> {
+    await this.#assertWindowsRoot()
+    await mkdir(this.child(name), { mode })
+    await this.sync()
+    await afterCreatedEntrySynced?.(this.child(name))
+    return this.openChildDirectory(name)
+  }
+
+  async regularFileModifiedAt(name: string): Promise<number> {
+    await this.#assertWindowsRoot()
+    const metadata = await lstat(this.child(name))
+    if (!metadata.isFile() || metadata.isSymbolicLink()) fail()
+    return metadata.mtimeMs
+  }
+
+  async childDirectoryModifiedAt(name: string): Promise<number> {
+    await this.#assertWindowsRoot()
+    const metadata = await lstat(this.child(name))
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) fail()
+    return metadata.mtimeMs
+  }
+
+  async childNames(): Promise<readonly string[]> {
+    await this.#assertWindowsRoot()
+    const names = await readdir(this.#root)
+    await this.#assertWindowsRoot()
+    return names
+  }
+
+  /** Durably records prior immutable child creation before a commit is exposed. */
+  async sync(): Promise<void> {
+    // Windows does not expose directory fsync through Node. Publication still
+    // uses FlushFileBuffers for each file; Windows CI exercises the no-replace
+    // namespace operations. POSIX additionally persists directory entries.
+    await this.#handle?.sync().catch(fail)
+    await this.#assertWindowsRoot()
+  }
+
+  /** Atomically detaches a proven real child directory before bounded garbage cleanup. */
+  async retireChildDirectory(name: string, retiredName: string): Promise<void> {
+    const opened = await this.openChildDirectory(name)
+    try {
+      await this.#assertWindowsRoot()
+      await rename(this.child(name), this.child(retiredName))
+      await this.#handle?.sync().catch(fail)
+    } finally { await opened.close().catch(() => undefined) }
+    // The retired name is unguessable and no publisher can reuse it. A failure
+    // here is harmless unreachable garbage and is retried by a later writer.
+    await rm(this.child(retiredName), { recursive: true, force: true })
+    await this.#assertWindowsRoot()
   }
 
   async readBoundedRegularFile(
@@ -322,6 +399,11 @@ export class OpenCodeSafePublicationDirectory {
         !metadata.isFile() || !actual.equals(expected) || !modeMatches(metadata.mode, mode)
         || (typeof process.getuid === 'function' && metadata.uid !== process.getuid())
       ) fail()
+      // Flush again after the no-replace link exists. On Windows this is the
+      // available durable namespace barrier: FlushFileBuffers on the linked
+      // file persists its file record and link metadata. POSIX additionally
+      // synchronizes the held parent directory above.
+      await held.sync().catch(fail)
     } finally {
       await held.close()
     }
@@ -336,6 +418,8 @@ export class OpenCodeSafePublicationDirectory {
 /** Creates only missing descendants beneath the nearest canonical existing ancestor. */
 export async function ensureOpenCodeSafePublicationDirectory(
   directoryPath: string,
+  durableAncestors = false,
+  afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
 ): Promise<OpenCodeSafePublicationDirectory> {
   const resolved = path.resolve(directoryPath)
   const missing: string[] = []
@@ -357,7 +441,9 @@ export async function ensureOpenCodeSafePublicationDirectory(
   let directory = await OpenCodeSafePublicationDirectory.open(cursor)
   try {
     for (const component of missing) {
-      const child = await directory.ensureChildDirectory(component)
+      const child = durableAncestors
+        ? await directory.ensureChildDirectoryDurable(component, 0o700, afterCreatedEntrySynced)
+        : await directory.ensureChildDirectory(component)
       await directory.close()
       directory = child
     }

@@ -122,6 +122,39 @@ describe('OpenCode passive runtime summary wiring', () => {
     expect(status.verificationState).toBe('unknown')
   })
 
+  test('legacy Windows payload without passive snapshot fields remains unknown and never launch-ready', async () => {
+    const legacyWindowsPayload = {
+      supported: true,
+      authenticated: true,
+      capabilities: { teamLaunch: true },
+    }
+    const status = await buildOpenCodePassiveRuntimeStatus({
+      getOpenCodePassiveStatus: async () => {
+        // The legacy transport shape has no passive snapshot contract fields;
+        // the boundary rejects it instead of translating optimistic booleans.
+        throw Object.assign(new Error('legacy payload missing passive snapshot fields'), {
+          payload: legacyWindowsPayload,
+        })
+      },
+      now: () => 1_000,
+      schedule: () => ({ cancel() {} }),
+    })
+    expect(status).toMatchObject({
+      supported: false,
+      authenticated: false,
+      verificationState: 'unknown',
+      capabilities: { teamLaunch: false },
+      passiveStatus: {
+        projectScope: null,
+        authorization: 'unknown',
+        launchReadiness: 'not_authorized',
+      },
+    })
+    expect(status.passiveStatus?.binary).toMatchObject({
+      value: { presence: 'unknown' }, authority: 'none', issueCode: 'read_failed',
+    })
+  })
+
   test('route deadline bounds a never-resolving injected passive reader and aborts it', async () => {
     let fireDeadline!: () => void
     let rejectLate!: (error: Error) => void

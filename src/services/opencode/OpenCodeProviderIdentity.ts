@@ -62,11 +62,14 @@ function hasUnsafeSegments(value: string): boolean {
  * Pure redaction boundary shared by identity and catalog contracts. It does
  * not parse, decode, resolve, or retain the rejected authority text.
  */
-export function isOpenCodeCredentialOrAuthorityLike(value: string): boolean {
+export function isOpenCodeCredentialOrAuthorityLike(
+  value: string,
+  options: Readonly<{ allowHostPort?: boolean }> = {},
+): boolean {
   if (typeof value !== 'string') return true
   if (SCHEME_OR_PROTOCOL_RELATIVE_AUTHORITY.test(value)
     || BRACKETED_IP_AUTHORITY.test(value)
-    || HOST_PORT_AUTHORITY.test(value)) return true
+    || (!options.allowHostPort && HOST_PORT_AUTHORITY.test(value))) return true
 
   return value.split('/').some(segment => {
     // URL userinfo is separated from its host at the final @, including when
@@ -145,12 +148,40 @@ export function createOpenCodeExactProviderModelRef(
   modelId: string | OpenCodeCanonicalModelId,
 ): OpenCodeScopedProviderModelRef {
   const canonicalProviderId = createOpenCodeCanonicalProviderId(providerId)
-  const canonicalModelId = createOpenCodeCanonicalModelId(modelId)
+  const canonicalModelId = canonicalProviderId === 'amazon-bedrock'
+    ? createOpenCodeCanonicalModelIdForProvider(modelId, bedrockVersionSuffix(modelId))
+    : createOpenCodeCanonicalModelId(modelId)
   return Object.freeze({
     providerId: canonicalProviderId,
     modelId: canonicalModelId,
     raw: `${canonicalProviderId}/${canonicalModelId}` as OpenCodeExactProviderModelRef,
   })
+}
+
+function bedrockVersionSuffix(value: string): boolean {
+  const last = value.slice(value.lastIndexOf('/') + 1)
+  return /(?:^|[-.])v\d+:0$/.test(last)
+}
+
+function createOpenCodeCanonicalModelIdForProvider(
+  value: string | OpenCodeCanonicalModelId,
+  allowHostPort: boolean,
+): OpenCodeCanonicalModelId {
+  const segments = typeof value === 'string' ? value.split('/') : []
+  const finalSegment = segments.at(-1) ?? ''
+  const safeBedrockSuffix = allowHostPort && /(?:^|[-.])v\d+:0$/.test(finalSegment)
+  if (typeof value !== 'string' || value.length === 0 || value !== value.trim()
+    || CONTROL_OR_WHITESPACE.test(value) || !MODEL_ID.test(value)
+    || value.startsWith('/') || value.endsWith('/') || value.includes('//')
+    || hasUnsafeSegments(value)
+    // Bedrock's version marker is model punctuation, never an authority
+    // exception for the rest of the path. Every earlier segment is checked
+    // with the normal host/port rejection rules.
+    || segments.slice(0, -1).some(segment => isOpenCodeCredentialOrAuthorityLike(segment))
+    || isOpenCodeCredentialOrAuthorityLike(finalSegment, { allowHostPort: safeBedrockSuffix })) {
+    throw new OpenCodeProviderIdentityError()
+  }
+  return value as OpenCodeCanonicalModelId
 }
 
 /** Parses exactly one scoped reference. There is deliberately no default or bare-id fallback. */

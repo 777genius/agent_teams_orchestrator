@@ -18,6 +18,7 @@ import {
   type OpenCodePassiveProviderStatus,
   OPEN_CODE_PASSIVE_MAX_PROVIDERS,
 } from './OpenCodePassiveStatusContract.js'
+import { parseOpenCodeExactProviderModelRef } from './OpenCodeProviderIdentity.js'
 
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES = 65_536
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS = OPEN_CODE_PASSIVE_MAX_PROVIDERS
@@ -26,10 +27,28 @@ export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS = 16_384
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_JSON_DEPTH = 16
 export const OPEN_CODE_REDACTED_SNAPSHOT_MAX_SCALAR_CODE_UNITS = 129
 
-export type OpenCodeRedactedSnapshotProviderV1 = OpenCodePassiveProviderStatus & {
+type OpenCodeRedactedEvidenceObservation<T> = OpenCodePassiveObservation<T> & {
+  /** Storage-only causal order. Zero means not yet assigned by the durable writer. */
+  evidenceGeneration?: number
+}
+export type OpenCodeRedactedSnapshotProviderV1 = Omit<OpenCodePassiveProviderStatus,
+  'configured' | 'lastConnected' | 'catalogAvailable' | 'executionVerified'> & {
+  configured: OpenCodeRedactedEvidenceObservation<OpenCodeConfiguredStatus>
+  lastConnected: OpenCodeRedactedEvidenceObservation<OpenCodeLastConnectedStatus>
+  catalogAvailable: OpenCodeRedactedEvidenceObservation<OpenCodeCatalogStatus>
+  executionVerified: OpenCodeRedactedEvidenceObservation<OpenCodeExecutionStatus>
   fingerprint?: `sha256:${string}`
+  binaryFingerprint?: `sha256:${string}`
   /** Binds catalog availability and its model projection to one redacted evidence generation. */
   catalogIdentity?: `sha256:${string}`
+  catalogAttemptIdentity?: `sha256:${string}`
+  catalogRequestGeneration?: number
+  /** Durable invalidation epoch retained after catalog data is cleared. */
+  catalogFenceGeneration?: number
+  catalogStartedAt?: number
+  catalogBinaryFingerprint?: `sha256:${string}`
+  catalogConfigFingerprint?: `sha256:${string}`
+  catalogAuthFingerprint?: `sha256:${string}`
   modelIds?: string[]
   modelIdsTotal?: number
   modelIdsTruncated?: boolean
@@ -39,7 +58,7 @@ export type OpenCodeRedactedSnapshotV1 = {
   schemaVersion: 1
   projectScope: `sha256:${string}`
   capturedAt: number
-  binary: OpenCodePassiveObservation<OpenCodeBinaryStatus>
+  binary: OpenCodeRedactedEvidenceObservation<OpenCodeBinaryStatus>
   providers: OpenCodeRedactedSnapshotProviderV1[]
 }
 export type OpenCodeRedactedSnapshotIssue =
@@ -59,8 +78,8 @@ const freshness = ['fresh', 'stale', 'unknown'] as const
 const conditions = ['normal', 'degraded'] as const
 const issues = ['none', 'unknown', 'expired', 'read_timeout', 'read_cancelled', 'read_failed', 'invalid_payload', 'unsupported_version', 'scope_unavailable'] as const
 const topKeys = ['schemaVersion', 'projectScope', 'capturedAt', 'binary', 'providers'] as const
-const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'catalogIdentity', 'modelIds', 'modelIdsTotal', 'modelIdsTruncated', 'modelIdsFingerprint'] as const
-const observationKeys = ['value', 'authority', 'freshness', 'condition', 'observedAt', 'validUntil', 'issueCode'] as const
+const providerKeys = ['providerId', 'configured', 'lastConnected', 'catalogAvailable', 'executionVerified', 'fingerprint', 'binaryFingerprint', 'catalogIdentity', 'catalogAttemptIdentity', 'catalogRequestGeneration', 'catalogFenceGeneration', 'catalogStartedAt', 'catalogBinaryFingerprint', 'catalogConfigFingerprint', 'catalogAuthFingerprint', 'modelIds', 'modelIdsTotal', 'modelIdsTruncated', 'modelIdsFingerprint'] as const
+const observationKeys = ['value', 'authority', 'freshness', 'condition', 'observedAt', 'validUntil', 'issueCode', 'evidenceGeneration'] as const
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!
 const typedArrayTag = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)!.get!
@@ -113,12 +132,19 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
       if (!isOpenCodeOpaqueSha256(provider.fingerprint)) return invalid()
       decoded.fingerprint = provider.fingerprint
     }
+    if (provider.binaryFingerprint !== undefined) {
+      if (!isOpenCodeOpaqueSha256(provider.binaryFingerprint)) return invalid()
+      decoded.binaryFingerprint = provider.binaryFingerprint
+    }
     if (provider.catalogIdentity !== undefined) {
       if (!isOpenCodeOpaqueSha256(provider.catalogIdentity)) return invalid()
       decoded.catalogIdentity = provider.catalogIdentity
     }
+    if (!copyCatalogBinding(provider, decoded)) return invalid()
     if (provider.modelIds !== undefined) {
-      if (!Array.isArray(provider.modelIds) || !provider.modelIds.every(isOpenCodeCanonicalModelId)) return invalid()
+      if (!Array.isArray(provider.modelIds) || !provider.modelIds.every(model =>
+        isOpenCodeCanonicalModelId(model)
+        && parseOpenCodeExactProviderModelRef(model)?.providerId === provider.providerId)) return invalid()
       if (new Set(provider.modelIds).size !== provider.modelIds.length) return invalid()
       modelCount += provider.modelIds.length
       if (modelCount > OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS) return countExceeded()
@@ -133,11 +159,21 @@ export function decodeOpenCodeRedactedSnapshotV1(bytes: unknown): OpenCodeRedact
       const retained = decoded.modelIds?.length ?? 0
       if (provider.modelIdsTotal < retained
         || provider.modelIdsTruncated !== (provider.modelIdsTotal > retained)) return invalid()
-      if (!provider.modelIdsTruncated
-        && provider.modelIdsFingerprint !== modelIdsFingerprint(decoded.modelIds ?? [])) return invalid()
+      if (provider.modelIdsFingerprint !== modelIdsFingerprint(decoded.modelIds ?? [])) return invalid()
       decoded.modelIdsTotal = provider.modelIdsTotal
       decoded.modelIdsTruncated = provider.modelIdsTruncated
       decoded.modelIdsFingerprint = provider.modelIdsFingerprint
+    }
+    if (hasCompleteCatalogBinding(decoded)) {
+      if (decoded.catalogIdentity !== catalogProjectionIdentity(record.projectScope, decoded)) return invalid()
+    } else {
+      delete decoded.catalogIdentity
+      if (decoded.catalogAvailable.value !== 'unavailable' || decoded.modelIds?.length !== 0) {
+        delete decoded.modelIds
+        delete decoded.modelIdsTotal
+        delete decoded.modelIdsTruncated
+        delete decoded.modelIdsFingerprint
+      }
     }
     providers.push(decoded)
   }
@@ -196,10 +232,15 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       if (!isOpenCodeOpaqueSha256(provider.fingerprint)) return invalid()
       owned.fingerprint = provider.fingerprint
     }
+    if (provider.binaryFingerprint !== undefined) {
+      if (!isOpenCodeOpaqueSha256(provider.binaryFingerprint)) return invalid()
+      owned.binaryFingerprint = provider.binaryFingerprint
+    }
     if (provider.catalogIdentity !== undefined) {
       if (!isOpenCodeOpaqueSha256(provider.catalogIdentity)) return invalid()
       owned.catalogIdentity = provider.catalogIdentity
     }
+    if (!copyCatalogBinding(provider, owned)) return invalid()
     if (provider.modelIds !== undefined) {
       const models = captureArray(provider.modelIds, OPEN_CODE_REDACTED_SNAPSHOT_MAX_CATALOG_MODELS)
       if (models === 'count') return countExceeded()
@@ -207,7 +248,7 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
       const unique = new Set<string>()
       for (const model of models) {
         const normalized = normalizeOpenCodePassiveModelRef(model)
-        if (normalized) unique.add(normalized)
+        if (normalized && parseOpenCodeExactProviderModelRef(normalized)?.providerId === provider.providerId) unique.add(normalized)
       }
       const sorted = [...unique].sort(codeUnitCompare)
       owned.modelIds = sorted
@@ -227,6 +268,19 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
   if (new Set(providers.map(provider => provider.providerId)).size !== providers.length) return invalid()
   providers.sort((left, right) => codeUnitCompare(left.providerId, right.providerId))
   retainModelPrefix(providers, OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS)
+  for (const provider of providers) {
+    if (hasCompleteCatalogBinding(provider)) {
+      provider.catalogIdentity = catalogProjectionIdentity(top.projectScope, provider)
+    } else {
+      delete provider.catalogIdentity
+      if (provider.catalogAvailable.value !== 'unavailable' || provider.modelIds?.length !== 0) {
+        delete provider.modelIds
+        delete provider.modelIdsTotal
+        delete provider.modelIdsTruncated
+        delete provider.modelIdsFingerprint
+      }
+    }
+  }
   const ownedProviders = providers.map(provider => inertRecord({
     ...provider,
     ...(provider.modelIds ? { modelIds: inertArray(provider.modelIds) } : {}),
@@ -235,7 +289,7 @@ function preflightSnapshot(value: OpenCodeRedactedSnapshotV1): PreflightResult {
 }
 
 function copyObservation(value: unknown, kind: 'binary' | 'connected' | 'scalar'): Record<string, unknown> | null {
-  const observation = captureRecord(value, observationKeys)
+  const observation = captureRecord(value, observationKeys, 7)
   if (!observation || !boundedScalar(observation.authority) || !boundedScalar(observation.freshness) || !boundedScalar(observation.condition) || !boundedScalar(observation.issueCode)) return null
   if (!nullableTimestamp(observation.observedAt) || !nullableTimestamp(observation.validUntil)) return null
   let ownedValue: unknown
@@ -254,7 +308,11 @@ function copyObservation(value: unknown, kind: 'binary' | 'connected' | 'scalar'
       ownedValue = inertRecord({ state: connected.state, at: connected.at })
     } else ownedValue = inertRecord({ state: connected.state })
   }
-  return inertRecord({ value: ownedValue, authority: observation.authority, freshness: observation.freshness, condition: observation.condition, observedAt: observation.observedAt, validUntil: observation.validUntil, issueCode: observation.issueCode })
+  if (observation.evidenceGeneration !== undefined
+    && (!Number.isSafeInteger(observation.evidenceGeneration) || observation.evidenceGeneration < 0)) return null
+  return inertRecord({ value: ownedValue, authority: observation.authority, freshness: observation.freshness, condition: observation.condition, observedAt: observation.observedAt, validUntil: observation.validUntil, issueCode: observation.issueCode,
+    ...(observation.evidenceGeneration === undefined || observation.evidenceGeneration === 0
+      ? {} : { evidenceGeneration: observation.evidenceGeneration }) })
 }
 function boundedScalar(value: unknown): value is string { return typeof value === 'string' && value.length <= OPEN_CODE_REDACTED_SNAPSHOT_MAX_SCALAR_CODE_UNITS }
 function captureRecord(value: unknown, whitelist: readonly string[], requiredCount = whitelist.length): Record<string, any> | null {
@@ -338,6 +396,53 @@ function modelIdsFingerprint(modelIds: readonly string[]): `sha256:${string}` {
     .update(modelIds.join('\0')).digest('hex')}`
 }
 
+function copyCatalogBinding(
+  source: Record<string, unknown>,
+  target: OpenCodeRedactedSnapshotProviderV1,
+): boolean {
+  if (source.catalogFenceGeneration !== undefined) {
+    if (!Number.isSafeInteger(source.catalogFenceGeneration)
+      || (source.catalogFenceGeneration as number) < 1) return false
+    target.catalogFenceGeneration = source.catalogFenceGeneration as number
+  }
+  const keys = ['catalogAttemptIdentity', 'catalogRequestGeneration', 'catalogStartedAt',
+    'catalogBinaryFingerprint', 'catalogConfigFingerprint', 'catalogAuthFingerprint'] as const
+  const present = keys.filter(key => source[key] !== undefined)
+  if (present.length === 0) return true
+  if (present.length !== keys.length
+    || !isOpenCodeOpaqueSha256(source.catalogAttemptIdentity)
+    || !Number.isSafeInteger(source.catalogRequestGeneration) || (source.catalogRequestGeneration as number) < 1
+    || !timestamp(source.catalogStartedAt)
+    || !isOpenCodeOpaqueSha256(source.catalogBinaryFingerprint)
+    || !isOpenCodeOpaqueSha256(source.catalogConfigFingerprint)
+    || !isOpenCodeOpaqueSha256(source.catalogAuthFingerprint)) return false
+  for (const key of keys) (target as Record<string, unknown>)[key] = source[key]
+  return true
+}
+
+function hasCompleteCatalogBinding(provider: OpenCodeRedactedSnapshotProviderV1): boolean {
+  return isOpenCodeOpaqueSha256(provider.catalogAttemptIdentity)
+    && Number.isSafeInteger(provider.catalogRequestGeneration) && provider.catalogRequestGeneration! >= 1
+    && timestamp(provider.catalogStartedAt)
+    && isOpenCodeOpaqueSha256(provider.catalogBinaryFingerprint)
+    && isOpenCodeOpaqueSha256(provider.catalogConfigFingerprint)
+    && isOpenCodeOpaqueSha256(provider.catalogAuthFingerprint)
+}
+
+export function catalogProjectionIdentity(
+  scope: `sha256:${string}`,
+  provider: OpenCodeRedactedSnapshotProviderV1,
+): `sha256:${string}` {
+  const fields = [scope, provider.providerId, provider.binaryFingerprint, provider.catalogAttemptIdentity,
+    String(provider.catalogRequestGeneration), String(provider.catalogStartedAt),
+    provider.catalogBinaryFingerprint, provider.catalogConfigFingerprint,
+    provider.catalogAuthFingerprint, provider.catalogAvailable.value,
+    String(provider.modelIdsTotal), String(provider.modelIdsTruncated), provider.modelIdsFingerprint,
+    ...(provider.modelIds ?? []).slice().sort(codeUnitCompare)]
+  const material = fields.map(field => `${String(field).length}:${String(field)}`).join('|')
+  return `sha256:${createHash('sha256').update('opencode-passive-catalog-identity-v3\0').update(material).digest('hex')}`
+}
+
 function readModelMetadata(
   provider: Record<string, unknown>,
   retained: number,
@@ -367,12 +472,15 @@ function retainModelPrefix(providers: OpenCodeRedactedSnapshotProviderV1[], maxi
     else delete provider.modelIds
     provider.modelIdsTotal = total
     provider.modelIdsTruncated = total > retained.length
-    provider.modelIdsFingerprint ??= modelIdsFingerprint(provider.modelIds ?? [])
+    provider.modelIdsFingerprint = modelIdsFingerprint(provider.modelIds ?? [])
   }
 }
 
 function fitStoredModelPrefix(snapshot: OpenCodeRedactedSnapshotV1): { value: OpenCodeRedactedSnapshotV1; text: string } | null {
-  const available = snapshot.providers.reduce((total, provider) => total + (provider.modelIds?.length ?? 0), 0)
+  let available = 0
+  for (let index = 0; index < snapshot.providers.length; index += 1) {
+    available += snapshot.providers[index].modelIds?.length ?? 0
+  }
   let low = 0
   let high = available
   let best: { value: OpenCodeRedactedSnapshotV1; text: string } | null = null
@@ -380,12 +488,17 @@ function fitStoredModelPrefix(snapshot: OpenCodeRedactedSnapshotV1): { value: Op
     const midpoint = Math.floor((low + high) / 2)
     const candidate: OpenCodeRedactedSnapshotV1 = {
       ...snapshot,
-      providers: snapshot.providers.map(provider => ({
+      providers: Array.prototype.map.call(snapshot.providers, (provider: OpenCodeRedactedSnapshotProviderV1) => ({
         ...provider,
-        ...(provider.modelIds === undefined ? {} : { modelIds: [...provider.modelIds] }),
-      })),
+        ...(provider.modelIds === undefined ? {} : { modelIds: Array.prototype.slice.call(provider.modelIds) }),
+      })) as OpenCodeRedactedSnapshotProviderV1[],
     }
     retainModelPrefix(candidate.providers, midpoint)
+    for (const provider of candidate.providers) {
+      if (hasCompleteCatalogBinding(provider)) {
+        provider.catalogIdentity = catalogProjectionIdentity(candidate.projectScope, provider)
+      }
+    }
     let text: string
     try { text = JSON.stringify(candidate) } catch { return null }
     if (text.length <= OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES
@@ -400,7 +513,6 @@ function fitStoredModelPrefix(snapshot: OpenCodeRedactedSnapshotV1): { value: Op
 /** Separate mutation boundary; the passive reader intentionally cannot receive this port. */
 export interface OpenCodeRedactedSnapshotWriterPort {
   write(snapshot: OpenCodeRedactedSnapshotV1, signal: AbortSignal): Promise<void>
-  withScopeLease?<T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>): Promise<T>
 }
 
 function decodeObservation<T>(
@@ -409,9 +521,10 @@ function decodeObservation<T>(
   requiredAuthority: Exclude<OpenCodePassiveObservation<unknown>['authority'], 'none'>,
   isUnknown: (value: T) => boolean,
   capturedAt: number,
-): OpenCodePassiveObservation<T> | null {
+): OpenCodeRedactedEvidenceObservation<T> | null {
   const record = asRecord(value)
-  if (!record || !exactKeys(record, observationKeys)) return null
+  if (!record || !exactKeys(record, observationKeys, true)
+    || !observationKeys.slice(0, 7).every(key => Object.hasOwn(record, key))) return null
   const decodedValue = decodeValue(record.value)
   if (decodedValue === null || !member(authorities, record.authority) || !member(freshness, record.freshness) || !member(conditions, record.condition) || !member(issues, record.issueCode)) return null
   if (!nullableTimestamp(record.observedAt) || !nullableTimestamp(record.validUntil)) return null
@@ -427,7 +540,10 @@ function decodeObservation<T>(
       if (record.condition !== 'degraded' || record.issueCode === 'none') return null
     } else return null
   }
-  return inertRecord({ value: decodedValue, authority: record.authority, freshness: record.freshness, condition: record.condition, observedAt: record.observedAt, validUntil: record.validUntil, issueCode: record.issueCode }) as OpenCodePassiveObservation<T>
+  if (record.evidenceGeneration !== undefined
+    && (!Number.isSafeInteger(record.evidenceGeneration) || record.evidenceGeneration <= 0)) return null
+  return inertRecord({ value: decodedValue, authority: record.authority, freshness: record.freshness, condition: record.condition, observedAt: record.observedAt, validUntil: record.validUntil, issueCode: record.issueCode,
+    ...(record.evidenceGeneration === undefined ? {} : { evidenceGeneration: record.evidenceGeneration }) }) as OpenCodeRedactedEvidenceObservation<T>
 }
 function decodeBinary(value: unknown): OpenCodeBinaryStatus | null {
   const record = asRecord(value)

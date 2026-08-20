@@ -25,6 +25,12 @@ function snapshot(): OpenCodeRedactedSnapshotV1 {
     providers: [{
       providerId: 'deepinfra',
       fingerprint: `sha256:${'b'.repeat(64)}`,
+      catalogAttemptIdentity: `sha256:${'c'.repeat(64)}`,
+      catalogRequestGeneration: 1,
+      catalogStartedAt: 100,
+      catalogBinaryFingerprint: `sha256:${'d'.repeat(64)}`,
+      catalogConfigFingerprint: `sha256:${'e'.repeat(64)}`,
+      catalogAuthFingerprint: `sha256:${'f'.repeat(64)}`,
       modelIds: ['deepinfra/llama-4'],
       configured: observation('configured', 'config_metadata'),
       lastConnected: observation({ state: 'connected', at: 90 }, 'auth_metadata'),
@@ -101,9 +107,36 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     }
   })
 
+  test('keeps legacy status but omits searchable IDs without complete attempt binding', () => {
+    const legacy = snapshot()
+    const provider = legacy.providers[0]
+    provider.catalogIdentity = `sha256:${'9'.repeat(64)}`
+    delete provider.catalogAttemptIdentity
+    delete provider.catalogRequestGeneration
+    delete provider.catalogStartedAt
+    delete provider.catalogBinaryFingerprint
+    delete provider.catalogConfigFingerprint
+    delete provider.catalogAuthFingerprint
+    const encoded = encodeOpenCodeRedactedSnapshotV1(legacy)
+    expect(encoded.ok).toBe(true)
+    if (!encoded.ok) throw new Error(encoded.issueCode)
+    expect(encoded.value.providers[0].catalogAvailable.value).toBe('available')
+    expect(encoded.value.providers[0].catalogIdentity).toBeUndefined()
+    expect(encoded.value.providers[0].modelIds).toBeUndefined()
+  })
+
   test('enforces provider/model counts, uniqueness, identifiers and timestamp ordering', () => {
     const tooManyProviders = snapshot()
-    tooManyProviders.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS + 1 }, (_, index) => ({ ...snapshot().providers[0], providerId: `p${index}` }))
+    tooManyProviders.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS + 1 }, (_, index) => {
+      const provider = { ...snapshot().providers[0], providerId: `p${index}`, modelIds: undefined }
+      delete provider.catalogAttemptIdentity
+      delete provider.catalogRequestGeneration
+      delete provider.catalogStartedAt
+      delete provider.catalogBinaryFingerprint
+      delete provider.catalogConfigFingerprint
+      delete provider.catalogAuthFingerprint
+      return provider
+    })
     expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(tooManyProviders))).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
     const tooManyModels = snapshot()
     tooManyModels.providers[0].modelIds = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_MODELS + 1 }, (_, index) => `deepinfra/model-${index}`)
@@ -132,11 +165,16 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     }))
     expect(encodeOpenCodeRedactedSnapshotV1(at33).ok).toBe(true)
     const maximum = snapshot()
-    maximum.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS }, (_, index) => ({
-      ...structuredClone(provider),
-      providerId: `sha256:${(index + 1).toString(16).padStart(64, '0')}`,
-      modelIds: undefined,
-    }))
+    maximum.providers = Array.from({ length: OPEN_CODE_REDACTED_SNAPSHOT_MAX_PROVIDERS }, (_, index) => {
+      const item = { ...structuredClone(provider), providerId: `sha256:${(index + 1).toString(16).padStart(64, '0')}`, modelIds: undefined }
+      delete item.catalogAttemptIdentity
+      delete item.catalogRequestGeneration
+      delete item.catalogStartedAt
+      delete item.catalogBinaryFingerprint
+      delete item.catalogConfigFingerprint
+      delete item.catalogAuthFingerprint
+      return item
+    })
     expect(encodeOpenCodeRedactedSnapshotV1(maximum).ok).toBe(true)
     maximum.providers.push({ ...structuredClone(provider), providerId: `sha256:${'f'.repeat(64)}` })
     expect(encodeOpenCodeRedactedSnapshotV1(maximum)).toEqual({ ok: false, issueCode: 'snapshot_count_exceeded' })
@@ -173,6 +211,18 @@ describe('OpenCodeRedactedSnapshotV1 codec', () => {
     expect(reversedEncoded.value.providers[0].modelIdsFingerprint)
       .toBe(encoded.value.providers[0].modelIdsFingerprint)
     expect(new TextDecoder().decode(reversedEncoded.bytes)).toBe(new TextDecoder().decode(encoded.bytes))
+
+    const stored = JSON.parse(new TextDecoder().decode(encoded.bytes!))
+    for (const mutate of [
+      (value: any) => { value.providers[0].modelIdsTotal += 1 },
+      (value: any) => { value.providers[0].modelIdsTruncated = false },
+      (value: any) => { value.providers[0].modelIdsFingerprint = `sha256:${'0'.repeat(64)}` },
+      (value: any) => { value.providers[0].modelIds.pop() },
+    ]) {
+      const forged = structuredClone(stored)
+      mutate(forged)
+      expect(decodeOpenCodeRedactedSnapshotV1(JSON.stringify(forged)).ok).toBe(false)
+    }
   })
 
   test('rejects duplicate keys, excessive depth and unknown fields before schema decoding', () => {

@@ -30,6 +30,7 @@ export type OpenCodePassiveIssueCode =
   | 'invalid_payload'
   | 'unsupported_version'
   | 'scope_unavailable'
+  | 'unsupported_safe_persistence'
 
 export type OpenCodePassiveObservation<T> = {
   value: T
@@ -127,12 +128,20 @@ export function normalizeOpenCodePassiveModelRef(value: unknown): string | null 
     || value.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_CODE_UNITS
     || value !== value.trim()
     || /[^\x21-\x7e]/.test(value)
-    || /[\\?#=%&]/.test(value)
-    || isOpenCodeCredentialOrAuthorityLike(value)) return null
+    || /[\\?#=%&]/.test(value)) return null
   const parts = value.split('/')
   if (parts.length < 2 || parts.length > OPEN_CODE_PASSIVE_MODEL_REF_MAX_SEGMENTS
     || !isOpenCodeCanonicalProviderId(parts[0])) return null
+  // Bedrock inference-profile/model identifiers legitimately end in `:0`.
+  // Authority detection is applied to the model portion with that one
+  // provider-aware exception, never to the enclosing exact ref as a URL.
+  if (isOpenCodeCredentialOrAuthorityLike(parts.slice(1).join('/'), {
+    allowHostPort: parts[0] === 'amazon-bedrock' && /(?:^|[-.])v\d+:\d+$/.test(parts.at(-1)!),
+  })) return null
   for (const part of parts.slice(1)) {
+    if (parts[0] === 'amazon-bedrock'
+      && /(?:^|[-.])v\d+:\d+$/.test(part)
+      && /^[A-Za-z0-9]+(?:[._+-][A-Za-z0-9]+)*:[0-9]+$/.test(part)) continue
     if (!safeModelRefSegment(part)) return null
   }
   return value

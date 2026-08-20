@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { types as nodeUtilTypes } from 'node:util'
 
@@ -11,6 +13,7 @@ import {
   type OpenCodeScopedProviderCatalog,
 } from './OpenCodeProviderCatalogContract.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import { canonicalizeOpenCodePassiveProjectPath } from './OpenCodePassiveStatusProductionReader.js'
 import {
   prepareOpenCodeProviderCatalogProductionProfile,
   type OpenCodeProviderCatalogProductionProfileManager,
@@ -23,12 +26,14 @@ const DEFAULT_MAX_STALE_MS = 5 * 60_000
 const DEFAULT_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_ENTRIES = 64
 const MAX_TIME_MS = 10_000_000_000
+const MAX_EPOCH_MS = 8_640_000_000_000_000
 const MAX_TIMEOUT_MS = 2_147_483_647
 const MAX_ENTRIES = 1_024
 const MAX_PERSISTED_BYTES = 2 * 1024 * 1024
 const MAX_IDENTITY_STRING = 16_384
 const FIXED_FAILURE = 'OpenCode provider catalog is temporarily unavailable.'
 const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+const customPersistenceCommitQueues = new WeakMap<Function, Map<string, Promise<boolean>>>()
 
 export type OpenCodeProviderCatalogLoadInput = Readonly<{
   providerId: string
@@ -38,9 +43,25 @@ export type OpenCodeProviderCatalogLoadInput = Readonly<{
 
 export type OpenCodeProviderCatalogLoadResult = Readonly<{
   catalog: OpenCodeScopedProviderCatalog
+  /** Redacted identity created before this scoped catalog attempt starts. */
+  catalogEvidence: OpenCodeCatalogPublicationEvidence
+  /** Original evidence time range; cache/fallback results never extend it. */
+  catalogObservedAt: number
+  catalogExpiresAt: number
+  catalogProvenance: 'fresh-live' | 'cache-hit' | 'bounded-stale'
   profileRootPath: string
   projectPath: string
   diagnostics: readonly string[]
+}>
+
+export type OpenCodeCatalogPublicationEvidence = Readonly<{
+  providerId: string
+  requestGeneration: number
+  startedAt: number
+  attemptIdentity: `sha256:${string}`
+  binaryFingerprint: `sha256:${string}`
+  configFingerprint: `sha256:${string}`
+  authFingerprint: `sha256:${string}`
 }>
 
 export type OpenCodeProviderCatalogPort = {
@@ -77,6 +98,14 @@ export type OpenCodeProviderCatalogServiceDeps = {
   ttlMs?: number
   maxStaleMs?: number
   maxEntries?: number
+  canonicalizeProjectPath?: (projectPath: string, signal: AbortSignal) => Promise<string>
+  setTimer?: typeof setTimeout
+  clearTimer?: typeof clearTimeout
+  /** Synchronous because request authority must exist before profile preparation awaits. */
+  allocateAttempt?: (scope: string, startedAt: number) => Readonly<{
+    requestGeneration: number
+    attemptIdentity: `sha256:${string}`
+  }>
 }
 
 type CacheIdentity = Readonly<{
@@ -93,6 +122,9 @@ type CacheEntry = {
   profileRootPath: string
   projectPath: string
   catalog: OpenCodeScopedProviderCatalog
+  catalogEvidence: OpenCodeCatalogPublicationEvidence
+  catalogObservedAt: number
+  catalogExpiresAt: number
   lastUsedAt: number
 }
 
@@ -226,7 +258,7 @@ function snapshotInput(value: unknown): {
   })
 }
 
-function snapshotProfile(value: unknown, providerId: string): {
+function snapshotProfile(value: unknown, providerId: string, expectedProjectPath?: string): {
   preparedProfile: OpenCodeScopedPreparedProfile
   identity: CacheIdentity
   profileRootPath: string
@@ -243,7 +275,8 @@ function snapshotProfile(value: unknown, providerId: string): {
     || !boundedString(record.projectPath) || !boundedString(record.profileRootPath)
     || !boundedString(record.binaryFingerprint, 512)
     || !boundedString(record.managedConfigFingerprint, 512)
-    || !boundedString(record.selectedAuthBaselineFingerprint, 512)) throw fixedCatalogFailure()
+    || !boundedString(record.selectedAuthBaselineFingerprint, 512)
+    || (expectedProjectPath !== undefined && record.projectPath !== expectedProjectPath)) throw fixedCatalogFailure()
   const identity = Object.freeze({
     projectPath: record.projectPath,
     providerId,
@@ -273,6 +306,94 @@ function cacheKeyFor(identity: CacheIdentity): string {
 
 function identityHash(identity: CacheIdentity): string {
   return `sha256:${cacheKeyFor(identity)}`
+}
+
+function redactedFingerprint(domain: string, value: string): `sha256:${string}` {
+  return `sha256:${hash(`${domain}\0${value}`)}`
+}
+
+function boundedIdentityMaterial(values: readonly (string | number)[]): string {
+  return values.map(value => `${String(value).length}:${String(value)}`).join('|')
+}
+
+function createCatalogPublicationEvidence(
+  identity: CacheIdentity,
+  allocation: Readonly<{ requestGeneration: number; attemptIdentity: `sha256:${string}` }>,
+  startedAt: number,
+): OpenCodeCatalogPublicationEvidence {
+  const binaryFingerprint = redactedFingerprint('opencode-catalog-binary-v1', identity.binaryFingerprint)
+  const configFingerprint = redactedFingerprint('opencode-catalog-config-v1', identity.managedConfigFingerprint)
+  const authFingerprint = redactedFingerprint('opencode-catalog-auth-v1', identity.selectedAuthBaselineFingerprint)
+  return Object.freeze({
+    providerId: identity.providerId,
+    requestGeneration: allocation.requestGeneration,
+    startedAt,
+    attemptIdentity: allocation.attemptIdentity,
+    binaryFingerprint,
+    configFingerprint,
+    authFingerprint,
+  })
+}
+
+/**
+ * Cross-process monotonic allocation. The tiny synchronous critical section is
+ * intentional: no request may enter asynchronous profile preparation without
+ * first receiving durable authority for its project/provider scope.
+ */
+function allocateDurableAttempt(scope: string, startedAt: number): Readonly<{
+  requestGeneration: number
+  attemptIdentity: `sha256:${string}`
+}> {
+  const cacheHome = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    ?? (process.platform === 'win32'
+      ? path.join(process.env.LOCALAPPDATA ?? os.tmpdir(), 'claude-multimodel-nodejs', 'Cache')
+      : process.platform === 'darwin'
+        ? path.join(os.homedir(), 'Library', 'Caches', 'claude-multimodel-nodejs')
+        : path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'claude-multimodel-nodejs'))
+  const root = path.join(cacheHome, 'opencode', 'provider-catalog-attempts-v1')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  const key = hash(scope)
+  const ledgerPath = path.join(root, `${key}.json`)
+  const ticketRoot = path.join(root, key)
+  mkdirSync(ticketRoot, { recursive: true, mode: 0o700 })
+  let legacyGeneration = 0
+  try {
+    const decoded = JSON.parse(readFileSync(ledgerPath, 'utf8')) as unknown
+    const record = snapshotRecord(decoded)
+    if (record?.schema !== 'opencode-catalog-attempt-ledger-v1'
+      || !Number.isSafeInteger(record.generation) || (record.generation as number) < 1) {
+      throw fixedCatalogFailure()
+    }
+    legacyGeneration = record.generation as number
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fixedCatalogFailure()
+  }
+  let requestGeneration: number
+  for (;;) {
+    let previous = legacyGeneration
+    for (const file of readdirSync(ticketRoot)) {
+      const match = /^([1-9]\d*)\.ticket$/.exec(file)
+      if (!match) continue
+      const candidate = Number(match[1])
+      if (Number.isSafeInteger(candidate)) previous = Math.max(previous, candidate)
+    }
+    requestGeneration = previous + 1
+    if (!Number.isSafeInteger(requestGeneration)) throw fixedCatalogFailure()
+    try {
+      // mkdir is the compare-and-claim primitive. A crashed allocator leaves a
+      // consumed ordinal, never a lease that another process must wait for or
+      // recover. Contenders that race for the same ordinal simply rescan.
+      mkdirSync(path.join(ticketRoot, `${requestGeneration}.ticket`), { mode: 0o700 })
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw fixedCatalogFailure()
+    }
+  }
+  const nonce = randomUUID()
+  const attemptIdentity = redactedFingerprint('opencode-catalog-attempt-v2', boundedIdentityMaterial([
+    scope, requestGeneration, startedAt, nonce,
+  ]))
+  return Object.freeze({ requestGeneration, attemptIdentity })
 }
 
 async function cacheRootPath(): Promise<string> {
@@ -312,7 +433,20 @@ async function readJsonFile(filePath: string): Promise<unknown | null> {
 }
 
 async function defaultReadPointer(cacheKey: string): Promise<unknown | null> {
-  return readJsonFile(await cacheFilePath(cacheKey))
+  const root = await cacheRootPath()
+  const prefix = `${hash(cacheKey)}.`
+  const candidates = (await readdir(root).catch(() => []))
+    .filter(file => file.startsWith(prefix) && file.endsWith('.commit.json'))
+    .slice(0, MAX_ENTRIES + 32)
+  let winner: CommittedPointer | null = null
+  for (const file of candidates) {
+    const candidate = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
+    if (!candidate) continue
+    if (winner && candidate.requestGeneration === winner.requestGeneration
+      && candidate.attemptIdentity !== winner.attemptIdentity) return null
+    if (!winner || compareCommittedPointers(candidate, winner) > 0) winner = candidate
+  }
+  return winner ?? readJsonFile(await cacheFilePath(cacheKey))
 }
 
 async function defaultReadStage(cacheKey: string, attemptId: string): Promise<unknown | null> {
@@ -332,11 +466,13 @@ async function defaultPublishPointer(
 ): Promise<void> {
   const encoded = JSON.stringify(value)
   if (new TextEncoder().encode(encoded).byteLength > MAX_PERSISTED_BYTES) throw fixedCatalogFailure()
-  await writeJsonFileAtomic(await cacheFilePath(cacheKey), value, { mode: 0o600 })
+  const pointer = decodeCommittedPointer(value)
+  if (!pointer) throw fixedCatalogFailure()
   const root = await cacheRootPath()
+  await writeJsonFileAtomic(defaultCommitFilePath(root, cacheKey, pointer), pointer, { mode: 0o600 })
   const allFiles = await readdir(root).catch(() => [])
   const files = allFiles
-    .filter(file => /^[0-9a-f]{64}\.current\.json$/.test(file))
+    .filter(file => /^[0-9a-f]{64}\.[1-9]\d*\.[0-9a-f]{16}\.commit\.json$/.test(file))
   if (files.length <= maxEntries) return
   const ordered = await Promise.all(files.map(async file => ({
     file,
@@ -354,10 +490,20 @@ async function defaultPublishPointer(
   })).catch(() => undefined)
 }
 
+function defaultCommitFilePath(root: string, cacheKey: string, pointer: CommittedPointer): string {
+  return path.join(root,
+    `${hash(cacheKey)}.${pointer.requestGeneration}.${pointer.attemptIdentity.slice(7, 23)}.commit.json`)
+}
+
+async function defaultDiscardPointer(cacheKey: string, pointer: CommittedPointer): Promise<void> {
+  await unlink(defaultCommitFilePath(await cacheRootPath(), cacheKey, pointer)).catch(() => undefined)
+}
+
 async function defaultCleanupStages(cacheKey: string, currentAttemptId: string): Promise<void> {
   const root = await cacheRootPath()
   const prefix = `${hash(cacheKey)}.`
-  const files = (await readdir(root).catch(() => []))
+  const allFiles = await readdir(root).catch(() => [])
+  const files = allFiles
     .filter(file => file.startsWith(prefix) && file.endsWith('.stage.json'))
   const orphans = files.filter(file => file !== `${prefix}${currentAttemptId}.stage.json`)
   const ordered = await Promise.all(orphans.map(async file => ({
@@ -367,6 +513,16 @@ async function defaultCleanupStages(cacheKey: string, currentAttemptId: string):
   ordered.sort((left, right) => left.modifiedAt - right.modifiedAt)
   await Promise.all(ordered.slice(0, 32).map(entry =>
     unlink(path.join(root, entry.file)).catch(() => undefined)
+  ))
+  const winner = decodeCommittedPointer(await defaultReadPointer(cacheKey))
+  if (!winner) return
+  const obsoleteCommits: string[] = []
+  for (const file of allFiles.filter(file => file.startsWith(prefix) && file.endsWith('.commit.json'))) {
+    const candidate = decodeCommittedPointer(await readJsonFile(path.join(root, file)))
+    if (candidate && compareCommittedPointers(candidate, winner) < 0) obsoleteCommits.push(file)
+  }
+  await Promise.all(obsoleteCommits.slice(0, 32).map(file =>
+    unlink(path.join(root, file)).catch(() => undefined)
   ))
 }
 
@@ -382,7 +538,8 @@ function identityPayload(catalog: OpenCodeScopedProviderCatalog): OpenCodeCatalo
   }
 }
 
-function persistedEnvelope(identity: CacheIdentity, catalog: OpenCodeScopedProviderCatalog): unknown {
+function persistedEnvelope(identity: CacheIdentity, entry: Pick<CacheEntry,
+  'catalog' | 'catalogEvidence' | 'catalogObservedAt' | 'catalogExpiresAt'>): unknown {
   const fingerprints = Object.freeze({
     providerId: identity.providerId,
     binaryFingerprint: identity.binaryFingerprint,
@@ -390,42 +547,60 @@ function persistedEnvelope(identity: CacheIdentity, catalog: OpenCodeScopedProvi
     selectedAuthBaselineFingerprint: identity.selectedAuthBaselineFingerprint,
   })
   return Object.freeze({
-    schema: 'opencode-provider-catalog-cache-v3',
+    schema: 'opencode-provider-catalog-cache-v4',
     identityHash: identityHash(identity),
     fingerprints,
-    catalog,
-    envelopeHash: `sha256:${hash(`${identityHash(identity)}\0${catalog.recordId}`)}`,
+    catalog: entry.catalog,
+    catalogEvidence: entry.catalogEvidence,
+    catalogObservedAt: entry.catalogObservedAt,
+    catalogExpiresAt: entry.catalogExpiresAt,
+    envelopeHash: `sha256:${hash(`${identityHash(identity)}\0${entry.catalog.recordId}\0${JSON.stringify(entry.catalogEvidence)}\0${entry.catalogObservedAt}\0${entry.catalogExpiresAt}`)}`,
   })
 }
 
 type CommittedPointer = Readonly<{
-  schema: 'opencode-provider-catalog-committed-pointer-v1'
+  schema: 'opencode-provider-catalog-committed-pointer-v2'
   attemptId: string
   generation: number
+  requestGeneration: number
+  attemptIdentity: `sha256:${string}`
   envelopeHash: string
 }>
 
-function committedPointer(attemptId: string, catalog: OpenCodeScopedProviderCatalog): CommittedPointer {
+function committedPointer(attemptId: string, catalog: OpenCodeScopedProviderCatalog,
+  evidence: OpenCodeCatalogPublicationEvidence): CommittedPointer {
   return Object.freeze({
-    schema: 'opencode-provider-catalog-committed-pointer-v1',
+    schema: 'opencode-provider-catalog-committed-pointer-v2',
     attemptId,
     generation: catalog.generation,
+    requestGeneration: evidence.requestGeneration,
+    attemptIdentity: evidence.attemptIdentity,
     envelopeHash: `sha256:${hash(catalog.recordId)}`,
   })
 }
 
+function compareCommittedPointers(left: CommittedPointer, right: CommittedPointer): number {
+  return left.requestGeneration - right.requestGeneration
+}
+
 function decodeCommittedPointer(value: unknown): CommittedPointer | null {
   try {
-    const pointer = closedRecord(value, ['schema', 'attemptId', 'generation', 'envelopeHash'])
-    if (!pointer || pointer.schema !== 'opencode-provider-catalog-committed-pointer-v1'
+    const pointer = closedRecord(value, ['schema', 'attemptId', 'generation', 'requestGeneration',
+      'attemptIdentity', 'envelopeHash'])
+    if (!pointer || pointer.schema !== 'opencode-provider-catalog-committed-pointer-v2'
       || !boundedString(pointer.attemptId, 128)
       || !/^[1-9]\d{0,15}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(pointer.attemptId)
       || !Number.isSafeInteger(pointer.generation) || (pointer.generation as number) < 1
+      || !Number.isSafeInteger(pointer.requestGeneration) || (pointer.requestGeneration as number) < 1
+      || typeof pointer.attemptIdentity !== 'string'
+      || !/^sha256:[0-9a-f]{64}$/.test(pointer.attemptIdentity)
       || typeof pointer.envelopeHash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(pointer.envelopeHash)) return null
     return Object.freeze({
-      schema: 'opencode-provider-catalog-committed-pointer-v1',
+      schema: 'opencode-provider-catalog-committed-pointer-v2',
       attemptId: pointer.attemptId,
       generation: pointer.generation,
+      requestGeneration: pointer.requestGeneration,
+      attemptIdentity: pointer.attemptIdentity,
       envelopeHash: pointer.envelopeHash,
     }) as CommittedPointer
   } catch {
@@ -433,14 +608,16 @@ function decodeCommittedPointer(value: unknown): CommittedPointer | null {
   }
 }
 
-function decodePersistedCatalog(value: unknown, expectedIdentity: CacheIdentity): OpenCodeScopedProviderCatalog | null {
+function decodePersistedCatalog(value: unknown, expectedIdentity: CacheIdentity): Pick<CacheEntry,
+  'catalog' | 'catalogEvidence' | 'catalogObservedAt' | 'catalogExpiresAt'> | null {
   try {
-    const envelope = closedRecord(value, ['schema', 'identityHash', 'fingerprints', 'catalog', 'envelopeHash'])
+    const envelope = closedRecord(value, ['schema', 'identityHash', 'fingerprints', 'catalog',
+      'catalogEvidence', 'catalogObservedAt', 'catalogExpiresAt', 'envelopeHash'])
     const fingerprints = envelope && closedRecord(envelope.fingerprints, [
       'providerId', 'binaryFingerprint', 'managedConfigFingerprint',
       'selectedAuthBaselineFingerprint',
     ])
-    if (!envelope || !fingerprints || envelope.schema !== 'opencode-provider-catalog-cache-v3'
+    if (!envelope || !fingerprints || envelope.schema !== 'opencode-provider-catalog-cache-v4'
       || envelope.identityHash !== identityHash(expectedIdentity)
       || fingerprints.providerId !== expectedIdentity.providerId
       || fingerprints.binaryFingerprint !== expectedIdentity.binaryFingerprint
@@ -466,8 +643,20 @@ function decodePersistedCatalog(value: unknown, expectedIdentity: CacheIdentity)
       connected: catalogRecord.connected,
       models: catalogRecord.models,
     } as OpenCodeCatalogRecordIdentityPayload)
-    if (expectedRecordId !== catalogRecord.recordId
-      || envelope.envelopeHash !== `sha256:${hash(`${identityHash(expectedIdentity)}\0${expectedRecordId}`)}`) return null
+    const evidence = closedRecord(envelope.catalogEvidence, ['providerId', 'requestGeneration',
+      'startedAt', 'attemptIdentity', 'binaryFingerprint', 'configFingerprint', 'authFingerprint'])
+    if (!evidence || evidence.providerId !== expectedIdentity.providerId
+      || !Number.isSafeInteger(evidence.requestGeneration) || (evidence.requestGeneration as number) < 1
+      || !Number.isSafeInteger(evidence.startedAt) || (evidence.startedAt as number) < 0
+      || !/^sha256:[0-9a-f]{64}$/.test(String(evidence.attemptIdentity))
+      || evidence.binaryFingerprint !== redactedFingerprint('opencode-catalog-binary-v1', expectedIdentity.binaryFingerprint)
+      || evidence.configFingerprint !== redactedFingerprint('opencode-catalog-config-v1', expectedIdentity.managedConfigFingerprint)
+      || evidence.authFingerprint !== redactedFingerprint('opencode-catalog-auth-v1', expectedIdentity.selectedAuthBaselineFingerprint)
+      || !Number.isSafeInteger(envelope.catalogObservedAt) || (envelope.catalogObservedAt as number) < 0
+      || !Number.isSafeInteger(envelope.catalogExpiresAt)
+      || (envelope.catalogExpiresAt as number) < (envelope.catalogObservedAt as number)
+      || expectedRecordId !== catalogRecord.recordId
+      || envelope.envelopeHash !== `sha256:${hash(`${identityHash(expectedIdentity)}\0${expectedRecordId}\0${JSON.stringify(evidence)}\0${envelope.catalogObservedAt}\0${envelope.catalogExpiresAt}`)}`) return null
     // The identity contract creates a complete inert deep snapshot. Rebuild the
     // catalog only from that snapshot so custom persistence objects never escape.
     const payload = JSON.parse(JSON.stringify(identityPayload(catalogRecord as unknown as OpenCodeScopedProviderCatalog))) as OpenCodeCatalogRecordIdentityPayload
@@ -486,7 +675,12 @@ function decodePersistedCatalog(value: unknown, expectedIdentity: CacheIdentity)
       selectionAllowed: true as const,
       launchAuthorization: 'forbidden' as const,
     }
-    return Object.freeze(owned)
+    return Object.freeze({
+      catalog: Object.freeze(owned),
+      catalogEvidence: Object.freeze({ ...evidence }) as OpenCodeCatalogPublicationEvidence,
+      catalogObservedAt: envelope.catalogObservedAt as number,
+      catalogExpiresAt: envelope.catalogExpiresAt as number,
+    })
   } catch {
     return null
   }
@@ -562,7 +756,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     let value: unknown
     try { value = this.deps.now?.() ?? Date.now() } catch { throw fixedCatalogFailure() }
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0
-      || value > MAX_TIME_MS || (previous !== undefined && value < previous)
+      || value > MAX_EPOCH_MS || (previous !== undefined && value < previous)
       || (this.lastClockSample !== null && value < this.lastClockSample)) throw fixedCatalogFailure()
     this.lastClockSample = value
     return value
@@ -654,7 +848,10 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // retained for restart and known obsolete attempts are removed on abort.
       return
     }
-    void defaultCleanupStages(key, currentAttemptId).catch(() => undefined)
+    void (async () => {
+      const winner = decodeCommittedPointer(await defaultReadPointer(key))
+      await defaultCleanupStages(key, winner?.attemptId ?? currentAttemptId)
+    })().catch(() => undefined)
   }
 
   private discardStage(key: string, attemptId: string): void {
@@ -673,21 +870,44 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     profileRootPath: string
     projectPath: string
     catalog: OpenCodeScopedProviderCatalog
+    catalogEvidence: OpenCodeCatalogPublicationEvidence
+    catalogExpiresAt: number
     observedAtMs: number
     maxEntries: number
     signal: AbortSignal
     flight: Flight
   }): Promise<boolean> {
-    const previous = this.commitQueues.get(params.key) ?? Promise.resolve()
+    const sharedQueues = this.deps.writePersisted
+      ? (customPersistenceCommitQueues.get(this.deps.writePersisted)
+        ?? (() => {
+          const queues = new Map<string, Promise<boolean>>()
+          customPersistenceCommitQueues.set(this.deps.writePersisted!, queues)
+          return queues
+        })())
+      : null
+    const previous = sharedQueues?.get(params.key)
+      ?? this.commitQueues.get(params.key)
+      ?? Promise.resolve()
     const commit = previous.catch(() => undefined).then(async () => {
       if (!this.hasCommitAuthority(params)) return false
-      const envelope = persistedEnvelope(params.identity, params.catalog)
+      const envelope = persistedEnvelope(params.identity, {
+        catalog: params.catalog,
+        catalogEvidence: params.catalogEvidence,
+        catalogObservedAt: params.observedAtMs,
+        catalogExpiresAt: params.catalogExpiresAt,
+      })
       const attemptId = `${params.catalog.generation}-${randomUUID()}`
       let previousPointer: CommittedPointer | null = null
       try {
         previousPointer = decodeCommittedPointer(await this.readPointer(params.key))
       } catch {
         previousPointer = null
+      }
+      const candidatePointer = committedPointer(attemptId, params.catalog, params.catalogEvidence)
+      if (previousPointer && (compareCommittedPointers(previousPointer, candidatePointer) > 0
+        || (previousPointer.requestGeneration === candidatePointer.requestGeneration
+          && previousPointer.attemptIdentity !== candidatePointer.attemptIdentity))) {
+        return false
       }
       try {
         await this.stage(params.key, attemptId, envelope)
@@ -708,7 +928,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // preceding guard prevents a withdrawn, timed-out, or superseded flight
       // whose stage write ignored cancellation from becoming current.
       try {
-        await this.publish(params.key, committedPointer(attemptId, params.catalog), params.maxEntries)
+        await this.publish(params.key, candidatePointer, params.maxEntries)
       } catch {
         this.discardStage(params.key, attemptId)
         return false
@@ -718,7 +938,17 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       // the await. A withdrawn/expired/superseded flight revokes what it just
       // published before the per-key commit queue can advance.
       if (!this.hasCommitAuthority(params)) {
-        await this.revokePublishedPointer(params.key, previousPointer, params.maxEntries)
+        const durableWinner = decodeCommittedPointer(await this.readPointer(params.key).catch(() => null))
+        if (!this.deps.writePersisted) {
+          await defaultDiscardPointer(params.key, candidatePointer)
+        } else if (!durableWinner || compareCommittedPointers(durableWinner, candidatePointer) <= 0) {
+          await this.revokePublishedPointer(params.key, previousPointer, params.maxEntries)
+        }
+        this.discardStage(params.key, attemptId)
+        return false
+      }
+      const durableWinner = decodeCommittedPointer(await this.readPointer(params.key).catch(() => null))
+      if (durableWinner && compareCommittedPointers(durableWinner, candidatePointer) > 0) {
         this.discardStage(params.key, attemptId)
         return false
       }
@@ -728,6 +958,9 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         profileRootPath: params.profileRootPath,
         projectPath: params.projectPath,
         catalog: params.catalog,
+        catalogEvidence: params.catalogEvidence,
+        catalogObservedAt: params.observedAtMs,
+        catalogExpiresAt: params.catalogExpiresAt,
         lastUsedAt: params.observedAtMs,
       }, params.maxEntries)
       if (previousPointer && previousPointer.attemptId !== attemptId) {
@@ -737,10 +970,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       return true
     })
     this.commitQueues.set(params.key, commit)
+    sharedQueues?.set(params.key, commit)
     try {
       return await commit
     } finally {
       if (this.commitQueues.get(params.key) === commit) this.commitQueues.delete(params.key)
+      if (sharedQueues?.get(params.key) === commit) sharedQueues.delete(params.key)
     }
   }
 
@@ -754,9 +989,10 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     options: Options
     startedAt: number
     flight: Flight
+    catalogEvidence: OpenCodeCatalogPublicationEvidence
   }): Promise<OpenCodeProviderCatalogLoadResult> {
     const { key, identity, preparedProfile, profileRootPath, projectPath, providerId } = params
-    const { ttlMs, maxStaleMs, timeoutMs, maxEntries } = params.options
+    const { ttlMs, maxStaleMs, maxEntries } = params.options
     const signal = params.flight.controller.signal
     let clock = params.startedAt
     let prior = this.cache.get(key) ?? null
@@ -765,10 +1001,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (refreshed?.freshness.state === 'fresh') {
         prior = { ...prior, catalog: refreshed, lastUsedAt: clock }
         this.remember(prior, maxEntries)
-        return Object.freeze({ catalog: refreshed, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
+        return Object.freeze({ catalog: refreshed, catalogEvidence: prior.catalogEvidence,
+          catalogObservedAt: prior.catalogObservedAt, catalogExpiresAt: prior.catalogExpiresAt,
+          catalogProvenance: 'cache-hit' as const, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
       }
     } else {
-      let persisted: OpenCodeScopedProviderCatalog | null = null
+      let persisted: Pick<CacheEntry, 'catalog' | 'catalogEvidence' | 'catalogObservedAt' | 'catalogExpiresAt'> | null = null
       try {
         const pointer = decodeCommittedPointer(await this.readPointer(key))
         if (pointer) {
@@ -779,15 +1017,15 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
             // A committed pointer can outlive an unreadable stage. Treat that
             // candidate as absent and continue through the one live refresh.
           }
-          let decoded: OpenCodeScopedProviderCatalog | null = null
+          let decoded: ReturnType<typeof decodePersistedCatalog> = null
           try {
             decoded = decodePersistedCatalog(staged, identity)
           } catch {
             // Persistence values are untrusted. Never inspect or stringify a
             // decode failure; discard the candidate and refresh normally.
           }
-          if (decoded && decoded.generation === pointer.generation
-            && `sha256:${hash(decoded.recordId)}` === pointer.envelopeHash) persisted = decoded
+          if (decoded && decoded.catalog.generation === pointer.generation
+            && `sha256:${hash(decoded.catalog.recordId)}` === pointer.envelopeHash) persisted = decoded
         }
       } catch {
         throw fixedCatalogFailure()
@@ -795,13 +1033,17 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (signal.aborted) throw fixedCatalogFailure()
       clock = this.sampleClock(clock)
       if (persisted) {
-        const refreshed = refreshCatalog(persisted, clock, ttlMs, maxStaleMs)
+        const refreshed = refreshCatalog(persisted.catalog, clock, ttlMs, maxStaleMs)
         if (refreshed) {
-          prior = { key, identity, profileRootPath, projectPath, catalog: refreshed, lastUsedAt: clock }
+          prior = { key, identity, profileRootPath, projectPath, catalog: refreshed,
+            catalogEvidence: persisted.catalogEvidence, catalogObservedAt: persisted.catalogObservedAt,
+            catalogExpiresAt: persisted.catalogExpiresAt, lastUsedAt: clock }
           this.generations.set(key, Math.max(this.generations.get(key) ?? 0, refreshed.generation))
           if (refreshed.freshness.state === 'fresh') {
             this.remember(prior, maxEntries)
-            return Object.freeze({ catalog: refreshed, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
+            return Object.freeze({ catalog: refreshed, catalogEvidence: persisted.catalogEvidence,
+              catalogObservedAt: persisted.catalogObservedAt, catalogExpiresAt: persisted.catalogExpiresAt,
+              catalogProvenance: 'cache-hit' as const, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
           }
         }
       }
@@ -810,7 +1052,6 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     const generation = (this.generations.get(key) ?? 0) + 1
     this.generations.set(key, generation)
     let acquiredHostKey: string | null = null
-    let timeout: ReturnType<typeof setTimeout> | null = null
     const operation = (async () => {
       try {
         const ensureHost = this.deps.ensureHost ?? (async request => {
@@ -859,13 +1100,17 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           profileRootPath,
           projectPath,
           catalog,
+          catalogEvidence: params.catalogEvidence,
+          catalogExpiresAt: Math.min(MAX_EPOCH_MS, observedAtMs + ttlMs),
           observedAtMs,
           maxEntries,
           signal,
           flight: params.flight,
         })) throw fixedCatalogFailure()
         this.sampleClock(observedAtMs)
-        return Object.freeze({ catalog, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
+        return Object.freeze({ catalog, catalogEvidence: params.catalogEvidence,
+          catalogObservedAt: observedAtMs, catalogExpiresAt: Math.min(MAX_EPOCH_MS, observedAtMs + ttlMs),
+          catalogProvenance: 'fresh-live' as const, profileRootPath, projectPath, diagnostics: Object.freeze([]) })
       } finally {
         if (acquiredHostKey) await this.release(acquiredHostKey)
       }
@@ -874,19 +1119,11 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     // acquired by an abort-ignoring dependency is always eventually released.
     operation.catch(() => undefined)
     try {
-      const timed = new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => {
-          params.flight.abortKind = 'timeout'
-          params.flight.controller.abort(fixedCatalogFailure())
-          reject(fixedCatalogFailure())
-        }, timeoutMs)
-        timeout.unref?.()
-      })
       const aborted = new Promise<never>((_resolve, reject) => {
         if (signal.aborted) return reject(fixedCatalogFailure())
         signal.addEventListener('abort', () => reject(fixedCatalogFailure()), { once: true })
       })
-      return await Promise.race([operation, timed, aborted])
+      return await Promise.race([operation, aborted])
     } catch {
       if (params.flight.abortKind === 'no-waiters') throw fixedCatalogFailure()
       clock = this.sampleClock(clock)
@@ -894,23 +1131,64 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (!stale) throw fixedCatalogFailure()
       return Object.freeze({
         catalog: stale,
+        catalogEvidence: prior!.catalogEvidence,
+        catalogObservedAt: prior!.catalogObservedAt,
+        catalogExpiresAt: prior!.catalogExpiresAt,
+        catalogProvenance: 'bounded-stale' as const,
         profileRootPath,
         projectPath,
         diagnostics: Object.freeze(['OpenCode provider catalog refresh failed; using bounded stale data.']),
       })
-    } finally {
-      if (timeout) clearTimeout(timeout)
     }
   }
 
   async loadCatalog(unsafeInput: OpenCodeProviderCatalogLoadInput): Promise<OpenCodeProviderCatalogLoadResult> {
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+    let externalAbort: (() => void) | null = null
+    let ownedFlight: Flight | null = null
     try {
       const selectedOptions = options(this.deps)
       const input = snapshotInput(unsafeInput)
       if (input.abortSignal?.aborted) throw fixedCatalogFailure()
+      // The one attempt deadline is armed before canonicalization, durable
+      // allocation, profile preparation, cache hydration, or native/provider
+      // work. A small cleanup reserve aborts owned work before the public
+      // timeout boundary; no retry or fallback creates another budget.
+      const attemptController = new AbortController()
+      const reserveMs = Math.min(250, Math.floor(selectedOptions.timeoutMs / 10))
+      const workBudgetMs = Math.max(0, selectedOptions.timeoutMs - reserveMs)
+      const setTimer = this.deps.setTimer ?? setTimeout
+      const clearTimer = this.deps.clearTimer ?? clearTimeout
+      const deadline = new Promise<never>((_resolve, reject) => {
+        deadlineTimer = setTimer(() => {
+          if (ownedFlight) ownedFlight.abortKind = 'timeout'
+          attemptController.abort(fixedCatalogFailure())
+          reject(fixedCatalogFailure())
+        }, workBudgetMs)
+        deadlineTimer.unref?.()
+      })
+      externalAbort = () => attemptController.abort(fixedCatalogFailure())
+      input.abortSignal?.addEventListener('abort', externalAbort, { once: true })
+      const withinDeadline = <T>(operation: Promise<T>): Promise<T> =>
+        Promise.race([operation, deadline])
       const startedAt = this.sampleClock()
       const providerId = canonicalizeOpenCodeProviderId(input.providerId)
       if (!providerId) throw fixedCatalogFailure()
+      const requestedPath = path.resolve(input.projectPath ?? process.cwd())
+      const canonicalize = this.deps.canonicalizeProjectPath
+        ?? canonicalizeOpenCodePassiveProjectPath
+      const canonicalProjectPath = await withinDeadline(canonicalize(
+        requestedPath,
+        attemptController.signal,
+      ))
+      if (attemptController.signal.aborted) throw fixedCatalogFailure()
+      const requestScope = boundedIdentityMaterial([
+        canonicalProjectPath, providerId,
+      ])
+      const allocation = (this.deps.allocateAttempt ?? allocateDurableAttempt)(requestScope, startedAt)
+      if (attemptController.signal.aborted) throw fixedCatalogFailure()
+      if (!Number.isSafeInteger(allocation.requestGeneration) || allocation.requestGeneration < 1
+        || !/^sha256:[0-9a-f]{64}$/.test(allocation.attemptIdentity)) throw fixedCatalogFailure()
       const prepareProfile = this.deps.prepareProfile ?? (async plan => {
         const manager = this.deps.profileManager ?? (await import('./OpenCodeProfileManager.js'))
           .openCodeProfileManager as unknown as OpenCodeProviderCatalogProductionProfileManager
@@ -919,16 +1197,16 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           plan,
         )
       })
-      const rawProfile = await prepareProfile({
+      const rawProfile = await withinDeadline(prepareProfile({
         purpose: 'provider-catalog',
         providerId,
         runtimeInstanceId: `catalog-${randomUUID()}`,
-        ...(input.projectPath !== undefined ? { projectPath: input.projectPath } : {}),
-        ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}),
-      })
-      if (input.abortSignal?.aborted) throw fixedCatalogFailure()
+        projectPath: canonicalProjectPath,
+        abortSignal: attemptController.signal,
+      }))
+      if (attemptController.signal.aborted) throw fixedCatalogFailure()
       const afterProfile = this.sampleClock(startedAt)
-      const profile = snapshotProfile(rawProfile, providerId)
+      const profile = snapshotProfile(rawProfile, providerId, canonicalProjectPath)
       const key = cacheKeyFor(profile.identity)
       let flight = this.inFlight.get(key)
       if (flight?.controller.signal.aborted) {
@@ -936,8 +1214,11 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         flight = undefined
       }
       if (!flight) {
+        const catalogEvidence = createCatalogPublicationEvidence(
+          profile.identity, allocation, startedAt,
+        )
         const created = {
-          controller: new AbortController(),
+          controller: attemptController,
           abortKind: null,
           settled: false,
           waiters: new Set<symbol>(),
@@ -953,14 +1234,22 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
           options: selectedOptions,
           startedAt: afterProfile,
           flight: created,
+          catalogEvidence,
         }).finally(() => {
           created.settled = true
           if (this.inFlight.get(key) === created) this.inFlight.delete(key)
         })
         flight = created
+        ownedFlight = created
         this.inFlight.set(key, flight)
       }
       const activeFlight = flight
+      // From here caller cancellation is waiter-local. It must not abort a
+      // coalesced flight while another caller still owns it.
+      if (externalAbort) {
+        input.abortSignal?.removeEventListener('abort', externalAbort)
+        externalAbort = null
+      }
       const waiter = Symbol('catalog-waiter')
       activeFlight.waiters.add(waiter)
       let callerCancelled = false
@@ -981,7 +1270,11 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       input.abortSignal?.addEventListener('abort', cancel, { once: true })
       try {
         if (input.abortSignal?.aborted) cancel()
-        const result = await Promise.race([activeFlight.promise, localCancellation])
+        const result = await Promise.race([
+          activeFlight.promise,
+          localCancellation,
+          ...(ownedFlight ? [] : [deadline]),
+        ])
         if (input.abortSignal?.aborted) throw fixedCatalogFailure()
         this.sampleClock(afterProfile)
         return result
@@ -992,6 +1285,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       }
     } catch {
       throw fixedCatalogFailure()
+    } finally {
+      const input = snapshotRecord(unsafeInput)
+      if (externalAbort && input?.abortSignal instanceof AbortSignal) {
+        input.abortSignal.removeEventListener('abort', externalAbort)
+      }
+      if (deadlineTimer) (this.deps.clearTimer ?? clearTimeout)(deadlineTimer)
     }
   }
 }

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 import {
   OpenCodeProviderCatalogService,
@@ -66,11 +69,18 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
   const releases: string[] = []
   let config = 'config-a'
   let auth = 'auth-a'
+  let requestGeneration = 0
   const deps: OpenCodeProviderCatalogServiceDeps = {
     now: () => now,
     ttlMs: 10,
     maxStaleMs: 1_000,
     timeoutMs: 20,
+    canonicalizeProjectPath: async projectPath => projectPath,
+    allocateAttempt: () => {
+      requestGeneration += 1
+      return { requestGeneration,
+        attemptIdentity: `sha256:${requestGeneration.toString(16).padStart(64, '0')}` }
+    },
     prepareProfile: async plan => {
       plans.push(plan)
       return profile({
@@ -105,6 +115,160 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
 }
 
 describe('OpenCodeProviderCatalogService', () => {
+  test('one absolute deadline aborts a forever-hanging profile in controlled fake time', async () => {
+    let fire!: () => void
+    let preparedSignal!: AbortSignal
+    const f = fixture({
+      timeoutMs: 1_000,
+      setTimer: ((callback: () => void) => {
+        fire = callback
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimer: (() => undefined) as typeof clearTimeout,
+      prepareProfile: async ({ abortSignal }) => {
+        preparedSignal = abortSignal!
+        return new Promise<never>(() => {})
+      },
+    })
+    const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    while (!preparedSignal) await Promise.resolve()
+    fire()
+    await expect(pending).rejects.toThrow('temporarily unavailable')
+    expect(preparedSignal.aborted).toBe(true)
+  })
+
+  test('canonical project identity is allocated and prepared once for symlink aliases', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-project-'))
+    const target = path.join(root, 'target')
+    const alias = path.join(root, 'alias')
+    await mkdir(target)
+    await symlink(target, alias, 'dir')
+    const scopes: string[] = []
+    try {
+      const canonical = await realpath(target)
+      const f = fixture({
+        timeoutMs: 1_000,
+        canonicalizeProjectPath: async projectPath => realpath(projectPath),
+        allocateAttempt: scope => {
+          scopes.push(scope)
+          return { requestGeneration: scopes.length,
+            attemptIdentity: `sha256:${scopes.length.toString(16).padStart(64, '0')}` }
+        },
+      })
+      const fromAlias = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: alias })
+      const fromTarget = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: target })
+      expect(scopes[0]).toBe(scopes[1])
+      expect(fromAlias.projectPath).toBe(canonical)
+      expect(fromTarget.projectPath).toBe(canonical)
+      expect(f.plans.every(plan => plan.projectPath === canonical)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('platform-normalized aliases share the durable allocation scope and profile identity', async () => {
+    const scopes: string[] = []
+    const canonicalizeProjectPath = async () => 'c:\\users\\alice\\project'
+    const f = fixture({
+      canonicalizeProjectPath,
+      allocateAttempt: scope => {
+        scopes.push(scope)
+        return { requestGeneration: scopes.length,
+          attemptIdentity: `sha256:${scopes.length.toString(16).padStart(64, '0')}` }
+      },
+    })
+    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: 'C:\\Users\\ALICE\\Project' })
+    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: 'c:\\users\\alice\\project\\' })
+    expect(scopes[0]).toBe(scopes[1])
+    expect(f.plans.every(plan => plan.projectPath === 'c:\\users\\alice\\project')).toBe(true)
+  })
+
+  test('durable attempt order wins across instances with inverted completion and backward clocks', async () => {
+    const persistence = memoryPersistence()
+    let allocation = 0
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    const common = {
+      ...persistence,
+      allocateAttempt: () => {
+        allocation += 1
+        return { requestGeneration: allocation,
+          attemptIdentity: `sha256:${allocation.toString(16).padStart(64, '0')}` }
+      },
+    }
+    const old = fixture({ ...common, now: () => 1_000,
+      fetchProviderCatalog: async () => { await oldGate; return response('deepinfra', 'old') } })
+    const newer = fixture({ ...common, now: () => 900,
+      fetchProviderCatalog: async () => response('deepinfra', 'winner') })
+    const late = old.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    while (allocation < 1) await Promise.resolve()
+    const winner = await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    releaseOld()
+    await expect(late).rejects.toThrow('temporarily unavailable')
+    expect(winner.catalogEvidence.requestGeneration).toBe(2)
+    const restarted = fixture({ ...common, now: () => 900,
+      fetchProviderCatalog: async () => { throw new Error('winner must hydrate') } })
+    const restored = await restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    expect(restored.catalog.models.map(model => model.id)).toEqual(['winner'])
+    expect(JSON.stringify([...persistence.values.values()])).not.toContain('"old"')
+  })
+
+  test('durable attempt order is independent of identical frozen clocks', async () => {
+    const persistence = memoryPersistence()
+    let allocation = 0
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    const common = {
+      ...persistence,
+      now: () => 1_000,
+      allocateAttempt: () => {
+        allocation += 1
+        return { requestGeneration: allocation,
+          attemptIdentity: `sha256:${allocation.toString(16).padStart(64, '0')}` }
+      },
+    }
+    const old = fixture({ ...common,
+      fetchProviderCatalog: async () => { await oldGate; return response('deepinfra', 'old') } })
+    const newer = fixture({ ...common,
+      fetchProviderCatalog: async () => response('deepinfra', 'winner') })
+    const late = old.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    while (allocation < 1) await Promise.resolve()
+    await newer.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    releaseOld()
+    await expect(late).rejects.toThrow('temporarily unavailable')
+    const restored = await fixture({ ...common,
+      fetchProviderCatalog: async () => { throw new Error('must hydrate winner') } })
+      .service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    expect(restored.catalog.models.map(model => model.id)).toEqual(['winner'])
+  })
+  test('accepts production epoch time and rejects nonfinite or out-of-Date-range clocks', async () => {
+    const production = fixture({ now: undefined, timeoutMs: 1_000 })
+    const result = await production.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    expect(result.catalogEvidence.startedAt).toBeGreaterThan(1_700_000_000_000)
+    for (const now of [Number.NaN, Number.POSITIVE_INFINITY, 8_640_000_000_000_001]) {
+      await expect(fixture({ now: () => now }).service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+        .rejects.toThrow('temporarily unavailable')
+    }
+  })
+
+  test('default attempt ledger remains monotonic across service instances', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-attempt-test-'))
+    const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    process.env.CLAUDE_MULTIMODEL_CACHE_HOME = root
+    try {
+      const first = fixture({ allocateAttempt: undefined })
+      const one = await first.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/durable' })
+      const restarted = fixture({ allocateAttempt: undefined })
+      const two = await restarted.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/durable' })
+      expect(two.catalogEvidence.requestGeneration).toBe(one.catalogEvidence.requestGeneration + 1)
+      expect(two.catalogEvidence.attemptIdentity).not.toBe(one.catalogEvidence.attemptIdentity)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   test('production wiring plans and passes the exact expected plan to scoped preparation', async () => {
     const calls: string[] = []
     const expected = Object.freeze({ digest: 'expected' }) as unknown as OpenCodeScopedProfilePlanContract
@@ -153,6 +317,11 @@ describe('OpenCodeProviderCatalogService', () => {
       providerId: 'deepinfra', selectionAllowed: true, launchAuthorization: 'forbidden',
     })
     expect(result.catalog).not.toHaveProperty('launchReadiness')
+    expect(result.catalogEvidence).toMatchObject({ providerId: 'deepinfra', requestGeneration: 1, startedAt: 1_000 })
+    expect(Object.values(result.catalogEvidence).join('|')).not.toContain('/p')
+    expect(Object.values(result.catalogEvidence).join('|')).not.toContain('config-a')
+    expect(Object.values(result.catalogEvidence).join('|')).not.toContain('auth-a')
+    expect(result.catalogEvidence.attemptIdentity).toMatch(/^sha256:[0-9a-f]{64}$/)
     expect(f.releases).toEqual(['/p:deepinfra'])
   })
 
@@ -217,15 +386,17 @@ describe('OpenCodeProviderCatalogService', () => {
 
   test('config and auth rotations miss cache and create distinct cache identities', async () => {
     const f = fixture()
-    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    const first = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     f.advance(11)
     f.rotateConfig('config-b')
-    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    const second = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     f.advance(11)
     f.rotateAuth('auth-b')
-    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    const third = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
 
     expect(f.writes.filter(write => write.key.endsWith('.current'))).toHaveLength(3)
+    expect([first, second, third].map(result => result.catalogEvidence.requestGeneration)).toEqual([1, 2, 3])
+    expect(new Set([first, second, third].map(result => result.catalogEvidence.attemptIdentity)).size).toBe(3)
   })
 
   test('late completion after cancellation cannot replace a newer generation', async () => {
@@ -268,12 +439,16 @@ describe('OpenCodeProviderCatalogService', () => {
       fetchProviderCatalog: async () => { fetches += 1; return response('deepinfra') },
     }
     const first = fixture(shared)
-    await first.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    const original = await first.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     const second = fixture(shared)
     const restored = await second.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
 
     expect(fetches).toBe(1)
     expect(restored.catalog.source).toBe('bounded-cache')
+    expect(restored.catalogEvidence).toEqual(original.catalogEvidence)
+    expect(restored.catalogObservedAt).toBe(original.catalogObservedAt)
+    expect(restored.catalogExpiresAt).toBe(original.catalogExpiresAt)
+    expect(restored.catalogProvenance).toBe('cache-hit')
     expect(restored.catalog.launchAuthorization).toBe('forbidden')
     second.advance(11)
     const refreshed = await second.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
@@ -438,7 +613,7 @@ describe('OpenCodeProviderCatalogService', () => {
     const f = fixture({
       fetchProviderCatalog: async () => hang ? new Promise<never>(() => {}) : response('deepinfra'),
     })
-    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    const fresh = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
     f.advance(11)
     hang = true
     const stale = await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
@@ -446,9 +621,24 @@ describe('OpenCodeProviderCatalogService', () => {
     expect(stale.catalog.freshness.state).toBe('bounded-stale')
     expect(stale.catalog.source).toBe('bounded-cache')
     expect(stale.catalog.launchAuthorization).toBe('forbidden')
+    expect(stale.catalogEvidence).toEqual(fresh.catalogEvidence)
+    expect(stale.catalogObservedAt).toBe(fresh.catalogObservedAt)
+    expect(stale.catalogExpiresAt).toBe(fresh.catalogExpiresAt)
+    expect(stale.catalogProvenance).toBe('bounded-stale')
     expect(stale.diagnostics).toEqual([
       'OpenCode provider catalog refresh failed; using bounded stale data.',
     ])
+  })
+
+  test('max-stale expiry returns no fallback catalog authority', async () => {
+    let hang = false
+    const f = fixture({ timeoutMs: 2, maxStaleMs: 20,
+      fetchProviderCatalog: async () => hang ? new Promise<never>(() => {}) : response('deepinfra') })
+    await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' })
+    f.advance(21)
+    hang = true
+    await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+      .rejects.toThrow('temporarily unavailable')
   })
 
   test('never serves stale data across an exact config identity rotation', async () => {

@@ -1,15 +1,38 @@
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { constants as fsConstants, readFileSync } from 'node:fs'
-import { lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { ensureOpenCodeSafePublicationDirectory } from './OpenCodeSafePublication.js'
 import {
+  decodeOpenCodePassiveSnapshotCommit,
+  encodeOpenCodePassiveSnapshotCommit,
+  openCodePassiveCommitName,
+  OPEN_CODE_PASSIVE_COMMIT_MAX_BYTES,
+  OPEN_CODE_PASSIVE_COMMIT_NAME_PATTERN,
+  OPEN_CODE_PASSIVE_COMMIT_TEMP_PATTERN,
+  OPEN_CODE_PASSIVE_COMMITS,
+  OPEN_CODE_PASSIVE_GENERATION_BINARY,
+  OPEN_CODE_PASSIVE_GENERATION_PROJECT,
+  OPEN_CODE_PASSIVE_GENERATION_PATTERN,
+  OPEN_CODE_PASSIVE_GENERATIONS,
+  OPEN_CODE_PASSIVE_READER_GRACE_MS,
+  OPEN_CODE_PASSIVE_RETAIN_GENERATIONS,
+  OPEN_CODE_PASSIVE_SCOPES,
+  OPEN_CODE_PASSIVE_TRANSACTION_MARKER,
+  OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT,
+  openCodePassiveGenerationSequence,
+} from './OpenCodePassiveSnapshotTransaction.js'
+import {
   getOpenCodePassiveSnapshotPath,
   getOpenCodePassiveStatusRootDirectory,
+  readBoundedSnapshotText,
 } from './OpenCodePassiveStatusProductionReader.js'
 import {
+  assertOpenCodePassiveSnapshotPersistenceSupported,
+  getOpenCodePassiveSnapshotPersistenceCapability,
+} from './OpenCodePassiveSnapshotPersistencePolicy.js'
+import {
+  decodeOpenCodeRedactedSnapshotV1,
   encodeOpenCodeRedactedSnapshotV1,
   OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES,
   type OpenCodeRedactedSnapshotV1,
@@ -17,322 +40,297 @@ import {
 } from './OpenCodeRedactedStatusSnapshot.js'
 
 type SnapshotWriterDeps = Readonly<{
+  platform?: NodeJS.Platform
   rootDirectory?: string
   makeDirectory?: (directory: string) => Promise<unknown>
   writeAtomic?: (filePath: string, data: string) => Promise<void>
   safeStorageHooks?: {
     afterRootOpened?: () => void | Promise<void>
+    afterTransactionMarker?: () => void | Promise<void>
+    afterGenerationDirectoryCreated?: () => void | Promise<void>
     afterProjectSnapshotPublished?: () => void | Promise<void>
-    afterBinarySnapshotRenamed?: () => void | Promise<void>
-    afterLeaseDirectoryCreated?: (leaseName: string) => void | Promise<void>
-    afterLeaseWait?: (leaseName: string) => void | Promise<void>
+    afterBinarySnapshotPublished?: () => void | Promise<void>
+    afterGenerationParentSynced?: () => void | Promise<void>
+    beforeCommitPublished?: () => void | Promise<void>
+    afterCommitPublished?: () => void | Promise<void>
+    cleanupFailed?: (error: unknown) => void
+    ancestorDirectorySynced?: (directory: string) => void | Promise<void>
+    beforeCleanup?: () => void | Promise<void>
   }
-  leaseWaitTimeoutMs?: number
-  leaseNow?: () => number
-  leaseWait?: (signal: AbortSignal, delayMs: number) => Promise<void>
-  leaseOwner?: Readonly<{ pid: number; birthIdentity: string }>
-  leaseOwnerIsAlive?: (owner: Readonly<{ pid: number; birthIdentity: string }>) => boolean | Promise<boolean>
-  leaseCleanupRename?: (source: string, destination: string) => Promise<void>
+  now?: () => number
+  scheduleMaintenance?: (operation: () => void, delayMs: number) => void
+  retentionCount?: number
+  readerGraceMs?: number
 }>
 
-type LeaseOwner = Readonly<{ pid: number; birthIdentity: string; token: string }>
-const PROCESS_BIRTH_IDENTITY = readLinuxProcessBirthIdentity(process.pid)
-  ?? `${process.pid}:${Math.floor(Date.now() - process.uptime() * 1_000)}`
-
-/** Explicit update-path writer. It is intentionally never owned or called by readStatus. */
+/**
+ * Append-only publication. There is deliberately no lock, shared pointer,
+ * recovery operation, or correctness-path garbage collection. Every pathname
+ * this writer publishes is cryptographically unique and is never reclaimed or
+ * replaced by another writer.
+ */
 export class OpenCodePassiveStatusSnapshotWriter implements OpenCodeRedactedSnapshotWriterPort {
+  readonly #platform: NodeJS.Platform
   readonly #rootDirectory: string
   readonly #makeDirectory: (directory: string) => Promise<unknown>
   readonly #writeAtomic: (filePath: string, data: string) => Promise<void>
   readonly #legacyInjectedStorage: boolean
-  readonly #safeStorageHooks: NonNullable<SnapshotWriterDeps['safeStorageHooks']>
-  readonly #leaseWaitTimeoutMs: number
-  readonly #leaseNow: () => number
-  readonly #leaseWait: (signal: AbortSignal, delayMs: number) => Promise<void>
-  readonly #leaseOwner: Readonly<{ pid: number; birthIdentity: string }>
-  readonly #leaseOwnerIsAlive: NonNullable<SnapshotWriterDeps['leaseOwnerIsAlive']>
-  readonly #leaseCleanupRename: NonNullable<SnapshotWriterDeps['leaseCleanupRename']>
+  readonly #hooks: NonNullable<SnapshotWriterDeps['safeStorageHooks']>
+  readonly #now: () => number
+  readonly #scheduleMaintenance: (operation: () => void, delayMs: number) => void
+  readonly #retentionCount: number
+  readonly #readerGraceMs: number
+  #maintenancePublications = 0
 
   constructor(deps: SnapshotWriterDeps = {}) {
     if ((deps.makeDirectory === undefined) !== (deps.writeAtomic === undefined)) {
       throw new TypeError('Passive snapshot test storage requires both directory and atomic-write ports')
     }
-    for (const value of [deps.leaseWaitTimeoutMs]) {
-      if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
-        throw new TypeError('Passive snapshot lease bounds must be positive safe integers')
-      }
-    }
-    this.#rootDirectory = deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
-    this.#legacyInjectedStorage = deps.makeDirectory !== undefined || deps.writeAtomic !== undefined
+    this.#platform = deps.platform ?? process.platform
+    this.#rootDirectory = getOpenCodePassiveSnapshotPersistenceCapability(this.#platform).supported
+      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
+      : ''
+    this.#legacyInjectedStorage = deps.makeDirectory !== undefined
     this.#makeDirectory = deps.makeDirectory ?? (async () => undefined)
     this.#writeAtomic = deps.writeAtomic ?? ((filePath, data) => writeFileAtomic(filePath, data, { mode: 0o600 }))
-    this.#safeStorageHooks = deps.safeStorageHooks ?? {}
-    this.#leaseWaitTimeoutMs = deps.leaseWaitTimeoutMs ?? 2_000
-    this.#leaseNow = deps.leaseNow ?? Date.now
-    this.#leaseWait = deps.leaseWait ?? waitForLease
-    this.#leaseOwner = deps.leaseOwner ?? { pid: process.pid, birthIdentity: processBirthIdentity() }
-    this.#leaseOwnerIsAlive = deps.leaseOwnerIsAlive ?? isLeaseOwnerAlive
-    this.#leaseCleanupRename = deps.leaseCleanupRename ?? rename
+    this.#hooks = deps.safeStorageHooks ?? {}
+    this.#now = deps.now ?? Date.now
+    this.#scheduleMaintenance = deps.scheduleMaintenance ?? ((operation, delayMs) => {
+      const timer = setTimeout(operation, delayMs)
+      timer.unref?.()
+    })
+    this.#retentionCount = deps.retentionCount ?? OPEN_CODE_PASSIVE_RETAIN_GENERATIONS
+    this.#readerGraceMs = deps.readerGraceMs ?? OPEN_CODE_PASSIVE_READER_GRACE_MS
+    if (!Number.isSafeInteger(this.#retentionCount) || this.#retentionCount < 2
+      || !Number.isSafeInteger(this.#readerGraceMs) || this.#readerGraceMs <= 60_000) {
+      throw new TypeError('Passive snapshot retention policy is invalid')
+    }
   }
 
   async write(snapshot: OpenCodeRedactedSnapshotV1, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-    const encoded = encodeOpenCodeRedactedSnapshotV1(snapshot)
-    if (!encoded.ok || !encoded.bytes || encoded.bytes.byteLength > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
+    // This capability gate must remain the first operation: unsupported native
+    // platforms perform no inspection, creation, publication, or cleanup I/O.
+    assertOpenCodePassiveSnapshotPersistenceSupported(this.#platform)
+    if (signal.aborted) throw cancelled()
+    const preflight = encodeOpenCodeRedactedSnapshotV1(snapshot)
+    if (!preflight.ok || !preflight.bytes || preflight.bytes.byteLength > OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES) {
       throw new TypeError('Passive snapshot is not a bounded redacted snapshot')
     }
-    // Own the exact immutable bounded payload before any asynchronous filesystem boundary.
-    const owned = new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
-    const snapshotFile = getOpenCodePassiveSnapshotPath(this.#rootDirectory, encoded.value.projectScope)
+    const digest = preflight.value.projectScope.slice(7)
+    const compatibilityOwned = new TextDecoder('utf-8', { fatal: true }).decode(preflight.bytes)
     if (this.#legacyInjectedStorage) {
+      const snapshotFile = getOpenCodePassiveSnapshotPath(this.#rootDirectory, preflight.value.projectScope)
       await this.#makeDirectory(path.dirname(snapshotFile))
-      if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-      await this.#writeAtomic(snapshotFile, owned)
-      if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-      await this.#writeAtomic(path.join(this.#rootDirectory, 'binary.snapshot.json'), owned)
+      if (signal.aborted) throw cancelled()
+      await this.#writeAtomic(snapshotFile, compatibilityOwned)
+      if (signal.aborted) throw cancelled()
+      await this.#writeAtomic(path.join(this.#rootDirectory, 'binary.snapshot.json'), compatibilityOwned)
       return
     }
-    const root = await ensureOpenCodeSafePublicationDirectory(this.#rootDirectory)
+
+    const root = await ensureOpenCodeSafePublicationDirectory(
+      this.#rootDirectory, true, this.#hooks.ancestorDirectorySynced,
+    )
     try {
-      await this.#safeStorageHooks.afterRootOpened?.()
-      // Publishers always acquire their scope lease first. Taking the single
-      // shared-binary lease only here gives every writer the same scope ->
-      // binary acquisition order and makes verification plus rollback one
-      // cross-process transaction without placing a lock on passive reads.
-      await this.#withLease(root, 'binary.snapshot.lease', 'binary', signal, async () => {
-        const snapshots = await root.ensureChildDirectory('snapshots')
+      await this.#hooks.afterRootOpened?.()
+      // Marker creation is monotonic. Once it exists readers must never fall
+      // back to compatibility mirrors, including after an interrupted migration.
+      await root.publishImmutableFile(
+        OPEN_CODE_PASSIVE_TRANSACTION_MARKER, OPEN_CODE_PASSIVE_TRANSACTION_MARKER_CONTENT, 0o600,
+      )
+      await root.sync()
+      await this.#hooks.afterTransactionMarker?.()
+
+      const scopes = await root.ensureChildDirectoryDurable(
+        OPEN_CODE_PASSIVE_SCOPES, 0o700, this.#hooks.ancestorDirectorySynced,
+      )
+      const scope = await scopes.ensureChildDirectoryDurable(
+        digest, 0o700, this.#hooks.ancestorDirectorySynced,
+      )
+      const generations = await scope.ensureChildDirectoryDurable(
+        OPEN_CODE_PASSIVE_GENERATIONS, 0o700, this.#hooks.ancestorDirectorySynced,
+      )
+      const commits = await scope.ensureChildDirectoryDurable(
+        OPEN_CODE_PASSIVE_COMMITS, 0o700, this.#hooks.ancestorDirectorySynced,
+      )
+      const claimed = await claimGeneration(generations, this.#hooks.ancestorDirectorySynced)
+      const generationName = claimed.name
+      const publicationSequence = claimed.sequence
+      const generation = claimed.directory
+      try {
+        await this.#hooks.afterGenerationDirectoryCreated?.()
+        if (signal.aborted) throw cancelled()
+        const publication = assignEvidenceGeneration(snapshot, publicationSequence)
+        const encoded = encodeOpenCodeRedactedSnapshotV1(publication)
+        if (!encoded.ok || !encoded.bytes) throw new TypeError('Passive snapshot evidence is invalid')
+        const owned = new TextDecoder('utf-8', { fatal: true }).decode(encoded.bytes)
+        await generation.publishImmutableFile(OPEN_CODE_PASSIVE_GENERATION_PROJECT, owned, 0o600)
+        await this.#hooks.afterProjectSnapshotPublished?.()
+        if (signal.aborted) throw cancelled()
+        await generation.publishImmutableFile(OPEN_CODE_PASSIVE_GENERATION_BINARY, owned, 0o600)
+        await this.#hooks.afterBinarySnapshotPublished?.()
+        if (signal.aborted) throw cancelled()
+        await generation.sync()
+        await generations.sync()
+        await this.#hooks.afterGenerationParentSynced?.()
+        if (signal.aborted) throw cancelled()
+        const commit = encodeOpenCodePassiveSnapshotCommit({
+          schemaVersion: 2,
+          scope: publication.projectScope,
+          generation: generationName,
+          domainGeneration: publicationSequence,
+        })
+        await this.#hooks.beforeCommitPublished?.()
+        await commits.publishImmutableFile(openCodePassiveCommitName(
+          publicationSequence, generationName,
+        ), commit, 0o600)
+        await commits.sync()
+        await this.#hooks.afterCommitPublished?.()
+
+        if (this.#maintenancePublications === 0) {
+          const maintenance = () => { void this.maintain(publication.projectScope).catch(error => {
+            this.#hooks.cleanupFailed?.(error)
+          }) }
+          this.#scheduleMaintenance(maintenance, 0)
+          this.#scheduleMaintenance(maintenance, this.#readerGraceMs + 1)
+        }
+
+        // Write-only compatibility mirrors. Failures cannot revoke a committed
+        // immutable transaction and readers ignore these whenever the marker exists.
         try {
-          const snapshotName = `${encoded.value.projectScope.slice(7)}.json`
-          const previousSnapshot = await snapshots.readBoundedRegularFile(snapshotName, OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
-          const previousBinary = await root.readBoundedRegularFile('binary.snapshot.json', OPEN_CODE_REDACTED_SNAPSHOT_MAX_BYTES)
-          try {
-            if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-            await snapshots.writeFileAtomic(snapshotName, owned, 0o600, signal)
-            await this.#safeStorageHooks.afterProjectSnapshotPublished?.()
-            if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-            await root.writeFileAtomic('binary.snapshot.json', owned, 0o600, signal, {
-              afterRenameBeforeVerification: this.#safeStorageHooks.afterBinarySnapshotRenamed,
-            })
-          } catch (error) {
-            await restorePublishedFile(snapshots, snapshotName, previousSnapshot)
-            await restorePublishedFile(root, 'binary.snapshot.json', previousBinary)
-            throw error
-          }
-        } finally { await snapshots.close() }
-      })
+          const mirrors = await root.ensureChildDirectory('snapshots')
+          try { await mirrors.writeFileAtomic(`${digest}.json`, compatibilityOwned, 0o600) }
+          finally { await mirrors.close() }
+          await root.writeFileAtomic('binary.snapshot.json', compatibilityOwned, 0o600)
+        } catch { /* disk hygiene/compatibility only */ }
+      } finally {
+        await generation.close().catch(() => undefined)
+        await commits.close().catch(() => undefined)
+        await generations.close().catch(() => undefined)
+        await scope.close().catch(() => undefined)
+        await scopes.close().catch(() => undefined)
+      }
     } finally { await root.close() }
   }
 
-  async withScopeLease<T>(
-    scope: `sha256:${string}`,
-    signal: AbortSignal,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    if (this.#legacyInjectedStorage) return operation()
-    const root = await ensureOpenCodeSafePublicationDirectory(this.#rootDirectory)
+  /** Out-of-band hygiene; publication and readers never depend on its success. */
+  async maintain(projectScope: `sha256:${string}`): Promise<void> {
+    if (this.#legacyInjectedStorage) return
+    await this.#hooks.beforeCleanup?.()
+    const now = this.#now()
+    if (!Number.isSafeInteger(now) || now < 0) return
+    let root: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>> | null = null
+    let scopes: typeof root = null; let scope: typeof root = null
+    let commits: typeof root = null; let generations: typeof root = null
     try {
-      return await this.#withLease(root, `${scope.slice(7)}.lease`, 'scope', signal, operation)
-    } finally {
-      await root.close()
-    }
-  }
-
-  async #withLease<T>(
-    root: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>>,
-    name: string,
-    kind: 'scope' | 'binary',
-    signal: AbortSignal,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    const locks = await root.ensureChildDirectory('locks')
-    try {
-      const lockName = `${name}.lock`
-      const leasePath = locks.child(lockName)
-      const deadline = this.#leaseNow() + this.#leaseWaitTimeoutMs
-      const owner: LeaseOwner = { ...this.#leaseOwner, token: randomUUID() }
-      for (;;) {
-        if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-        try {
-          await createInitializedLeaseDirectory(leasePath, owner)
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-          await this.#recoverLeaseIfSafe(locks.descriptorPath(), lockName)
-          if (this.#leaseNow() >= deadline) throw Object.assign(
-            new Error(`Passive snapshot ${kind} lease is held by a live owner`), { code: 'ELOCKED' },
-          )
-          await this.#safeStorageHooks.afterLeaseWait?.(name)
-          await this.#leaseWait(signal, 25)
+      root = await ensureOpenCodeSafePublicationDirectory(this.#rootDirectory, true)
+      scopes = await root.openChildDirectory(OPEN_CODE_PASSIVE_SCOPES)
+      scope = await scopes.openChildDirectory(projectScope.slice(7))
+      commits = await scope.openChildDirectory(OPEN_CODE_PASSIVE_COMMITS)
+      generations = await scope.openChildDirectory(OPEN_CODE_PASSIVE_GENERATIONS)
+      let records = await maintenanceRecords(commits, projectScope)
+      if (records.length > this.#retentionCount) {
+        // Publish a cumulative immutable checkpoint before dropping evidence.
+        // If this fails, deletion never starts and the prior commits stay valid.
+        const text = await readBoundedSnapshotText(
+          getOpenCodePassiveSnapshotPath(this.#rootDirectory, projectScope), new AbortController().signal,
+        )
+        const decoded = decodeOpenCodeRedactedSnapshotV1(text)
+        if (!decoded.ok || decoded.value.projectScope !== projectScope) {
+          throw new Error('Passive snapshot compaction input is invalid')
+        }
+        this.#maintenancePublications += 1
+        try { await this.write(decoded.value, new AbortController().signal) }
+        finally { this.#maintenancePublications -= 1 }
+        records = await maintenanceRecords(commits, projectScope)
+      }
+      const recent = records.filter(record => record.modifiedAt >= now - this.#readerGraceMs)
+      const keep = new Set(records.slice(0, this.#retentionCount).map(record => record.name))
+      for (const record of recent) keep.add(record.name)
+      // A reader may have selected the transaction immediately preceding the grace window.
+      const oldestRecent = recent.at(-1)
+      if (oldestRecent) {
+        const predecessor = records.find(record => record.sequence < oldestRecent.sequence)
+        if (predecessor) keep.add(predecessor.name)
+      }
+      for (const record of records) {
+        if (keep.has(record.name)) continue
+        await commits.removeRegularFile(record.name)
+        await generations.retireChildDirectory(record.generation, `.retired.${randomUUID()}`).catch(() => undefined)
+      }
+      const referenced = new Set(records.filter(record => keep.has(record.name)).map(record => record.generation))
+      for (const name of await generations.childNames()) {
+        if (referenced.has(name)) continue
+        if (name.startsWith('.retired.')) {
+          await generations.retireChildDirectory(name, `.retired.${randomUUID()}`).catch(() => undefined)
           continue
         }
-        await this.#safeStorageHooks.afterLeaseDirectoryCreated?.(name)
-        break
-      }
-      let leaseDirectory
-      try { leaseDirectory = await locks.openChildDirectory(lockName) }
-      catch (error) {
-        await this.#recoverLeaseIfSafe(locks.descriptorPath(), lockName).catch(() => undefined)
-        throw error
-      }
-      const ownedLeasePath = leaseDirectory.descriptorPath()
-      try {
-        if (signal.aborted) throw new Error('Passive snapshot update cancelled')
-        return await operation()
-      } finally {
-        await rename(
-          path.join(ownedLeasePath, 'active.json'), path.join(ownedLeasePath, 'released.json'),
-        ).catch(() => undefined)
-        await leaseDirectory.close().catch(() => undefined)
-        await this.#recoverLeaseIfSafe(locks.descriptorPath(), lockName)
-      }
-    } finally {
-      await locks.close().catch(() => undefined)
-    }
-  }
-
-  async #recoverLeaseIfSafe(locksPath: string, lockName: string): Promise<void> {
-    const leasePath = path.join(locksPath, lockName)
-    let marker = 'released.json'
-    let owner = await readLeaseOwner(path.join(leasePath, marker))
-    if (!owner) {
-      marker = 'active.json'
-      owner = await readLeaseOwner(path.join(leasePath, marker))
-      if (owner && await this.#leaseOwnerIsAlive(owner)) return
-    }
-    if (!owner) {
-      const cleanup = (await readdir(leasePath).catch(() => []))
-        .find(entry => /^cleanup\.[0-9a-f-]+\.json$/.test(entry))
-      if (!cleanup) return
-      marker = cleanup
-      owner = await readLeaseOwner(path.join(
-        leasePath, `claimant.${cleanup.slice('cleanup.'.length, -'.json'.length)}.json`,
-      ))
-      if (!owner || await this.#leaseOwnerIsAlive(owner)) return
-    }
-
-    // Moving the one extant state marker is the fencing operation. Exactly one
-    // cleaner can win it; no check-then-delete path is allowed to race a new
-    // lease generation at the shared name.
-    const cleaner: LeaseOwner = { ...this.#leaseOwner, token: randomUUID() }
-    const claim = `cleanup.${cleaner.token}.json`
-    const claimant = `claimant.${cleaner.token}.json`
-    await createLeaseOwner(path.join(leasePath, claimant), cleaner)
-    try { await rename(path.join(leasePath, marker), path.join(leasePath, claim)) }
-    catch (error) {
-      await rm(path.join(leasePath, claimant), { force: true }).catch(() => undefined)
-      if (['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) return
-      throw error
-    }
-    const tombstone = path.join(locksPath, `.${lockName}.retired.${cleaner.token}`)
-    try {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          await this.#leaseCleanupRename(leasePath, tombstone)
-          await rm(tombstone, { recursive: true, force: true }).catch(() => undefined)
-          return
-        } catch (error) {
-          if (!['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '') || attempt === 2) {
-            throw error
-          }
+        if (!OPEN_CODE_PASSIVE_GENERATION_PATTERN.test(name)) continue
+        const modifiedAt = await generations.childDirectoryModifiedAt(name)
+        if (modifiedAt < now - this.#readerGraceMs) {
+          await generations.retireChildDirectory(name, `.retired.${randomUUID()}`).catch(() => undefined)
         }
       }
-    } catch (error) {
-      await rename(path.join(leasePath, claim), path.join(leasePath, 'released.json')).catch(() => undefined)
-      throw error
+    } finally {
+      await generations?.close().catch(() => undefined); await commits?.close().catch(() => undefined)
+      await scope?.close().catch(() => undefined); await scopes?.close().catch(() => undefined)
+      await root?.close().catch(() => undefined)
     }
   }
+
 }
 
-async function createInitializedLeaseDirectory(leasePath: string, owner: LeaseOwner): Promise<void> {
-  const temporary = `${leasePath}.candidate.${owner.token}`
-  await mkdir(temporary, { mode: 0o700 })
-  try {
-    await createLeaseOwner(path.join(temporary, 'active.json'), owner)
-    if (await lstat(leasePath).then(() => true, error => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-      throw error
-    })) throw Object.assign(new Error('lease exists'), { code: 'EEXIST' })
-    await rename(temporary, leasePath)
-  } catch (error) {
-    await rm(temporary, { recursive: true, force: true }).catch(() => undefined)
-    if (['ENOTEMPTY', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-      throw Object.assign(error as Error, { code: 'EEXIST' })
-    }
-    throw error
-  }
-}
+function cancelled(): Error { return new Error('Passive snapshot update cancelled') }
 
-async function createLeaseOwner(filePath: string, owner: LeaseOwner): Promise<void> {
-  const handle = await open(filePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
-    | (fsConstants.O_NOFOLLOW ?? 0), 0o600)
-  try { await handle.writeFile(`${JSON.stringify(owner)}\n`); await handle.sync() }
-  finally { await handle.close() }
-}
-
-async function readLeaseOwner(filePath: string): Promise<LeaseOwner | null> {
-  try {
-    const before = await lstat(filePath, { bigint: true })
-    if (!before.isFile() || before.isSymbolicLink() || before.size > 1_024n) return null
-    const handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+async function claimGeneration(
+  generations: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>>,
+  afterCreatedEntrySynced?: (path: string) => void | Promise<void>,
+) {
+  for (;;) {
+    const sequences = (await generations.childNames()).map(openCodePassiveGenerationSequence)
+      .filter((value): value is number => value !== null)
+    const sequence = Math.max(0, ...sequences) + 1
+    if (!Number.isSafeInteger(sequence)) throw new Error('Passive snapshot generation exhausted')
+    const name = `${String(sequence).padStart(16, '0')}.${randomUUID()}`
     try {
-      const metadata = await handle.stat({ bigint: true })
-      if (!metadata.isFile() || metadata.dev !== before.dev || metadata.ino !== before.ino) return null
-      const value = JSON.parse(await handle.readFile('utf8')) as Partial<LeaseOwner>
-      if (!Number.isSafeInteger(value.pid) || (value.pid ?? 0) <= 0
-        || typeof value.birthIdentity !== 'string' || !value.birthIdentity
-        || typeof value.token !== 'string' || !/^[0-9a-f-]+$/.test(value.token)) return null
-      return value as LeaseOwner
-    } finally { await handle.close() }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-}
-
-function processBirthIdentity(): string {
-  return PROCESS_BIRTH_IDENTITY
-}
-
-function isLeaseOwnerAlive(owner: Readonly<{ pid: number; birthIdentity: string }>): boolean {
-  if (owner.pid === process.pid) return owner.birthIdentity === PROCESS_BIRTH_IDENTITY
-  try { process.kill(owner.pid, 0) }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH' }
-  if (owner.birthIdentity.startsWith('linux:')) {
-    const actual = readLinuxProcessBirthIdentity(owner.pid)
-    return actual === null || actual === owner.birthIdentity
-  }
-  return true
-}
-
-function readLinuxProcessBirthIdentity(pid: number): string | null {
-  if (process.platform !== 'linux') return null
-  try {
-    // The comm field may contain spaces and parentheses. Fields after its last
-    // ')' begin with state; starttime is field 22, therefore index 19 here.
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
-    return fields[19] ? `linux:${fields[19]}` : null
-  } catch { return null }
-}
-
-async function restorePublishedFile(
-  directory: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>>,
-  name: string,
-  previous: string | null,
-): Promise<void> {
-  if (previous === null) await directory.removeRegularFile(name)
-  else await directory.writeFileAtomic(name, previous, 0o600)
-}
-
-function waitForLease(signal: AbortSignal, delayMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(new Error('Passive snapshot update cancelled')); return }
-    const timer = setTimeout(done, delayMs)
-    const cancelled = () => done(new Error('Passive snapshot update cancelled'))
-    function done(error?: Error): void {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', cancelled)
-      if (error) reject(error); else resolve()
+      return { sequence, name, directory: await generations.createChildDirectoryExclusive(
+        name, 0o700, afterCreatedEntrySynced,
+      ) }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
     }
-    signal.addEventListener('abort', cancelled, { once: true })
-  })
+  }
+}
+
+function assignEvidenceGeneration(snapshot: OpenCodeRedactedSnapshotV1, generation: number): OpenCodeRedactedSnapshotV1 {
+  const owned = structuredClone(snapshot)
+  const observations = [owned.binary, ...owned.providers.flatMap(provider => [provider.configured,
+    provider.lastConnected, provider.catalogAvailable, provider.executionVerified])]
+  for (const observation of observations) {
+    if (observation.authority !== 'none' && (observation.evidenceGeneration ?? 0) === 0) {
+      observation.evidenceGeneration = generation
+    }
+  }
+  return owned
+}
+
+async function maintenanceRecords(
+  commits: Awaited<ReturnType<typeof ensureOpenCodeSafePublicationDirectory>>,
+  scope: `sha256:${string}`,
+): Promise<Array<{ name: string; generation: string; sequence: number; modifiedAt: number }>> {
+  const records: Array<{ name: string; generation: string; sequence: number; modifiedAt: number }> = []
+  for (const name of await commits.childNames()) {
+    if (OPEN_CODE_PASSIVE_COMMIT_TEMP_PATTERN.test(name)) continue
+    if (!OPEN_CODE_PASSIVE_COMMIT_NAME_PATTERN.test(name)) throw new Error('Passive snapshot commit set is invalid')
+    const text = await commits.readBoundedRegularFile(name, OPEN_CODE_PASSIVE_COMMIT_MAX_BYTES)
+    if (text === null) throw new Error('Passive snapshot commit set is invalid')
+    const parsed = decodeOpenCodePassiveSnapshotCommit(text)
+    if (!parsed || parsed.scope !== scope || name !== openCodePassiveCommitName(
+      parsed.domainGeneration, parsed.generation,
+    )) throw new Error('Passive snapshot commit set is invalid')
+    records.push({ name, generation: parsed.generation, sequence: parsed.domainGeneration,
+      modifiedAt: await commits.regularFileModifiedAt(name) })
+  }
+  records.sort((a, b) => b.sequence - a.sequence || b.name.localeCompare(a.name))
+  return records
 }

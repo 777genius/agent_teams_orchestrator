@@ -69,6 +69,19 @@ describe('normalizeOpenCodeScopedProviderCatalogResponse', () => {
     },
   }
 
+  test('uses the structural Bedrock parser for final version suffixes only', () => {
+    const valid = 'us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+    expect(normalizeOpenCodeScopedProviderCatalogResponse({
+      requestedProviderId: 'amazon-bedrock',
+      response: { all: [{ id: 'amazon-bedrock', models: { [valid]: { id: valid } } }] },
+    }).models[0].id).toBe(valid)
+    const malicious = 'api.example.invalid:443/us.anthropic.claude-v1:0'
+    expect(() => normalizeOpenCodeScopedProviderCatalogResponse({
+      requestedProviderId: 'amazon-bedrock',
+      response: { all: [{ id: 'amazon-bedrock', models: { [malicious]: { id: malicious } } }] },
+    })).toThrow(OpenCodeProviderCatalogContractError)
+  })
+
   test('retains only the exact canonical requested provider and whitelisted model metadata', () => {
     const catalog = normalizeOpenCodeScopedProviderCatalogResponse({
       requestedProviderId: 'Amazon Q Developer / Kiro',
@@ -307,7 +320,7 @@ describe('normalizeOpenCodeScopedProviderCatalogResponse', () => {
     },
   )
 
-  test.each([null, Number.NaN, Number.POSITIVE_INFINITY, -1, 10_000_000_001])(
+  test.each([null, Number.NaN, Number.POSITIVE_INFINITY, -1])(
     'rejects explicit invalid freshness value %p instead of defaulting it', invalid => {
       for (const field of ['observedAtMs', 'nowMs', 'freshForMs', 'maxStaleMs'] as const) {
         expect(() => normalizeOpenCodeScopedProviderCatalogResponse({
@@ -317,6 +330,20 @@ describe('normalizeOpenCodeScopedProviderCatalogResponse', () => {
       }
     },
   )
+
+  test('accepts epoch timestamps above duration bounds but keeps durations bounded', () => {
+    const epoch = 1_700_000_000_000
+    expect(normalizeOpenCodeScopedProviderCatalogResponse({
+      requestedProviderId: 'kiro', response: { all: [{ id: 'kiro', models: {} }] },
+      observedAtMs: epoch, nowMs: epoch,
+    }).freshness.observedAtMs).toBe(epoch)
+    for (const field of ['freshForMs', 'maxStaleMs'] as const) {
+      expect(() => normalizeOpenCodeScopedProviderCatalogResponse({
+        requestedProviderId: 'kiro', response: { all: [{ id: 'kiro', models: {} }] },
+        [field]: 10_000_000_001,
+      })).toThrow(OpenCodeProviderCatalogContractError)
+    }
+  })
 
   test('requires input and response generations to agree when both are present', () => {
     expect(() => normalizeOpenCodeScopedProviderCatalogResponse({

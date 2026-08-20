@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { types as nodeUtilTypes } from 'node:util'
 
 import {
-  createOpenCodeCanonicalModelId,
+  createOpenCodeExactProviderModelRef,
   createOpenCodeCanonicalProviderId,
   isOpenCodeCredentialOrAuthorityLike,
 } from './OpenCodeProviderIdentity.js'
@@ -132,6 +132,7 @@ function codeUnitCompare(left: string, right: string): number {
 }
 
 const CATALOG_NUMBER_MAX = 10_000_000_000
+const CATALOG_EPOCH_MAX = 8_640_000_000_000_000
 const CATALOG_IDENTITY_MAX_MODELS = 2_048
 const CATALOG_IDENTITY_ERROR = 'Invalid OpenCode catalog record identity payload'
 const DANGEROUS_CATALOG_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
@@ -185,6 +186,11 @@ function catalogInteger(value: unknown): value is number {
     && value >= 0 && value <= CATALOG_NUMBER_MAX
 }
 
+function catalogTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= 0 && value <= CATALOG_EPOCH_MAX
+}
+
 function nullableCatalogInteger(value: unknown): value is number | null {
   return value === null || catalogInteger(value)
 }
@@ -235,9 +241,9 @@ function snapshotCatalogIdentityPayload(value: unknown): OpenCodeCatalogRecordId
     'state', 'observedAtMs', 'ageMs', 'maxStaleMs',
   ])
   if (!freshness || !['fresh', 'bounded-stale'].includes(freshness.state as string)
-    || !catalogInteger(freshness.observedAtMs) || !catalogInteger(freshness.ageMs)
+    || !catalogTimestamp(freshness.observedAtMs) || !catalogInteger(freshness.ageMs)
     || !catalogInteger(freshness.maxStaleMs) || freshness.ageMs > freshness.maxStaleMs
-    || freshness.observedAtMs + freshness.ageMs > CATALOG_NUMBER_MAX) return null
+    || freshness.observedAtMs + freshness.ageMs > CATALOG_EPOCH_MAX) return null
 
   const inputModels = inertCatalogArray(payload.models, CATALOG_IDENTITY_MAX_MODELS)
   if (!inputModels) return null
@@ -252,7 +258,7 @@ function snapshotCatalogIdentityPayload(value: unknown): OpenCodeCatalogRecordId
       || !['free', 'paid', 'unknown'].includes(model.billing as string)) return null
     let id: OpenCodeCanonicalModelId
     try {
-      id = createOpenCodeCanonicalModelId(model.id)
+      id = createOpenCodeExactProviderModelRef(providerId, model.id).modelId
       if (id !== model.id) return null
     } catch { return null }
     const limits = inertCatalogRecord(model.limits, ['context', 'input', 'output'])

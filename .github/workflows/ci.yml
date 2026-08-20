@@ -23,6 +23,48 @@ permissions:
   contents: read
 
 jobs:
+  posix-passive-snapshot:
+    name: POSIX passive snapshot publication
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test immutable passive publication on a supported platform
+        run: >-
+          bun test
+          src/services/opencode/OpenCodePassiveStatusSnapshotWriter.test.ts
+          src/services/opencode/OpenCodePassiveStatusProductionReader.test.ts
+          src/services/opencode/OpenCodeActiveStatusSnapshotPublisher.test.ts
+
+  windows-passive-snapshot:
+    name: Windows passive snapshot fail-closed boundary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Enable Windows long paths
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # Node has no handle-relative Windows implementation equivalent to the
+      # descriptor-root POSIX boundary. Windows persistence stays unavailable.
+      - name: Prove passive snapshot persistence performs zero I/O on Windows
+        run: >-
+          bun test
+          src/services/opencode/OpenCodePassiveSnapshotPersistencePolicy.test.ts
+          src/services/runtimeBackends/openCodePassiveStatus.test.ts
+
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

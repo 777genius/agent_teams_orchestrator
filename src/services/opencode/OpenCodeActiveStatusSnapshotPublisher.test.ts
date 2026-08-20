@@ -47,7 +47,7 @@ function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCode
 function publisherHarness(clock: { now: number }) {
   let stored: string | null = null
   let writes = 0
-  const publisher = new OpenCodeActiveStatusSnapshotPublisher({
+  const scopedPublisher = new OpenCodeActiveStatusSnapshotPublisher({
     now: () => clock.now,
     canonicalizePath: async () => '/canonical/project',
     readSnapshot: async () => stored,
@@ -60,6 +60,48 @@ function publisherHarness(clock: { now: number }) {
       },
     },
   })
+  let generation = 0
+  const knownProviders = new Set<string>()
+  const catalogEvidence = (providerId: string) => ({
+    providerId, requestGeneration: ++generation, startedAt: clock.now,
+    attemptIdentity: `sha256:${generation.toString(16).padStart(64, '0')}` as const,
+    binaryFingerprint: `sha256:${'b'.repeat(64)}` as const,
+    configFingerprint: `sha256:${'c'.repeat(64)}` as const,
+    authFingerprint: `sha256:${'d'.repeat(64)}` as const,
+  })
+  // Compatibility facade for the pre-existing bridge tests: inventory and
+  // catalog are still invoked as two purpose-specific publications.
+  const publisher = {
+    publishInventory: async (value: OpenCodeInventorySnapshot, signal?: AbortSignal) => {
+      await scopedPublisher.publishInventory(value, signal)
+      const complete = (value.completeness?.modelCatalog.state ?? (value.probeError ? 'failed' : 'complete')) === 'complete'
+      if (!complete) return
+      for (const providerId of value.availableProviders) knownProviders.add(providerId)
+      const byProvider = new Map<string, string[]>()
+      for (const model of value.models) {
+        const providerId = model.slice(0, model.indexOf('/'))
+        if (!providerId) continue
+        knownProviders.add(providerId)
+        const models = byProvider.get(providerId) ?? []
+        models.push(model)
+        byProvider.set(providerId, models)
+      }
+      for (const providerId of knownProviders) await scopedPublisher.publishCatalogResult({
+        projectPath: value.projectPath, evidence: catalogEvidence(providerId),
+        catalogAvailable: byProvider.has(providerId), modelIds: byProvider.get(providerId) ?? [],
+      }, signal)
+    },
+    publishProviderUpdate: async (value: any, signal?: AbortSignal) => {
+      if (value.executionVerified !== undefined) await scopedPublisher.publishExecutionUpdate(value, signal)
+      else await scopedPublisher.publishProviderUpdate(value, signal)
+      if (value.catalogAvailable !== undefined || value.modelIds !== undefined) {
+        await scopedPublisher.publishCatalogResult({
+          projectPath: value.projectPath, evidence: catalogEvidence(value.providerId),
+          catalogAvailable: value.catalogAvailable ?? true, modelIds: value.modelIds ?? [],
+        }, signal)
+      }
+    },
+  }
   return {
     publisher,
     stored: () => stored,
@@ -75,7 +117,9 @@ function productionReader(clock: { now: number }, stored: () => string | null) {
   })
 }
 
-describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
+const describeSupportedPersistence = process.platform === 'win32' ? describe.skip : describe
+
+describeSupportedPersistence('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
   test('publishes case-preserving multi-segment exact refs while omitting malformed catalog entries', async () => {
     const clock = { now: 1_000 }
     const harness = publisherHarness(clock)
@@ -119,7 +163,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       models: [...kiroModels].reverse().concat(['xai/org/Team:Model-v2'], [...deepinfraModels].reverse()),
     }))
 
-    clock.now = 300_999
+    clock.now = 301_000
     await harness.publisher.publishProviderUpdate({
       projectPath: '/project/secret-name', providerId: 'xai', executionVerified: true,
     })
@@ -154,7 +198,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       projectPath: '/project/secret-name', providerId: 'deepinfra', executionVerified: true,
       modelIds: ['deepinfra/llama-4'],
     })
-    expect(harness.writes()).toBe(2)
+    expect(harness.writes()).toBe(4)
     expect(harness.stored()).not.toContain('/project/secret-name')
     expect(harness.stored()).not.toContain('/secret/auth.json')
     expect(harness.stored()).not.toContain('/redacted/by-publisher')
@@ -163,12 +207,12 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       probeError: 'transient timeout',
       completeness: completeness({ profileConfig: 'failed', managedAuth: 'failed', environmentAuth: 'failed', providerInventory: 'failed', modelCatalog: 'failed' }),
     }))
-    expect(harness.writes()).toBe(2)
+    expect(harness.writes()).toBe(4)
 
     clock.now = 2_000
     const reader = productionReader(clock, harness.stored)
     const status = await reader.reader.read({ projectPath: '/project/secret-name', providerIds: ['deepinfra'], timeoutMs: 50 })
-    expect(harness.writes()).toBe(2)
+    expect(harness.writes()).toBe(4)
     expect(status.providers[0]).toMatchObject({
       configured: { value: 'configured', freshness: 'fresh' },
       lastConnected: { value: { state: 'connected' }, freshness: 'fresh' },
@@ -222,7 +266,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       },
     })
     expect(status.providers[1]?.executionVerified).toMatchObject({ value: 'verified', freshness: 'fresh' })
-    expect(harness.writes()).toBe(4)
+    expect(harness.writes()).toBe(6)
   })
 
   test('publishes managed authless configuration independently from connection without authorizing launch', async () => {
@@ -301,7 +345,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(deepinfra.configured).toMatchObject({ value: 'not_configured', observedAt: 2_000 })
     expect(deepinfra.lastConnected).toMatchObject({ value: { state: 'connected', at: 1_000 }, observedAt: 1_000 })
     expect(deepinfra.catalogAvailable).toMatchObject({ value: 'available', observedAt: 1_000 })
-    expect(deepinfra.modelIds).toEqual(['deepinfra/llama-4'])
+    expect(deepinfra.modelIds).toBeUndefined()
 
     clock.now = 3_000
     await harness.publisher.publishInventory(inventory({
@@ -335,8 +379,8 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(decoded.value.providers[0]).toMatchObject({
       lastConnected: { value: { state: 'connected' }, observedAt: 1_000 },
       catalogAvailable: { value: 'available', observedAt: 1_000 },
-      modelIds: ['deepinfra/llama-4'],
     })
+    expect(decoded.value.providers[0].modelIds).toBeUndefined()
     clock.now = 3_000
     await harness.publisher.publishInventory(inventory({
       profile: managedProfile(), connectedProviders: [], availableProviders: [], models: [],
@@ -349,7 +393,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       lastConnected: { value: { state: 'not_connected' }, observedAt: 3_000 },
       catalogAvailable: { value: 'unavailable', observedAt: 3_000 },
     })
-    expect(decoded.value.providers[0].modelIds).toBeUndefined()
+    expect(decoded.value.providers[0].modelIds).toEqual([])
   })
 
   test('invalidates catalog identity on config/auth changes until a same-generation catalog is published', async () => {
@@ -369,7 +413,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     expect(decoded.ok).toBe(true)
     if (!decoded.ok) throw new Error(decoded.issueCode)
     expect(decoded.value.providers[0].catalogIdentity).toBeUndefined()
-    expect(decoded.value.providers[0].modelIds).toEqual(['deepinfra/llama-4'])
+    expect(decoded.value.providers[0].modelIds).toBeUndefined()
 
     const passive = await productionReader(clock, harness.stored).reader.read({
       projectPath: '/project/secret-name', providerIds: ['deepinfra'], timeoutMs: 50,
@@ -412,10 +456,10 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
     }
   })
 
-  test('cross-instance scope lease keeps independent DeepInfra and Ollama observations', async () => {
+  test('an injected in-memory scope coordinator keeps independent DeepInfra and Ollama observations', async () => {
     let stored: string | null = null
     let tail = Promise.resolve()
-    const withScopeLease = async <T>(_scope: `sha256:${string}`, _signal: AbortSignal, operation: () => Promise<T>): Promise<T> => {
+    const withScopeUpdate = async <T>(_scope: `sha256:${string}`, _signal: AbortSignal, operation: () => Promise<T>): Promise<T> => {
       const previous = tail
       let release!: () => void
       tail = new Promise<void>(resolve => { release = resolve })
@@ -426,7 +470,7 @@ describe('OpenCodeActiveStatusSnapshotPublisher production bridge', () => {
       now: () => 1_000,
       canonicalizePath: async () => '/canonical/project',
       readSnapshot: async () => { await Promise.resolve(); return stored },
-      withScopeLease,
+      withScopeUpdate,
       writer: { write: async snapshot => {
         await Promise.resolve()
         const encoded = encodeOpenCodeRedactedSnapshotV1(snapshot)

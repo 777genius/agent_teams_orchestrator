@@ -13,50 +13,76 @@ import {
   normalizeOpenCodePassiveModelRef,
 } from './OpenCodePassiveStatusContract.js'
 import {
+  assertOpenCodePassiveSnapshotPersistenceSupported,
+  getOpenCodePassiveSnapshotPersistenceCapability,
+} from './OpenCodePassiveSnapshotPersistencePolicy.js'
+import {
   decodeOpenCodeRedactedSnapshotV1,
+  catalogProjectionIdentity,
   type OpenCodeRedactedSnapshotProviderV1,
   type OpenCodeRedactedSnapshotV1,
   type OpenCodeRedactedSnapshotWriterPort,
 } from './OpenCodeRedactedStatusSnapshot.js'
 import type { OpenCodeInventoryCompleteness, OpenCodeInventorySnapshot } from './types.js'
+import type { OpenCodeCatalogPublicationEvidence } from './OpenCodeProviderCatalogService.js'
 
 const ACTIVE_EVIDENCE_TTL_MS = 5 * 60_000
 
 export type OpenCodeActiveStatusPublisherPort = {
   publishInventory(snapshot: OpenCodeInventorySnapshot, signal?: AbortSignal): Promise<void>
+  /** Execution/config/auth observations can never carry catalog evidence. */
   publishProviderUpdate(input: {
     projectPath: string
     providerId: string
     configured?: boolean
     connected?: boolean
-    catalogAvailable?: boolean
+  }, signal?: AbortSignal): Promise<void>
+  publishExecutionUpdate(input: {
+    projectPath: string
+    providerId: string
     executionVerified?: boolean
-    modelIds?: readonly string[]
+  }, signal?: AbortSignal): Promise<void>
+  publishCatalogResult(input: {
+    projectPath: string
+    evidence: OpenCodeCatalogPublicationEvidence
+    catalogAvailable: boolean
+    modelIds: readonly string[]
+    observedAt?: number
+    expiresAt?: number
+    provenance?: 'fresh-live' | 'cache-hit' | 'bounded-stale'
   }, signal?: AbortSignal): Promise<void>
 }
 
 type PublisherDeps = Readonly<{
+  platform?: NodeJS.Platform
   rootDirectory?: string
   writer?: OpenCodeRedactedSnapshotWriterPort
   now?: () => number
   canonicalizePath?: (projectPath: string, signal: AbortSignal) => Promise<string>
   readSnapshot?: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
-  withScopeLease?: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
+  withScopeUpdate?: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
 }>
 
 /** Mutation-only bridge from successful active observations to the passive redacted store. */
 export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStatusPublisherPort {
+  readonly #platform: NodeJS.Platform
   readonly #rootDirectory: string
   readonly #writer: OpenCodeRedactedSnapshotWriterPort
   readonly #now: () => number
   readonly #canonicalizePath: (projectPath: string, signal: AbortSignal) => Promise<string>
   readonly #readSnapshot: (scope: `sha256:${string}`, signal: AbortSignal) => Promise<string | null>
-  readonly #withScopeLease: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
+  readonly #withScopeUpdate: <T>(scope: `sha256:${string}`, signal: AbortSignal, operation: () => Promise<T>) => Promise<T>
   readonly #tails = new Map<string, Promise<void>>()
 
   constructor(deps: PublisherDeps = {}) {
-    this.#rootDirectory = deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
-    this.#writer = deps.writer ?? new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: this.#rootDirectory })
+    this.#platform = deps.platform ?? process.platform
+    this.#rootDirectory = getOpenCodePassiveSnapshotPersistenceCapability(this.#platform).supported
+      ? deps.rootDirectory ?? getOpenCodePassiveStatusRootDirectory()
+      : ''
+    this.#writer = deps.writer ?? new OpenCodePassiveStatusSnapshotWriter({
+      rootDirectory: this.#rootDirectory,
+      platform: this.#platform,
+    })
     this.#now = deps.now ?? Date.now
     this.#canonicalizePath = deps.canonicalizePath ?? canonicalizeOpenCodePassiveProjectPath
     this.#readSnapshot = deps.readSnapshot ?? (async (scope, signal) => {
@@ -65,9 +91,7 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         getOpenCodePassiveSnapshotPath(this.#rootDirectory, scope), signal,
       )
     })
-    this.#withScopeLease = deps.withScopeLease
-      ?? (this.#writer.withScopeLease?.bind(this.#writer) as typeof this.#withScopeLease | undefined)
-      ?? (async (_scope, _signal, operation) => operation())
+    this.#withScopeUpdate = deps.withScopeUpdate ?? (async (_scope, _signal, operation) => operation())
   }
 
   async publishInventory(inventory: OpenCodeInventorySnapshot, signal = new AbortController().signal): Promise<void> {
@@ -84,26 +108,19 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
       && completeness.modelCatalog.state !== 'complete'
       && usableConnected.size === 0) return
     const configuredProviderIds = getManagedConfiguredProviderIds(inventory)
-    const modelIds = new Map<string, string[]>()
-    for (const model of inventory.models) {
-      const parsed = parseOpenCodeExactProviderModelRef(model)
-      if (!parsed) continue
-      const normalized = normalizeOpenCodePassiveModelRef(parsed.raw)
-      if (!normalized) continue
-      const values = modelIds.get(parsed.providerId) ?? []
-      values.push(normalized)
-      modelIds.set(parsed.providerId, values)
-    }
     const providerIds = new Set(
-      [...inventory.availableProviders, ...configuredProviderIds, ...connected.keys(), ...modelIds.keys()]
+      [...inventory.availableProviders, ...configuredProviderIds, ...connected.keys()]
         .filter(providerId => tryCreateOpenCodeCanonicalProviderId(providerId) === providerId
           && isOpenCodeCanonicalProviderId(providerId)),
     )
     await this.#update(inventory.projectPath, signal, (snapshot, now) => {
-      if (!inventory.probeError) snapshot.binary = observation(
-        { presence: inventory.detected ? 'present' as const : 'absent' as const, version: inventory.version },
-        'binary_metadata', now,
-      )
+      if (!inventory.probeError) {
+        const nextBinary = { presence: inventory.detected ? 'present' as const : 'absent' as const, version: inventory.version }
+        const binaryChanged = JSON.stringify(snapshot.binary.value) !== JSON.stringify(nextBinary)
+          && snapshot.binary.value.presence !== 'unknown'
+        snapshot.binary = observation(nextBinary, 'binary_metadata', now)
+        if (binaryChanged) for (const provider of snapshot.providers) invalidateCatalogEvidence(provider)
+      }
       const knownProviderIds = new Set([
         ...snapshot.providers.map(provider => provider.providerId),
         ...providerIds,
@@ -114,6 +131,9 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         const priorConnected = provider.lastConnected.value.state
         const priorFingerprint = provider.fingerprint
         const evidenceFingerprint = providerEvidenceFingerprint(inventory, providerId)
+        const inventoryBinaryFingerprint = inventory.profile?.binaryFingerprint
+          ? redactedCatalogFingerprint('binary', inventory.profile.binaryFingerprint) : null
+        if (inventoryBinaryFingerprint) provider.binaryFingerprint = inventoryBinaryFingerprint
         if (completeness.profileConfig.state === 'complete' && inventory.profile) {
           provider.configured = observation(
             configuredProviderIds.has(providerId) ? 'configured' : 'not_configured',
@@ -129,19 +149,24 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
             { state: 'not_connected' as const }, 'auth_metadata', now,
           )
         }
-        if (completeness.modelCatalog.state === 'complete') {
-          provider.fingerprint = evidenceFingerprint
-          provider.catalogAvailable = observation(
-            modelIds.has(providerId) ? 'available' : 'unavailable',
-            'catalog_snapshot', now,
-          )
-          replaceModelRefs(provider, modelIds.has(providerId) ? modelIds.get(providerId) : undefined)
-          provider.catalogIdentity = catalogIdentity(snapshot.projectScope, provider, now)
-        } else if (provider.configured.value !== priorConfigured
+        if (provider.configured.value !== priorConfigured
           || provider.lastConnected.value.state !== priorConnected
           || evidenceFingerprint !== priorFingerprint) {
           provider.fingerprint = evidenceFingerprint
-          delete provider.catalogIdentity
+          invalidateCatalogEvidence(provider)
+        }
+        if (inventoryBinaryFingerprint && provider.catalogBinaryFingerprint
+          && inventoryBinaryFingerprint !== provider.catalogBinaryFingerprint) {
+          invalidateCatalogEvidence(provider)
+        }
+        if (completeness.providerInventory.state === 'complete'
+          && completeness.modelCatalog.state === 'complete'
+          && provider.configured.value === 'not_configured'
+          && provider.lastConnected.value.state === 'not_connected') {
+          provider.catalogAvailable = catalogObservation(
+            'unavailable', now, Math.min(Number.MAX_SAFE_INTEGER, now + ACTIVE_EVIDENCE_TTL_MS), false,
+          )
+          replaceModelRefs(provider, [])
         }
       }
     })
@@ -149,11 +174,14 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
 
   async publishProviderUpdate(input: {
     projectPath: string; providerId: string; configured?: boolean; connected?: boolean
-    catalogAvailable?: boolean; executionVerified?: boolean; modelIds?: readonly string[]
   }, signal = new AbortController().signal): Promise<void> {
     if (!isOpenCodeCanonicalProviderId(input.providerId)) return
     await this.#update(input.projectPath, signal, (snapshot, now) => {
       const provider = getOrCreateProvider(snapshot, input.providerId)
+      const changed = (input.configured !== undefined
+        && provider.configured.value !== (input.configured ? 'configured' : 'not_configured'))
+        || (input.connected !== undefined
+          && provider.lastConnected.value.state !== (input.connected ? 'connected' : 'not_connected'))
       if (input.configured !== undefined) provider.configured = observation(
         input.configured ? 'configured' : 'not_configured', 'config_metadata', now,
       )
@@ -161,20 +189,55 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
         input.connected ? { state: 'connected' as const, at: now } : { state: 'not_connected' as const },
         'auth_metadata', now,
       )
-      if (input.catalogAvailable !== undefined) provider.catalogAvailable = observation(
-        input.catalogAvailable ? 'available' : 'unavailable', 'catalog_snapshot', now,
-      )
+      if (changed) invalidateCatalogEvidence(provider)
+    })
+  }
+
+  async publishExecutionUpdate(input: {
+    projectPath: string; providerId: string; executionVerified?: boolean
+  }, signal = new AbortController().signal): Promise<void> {
+    if (!isOpenCodeCanonicalProviderId(input.providerId)) return
+    await this.#update(input.projectPath, signal, (snapshot, now) => {
+      const provider = getOrCreateProvider(snapshot, input.providerId)
       if (input.executionVerified !== undefined) provider.executionVerified = observation(
         input.executionVerified ? 'verified' : 'rejected', 'execution_snapshot', now,
       )
-      if (input.modelIds) {
-        replaceModelRefs(provider, input.modelIds)
-        provider.catalogIdentity = catalogIdentity(snapshot.projectScope, provider, now)
-      } else if (input.configured !== undefined || input.connected !== undefined || input.catalogAvailable !== undefined) {
-        // The retained catalog status remains useful, but its older model IDs
-        // are no longer generation-bound to this config/auth/catalog update.
-        delete provider.catalogIdentity
-      }
+    })
+  }
+
+  async publishCatalogResult(input: {
+    projectPath: string
+    evidence: OpenCodeCatalogPublicationEvidence
+    catalogAvailable: boolean
+    modelIds: readonly string[]
+    observedAt?: number
+    expiresAt?: number
+    provenance?: 'fresh-live' | 'cache-hit' | 'bounded-stale'
+  }, signal = new AbortController().signal): Promise<void> {
+    const { evidence } = input
+    if (!isOpenCodeCanonicalProviderId(evidence.providerId)) return
+    await this.#update(input.projectPath, signal, (snapshot, now) => {
+      const provider = getOrCreateProvider(snapshot, evidence.providerId)
+      if (isSuperseded(provider, evidence)) return
+      if (provider.binaryFingerprint && provider.binaryFingerprint !== evidence.binaryFingerprint) return
+      const observedAt = input.observedAt ?? now
+      const expiresAt = input.expiresAt ?? Math.min(Number.MAX_SAFE_INTEGER, now + ACTIVE_EVIDENCE_TTL_MS)
+      if (!Number.isSafeInteger(observedAt) || !Number.isSafeInteger(expiresAt)
+        || observedAt < 0 || observedAt > now || expiresAt < observedAt
+        || (now > expiresAt && input.provenance !== 'bounded-stale')) return
+      provider.catalogAvailable = catalogObservation(
+        input.catalogAvailable ? 'available' : 'unavailable', observedAt, expiresAt,
+        input.provenance === 'bounded-stale',
+      )
+      replaceModelRefs(provider, input.modelIds, evidence.providerId)
+      provider.catalogRequestGeneration = evidence.requestGeneration
+      delete provider.catalogFenceGeneration
+      provider.catalogStartedAt = evidence.startedAt
+      provider.catalogAttemptIdentity = evidence.attemptIdentity
+      provider.catalogBinaryFingerprint = evidence.binaryFingerprint
+      provider.catalogConfigFingerprint = evidence.configFingerprint
+      provider.catalogAuthFingerprint = evidence.authFingerprint
+      provider.catalogIdentity = catalogProjectionIdentity(snapshot.projectScope, provider)
     })
   }
 
@@ -183,19 +246,23 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
     signal: AbortSignal,
     mutate: (snapshot: OpenCodeRedactedSnapshotV1, now: number) => void,
   ): Promise<void> {
+    // Persistence-unavailable is a typed transient result. Gate before path
+    // canonicalization or compatibility reads so native Windows does zero I/O.
+    assertOpenCodePassiveSnapshotPersistenceSupported(this.#platform)
     if (signal.aborted) return
     const canonical = await this.#canonicalizePath(projectPath, signal)
     const scope = projectScope(canonical)
     const previous = this.#tails.get(scope) ?? Promise.resolve()
-    const next = previous.catch(() => undefined).then(async () => this.#withScopeLease(scope, signal, async () => {
+    const next = previous.catch(() => undefined).then(async () => this.#withScopeUpdate(scope, signal, async () => {
       if (signal.aborted) return
       const now = this.#now()
       if (!Number.isSafeInteger(now) || now < 0) return
       const loaded = await this.#load(scope, signal)
       const snapshot = loaded ?? emptySnapshot(scope, now)
-      ageExpiredObservations(snapshot, now)
-      snapshot.capturedAt = now
-      mutate(snapshot, now)
+      const evidenceTime = Math.max(now, snapshot.capturedAt)
+      ageExpiredObservations(snapshot, evidenceTime)
+      snapshot.capturedAt = evidenceTime
+      mutate(snapshot, evidenceTime)
       snapshot.providers.sort((left, right) => left.providerId.localeCompare(right.providerId))
       await this.#writer.write(snapshot, signal)
     }))
@@ -211,18 +278,19 @@ export class OpenCodeActiveStatusSnapshotPublisher implements OpenCodeActiveStat
   }
 }
 
-function normalizeModelRefs(values: readonly string[]): string[] {
+function normalizeModelRefs(values: readonly string[], providerId: string): string[] {
   const retained = new Set<string>()
   for (const value of values) {
     const normalized = normalizeOpenCodePassiveModelRef(value)
-    if (normalized) retained.add(normalized)
+    const parsed = normalized && parseOpenCodeExactProviderModelRef(normalized)
+    if (parsed?.providerId === providerId) retained.add(normalized)
   }
   return [...retained]
 }
 
-function replaceModelRefs(provider: OpenCodeRedactedSnapshotProviderV1, values: readonly string[] | undefined): void {
+function replaceModelRefs(provider: OpenCodeRedactedSnapshotProviderV1, values: readonly string[] | undefined, providerId = provider.providerId): void {
   if (values === undefined) delete provider.modelIds
-  else provider.modelIds = normalizeModelRefs(values)
+  else provider.modelIds = normalizeModelRefs(values, providerId)
   delete provider.modelIdsTotal
   delete provider.modelIdsTruncated
   delete provider.modelIdsFingerprint
@@ -243,26 +311,37 @@ function projectScope(canonicalPath: string): `sha256:${string}` {
   return `sha256:${createHash('sha256').update('opencode-project-scope-v1\0').update(canonicalPath).digest('hex')}`
 }
 
-function catalogIdentity(
-  scope: `sha256:${string}`,
+function isSuperseded(
   provider: OpenCodeRedactedSnapshotProviderV1,
-  generation: number,
-): `sha256:${string}` {
-  const models = [...(provider.modelIds ?? [])].sort()
-  const config = provider.configured.value
-  const auth = provider.lastConnected.value.state === 'connected'
-    ? `connected:${provider.lastConnected.value.at}` : provider.lastConnected.value.state
-  const material = JSON.stringify({
-    scope,
-    providerId: provider.providerId,
-    providerFingerprint: provider.fingerprint ?? null,
-    config,
-    auth,
-    generation,
-    catalog: provider.catalogAvailable.value,
-    models,
-  })
-  return `sha256:${createHash('sha256').update('opencode-passive-catalog-identity-v1\0').update(material).digest('hex')}`
+  evidence: OpenCodeCatalogPublicationEvidence,
+): boolean {
+  if ((provider.catalogFenceGeneration ?? 0) > evidence.requestGeneration) return true
+  if (provider.catalogRequestGeneration === undefined) return false
+  if (evidence.requestGeneration !== provider.catalogRequestGeneration) {
+    return evidence.requestGeneration < provider.catalogRequestGeneration
+  }
+  // An invalidation fence deliberately has no producer identity. The next
+  // durable attempt may claim that exact ordinal; an already-published
+  // ordinal remains idempotent only for its exact producer.
+  return provider.catalogAttemptIdentity !== undefined
+    && evidence.attemptIdentity !== provider.catalogAttemptIdentity
+}
+
+function invalidateCatalogEvidence(provider: OpenCodeRedactedSnapshotProviderV1): void {
+  // Never remove ordering authority. A request that started before the
+  // config/auth/binary mutation must remain durably fenced when it finishes
+  // late, including after the publisher is restarted from this snapshot.
+  provider.catalogFenceGeneration = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    Math.max(provider.catalogFenceGeneration ?? 0, provider.catalogRequestGeneration ?? 0) + 1,
+  )
+  delete provider.catalogIdentity
+  delete provider.catalogAttemptIdentity
+  delete provider.catalogRequestGeneration
+  delete provider.catalogStartedAt
+  delete provider.catalogBinaryFingerprint
+  delete provider.catalogConfigFingerprint
+  delete provider.catalogAuthFingerprint
 }
 
 function providerEvidenceFingerprint(
@@ -280,8 +359,13 @@ function providerEvidenceFingerprint(
     authSource: connected?.source ?? null,
     authHint: connected?.authHint ?? null,
     credentialScopes: [...(connected?.credentialScopes ?? [])].sort(),
+    binaryFingerprint: profile?.binaryFingerprint ?? null,
   })
   return `sha256:${createHash('sha256').update('opencode-passive-provider-evidence-v1\0').update(material).digest('hex')}`
+}
+
+function redactedCatalogFingerprint(kind: 'binary', value: string): `sha256:${string}` {
+  return `sha256:${createHash('sha256').update(`opencode-catalog-${kind}-v1\0${value}`).digest('hex')}`
 }
 
 function getManagedConfiguredProviderIds(inventory: OpenCodeInventorySnapshot): Set<string> {
@@ -315,7 +399,14 @@ function ageExpiredObservations(snapshot: OpenCodeRedactedSnapshotV1, now: numbe
 
 function observation<T>(value: T, authority: any, now: number): any {
   return { value, authority, freshness: 'fresh', condition: 'normal', observedAt: now,
-    validUntil: Math.min(Number.MAX_SAFE_INTEGER, now + ACTIVE_EVIDENCE_TTL_MS), issueCode: 'none' }
+    validUntil: Math.min(Number.MAX_SAFE_INTEGER, now + ACTIVE_EVIDENCE_TTL_MS), issueCode: 'none',
+    evidenceGeneration: 0 }
+}
+
+function catalogObservation<T>(value: T, observedAt: number, validUntil: number, stale: boolean): any {
+  return { value, authority: 'catalog_snapshot', freshness: stale ? 'stale' : 'fresh',
+    condition: stale ? 'degraded' : 'normal', observedAt, validUntil,
+    issueCode: stale ? 'expired' : 'none' }
 }
 
 function emptySnapshot(scope: `sha256:${string}`, now: number): OpenCodeRedactedSnapshotV1 {

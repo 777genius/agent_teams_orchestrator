@@ -144,10 +144,21 @@ function providerCatalog(
         observedAtMs: 1,
         nowMs: 1,
       }),
+      catalogEvidence: fakeCatalogEvidence(providerId),
       profileRootPath: '/tmp/profile',
       projectPath: input.projectPath ?? '/tmp/project',
       diagnostics: [],
     }),
+  }
+}
+
+function fakeCatalogEvidence(providerId: string) {
+  return {
+    providerId, requestGeneration: 1, startedAt: 1,
+    attemptIdentity: `sha256:${'a'.repeat(64)}` as const,
+    binaryFingerprint: `sha256:${'b'.repeat(64)}` as const,
+    configFingerprint: `sha256:${'c'.repeat(64)}` as const,
+    authFingerprint: `sha256:${'d'.repeat(64)}` as const,
   }
 }
 
@@ -210,6 +221,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
       activeStatusPublisher: {
         publishInventory: async () => {},
         publishProviderUpdate: async input => { statusUpdates.push(input) },
+        publishExecutionUpdate: async input => { statusUpdates.push(input) },
+        publishCatalogResult: async input => { statusUpdates.push(input) },
       },
       providerCatalog: {
         loadCatalog: async input => {
@@ -225,6 +238,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
               observedAtMs: 1,
               nowMs: 1,
             }),
+            catalogEvidence: fakeCatalogEvidence('deepinfra'),
             profileRootPath: '/scoped/deepinfra',
             projectPath: '/project-a',
             diagnostics: [],
@@ -260,7 +274,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!result.ok) return
     expect(catalogCalls).toBe(1)
     expect(statusUpdates).toEqual([{
-      projectPath: '/project-a', providerId: 'deepinfra', catalogAvailable: true,
+      projectPath: '/project-a', evidence: fakeCatalogEvidence('deepinfra'), catalogAvailable: true,
       modelIds: ['deepinfra/model'],
     }])
     expect(result.value.models.map(model => model.modelId)).toEqual(['deepinfra/model'])

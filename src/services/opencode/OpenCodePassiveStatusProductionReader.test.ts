@@ -44,7 +44,12 @@ function snapshot(canonicalPath = '/canonical/a', validUntil = 2_000): OpenCodeR
     providers: [{
       providerId: 'deepinfra',
       fingerprint: `sha256:${'b'.repeat(64)}`,
-      catalogIdentity: catalogIdentity(`${canonicalPath}:${validUntil}`),
+      catalogAttemptIdentity: catalogIdentity(`${canonicalPath}:${validUntil}`),
+      catalogRequestGeneration: 1,
+      catalogStartedAt: 800,
+      catalogBinaryFingerprint: `sha256:${'c'.repeat(64)}`,
+      catalogConfigFingerprint: `sha256:${'d'.repeat(64)}`,
+      catalogAuthFingerprint: `sha256:${'e'.repeat(64)}`,
       modelIds: ['deepinfra/llama-4'],
       configured: observation('configured', 'config_metadata', validUntil),
       lastConnected: observation({ state: 'connected', at: 800 }, 'auth_metadata', validUntil),
@@ -60,7 +65,9 @@ function encoded(value: OpenCodeRedactedSnapshotV1): string {
   return new TextDecoder().decode(result.bytes)
 }
 
-describe('OpenCode passive status production adapters', () => {
+const describeSupportedPersistence = process.platform === 'win32' ? describe.skip : describe
+
+describeSupportedPersistence('OpenCode passive status production adapters', () => {
   test('uses the managed data-root contract without creating directories', () => {
     expect(getOpenCodePassiveStatusRootDirectory({
       CLAUDE_MULTIMODEL_DATA_HOME: '/managed/data',
@@ -141,7 +148,7 @@ describe('OpenCode passive status production adapters', () => {
 
     disk = structuredClone(disk)
     disk.providers[0].modelIds = ['deepinfra/qwen-2.5-coder']
-    disk.providers[0].catalogIdentity = catalogIdentity('generation-n-plus-1')
+    disk.providers[0].catalogAttemptIdentity = catalogIdentity('generation-n-plus-1')
     const next = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
     expect(next.providers[0].catalogAvailable.value).toBe('available')
     expect(next.providers[0].knownModelIds).toBeUndefined()
@@ -161,7 +168,7 @@ describe('OpenCode passive status production adapters', () => {
       disk = structuredClone(disk)
       if (change === 'config') disk.providers[0].configured = observation('not_configured', 'config_metadata')
       else disk.providers[0].lastConnected = observation({ state: 'not_connected' }, 'auth_metadata')
-      disk.providers[0].catalogIdentity = catalogIdentity(`${change}-changed`)
+      disk.providers[0].catalogAttemptIdentity = catalogIdentity(`${change}-changed`)
       const changed = await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 })
       expect(changed.providers[0].knownModelIds).toBeUndefined()
     }
@@ -170,6 +177,12 @@ describe('OpenCode passive status production adapters', () => {
   test('legacy snapshots without catalog identity retain safe status but expose no model IDs', async () => {
     const legacy = snapshot()
     delete legacy.providers[0].catalogIdentity
+    delete legacy.providers[0].catalogAttemptIdentity
+    delete legacy.providers[0].catalogRequestGeneration
+    delete legacy.providers[0].catalogStartedAt
+    delete legacy.providers[0].catalogBinaryFingerprint
+    delete legacy.providers[0].catalogConfigFingerprint
+    delete legacy.providers[0].catalogAuthFingerprint
     const adapter = new OpenCodePassiveStatusProductionReader({
       rootDirectory: '/passive', now: () => 1_000,
       canonicalizePath: async () => '/canonical/a',
@@ -199,7 +212,7 @@ describe('OpenCode passive status production adapters', () => {
       expect(initial.providers[0].knownModelIds).toEqual(['deepinfra/llama-4'])
     }
     const changedA = structuredClone(disks.get(projectScope('/canonical/a').slice(7))!)
-    changedA.providers[0].catalogIdentity = catalogIdentity('project-a-new-generation')
+    changedA.providers[0].catalogAttemptIdentity = catalogIdentity('project-a-new-generation')
     disks.set(projectScope('/canonical/a').slice(7), changedA)
     expect((await adapter.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 50 }))
       .providers[0].knownModelIds).toBeUndefined()
@@ -490,7 +503,10 @@ describe('OpenCode passive status production adapters', () => {
       const status = await reader.reader.read({ projectPath: '/a', providerIds: ['deepinfra'], timeoutMs: 1_000 })
       expect(status.providers[0].configured.value).toBe('configured')
 
-      await writeFile(path.join(root, 'binary.snapshot.json'), 'x'.repeat(65_537))
+      const scoped = path.join(root, 'scopes', snapshot().projectScope.slice(7))
+      const commitName = (await readdir(path.join(scoped, 'commits')))[0]
+      const commit = JSON.parse(await readFile(path.join(scoped, 'commits', commitName), 'utf8')) as { generation: string }
+      await writeFile(path.join(scoped, 'generations', commit.generation, 'binary.snapshot.json'), 'x'.repeat(65_537))
       const bounded = new OpenCodePassiveStatusProductionReader({
         rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/missing',
       })
@@ -504,16 +520,21 @@ describe('OpenCode passive status production adapters', () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-symlink-'))
     const outside = await mkdtemp(path.join(process.cwd(), '.opencode-passive-outside-'))
     try {
-      await symlink(outside, path.join(root, 'snapshots'), 'dir')
+      await symlink(outside, path.join(root, 'scopes'), 'dir')
       const writer = new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root })
       await expect(writer.write(snapshot(), new AbortController().signal)).rejects.toThrow()
       expect(await readdir(outside)).toEqual([])
 
-      await rm(path.join(root, 'snapshots'), { force: true })
-      await mkdir(path.join(root, 'snapshots'))
+      await rm(path.join(root, 'scopes'), { force: true })
+      await writer.write(snapshot(), new AbortController().signal)
+      const scoped = path.join(root, 'scopes', snapshot().projectScope.slice(7))
+      const commitName = (await readdir(path.join(scoped, 'commits')))[0]
+      const commit = JSON.parse(await readFile(path.join(scoped, 'commits', commitName), 'utf8')) as { generation: string }
+      const projectSnapshot = path.join(scoped, 'generations', commit.generation, 'project.snapshot.json')
       const target = path.join(outside, 'outside.json')
       await writeFile(target, encoded(snapshot()))
-      await symlink(target, path.join(root, 'snapshots', `${snapshot().projectScope.slice(7)}.json`))
+      await rm(projectSnapshot)
+      await symlink(target, projectSnapshot)
       const reader = new OpenCodePassiveStatusProductionReader({
         rootDirectory: root, now: () => 1_000, canonicalizePath: async () => '/canonical/a',
       })

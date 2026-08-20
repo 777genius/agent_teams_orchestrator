@@ -154,11 +154,13 @@ export function buildOpenCodePassiveProviderDirectory(
     cursor: input.cursor ?? null,
     nextCursor: nextOffset < filtered.length ? String(nextOffset) : null,
     entries,
-    diagnostics: status.projectScope === null
-      ? ['passive_scope_unavailable']
-      : status.providers.some(provider => provider.configured.condition === 'degraded')
-        ? ['passive_status_degraded']
-        : [],
+    diagnostics: status.binary.issueCode === 'unsupported_safe_persistence'
+      ? ['passive_snapshot_persistence_unsupported']
+      : status.projectScope === null
+        ? ['passive_scope_unavailable']
+        : status.providers.some(provider => provider.configured.condition === 'degraded')
+          ? ['passive_status_degraded']
+          : [],
     fetchedAt: new Date(status.completedAt).toISOString(),
   }
 }

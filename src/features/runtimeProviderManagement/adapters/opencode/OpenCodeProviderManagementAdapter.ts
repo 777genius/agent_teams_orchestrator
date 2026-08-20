@@ -2967,8 +2967,8 @@ export class OpenCodeProviderManagementAdapter
     return this.deps.activeStatusPublisher ?? openCodeActiveStatusSnapshotPublisher
   }
 
-  private async publishProviderStatus(input: Parameters<OpenCodeActiveStatusPublisherPort['publishProviderUpdate']>[0]): Promise<void> {
-    await this.getActiveStatusPublisher().publishProviderUpdate(input).catch(() => undefined)
+  private async publishProviderStatus(input: Parameters<OpenCodeActiveStatusPublisherPort['publishExecutionUpdate']>[0]): Promise<void> {
+    await this.getActiveStatusPublisher().publishExecutionUpdate(input).catch(() => undefined)
   }
 
   private async retainProviderManagementHost(
@@ -3363,10 +3363,7 @@ export class OpenCodeProviderManagementAdapter
         await this.publishProviderStatus({
           projectPath: input.inventory.projectPath,
           providerId: input.providerId,
-          configured: true,
-          connected: true,
           executionVerified: true,
-          modelIds: [validationModelId],
         })
         return { ok: true, value: validationModelId }
       }
@@ -3921,12 +3918,15 @@ export class OpenCodeProviderManagementAdapter
       const scoped = await (this.deps.providerCatalog ?? openCodeProviderCatalogService)
         .loadCatalog({ providerId, projectPath: input.projectPath })
       const catalog = scoped.catalog
-      await this.publishProviderStatus({
+      await this.getActiveStatusPublisher().publishCatalogResult({
         projectPath: scoped.projectPath,
-        providerId,
+        evidence: scoped.catalogEvidence,
         catalogAvailable: true,
         modelIds: catalog.models.map(model => `${providerId}/${model.id}`),
-      })
+        observedAt: scoped.catalogObservedAt,
+        expiresAt: scoped.catalogExpiresAt,
+        provenance: scoped.catalogProvenance,
+      }).catch(() => undefined)
       const managedPreferences = this.getManagedPreferences()
       const [preferencesResult, globalPreferencesResult] = await Promise.all([
         safeRead(() => managedPreferences.read(scoped.profileRootPath)),

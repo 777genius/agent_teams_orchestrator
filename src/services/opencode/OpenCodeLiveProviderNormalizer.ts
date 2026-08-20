@@ -2,7 +2,7 @@ import { formatOpenCodeModelRef } from './OpenCodeModelRef.js'
 import { types as nodeUtilTypes } from 'node:util'
 import {
   canonicalizeOpenCodeProviderId,
-  createOpenCodeCanonicalModelId,
+  createOpenCodeExactProviderModelRef,
   isOpenCodeCredentialOrAuthorityLike,
   tryCreateOpenCodeCanonicalProviderId,
 } from './OpenCodeProviderIdentity.js'
@@ -264,6 +264,7 @@ function contractViolation(): never {
 }
 
 const OPEN_CODE_MAX_CATALOG_NUMBER = 10_000_000_000
+const OPEN_CODE_MAX_EPOCH_MS = 8_640_000_000_000_000
 
 function safeNonnegativeInteger(value: unknown): number | null {
   return typeof value === 'number'
@@ -272,6 +273,11 @@ function safeNonnegativeInteger(value: unknown): number | null {
     && value <= OPEN_CODE_MAX_CATALOG_NUMBER
     ? value
     : null
+}
+
+function safeEpochMilliseconds(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= 0 && value <= OPEN_CODE_MAX_EPOCH_MS ? value : null
 }
 
 function safeDisplayName(value: unknown): string | null {
@@ -390,7 +396,7 @@ function safeCapabilities(
   })
 }
 
-function safeModels(value: unknown): readonly OpenCodeSafeCatalogModel[] {
+function safeModels(value: unknown, providerId: string): readonly OpenCodeSafeCatalogModel[] {
   const budget = { units: 0 }
   const models = safeRecord(value, { maxKeys: OPEN_CODE_MAX_CATALOG_MODELS, budget })
   if (!models) contractViolation()
@@ -400,9 +406,9 @@ function safeModels(value: unknown): readonly OpenCodeSafeCatalogModel[] {
   for (const [key, value] of modelEntries) {
     const raw = safeRecord(value, { maxKeys: 256, budget })
     if (!raw) contractViolation()
-    let modelId: ReturnType<typeof createOpenCodeCanonicalModelId>
+    let modelId: ReturnType<typeof createOpenCodeExactProviderModelRef>['modelId']
     try {
-      modelId = createOpenCodeCanonicalModelId(key)
+      modelId = createOpenCodeExactProviderModelRef(providerId, key).modelId
       const rawId = own(raw, 'id')
       if (rawId.present && (typeof rawId.value !== 'string' || rawId.value !== modelId)) contractViolation()
     } catch (error) {
@@ -472,8 +478,8 @@ function safeFreshness(input: Record<string, unknown>): OpenCodeCatalogFreshness
   const nowMs = optionalField(input, 'nowMs', observedAtMs as number)
   const freshForMs = optionalField(input, 'freshForMs', 30_000)
   const maxStaleMs = optionalField(input, 'maxStaleMs', 5 * 60_000)
-  const safeObservedAtMs = safeNonnegativeInteger(observedAtMs)
-  const safeNowMs = safeNonnegativeInteger(nowMs)
+  const safeObservedAtMs = safeEpochMilliseconds(observedAtMs)
+  const safeNowMs = safeEpochMilliseconds(nowMs)
   const safeFreshForMs = safeNonnegativeInteger(freshForMs)
   const safeMaxStaleMs = safeNonnegativeInteger(maxStaleMs)
   if (safeObservedAtMs === null || safeNowMs === null || safeFreshForMs === null
@@ -515,7 +521,7 @@ export function normalizeOpenCodeScopedProviderCatalogResponse(
     if (matches.length === 0) contractViolation()
 
     const normalized = matches.map(row => ({
-      models: safeModels(own(row, 'models').value),
+      models: safeModels(own(row, 'models').value, requestedProviderId),
       source: normalizeOpenCodeProviderCatalogSource(
         own(inputSnapshot, 'source').value ?? own(row, 'source').value ?? own(response, 'source').value,
       ),

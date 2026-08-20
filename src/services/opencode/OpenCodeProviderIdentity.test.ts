@@ -115,6 +115,18 @@ describe('branded OpenCode provider identity boundary', () => {
     expect(createOpenCodeCanonicalModelId('vendor/model@revision')).toBe('vendor/model@revision')
   })
 
+  test('accepts only structurally versioned Bedrock :0 refs, not authorities', () => {
+    const ref = 'amazon-bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+    expect(parseOpenCodeExactProviderModelRef(ref)?.raw).toBe(ref)
+    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/api.example.invalid-v1:443')).toBeNull()
+    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/user@api.example.invalid-v1:0')).toBeNull()
+    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/[2001:db8::1]-v1:0')).toBeNull()
+    expect(parseOpenCodeExactProviderModelRef('amazon-bedrock/api.example.invalid:443/model')).toBeNull()
+    expect(parseOpenCodeExactProviderModelRef(
+      'amazon-bedrock/api.example.invalid:443/us.anthropic.claude-v1:0',
+    )).toBeNull()
+  })
+
   test('rejects endpoint and userinfo shaped exact refs without provider fallback', () => {
     for (const value of [
       'xai/user:pass@host', 'xai/user:pass@host/model', 'xai/user:pass@host:443/model',
