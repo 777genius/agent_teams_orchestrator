@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join, posix, win32 } from 'node:path'
 
@@ -24,6 +24,7 @@ const linkage: OpenCodeLaunchMemberLinkage = {
   memberIdentity: member, sessionIdentity: oid('2'),
   bootstrapMessageIdentity: oid('3'), commitIdentity: oid('4'),
 }
+const leasePath = (filePath: string) => deriveOpenCodeLaunchNamespacePaths(filePath, posix).lock
 
 class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
   bytes: Uint8Array | null = null
@@ -53,11 +54,13 @@ class MemoryPersistence implements OpenCodeLaunchJournalPersistence {
 describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
   test('derives the secure namespace with the injected host path strategy and no descriptor filesystem', async () => {
     expect(deriveOpenCodeLaunchNamespacePaths('/var/app/attempt.json', posix)).toMatchObject({
-      directory: '/var/app', lock: '/var/app/attempt.json.lease',
+      directory: '/var/app', trustedRoot: '/',
     })
     expect(deriveOpenCodeLaunchNamespacePaths('C:\\App\\attempt.json', win32)).toMatchObject({
-      directory: 'C:\\App', lock: 'C:\\App\\attempt.json.lease',
+      directory: 'C:\\App',
     })
+    expect(deriveOpenCodeLaunchNamespacePaths('C:\\App\\attempt.json', win32).lock.toLowerCase())
+      .toBe(deriveOpenCodeLaunchNamespacePaths('c:\\app\\ATTEMPT.json', win32).lock.toLowerCase())
     expect(await readFile(new URL('./OpenCodeLaunchAttemptStore.ts', import.meta.url), 'utf8'))
       .not.toContain('/proc/')
   })
@@ -447,37 +450,120 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
-  test('retains one descriptor-relative namespace when the parent pathname is deterministically swapped', async () => {
+  test('fences a retained final directory and blocks a second store on the stable logical-path anchor', async () => {
     if (process.platform === 'win32') return
-    const outer = await workspaceTemp('parent-swap-anchor')
-    const live = join(outer, 'live')
-    const retained = join(outer, 'retained')
-    await mkdir(live)
+    const outer = await workspaceTemp('final-swap-anchor')
+    const parent = join(outer, 'parent')
+    const live = join(parent, 'live')
+    const retained = join(parent, 'retained')
+    await mkdir(live, { recursive: true })
     const path = join(live, 'attempt.json')
-    let swapped = false
-    const persistence = new OpenCodeLaunchFileJournalPersistence(path, {
-      afterNamespaceAnchored: async () => {
-        await rename(live, retained)
-        await mkdir(live)
-        swapped = true
-      },
-    })
     const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
       signal: new AbortController().signal }
+    let entered!: () => void
+    const acquired = new Promise<void>(resolve => { entered = resolve })
+    let resume!: () => void
+    const gate = new Promise<void>(resolve => { resume = resolve })
+    let secondEntered = false
     try {
-      const store = new OpenCodeLaunchAttemptStore(persistence)
-      await store.withGeneration(identity, 'begin', async lease => {
-        expect(swapped).toBe(true)
-        expect(await readdir(live)).toEqual([])
-        expect((await readdir(retained)).sort()).toEqual([
-          'attempt.json', 'attempt.json.fence', 'attempt.json.lease', 'attempt.json.slot0',
-        ])
-        expect(lease).toMatchObject({ generation: 1, fence: 1 })
+      const first = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+      const running = first.withGeneration(identity, 'begin', async lease => {
+        entered(); await gate
+        await lease.append({ type: 'member_intent', memberIdentity: member })
       }, context)
-      expect(await store.inspect(identity, context)).toMatchObject({ generation: 1, fence: 1 })
-      expect((await readdir(retained)).sort()).toEqual([
-        'attempt.json', 'attempt.json.fence', 'attempt.json.slot0',
-      ])
+      await acquired
+      await rename(live, retained); await mkdir(live)
+
+      const contenderController = new AbortController()
+      const contenderContext = { ...context, signal: contenderController.signal }
+      let contenderAnchored!: () => void
+      const anchored = new Promise<void>(resolve => { contenderAnchored = resolve })
+      let secondSettled = false
+      const second = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path, {
+        afterNamespaceAnchored: async () => { contenderAnchored() },
+      }))
+        .withGeneration(identity, 'begin', async () => { secondEntered = true }, contenderContext)
+      void second.then(() => { secondSettled = true }, () => { secondSettled = true })
+      await anchored; await Bun.sleep(20)
+      expect(secondSettled).toBe(false)
+      contenderController.abort(new Error('stop contender'))
+      await expect(second).rejects.toThrow('stop contender')
+      expect(secondEntered).toBe(false)
+
+      resume()
+      await expect(running).rejects.toMatchObject({ code: 'fenced' })
+      await expect(new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .inspect(identity, context)).rejects.toMatchObject({ code: 'fenced' })
+
+      await rm(live, { recursive: true }); await rename(retained, live)
+      expect(await new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .inspect(identity, context)).toMatchObject({ generation: 1, fence: 1 })
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
+  test('fences a parent swap, survives rename-back, and continues after store restart', async () => {
+    if (process.platform === 'win32') return
+    const outer = await workspaceTemp('parent-swap-restart')
+    const parent = join(outer, 'parent')
+    const final = join(parent, 'final')
+    const displaced = join(outer, 'displaced')
+    await mkdir(final, { recursive: true })
+    const path = join(final, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const liveIdentity = { ...identity, startedAtMs: Date.now() }
+    let entered!: () => void
+    const acquired = new Promise<void>(resolve => { entered = resolve })
+    let resume!: () => void
+    const gate = new Promise<void>(resolve => { resume = resolve })
+    try {
+      const running = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .withGeneration(liveIdentity, 'begin', async lease => {
+          entered(); await gate
+          await lease.revalidate(member, 'not-a-claim', context)
+        }, context)
+      await acquired
+      await rename(parent, displaced); await mkdir(final, { recursive: true })
+      resume()
+      await expect(running).rejects.toMatchObject({ code: 'fenced' })
+      await expect(new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .withGeneration(liveIdentity, 'begin', async () => undefined, context)).rejects.toMatchObject({ code: 'fenced' })
+
+      await rm(parent, { recursive: true }); await rename(displaced, parent)
+      const restarted = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+      await restarted.withGeneration({ ...liveIdentity, inputDigest: 'b'.repeat(64) }, 'continue', async lease => {
+        expect(lease).toMatchObject({ generation: 2, fence: 2 })
+      }, context)
+      expect(await restarted.inspect({ ...identity, inputDigest: 'b'.repeat(64) }, context))
+        .toMatchObject({ generation: 2, fence: 2 })
+    } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
+  test('reaps a crashed owner without admitting a recreated parent namespace', async () => {
+    const outer = await workspaceTemp('parent-swap-crash')
+    const parent = join(outer, 'parent')
+    const final = join(parent, 'final')
+    const displaced = join(outer, 'displaced')
+    await mkdir(final, { recursive: true })
+    const path = join(final, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const liveIdentity = { ...identity, startedAtMs: Date.now() }
+    try {
+      await new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .withGeneration(liveIdentity, 'begin', async () => undefined, context)
+      const crashedOwner = { version: 1, pid: 2_147_483_647, processBirth: '1', token: crypto.randomUUID() }
+      await mkdir(leasePath(path), { mode: 0o700 })
+      await writeFile(join(leasePath(path), 'owner.json'), JSON.stringify(crashedOwner), { mode: 0o600 })
+
+      await rename(parent, displaced); await mkdir(final, { recursive: true })
+      await expect(new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .inspect(liveIdentity, context)).rejects.toMatchObject({ code: 'fenced' })
+      await expect(stat(leasePath(path))).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await rm(parent, { recursive: true }); await rename(displaced, parent)
+      expect(await new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path))
+        .inspect(liveIdentity, context)).toMatchObject({ generation: 1, fence: 1 })
     } finally { await rm(outer, { recursive: true, force: true }) }
   })
 
@@ -498,10 +584,55 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
           await rename(live, displaced); await mkdir(live); swapped = true
         },
       })
-      await expect(guarded.read()).rejects.toMatchObject({ code: 'foreign' })
+      await expect(guarded.read()).rejects.toMatchObject({ code: 'fenced' })
       expect(swapped).toBe(true)
       expect(await readdir(live)).toEqual([])
     } finally { await rm(outer, { recursive: true, force: true }) }
+  })
+
+  test('trusted-root Windows backend shares authority across a final-directory swap', async () => {
+    const outer = await workspaceTemp('windows-two-store-anchor')
+    const parent = join(outer, 'parent')
+    const live = join(parent, 'live')
+    const displaced = join(parent, 'displaced')
+    await mkdir(live, { recursive: true })
+    const path = join(live, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    const liveIdentity = { ...identity, startedAtMs: Date.now() }
+    let entered!: () => void
+    const acquired = new Promise<void>(resolve => { entered = resolve })
+    let resume!: () => void
+    const gate = new Promise<void>(resolve => { resume = resolve })
+    let contenderEntered = false
+    try {
+      const running = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path, { platform: 'win32' }))
+        .withGeneration(liveIdentity, 'begin', async lease => {
+          entered(); await gate
+          await lease.append({ type: 'member_intent', memberIdentity: member })
+        }, context)
+      await acquired
+      await rename(live, displaced); await mkdir(live)
+      const contenderController = new AbortController()
+      const contenderContext = { ...context, signal: contenderController.signal }
+      let contenderAnchored!: () => void
+      const anchored = new Promise<void>(resolve => { contenderAnchored = resolve })
+      let contenderSettled = false
+      const contender = new OpenCodeLaunchAttemptStore(new OpenCodeLaunchFileJournalPersistence(path, {
+        platform: 'win32', afterNamespaceAnchored: async () => { contenderAnchored() },
+      })).withGeneration(liveIdentity, 'begin', async () => { contenderEntered = true }, contenderContext)
+      void contender.then(() => { contenderSettled = true }, () => { contenderSettled = true })
+      await anchored; await Bun.sleep(20)
+      expect(contenderSettled).toBe(false)
+      contenderController.abort(new Error('stop contender'))
+      await expect(contender).rejects.toThrow('stop contender')
+      expect(contenderEntered).toBe(false)
+      resume()
+      await expect(running).rejects.toMatchObject({ code: 'fenced' })
+    } finally {
+      resume?.()
+      await rm(outer, { recursive: true, force: true })
+    }
   })
 
   test('rejects a pre-planted lease symlink without reading or mutating its target namespace', async () => {
@@ -509,7 +640,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const target = join(directory, 'target')
     const path = join(directory, 'attempt.json')
     await mkdir(target)
-    await symlink(target, `${path}.lease`)
+    await symlink(target, leasePath(path))
     const context = { deadlineAtMs: Date.now() + 1_000, monotonicNow: Date.now,
       signal: new AbortController().signal }
     try {
@@ -526,14 +657,14 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       signal: new AbortController().signal }
     try {
       const release = await new OpenCodeLaunchFileJournalPersistence(path).acquireExclusive(context)
-      const owner = JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))
+      const owner = JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8'))
       expect(owner).toMatchObject({ version: 1, pid: process.pid })
       expect(owner.token).toMatch(/^[0-9a-f-]{36}$/)
       expect(owner.processBirth).toMatch(/^\d+$/)
-      expect(await readdir(`${path}.lease`)).toEqual(['owner.json'])
+      expect(await readdir(leasePath(path))).toEqual(['owner.json'])
       await release(context)
       const releaseAgain = await new OpenCodeLaunchFileJournalPersistence(path).acquireExclusive(context)
-      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8')).processBirth).toBe(owner.processBirth)
+      expect(JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8')).processBirth).toBe(owner.processBirth)
       await releaseAgain(context)
       expect(await readdir(directory)).toEqual([])
     } finally { await rm(directory, { recursive: true, force: true }) }
@@ -546,11 +677,11 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       signal: new AbortController().signal }
     try {
       const release = await new OpenCodeLaunchFileJournalPersistence(path).acquireExclusive(context)
-      const ownerPath = `${path}.lease/owner.json`
+      const ownerPath = join(leasePath(path), 'owner.json')
       const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
       await writeFile(ownerPath, JSON.stringify({ ...owner, token: 'foreign-token' }), { mode: 0o600 })
       await expect(release(context)).rejects.toMatchObject({ code: 'fenced' })
-      expect((await stat(`${path}.lease`)).isDirectory()).toBe(true)
+      expect((await stat(leasePath(path))).isDirectory()).toBe(true)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
@@ -570,13 +701,13 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       const releaseFirst = await first.acquireExclusive(context)
       const releasing = releaseFirst(context)
       await mutationPoint
-      const ownerPath = `${path}.lease/owner.json`
+      const ownerPath = join(leasePath(path), 'owner.json')
       const owner = JSON.parse(await readFile(ownerPath, 'utf8'))
       await writeFile(ownerPath, JSON.stringify({ ...owner, processBirth: `${Number(owner.processBirth) + 1}` }))
       mutationDone()
       await expect(releasing).rejects.toMatchObject({ code: 'fenced' })
       expect(JSON.parse(await readFile(ownerPath, 'utf8')).processBirth).not.toBe(owner.processBirth)
-      expect((await stat(`${path}.lease`)).isDirectory()).toBe(true)
+      expect((await stat(leasePath(path))).isDirectory()).toBe(true)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
@@ -599,13 +730,13 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       await detachPoint
 
       const releaseContender = await contender.acquireExclusive(context)
-      const contenderOwner = await readFile(`${path}.lease/owner.json`, 'utf8')
+      const contenderOwner = await readFile(join(leasePath(path), 'owner.json'), 'utf8')
       finishRelease()
       await releasing
 
-      expect(await readFile(`${path}.lease/owner.json`, 'utf8')).toBe(contenderOwner)
+      expect(await readFile(join(leasePath(path), 'owner.json'), 'utf8')).toBe(contenderOwner)
       await releaseContender(context)
-      await expect(stat(`${path}.lease`)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(leasePath(path))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       finishRelease?.()
       await rm(directory, { recursive: true, force: true })
@@ -620,7 +751,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     try {
       const first = new OpenCodeLaunchFileJournalPersistence(path)
       const release = await first.acquireExclusive(context)
-      const owner = JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))
+      const owner = JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8'))
       let reads = 0
       const contender = new OpenCodeLaunchFileJournalPersistence(path, {
         processBirth: async () => {
@@ -633,7 +764,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       while (reads < 2) await Bun.sleep(1)
       controller.abort(new Error('stop waiting'))
       await expect(waiting).rejects.toThrow('stop waiting')
-      expect((await stat(`${path}.lease`)).isDirectory()).toBe(true)
+      expect((await stat(leasePath(path))).isDirectory()).toBe(true)
       await release({ ...context, signal: new AbortController().signal })
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
@@ -643,8 +774,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const path = join(directory, 'attempt.json')
     const child = Bun.spawn(['/root/.bun/bin/bun', '-e', 'await Bun.sleep(30_000)'])
     const owner = { version: 1, pid: child.pid, processBirth: '1', token: crypto.randomUUID() }
-    await mkdir(`${path}.lease`, { mode: 0o700 })
-    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    await mkdir(leasePath(path), { mode: 0o700 })
+    await writeFile(join(leasePath(path), 'owner.json'), JSON.stringify(owner), { mode: 0o600 })
     const controller = new AbortController()
     const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now, signal: controller.signal }
     try {
@@ -657,7 +788,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       const waiting = persistence.acquireExclusive(context)
       await Bun.sleep(20); controller.abort(new Error('stop waiting'))
       await expect(waiting).rejects.toThrow('stop waiting')
-      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))).toEqual(owner)
+      expect(JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8'))).toEqual(owner)
     } finally {
       child.kill(); await child.exited
       await rm(directory, { recursive: true, force: true })
@@ -668,14 +799,14 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const directory = await workspaceTemp('pid-reuse')
     const path = join(directory, 'attempt.json')
     const owner = { version: 1, pid: process.pid, processBirth: '1', token: crypto.randomUUID() }
-    await mkdir(`${path}.lease`, { mode: 0o700 })
-    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    await mkdir(leasePath(path), { mode: 0o700 })
+    await writeFile(join(leasePath(path), 'owner.json'), JSON.stringify(owner), { mode: 0o600 })
     const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
       signal: new AbortController().signal }
     try {
       const persistence = new OpenCodeLaunchFileJournalPersistence(path, { processBirth: async () => '2' })
       const release = await persistence.acquireExclusive(context)
-      const replacement = JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8'))
+      const replacement = JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8'))
       expect(replacement.token).not.toBe(owner.token)
       expect(replacement.processBirth).toBe('2')
       await release(context)
@@ -686,8 +817,8 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     const directory = await workspaceTemp('dead-pid-no-birth')
     const path = join(directory, 'attempt.json')
     const owner = { version: 1, pid: 2_147_483_647, processBirth: '1', token: crypto.randomUUID() }
-    await mkdir(`${path}.lease`, { mode: 0o700 })
-    await writeFile(`${path}.lease/owner.json`, JSON.stringify(owner), { mode: 0o600 })
+    await mkdir(leasePath(path), { mode: 0o700 })
+    await writeFile(join(leasePath(path), 'owner.json'), JSON.stringify(owner), { mode: 0o600 })
     let foreignBirthRead = false
     const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
       signal: new AbortController().signal }
@@ -701,7 +832,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       })
       const release = await persistence.acquireExclusive(context)
       expect(foreignBirthRead).toBe(false)
-      expect(JSON.parse(await readFile(`${path}.lease/owner.json`, 'utf8')).token).not.toBe(owner.token)
+      expect(JSON.parse(await readFile(join(leasePath(path), 'owner.json'), 'utf8')).token).not.toBe(owner.token)
       await release(context)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
@@ -934,7 +1065,7 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
       expect(journal.events).toHaveLength(1)
       expect(journal.events[0]).toMatchObject({ type: 'member_intent', generation: 1, fence: 1 })
     } finally { await rm(directory, { recursive: true, force: true }) }
-  })
+  }, 15_000)
 
   test('two processes preserve a newer generation against a detached stale writer', async () => {
     const directory = await workspaceTemp('stale')
@@ -976,11 +1107,21 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
         [member, 1], [oid('8'), 2],
       ])
     } finally { await rm(directory, { recursive: true, force: true }) }
-  })
+  }, 15_000)
+})
+
+const temporaryRoots = new Set<string>()
+afterEach(async () => {
+  await Promise.all([...temporaryRoots].map(root => rm(root, { recursive: true, force: true })))
+  temporaryRoots.clear()
 })
 
 async function workspaceTemp(label: string): Promise<string> {
-  return mkdtemp(join(process.cwd(), `src/services/opencode/.launch-store-${label}-`))
+  const root = await mkdtemp(join(process.cwd(), `src/services/opencode/.launch-store-${label}-`))
+  temporaryRoots.add(root)
+  const directory = join(root, 'trusted', 'parent', 'work')
+  await mkdir(directory, { recursive: true })
+  return directory
 }
 
 async function readCommittedJournal(path: string): Promise<any> {
