@@ -46,7 +46,10 @@ import {
   type OpenCodeModelAccessCatalog,
 } from '../../../../services/opencode/OpenCodeModelAccessPolicy.js'
 import { openCodeProfileManager } from '../../../../services/opencode/OpenCodeProfileManager.js'
-import { canonicalizeOpenCodeProviderId } from '../../../../services/opencode/OpenCodeProviderIdentity.js'
+import {
+  canonicalizeOpenCodeProviderId,
+  parseOpenCodeExactProviderModelRef,
+} from '../../../../services/opencode/OpenCodeProviderIdentity.js'
 import {
   openCodeProviderCatalogService,
   type OpenCodeProviderCatalogPort,
@@ -517,6 +520,7 @@ function normalizeProviderId(value: string | null | undefined): string | null {
   const normalized = value?.trim()
   if (!normalized) return null
   const canonical = canonicalizeOpenCodeProviderId(normalized)
+  if (!canonical) return null
   return /^[a-z0-9][a-z0-9._-]*$/i.test(canonical) ? canonical : null
 }
 
@@ -3882,15 +3886,21 @@ export class OpenCodeProviderManagementAdapter
       const preferencesResult = await safeRead(() =>
         this.getManagedPreferences().read(scoped.profileRootPath)
       )
-      const overrides: Readonly<Record<string, OpenCodeManagedModelLimitOverride>> = preferencesResult.ok
-        ? preferencesResult.value.modelLimitOverrides
-        : Object.freeze({})
+      const preferences = preferencesResult.ok ? preferencesResult.value : null
+      const overrides: Readonly<Record<string, OpenCodeManagedModelLimitOverride>> =
+        preferences?.modelLimitOverrides ?? Object.freeze({})
+      const configuredDefault = parseOpenCodeExactProviderModelRef(
+        preferences?.defaultModelId ?? '',
+      )
+      const defaultModelId = configuredDefault?.providerId === providerId
+        ? configuredDefault.raw
+        : null
       const query = normalizeQuery(input.query)
       const limit = normalizePositiveLimit(input.limit)
       const offset = normalizeDirectoryCursor(input.cursor)
       const sourceLabel = getProviderDisplayName(providerId)
       const allModels: RuntimeProviderModel[] = catalog.models
-        .filter(model => model.status !== 'deprecated')
+        .filter(model => model.status !== 'deprecated' || `${providerId}/${model.id}` === defaultModelId)
         .map(model => {
           const modelId = `${providerId}/${model.id}`
           const managed = overrides[modelId] ?? null
@@ -3900,7 +3910,7 @@ export class OpenCodeProviderManagementAdapter
             displayName: model.displayName ?? model.id,
             sourceLabel,
             free: model.billing === 'free',
-            default: false,
+            default: modelId === defaultModelId,
             catalogStatus: model.status === 'unknown' ? 'active' : model.status,
             availability: 'untested',
             accessKind: 'catalog_selection_only',
@@ -3928,7 +3938,7 @@ export class OpenCodeProviderManagementAdapter
           cursor: input.cursor?.trim() || null,
           nextCursor: nextOffset < allModels.length ? String(nextOffset) : null,
           models: Object.freeze(models),
-          defaultModelId: null,
+          defaultModelId,
           diagnostics: Object.freeze([
             ...scoped.diagnostics,
             ...safeReadDiagnostics(preferencesResult),

@@ -132,6 +132,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
       processBirth?: (pid: number) => Promise<string>
       syncLeaseDirectory?: (handle: Awaited<ReturnType<typeof open>>) => Promise<void>
       beforeLeaseDirectoryRemove?: () => Promise<void>
+      afterLeaseDirectoryDetach?: () => Promise<void>
     } = {},
   ) {
     if (!filePath) throw new TypeError('journal path is required')
@@ -250,7 +251,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
         // Cancellation may win immediately after the atomic rename; explicitly reap that late acquisition.
         if (context.signal.aborted || context.monotonicNow() >= context.deadlineAtMs) {
           await releaseOwnedLock(namespace, lock, ownerRecord!, lockHandle, lockIdentity,
-            this.testHooks.beforeLeaseDirectoryRemove).catch(() => undefined)
+            this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach).catch(() => undefined)
           ensureContext(context)
         }
         let released = false
@@ -261,7 +262,7 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
             // Start token-checked physical release even when the caller's deadline just expired;
             // the deadline bounds waiting, while the operation is explicitly reaped late.
             const physicalRelease = releaseOwnedLock(namespace, lock, ownerRecord!, lockHandle!, lockIdentity,
-              this.testHooks.beforeLeaseDirectoryRemove)
+              this.testHooks.beforeLeaseDirectoryRemove, this.testHooks.afterLeaseDirectoryDetach)
             try { await awaitWithContext(physicalRelease, effectiveContext) }
             catch (error) {
               // A timed-out unlink/rmdir is still reaped when the physical operation settles.
@@ -505,10 +506,11 @@ async function releaseOwnedLockByPath(
   lock: string,
   owner: LockOwner,
   beforeDirectoryRemove?: () => Promise<void>,
+  afterDirectoryDetach?: () => Promise<void>,
 ): Promise<void> {
   const handle = await open(lock, 'r')
   const identity = await handle.stat()
-  await releaseOwnedLock(namespace, lock, owner, handle, identity, beforeDirectoryRemove)
+  await releaseOwnedLock(namespace, lock, owner, handle, identity, beforeDirectoryRemove, afterDirectoryDetach)
 }
 
 type LockOwner = { version: 1; pid: number; processBirth: string; token: string }
@@ -520,6 +522,7 @@ async function releaseOwnedLock(
   lockHandle: Awaited<ReturnType<typeof open>>,
   identity: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
   beforeDirectoryRemove?: () => Promise<void>,
+  afterDirectoryDetach?: () => Promise<void>,
 ): Promise<void> {
   try {
     await verifyNamespace(namespace)
@@ -538,11 +541,23 @@ async function releaseOwnedLock(
       throw new OpenCodeLaunchJournalError('fenced', 'lock ownership tuple changed')
     }
     const beforeRemove = await stat(lock)
-    if (beforeRemove.dev !== identity.dev || beforeRemove.ino !== identity.ino) {
+    if (!sameFileIdentity(beforeRemove, identity)) {
       throw new OpenCodeLaunchJournalError('fenced', 'lease directory changed during release')
     }
+    // Detach the still-nonempty owned directory in one namespace transition.
+    // A contender can publish immediately afterward, but cleanup below targets
+    // only this acquisition's unique tombstone and retained descriptor.
+    const detached = `${lock}.${expectedOwner.token}.releasing`
+    await rename(lock, detached)
+    const visibleDetached = await stat(detached)
+    if (!sameFileIdentity(visibleDetached, identity)) {
+      throw new OpenCodeLaunchJournalError('fenced', 'detached lease directory identity changed')
+    }
+    await namespace.handle.sync()
+    await afterDirectoryDetach?.()
     await unlink(owner)
-    await rmdir(lock)
+    await rmdir(detached)
+    await namespace.handle.sync()
   } finally {
     await lockHandle.close().catch(() => undefined)
   }

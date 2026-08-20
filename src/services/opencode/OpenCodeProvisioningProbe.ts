@@ -306,10 +306,14 @@ export class OpenCodeProvisioningProbe {
 
       const diagnostics = [...inventory.diagnostics]
       const inventoryConnectedProviders = uniqueSorted(
-        inventory.connectedProviders.map(provider => canonicalizeOpenCodeProviderId(provider.id)),
+        inventory.connectedProviders
+          .map(provider => canonicalizeOpenCodeProviderId(provider.id))
+          .filter(providerId => providerId !== null),
       )
       const hostConnectedProviders = uniqueSorted(
-        (providers.connected ?? []).map(canonicalizeOpenCodeProviderId),
+        (providers.connected ?? [])
+          .map(canonicalizeOpenCodeProviderId)
+          .filter(providerId => providerId !== null),
       )
 
       if (host.state !== 'healthy') {
@@ -470,7 +474,7 @@ export function createOpenCodePurposeCompositionAdapter(
   const projectPath = options.selected.projectPath.trim()
   const providerId = canonicalizeOpenCodeProviderId(options.selected.provider)
   const model = parseOpenCodeExactProviderModelRef(options.selected.model)
-  if (!projectPath || !model || model.providerId !== providerId) {
+  if (!projectPath || !providerId || !model || model.providerId !== providerId) {
     throw new TypeError('OpenCode purpose composition requires one exact project/provider/model selection')
   }
   const ports = Object.freeze({

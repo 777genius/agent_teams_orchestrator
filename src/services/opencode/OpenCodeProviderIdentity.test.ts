@@ -25,6 +25,12 @@ describe('canonicalizeOpenCodeProviderId', () => {
   ])('maps %s to %s', (input, expected) => {
     expect(canonicalizeOpenCodeProviderId(input)).toBe(expected)
   })
+
+  test('returns null at malformed user and config boundaries', () => {
+    expect(canonicalizeOpenCodeProviderId('../provider')).toBeNull()
+    expect(canonicalizeOpenCodeProviderId('Provider')).toBeNull()
+    expect(canonicalizeOpenCodeProviderId(null)).toBeNull()
+  })
 })
 
 describe('branded OpenCode provider identity boundary', () => {

@@ -485,7 +485,11 @@ export function isOpenCodeManagedPathComponentOwnershipValid(
 ): boolean {
   const component = path.resolve(componentPath)
   const boundary = path.resolve(ownershipBoundaryPath)
-  const insideBoundary = component === boundary || component.startsWith(`${boundary}${path.sep}`)
+  const relative = path.relative(boundary, component)
+  const insideBoundary = relative === ''
+    || (relative !== '..'
+      && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative))
   return !insideBoundary
     || (metadata.uid === currentUid && (metadata.mode & 0o022) === 0)
 }
@@ -496,8 +500,12 @@ async function assertCanonicalOwnedPathComponents(
 ): Promise<void> {
   const resolved = path.resolve(targetPath)
   const ownershipBoundary = path.resolve(ownershipBoundaryPath)
-  if (resolved !== ownershipBoundary
-    && !resolved.startsWith(`${ownershipBoundary}${path.sep}`)) {
+  const relative = path.relative(ownershipBoundary, resolved)
+  if (relative !== '' && (
+    relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  )) {
     throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
   }
   const parsed = path.parse(resolved)
@@ -526,6 +534,83 @@ async function assertCanonicalOwnedPathComponents(
   }
 }
 
+async function ensureWindowsManagedDirectoryPath(
+  resolved: string,
+  ownershipBoundary: string,
+  afterComponentOpened?: (componentPath: string) => void | Promise<void>,
+): Promise<void> {
+  const parsed = path.parse(resolved)
+  const relativeParts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)
+
+  const inspectThrough = async (target: string): Promise<void> => {
+    const targetParts = target.slice(parsed.root.length).split(path.sep).filter(Boolean)
+    let current = parsed.root
+    for (const part of targetParts) {
+      current = path.join(current, part)
+      const metadata = await lstat(current).catch(error => {
+        if (getErrnoCode(error) === 'ENOENT') return null
+        throw error
+      })
+      if (!metadata) {
+        throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+      }
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
+      }
+      if (typeof process.getuid === 'function' && !isOpenCodeManagedPathComponentOwnershipValid(
+        current,
+        ownershipBoundary,
+        metadata,
+        process.getuid(),
+      )) {
+        throw new Error('OpenCode scoped managed path ancestry is not safely app-owned [redacted]')
+      }
+    }
+  }
+
+  const walk = async (createMissing: boolean, notify: boolean): Promise<bigint[]> => {
+    const identities: bigint[] = []
+    let current = parsed.root
+    for (const part of relativeParts) {
+      const parent = current
+      current = path.join(parent, part)
+      await inspectThrough(parent)
+      let metadata = await lstat(current, { bigint: true }).catch(error => {
+        if (getErrnoCode(error) === 'ENOENT') return null
+        throw error
+      })
+      if (!metadata) {
+        if (!createMissing) {
+          throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+        }
+        try {
+          await mkdir(current, { mode: 0o700 })
+        } catch (error) {
+          if (getErrnoCode(error) !== 'EEXIST') throw error
+        }
+        metadata = await lstat(current, { bigint: true }).catch(error => {
+          throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]', {
+            cause: error,
+          })
+        })
+      }
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error('OpenCode scoped managed path ancestry is not canonical [redacted]')
+      }
+      if (notify) await afterComponentOpened?.(current)
+      identities.push(metadata.dev, metadata.ino)
+    }
+    return identities
+  }
+
+  const createdIdentities = await walk(true, true)
+  const reachableIdentities = await walk(false, false)
+  if (createdIdentities.length !== reachableIdentities.length
+    || createdIdentities.some((identity, index) => identity !== reachableIdentities[index])) {
+    throw new Error('OpenCode scoped managed path ancestry changed during creation [redacted]')
+  }
+}
+
 /**
  * Creates a managed directory one component at a time relative to a held
  * no-follow directory descriptor. The optional callback is a deterministic
@@ -535,17 +620,24 @@ export async function ensureOpenCodeManagedDirectoryPath(
   targetPath: string,
   ownershipBoundaryPath: string,
   afterComponentOpened?: (componentPath: string) => void | Promise<void>,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<void> {
   const resolved = path.resolve(targetPath)
   const ownershipBoundary = path.resolve(ownershipBoundaryPath)
-  if (resolved !== ownershipBoundary
-    && !resolved.startsWith(`${ownershipBoundary}${path.sep}`)) {
+  const relative = path.relative(ownershipBoundary, resolved)
+  if (relative !== '' && (
+    relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+  )) {
     throw new Error('OpenCode scoped managed ownership boundary is invalid [redacted]')
   }
-  if (process.platform === 'win32') {
-    // Node does not expose mkdirat/openat on Windows. Refuse the descriptor-
-    // relative S1 path instead of falling back to a check-then-mkdir sequence.
-    throw new Error('OpenCode scoped descriptor-relative directory creation is unsupported [redacted]')
+  if (platform === 'win32') {
+    // Node does not expose mkdirat/openat on Windows. Walk one component at a
+    // time without recursive mkdir, reject reparse-point ancestry, and verify
+    // that every component retains the same file identity across a second walk.
+    await ensureWindowsManagedDirectoryPath(resolved, ownershipBoundary, afterComponentOpened)
+    return
   }
 
   const descriptorRoot = process.platform === 'linux' ? '/proc/self/fd' : '/dev/fd'

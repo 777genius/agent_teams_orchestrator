@@ -334,4 +334,22 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.launchAllowed).toBe(false)
     expect(access.reason).toContain('was not found in the live provider catalog')
   })
+
+  test('ignores malformed external provider rows without throwing or granting access', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'openrouter/ghost-model',
+      catalog: catalog({
+        connectedProviders: ['../openrouter'],
+        models: ['../openrouter/ghost-model'],
+        providers: {
+          all: [{ id: '../openrouter', models: { 'ghost-model': {} } }],
+          connected: ['../openrouter'],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('unknown_model')
+    expect(access.launchAllowed).toBe(false)
+  })
 })

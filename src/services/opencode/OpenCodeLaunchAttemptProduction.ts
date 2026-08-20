@@ -14,7 +14,6 @@ import {
   computeOpenCodeLaunchAttemptImmutableDigest,
   type OpenCodeLaunchAttemptPorts,
   type OpenCodeLaunchAttemptResult,
-  type OpenCodeLaunchOwnedResources,
   type OpenCodeLaunchProfile,
 } from './OpenCodeLaunchAttempt.js'
 import { createOpenCodeLaunchAttemptProductionBridge } from './OpenCodeLaunchAttemptProductionComposition.js'
@@ -48,6 +47,7 @@ import {
   OpenCodeLaunchRetainedHostLeases,
   readOpenCodeExactMessageText,
 } from './OpenCodeLaunchProductionGuards.js'
+import { createOpenCodeOwnedMemberSession } from './OpenCodeLaunchAttemptProductionSession.js'
 import {
   authorizeOpenCodeLaunchScopedProfile,
   prepareAuthorizedOpenCodeLaunchScopedProfile,
@@ -544,12 +544,6 @@ class OpenCodeProductionLaunchRuntime {
           })
           const target = targetByMember.get(input.memberIdentity)!
           const authoritativeSessionId = OpenCodeLaunchMutationLedger.idempotencyIdentity(target)
-          const session = await client.createSession({
-              id: authoritativeSessionId, title: `${command.teamId} - ${member.name}`,
-            })
-          if (session.id !== authoritativeSessionId) {
-            return { outcome: 'unknown_transport' }
-          }
           const now = new Date().toISOString()
           let record: OpenCodeSessionRecord = {
             teamId: command.teamId, laneId: command.laneId, memberName: member.name,
@@ -558,7 +552,7 @@ class OpenCodeProductionLaunchRuntime {
             projectPath: handle.projectPath, profileRootKey: handle.profileRootKey,
             hostKey: handle.hostKey, toolApprovalMode: command.toolApprovalMode,
             runtimePid: handle.pid, resolvedBehaviorFingerprint: handle.resolvedConfigFingerprint,
-            opencodeSessionId: session.id, lastCanonicalCursor: null,
+            opencodeSessionId: authoritativeSessionId, lastCanonicalCursor: null,
             lastKnownRawStatus: null, lastKnownDurableState: null,
             sourceAuthFingerprint: handle.profile.sourceAuthFingerprint,
             managedAuthFingerprint: handle.profile.managedAuthFingerprint,
@@ -567,13 +561,22 @@ class OpenCodeProductionLaunchRuntime {
             ...(handle.version ? { opencodeVersion: handle.version } : {}),
             bootstrapMode: 'app_managed_context', staleReason: null, createdAt: now, updatedAt: now,
           }
+          const { session, owned } = await createOpenCodeOwnedMemberSession({
+            memberIdentity: input.memberIdentity,
+            authoritativeSessionId,
+            registerRecord: () => { records.set(input.memberIdentity, record) },
+            registerOwned: input.registerOwned,
+            createSession: () => client.createSession({
+              id: authoritativeSessionId, title: `${command.teamId} - ${member.name}`,
+            }),
+          })
+          if (session.id !== authoritativeSessionId) {
+            return { outcome: 'unknown_transport', owned }
+          }
           await openCodeHostManager.retainHostLease(handle.hostKey, {
             teamId: command.teamId, laneId: command.laneId, memberName: member.name,
             runId: command.runId, sessionId: session.id,
           })
-          const owned: OpenCodeLaunchOwnedResources = { memberIdentity: input.memberIdentity,
-            sessionIdentity: opaque({ kind: 'opencode-session', id: record.opencodeSessionId }) }
-          records.set(input.memberIdentity, record); input.registerOwned(owned)
           const text = bootstrapText(command, member.name, record.opencodeSessionId, member.prompt)
           const contextHash = createHash('sha256').update(text).digest('hex')
           const briefingHash = createHash('sha256').update(member.prompt ?? '').digest('hex')

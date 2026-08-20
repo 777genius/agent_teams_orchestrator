@@ -100,9 +100,15 @@ export function createOpenCodeCanonicalProviderId(value: string): OpenCodeCanoni
   return canonical as OpenCodeCanonicalProviderId
 }
 
-/** Compatibility spelling. Invalid values now fail closed rather than leaking through. */
-export function canonicalizeOpenCodeProviderId(value: string): OpenCodeCanonicalProviderId {
-  return createOpenCodeCanonicalProviderId(value)
+/**
+ * Non-throwing normalization for provider ids received at user/config/runtime
+ * boundaries. Internal code that requires an invariant must use
+ * createOpenCodeCanonicalProviderId instead.
+ */
+export function canonicalizeOpenCodeProviderId(
+  value: unknown,
+): OpenCodeCanonicalProviderId | null {
+  return tryCreateOpenCodeCanonicalProviderId(value)
 }
 
 export function tryCreateOpenCodeCanonicalProviderId(

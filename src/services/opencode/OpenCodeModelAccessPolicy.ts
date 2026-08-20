@@ -186,9 +186,11 @@ function hasKnownOpenCodeModel(
   if (
     catalog.models.some(model => {
       const parsed = parseOpenCodeProviderScopedModelRef(model)
-      return parsed
-        ? formatOpenCodeModelRef(canonicalizeOpenCodeProviderId(parsed.providerId), parsed.modelId)
-          === scopedModel
+      const normalizedProviderId = parsed
+        ? canonicalizeOpenCodeProviderId(parsed.providerId)
+        : null
+      return parsed && normalizedProviderId
+        ? formatOpenCodeModelRef(normalizedProviderId, parsed.modelId) === scopedModel
         : false
     })
   ) {
@@ -246,14 +248,14 @@ export function evaluateOpenCodeModelAccess(input: {
   }
 
   const rawParsed = parseOpenCodeProviderScopedModelRef(selected)
-  const parsed = rawParsed
+  const normalizedProviderId = rawParsed
+    ? canonicalizeOpenCodeProviderId(rawParsed.providerId)
+    : null
+  const parsed = rawParsed && normalizedProviderId
     ? {
         ...rawParsed,
-        providerId: canonicalizeOpenCodeProviderId(rawParsed.providerId),
-        raw: formatOpenCodeModelRef(
-          canonicalizeOpenCodeProviderId(rawParsed.providerId),
-          rawParsed.modelId,
-        ),
+        providerId: normalizedProviderId,
+        raw: formatOpenCodeModelRef(normalizedProviderId, rawParsed.modelId),
       }
     : null
   if (!parsed) {
@@ -473,8 +475,11 @@ export function hasOpenCodeConfiguredAuthlessModel(
 ): boolean {
   for (const model of catalog.models) {
     const rawParsed = parseOpenCodeProviderScopedModelRef(model)
-    const parsed = rawParsed
-      ? { ...rawParsed, providerId: canonicalizeOpenCodeProviderId(rawParsed.providerId) }
+    const normalizedProviderId = rawParsed
+      ? canonicalizeOpenCodeProviderId(rawParsed.providerId)
+      : null
+    const parsed = rawParsed && normalizedProviderId
+      ? { ...rawParsed, providerId: normalizedProviderId }
       : null
     if (!parsed || normalizeProviderIdSet(catalog.connectedProviders).has(parsed.providerId)) {
       continue

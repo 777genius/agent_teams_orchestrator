@@ -727,6 +727,37 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
+  test('creates Windows scoped managed directories without traversing reparse-point ancestry', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-managed-windows-v2-'))
+    const boundary = path.join(tempDir, 'managed')
+    const target = path.join(boundary, 'one', 'two')
+    const outside = path.join(tempDir, 'outside')
+    try {
+      await ensureOpenCodeManagedDirectoryPath(target, boundary, undefined, 'win32')
+      expect((await stat(target)).isDirectory()).toBe(true)
+
+      await mkdir(outside)
+      await symlink(outside, path.join(boundary, 'linked'), 'dir')
+      await expect(ensureOpenCodeManagedDirectoryPath(
+        path.join(boundary, 'linked', 'child'),
+        boundary,
+        undefined,
+        'win32',
+      )).rejects.toThrow('ancestry is not canonical')
+      expect(await readdir(outside)).toEqual([])
+
+      await expect(ensureOpenCodeManagedDirectoryPath(
+        path.join(boundary, '..', 'outside', 'child'),
+        boundary,
+        undefined,
+        'win32',
+      )).rejects.toThrow('ownership boundary is invalid')
+      expect(await readdir(outside)).toEqual([])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('accepts root-owned platform ancestors above a non-root app-owned boundary', () => {
     const currentUid = 12_345
     expect(isOpenCodeManagedPathComponentOwnershipValid(

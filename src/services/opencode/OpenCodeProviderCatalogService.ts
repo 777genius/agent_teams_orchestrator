@@ -11,6 +11,10 @@ import {
   type OpenCodeScopedProviderCatalog,
 } from './OpenCodeProviderCatalogContract.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
+import {
+  prepareOpenCodeProviderCatalogProductionProfile,
+  type OpenCodeProviderCatalogProductionProfileManager,
+} from './OpenCodeProviderCatalogProduction.js'
 
 import type { OpenCodeScopedPreparedProfile } from './types.js'
 
@@ -46,6 +50,8 @@ export type OpenCodeProviderCatalogPort = {
 type CatalogHost = Readonly<{ hostKey: string; baseUrl: string }>
 
 export type OpenCodeProviderCatalogServiceDeps = {
+  /** Production profile-manager seam; omission loads the process singleton. */
+  profileManager?: OpenCodeProviderCatalogProductionProfileManager
   prepareProfile?: (input: {
     purpose: 'provider-catalog'
     providerId: string
@@ -904,9 +910,14 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (input.abortSignal?.aborted) throw fixedCatalogFailure()
       const startedAt = this.sampleClock()
       const providerId = canonicalizeOpenCodeProviderId(input.providerId)
+      if (!providerId) throw fixedCatalogFailure()
       const prepareProfile = this.deps.prepareProfile ?? (async plan => {
-        const { openCodeProfileManager } = await import('./OpenCodeProfileManager.js')
-        return openCodeProfileManager.prepareScopedProfile(plan)
+        const manager = this.deps.profileManager ?? (await import('./OpenCodeProfileManager.js'))
+          .openCodeProfileManager as unknown as OpenCodeProviderCatalogProductionProfileManager
+        return prepareOpenCodeProviderCatalogProductionProfile(
+          manager,
+          plan,
+        )
       })
       const rawProfile = await prepareProfile({
         purpose: 'provider-catalog',

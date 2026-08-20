@@ -5847,6 +5847,27 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('returns provider-missing for a malformed provider id without loading a catalog', async () => {
+    let catalogCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      providerCatalog: {
+        loadCatalog: async () => {
+          catalogCalls += 1
+          throw new Error('catalog must not load')
+        },
+      },
+    })
+
+    const result = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: '../openrouter',
+    })
+
+    expect(result.ok).toBe(false)
+    expect(expectFailure(result)).toMatchObject({ code: 'provider-missing' })
+    expect(catalogCalls).toBe(0)
+  })
+
   test('paginates the filtered union of inventory, config, and live provider models', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       providerCatalog: providerCatalog('openrouter', {
@@ -6007,8 +6028,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
-  test('filters deprecated provider-scoped catalog models', async () => {
+  test('filters deprecated provider-scoped catalog models unless one is the managed default', async () => {
     let defaultModelId = 'active-model'
+    let managedDefaultModelId = 'google/active-model'
     const adapter = new OpenCodeProviderManagementAdapter({
       providerCatalog: providerCatalog('google', {
         'active-model': {},
@@ -6068,6 +6090,15 @@ describe('OpenCodeProviderManagementAdapter', () => {
           getProviderAuth: async () => ({ google: [{ type: 'api' }] }),
         }),
       },
+      managedPreferences: {
+        read: async () => ({
+          schemaVersion: 2,
+          defaultModelId: managedDefaultModelId,
+          modelLimitOverrides: {},
+          updatedAt: '2026-08-20T00:00:00.000Z',
+        }),
+        setDefaultModel: async () => {},
+      },
     })
 
     const activeDefault = await adapter.loadModels({
@@ -6089,6 +6120,21 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(activeDefault.value.models.find(model => model.modelId === 'google/old-model'))
       .toBeUndefined()
+    expect(activeDefault.value.defaultModelId).toBe('google/active-model')
+    expect(activeDefault.value.models.find(model => model.modelId === 'google/active-model'))
+      .toMatchObject({ default: true })
+
+    managedDefaultModelId = 'google/old-model'
+    const deprecatedDefault = await adapter.loadModels({
+      runtimeId: 'opencode',
+      providerId: 'google',
+    })
+
+    expect(deprecatedDefault.ok).toBe(true)
+    if (!deprecatedDefault.ok) return
+    expect(deprecatedDefault.value.defaultModelId).toBe('google/old-model')
+    expect(deprecatedDefault.value.models.find(model => model.modelId === 'google/old-model'))
+      .toMatchObject({ default: true, catalogStatus: 'deprecated' })
   })
 
   test('loads provider-scoped models reported only by the live provider catalog', async () => {

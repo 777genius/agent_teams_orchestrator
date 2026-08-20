@@ -217,7 +217,7 @@ type CacheEntry = {
   snapshot: OpenCodeInventorySnapshot
 }
 
-function normalizeProviderId(value: string): string {
+function normalizeProviderId(value: string): string | null {
   const canonical = tryCreateOpenCodeCanonicalProviderId(value)
   if (canonical) return canonical
   // Provider CLI output may use a plain human label (for example,
@@ -889,8 +889,10 @@ export function parseOpenCodeProvidersOutput(output: string): {
       continue
     }
 
+    const providerId = normalizeProviderId(parsed.provider)
+    if (!providerId) continue
     connectedProviders.push({
-      id: normalizeProviderId(parsed.provider),
+      id: providerId,
       authHint: parsed.authHint,
       source: currentSource,
     })

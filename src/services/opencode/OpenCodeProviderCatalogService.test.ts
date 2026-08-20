@@ -6,6 +6,7 @@ import {
 } from './OpenCodeProviderCatalogService.js'
 
 import type { OpenCodeScopedPreparedProfile } from './types.js'
+import type { OpenCodeScopedProfilePlanContract } from './types.js'
 
 function profile(input: {
   providerId: string
@@ -104,6 +105,30 @@ function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
 }
 
 describe('OpenCodeProviderCatalogService', () => {
+  test('production wiring plans and passes the exact expected plan to scoped preparation', async () => {
+    const calls: string[] = []
+    const expected = Object.freeze({ digest: 'expected' }) as unknown as OpenCodeScopedProfilePlanContract
+    const f = fixture({
+      prepareProfile: undefined,
+      profileManager: {
+        planScopedProfile: input => {
+          calls.push('plan')
+          expect(input).toMatchObject({ purpose: 'provider-catalog', providerId: 'deepinfra' })
+          return expected
+        },
+        prepareScopedProfile: async (input, actualExpected) => {
+          calls.push('prepare')
+          expect(actualExpected).toBe(expected)
+          return profile({ providerId: input.providerId, projectPath: input.projectPath ?? '/project' })
+        },
+      },
+    })
+
+    await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/p' }))
+      .resolves.toMatchObject({ catalog: { providerId: 'deepinfra' } })
+    expect(calls).toEqual(['plan', 'prepare'])
+  })
+
   test('builds a catalog-only selected-provider plan and uses only the host provider API', async () => {
     const calls: string[] = []
     const f = fixture({

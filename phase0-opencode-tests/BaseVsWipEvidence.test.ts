@@ -10,7 +10,7 @@ const root = path.resolve(import.meta.dir, '..')
 const git = '/usr/bin/git'
 const command = ['test', 'phase0-opencode-tests/OpenCodeStatusCatalogLaunch.regression.test.ts']
 
-async function run(executable: string, args: string[], cwd: string): Promise<{ code: number; output: string }> {
+async function run(executable: string, args: string[], cwd: string): Promise<{ code: number; output: string; stdout: string }> {
   const child = Bun.spawn([executable, ...args], {
     cwd,
     env: { ...process.env, NO_COLOR: '1', TMPDIR: path.join(cwd, '.phase0-tmp') },
@@ -22,7 +22,7 @@ async function run(executable: string, args: string[], cwd: string): Promise<{ c
     new Response(child.stderr).text(),
     child.exited,
   ])
-  return { code, output: `${stdout}\n${stderr}` }
+  return { code, output: `${stdout}\n${stderr}`, stdout }
 }
 
 async function checked(executable: string, args: string[], cwd: string): Promise<string> {
@@ -52,19 +52,23 @@ test('executes unchanged production regressions in disposable base and patch-bou
     ['ls-files', '--others', '--exclude-standard', '--', 'src'],
     root,
   )).split('\n').map(value => value.trim()).filter(Boolean)
+  const wipRevision = (await checked(git, ['rev-parse', 'HEAD'], root)).trim()
 
   try {
     for (const checkout of [base, wip]) {
       await checked(git, ['clone', '--shared', '--no-checkout', root, checkout], tempRoot)
-      await checked(git, ['checkout', '--detach', recorded.baseRevision], checkout)
     }
+    await checked(git, ['checkout', '--detach', recorded.baseRevision], base)
+    await checked(git, ['checkout', '--detach', wipRevision], wip)
     for (const checkout of [base, wip]) {
       await mkdir(path.join(checkout, 'phase0-opencode-tests'), { recursive: true })
       await mkdir(path.join(checkout, '.phase0-tmp'), { recursive: true })
       for (const file of phaseFiles) await cp(path.join(import.meta.dir, file), path.join(checkout, 'phase0-opencode-tests', file))
     }
 
-    const patch = await checked(git, ['diff', '--binary', '--no-ext-diff'], root)
+    const patchResult = await run(git, ['diff', '--binary', '--no-ext-diff'], root)
+    if (patchResult.code !== 0) throw new Error(`${git} diff failed:\n${patchResult.output}`)
+    const patch = patchResult.stdout
     await writeFile(patchFile, patch)
     if (patch.length > 0) await checked(git, ['apply', '--whitespace=nowarn', patchFile], wip)
     for (const relative of untrackedProduction) {
@@ -78,6 +82,7 @@ test('executes unchanged production regressions in disposable base and patch-bou
     }
 
     const snapshotHash = createHash('sha256')
+    snapshotHash.update(wipRevision)
     snapshotHash.update(patch)
     for (const file of phaseFiles) {
       snapshotHash.update(`phase0-opencode-tests/${file}`)

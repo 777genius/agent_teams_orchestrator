@@ -97,7 +97,10 @@ function getDefaultProviderMatch(
     }
     for (const [providerId, modelId] of Object.entries(defaults)) {
       if (asString(modelId) === rawModelId) {
-        return { providerId: canonicalizeOpenCodeProviderId(providerId), modelId: rawModelId }
+        const canonicalProviderId = canonicalizeOpenCodeProviderId(providerId)
+        if (canonicalProviderId) {
+          return { providerId: canonicalProviderId, modelId: rawModelId }
+        }
       }
     }
   }
@@ -111,6 +114,7 @@ function splitProviderScopedModel(
   const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
   if (!parsed) return null
   const providerId = canonicalizeOpenCodeProviderId(parsed.providerId)
+  if (!providerId) return null
   return {
     providerId,
     modelId: parsed.modelId,

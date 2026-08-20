@@ -485,6 +485,38 @@ describe('OpenCodeLaunchAttemptStore durable schema and fencing', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
+  test('release cannot remove a concurrently reacquired lease directory', async () => {
+    const directory = await workspaceTemp('release-atomic-reacquire')
+    const path = join(directory, 'attempt.json')
+    const context = { deadlineAtMs: Date.now() + 10_000, monotonicNow: Date.now,
+      signal: new AbortController().signal }
+    let detached!: () => void
+    const detachPoint = new Promise<void>(resolve => { detached = resolve })
+    let finishRelease!: () => void
+    const releaseGate = new Promise<void>(resolve => { finishRelease = resolve })
+    const first = new OpenCodeLaunchFileJournalPersistence(path, {
+      afterLeaseDirectoryDetach: async () => { detached(); await releaseGate },
+    })
+    const contender = new OpenCodeLaunchFileJournalPersistence(path)
+    try {
+      const releaseFirst = await first.acquireExclusive(context)
+      const releasing = releaseFirst(context)
+      await detachPoint
+
+      const releaseContender = await contender.acquireExclusive(context)
+      const contenderOwner = await readFile(`${path}.lease/owner.json`, 'utf8')
+      finishRelease()
+      await releasing
+
+      expect(await readFile(`${path}.lease/owner.json`, 'utf8')).toBe(contenderOwner)
+      await releaseContender(context)
+      await expect(stat(`${path}.lease`)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      finishRelease?.()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   test('fails closed when a live owner birth identity cannot be read', async () => {
     const directory = await workspaceTemp('owner-birth-unreadable')
     const path = join(directory, 'attempt.json')
