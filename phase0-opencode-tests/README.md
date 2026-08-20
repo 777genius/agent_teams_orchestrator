@@ -9,23 +9,21 @@ live below a disposable sandbox (with a workspace-local `TMPDIR` supported).
 - `FakeOpenCodeRegressionHarness.test.ts` proves the small fake CLI/host HTTP
   harness: command, write, plugin, PID/cleanup, deferred hang, cancellation, late
   completion, virtual timer, and retry-amplification journals.
-- `PortableOpenCodeAcceptance.e2e.test.ts` is the green parameterized acceptance
-  contract. Its status/catalog/launch adapter invokes injected callable ports. It
-  covers purpose boundaries, selected-provider isolation, opaque proof capability,
-  all identity mutations, canonical bytes, atomic persistence/restart/crash,
-  controlled concurrent claims, real fake-PID liveness and TERM escalation, one
-  monotonic deadline/retry coordinator, late authority suppression, schema-checked
-  redacted ledger bytes, selected-route barriers, real deferred cancellation,
-  forged-capability denial, strict ledger negative validation, and unsafe-adapter
-  mutation sensitivity (including log-only cancellation).
+- `PortableOpenCodeAcceptance.e2e.test.ts` runs 3/3 deterministic fakes through
+  the production command-status route, provider-management catalog adapter, and
+  launch production bridge/core. Only external time, HTTP, OpenCode, process, and
+  persistence effects are replaced. The launch case reaches the production
+  profile policy, Windows managed-directory guard, same-host fresh nonce proof,
+  one-deadline coordinator, journal store, cleanup, and member commit ordering.
 - `OpenCodeStatusCatalogLaunch.regression.test.ts` contains production-composition
   assertions. The integrated Phase 1 implementation keeps Moth status passive,
   preserves #443 catalog containment, and exports the public purpose adapter.
-- `BaseVsWipEvidence.json` records the revision and command. Its test creates two
-  disposable git checkouts, applies the live tracked diff and untracked production
-  files to a SHA-256-bound WIP snapshot, executes the unchanged regressions in both,
-  and copies the live untracked production additions into the WIP checkout before
-  comparing generated outcomes rather than comparing canned JSON.
+- `BaseVsWipEvidence.json` binds canonical base
+  `73993bad8ff96dc08086b5ecf125084e1df4a08f` to reviewed commit/tree
+  `6294d48`/`0b8ce218`. Its verifier records exact HEAD commit/tree/artifact hashes
+  from a non-empty committed `base...HEAD` production-composer diff. The negative
+  matrix rejects empty, unrelated, working-tree-only, wrong base/HEAD/tree,
+  facade-only, and production-composer-bypass evidence; a clean worktree is valid.
 
 ## Focused safe commands
 
@@ -37,12 +35,6 @@ bun test phase0-opencode-tests/FakeOpenCodeRegressionHarness.test.ts \
 bun test phase0-opencode-tests/OpenCodeStatusCatalogLaunch.regression.test.ts
 ```
 
-At base revision `73993bad8ff96dc08086b5ecf125084e1df4a08f`, a disposable
-git checkout plus the unchanged Phase 0 test bundle produces 0 pass / 3 fail:
-Moth status, #443 catalog (`models --verbose` plus `catalog-prewarm`), and the
-missing public composition seam. Current integrated WIP produces 3 pass / 0 fail.
-
-Phase 1 must add the public status/catalog/launch composition seam, make passive
-status avoid profile/lock/write/process work, and bind the production coordinator
-to the acceptance contract's injected persistence, proof, supervisor, provider,
-deadline, and member-claim ports.
+The old miniature purpose adapter was removed: no production route called it.
+Acceptance now imports the same concrete production entrypoints used by runtime
+routing and relies on their existing narrow dependency-injection ports.
