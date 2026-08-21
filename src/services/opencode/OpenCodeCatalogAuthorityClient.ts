@@ -188,16 +188,21 @@ export class OpenCodeCatalogAuthorityClient {
       // flushed.  Resolve through a fresh verified worker using the durable
       // attempt/generation key; never guess from the old cached envelope.
       this.kill()
-      if (this.#signal.aborted || performance.now() >= this.#deadline) {
+      if (performance.now() >= this.#deadline) {
         throw new OpenCodeCatalogCommitUncertainError()
       }
       let recovery: OpenCodeCatalogAuthorityClient | null = null
+      // Once FINALIZE was placed on the native pipe, caller cancellation can
+      // no longer distinguish pre-COMMIT from post-COMMIT. Spend the reserve
+      // on a non-cancellable exact-key resolve; its absolute deadline remains
+      // bounded by the original attempt budget.
+      const recoveryController = new AbortController()
       try {
         recovery = new OpenCodeCatalogAuthorityClient({ ...this.#options,
-          deadline: this.#deadline, signal: this.#signal })
+          deadline: this.#deadline, signal: recoveryController.signal })
         const resolved = await recovery.resolve(generation, attemptIdentity, identity)
         if (!resolved.resolved) throw new OpenCodeCatalogCommitUncertainError()
-        if (!resolved.committed) throw finalizeError
+        if (!resolved.committed) throw new OpenCodeCatalogCommitUncertainError()
         if (resolved.envelopeJson !== envelopeJson) throw new OpenCodeCatalogCommitUncertainError()
         value = { committed: true, generation }
       } catch (resolveError) {

@@ -253,6 +253,9 @@ impl Statement {
     fn integer(&self, at: c_int) -> i64 {
         unsafe { sqlite::sqlite3_column_int64(self.ptr, at) }
     }
+    fn column_type(&self, at: c_int) -> c_int {
+        unsafe { sqlite::sqlite3_column_type(self.ptr, at) }
+    }
     fn string(&self, at: c_int) -> String {
         unsafe {
             let p = sqlite::sqlite3_column_text(self.ptr, at);
@@ -673,88 +676,183 @@ fn legacy_table(db: &Db, name: &str) -> Result<bool, String> {
     Ok(statement.integer(0) == 1)
 }
 
-fn include_legacy_marker(
-    db: &Db,
-    table: &str,
-    sql: &str,
-    required: bool,
-    maximum: &mut i64,
-) -> Result<(), String> {
-    if !legacy_table(db, table)? {
-        return if required {
-            Err("LEGACY_SCHEMA".into())
-        } else {
-            Ok(())
-        };
-    }
-    let value = scalar(db, sql).map_err(|_| "LEGACY_SCHEMA")?;
-    if !(0..=MAX_GENERATION).contains(&value) {
-        return Err("LEGACY_GENERATION".into());
-    }
-    *maximum = (*maximum).max(value);
-    Ok(())
+fn normalized_schema(value: &str) -> String {
+    value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
 }
 
-fn legacy_maximum(db: &Db) -> Result<i64, String> {
-    // allocation_state and catalog_entry are the two allocation/catalog
-    // authorities common to both supported layouts.  Their absence (including
-    // an empty allocation state) is corruption, not permission to restart at 1.
-    if !legacy_table(db, "allocation_state")?
-        || scalar(db, "SELECT count(*) FROM allocation_state").map_err(|_| "LEGACY_SCHEMA")? != 1
-        || !legacy_table(db, "catalog_entry")?
+fn legacy_schema_sql(db: &Db, name: &str) -> Result<String, String> {
+    let statement = Statement::new(
+        db,
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
+    )
+    .map_err(|_| "LEGACY_SCHEMA")?;
+    statement.text(1, name).map_err(|_| "LEGACY_SCHEMA")?;
+    if statement.step().map_err(|_| "LEGACY_SCHEMA")? != sqlite::SQLITE_ROW
+        || statement.column_type(0) != sqlite::SQLITE_TEXT
     {
         return Err("LEGACY_SCHEMA".into());
     }
-    let mut maximum = 0;
-    include_legacy_marker(
-        db,
-        "allocation_state",
-        "SELECT generation FROM allocation_state",
-        true,
-        &mut maximum,
-    )?;
-    include_legacy_marker(
-        db,
-        "catalog_entry",
-        "SELECT coalesce(max(request_generation),0) FROM catalog_entry",
-        true,
-        &mut maximum,
-    )?;
-    include_legacy_marker(
-        db,
-        "authority_state",
-        "SELECT coalesce(max(generation),0) FROM authority_state",
-        false,
-        &mut maximum,
-    )?;
-    include_legacy_marker(
-        db,
-        "allocation_ticket",
-        "SELECT coalesce(max(id),0) FROM allocation_ticket",
-        false,
-        &mut maximum,
-    )?;
-    if legacy_table(db, "migration_state")? {
-        // The supported releases used staged_generation. A present table with
-        // a different/malformed shape is corruption and must not be ignored.
-        include_legacy_marker(
-            db,
-            "migration_state",
-            "SELECT coalesce(max(staged_generation),0) FROM migration_state",
-            true,
-            &mut maximum,
-        )?;
+    Ok(normalized_schema(&statement.string(0)))
+}
+
+fn validate_legacy_authority(db: &Db, version: i64) -> Result<i64, String> {
+    let ticket_44305 = normalized_schema(
+        "CREATE TABLE allocation_ticket (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
+      started_at INTEGER NOT NULL CHECK(started_at >= 0)
+    )",
+    );
+    let ticket_44306 = normalized_schema(
+        "CREATE TABLE allocation_ticket (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
+      started_at INTEGER NOT NULL CHECK(started_at >= 0),
+      cache_key TEXT CHECK(cache_key IS NULL OR length(cache_key) = 64)
+    )",
+    );
+    let state_schema = normalized_schema(
+        "CREATE TABLE allocation_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      generation INTEGER NOT NULL CHECK(generation >= 0)
+    )",
+    );
+    let catalog_schema = normalized_schema(
+        "CREATE TABLE catalog_entry (
+      cache_key TEXT PRIMARY KEY CHECK(length(cache_key) = 64),
+      request_generation INTEGER NOT NULL CHECK(request_generation > 0),
+      attempt_identity TEXT NOT NULL CHECK(length(attempt_identity) = 71),
+      attempt_id TEXT NOT NULL,
+      pointer_json TEXT NOT NULL,
+      envelope_json TEXT NOT NULL,
+      retained_order INTEGER NOT NULL CHECK(retained_order > 0)
+    )",
+    );
+    let expected_objects = if version == 44305 { 3 } else { 4 };
+    if scalar(db, "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_autoindex_%'")
+        .map_err(|_| "LEGACY_SCHEMA")?
+        != expected_objects
+        || scalar(db, "SELECT count(*) FROM sqlite_schema WHERE type IN ('index','trigger','view') AND name NOT LIKE 'sqlite_autoindex_%'")
+            .map_err(|_| "LEGACY_SCHEMA")?
+            != 0
+        || legacy_schema_sql(db, "allocation_state")? != state_schema
+        || legacy_schema_sql(db, "allocation_ticket")?
+            != if version == 44305 { ticket_44305 } else { ticket_44306 }
+        || legacy_schema_sql(db, "sqlite_sequence")?
+            != normalized_schema("CREATE TABLE sqlite_sequence(name,seq)")
+        || (version == 44306 && legacy_schema_sql(db, "catalog_entry")? != catalog_schema)
+        || (version == 44305 && legacy_table(db, "catalog_entry")?)
+    {
+        return Err("LEGACY_SCHEMA".into());
     }
-    if legacy_table(db, "audit_event")? {
-        include_legacy_marker(
-            db,
-            "audit_event",
-            "SELECT coalesce(max(generation),0) FROM audit_event",
-            true,
-            &mut maximum,
-        )?;
+
+    let state = Statement::new(db, "SELECT singleton,generation FROM allocation_state")
+        .map_err(|_| "LEGACY_LEDGER")?;
+    if state.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_ROW
+        || state.column_type(0) != sqlite::SQLITE_INTEGER
+        || state.column_type(1) != sqlite::SQLITE_INTEGER
+        || state.integer(0) != 1
+        || !(0..=MAX_GENERATION).contains(&state.integer(1))
+    {
+        return Err("LEGACY_LEDGER".into());
     }
-    Ok(maximum)
+    let generation = state.integer(1);
+    if state.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_DONE {
+        return Err("LEGACY_LEDGER".into());
+    }
+    let expected_count = generation.min(64);
+    let expected_minimum = if generation == 0 {
+        0
+    } else {
+        generation - expected_count + 1
+    };
+    let ledger = Statement::new(
+        db,
+        "SELECT count(*),coalesce(min(id),0),coalesce(max(id),0),coalesce(sum(id),0) FROM allocation_ticket",
+    )
+    .map_err(|_| "LEGACY_LEDGER")?;
+    if ledger.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_ROW
+        || ledger.integer(0) != expected_count
+        || ledger.integer(1) != expected_minimum
+        || ledger.integer(2) != generation
+        || ledger.integer(3) != expected_count * (expected_minimum.saturating_add(generation)) / 2
+    {
+        return Err("LEGACY_LEDGER".into());
+    }
+    let tickets = Statement::new(
+        db,
+        if version == 44305 {
+            "SELECT id,scope_hash,started_at,NULL FROM allocation_ticket ORDER BY id"
+        } else {
+            "SELECT id,scope_hash,started_at,cache_key FROM allocation_ticket ORDER BY id"
+        },
+    )
+    .map_err(|_| "LEGACY_LEDGER")?;
+    let mut expected = expected_minimum;
+    while tickets.step().map_err(|_| "LEGACY_LEDGER")? == sqlite::SQLITE_ROW {
+        let cache_type = tickets.column_type(3);
+        if tickets.column_type(0) != sqlite::SQLITE_INTEGER
+            || tickets.integer(0) != expected
+            || tickets.column_type(1) != sqlite::SQLITE_TEXT
+            || !lowercase_hash(&tickets.string(1))
+            || tickets.column_type(2) != sqlite::SQLITE_INTEGER
+            || tickets.integer(2) < 0
+            || (version == 44305 && cache_type != sqlite::SQLITE_NULL)
+            || (version == 44306
+                && cache_type != sqlite::SQLITE_NULL
+                && (cache_type != sqlite::SQLITE_TEXT || !lowercase_hash(&tickets.string(3))))
+        {
+            return Err("LEGACY_LEDGER".into());
+        }
+        expected += 1;
+    }
+    let sequence = Statement::new(db, "SELECT name,seq FROM sqlite_sequence ORDER BY name")
+        .map_err(|_| "LEGACY_LEDGER")?;
+    if generation == 0 {
+        if sequence.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_DONE {
+            return Err("LEGACY_LEDGER".into());
+        }
+    } else if sequence.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_ROW
+        || sequence.column_type(0) != sqlite::SQLITE_TEXT
+        || sequence.string(0) != "allocation_ticket"
+        || sequence.column_type(1) != sqlite::SQLITE_INTEGER
+        || sequence.integer(1) != generation
+        || sequence.step().map_err(|_| "LEGACY_LEDGER")? != sqlite::SQLITE_DONE
+    {
+        return Err("LEGACY_LEDGER".into());
+    }
+
+    if version == 44306 {
+        let rows = Statement::new(db, "SELECT cache_key,request_generation,attempt_identity,attempt_id,pointer_json,envelope_json,retained_order FROM catalog_entry")
+            .map_err(|_| "LEGACY_ROW")?;
+        while rows.step().map_err(|_| "LEGACY_ROW")? == sqlite::SQLITE_ROW {
+            if rows.column_type(0) != sqlite::SQLITE_TEXT
+                || !lowercase_hash(&rows.string(0))
+                || rows.column_type(1) != sqlite::SQLITE_INTEGER
+                || !(1..=generation).contains(&rows.integer(1))
+                || rows.column_type(2) != sqlite::SQLITE_TEXT
+                || rows
+                    .string(2)
+                    .strip_prefix("sha256:")
+                    .is_none_or(|hash| !lowercase_hash(hash))
+                || (3..=5).any(|column| rows.column_type(column) != sqlite::SQLITE_TEXT)
+                || rows.column_type(6) != sqlite::SQLITE_INTEGER
+                || !(1..=generation).contains(&rows.integer(6))
+            {
+                return Err("LEGACY_ROW".into());
+            }
+        }
+    }
+    Ok(generation)
+}
+
+fn legacy_maximum(db: &Db) -> Result<i64, String> {
+    let version = scalar(db, "PRAGMA user_version")?;
+    validate_legacy_authority(db, version)
 }
 
 fn legacy_audit_anchor(db: &Db, high: i64) -> Result<(i64, String), String> {
@@ -813,7 +911,11 @@ fn schema(db: &Db) -> Result<(), String> {
     fault("migration-open");
     let version = scalar(db, "PRAGMA user_version")?;
     if version == VERSION {
-        exec(db,"CREATE TABLE IF NOT EXISTS legacy_import(cache_key TEXT NOT NULL, identity_json TEXT NOT NULL, envelope_json TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(cache_key,identity_json))")?;
+        exec(db,"CREATE TABLE IF NOT EXISTS legacy_import(cache_key TEXT NOT NULL, identity_json TEXT NOT NULL, envelope_json TEXT NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(cache_key,identity_json));
+          CREATE TABLE IF NOT EXISTS committed_result(generation INTEGER PRIMARY KEY, attempt_identity TEXT NOT NULL,
+            identity_json TEXT NOT NULL, cache_key TEXT NOT NULL, envelope_json TEXT NOT NULL, envelope_bytes INTEGER NOT NULL);
+          INSERT OR IGNORE INTO committed_result
+            SELECT generation,attempt_identity,identity_json,cache_key,envelope_json,envelope_bytes FROM catalog_entry")?;
         validate(db)?;
         // A crash after the schema COMMIT but before its directory flush is
         // resumed here. No BEGIN acknowledgement is possible until the
@@ -824,6 +926,18 @@ fn schema(db: &Db) -> Result<(), String> {
     }
     if version != 0 && version != 44305 && version != 44306 {
         return Err("SCHEMA_VERSION".into());
+    }
+    if version == 0
+        && (scalar(
+            db,
+            "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+        )? != 0
+            || scalar(db, "PRAGMA page_count")? > 1
+            || scalar(db, "PRAGMA freelist_count")? != 0)
+    {
+        // user_version=0 is not proof of a new database. A dropped, partially
+        // initialized, or pre-versioned authority must never be reset to one.
+        return Err("VERSION_ZERO_NONEMPTY".into());
     }
     exec(db, "BEGIN IMMEDIATE")?;
     let migrated = (|| {
@@ -872,7 +986,7 @@ fn schema(db: &Db) -> Result<(), String> {
           DROP TABLE IF EXISTS allocation_state; DROP TABLE IF EXISTS authority_state;
           DROP TABLE IF EXISTS admission_history; DROP TABLE IF EXISTS audit_event;
           DROP TABLE IF EXISTS audit_anchor; DROP TABLE IF EXISTS migration_state;
-          DROP TABLE IF EXISTS legacy_import",
+          DROP TABLE IF EXISTS legacy_import; DROP TABLE IF EXISTS committed_result",
         )?;
         exec(db, "CREATE TABLE authority_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL CHECK(generation>=0));
           CREATE TABLE admission_history(generation INTEGER PRIMARY KEY, started_at INTEGER NOT NULL, scope_hash TEXT NOT NULL,
@@ -888,6 +1002,8 @@ fn schema(db: &Db) -> Result<(), String> {
             burned_generation INTEGER NOT NULL, complete INTEGER NOT NULL CHECK(complete IN (0,1)));
           CREATE TABLE legacy_import(cache_key TEXT NOT NULL, identity_json TEXT NOT NULL, envelope_json TEXT NOT NULL,
             generation INTEGER NOT NULL, PRIMARY KEY(cache_key,identity_json));
+          CREATE TABLE committed_result(generation INTEGER PRIMARY KEY, attempt_identity TEXT NOT NULL,
+            identity_json TEXT NOT NULL, cache_key TEXT NOT NULL, envelope_json TEXT NOT NULL, envelope_bytes INTEGER NOT NULL);
           INSERT INTO authority_state VALUES(1,0);
           INSERT INTO migration_state VALUES(1,0,0,0)")?;
         {
@@ -1076,7 +1192,11 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         )
     };
     if legacy_fd < 0 {
-        return Ok(());
+        return if unsafe { unix_errno() } == libc::ENOENT {
+            Ok(())
+        } else {
+            Err("LEGACY_ROOT_OPEN".into())
+        };
     }
     let mut legacy_directory_identity: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(legacy_fd, &mut legacy_directory_identity) } != 0
@@ -1093,11 +1213,15 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         let descriptor = unsafe {
             libc::open(
                 file.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if descriptor < 0 {
-            return Ok(None);
+            return if unsafe { unix_errno() } == libc::ENOENT {
+                Ok(None)
+            } else {
+                Err("LEGACY_DB_OPEN".into())
+            };
         }
         let mut held_identity = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(descriptor, &mut held_identity) } != 0
@@ -1108,20 +1232,50 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
             unsafe { libc::close(descriptor) };
             return Err("LEGACY_HANDLE".into());
         }
-        posix_vfs::set_legacy_handle(descriptor, &held_identity)?;
+        let journal_name = c("attempts.sqlite-journal")?;
+        let journal_descriptor = unsafe {
+            libc::open(
+                journal_name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        let mut journal_identity: libc::stat = unsafe { std::mem::zeroed() };
+        let journal = if journal_descriptor >= 0 {
+            if unsafe { libc::fstat(journal_descriptor, &mut journal_identity) } != 0
+                || journal_identity.st_mode & libc::S_IFMT != libc::S_IFREG
+                || journal_identity.st_uid != unsafe { libc::geteuid() }
+                || journal_identity.st_mode & 0o022 != 0
+            {
+                unsafe {
+                    libc::close(journal_descriptor);
+                    libc::close(descriptor)
+                };
+                return Err("LEGACY_JOURNAL_HANDLE".into());
+            }
+            Some((journal_descriptor, &journal_identity))
+        } else if unsafe { unix_errno() } == libc::ENOENT {
+            None
+        } else {
+            unsafe { libc::close(descriptor) };
+            return Err("LEGACY_JOURNAL_OPEN".into());
+        };
+        posix_vfs::set_legacy_handles(descriptor, &held_identity, journal, legacy_fd)?;
         test_gate("legacy-after-handle");
         let mut raw = ptr::null_mut();
         let rc = unsafe {
             sqlite::sqlite3_open_v2(
                 file.as_ptr(),
                 &mut raw,
-                sqlite::SQLITE_OPEN_READONLY | sqlite::SQLITE_OPEN_FULLMUTEX,
+                sqlite::SQLITE_OPEN_READWRITE | sqlite::SQLITE_OPEN_FULLMUTEX,
                 posix_vfs::name(),
             )
         };
         if rc != sqlite::SQLITE_OK {
             posix_vfs::clear_legacy_handle();
             unsafe { libc::close(descriptor) };
+            if journal_descriptor >= 0 {
+                unsafe { libc::close(journal_descriptor) };
+            }
             return Err("LEGACY_OPEN".into());
         }
         let legacy = Db { raw };
@@ -1129,6 +1283,9 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         drop(legacy);
         posix_vfs::clear_legacy_handle();
         unsafe { libc::close(descriptor) };
+        if journal_descriptor >= 0 {
+            unsafe { libc::close(journal_descriptor) };
+        }
         Ok(Some(snapshot?))
     })();
     let restored = unsafe { libc::fchdir(final_root.fd) };
@@ -1278,8 +1435,8 @@ fn validate(db: &Db) -> Result<(), String> {
     {
         return Err("STATE".into());
     }
-    if scalar(db,"SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('authority_state','admission_history','catalog_entry','audit_event','audit_anchor','migration_state','legacy_import')")?!=7
-      || scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type='table'")?!=7
+    if scalar(db,"SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('authority_state','admission_history','catalog_entry','audit_event','audit_anchor','migration_state','legacy_import','committed_result')")?!=8
+      || scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type='table'")?!=8
       || scalar(db,"SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_autoindex_%' AND type IN ('index','trigger','view')")?!=0 {
         return Err("SCHEMA_OBJECTS".into());
     }
@@ -1303,12 +1460,18 @@ fn validate(db: &Db) -> Result<(), String> {
     if scalar(db, "SELECT count(*) FROM admission_history")? > MAX_ADMISSIONS
         || scalar(db, "SELECT count(*) FROM audit_event")? > MAX_AUDIT
         || scalar(db, "SELECT count(*) FROM catalog_entry")? > MAX_ROWS
+        || scalar(db, "SELECT count(*) FROM committed_result")? > MAX_ADMISSIONS
         || scalar(
             db,
             "SELECT coalesce(sum(envelope_bytes),0) FROM catalog_entry",
         )? > MAX_BYTES
     {
         return Err("RETENTION_BOUNDS".into());
+    }
+    if scalar(db, "SELECT count(*) FROM committed_result WHERE typeof(generation)!='integer' OR generation<1 OR generation>(SELECT generation FROM authority_state WHERE singleton=1) OR typeof(attempt_identity)!='text' OR typeof(identity_json)!='text' OR typeof(cache_key)!='text' OR length(cache_key)!=64 OR typeof(envelope_json)!='text' OR typeof(envelope_bytes)!='integer' OR envelope_bytes<0 OR envelope_bytes>2097152 OR envelope_bytes!=length(CAST(envelope_json AS BLOB))")? != 0
+        || scalar(db, "SELECT coalesce(sum(envelope_bytes),0) FROM committed_result")? > MAX_BYTES
+    {
+        return Err("COMMITTED_RESULT".into());
     }
     let check = Statement::new(db, "PRAGMA quick_check(1)")?;
     if check.step()? != sqlite::SQLITE_ROW || check.string(0) != "ok" {
@@ -1591,6 +1754,22 @@ fn finalize(
     }
     let encoded = identity_json(identity)?;
     validate(db)?;
+    let replay = Statement::new(
+        db,
+        "SELECT envelope_json FROM committed_result WHERE generation=?1 AND attempt_identity=?2 \
+         AND identity_json=?3 AND cache_key=?4",
+    )?;
+    replay.int(1, generation)?;
+    replay.text(2, attempt)?;
+    replay.text(3, &encoded)?;
+    replay.text(4, &identity.cache_key)?;
+    if replay.step()? == sqlite::SQLITE_ROW {
+        return if replay.string(0) == envelope {
+            Ok(json!({"committed":true,"generation":generation}))
+        } else {
+            Err("FINALIZE_REPLAY_MISMATCH".into())
+        };
+    }
     exec(db, "BEGIN IMMEDIATE")?;
     let result = (|| {
         validate(db)?;
@@ -1625,6 +1804,15 @@ fn finalize(
         a.int(1, generation)?;
         a.text(2, attempt)?;
         a.step()?;
+        let committed =
+            Statement::new(db, "INSERT INTO committed_result VALUES(?1,?2,?3,?4,?5,?6)")?;
+        committed.int(1, generation)?;
+        committed.text(2, attempt)?;
+        committed.text(3, &encoded)?;
+        committed.text(4, &identity.cache_key)?;
+        committed.text(5, envelope)?;
+        committed.int(6, envelope.len() as i64)?;
+        committed.step()?;
         audit(db, generation, "FINALIZE", &sha256_hex(envelope.as_bytes()))?;
         // Exact deterministic retention: protect this transaction's winner,
         // then remove oldest rows until both limits hold.
@@ -1642,6 +1830,19 @@ fn finalize(
             }
         }
         exec(db,&format!("DELETE FROM admission_history WHERE generation IN (SELECT generation FROM admission_history WHERE generation != {generation} ORDER BY generation DESC LIMIT -1 OFFSET {})",MAX_ADMISSIONS-1))?;
+        exec(db,"DELETE FROM committed_result WHERE generation NOT IN (SELECT generation FROM admission_history)")?;
+        while scalar(
+            db,
+            "SELECT coalesce(sum(envelope_bytes),0) FROM committed_result",
+        )? > MAX_BYTES
+        {
+            let d=Statement::new(db,"DELETE FROM committed_result WHERE generation=(SELECT generation FROM committed_result WHERE generation != ?1 ORDER BY generation LIMIT 1)")?;
+            d.int(1, generation)?;
+            d.step()?;
+            if unsafe { sqlite::sqlite3_changes(db.raw) } == 0 {
+                return Err("RETENTION".into());
+            }
+        }
         // Construct the complete reply before COMMIT.  After COMMIT there are
         // deliberately no validation, cleanup, clock, input, or VFS probes
         // whose failure could reinterpret the acknowledged transaction.
@@ -1685,7 +1886,7 @@ fn resolve(db: &Db, generation: i64, attempt: &str, identity: &Identity) -> Resu
     }
     let catalog = Statement::new(
         db,
-        "SELECT envelope_json FROM catalog_entry WHERE generation=?1 AND attempt_identity=?2 \
+        "SELECT envelope_json FROM committed_result WHERE generation=?1 AND attempt_identity=?2 \
          AND identity_json=?3 AND cache_key=?4",
     )?;
     catalog.int(1, generation)?;

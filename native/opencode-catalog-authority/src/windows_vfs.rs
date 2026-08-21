@@ -389,21 +389,48 @@ fn open_named(name: &str, flags: c_int) -> Result<File, c_int> {
         validate_named_files().map_err(|_| sqlite::SQLITE_CANTOPEN)?;
         return Ok(file);
     }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        // A hot-journal probe may be SQLite's first open. Retain a writable
-        // actual handle so a later transaction can reuse the same object.
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
-    if flags & sqlite::SQLITE_OPEN_EXCLUSIVE != 0 {
-        options.create_new(true);
-    } else if flags & sqlite::SQLITE_OPEN_CREATE != 0 {
-        options.create(true);
-    }
-    let file = options.open(name).map_err(|_| sqlite::SQLITE_CANTOPEN)?;
+    let options = |create_new: bool| {
+        let mut value = OpenOptions::new();
+        value
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
+        if create_new {
+            value.create_new(true);
+        } else if flags & sqlite::SQLITE_OPEN_CREATE != 0 {
+            value.create(true);
+        }
+        value
+    };
+    let mut created = false;
+    let file = if name == "authority.sqlite-journal" && flags & sqlite::SQLITE_OPEN_CREATE != 0 {
+        match options(true).open(name) {
+            Ok(file) => {
+                created = true;
+                file
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && flags & sqlite::SQLITE_OPEN_EXCLUSIVE == 0 =>
+            {
+                options(false)
+                    .open(name)
+                    .map_err(|_| sqlite::SQLITE_CANTOPEN)?
+            }
+            Err(_) => return Err(sqlite::SQLITE_CANTOPEN),
+        }
+    } else {
+        options(flags & sqlite::SQLITE_OPEN_EXCLUSIVE != 0)
+            .open(name)
+            .map_err(|_| sqlite::SQLITE_CANTOPEN)?
+    };
     let (volume, index) = identity(&file)?;
+    if created {
+        fault("journal-before-directory-sync");
+        sync_directory().map_err(|_| sqlite::SQLITE_IOERR_DIR_FSYNC)?;
+        fault("journal-after-directory-sync");
+    }
     let guard = file.try_clone().map_err(|_| sqlite::SQLITE_CANTOPEN)?;
     held()
         .lock()

@@ -96,6 +96,13 @@ export async function writeOpenCodeCatalogProfileManifest(input: Readonly<{
   try { await rename(temporary, manifestPath) } catch (error) {
     await rm(temporary, { force: true }).catch(() => undefined); throw error
   }
+  // rename durability is separate from file-content durability. On POSIX the
+  // attempt is not ready until its containing directory records the manifest.
+  if (process.platform !== 'win32') {
+    const directory = await open(input.profileRootPath,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
+    try { await directory.sync() } finally { await directory.close() }
+  }
 }
 
 export async function heartbeatOpenCodeCatalogProfile(input: Readonly<{
@@ -206,11 +213,34 @@ export async function janitorOpenCodeCatalogProfiles(
   }
 
   const profiles: Array<{ path: string; manifest: Manifest }> = []
+  const abandonedPreparations: Array<{ path: string; modifiedAt: number }> = []
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.includes('-catalog-')) continue
     const target = path.join(scopedProfilesRoot, entry.name)
     const manifest = await readAttemptManifest(target, scopedProfilesRoot)
-    if (manifest) profiles.push({ path: target, manifest })
+    if (manifest) {
+      profiles.push({ path: target, manifest })
+    } else if (/^[a-z0-9:_-]{8,256}-catalog-[a-z0-9:_-]{8,256}$/i.test(entry.name)) {
+      try {
+        const metadata = await lstat(target)
+        if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+          abandonedPreparations.push({ path: target, modifiedAt: metadata.mtimeMs })
+        }
+      } catch {}
+    }
+  }
+  abandonedPreparations.sort((left, right) => left.modifiedAt - right.modifiedAt
+    || left.path.localeCompare(right.path))
+  for (const preparation of abandonedPreparations) {
+    if (removed >= MAX_TRASH) break
+    // A manifestless root can only be proven abandoned after the full lease
+    // window. This also covers a crash in the mkdir-to-manifest gap without
+    // racing a currently preparing process.
+    if (Date.now() - preparation.modifiedAt < DEFAULT_LEASE_MS) continue
+    const receipt = await cleanupOpenCodeCatalogProfile(
+      preparation.path, path.basename(preparation.path),
+    )
+    if (receipt.disposition === 'removed') removed += 1
   }
   profiles.sort((left, right) => left.manifest.createdAt - right.manifest.createdAt
     || left.path.localeCompare(right.path))

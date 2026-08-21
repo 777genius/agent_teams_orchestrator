@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes,
   writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -6,8 +6,10 @@ import path from 'node:path'
 
 import { cleanupOpenCodeCatalogProfile, janitorOpenCodeCatalogProfiles,
   writeOpenCodeCatalogProfileManifest } from './OpenCodeCatalogProfileJanitor.js'
+import { ensureOpenCodeManagedDirectoryPath } from './OpenCodeProfileManager.js'
 
 const roots: string[] = []
+setDefaultTimeout(20_000)
 afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
 
 describe('catalog profile janitor', () => {
@@ -108,5 +110,28 @@ describe('catalog profile janitor', () => {
     expect(await janitorOpenCodeCatalogProfiles(parent, 2)).toBe(1)
     expect((await lstat(a)).isDirectory()).toBe(true)
     await expect(lstat(crashed)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('restart janitor safely collects an aged manifestless mkdir preparation root', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-janitor-mkdir-')); roots.push(parent)
+    const abandoned = path.join(parent, `${'a'.repeat(64)}-catalog-${'b'.repeat(64)}`)
+    await mkdir(abandoned)
+    const old = new Date(Date.now() - 121_000); await utimes(abandoned, old, old)
+    expect(await janitorOpenCodeCatalogProfiles(parent, 9)).toBe(1)
+    await expect(lstat(abandoned)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('mkdir ownership is established before a manifest-stage abort and cleanup removes the root', async () => {
+    if (process.platform === 'win32') return
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-janitor-abort-')); roots.push(parent)
+    const key = `${'c'.repeat(64)}-catalog-${'d'.repeat(64)}`; const target = path.join(parent, key)
+    let cleanupOwned = false
+    await expect(ensureOpenCodeManagedDirectoryPath(target, parent, undefined, process.platform,
+      undefined, undefined, component => {
+        if (component === target) { cleanupOwned = true; throw new Error('manifest-stage abort') }
+      })).rejects.toThrow('manifest-stage abort')
+    expect(cleanupOwned).toBe(true)
+    expect((await cleanupOpenCodeCatalogProfile(target, key)).disposition).toBe('removed')
+    await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
