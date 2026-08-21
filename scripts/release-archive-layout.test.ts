@@ -42,6 +42,25 @@ describe('runtime release archive layout contract', () => {
     expect(workflow).toContain('release-archive-layout.ts')
   })
 
+  test('both native VFS sources durably publish a first journal before exposing it to SQLite', async () => {
+    const [main, posix, windows] = await Promise.all([
+      readFile('native/opencode-catalog-authority/src/main.rs', 'utf8'),
+      readFile('native/opencode-catalog-authority/src/posix_vfs.rs', 'utf8'),
+      readFile('native/opencode-catalog-authority/src/windows_vfs.rs', 'utf8'),
+    ])
+    expect(main).toContain('#[cfg(windows)]\nmod windows_vfs;')
+    for (const source of [posix, windows]) {
+      const created = source.indexOf('if created {')
+      const before = source.indexOf('fault("journal-before-directory-sync")', created)
+      const sync = source.indexOf('sync_directory', before) >= 0
+        ? source.indexOf('sync_directory', before)
+        : source.indexOf('fsync(root_fd()', before)
+      const after = source.indexOf('fault("journal-after-directory-sync")', sync)
+      expect(created).toBeGreaterThan(-1); expect(before).toBeGreaterThan(created)
+      expect(sync).toBeGreaterThan(before); expect(after).toBeGreaterThan(sync)
+    }
+  })
+
   test.each(platforms)('%s rejects missing, renamed, and hash-mismatched native artifacts', platform => {
     const layout = runtimeArchiveLayout(platform)
     const files = { [layout.authorityName]: new TextEncoder().encode('authority'),

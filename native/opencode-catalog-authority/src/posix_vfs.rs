@@ -19,7 +19,12 @@ const SHARED_SIZE: i64 = 510;
 static REGISTERED: OnceLock<()> = OnceLock::new();
 static IDENTITIES: OnceLock<Mutex<Vec<(String, u64, u64)>>> = OnceLock::new();
 static HELD_HANDLES: OnceLock<Mutex<Vec<(String, c_int)>>> = OnceLock::new();
-static LEGACY_HANDLE: OnceLock<Mutex<Option<(c_int, u64, u64)>>> = OnceLock::new();
+struct LegacyHandles {
+    database: (c_int, u64, u64),
+    journal: Option<(c_int, u64, u64)>,
+    directory: c_int,
+}
+static LEGACY_HANDLE: OnceLock<Mutex<Option<LegacyHandles>>> = OnceLock::new();
 
 #[repr(C)]
 struct AuthorityFile {
@@ -38,26 +43,75 @@ fn held_handles() -> &'static Mutex<Vec<(String, c_int)>> {
     HELD_HANDLES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn legacy_handle() -> &'static Mutex<Option<(c_int, u64, u64)>> {
+fn legacy_handle() -> &'static Mutex<Option<LegacyHandles>> {
     LEGACY_HANDLE.get_or_init(|| Mutex::new(None))
 }
 
-pub(super) fn set_legacy_handle(fd: c_int, stat: &libc::stat) -> Result<(), String> {
+pub(super) fn set_legacy_handles(
+    fd: c_int,
+    stat: &libc::stat,
+    journal: Option<(c_int, &libc::stat)>,
+    directory: c_int,
+) -> Result<(), String> {
     let guard = unsafe { libc::dup(fd) };
-    if guard < 0 {
+    let directory_guard = unsafe { libc::dup(directory) };
+    let journal_guard = match journal {
+        Some((journal_fd, journal_stat)) => {
+            let duplicate = unsafe { libc::dup(journal_fd) };
+            if duplicate < 0 {
+                unsafe {
+                    libc::close(guard);
+                    libc::close(directory_guard);
+                }
+                return Err("LEGACY_HANDLE".into());
+            }
+            Some((
+                duplicate,
+                journal_stat.st_dev as u64,
+                journal_stat.st_ino as u64,
+            ))
+        }
+        None => None,
+    };
+    if guard < 0 || directory_guard < 0 {
+        if guard >= 0 {
+            unsafe { libc::close(guard) };
+        }
+        if directory_guard >= 0 {
+            unsafe { libc::close(directory_guard) };
+        }
+        if let Some((journal_fd, _, _)) = journal_guard {
+            unsafe { libc::close(journal_fd) };
+        }
         return Err("LEGACY_HANDLE".into());
     }
     let mut slot = legacy_handle().lock().map_err(|_| "LEGACY_HANDLE")?;
-    if let Some((old, _, _)) = slot.replace((guard, stat.st_dev as u64, stat.st_ino as u64)) {
-        unsafe { libc::close(old) };
+    if let Some(old) = slot.replace(LegacyHandles {
+        database: (guard, stat.st_dev as u64, stat.st_ino as u64),
+        journal: journal_guard,
+        directory: directory_guard,
+    }) {
+        unsafe {
+            libc::close(old.database.0);
+            libc::close(old.directory);
+        }
+        if let Some((journal_fd, _, _)) = old.journal {
+            unsafe { libc::close(journal_fd) };
+        }
     }
     Ok(())
 }
 
 pub(super) fn clear_legacy_handle() {
     if let Ok(mut slot) = legacy_handle().lock() {
-        if let Some((fd, _, _)) = slot.take() {
-            unsafe { libc::close(fd) };
+        if let Some(handles) = slot.take() {
+            unsafe {
+                libc::close(handles.database.0);
+                libc::close(handles.directory);
+            }
+            if let Some((journal_fd, _, _)) = handles.journal {
+                unsafe { libc::close(journal_fd) };
+            }
         }
     }
 }
@@ -87,6 +141,7 @@ fn known_name(raw: *const c_char) -> Result<&'static str, c_int> {
         b"authority.sqlite" => Ok("authority.sqlite"),
         b"authority.sqlite-journal" => Ok("authority.sqlite-journal"),
         b"attempts.sqlite" => Ok("attempts.sqlite"),
+        b"attempts.sqlite-journal" => Ok("attempts.sqlite-journal"),
         _ => Err(sqlite::SQLITE_CANTOPEN),
     }
 }
@@ -395,15 +450,21 @@ unsafe extern "C" fn vfs_open(
         Ok(value) => value,
         Err(error) => return error,
     };
-    if name == "attempts.sqlite" {
-        if flags & sqlite::SQLITE_OPEN_READONLY == 0
-            || flags & (sqlite::SQLITE_OPEN_CREATE | sqlite::SQLITE_OPEN_READWRITE) != 0
-        {
+    if name == "attempts.sqlite" || name == "attempts.sqlite-journal" {
+        if flags & sqlite::SQLITE_OPEN_CREATE != 0 {
             return sqlite::SQLITE_READONLY;
         }
         let fd = match legacy_handle().lock() {
-            Ok(slot) => match *slot {
-                Some((held, device, inode)) => {
+            Ok(slot) => match slot.as_ref() {
+                Some(handles) => {
+                    let selected = if name == "attempts.sqlite" {
+                        Some(handles.database)
+                    } else {
+                        handles.journal
+                    };
+                    let Some((held, device, inode)) = selected else {
+                        return sqlite::SQLITE_CANTOPEN;
+                    };
                     let duplicate = libc::dup(held);
                     let mut stat: libc::stat = std::mem::zeroed();
                     if duplicate < 0
@@ -430,7 +491,7 @@ unsafe extern "C" fn vfs_open(
         file.shared_byte = SHARED_FIRST + (libc::getpid() as i64 % SHARED_SIZE);
         file.name[..name.len()].copy_from_slice(name.as_bytes());
         if !output_flags.is_null() {
-            *output_flags = sqlite::SQLITE_OPEN_READONLY;
+            *output_flags = flags;
         }
         return sqlite::SQLITE_OK;
     }
@@ -457,21 +518,30 @@ unsafe extern "C" fn vfs_open(
             .map(|(_, fd)| *fd),
         Err(_) => return sqlite::SQLITE_IOERR,
     };
+    let mut created = false;
     let fd = if let Some(retained) = retained {
         if validate_named_files().is_err() {
             return sqlite::SQLITE_CANTOPEN;
         }
         libc::dup(retained)
     } else {
-        libc::openat(
-            match root_fd() {
-                Ok(value) => value,
-                Err(error) => return error,
-            },
-            encoded.as_ptr(),
-            open_flags,
-            0o600,
-        )
+        let root = match root_fd() {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if name == "authority.sqlite-journal" && flags & sqlite::SQLITE_OPEN_CREATE != 0 {
+            let first = libc::openat(root, encoded.as_ptr(), open_flags | libc::O_EXCL, 0o600);
+            if first >= 0 {
+                created = true;
+                first
+            } else if unix_errno() == libc::EEXIST && flags & sqlite::SQLITE_OPEN_EXCLUSIVE == 0 {
+                libc::openat(root, encoded.as_ptr(), open_flags & !libc::O_EXCL, 0o600)
+            } else {
+                -1
+            }
+        } else {
+            libc::openat(root, encoded.as_ptr(), open_flags, 0o600)
+        }
     };
     if fd < 0 {
         return sqlite::SQLITE_CANTOPEN;
@@ -501,6 +571,16 @@ unsafe extern "C" fn vfs_open(
             }
         }
     }
+    if created {
+        // SQLite may write database pages immediately after xOpen returns.
+        // Make the first rollback-journal directory entry durable first.
+        fault("journal-before-directory-sync");
+        if libc::fsync(root_fd().unwrap_or(-1)) != 0 {
+            libc::close(fd);
+            return sqlite::SQLITE_IOERR_DIR_FSYNC;
+        }
+        fault("journal-after-directory-sync");
+    }
     let file = authority_file(raw);
     ptr::write_bytes(file as *mut AuthorityFile, 0, 1);
     file.base.pMethods = &IO_METHODS;
@@ -523,6 +603,47 @@ unsafe extern "C" fn vfs_delete(
         Ok(value) => value,
         Err(error) => return error,
     };
+    if name == "attempts.sqlite-journal" {
+        let mut slot = match legacy_handle().lock() {
+            Ok(value) => value,
+            Err(_) => return sqlite::SQLITE_IOERR_DELETE,
+        };
+        let Some(handles) = slot.as_mut() else {
+            return sqlite::SQLITE_IOERR_DELETE;
+        };
+        let encoded = match c(name) {
+            Ok(value) => value,
+            Err(_) => return sqlite::SQLITE_IOERR_DELETE,
+        };
+        let Some((_, device, inode)) = handles.journal else {
+            return sqlite::SQLITE_IOERR_DELETE;
+        };
+        let mut named: libc::stat = std::mem::zeroed();
+        if libc::fstatat(
+            handles.directory,
+            encoded.as_ptr(),
+            &mut named,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+            || named.st_mode & libc::S_IFMT != libc::S_IFREG
+            || named.st_dev as u64 != device
+            || named.st_ino as u64 != inode
+        {
+            return sqlite::SQLITE_IOERR_DELETE;
+        }
+        if libc::unlinkat(handles.directory, encoded.as_ptr(), 0) != 0
+            && unix_errno() != libc::ENOENT
+        {
+            return sqlite::SQLITE_IOERR_DELETE;
+        }
+        if let Some((fd, _, _)) = handles.journal.take() {
+            libc::close(fd);
+        }
+        if sync != 0 && libc::fsync(handles.directory) != 0 {
+            return sqlite::SQLITE_IOERR_DIR_FSYNC;
+        }
+        return sqlite::SQLITE_OK;
+    }
     if name != "authority.sqlite-journal" {
         return sqlite::SQLITE_IOERR_DELETE;
     }
@@ -577,11 +698,42 @@ unsafe extern "C" fn vfs_access(
             return sqlite::SQLITE_OK;
         }
     };
-    if name == "attempts.sqlite" {
-        *output = legacy_handle()
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false) as c_int;
+    if name == "attempts.sqlite" || name == "attempts.sqlite-journal" {
+        let slot = match legacy_handle().lock() {
+            Ok(value) => value,
+            Err(_) => return sqlite::SQLITE_IOERR_ACCESS,
+        };
+        let Some(handles) = slot.as_ref() else {
+            return sqlite::SQLITE_IOERR_ACCESS;
+        };
+        if name == "attempts.sqlite" {
+            *output = 1;
+            return sqlite::SQLITE_OK;
+        }
+        if handles.journal.is_some() {
+            *output = 1;
+            return sqlite::SQLITE_OK;
+        }
+        let encoded = match c(name) {
+            Ok(value) => value,
+            Err(_) => return sqlite::SQLITE_IOERR_ACCESS,
+        };
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstatat(
+            handles.directory,
+            encoded.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
+        {
+            // It was absent when safe handles were captured. Never silently
+            // hide a newly introduced crash journal or unsafe replacement.
+            return sqlite::SQLITE_IOERR_ACCESS;
+        }
+        if unix_errno() != libc::ENOENT {
+            return sqlite::SQLITE_IOERR_ACCESS;
+        }
+        *output = 0;
         return sqlite::SQLITE_OK;
     }
     let encoded = match c(name) {

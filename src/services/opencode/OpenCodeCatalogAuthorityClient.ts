@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { closeSync, constants, fstatSync, lstatSync, openSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -68,6 +68,25 @@ function artifactName(base: string): string {
   return `${base}${process.platform === 'win32' ? '.exe' : ''}`
 }
 
+export function resolveOpenCodeCatalogSourceArtifacts(sourceRoot: string,
+  platform: NodeJS.Platform = process.platform,
+  exists: (filePath: string) => boolean = existsSync): {
+    launcherPath: string; workerPath: string; profile: 'release' | 'debug' | 'missing'
+  } {
+  const suffix = platform === 'win32' ? '.exe' : ''
+  const pair = (profile: 'release' | 'debug') => ({
+    launcherPath: path.join(sourceRoot, 'native', 'opencode-catalog-launcher', 'target', profile,
+      `opencode-catalog-launcher${suffix}`),
+    workerPath: path.join(sourceRoot, 'native', 'opencode-catalog-authority', 'target', profile,
+      `opencode-catalog-authority${suffix}`),
+  })
+  for (const profile of ['release', 'debug'] as const) {
+    const candidate = pair(profile)
+    if (exists(candidate.launcherPath) && exists(candidate.workerPath)) return { ...candidate, profile }
+  }
+  return { ...pair('release'), profile: 'missing' }
+}
+
 function resolveArtifacts(options: OpenCodeCatalogAuthorityClientOptions): {
   launcherPath: string; workerPath: string
 } {
@@ -77,17 +96,16 @@ function resolveArtifacts(options: OpenCodeCatalogAuthorityClientOptions): {
   const bunHostedBundle = /(?:^|[\\/])bun(?:\.exe)?$/i.test(process.execPath)
   const packaged = bunHostedBundle ? import.meta.dir : path.dirname(process.execPath)
   const sourceRoot = path.resolve(import.meta.dir, '../../..')
-  const debug = (crate: string, binary: string) => path.join(sourceRoot, 'native', crate,
-    'target', 'debug', artifactName(binary))
   const launcherName = artifactName('opencode-catalog-launcher')
   const workerName = artifactName('opencode-catalog-authority')
   const sourceRuntime = import.meta.url.endsWith('.ts')
+  const source = resolveOpenCodeCatalogSourceArtifacts(sourceRoot)
   return {
     launcherPath: options.launcherPath ?? (sourceRuntime
-      ? debug('opencode-catalog-launcher', 'opencode-catalog-launcher')
+      ? source.launcherPath
       : path.join(packaged, launcherName)),
     workerPath: options.workerPath ?? (sourceRuntime
-      ? debug('opencode-catalog-authority', 'opencode-catalog-authority')
+      ? source.workerPath
       : path.join(packaged, workerName)),
   }
 }
@@ -138,6 +156,9 @@ export class OpenCodeCatalogAuthorityClient {
     this.#options = options
     const artifacts = resolveArtifacts(options)
     if (!options.launch) {
+      if (!existsSync(artifacts.launcherPath) || !existsSync(artifacts.workerPath)) {
+        throw new Error('native catalog artifacts are missing; run ./cli-source --prepare-native-catalog')
+      }
       verifyRegularOwnedArtifact(artifacts.launcherPath)
       verifyRegularOwnedArtifact(artifacts.workerPath)
     }
@@ -188,16 +209,21 @@ export class OpenCodeCatalogAuthorityClient {
       // flushed.  Resolve through a fresh verified worker using the durable
       // attempt/generation key; never guess from the old cached envelope.
       this.kill()
-      if (this.#signal.aborted || performance.now() >= this.#deadline) {
+      if (performance.now() >= this.#deadline) {
         throw new OpenCodeCatalogCommitUncertainError()
       }
       let recovery: OpenCodeCatalogAuthorityClient | null = null
+      // Once FINALIZE was placed on the native pipe, caller cancellation can
+      // no longer distinguish pre-COMMIT from post-COMMIT. Spend the reserve
+      // on a non-cancellable exact-key resolve; its absolute deadline remains
+      // bounded by the original attempt budget.
+      const recoveryController = new AbortController()
       try {
         recovery = new OpenCodeCatalogAuthorityClient({ ...this.#options,
-          deadline: this.#deadline, signal: this.#signal })
+          deadline: this.#deadline, signal: recoveryController.signal })
         const resolved = await recovery.resolve(generation, attemptIdentity, identity)
         if (!resolved.resolved) throw new OpenCodeCatalogCommitUncertainError()
-        if (!resolved.committed) throw finalizeError
+        if (!resolved.committed) throw new OpenCodeCatalogCommitUncertainError()
         if (resolved.envelopeJson !== envelopeJson) throw new OpenCodeCatalogCommitUncertainError()
         value = { committed: true, generation }
       } catch (resolveError) {

@@ -554,6 +554,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
   platform: NodeJS.Platform = process.platform,
   trustedRootPath?: string,
   abortSignal?: AbortSignal,
+  afterComponentCreated?: (componentPath: string) => void,
 ): Promise<void> {
   const assertActive = () => { if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal) }
   assertActive()
@@ -604,6 +605,7 @@ export async function ensureOpenCodeManagedDirectoryPath(
           try {
             assertActive()
             await mkdir(descriptorChild, { mode: 0o700 })
+            afterComponentCreated?.(logicalPath)
           } catch (mkdirError) {
             if (getErrnoCode(mkdirError) !== 'EEXIST') throw mkdirError
           }
@@ -4320,6 +4322,11 @@ export class OpenCodeProfileManager {
         await ensureOpenCodeManagedDirectoryPath(
           profileRootPath, this.paths.data, undefined, this.platform,
           this.paths.dataTrustedRoot, preparationSignal,
+          componentPath => {
+            if (path.resolve(componentPath) === path.resolve(profileRootPath)) {
+              catalogAttemptRootCreated = true
+            }
+          },
         )
         catalogAttemptRootCreated = true
         await writeOpenCodeCatalogProfileManifest({ profileRootPath, runtimeInstanceId,

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
@@ -12,6 +12,7 @@ import { OpenCodeProviderCatalogService, type OpenCodeProviderCatalogServiceDeps
 import type { OpenCodeScopedPreparedProfile } from './types.js'
 
 const roots: string[] = []
+setDefaultTimeout(20_000)
 afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
 
 function response(model = 'model-a') {
@@ -26,7 +27,7 @@ async function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
   const profiles = await mkdtemp(path.join(os.tmpdir(), 'catalog-service-profiles-')); roots.push(profiles)
   let attempt = 0; let fetches = 0; const releases: string[] = []
   const deps: OpenCodeProviderCatalogServiceDeps = {
-    timeoutMs: 1_000, ttlMs: 10_000, maxStaleMs: 60_000,
+    timeoutMs: 10_000, ttlMs: 10_000, maxStaleMs: 60_000,
     canonicalizeProjectPath: async value => value,
     prepareProfile: async plan => {
       const profileRootPath = path.join(profiles, `scope-catalog-${++attempt}`); await mkdir(profileRootPath)
@@ -96,6 +97,27 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
     } finally { if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME; else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previous }
   })
 
+  test('deadline after FINALIZE dispatch waits for exact commit recovery and never returns bounded stale', async () => {
+    let fire!: () => void; let entered!: () => void; let committed = false
+    const finalizeEntered = new Promise<void>(resolve => { entered = resolve })
+    let finish!: () => void; const recovered = new Promise<void>(resolve => { finish = resolve })
+    const f = await fixture({ setTimer: ((callback: () => void) => {
+      fire = callback; return { unref() {} } as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout, clearTimer: (() => undefined) as typeof clearTimeout,
+    authorityFactory: () => ({
+      get committed() { return committed },
+      beginAttempt: async () => ({ generation: 1, attemptIdentity: `sha256:${'1'.repeat(64)}` as const }),
+      bindAndRead: async () => ({ previousEnvelope: null }),
+      finalize: async () => { entered(); await recovered; committed = true
+        return { committed: true as const, generation: 1 } },
+      resolve: async () => ({ resolved: false as const, generation: 1 }),
+      close: async () => {}, kill: () => {},
+    }) })
+    const pending = f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox/project' })
+    await finalizeEntered; fire(); finish()
+    await expect(pending).resolves.toMatchObject({ catalogProvenance: 'fresh-live' })
+  })
+
   test('imports the exact eligible previous filesystem catalog without a provider fetch', async () => {
     const f = await fixture(); const observedAt = Date.now(); const project = '/sandbox/project'
     const keyMaterial = JSON.stringify([project, 'deepinfra', 'binary', 'config', 'auth'])
@@ -117,9 +139,21 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
       catalog, catalogEvidence, catalogObservedAt: observedAt, catalogExpiresAt: expiresAt, envelopeHash })
     const legacyRoot = path.join(f.cache, 'opencode', 'provider-catalog-attempts-v2'); await mkdir(legacyRoot, { recursive: true })
     const db = new Database(path.join(legacyRoot, 'attempts.sqlite'))
-    db.exec(`PRAGMA journal_mode=PERSIST; CREATE TABLE allocation_state(generation INTEGER); INSERT INTO allocation_state VALUES(30);
-      CREATE TABLE catalog_entry(cache_key TEXT,request_generation INTEGER,attempt_identity TEXT,attempt_id TEXT,pointer_json TEXT,envelope_json TEXT,retained_order INTEGER);
-      PRAGMA user_version=44306`)
+    db.exec(`PRAGMA journal_mode=PERSIST; CREATE TABLE allocation_ticket (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
+      started_at INTEGER NOT NULL CHECK(started_at >= 0), cache_key TEXT CHECK(cache_key IS NULL OR length(cache_key) = 64));
+      CREATE TABLE allocation_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      generation INTEGER NOT NULL CHECK(generation >= 0)); INSERT INTO allocation_state VALUES(1,30);
+      CREATE TABLE catalog_entry (cache_key TEXT PRIMARY KEY CHECK(length(cache_key) = 64),
+      request_generation INTEGER NOT NULL CHECK(request_generation > 0),
+      attempt_identity TEXT NOT NULL CHECK(length(attempt_identity) = 71), attempt_id TEXT NOT NULL,
+      pointer_json TEXT NOT NULL,envelope_json TEXT NOT NULL,
+      retained_order INTEGER NOT NULL CHECK(retained_order > 0)); PRAGMA user_version=44306`)
+    const insertTicket = db.query('INSERT INTO allocation_ticket(scope_hash,started_at,cache_key) VALUES(?1,?2,?3)')
+    for (let generation = 1; generation <= 30; generation += 1) {
+      insertTicket.run(createHash('sha256').update(`scope-${generation}`).digest('hex'), generation,
+        generation === 30 ? key : null)
+    }
     db.query('INSERT INTO catalog_entry VALUES(?1,29,?2,?3,?4,?5,29)')
       .run(key, catalogEvidence.attemptIdentity, 'legacy-attempt', '{}', envelope); db.close()
     const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME

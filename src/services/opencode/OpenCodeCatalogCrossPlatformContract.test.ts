@@ -1,7 +1,31 @@
 import { describe, expect, test } from 'bun:test'
 import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+
+import { resolveOpenCodeCatalogSourceArtifacts } from './OpenCodeCatalogAuthorityClient.js'
 
 describe('native catalog cross-platform source contract', () => {
+  test('source resolution prefers a complete release pair, falls back to debug, and reports missing', () => {
+    const root = path.resolve('/source-contract')
+    const resolved = (platform: NodeJS.Platform, files: string[]) =>
+      resolveOpenCodeCatalogSourceArtifacts(root, platform, candidate => files.includes(candidate))
+    const release = resolveOpenCodeCatalogSourceArtifacts(root, 'linux', () => true)
+    expect(release.profile).toBe('release')
+    expect(release.launcherPath).toContain('/target/release/opencode-catalog-launcher')
+
+    const debugFiles = [
+      path.join(root, 'native/opencode-catalog-launcher/target/debug/opencode-catalog-launcher'),
+      path.join(root, 'native/opencode-catalog-authority/target/debug/opencode-catalog-authority'),
+    ]
+    const debug = resolved('linux', debugFiles)
+    expect(debug.profile).toBe('debug')
+    expect(debug.workerPath).toContain('/target/debug/opencode-catalog-authority')
+    const missing = resolved('win32', [])
+    expect(missing.profile).toBe('missing')
+    expect(missing.launcherPath).toEndWith('opencode-catalog-launcher.exe')
+    expect(missing.workerPath).toEndWith('opencode-catalog-authority.exe')
+  })
+
   test('POSIX authority uses held beneath/no-follow components without descriptor pseudo-paths', async () => {
     const source = await readFile('native/opencode-catalog-authority/src/main.rs', 'utf8')
     const vfs = await readFile('native/opencode-catalog-authority/src/posix_vfs.rs', 'utf8')

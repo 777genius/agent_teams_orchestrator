@@ -395,11 +395,13 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     let leaseTimer: ReturnType<typeof setInterval> | null = null
     let inputSignal: AbortSignal | undefined
     let rejectDeadline: ((error: Error) => void) | null = null
+    let finalizeInFlight = false
     const deadlineFailure = new Promise<never>((_resolve, reject) => { rejectDeadline = reject })
     const expire = () => {
       if (authority?.committed) return
       controller.abort(failure())
       authority?.kill()
+      if (finalizeInFlight) return
       rejectDeadline?.(failure())
     }
     const timer = (this.deps.setTimer ?? setTimeout)(expire, selected.timeoutMs)
@@ -507,8 +509,12 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       hostKey = null
       await within(this.release(releaseKey))
       if (controller.signal.aborted || performance.now() >= deadline) throw failure()
-      await within(authority.finalize(begun.generation, begun.attemptIdentity, boundIdentity,
-        envelopeJson, clock, expiresAt))
+      finalizeInFlight = true
+      // The native client owns the reserved, exact-key recovery budget from
+      // this point. Racing it with the caller/deadline promise could return
+      // bounded stale while RESOLVE was proving a post-COMMIT result.
+      await authority.finalize(begun.generation, begun.attemptIdentity, boundIdentity,
+        envelopeJson, clock, expiresAt)
       // A valid native reply follows durable COMMIT. Nothing below is allowed
       // to reject or reinterpret that publication.
       scheduleProfileCleanup(profile)

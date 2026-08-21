@@ -1,6 +1,6 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -10,7 +10,17 @@ import { OpenCodeCatalogAuthorityClient, OpenCodeCatalogCommitUncertainError,
 import type { OpenCodeCatalogAuthorityIdentity } from './OpenCodeCatalogAuthorityProtocol.js'
 
 const roots: string[] = []
-afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
+const clients = new Set<OpenCodeCatalogAuthorityClient>()
+setDefaultTimeout(20_000)
+async function cleanupFixtures() {
+  const ownedClients = [...clients]; clients.clear()
+  await Promise.allSettled(ownedClients.map(authority => authority.close()))
+  const ownedRoots = roots.splice(0)
+  await Promise.all(ownedRoots.map(root => rm(root, { recursive: true, force: true })))
+  for (const root of ownedRoots) await expect(lstat(root)).rejects.toMatchObject({ code: 'ENOENT' })
+}
+afterEach(cleanupFixtures)
+afterAll(cleanupFixtures)
 
 function sha(value: string) { return createHash('sha256').update(value).digest('hex') }
 function identity(key = sha('key')): OpenCodeCatalogAuthorityIdentity {
@@ -26,8 +36,14 @@ function envelopeFor(generation: number, attemptIdentity: string,
 async function root() { const value = await mkdtemp(path.join(os.tmpdir(), 'catalog-authority-')); roots.push(value); return value }
 function client(cacheHome: string, timeout = 2_000, launch?: OpenCodeCatalogAuthorityLaunch) {
   const controller = new AbortController()
-  return new OpenCodeCatalogAuthorityClient({ cacheHome, deadline: performance.now() + timeout,
-    signal: controller.signal, launch })
+  const authority = new OpenCodeCatalogAuthorityClient({ cacheHome,
+    deadline: performance.now() + timeout, signal: controller.signal, launch })
+  clients.add(authority); return authority
+}
+async function withTemporaryAuthorityRoot<T>(work: (root: string) => Promise<T>): Promise<T> {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), 'catalog-authority-scoped-'))
+  try { return await work(temporary) }
+  finally { await rm(temporary, { recursive: true, force: true }) }
 }
 function faultLaunch(fault: string): OpenCodeCatalogAuthorityLaunch {
   return input => Bun.spawn({ cmd: [input.launcherPath, input.workerPath, input.cacheHome],
@@ -38,29 +54,72 @@ async function seedLegacy(cache: string, version: 44305 | 44306, staged: number,
   exact = identity(), envelope = '{"legacy":true}') {
   const directory = path.join(cache, 'opencode', 'provider-catalog-authority-v44307')
   await mkdir(directory, { recursive: true }); const db = new Database(path.join(directory, 'authority.sqlite'))
-  db.exec(`PRAGMA journal_mode=PERSIST; CREATE TABLE allocation_state(generation INTEGER);
-    INSERT INTO allocation_state VALUES(7);
-    CREATE TABLE migration_state(staged_generation INTEGER); INSERT INTO migration_state VALUES(${staged});
-    CREATE TABLE catalog_entry(cache_key TEXT,identity_json TEXT,envelope_json TEXT,request_generation INTEGER);
+  db.exec(`PRAGMA journal_mode=PERSIST;
+    CREATE TABLE allocation_ticket (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
+      started_at INTEGER NOT NULL CHECK(started_at >= 0)${version === 44306
+        ? ', cache_key TEXT CHECK(cache_key IS NULL OR length(cache_key) = 64)' : ''}
+    );
+    CREATE TABLE allocation_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      generation INTEGER NOT NULL CHECK(generation >= 0)
+    ); INSERT INTO allocation_state VALUES(1,${staged});
+    ${version === 44306 ? `CREATE TABLE catalog_entry (
+      cache_key TEXT PRIMARY KEY CHECK(length(cache_key) = 64),
+      request_generation INTEGER NOT NULL CHECK(request_generation > 0),
+      attempt_identity TEXT NOT NULL CHECK(length(attempt_identity) = 71),
+      attempt_id TEXT NOT NULL, pointer_json TEXT NOT NULL, envelope_json TEXT NOT NULL,
+      retained_order INTEGER NOT NULL CHECK(retained_order > 0)
+    );` : ''}
     PRAGMA user_version=${version}`)
-  db.query('INSERT INTO catalog_entry VALUES(?1,?2,?3,?4)')
-    .run(exact.cache_key, JSON.stringify(exact), envelope, 9)
+  const ticket = db.query(version === 44306
+    ? 'INSERT INTO allocation_ticket(scope_hash,started_at,cache_key) VALUES(?1,?2,?3)'
+    : 'INSERT INTO allocation_ticket(scope_hash,started_at) VALUES(?1,?2)')
+  for (let generation = Math.max(1, staged - 63); generation <= staged; generation += 1) {
+    if (version === 44306) ticket.run(sha(`scope-${generation}`), generation,
+      generation === staged ? exact.cache_key : null)
+    else ticket.run(sha(`scope-${generation}`), generation)
+  }
+  if (version === 44306) db.query('INSERT INTO catalog_entry VALUES(?1,?2,?3,?4,?5,?6,?7)')
+    .run(exact.cache_key, staged - 1, `sha256:${'1'.repeat(64)}`, 'legacy-attempt', '{}', envelope, staged - 1)
   db.close(); return exact
 }
 async function seedExternalLegacy(cache: string, exact: OpenCodeCatalogAuthorityIdentity) {
   const directory = path.join(cache, 'opencode', 'provider-catalog-attempts-v2')
   await mkdir(directory, { recursive: true }); const db = new Database(path.join(directory, 'attempts.sqlite'))
-  db.exec(`PRAGMA journal_mode=PERSIST; CREATE TABLE allocation_state(generation INTEGER);
-    INSERT INTO allocation_state VALUES(30);
-    CREATE TABLE catalog_entry(cache_key TEXT,request_generation INTEGER,attempt_identity TEXT,
-      attempt_id TEXT,pointer_json TEXT,envelope_json TEXT,retained_order INTEGER);
-    PRAGMA user_version=44306`)
+  db.exec(`PRAGMA journal_mode=PERSIST; CREATE TABLE allocation_ticket (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, scope_hash TEXT NOT NULL CHECK(length(scope_hash) = 64),
+      started_at INTEGER NOT NULL CHECK(started_at >= 0),
+      cache_key TEXT CHECK(cache_key IS NULL OR length(cache_key) = 64));
+    CREATE TABLE allocation_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      generation INTEGER NOT NULL CHECK(generation >= 0)); INSERT INTO allocation_state VALUES(1,30);
+    CREATE TABLE catalog_entry (cache_key TEXT PRIMARY KEY CHECK(length(cache_key) = 64),
+      request_generation INTEGER NOT NULL CHECK(request_generation > 0),
+      attempt_identity TEXT NOT NULL CHECK(length(attempt_identity) = 71), attempt_id TEXT NOT NULL,
+      pointer_json TEXT NOT NULL,envelope_json TEXT NOT NULL,
+      retained_order INTEGER NOT NULL CHECK(retained_order > 0)); PRAGMA user_version=44306`)
+  const ticket = db.query('INSERT INTO allocation_ticket(scope_hash,started_at,cache_key) VALUES(?1,?2,?3)')
+  for (let generation = 1; generation <= 30; generation += 1) {
+    ticket.run(sha(`external-${generation}`), generation, generation === 30 ? exact.cache_key : null)
+  }
   db.query('INSERT INTO catalog_entry VALUES(?1,?2,?3,?4,?5,?6,?7)')
     .run(exact.cache_key, 29, `sha256:${'1'.repeat(64)}`, 'legacy-attempt', '{}', '{"external":true}', 29)
   db.close()
 }
 
 describe.serial('native v44307 catalog authority', () => {
+  test.each(['failure', 'timeout'])('scoped fixture cleanup survives injected %s', async mode => {
+    let fixture = ''
+    const operation = withTemporaryAuthorityRoot(async temporary => {
+      fixture = temporary; await writeFile(path.join(temporary, 'owned'), 'fixture')
+      if (mode === 'failure') throw new Error('injected assertion failure')
+      await new Promise((_, reject) => setTimeout(() => reject(new Error('injected timeout')), 5))
+    })
+    await expect(operation).rejects.toThrow(mode)
+    await expect(lstat(fixture)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   test('a canceled intervening attempt permanently fences an older exact-key candidate', async () => {
     const cache = await root(); const x = identity(sha('x')); const y = identity(sha('y'))
     const a = client(cache); const ar = await a.beginAttempt(1, sha('scope-a')); await a.bindAndRead(ar.generation, ar.attemptIdentity, x)
@@ -91,6 +150,49 @@ describe.serial('native v44307 catalog authority', () => {
     const prior = await restart.bindAndRead(next.generation, next.attemptIdentity, exact)
     expect(prior.previousEnvelope).toBe(durable)
     await restart.close()
+  })
+
+  test('same-key A remains exactly resolvable after committed B overwrites the catalog head', async () => {
+    const cache = await root(); const exact = identity(sha('same-key'))
+    const a = client(cache); const ar = await a.beginAttempt(1, sha('same-key-a'))
+    await a.bindAndRead(ar.generation, ar.attemptIdentity, exact)
+    const aEnvelope = envelopeFor(ar.generation, ar.attemptIdentity, exact, { winner: 'A' })
+    await a.finalize(ar.generation, ar.attemptIdentity, exact, aEnvelope, 1, 2); await a.close()
+    const b = client(cache); const br = await b.beginAttempt(2, sha('same-key-b'))
+    await b.bindAndRead(br.generation, br.attemptIdentity, exact)
+    const bEnvelope = envelopeFor(br.generation, br.attemptIdentity, exact, { winner: 'B' })
+    await b.finalize(br.generation, br.attemptIdentity, exact, bEnvelope, 2, 3); await b.close()
+    const resolver = client(cache)
+    await expect(resolver.finalize(ar.generation, ar.attemptIdentity, exact, aEnvelope, 1, 2))
+      .resolves.toEqual({ committed: true, generation: ar.generation })
+    await expect(resolver.resolve(ar.generation, ar.attemptIdentity, exact)).resolves.toEqual({
+      resolved: true, committed: true, generation: ar.generation, envelopeJson: aEnvelope,
+    })
+    await resolver.close()
+  })
+
+  test('abort after native COMMIT spends the non-cancellable reserve on exact resolve', async () => {
+    const cache = await root(); const exact = identity(sha('post-commit-abort'))
+    const controller = new AbortController()
+    const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
+      deadline: performance.now() + 2_000, signal: controller.signal,
+      launch: faultLaunch('stall:finalize-after-commit-before-reply') })
+    clients.add(authority)
+    const begun = await authority.beginAttempt(1, sha('post-commit-abort-scope'))
+    await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)
+    const durable = envelopeFor(begun.generation, begun.attemptIdentity, exact, { durable: 'abort' })
+    const finalizing = authority.finalize(begun.generation, begun.attemptIdentity, exact, durable, 1, 2)
+    const dbPath = path.join(cache, 'opencode', 'provider-catalog-authority-v44307', 'authority.sqlite')
+    for (;;) {
+      try {
+        const check = new Database(dbPath, { readonly: true })
+        const committed = check.query('SELECT count(*) AS count FROM committed_result').get() as { count: number }
+        check.close(); if (committed.count === 1) break
+      } catch {}
+      await new Promise(resolve => setTimeout(resolve, 2))
+    }
+    controller.abort()
+    await expect(finalizing).resolves.toEqual({ committed: true, generation: begun.generation })
   })
 
   test('bounded resolve failure reports explicit uncertainty and never authorizes stale proof', async () => {
@@ -167,6 +269,7 @@ describe.serial('native v44307 catalog authority', () => {
     const controller = new AbortController()
     const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
       deadline: performance.now() + 2_000, signal: controller.signal, launch, launcherPath, workerPath })
+    clients.add(authority)
     while (!await Bun.file(`${gate}.entered`).exists()) await new Promise(resolve => setImmediate(resolve))
     await rename(workerPath, `${workerPath}.held`)
     await writeFile(workerPath, '#!/bin/sh\nexit 97\n'); await chmod(workerPath, 0o755)
@@ -204,28 +307,12 @@ describe.serial('native v44307 catalog authority', () => {
     await authority.close()
   })
 
-  test('44305 live-journal migration retains bytes and burns its maximum marker', async () => {
-    const cache = await root(); const exact = await seedLegacy(cache, 44305, 14, identity(sha('44305')),
-      '{"from":44305}')
-    const dbPath = path.join(cache, 'opencode', 'provider-catalog-authority-v44307', 'authority.sqlite')
-    const legacy = new Database(dbPath)
-    const zero = '0'.repeat(64); const payloadHash = sha('legacy-audit')
-    const eventHash = sha(`${zero}\0${1}\0${14}\0LEGACY\0${payloadHash}`)
-    legacy.exec(`CREATE TABLE audit_anchor(singleton INTEGER,pruned_through INTEGER,anchor_hash TEXT);
-      INSERT INTO audit_anchor VALUES(1,0,'${zero}');
-      CREATE TABLE audit_event(sequence INTEGER,generation INTEGER,kind TEXT,payload_hash TEXT,
-        previous_hash TEXT,event_hash TEXT);
-      INSERT INTO audit_event VALUES(1,14,'LEGACY','${payloadHash}','${zero}','${eventHash}')`)
-    legacy.close()
+  test('44305 exact allocation ledger is burned without inventing catalog bytes', async () => {
+    const cache = await root(); const exact = await seedLegacy(cache, 44305, 14, identity(sha('44305')))
     const authority = client(cache); const begun = await authority.beginAttempt(1, sha('scope-44305'))
     expect(begun.generation).toBe(15)
-    expect((await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)).previousEnvelope)
-      .toBe('{"from":44305}')
+    expect((await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)).previousEnvelope).toBeNull()
     await authority.close()
-    const migrated = new Database(dbPath, { readonly: true })
-    expect(migrated.query('SELECT min(sequence) AS sequence,previous_hash FROM audit_event').get())
-      .toEqual({ sequence: 2, previous_hash: eventHash })
-    migrated.close()
   })
 
   test('44306 missing allocation state is corruption and cannot reset generation to one', async () => {
@@ -243,6 +330,38 @@ describe.serial('native v44307 catalog authority', () => {
     const check = new Database(path.join(directory, 'authority.sqlite'), { readonly: true })
     expect(check.query('PRAGMA user_version').get()).toEqual({ user_version: 44306 })
     check.close()
+  })
+
+  test('user_version zero with legacy authority objects is ambiguous and never reset', async () => {
+    const cache = await root(); const directory = path.join(cache, 'opencode', 'provider-catalog-authority-v44307')
+    await mkdir(directory, { recursive: true }); const dbPath = path.join(directory, 'authority.sqlite')
+    const db = new Database(dbPath); db.exec('CREATE TABLE legacy_authority(generation INTEGER); INSERT INTO legacy_authority VALUES(41)'); db.close()
+    const authority = client(cache, 500)
+    await expect(authority.beginAttempt(1, sha('version-zero-nonempty'))).rejects.toThrow()
+    const check = new Database(dbPath, { readonly: true })
+    expect(check.query('SELECT generation FROM legacy_authority').get()).toEqual({ generation: 41 })
+    expect(check.query('PRAGMA user_version').get()).toEqual({ user_version: 0 }); check.close()
+  })
+
+  test('deleted retained allocation history and replayed sqlite_sequence fail closed', async () => {
+    const cache = await root(); await seedLegacy(cache, 44306, 20)
+    const dbPath = path.join(cache, 'opencode', 'provider-catalog-authority-v44307', 'authority.sqlite')
+    const db = new Database(dbPath); db.exec(`DELETE FROM allocation_ticket WHERE id=19;
+      UPDATE sqlite_sequence SET seq=18 WHERE name='allocation_ticket'`); db.close()
+    const authority = client(cache, 500)
+    await expect(authority.beginAttempt(1, sha('deleted-ledger'))).rejects.toThrow()
+    const check = new Database(dbPath, { readonly: true })
+    expect(check.query('SELECT generation FROM allocation_state').get()).toEqual({ generation: 20 })
+    check.close()
+  })
+
+  test('legacy allocation values with SQLite type confusion fail closed', async () => {
+    const cache = await root(); await seedLegacy(cache, 44306, 8)
+    const dbPath = path.join(cache, 'opencode', 'provider-catalog-authority-v44307', 'authority.sqlite')
+    const db = new Database(dbPath)
+    db.query('UPDATE allocation_ticket SET scope_hash=?1 WHERE id=8').run(Buffer.alloc(64, 0x61)); db.close()
+    const authority = client(cache, 500)
+    await expect(authority.beginAttempt(1, sha('legacy-type-confusion'))).rejects.toThrow()
   })
 
   test('bounded sibling import burns the real 44306 authority and retains its exact key', async () => {
@@ -277,6 +396,33 @@ describe.serial('native v44307 catalog authority', () => {
     await authority.close()
   })
 
+  test('POSIX sibling symlink/ELOOP is corruption, not genuine legacy absence', async () => {
+    if (process.platform === 'win32') return
+    const cache = await root(); const opencode = path.join(cache, 'opencode'); const outside = await root()
+    await mkdir(opencode, { recursive: true }); await symlink(outside,
+      path.join(opencode, 'provider-catalog-attempts-v2'), 'dir')
+    const authority = client(cache, 500)
+    await expect(authority.beginAttempt(1, sha('legacy-eloop'))).rejects.toThrow()
+  })
+
+  test('POSIX retained legacy handles expose and recover a hot rollback journal', async () => {
+    if (process.platform === 'win32') return
+    const cache = await root(); const exact = identity(sha('hot-journal')); await seedExternalLegacy(cache, exact)
+    const dbPath = path.join(cache, 'opencode', 'provider-catalog-attempts-v2', 'attempts.sqlite')
+    const script = `import { Database } from 'bun:sqlite'; import { writeFileSync } from 'node:fs';
+      const db=new Database(${JSON.stringify(dbPath)}); db.exec("PRAGMA journal_mode=PERSIST; BEGIN IMMEDIATE; UPDATE catalog_entry SET envelope_json='{\\"dirty\\":true}'");
+      writeFileSync(${JSON.stringify(`${dbPath}.dirty`)},''); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);`
+    const dirty = Bun.spawn({ cmd: [process.execPath, '-e', script], stdout: 'ignore', stderr: 'pipe' })
+    while (!await Bun.file(`${dbPath}.dirty`).exists()) await new Promise(resolve => setTimeout(resolve, 2))
+    dirty.kill('SIGKILL'); await dirty.exited
+    expect(await Bun.file(`${dbPath}-journal`).exists()).toBe(true)
+    const authority = client(cache, 10_000); const begun = await authority.beginAttempt(1, sha('hot-recovery'))
+    expect(begun.generation).toBe(31)
+    expect((await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)).previousEnvelope)
+      .toBe('{"external":true}')
+    await authority.close()
+  })
+
   test.each(['migration-before-commit', 'migration-after-commit', 'migration-after-directory-sync'])(
     'restart after %s never wedges or reuses a legacy generation', async phase => {
       const cache = await root(); await seedLegacy(cache, 44306, 20)
@@ -303,4 +449,12 @@ describe.serial('native v44307 catalog authority', () => {
     const restart = client(cache); expect((await restart.beginAttempt(2, sha('restart'))).generation).toBe(1)
     await restart.close()
   })
+
+  test.each(['journal-before-directory-sync', 'journal-after-directory-sync'])(
+    'first rollback-journal barrier at %s permits no page-change acknowledgement', async phase => {
+      const cache = await root(); const interrupted = client(cache, 300, faultLaunch(`exit:${phase}`))
+      await expect(interrupted.beginAttempt(1, sha(phase))).rejects.toThrow()
+      const restart = client(cache); expect((await restart.beginAttempt(2, sha(`${phase}-restart`))).generation).toBe(1)
+      await restart.close()
+    })
 })

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes,
   writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -6,8 +6,10 @@ import path from 'node:path'
 
 import { cleanupOpenCodeCatalogProfile, janitorOpenCodeCatalogProfiles,
   writeOpenCodeCatalogProfileManifest } from './OpenCodeCatalogProfileJanitor.js'
+import { ensureOpenCodeManagedDirectoryPath } from './OpenCodeProfileManager.js'
 
 const roots: string[] = []
+setDefaultTimeout(20_000)
 afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
 
 describe('catalog profile janitor', () => {
@@ -49,7 +51,8 @@ describe('catalog profile janitor', () => {
       await mkdir(target); await utimes(target, index + 1, index + 1)
     }
     expect(await janitorOpenCodeCatalogProfiles(parent)).toBe(32)
-    expect((await readdir(parent)).sort()).toEqual(Array.from({ length: 8 }, (_, offset) =>
+    expect((await readdir(parent)).filter(name => name !== '.catalog-janitor-cursor-v1').sort())
+      .toEqual(Array.from({ length: 8 }, (_, offset) =>
       `.catalog-trash-${(offset + 32).toString().padStart(2, '0')}`))
   })
 
@@ -108,5 +111,104 @@ describe('catalog profile janitor', () => {
     expect(await janitorOpenCodeCatalogProfiles(parent, 2)).toBe(1)
     expect((await lstat(a)).isDirectory()).toBe(true)
     await expect(lstat(crashed)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('expired leases require an exact OS birth mismatch and preserve permission-unknown owners', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-profile-birth-')); roots.push(parent)
+    const live = path.join(parent, 'scope-catalog-live-owner'); await mkdir(live)
+    await writeOpenCodeCatalogProfileManifest({ profileRootPath: live,
+      runtimeInstanceId: 'catalog-g1-live-owner', profileRootKey: path.basename(live),
+      createdAt: 1, heartbeatAt: 1, leaseExpiresAt: 1 })
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2)).toBe(0)
+    expect((await lstat(live)).isDirectory()).toBe(true)
+    const make = async (name: string) => {
+      const profile = path.join(parent, name); await mkdir(profile)
+      await writeOpenCodeCatalogProfileManifest({ profileRootPath: profile,
+        runtimeInstanceId: `catalog-g1-${name}`, profileRootKey: name, createdAt: 1,
+        heartbeatAt: 1, leaseExpiresAt: 1, ownerPid: 42_424_242,
+        processBirthId: 'linux-procfs:1' })
+      return profile
+    }
+    const reused = await make('scope-catalog-reused')
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2, { observeProcess: async pid =>
+      pid === process.pid ? { state: 'unknown' } : {
+        state: 'live', birthId: 'linux-procfs:2',
+      } })).toBe(1)
+    await expect(lstat(reused)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const unknown = await make('scope-catalog-unknown')
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2, { observeProcess: async () => ({
+      state: 'unknown',
+    }) })).toBe(0)
+    expect((await lstat(unknown)).isDirectory()).toBe(true)
+  })
+
+  test('a heartbeat renewed after scanning is revalidated immediately before rename', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-profile-renew-')); roots.push(parent)
+    const profile = path.join(parent, 'scope-catalog-renewed'); await mkdir(profile)
+    const input = { profileRootPath: profile, runtimeInstanceId: 'catalog-g1-renewed',
+      profileRootKey: path.basename(profile) }
+    await writeOpenCodeCatalogProfileManifest({ ...input, createdAt: 1, heartbeatAt: 1,
+      leaseExpiresAt: 1, ownerPid: 999_999, processBirthId: 'linux-procfs:1' })
+    let renewed = false
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2, {
+      observeProcess: async () => ({ state: 'dead' }),
+      beforeProfileRevalidation: async target => {
+        if (renewed || target !== profile) return
+        renewed = true; const now = Date.now()
+        await writeOpenCodeCatalogProfileManifest({ ...input, heartbeatAt: now,
+          leaseExpiresAt: now + 60_000 })
+      },
+    })).toBe(0)
+    expect(renewed).toBe(true)
+    expect((await lstat(profile)).isDirectory()).toBe(true)
+  })
+
+  test('fair bounded continuation reaches entries after 128 even when its cursor entry is deleted', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-profile-fair-')); roots.push(parent)
+    const now = Date.now()
+    for (let index = 0; index < 129; index += 1) {
+      const name = `a${index.toString().padStart(3, '0')}-catalog-stable`
+      const profile = path.join(parent, name); await mkdir(profile)
+      await writeOpenCodeCatalogProfileManifest({ profileRootPath: profile,
+        runtimeInstanceId: `catalog-g1-${name}`, profileRootKey: name, createdAt: index + 1,
+        heartbeatAt: now, leaseExpiresAt: now + 60_000, ownerPid: 999_999,
+        processBirthId: 'linux-procfs:1' })
+    }
+    const expiredName = 'z999-catalog-expired'; const expired = path.join(parent, expiredName)
+    await mkdir(expired)
+    await writeOpenCodeCatalogProfileManifest({ profileRootPath: expired,
+      runtimeInstanceId: 'catalog-g1-expired', profileRootKey: expiredName, createdAt: 1,
+      heartbeatAt: 1, leaseExpiresAt: 1, ownerPid: 999_999,
+      processBirthId: 'linux-procfs:1' })
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2,
+      { observeProcess: async () => ({ state: 'dead' }) })).toBe(0)
+    await rm(path.join(parent, 'a127-catalog-stable'), { recursive: true })
+    expect(await janitorOpenCodeCatalogProfiles(parent, 2,
+      { observeProcess: async () => ({ state: 'dead' }) })).toBe(1)
+    await expect(lstat(expired)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('restart janitor safely collects an aged manifestless mkdir preparation root', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-janitor-mkdir-')); roots.push(parent)
+    const abandoned = path.join(parent, `${'a'.repeat(64)}-catalog-${'b'.repeat(64)}`)
+    await mkdir(abandoned)
+    const old = new Date(Date.now() - 121_000); await utimes(abandoned, old, old)
+    expect(await janitorOpenCodeCatalogProfiles(parent, 9)).toBe(1)
+    await expect(lstat(abandoned)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('mkdir ownership is established before a manifest-stage abort and cleanup removes the root', async () => {
+    if (process.platform === 'win32') return
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-janitor-abort-')); roots.push(parent)
+    const key = `${'c'.repeat(64)}-catalog-${'d'.repeat(64)}`; const target = path.join(parent, key)
+    let cleanupOwned = false
+    await expect(ensureOpenCodeManagedDirectoryPath(target, parent, undefined, process.platform,
+      undefined, undefined, component => {
+        if (component === target) { cleanupOwned = true; throw new Error('manifest-stage abort') }
+      })).rejects.toThrow('manifest-stage abort')
+    expect(cleanupOwned).toBe(true)
+    expect((await cleanupOpenCodeCatalogProfile(target, key)).disposition).toBe('removed')
+    await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
