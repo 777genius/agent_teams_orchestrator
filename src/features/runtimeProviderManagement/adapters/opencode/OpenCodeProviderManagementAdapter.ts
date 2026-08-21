@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import path from 'node:path'
 
 import { openCodeClientFactory } from '../../../../services/opencode/OpenCodeClientFactory.js'
@@ -70,7 +69,10 @@ import {
   type OpenCodeManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
-import { canonicalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
+import {
+  canonicalizeOpenCodeProjectIdentity,
+  openCodeProjectIdentityKey,
+} from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 import type {
   OpenCodeApiAuthInput,
   OpenCodeConfigProvidersResponse,
@@ -261,9 +263,8 @@ const CURATED_SUBSCRIPTION_PROVIDER_LABELS = Object.fromEntries(
   ]),
 )
 
-export function resolveOpenCodeProjectPreferenceRoot(projectPath: string): string {
-  const canonicalProjectPath = path.resolve(projectPath.trim())
-  const profileRootKey = createHash('sha256').update(canonicalProjectPath).digest('hex').slice(0, 16)
+export function resolveOpenCodeProjectPreferenceRoot(canonicalProjectIdentity: string): string {
+  const profileRootKey = openCodeProjectIdentityKey(canonicalProjectIdentity)
   return path.join(resolveClaudeMultimodelPaths().data, 'opencode', 'profiles', profileRootKey)
 }
 

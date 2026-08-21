@@ -135,10 +135,10 @@ async function commitOpenCodePassiveSnapshot(
       try { await root.publishImmutableFile(OPEN_CODE_PASSIVE_DATABASE, '', 0o600) }
       catch { /* a racing owner may have published the same managed file */ }
     }
-    await assertSafeDatabaseArtifacts(options.rootDirectory, true)
+    await assertSafeDatabaseArtifacts(options.rootDirectory, true, options.platform)
     database = openDatabase(options.rootDirectory, false)
     await ensureDatabaseReady(database, signal)
-    await protectDatabaseArtifacts(options.rootDirectory)
+    await protectDatabaseArtifacts(options.rootDirectory, options.platform)
     await root.sync()
     await options.hooks?.afterTransactionMarker?.()
     await beginImmediate(database, signal)
@@ -231,7 +231,7 @@ export async function readOpenCodePassiveSnapshot(
 ): Promise<{ transactionId: number; text: string; value: OpenCodeRedactedSnapshotV1 } | null> {
   rejectUnsupportedPlatform(options.platform)
   if (signal.aborted) throw cancelled()
-  await assertSafeDatabaseArtifacts(rootDirectory, true)
+  await assertSafeDatabaseArtifacts(rootDirectory, true, options.platform)
   const database = openDatabase(rootDirectory, true)
   try {
     verifySchema(database)
@@ -266,7 +266,7 @@ export async function readOpenCodePassiveSnapshot(
 export async function maintainOpenCodePassiveStore(rootDirectory: string, platform?: NodeJS.Platform): Promise<void> {
   rejectUnsupportedPlatform(platform)
   if (!await openCodePassiveDatabaseExists(rootDirectory)) return
-  await assertSafeDatabaseArtifacts(rootDirectory, true)
+  await assertSafeDatabaseArtifacts(rootDirectory, true, platform)
   const database = openDatabase(rootDirectory, false)
   try { verifySchema(database); database.exec('PRAGMA wal_checkpoint(PASSIVE)') }
   finally { database.close(false) }
@@ -594,11 +594,16 @@ async function hasLegacyArtifacts(root: string): Promise<boolean> {
   return false
 }
 
-async function assertSafeDatabaseArtifacts(root: string, databaseRequired = false): Promise<void> {
+async function assertSafeDatabaseArtifacts(
+  root: string,
+  databaseRequired = false,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
   for (const suffix of ['', '-wal', '-shm', '-journal']) {
     try {
       const stat = await lstat(`${openCodePassiveDatabasePath(root)}${suffix}`)
-      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+      if (!stat.isFile() || stat.isSymbolicLink()
+        || (platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
         throw new Error('Passive snapshot database artifact is unsafe')
       }
     } catch (error) {
@@ -608,7 +613,10 @@ async function assertSafeDatabaseArtifacts(root: string, databaseRequired = fals
   }
 }
 
-async function protectDatabaseArtifacts(root: string): Promise<void> {
+async function protectDatabaseArtifacts(
+  root: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
   for (const suffix of ['', '-wal', '-shm', '-journal']) {
     const artifact = `${openCodePassiveDatabasePath(root)}${suffix}`
     try {
@@ -617,7 +625,7 @@ async function protectDatabaseArtifacts(root: string): Promise<void> {
       await chmod(artifact, 0o600)
     } catch (error) { if (!isMissing(error)) throw error }
   }
-  await assertSafeDatabaseArtifacts(root, true)
+  await assertSafeDatabaseArtifacts(root, true, platform)
 }
 
 async function readLegacySnapshot(root: string, scope: `sha256:${string}`): Promise<LegacyRead> {
@@ -1052,7 +1060,9 @@ function withoutGeneration<T extends { evidenceGeneration?: number }>(value: T):
 }
 
 function rejectUnsupportedPlatform(platform = process.platform): void {
-  if (platform === 'win32') throw new Error('Passive transactional persistence is unsupported on native Windows')
+  if (platform !== 'linux' && platform !== 'darwin' && platform !== 'win32') {
+    throw new Error('Passive transactional persistence is unsupported on this platform')
+  }
 }
 function rollback(database: Database): void { try { database.exec('ROLLBACK') } catch { /* no active transaction */ } }
 function cancelled(): Error { return Object.assign(new Error('Passive snapshot update cancelled'), { code: 'ABORT_ERR' }) }

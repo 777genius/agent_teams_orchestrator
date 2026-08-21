@@ -5,7 +5,10 @@ import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { OpenCodeActiveStatusSnapshotPublisher } from './OpenCodeActiveStatusSnapshotPublisher.js'
-import { openCodePassiveDatabasePath } from './OpenCodePassiveSnapshotStore.js'
+import {
+  openCodePassiveDatabasePath,
+  readOpenCodePassiveSnapshot,
+} from './OpenCodePassiveSnapshotStore.js'
 import { OpenCodePassiveStatusSnapshotWriter } from './OpenCodePassiveStatusSnapshotWriter.js'
 import type { OpenCodeRedactedSnapshotV1 } from './OpenCodeRedactedStatusSnapshot.js'
 
@@ -21,12 +24,28 @@ function snapshot(): OpenCodeRedactedSnapshotV1 { return { schemaVersion: 1, pro
     lastConnected: unknown({ state: 'unknown' }), catalogAvailable: unknown('unknown'), executionVerified: unknown('unknown') }] } }
 
 describe('OpenCode passive transaction writer boundary', () => {
-  test('rejects native Windows capability before any injected storage I/O', async () => {
-    let touched = false
+  test('simulated Windows publishes through injected atomic storage without runtime activity', async () => {
+    const calls: string[] = []
     const writer = new OpenCodePassiveStatusSnapshotWriter({ platform: 'win32', rootDirectory: 'C:\\forbidden',
-      makeDirectory: async () => { touched = true }, writeAtomic: async () => { touched = true } })
-    await expect(writer.write(snapshot(), new AbortController().signal)).rejects.toThrow('unavailable on this platform')
-    expect(touched).toBe(false)
+      makeDirectory: async () => { calls.push('mkdir') }, writeAtomic: async () => { calls.push('write') } })
+    await writer.write(snapshot(), new AbortController().signal)
+    expect(calls).toEqual(['mkdir', 'write', 'write'])
+  })
+
+  test('simulated Windows commits verified SQLite evidence and ignores corrupt payloads', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.passive-sqlite-win32-'))
+    const signal = new AbortController().signal
+    try {
+      await new OpenCodePassiveStatusSnapshotWriter({ platform: 'win32', rootDirectory: root })
+        .write(snapshot(), signal)
+      const committed = await readOpenCodePassiveSnapshot(root, scope, signal, { platform: 'win32' })
+      expect(committed?.value.projectScope).toBe(scope)
+
+      const database = new Database(openCodePassiveDatabasePath(root))
+      try { database.exec("UPDATE passive_transactions SET payload = '{corrupt' WHERE id = (SELECT max(id) FROM passive_transactions)") }
+      finally { database.close(false) }
+      expect(await readOpenCodePassiveSnapshot(root, scope, signal, { platform: 'win32' })).toBeNull()
+    } finally { await rm(root, { recursive: true, force: true }) }
   })
 
   test('rejects database and sidecar symlinks instead of following them', async () => {

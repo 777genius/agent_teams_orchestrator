@@ -552,8 +552,9 @@ export async function ensureOpenCodeSafePublicationDirectory(
   for (;;) {
     try {
       const metadata = await lstat(cursor)
+      const canonical = await realpath(cursor)
       if (!metadata.isDirectory() || metadata.isSymbolicLink()
-        || await realpath(cursor) !== cursor) fail()
+        || !sameCanonicalPath(canonical, cursor)) fail()
       break
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -577,6 +578,13 @@ export async function ensureOpenCodeSafePublicationDirectory(
     await directory.close().catch(() => undefined)
     throw error
   }
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  if (process.platform !== 'win32') return left === right
+  const normalize = (value: string) => path.win32.normalize(value)
+    .replace(/^\\\\\?\\/, '').toLowerCase()
+  return normalize(left) === normalize(right)
 }
 
 export async function withOpenCodeSafePublicationDirectory<T>(
