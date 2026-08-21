@@ -199,7 +199,7 @@ function classifyRetryStatusFailure(
   const message = getRetryStatusMessage(value)
   if (!message) return null
   const classified = classifyProbeFailure({ message })
-  return classified.outcome === 'unknown' ? null : classified
+  return classified.outcome === 'unknown' && !classified.failureCode ? null : classified
 }
 
 function parseProviderScopedModel(selectedModel: string): {
@@ -299,7 +299,7 @@ function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
 
 export function classifyProbeFailure(params: {
   message: string
-}): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> {
+}): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason' | 'failureCode'> {
   const reason = normalizeFailureMessage(params.message)
   const lower = reason.toLowerCase()
 
@@ -307,30 +307,42 @@ export function classifyProbeFailure(params: {
   // Some gateways wrap RESOURCE_EXHAUSTED in a generic forbidden response.
   if (isUsageLimitFailureMessage(lower)) {
     return {
-      outcome: 'unavailable',
+      outcome: 'unknown',
       reason,
+      failureCode: 'uncertain_provider_rejection',
     }
   }
 
   if (
-    lower.includes('token refresh failed')
-    || lower.includes('authentication failed')
+    (lower.includes('token refresh failed') && lower.includes('invalid_grant'))
     || lower.includes('authentication required')
-    || lower.includes('auth failed')
     || lower.includes('not logged in')
     || lower.includes('please run \'agent login\'')
     || lower.includes('please run `kiro-cli login`')
     || lower.includes('cursor_api_key')
     || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
     || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
-    || lower.includes('unauthorized')
-    || lower.includes('forbidden')
-    || /\b401\b/.test(lower)
-    || /\b403\b/.test(lower)
   ) {
     return {
       outcome: 'not_authenticated',
       reason,
+      failureCode: 'definitive_auth_rejected',
+    }
+  }
+
+  if (
+    lower.includes('unauthorized')
+    || lower.includes('forbidden')
+    || /\b401\b/.test(lower)
+    || /\b403\b/.test(lower)
+    || lower.includes('entitlement')
+    || lower.includes('regional policy')
+    || lower.includes('not available for your account')
+  ) {
+    return {
+      outcome: 'unknown',
+      reason,
+      failureCode: 'uncertain_provider_rejection',
     }
   }
 
@@ -345,7 +357,6 @@ export function classifyProbeFailure(params: {
     || lower.includes('model not found')
     || lower.includes('unknown model')
     || lower.includes('invalid model')
-    || lower.includes('not available for your account')
   ) {
     return {
       outcome: 'unavailable',
@@ -356,6 +367,99 @@ export function classifyProbeFailure(params: {
   return {
     outcome: 'unknown',
     reason,
+  }
+}
+
+function getObservedAssistantModel(
+  summary: OpenCodeSessionReconcileSummary,
+): { providerId: string | null; modelId: string | null; scopedModelId: string | null } {
+  const assistant = summary.latestAssistantMessageId
+    ? summary.messages.find(message => message.id === summary.latestAssistantMessageId) ?? null
+    : null
+  const providerId = assistant?.providerId?.trim() || null
+  const modelId = assistant?.modelId?.trim() || null
+  return {
+    providerId,
+    modelId,
+    scopedModelId: providerId && modelId ? `${providerId}/${modelId}` : null,
+  }
+}
+
+function buildTranscriptSuccessResult(input: {
+  selectedModel: string
+  prompt: string
+  expectedOutput: string
+  startedAtMs: number
+  summary: OpenCodeSessionReconcileSummary
+  diagnostics: Set<string>
+}): OpenCodeExecutionProbeResult {
+  const observed = getObservedAssistantModel(input.summary)
+  if (observed.scopedModelId !== input.selectedModel) {
+    const reason = observed.scopedModelId
+      ? `OpenCode executed ${observed.scopedModelId} instead of requested model ${input.selectedModel}`
+      : `OpenCode assistant response omitted exact provider/model metadata for requested model ${input.selectedModel}`
+    input.diagnostics.add(reason)
+    return {
+      providerId: 'opencode',
+      modelId: input.selectedModel,
+      observedProviderId: observed.providerId,
+      observedModelId: observed.modelId,
+      probePrompt: input.prompt,
+      expectedOutput: input.expectedOutput,
+      outcome: 'unknown',
+      reason,
+      durationMs: buildDurationMs(input.startedAtMs),
+      rawStatus: input.summary.rawStatus,
+      durableState: input.summary.durableState,
+      latestAssistantText: input.summary.latestAssistantText,
+      latestAssistantPreview: input.summary.latestAssistantPreview,
+      toolCallCount: input.summary.toolCallCount,
+      errorCount: input.summary.errorCount,
+      diagnostics: Array.from(input.diagnostics),
+      failureCode: 'execution_identity_unverified',
+    }
+  }
+  return {
+    providerId: 'opencode',
+    modelId: input.selectedModel,
+    observedProviderId: observed.providerId,
+    observedModelId: observed.modelId,
+    probePrompt: input.prompt,
+    expectedOutput: input.expectedOutput,
+    outcome: 'available',
+    reason: null,
+    durationMs: buildDurationMs(input.startedAtMs),
+    rawStatus: input.summary.rawStatus,
+    durableState: input.summary.durableState,
+    latestAssistantText: input.summary.latestAssistantText,
+    latestAssistantPreview: input.summary.latestAssistantPreview,
+    toolCallCount: input.summary.toolCallCount,
+    errorCount: input.summary.errorCount,
+    diagnostics: Array.from(input.diagnostics),
+    verifiedAt: new Date().toISOString(),
+  }
+}
+
+function enforceExactExecutionIdentity(
+  result: OpenCodeExecutionProbeResult,
+  selectedModel: string,
+): OpenCodeExecutionProbeResult {
+  const observedModel = result.observedProviderId && result.observedModelId
+    ? `${result.observedProviderId}/${result.observedModelId}`
+    : null
+  const requiresExactIdentity = result.outcome === 'available'
+    || result.failureCode === 'definitive_auth_rejected'
+  if (!requiresExactIdentity || observedModel === selectedModel) return result
+  const reason = observedModel
+    ? `OpenCode executed ${observedModel} instead of requested model ${selectedModel}`
+    : `OpenCode response omitted exact provider/model metadata for requested model ${selectedModel}`
+  const { verifiedAt: _verifiedAt, ...unverifiedResult } = result
+  return {
+    ...unverifiedResult,
+    outcome: 'unknown',
+    reason,
+    failureCode: 'execution_identity_unverified',
+    diagnostics: [...result.diagnostics, reason],
   }
 }
 
@@ -370,15 +474,15 @@ function buildCursorNativeExecutionOutcome(input: {
   const { nativeResult, diagnostics } = input
   if (nativeResult?.outcome === 'available') {
     diagnostics.add(
-      `Cursor native execution probe confirmed model availability in ${nativeResult.durationMs}ms`,
+      `Cursor native execution probe completed in ${nativeResult.durationMs}ms but did not report exact provider/model metadata`,
     )
     return {
       providerId: 'opencode',
       modelId: input.selectedModel,
       probePrompt: input.prompt,
       expectedOutput: input.expectedOutput,
-      outcome: 'available',
-      reason: null,
+      outcome: 'unknown',
+      reason: `Cursor native execution response omitted exact provider/model metadata for requested model ${input.selectedModel}`,
       durationMs: buildDurationMs(input.startedAtMs),
       rawStatus: null,
       durableState: 'idle',
@@ -387,18 +491,18 @@ function buildCursorNativeExecutionOutcome(input: {
       toolCallCount: 0,
       errorCount: 0,
       diagnostics: Array.from(diagnostics),
-      verifiedAt: new Date().toISOString(),
+      failureCode: 'execution_identity_unverified',
     }
   }
 
   if (nativeResult?.outcome !== 'failure') return null
   const classified = classifyProbeFailure({ message: nativeResult.message ?? '' })
-  if (classified.outcome === 'unknown') return null
+  if (classified.outcome === 'unknown' && !classified.failureCode) return null
   diagnostics.add(classified.reason)
   diagnostics.add(
     `Cursor native failure probe confirmed a terminal provider error in ${nativeResult.durationMs}ms`,
   )
-  return {
+  return enforceExactExecutionIdentity({
     providerId: 'opencode',
     modelId: input.selectedModel,
     probePrompt: input.prompt,
@@ -413,7 +517,8 @@ function buildCursorNativeExecutionOutcome(input: {
     toolCallCount: 0,
     errorCount: 1,
     diagnostics: Array.from(diagnostics),
-  }
+    ...(classified.failureCode ? { failureCode: classified.failureCode } : {}),
+  }, input.selectedModel)
 }
 
 function knownFailureMessagePriority(message: string | null): number {
@@ -422,6 +527,7 @@ function knownFailureMessagePriority(message: string | null): number {
   const classified = classifyProbeFailure({ message })
   if (classified.outcome === 'not_authenticated') return 2
   if (classified.outcome === 'unavailable') return 1
+  if (classified.failureCode === 'uncertain_provider_rejection') return 1
   return 0
 }
 
@@ -436,7 +542,8 @@ function extractNestedKnownFailureMessage(value: unknown, depth = 0): string | n
     } catch {
       // Plain provider error text.
     }
-    const direct = classifyProbeFailure({ message: trimmed }).outcome === 'unknown'
+    const classified = classifyProbeFailure({ message: trimmed })
+    const direct = classified.outcome === 'unknown' && !classified.failureCode
       ? null
       : trimmed
     return knownFailureMessagePriority(nested) >= knownFailureMessagePriority(direct)
@@ -568,7 +675,10 @@ function getProbeResultCacheTtlMs(result: OpenCodeExecutionProbeResult): number 
     return OPEN_CODE_EXECUTION_PROBE_SUCCESS_CACHE_TTL_MS
   }
   const lower = `${result.reason ?? ''} ${result.diagnostics.join(' ')}`.toLowerCase()
-  if (result.outcome === 'unavailable' && isUsageLimitFailureMessage(lower)) {
+  if (
+    (result.outcome === 'unavailable' || result.failureCode === 'uncertain_provider_rejection')
+    && isUsageLimitFailureMessage(lower)
+  ) {
     return OPEN_CODE_EXECUTION_PROBE_RATE_LIMIT_CACHE_TTL_MS
   }
   return 0
@@ -1143,7 +1253,7 @@ export class OpenCodeExecutionProbe {
         params.runtimeDeadline?.throwIfExpired('execution_submit')
         const cached = await readPersistentProbeCache(cachePaths.cacheFilePath)
         if (cached) {
-          return cached
+          return enforceExactExecutionIdentity(cached, params.selectedModel)
         }
 
         const lockStaleMs = Math.max(
@@ -1164,7 +1274,7 @@ export class OpenCodeExecutionProbe {
             params.runtimeDeadline,
           )
           if (sharedResult) {
-            return sharedResult
+            return enforceExactExecutionIdentity(sharedResult, params.selectedModel)
           }
 
           const retryLock = await this.tryAcquirePersistentProbeLock(cachePaths, lockStaleMs)
@@ -1356,6 +1466,7 @@ export class OpenCodeExecutionProbe {
     const finish = async (
       result: OpenCodeExecutionProbeResult,
     ): Promise<OpenCodeExecutionProbeResult> => {
+      result = enforceExactExecutionIdentity(result, params.selectedModel)
       if (parseProviderScopedModel(params.selectedModel).providerID === 'xai') {
         await this.fanOutOAuthCredential({
           providerId: 'xai',
@@ -1491,7 +1602,9 @@ export class OpenCodeExecutionProbe {
           toolCallCount: 0,
           errorCount: 1,
           diagnostics: Array.from(diagnostics),
-          failureCode: hasTerminalClassification ? undefined : 'prompt_start_failed',
+          ...(submitted.classified?.failureCode
+            ? { failureCode: submitted.classified.failureCode }
+            : hasTerminalClassification ? {} : { failureCode: 'prompt_start_failed' as const }),
         })
       }
 
@@ -1514,6 +1627,9 @@ export class OpenCodeExecutionProbe {
           toolCallCount: 0,
           errorCount: 1,
           diagnostics: Array.from(diagnostics),
+          ...(submitted.classified.failureCode
+            ? { failureCode: submitted.classified.failureCode }
+            : {}),
         })
       }
 
@@ -1599,7 +1715,7 @@ export class OpenCodeExecutionProbe {
           const classified = classifyProbeFailure({
             message: failureMessageFromUnknown(error),
           })
-          if (classified.outcome === 'unknown') return null
+          if (classified.outcome === 'unknown' && !classified.failureCode) return null
           diagnostics.add(
             `OpenCode session ${source} request exposed a terminal provider error in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
           )
@@ -1618,6 +1734,7 @@ export class OpenCodeExecutionProbe {
             toolCallCount: latestToolCallCount,
             errorCount: Math.max(1, latestErrorCount),
             diagnostics: Array.from(diagnostics),
+            ...(classified.failureCode ? { failureCode: classified.failureCode } : {}),
           })
         }
         const checkOriginalProbeRecovered = async () => {
@@ -1698,23 +1815,14 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'OpenCode original probe recovered before the auxiliary Cursor failure was applied',
               )
-              return finish({
-                providerId: 'opencode',
-                modelId: params.selectedModel,
-                probePrompt: prompt,
+              return finish(buildTranscriptSuccessResult({
+                selectedModel: params.selectedModel,
+                prompt,
                 expectedOutput,
-                outcome: 'available',
-                reason: null,
-                durationMs: buildDurationMs(startedAtMs),
-                rawStatus: recovered.rawStatus,
-                durableState: recovered.durableState,
-                latestAssistantText: recovered.latestAssistantText,
-                latestAssistantPreview: recovered.latestAssistantPreview,
-                toolCallCount: recovered.toolCallCount,
-                errorCount: recovered.errorCount,
-                diagnostics: Array.from(diagnostics),
-                verifiedAt: new Date().toISOString(),
-              })
+                startedAtMs,
+                summary: recovered,
+                diagnostics,
+              }))
             }
             diagnostics.add(
               `Cursor native failure probe confirmed a terminal provider error in ${nativeTerminalFailure.durationMs}ms`,
@@ -1734,6 +1842,9 @@ export class OpenCodeExecutionProbe {
               toolCallCount: latestToolCallCount,
               errorCount: Math.max(1, latestErrorCount),
               diagnostics: Array.from(diagnostics),
+              ...(nativeTerminalFailure.classified.failureCode
+                ? { failureCode: nativeTerminalFailure.classified.failureCode }
+                : {}),
             })
           }
           const pollRequestsController = new AbortController()
@@ -1807,6 +1918,9 @@ export class OpenCodeExecutionProbe {
                   toolCallCount: latestToolCallCount,
                   errorCount: Math.max(1, latestErrorCount),
                   diagnostics: Array.from(diagnostics),
+                  ...(retryFailure.failureCode
+                    ? { failureCode: retryFailure.failureCode }
+                    : {}),
                 })
               }
 
@@ -1875,6 +1989,7 @@ export class OpenCodeExecutionProbe {
             rawStatus,
             messages,
           })
+          const observedAssistantModel = getObservedAssistantModel(summary)
           for (const diagnostic of summary.diagnostics) diagnostics.add(diagnostic)
           latestRawStatus = summary.rawStatus
           latestDurableState = summary.durableState
@@ -1909,23 +2024,14 @@ export class OpenCodeExecutionProbe {
             )
           ) {
             sessionRequiresCleanup = false
-            return finish({
-              providerId: 'opencode',
-              modelId: params.selectedModel,
-              probePrompt: prompt,
+            return finish(buildTranscriptSuccessResult({
+              selectedModel: params.selectedModel,
+              prompt,
               expectedOutput,
-              outcome: 'available',
-              reason: null,
-              durationMs: buildDurationMs(startedAtMs),
-              rawStatus: summary.rawStatus,
-              durableState: summary.durableState,
-              latestAssistantText: summary.latestAssistantText,
-              latestAssistantPreview: summary.latestAssistantPreview,
-              toolCallCount: summary.toolCallCount,
-              errorCount: summary.errorCount,
-              diagnostics: Array.from(diagnostics),
-              verifiedAt: new Date().toISOString(),
-            })
+              startedAtMs,
+              summary,
+              diagnostics,
+            }))
           }
 
           const latestAssistantError = getLatestAssistantMessageError(
@@ -1941,7 +2047,7 @@ export class OpenCodeExecutionProbe {
             && (latestAssistantError || summary.durableState === 'retrying')
             ? classifyProbeFailure({ message: failureMessage })
             : null
-          if (eagerFailure && eagerFailure.outcome !== 'unknown') {
+          if (eagerFailure && (eagerFailure.outcome !== 'unknown' || eagerFailure.failureCode)) {
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
             diagnostics.add(
               `OpenCode retry/error payload exposed a terminal provider failure before polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
@@ -1949,6 +2055,8 @@ export class OpenCodeExecutionProbe {
             return finish({
               providerId: 'opencode',
               modelId: params.selectedModel,
+              observedProviderId: observedAssistantModel.providerId,
+              observedModelId: observedAssistantModel.modelId,
               probePrompt: prompt,
               expectedOutput,
               outcome: eagerFailure.outcome,
@@ -1961,6 +2069,7 @@ export class OpenCodeExecutionProbe {
               toolCallCount: summary.toolCallCount,
               errorCount: Math.max(1, summary.errorCount),
               diagnostics: Array.from(diagnostics),
+              ...(eagerFailure.failureCode ? { failureCode: eagerFailure.failureCode } : {}),
             })
           }
           if (!failureMessage && hasCompletedAssistantResponseWithoutText(summary)) {
@@ -1970,6 +2079,8 @@ export class OpenCodeExecutionProbe {
             return finish({
               providerId: 'opencode',
               modelId: params.selectedModel,
+              observedProviderId: observedAssistantModel.providerId,
+              observedModelId: observedAssistantModel.modelId,
               probePrompt: prompt,
               expectedOutput,
               outcome: 'unknown',
@@ -2032,7 +2143,7 @@ export class OpenCodeExecutionProbe {
 
           if (failureMessage) {
             const classified = classifyProbeFailure({ message: failureMessage })
-            if (classified.outcome !== 'unknown') {
+            if (classified.outcome !== 'unknown' || classified.failureCode) {
               diagnostics.add(
                 `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
               )
@@ -2046,29 +2157,22 @@ export class OpenCodeExecutionProbe {
               diagnostics.add(
                 'Model verification completed with non-matching assistant output; treating non-empty response as execution proof',
               )
-              return finish({
-                providerId: 'opencode',
-                modelId: params.selectedModel,
-                probePrompt: prompt,
+              return finish(buildTranscriptSuccessResult({
+                selectedModel: params.selectedModel,
+                prompt,
                 expectedOutput,
-                outcome: 'available',
-                reason: null,
-                durationMs: buildDurationMs(startedAtMs),
-                rawStatus: summary.rawStatus,
-                durableState: summary.durableState,
-                latestAssistantText: summary.latestAssistantText,
-                latestAssistantPreview: summary.latestAssistantPreview,
-                toolCallCount: summary.toolCallCount,
-                errorCount: summary.errorCount,
-                diagnostics: Array.from(diagnostics),
-                verifiedAt: new Date().toISOString(),
-              })
+                startedAtMs,
+                summary,
+                diagnostics,
+              }))
             }
 
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
             return finish({
               providerId: 'opencode',
               modelId: params.selectedModel,
+              observedProviderId: observedAssistantModel.providerId,
+              observedModelId: observedAssistantModel.modelId,
               probePrompt: prompt,
               expectedOutput,
               outcome: classified.outcome,
@@ -2081,6 +2185,7 @@ export class OpenCodeExecutionProbe {
               toolCallCount: summary.toolCallCount,
               errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
+              ...(classified.failureCode ? { failureCode: classified.failureCode } : {}),
             })
           }
 

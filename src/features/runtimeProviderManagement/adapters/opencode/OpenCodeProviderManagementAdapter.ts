@@ -2978,6 +2978,47 @@ function buildProviderModelTestResult(input: {
   }
 }
 
+function hasExactObservedExecutionIdentity(input: {
+  providerId: string
+  modelId: string
+  probe: OpenCodeExecutionProbeResult
+}): boolean {
+  const observedProviderId = input.probe.observedProviderId?.trim()
+  const observedModelId = input.probe.observedModelId?.trim()
+  return Boolean(
+    observedProviderId
+    && observedModelId
+    && observedProviderId === input.providerId
+    && `${observedProviderId}/${observedModelId}` === input.modelId,
+  )
+}
+
+function gateProbeByObservedExecutionIdentity(input: {
+  providerId: string
+  modelId: string
+  probe: OpenCodeExecutionProbeResult
+}): OpenCodeExecutionProbeResult {
+  const requiresExactIdentity = input.probe.outcome === 'available'
+    || input.probe.failureCode === 'definitive_auth_rejected'
+  if (!requiresExactIdentity || hasExactObservedExecutionIdentity(input)) {
+    return input.probe
+  }
+  const observed = input.probe.observedProviderId && input.probe.observedModelId
+    ? `${input.probe.observedProviderId}/${input.probe.observedModelId}`
+    : null
+  const reason = observed
+    ? `OpenCode executed ${observed} instead of requested model ${input.modelId}`
+    : `OpenCode assistant response omitted exact provider/model metadata for requested model ${input.modelId}`
+  const { verifiedAt: _verifiedAt, ...unverifiedProbe } = input.probe
+  return {
+    ...unverifiedProbe,
+    outcome: 'unknown',
+    reason,
+    failureCode: 'execution_identity_unverified',
+    diagnostics: [...input.probe.diagnostics, reason],
+  }
+}
+
 function getModelAccessError(input: {
   access: ReturnType<typeof evaluateOpenCodeModelAccess>
   modelId: string
@@ -3040,17 +3081,10 @@ export class OpenCodeProviderManagementAdapter
     modelId: string
     probe: OpenCodeExecutionProbeResult
   }): Promise<string | null> {
-    const observedModel = parseOpenCodeExactProviderModelRef(input.probe.modelId)
-    if (
-      !observedModel
-      || observedModel.raw !== input.modelId
-      || observedModel.providerId !== input.providerId
-    ) {
-      return null
-    }
+    if (!hasExactObservedExecutionIdentity(input)) return null
     const executionVerified = input.probe.outcome === 'available'
       ? true
-      : input.probe.outcome === 'not_authenticated'
+      : input.probe.failureCode === 'definitive_auth_rejected'
         ? false
         : undefined
     if (executionVerified === undefined) return null
@@ -3462,6 +3496,12 @@ export class OpenCodeProviderManagementAdapter
         runtimeDeadline.dispose()
       }
 
+      probeResult = gateProbeByObservedExecutionIdentity({
+        providerId: input.providerId,
+        modelId: validationModelId,
+        probe: probeResult,
+      })
+
       if (probeResult.outcome === 'available') {
         await this.publishModelExecutionEvidence({
           projectPath: input.inventory.projectPath,
@@ -3483,7 +3523,7 @@ export class OpenCodeProviderManagementAdapter
         copilotUnsupportedCandidateCount += 1
         continue
       }
-      if (probeResult.outcome === 'not_authenticated') {
+      if (probeResult.failureCode === 'definitive_auth_rejected') {
         return providerManagementError(
           'auth-failed',
           probeResult.reason
@@ -5029,7 +5069,7 @@ export class OpenCodeProviderManagementAdapter
           (access.kind === 'configured_authless' && access.requiresExecutionProof)
         let publicationIssue: string | null = null
         if (mustProbe) {
-          const probeResult = await this.getExecutionProbe().probeModel({
+          const rawProbeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
             projectPath: inventory.projectPath,
             bypassCache: true,
@@ -5038,6 +5078,11 @@ export class OpenCodeProviderManagementAdapter
               configProviders,
             }).baseUrl,
           })
+          const probeResult = gateProbeByObservedExecutionIdentity({
+            providerId,
+            modelId,
+            probe: rawProbeResult,
+          })
           publicationIssue = await this.publishModelExecutionEvidence({
             projectPath: inventory.projectPath,
             providerId,
@@ -5045,7 +5090,7 @@ export class OpenCodeProviderManagementAdapter
             probe: probeResult,
           })
           if (probeResult.outcome !== 'available') {
-            if (probeResult.outcome === 'not_authenticated') {
+            if (probeResult.failureCode === 'definitive_auth_rejected') {
               return providerManagementError(
                 'auth-required',
                 probeResult.reason ?? `Provider authentication failed for ${modelId}`,
@@ -5237,7 +5282,7 @@ export class OpenCodeProviderManagementAdapter
           return accessError
         }
 
-        const probe = await this.getExecutionProbe().probeModel({
+        const rawProbe = await this.getExecutionProbe().probeModel({
           selectedModel: modelId,
           projectPath: inventory.projectPath,
           bypassCache: true,
@@ -5245,6 +5290,11 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             configProviders,
           }).baseUrl,
+        })
+        const probe = gateProbeByObservedExecutionIdentity({
+          providerId,
+          modelId,
+          probe: rawProbe,
         })
         const publicationIssue = await this.publishModelExecutionEvidence({
           projectPath: inventory.projectPath,
@@ -5352,7 +5402,7 @@ export class OpenCodeProviderManagementAdapter
             'OpenCode managed model limit preferences are unavailable',
           )
         }
-        const probe = await this.getExecutionProbe().probeModel({
+        const rawProbe = await this.getExecutionProbe().probeModel({
           selectedModel: modelId,
           projectPath: inventory.projectPath,
           contextTokens,
@@ -5362,6 +5412,11 @@ export class OpenCodeProviderManagementAdapter
             providerId,
             configProviders,
           }).baseUrl,
+        })
+        const probe = gateProbeByObservedExecutionIdentity({
+          providerId,
+          modelId,
+          probe: rawProbe,
         })
         const publicationIssue = await this.publishModelExecutionEvidence({
           projectPath: inventory.projectPath,
