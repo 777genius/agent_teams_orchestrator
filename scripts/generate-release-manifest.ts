@@ -7,7 +7,8 @@ type AssetDescriptor = {
   file: string;
   archiveKind: 'tar.gz' | 'zip';
   binaryName: string;
-  workerName: string;
+  authorityName: string;
+  launcherName: string;
 };
 
 const releaseDir = path.join(process.cwd(), 'release-flat');
@@ -31,35 +32,35 @@ const assets: AssetDescriptor[] = [
     file: `agent-teams-runtime-darwin-arm64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
-    workerName: 'opencode-catalog-allocation-worker',
+    authorityName: 'opencode-catalog-authority', launcherName: 'opencode-catalog-launcher',
   },
   {
     platform: 'darwin-x64',
     file: `agent-teams-runtime-darwin-x64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
-    workerName: 'opencode-catalog-allocation-worker',
+    authorityName: 'opencode-catalog-authority', launcherName: 'opencode-catalog-launcher',
   },
   {
     platform: 'linux-x64',
     file: `agent-teams-runtime-linux-x64-v${runtimeVersion}.tar.gz`,
     archiveKind: 'tar.gz',
     binaryName: 'claude-multimodel',
-    workerName: 'opencode-catalog-allocation-worker',
+    authorityName: 'opencode-catalog-authority', launcherName: 'opencode-catalog-launcher',
   },
   {
     platform: 'win32-arm64',
     file: `agent-teams-runtime-win32-arm64-v${runtimeVersion}.zip`,
     archiveKind: 'zip',
     binaryName: 'claude-multimodel.exe',
-    workerName: 'opencode-catalog-allocation-worker.exe',
+    authorityName: 'opencode-catalog-authority.exe', launcherName: 'opencode-catalog-launcher.exe',
   },
   {
     platform: 'win32-x64',
     file: `agent-teams-runtime-win32-x64-v${runtimeVersion}.zip`,
     archiveKind: 'zip',
     binaryName: 'claude-multimodel.exe',
-    workerName: 'opencode-catalog-allocation-worker.exe',
+    authorityName: 'opencode-catalog-authority.exe', launcherName: 'opencode-catalog-launcher.exe',
   },
 ];
 
@@ -71,7 +72,8 @@ const manifest = {
   sourceRef: process.env.RUNTIME_SOURCE_REF ?? process.env.GITHUB_REF_NAME,
   sourceCommit: process.env.RUNTIME_SOURCE_COMMIT ?? process.env.GITHUB_SHA,
   assets: {} as Record<string, {
-    file: string; archiveKind: string; binaryName: string; workerName: string; sha256: string
+    file: string; archiveKind: string; binaryName: string; authorityName: string;
+    launcherName: string; nativeChecksumsName: string; sha256: string
   }>,
 };
 
@@ -84,7 +86,9 @@ for (const asset of assets) {
     file: asset.file,
     archiveKind: asset.archiveKind,
     binaryName: asset.binaryName,
-    workerName: asset.workerName,
+    authorityName: asset.authorityName,
+    launcherName: asset.launcherName,
+    nativeChecksumsName: 'NATIVE_SHA256SUMS',
     sha256,
   };
   sums += `${sha256}  ${asset.file}\n`;

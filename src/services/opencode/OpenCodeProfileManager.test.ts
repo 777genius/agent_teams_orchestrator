@@ -292,7 +292,7 @@ async function buildDeepinfraPlannedInput(
     purpose,
     providerId: 'deepinfra',
     modelId,
-    runtimeInstanceId: 'planned',
+    runtimeInstanceId: purpose === 'provider-catalog' ? 'catalog-g1-planned' : 'planned',
     projectPath,
     evidence: {
       canonicalProjectPathFingerprint: canonicalFingerprint(await realpath(projectPath)),
@@ -330,7 +330,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       const catalogInput = {
         purpose: 'provider-catalog' as const,
         providerId: 'deepinfra',
-        runtimeInstanceId: 'windows-catalog-attempt',
+        runtimeInstanceId: 'catalog-g1-windows-attempt',
         projectPath: tempDir,
       }
       let catalogPrepared = false
@@ -359,7 +359,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
 
       const firstUseCatalog = await prepareOpenCodeProviderCatalogProductionProfile(manager, {
         ...catalogInput,
-        runtimeInstanceId: 'windows-first-use-catalog',
+        runtimeInstanceId: 'catalog-g1-windows-first-use',
       })
       expect(firstUseCatalog.scopeSchema).toBe('opencode-scoped-profile-v1')
       expect((await lstat(firstUseCatalog.profileRootPath)).isDirectory()).toBe(true)
@@ -381,7 +381,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       const nestedFirstUseManager = new OpenCodeProfileManager('win32')
       const nestedCatalog = await prepareOpenCodeProviderCatalogProductionProfile(
         nestedFirstUseManager,
-        { ...catalogInput, runtimeInstanceId: 'windows-nested-env-paths-catalog' },
+        { ...catalogInput, runtimeInstanceId: 'catalog-g1-windows-nested-env-paths' },
       )
       expect(nestedCatalog.profileRootPath).toStartWith(path.join(
         localAppData, 'claude-multimodel-nodejs', 'Data',
@@ -423,7 +423,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     const fixture = await createScopedTestManager(tempDir)
     try {
       const prepared = await prepareOpenCodeProviderCatalogProductionProfile(fixture.manager, {
-        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-a',
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g1-attempt-a',
         projectPath: tempDir,
       })
       expect(prepared.providerId).toBe('deepinfra')
@@ -439,12 +439,12 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       expect(launchAuthorization.effectivePlanDigest).toMatch(/^[a-f0-9]{64}$/)
 
       const first = await fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-b',
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g2-attempt-b',
         projectPath: tempDir,
       })
       await writeFile(path.join(tempDir, 'AGENTS.md'), 'fresh attempt evidence\n')
       const second = await fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-attempt-c',
+        purpose: 'provider-catalog', providerId: 'deepinfra', runtimeInstanceId: 'catalog-g3-attempt-c',
         projectPath: tempDir,
       })
       expect(fixture.manager.planScopedProfile(second).digest)
@@ -476,7 +476,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
 
       const current = await fixture.manager.captureCurrentScopedProfilePlan({
         purpose: 'provider-catalog', providerId: 'deepinfra',
-        runtimeInstanceId: 'deepinfra-user-plugin-attempt', projectPath: tempDir,
+        runtimeInstanceId: 'catalog-g1-deepinfra-user-plugin-attempt', projectPath: tempDir,
       })
       expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
         ['ordinary-user-choice@1.2.3', 'project'],
@@ -546,7 +546,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       await writeFile(path.join(packagesRoot, 'installed-tag', 'index.js'), 'export default "changed"\n')
       const changedCurrent = await fixture.manager.captureCurrentScopedProfilePlan({
         purpose: 'provider-catalog', providerId: 'deepinfra',
-        runtimeInstanceId: 'mutable-plugin-changed-attempt', projectPath: tempDir,
+        runtimeInstanceId: 'catalog-g2-mutable-plugin-changed-attempt', projectPath: tempDir,
       })
       const expected = fixture.manager.planScopedProfile(changedCurrent)
       expect(expected.digest).not.toBe(firstExpected.digest)
@@ -627,7 +627,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       await writeCachedPackage('@rama_nigg/open-cursor@2.5.2', '@rama_nigg/open-cursor', '2.5.2')
 
       const current = await fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'kiro-catalog-attempt',
+        purpose: 'provider-catalog', providerId: 'kiro', runtimeInstanceId: 'catalog-g1-kiro-attempt',
         projectPath: tempDir,
       })
       expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([

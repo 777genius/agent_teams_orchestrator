@@ -41,6 +41,9 @@ import {
   withOpenCodeSafePublicationDirectory,
 } from './OpenCodeSafePublication.js'
 import { commitOpenCodeScopedProfileAuth } from './OpenCodeScopedProfileAuthPublication.js'
+import { janitorOpenCodeCatalogProfiles,
+  cleanupOpenCodeCatalogProfile,
+  writeOpenCodeCatalogProfileManifest } from './OpenCodeCatalogProfileJanitor.js'
 import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
@@ -3970,6 +3973,7 @@ export class OpenCodeProfileManager {
     assertPreparationActive()
     let behaviorCapture: OpenCodeProjectBehaviorCapture | null = null
     let profileTransactionCommitted = false
+    let catalogAttemptRootCreated = false
     try {
     const userConfigRoot = hostEnvironment.XDG_CONFIG_HOME?.trim()
       || path.join(os.homedir(), '.config')
@@ -4285,6 +4289,14 @@ export class OpenCodeProfileManager {
       ? `${profileScopeIdentity}-catalog-${canonicalFingerprint(runtimeInstanceId)}`
       : profileScopeIdentity
     const profileRootPath = path.join(this.paths.data, 'opencode', 'scoped-profiles', profileRootKey)
+    if (policy.purpose === 'provider-catalog') {
+      const generation = /^catalog-g([1-9][0-9]*)-/.exec(runtimeInstanceId)?.[1]
+      const parsedGeneration = generation === undefined ? NaN : Number(generation)
+      if (!Number.isSafeInteger(parsedGeneration)) {
+        throw new Error('OpenCode catalog profile is missing its authority generation')
+      }
+      await janitorOpenCodeCatalogProfiles(path.dirname(profileRootPath), parsedGeneration)
+    }
     const homePath = path.join(profileRootPath, 'home')
     const tmpPath = path.join(profileRootPath, 'tmp')
     const xdgConfigHome = path.join(profileRootPath, 'config')
@@ -4301,6 +4313,18 @@ export class OpenCodeProfileManager {
 
     return await this.withProfilePreparationLock(profileScopeIdentity, async () => {
       if (preparationSignal?.aborted) throwOpenCodeAbortReason(preparationSignal)
+      if (policy.purpose === 'provider-catalog') {
+        // Create only the owned root first, then publish the preparing lease
+        // before any child population can fail. A catalog root is therefore
+        // never stranded without janitor authority.
+        await ensureOpenCodeManagedDirectoryPath(
+          profileRootPath, this.paths.data, undefined, this.platform,
+          this.paths.dataTrustedRoot, preparationSignal,
+        )
+        catalogAttemptRootCreated = true
+        await writeOpenCodeCatalogProfileManifest({ profileRootPath, runtimeInstanceId,
+          profileRootKey, state: 'preparing' })
+      }
       await ensureOpenCodeManagedDirectoryPath(
         homePath, this.paths.data, undefined, this.platform, this.paths.dataTrustedRoot, preparationSignal,
       )
@@ -4466,6 +4490,14 @@ export class OpenCodeProfileManager {
           }
         }
         const executionEnvironmentFingerprint = fingerprintOpenCodeScopedExecutionEnvironment(env)
+        if (policy.purpose === 'provider-catalog') {
+          await writeOpenCodeCatalogProfileManifest({
+            profileRootPath,
+            runtimeInstanceId,
+            profileRootKey,
+            state: 'ready',
+          })
+        }
         const preparedProfile: OpenCodeScopedPreparedProfile = {
           scopeSchema: 'opencode-scoped-profile-v1',
           policy,
@@ -4548,6 +4580,9 @@ export class OpenCodeProfileManager {
         await releaseEarlyPreparationLock().catch(() => undefined)
         await earlyLockDirectory.close().catch(() => undefined)
       } else {
+        if (catalogAttemptRootCreated) {
+          await cleanupOpenCodeCatalogProfile(profileRootPath, profileRootKey).catch(() => undefined)
+        }
         await behaviorCapture?.close()
         await releaseEarlyPreparationLock()
         await earlyLockDirectory.close()
