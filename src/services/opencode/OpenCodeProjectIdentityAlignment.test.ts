@@ -62,6 +62,7 @@ describe('OpenCode managed profile and preference identity alignment', () => {
     expect(manager).toContain('return openCodeProjectIdentityKey(projectPath)')
     expect(adapter).toContain('openCodeProjectIdentityKey(canonicalProjectIdentity)')
     expect(adapter).toContain('await (this.deps.managedPreferences?.canonicalizeProjectIdentity')
+    expect(adapter).toContain('(projectPath, { allowMissing: true })')
     expect(adapter).toContain('return preferences.resolveProjectRoot(canonical)')
   })
 })

@@ -236,7 +236,10 @@ type OpenCodeProviderManagementAdapterDeps = {
   managedPreferences?: {
     /** Resolves the stable project preference scope, never an operation-attempt profile. */
     resolveProjectRoot?(projectPath: string): string
-    canonicalizeProjectIdentity?(projectPath: string): Promise<string>
+    canonicalizeProjectIdentity?(
+      projectPath: string,
+      options: Readonly<{ allowMissing: true }>,
+    ): Promise<string>
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     readGlobal?(dataRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     clearProjectDefaultModel?(profileRootPath: string): Promise<unknown>
@@ -3281,7 +3284,7 @@ export class OpenCodeProviderManagementAdapter
   private async resolveCanonicalPreferenceRoot(projectPath: string): Promise<string> {
     const preferences = this.getManagedPreferences()
     const canonical = await (this.deps.managedPreferences?.canonicalizeProjectIdentity
-      ?? canonicalizeOpenCodeProjectIdentity)(projectPath)
+      ?? canonicalizeOpenCodeProjectIdentity)(projectPath, { allowMissing: true })
     return preferences.resolveProjectRoot(canonical)
   }
 

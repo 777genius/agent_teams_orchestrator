@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -12,6 +12,7 @@ import {
   getOpenCodeGlobalManagedPreferencesPath,
   readOpenCodeGlobalManagedRuntimePreferences,
 } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
+import { canonicalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -272,6 +273,136 @@ function activeModelActionAdapter(input: {
 }
 
 describe('OpenCodeProviderManagementAdapter', () => {
+  test('keeps project preference reads, writes, and clears on one alias-stable missing identity', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-adapter-missing-preference-'))
+    try {
+      const realAncestor = path.join(root, 'real')
+      const aliasAncestor = path.join(root, 'alias')
+      const realProject = path.join(realAncestor, 'nested', 'project')
+      const aliasProject = path.join(aliasAncestor, 'nested', 'project')
+      await mkdir(realAncestor)
+      await symlink(realAncestor, aliasAncestor)
+
+      const readRoots: string[] = []
+      const writeRoots: string[] = []
+      const clearRoots: string[] = []
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('openrouter', { model: {} }),
+        inventoryService: {
+          probe: async projectPath => inventory({
+            projectPath: projectPath ?? aliasProject,
+            connectedProviders: [{
+              id: 'openrouter', authHint: 'api', source: 'credentials',
+              credentialScopes: ['managed'],
+            }],
+            availableProviders: ['openrouter'],
+            models: ['openrouter/model'],
+          }),
+          clearCache: () => {},
+        },
+        hostManager: {
+          ensureHost: async () => host(),
+          releaseHost: async () => {},
+        },
+        clientFactory: {
+          create: () => ({
+            getConfigProviders: async () => ({
+              providers: [{ id: 'openrouter', name: 'OpenRouter', models: { model: {} } }],
+              default: {},
+            }),
+            getProviders: async () => ({
+              all: [{ id: 'openrouter', name: 'OpenRouter', models: { model: {} } }],
+              connected: ['openrouter'],
+              default: {},
+            }),
+            getProviderAuth: async () => ({ openrouter: [{ type: 'api' as const }] }),
+          }),
+        },
+        managedPreferences: {
+          resolveProjectRoot: canonicalIdentity => canonicalIdentity,
+          read: async preferenceRoot => {
+            readRoots.push(preferenceRoot)
+            return { schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }
+          },
+          readGlobal: async () => ({
+            schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+          }),
+          setDefaultModel: async preferenceRoot => { writeRoots.push(preferenceRoot) },
+          clearProjectDefaultModel: async preferenceRoot => { clearRoots.push(preferenceRoot) },
+        },
+        activeStatusPublisher: {
+          publishInventory: async () => {},
+          publishProviderUpdate: async () => {},
+          publishExecutionUpdate: async () => {},
+          publishCatalogResult: async () => {},
+        },
+      })
+
+      expect((await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'openrouter', projectPath: aliasProject,
+      })).ok).toBe(true)
+      expect((await adapter.setDefaultModel({
+        runtimeId: 'opencode', providerId: 'openrouter', modelId: 'openrouter/model',
+        projectPath: aliasProject, probe: false,
+      })).ok).toBe(true)
+      expect((await adapter.clearProjectDefaultModel({
+        runtimeId: 'opencode', projectPath: aliasProject,
+      })).ok).toBe(true)
+
+      await mkdir(realProject, { recursive: true })
+      expect((await adapter.loadModels({
+        runtimeId: 'opencode', providerId: 'openrouter', projectPath: realProject,
+      })).ok).toBe(true)
+      expect((await adapter.clearProjectDefaultModel({
+        runtimeId: 'opencode', projectPath: realProject,
+      })).ok).toBe(true)
+
+      expect(readRoots).toEqual([realProject, realProject])
+      expect(writeRoots).toEqual([realProject])
+      expect(clearRoots).toEqual([realProject, realProject])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('passes the missing-project policy through deterministic Windows preference identity', async () => {
+    const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' })
+    const stat = { dev: 3, ino: 7, isDirectory: () => true }
+    const optionsSeen: Array<Readonly<{ allowMissing: true }>> = []
+    const canonicalizeProjectIdentity = async (
+      projectPath: string,
+      options: Readonly<{ allowMissing: true }>,
+    ) => {
+      optionsSeen.push(options)
+      return canonicalizeOpenCodeProjectIdentity(projectPath, {
+        ...options,
+        platform: 'win32',
+        filesystem: {
+          realpath: async value => {
+            if (value.toLowerCase() === 'c:\\alias') return 'D:\\Real'
+            throw missing()
+          },
+          lstat: async value => value.toLowerCase() === 'd:\\real' ? stat : Promise.reject(missing()),
+        },
+      })
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      managedPreferences: {
+        canonicalizeProjectIdentity,
+        resolveProjectRoot: canonicalIdentity => canonicalIdentity,
+        setDefaultModel: async () => {},
+      },
+    })
+    const resolvePreferenceRoot = adapter as unknown as {
+      resolveCanonicalPreferenceRoot(projectPath: string): Promise<string>
+    }
+
+    await expect(resolvePreferenceRoot.resolveCanonicalPreferenceRoot('C:\\Alias\\Nested\\Project'))
+      .resolves.toBe('d:\\real\\nested\\project')
+    expect(optionsSeen).toEqual([{ allowMissing: true }])
+  })
+
   test('publishes exact scoped execution evidence after each successful active model probe', async () => {
     const updates: Array<{
       projectPath: string
