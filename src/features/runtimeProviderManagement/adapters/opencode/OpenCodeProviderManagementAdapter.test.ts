@@ -196,7 +196,207 @@ function executionProbeResult(
   }
 }
 
+function activeModelActionAdapter(input: {
+  probe: (modelId: string) => OpenCodeExecutionProbeResult | Promise<OpenCodeExecutionProbeResult>
+  publishExecutionUpdate: (update: {
+    projectPath: string
+    providerId: string
+    executionVerified?: boolean
+  }) => Promise<void>
+  connected?: boolean
+  configured?: boolean
+  providerId?: string
+}) {
+  const providerId = input.providerId ?? 'local'
+  const modelId = `${providerId}/qwen`
+  return new OpenCodeProviderManagementAdapter({
+    inventoryService: {
+      probe: async projectPath => inventory({
+        projectPath: projectPath ?? '/tmp/action-project',
+        connectedProviders: input.connected
+          ? [{ id: providerId, authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }]
+          : [],
+        availableProviders: [providerId],
+        models: [modelId],
+      }),
+      clearCache: () => {},
+    },
+    hostManager: {
+      ensureHost: async () => host(),
+      releaseHost: async () => {},
+    },
+    clientFactory: {
+      create: () => ({
+        getConfigProviders: async () => ({
+          providers: input.configured === false
+            ? []
+            : [{ id: providerId, name: providerId, models: { qwen: {} } }],
+          default: {},
+        }),
+        getProviders: async () => ({
+          all: [{ id: providerId, name: providerId, models: { qwen: {} } }],
+          connected: input.connected ? [providerId] : [],
+          default: {},
+        }),
+        getProviderAuth: async () => input.connected
+          ? { [providerId]: [{ type: 'api' as const }] }
+          : {},
+      }),
+    },
+    executionProbe: {
+      probeModel: async ({ selectedModel }) => input.probe(selectedModel),
+    },
+    managedPreferences: {
+      resolveProjectRoot: () => '/tmp/profile',
+      canonicalizeProjectIdentity: async projectPath => projectPath,
+      setDefaultModel: async () => {},
+      setModelLimits: async () => {},
+    },
+    activeStatusPublisher: {
+      publishInventory: async () => {},
+      publishProviderUpdate: async () => {},
+      publishExecutionUpdate: input.publishExecutionUpdate,
+      publishCatalogResult: async () => {},
+    },
+  })
+}
+
 describe('OpenCodeProviderManagementAdapter', () => {
+  test('publishes exact scoped execution evidence after each successful active model probe', async () => {
+    const updates: Array<{
+      projectPath: string
+      providerId: string
+      executionVerified?: boolean
+    }> = []
+    const adapter = activeModelActionAdapter({
+      probe: modelId => executionProbeResult(modelId),
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const tested = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      projectPath: '/tmp/project',
+    })
+    const defaulted = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+      projectPath: '/tmp/project',
+    })
+    const configured = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+      projectPath: '/tmp/project',
+    })
+
+    expect([tested.ok, defaulted.ok, configured.ok]).toEqual([true, true, true])
+    expect(updates).toEqual(Array.from({ length: 3 }, () => ({
+      projectPath: '/tmp/project',
+      providerId: 'local',
+      executionVerified: true,
+    })))
+  })
+
+  test('does not publish set-default execution evidence when no probe occurred', async () => {
+    const updates: unknown[] = []
+    let probes = 0
+    const adapter = activeModelActionAdapter({
+      connected: true,
+      configured: false,
+      providerId: 'openrouter',
+      probe: modelId => {
+        probes += 1
+        return executionProbeResult(modelId)
+      },
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const result = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'openrouter', modelId: 'openrouter/qwen', probe: false,
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(probes).toBe(0)
+    expect(updates).toEqual([])
+  })
+
+  test('publishes rejection only for exact definitive authentication rejection', async () => {
+    const updates: unknown[] = []
+    let probeResult = executionProbeResult('local/qwen', 'not_authenticated', 'invalid token')
+    const adapter = activeModelActionAdapter({
+      probe: () => probeResult,
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(updates).toEqual([{
+      projectPath: '/tmp/action-project', providerId: 'local', executionVerified: false,
+    }])
+
+    for (const uncertain of [
+      { outcome: 'unavailable' as const, reason: 'rate limited', failureCode: undefined },
+      { outcome: 'unknown' as const, reason: 'malformed response', failureCode: undefined },
+      { outcome: 'unavailable' as const, reason: 'transport failed', failureCode: 'provider_endpoint_unreachable' as const },
+      { outcome: 'unknown' as const, reason: 'probe timed out', failureCode: 'execution_timeout' as const },
+    ]) {
+      probeResult = {
+        ...executionProbeResult('local/qwen', uncertain.outcome, uncertain.reason),
+        ...(uncertain.failureCode ? { failureCode: uncertain.failureCode } : {}),
+      }
+      await adapter.testModel({
+        runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      })
+    }
+    expect(updates).toHaveLength(1)
+  })
+
+  test('does not publish success when probe evidence names a different model or provider', async () => {
+    const updates: unknown[] = []
+    let observedModel = 'local/other'
+    const adapter = activeModelActionAdapter({
+      probe: () => executionProbeResult(observedModel),
+      publishExecutionUpdate: async update => { updates.push(update) },
+    })
+
+    const wrongModel = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    observedModel = 'other/qwen'
+    const wrongProvider = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+
+    expect([wrongModel.ok, wrongProvider.ok]).toEqual([true, true])
+    expect(updates).toEqual([])
+  })
+
+  test('preserves successful model action semantics when execution publication fails', async () => {
+    const adapter = activeModelActionAdapter({
+      probe: modelId => executionProbeResult(modelId),
+      publishExecutionUpdate: async () => { throw new Error('snapshot store unavailable') },
+    })
+
+    const tested = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    const defaulted = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    const configured = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+    })
+
+    expect([tested.ok, defaulted.ok, configured.ok]).toEqual([true, true, true])
+    if (!tested.ok || !defaulted.ok || !configured.ok) return
+    expect(tested.value.ok).toBe(true)
+    expect(tested.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+    expect(defaulted.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+    expect(configured.value).toMatchObject({ saved: true, verified: true })
+    expect(configured.value.diagnostics.join('\n')).toContain('Passive status publication failed')
+  })
+
   test('rejects uppercase and malformed provider rows without throwing before the catalog boundary', async () => {
     let catalogCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({

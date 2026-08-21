@@ -3034,9 +3034,32 @@ export class OpenCodeProviderManagementAdapter
     return this.deps.activeStatusPublisher ?? openCodeActiveStatusSnapshotPublisher
   }
 
-  private async publishProviderStatus(input: Parameters<OpenCodeActiveStatusPublisherPort['publishExecutionUpdate']>[0]): Promise<void> {
-    await boundedPassivePublication(signal =>
-      this.getActiveStatusPublisher().publishExecutionUpdate(input, signal))
+  private async publishModelExecutionEvidence(input: {
+    projectPath: string
+    providerId: string
+    modelId: string
+    probe: OpenCodeExecutionProbeResult
+  }): Promise<string | null> {
+    const observedModel = parseOpenCodeExactProviderModelRef(input.probe.modelId)
+    if (
+      !observedModel
+      || observedModel.raw !== input.modelId
+      || observedModel.providerId !== input.providerId
+    ) {
+      return null
+    }
+    const executionVerified = input.probe.outcome === 'available'
+      ? true
+      : input.probe.outcome === 'not_authenticated'
+        ? false
+        : undefined
+    if (executionVerified === undefined) return null
+    return boundedPassivePublication(signal =>
+      this.getActiveStatusPublisher().publishExecutionUpdate({
+        projectPath: input.projectPath,
+        providerId: input.providerId,
+        executionVerified,
+      }, signal))
   }
 
   private async retainProviderManagementHost(
@@ -3440,10 +3463,11 @@ export class OpenCodeProviderManagementAdapter
       }
 
       if (probeResult.outcome === 'available') {
-        await this.publishProviderStatus({
+        await this.publishModelExecutionEvidence({
           projectPath: input.inventory.projectPath,
           providerId: input.providerId,
-          executionVerified: true,
+          modelId: validationModelId,
+          probe: probeResult,
         })
         return { ok: true, value: validationModelId }
       }
@@ -5003,6 +5027,7 @@ export class OpenCodeProviderManagementAdapter
         const mustProbe =
           input.probe !== false ||
           (access.kind === 'configured_authless' && access.requiresExecutionProof)
+        let publicationIssue: string | null = null
         if (mustProbe) {
           const probeResult = await this.getExecutionProbe().probeModel({
             selectedModel: modelId,
@@ -5012,6 +5037,12 @@ export class OpenCodeProviderManagementAdapter
               providerId,
               configProviders,
             }).baseUrl,
+          })
+          publicationIssue = await this.publishModelExecutionEvidence({
+            projectPath: inventory.projectPath,
+            providerId,
+            modelId,
+            probe: probeResult,
           })
           if (probeResult.outcome !== 'available') {
             if (probeResult.outcome === 'not_authenticated') {
@@ -5080,7 +5111,10 @@ export class OpenCodeProviderManagementAdapter
         })
         return {
           ok: true,
-          value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
+          value: appendViewDiagnostics(view, [
+            ...refresh.postViewDiagnostics,
+            ...(publicationIssue ? [publicationIssue] : []),
+          ]),
         }
       },
       { failureCode: 'model-test-failed', inventoryMode: 'profile' },
@@ -5212,14 +5246,23 @@ export class OpenCodeProviderManagementAdapter
             configProviders,
           }).baseUrl,
         })
+        const publicationIssue = await this.publishModelExecutionEvidence({
+          projectPath: inventory.projectPath,
+          providerId,
+          modelId,
+          probe,
+        })
+        const value = buildProviderModelTestResult({
+          providerId,
+          modelId,
+          probe,
+          configProviders,
+        })
         return {
           ok: true,
-          value: buildProviderModelTestResult({
-            providerId,
-            modelId,
-            probe,
-            configProviders,
-          }),
+          value: publicationIssue
+            ? { ...value, diagnostics: [...value.diagnostics, publicationIssue] }
+            : value,
         }
       },
       { failureCode: 'model-test-failed', inventoryMode: 'profile' },
@@ -5320,6 +5363,12 @@ export class OpenCodeProviderManagementAdapter
             configProviders,
           }).baseUrl,
         })
+        const publicationIssue = await this.publishModelExecutionEvidence({
+          projectPath: inventory.projectPath,
+          providerId,
+          modelId,
+          probe,
+        })
         const verified = probe.outcome === 'available'
         if (!verified) {
           return providerManagementError(
@@ -5362,7 +5411,11 @@ export class OpenCodeProviderManagementAdapter
               cacheDiagnostics.length === 0
                 ? 'Context limits saved and model probe passed'
                 : 'Context limits saved and model probe passed; cached views will refresh later',
-            diagnostics: [...probe.diagnostics, ...redactDiagnostics(cacheDiagnostics)],
+            diagnostics: [
+              ...probe.diagnostics,
+              ...redactDiagnostics(cacheDiagnostics),
+              ...(publicationIssue ? [publicationIssue] : []),
+            ],
           },
         }
       },
