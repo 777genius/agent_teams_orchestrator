@@ -5,10 +5,12 @@ import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import {
+  __OPEN_CODE_LEGACY_LAUNCH_FIXTURE,
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
-  executeOpenCodeBridgeCommandEnvelope,
+  executeOpenCodeBridgeCommandEnvelope as executeStrictOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
+import type { OpenCodeBridgeCommandHandlerPorts } from './OpenCodeLaunchAttemptBridge.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -122,6 +124,20 @@ const snapshot: OpenCodeProvisioningSnapshot = {
   probeError: null,
   diagnostics: [],
 }
+
+const legacyLaunchFixturePorts = {
+  [__OPEN_CODE_LEGACY_LAUNCH_FIXTURE]: true,
+  launchAttempt: {
+    execute: async () => {
+      throw new Error('legacy launch fixture unexpectedly reached the S3 port')
+    },
+  },
+} as OpenCodeBridgeCommandHandlerPorts & {
+  [__OPEN_CODE_LEGACY_LAUNCH_FIXTURE]: true
+}
+
+const executeOpenCodeBridgeCommandEnvelope = (input: unknown) =>
+  executeStrictOpenCodeBridgeCommandEnvelope(input, legacyLaunchFixturePorts)
 
 function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSessionRecord {
   return {

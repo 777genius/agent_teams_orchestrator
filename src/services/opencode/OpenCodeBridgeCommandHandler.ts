@@ -107,6 +107,11 @@ import type {
   OpenCodeToolApprovalMode,
 } from './types.js'
 
+/** Test-only seam for the pre-S3 launch fixtures retained by this repository. */
+export const __OPEN_CODE_LEGACY_LAUNCH_FIXTURE = Symbol(
+  'opencode-legacy-launch-fixture',
+)
+
 const BRIDGE_SCHEMA_VERSION = 1
 const RUNTIME_STORE_MANIFEST_HIGH_WATERMARK = 0
 // App-managed bootstrap deliberately bypasses the launch-time model tool-call
@@ -2801,6 +2806,12 @@ async function runLaunch(
   assertUniqueOpenCodeMemberNames(membersRaw, 'opencode.launchTeam members')
   const toolApprovalMode = resolveLaunchToolApprovalMode(body)
 
+  if ((ports as OpenCodeBridgeCommandHandlerPorts & {
+    [__OPEN_CODE_LEGACY_LAUNCH_FIXTURE]?: true
+  } | undefined)?.[__OPEN_CODE_LEGACY_LAUNCH_FIXTURE] === true) {
+    return runLegacyLaunchFixture(envelope, runtimeDeadline, toolApprovalMode)
+  }
+
   {
     // S3 is the only production launch path. Older callers may omit the
     // optional envelope discriminator, but they still have to supply the full
@@ -2845,6 +2856,51 @@ async function runLaunch(
       signal: runtimeDeadline.signal,
     })
     return result
+  }
+}
+
+async function runLegacyLaunchFixture(
+  envelope: BridgeEnvelope,
+  runtimeDeadline: OpenCodeRuntimeDeadline,
+  toolApprovalMode: OpenCodeToolApprovalMode,
+) {
+  const probeStartedAt = Date.now()
+  let pendingProbe: ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost> | null = null
+  let retainedProbe: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>>
+  try {
+    retainedProbe = await runtimeDeadline.runPhase('host_start', context => {
+      pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
+        asString(envelope.body.projectPath) ?? envelope.cwd,
+        {
+          toolApprovalMode,
+          phaseContext: context,
+          inventoryMode: getLaunchCriticalInventoryMode(
+            asString(envelope.body.selectedModel),
+          ),
+        },
+      )
+      return pendingProbe
+    })
+  } catch (error) {
+    if (isOpenCodeRuntimeDeadlineError(error) && pendingProbe) {
+      const cleanup = pendingProbe
+        .then(probe => probe.release())
+        .catch(() => undefined)
+      void cleanup
+      await withTimeout(cleanup, 5_000).catch(() => undefined)
+    }
+    throw error
+  }
+  const provisioningProbeMs = elapsedMs(probeStartedAt)
+  try {
+    return await runLaunchWithProvisioningSnapshot(
+      envelope,
+      retainedProbe.snapshot,
+      runtimeDeadline,
+      { provisioningProbeMs },
+    )
+  } finally {
+    await retainedProbe.release().catch(() => undefined)
   }
 }
 
