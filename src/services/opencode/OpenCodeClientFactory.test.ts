@@ -331,6 +331,15 @@ describe('OpenCodeClientFactory request context', () => {
 })
 
 describe('OpenCodeClientFactory provider response bounds', () => {
+  test('uses the explicit provider-scoped catalog route without full inventory fallback', async () => {
+    const paths: string[] = []
+    const factory = new OpenCodeClientFactory({ fetchImpl: async input => {
+      paths.push(String(input)); return new Response('{}', { status: 200 })
+    } })
+    await factory.create('http://127.0.0.1:4096').getProviderCatalog('cursor-acp')
+    expect(paths).toEqual(['http://127.0.0.1:4096/provider/cursor-acp'])
+  })
+
   test('rejects an oversized provider body from content-length before parsing', async () => {
     const factory = new OpenCodeClientFactory({
       fetchImpl: async () => new Response('{}', {

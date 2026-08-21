@@ -361,6 +361,8 @@ describe('OpenCodeOperationPolicy', () => {
 
   test('preserves selected-provider user package duplicates in order without injecting an app pin', () => {
     const input = fakeScopedPlanInput()
+    input.purpose = 'execution-probe'
+    input.modelId = 'kiro/model'
     const selectedUserPackage = {
       ...input.evidence.plugins[0]!,
       provenance: 'user' as const,

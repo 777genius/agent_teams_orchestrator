@@ -585,6 +585,10 @@ export function planScopedProfile(
     'opencode-kiro', '@rama_nigg/open-cursor',
   ].filter(packageName => packageName !== selectedManagedPackage))
   const expectedManagedSpec = APP_MANAGED_PLUGIN_BY_PROVIDER[providerId]
+  if (input.purpose === 'provider-catalog'
+    && plugins.some(plugin => plugin.provenance !== 'app-managed')) {
+    throw new Error('OpenCode catalog plan cannot execute canonical ordinary plugins')
+  }
   if (plugins.some(plugin =>
     plugin.provenance === 'app-managed' && plugin.spec !== expectedManagedSpec)) {
     throw new Error('OpenCode scoped app-managed plugin pin is invalid')
@@ -599,6 +603,11 @@ export function planScopedProfile(
     && !plugins.some(plugin => plugin.packageName === selectedManagedPackage)
   ) {
     throw new Error('OpenCode selected provider plugin immutable evidence is unavailable')
+  }
+  if (input.purpose === 'provider-catalog' && selectedManagedPackage
+    && plugins.filter(plugin => plugin.packageName === selectedManagedPackage
+      && plugin.provenance === 'app-managed').length !== 1) {
+    throw new Error('OpenCode catalog selected provider extension is not exact')
   }
   const pluginFingerprint = planningFingerprint(plugins)
   const accountFingerprint = planningFingerprint({
@@ -655,10 +664,16 @@ function resolveProviderScope(
 }
 
 function resolvePlugins(
+  purpose: OpenCodeOperationPurpose,
   providerId: string | null,
   preservedPlugins: readonly OpenCodePreservedPlugin[],
 ): OpenCodePolicyPlugin[] {
-  const plugins: OpenCodePolicyPlugin[] = preservedPlugins.map(plugin => ({
+  // Catalog hosts are disposable provider sandboxes. Canonical user/project
+  // plugin declarations remain untouched, but are intentionally not copied or
+  // executed in this profile. Only the selected provider's pinned extension
+  // may cross the catalog boundary.
+  const plugins: OpenCodePolicyPlugin[] = (purpose === 'provider-catalog'
+    ? [] : preservedPlugins).map(plugin => ({
     spec: plugin.spec,
     packageName: plugin.packageName ?? packageNameFromSpec(plugin.spec),
     provenance: plugin.provenance,
@@ -687,7 +702,8 @@ export function resolveOpenCodeOperationPolicy(
   const providerScope = resolveProviderScope(input.purpose, providerId)
   const executionProbe = input.purpose === 'execution-probe'
   const launch = input.purpose === 'launch'
-  const plugins = resolvePlugins(passive ? null : providerId, input.preservedPlugins ?? [])
+  const plugins = resolvePlugins(input.purpose, passive ? null : providerId,
+    input.preservedPlugins ?? [])
   const sessionPurpose = input.purpose === 'launch' || input.purpose === 'session-resume'
   const mutationCapabilities: OpenCodeOperationPolicy['profile']['mutationCapabilities'] = passive
     ? []

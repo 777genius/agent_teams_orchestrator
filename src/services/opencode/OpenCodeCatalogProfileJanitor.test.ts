@@ -181,11 +181,12 @@ describe('catalog profile janitor', () => {
       runtimeInstanceId: 'catalog-g1-expired', profileRootKey: expiredName, createdAt: 1,
       heartbeatAt: 1, leaseExpiresAt: 1, ownerPid: 999_999,
       processBirthId: 'linux-procfs:1' })
-    expect(await janitorOpenCodeCatalogProfiles(parent, 2,
-      { observeProcess: async () => ({ state: 'dead' }) })).toBe(0)
+    let removed = await janitorOpenCodeCatalogProfiles(parent, 2,
+      { observeProcess: async () => ({ state: 'dead' }) })
     await rm(path.join(parent, 'a127-catalog-stable'), { recursive: true })
-    expect(await janitorOpenCodeCatalogProfiles(parent, 2,
-      { observeProcess: async () => ({ state: 'dead' }) })).toBe(1)
+    if (removed === 0) removed += await janitorOpenCodeCatalogProfiles(parent, 2,
+      { observeProcess: async () => ({ state: 'dead' }) })
+    expect(removed).toBe(1)
     await expect(lstat(expired)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -210,5 +211,29 @@ describe('catalog profile janitor', () => {
     expect(cleanupOwned).toBe(true)
     expect((await cleanupOpenCodeCatalogProfile(target, key)).disposition).toBe('removed')
     await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('inspects at most 128 entries per invocation and eventually reaches past 4096 inert entries', async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), 'catalog-janitor-4096-')); roots.push(parent)
+    const expiredName = 'target-catalog-expired'
+    const expired = path.join(parent, expiredName); await mkdir(expired)
+    await writeOpenCodeCatalogProfileManifest({ profileRootPath: expired,
+      runtimeInstanceId: 'catalog-g1-4096', profileRootKey: expiredName, createdAt: 1,
+      heartbeatAt: 1, leaseExpiresAt: 1, ownerPid: 999_999,
+      processBirthId: 'linux-procfs:1' })
+    for (let index = 0; index < 4096; index += 1) {
+      await writeFile(path.join(parent, `inert-${index.toString().padStart(4, '0')}`), '')
+    }
+    let removed = 0
+    for (let pass = 0; pass < 34 && removed === 0; pass += 1) {
+      let inspected = 0
+      removed += await janitorOpenCodeCatalogProfiles(parent, 2, {
+        observeDirectoryEntry: () => { inspected += 1 },
+        observeProcess: async () => ({ state: 'dead' }),
+      })
+      expect(inspected).toBeLessThanOrEqual(128)
+    }
+    expect(removed).toBe(1)
+    await expect(lstat(expired)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })

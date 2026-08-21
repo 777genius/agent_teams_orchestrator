@@ -457,7 +457,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     }
   })
 
-  test('actual production manager preserves and prepares a DeepInfra user plugin', async () => {
+  test('catalog profile omits ordinary plugins while preserving canonical plugin config bytes', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-current-deepinfra-plugin-'))
     const fixture = await createScopedTestManager(tempDir)
     try {
@@ -478,19 +478,16 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         purpose: 'provider-catalog', providerId: 'deepinfra',
         runtimeInstanceId: 'catalog-g1-deepinfra-user-plugin-attempt', projectPath: tempDir,
       })
-      expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
-        ['ordinary-user-choice@1.2.3', 'project'],
-      ])
+      expect(current.evidence.plugins).toEqual([])
       const expected = fixture.manager.planScopedProfile(current)
       const prepared = await fixture.manager.prepareScopedProfile(current, expected)
-      expect(prepared.policy.plugins).toEqual([{
-        spec: 'ordinary-user-choice@1.2.3',
-        packageName: 'ordinary-user-choice',
-        provenance: 'project',
-      }])
-      expect(prepared.managedConfig.plugin).toEqual([
-        'file:./node_modules/ordinary-user-choice',
-      ])
+      expect(prepared.policy.plugins).toEqual([])
+      expect(prepared.managedConfig.plugin).toEqual([])
+      expect(prepared.managedConfig.agent).toBeUndefined()
+      expect(prepared.managedConfig.mcp).toBeUndefined()
+      expect(await readFile(path.join(tempDir, 'opencode.json'), 'utf8')).toBe(JSON.stringify({
+        plugin: ['ordinary-user-choice@1.2.3'],
+      }))
     } finally {
       fixture.restore()
       await rm(tempDir, { recursive: true, force: true })
@@ -531,7 +528,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       await writeResolved(path.join(tempDir, 'resolved', 'file-plugin'), 'file-plugin', '5.0.0')
 
       const current = await fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra',
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
         runtimeInstanceId: 'mutable-plugin-attempt', projectPath: tempDir,
       })
       expect(current.evidence.plugins.map(plugin =>
@@ -545,7 +542,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       const firstExpected = fixture.manager.planScopedProfile(current)
       await writeFile(path.join(packagesRoot, 'installed-tag', 'index.js'), 'export default "changed"\n')
       const changedCurrent = await fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra',
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
         runtimeInstanceId: 'catalog-g2-mutable-plugin-changed-attempt', projectPath: tempDir,
       })
       const expected = fixture.manager.planScopedProfile(changedCurrent)
@@ -580,7 +577,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     try {
       await writeFile(path.join(tempDir, 'opencode.json'), JSON.stringify({ plugin: ['missing-plugin'] }))
       await expect(fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra',
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
         runtimeInstanceId: 'missing-plugin-attempt', projectPath: tempDir,
       })).rejects.toThrow('immutable planning evidence is unavailable')
 
@@ -594,7 +591,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       await writeFile(outside, 'external bytes\n')
       await symlink(outside, path.join(linkedRoot, 'index.js'))
       await expect(fixture.manager.captureCurrentScopedProfilePlan({
-        purpose: 'provider-catalog', providerId: 'deepinfra',
+        purpose: 'execution-probe', providerId: 'deepinfra', modelId: 'deepinfra/model',
         runtimeInstanceId: 'linked-plugin-attempt', projectPath: tempDir,
       })).rejects.toThrow('immutable planning evidence is unavailable')
     } finally {
@@ -631,18 +628,16 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         projectPath: tempDir,
       })
       expect(current.evidence.plugins.map(plugin => [plugin.spec, plugin.provenance])).toEqual([
-        ['ordinary-user-choice@1.2.3', 'project'],
         ['opencode-kiro@0.4.0', 'app-managed'],
       ])
       expect(current.evidence.nativeAccountIdentitySource).toBe('official-provider-cli')
       const expected = fixture.manager.planScopedProfile(current)
       expect(expected.plugins.map(plugin => plugin.spec)).toEqual([
-        'ordinary-user-choice@1.2.3', 'opencode-kiro@0.4.0',
+        'opencode-kiro@0.4.0',
       ])
       expect(JSON.stringify(expected)).not.toContain('@rama_nigg/open-cursor')
       const prepared = await fixture.manager.prepareScopedProfile(current, expected)
       expect(prepared.managedConfig.plugin).toEqual([
-        'file:./node_modules/ordinary-user-choice',
         'file:./node_modules/opencode-kiro',
       ])
     } finally {
@@ -923,7 +918,9 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-scoped-planned-v2-'))
     const fixture = await createScopedTestManager(tempDir)
     try {
-      const input = await buildDeepinfraPlannedInput(fixture, tempDir)
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
       const expectedPlan = fixture.manager.planScopedProfile(input)
       const prepared = await fixture.manager.prepareScopedProfile(input, expectedPlan)
       expect(prepared.scopedPlanDigest).toBe(expectedPlan.digest)
@@ -979,7 +976,9 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
         resolvedIdentity: fakeResolvedIdentity('7.2.1', treeFingerprint, manifest, 'custom-package'),
         immutableTreeEntries,
       }
-      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [plugin])
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [plugin], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
       const expectedPlan = fixture.manager.planScopedProfile(input)
       const prepared = await fixture.manager.prepareScopedProfile(input, expectedPlan)
       const dependencyPath = path.join(
@@ -1027,10 +1026,14 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       }
       const pluginA = makePlugin('module.exports = "A"\n')
       const pluginB = makePlugin('module.exports = "B"\n')
-      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginA])
+      const input = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginA], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
       const expectedA = fixture.manager.planScopedProfile(input)
       const mutableExpected = structuredClone(expectedA)
-      const inputB = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginB])
+      const inputB = await buildDeepinfraPlannedInput(fixture, tempDir, [pluginB], {
+        purpose: 'launch', modelId: 'deepinfra/model',
+      })
       const expectedB = fixture.manager.planScopedProfile(inputB)
 
       const preparation = fixture.manager.prepareScopedProfile(input, mutableExpected)
@@ -1190,6 +1193,7 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       kill() { return true },
     })
     let spawnCount = 0
+    let failExitCleanup = false
     const ownerKey = Buffer.alloc(32, 7)
     const dependencies = () => ({
       allocateLoopbackPort: async () => 44221,
@@ -1210,6 +1214,9 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       sleepMs: async () => {},
       persistentRegistryPath: registryPath,
       scopedTransportOwnerKey: ownerKey,
+      beforePersistentRegistryUnlink: async () => {
+        if (failExitCleanup) throw new Error('fake durable registry unlink failure')
+      },
     })
     try {
       const input = await buildDeepinfraPlannedInput(fixture, tempDir, [], {
@@ -1235,8 +1242,17 @@ describe('OpenCodeProfileManager immutable planned preparation', () => {
       expect(adopted.diagnostics.join(' ')).toContain('adopted persistent')
       expect(spawnCount).toBe(1)
 
+      failExitCleanup = true
       child.emit('exit', 1, null)
-      await new Promise(resolve => setTimeout(resolve, 20))
+      const pendingCleanup = await owner.reconcilePendingExitCleanups()
+      expect(pendingCleanup.pending).toBe(1)
+      expect(pendingCleanup.diagnostics.join(' ')).toContain('fake durable registry unlink failure')
+      const pendingRegistry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>
+      }
+      expect(pendingRegistry.hosts[plan.expectedHostKey]).toBeDefined()
+      failExitCleanup = false
+      expect(await owner.reconcilePendingExitCleanups()).toMatchObject({ cleaned: 1, pending: 0 })
       const registryBytes = await readFile(registryPath, 'utf8').catch(() => null)
       if (registryBytes !== null) {
         const registry = JSON.parse(registryBytes) as { hosts: Record<string, unknown> }

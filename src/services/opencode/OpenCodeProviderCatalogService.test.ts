@@ -8,6 +8,9 @@ import { Database } from 'bun:sqlite'
 import { writeOpenCodeCatalogProfileManifest } from './OpenCodeCatalogProfileJanitor.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from './OpenCodeLiveProviderNormalizer.js'
 import { OpenCodeProviderCatalogService, type OpenCodeProviderCatalogServiceDeps } from './OpenCodeProviderCatalogService.js'
+import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import { openCodeProfileManager } from './OpenCodeProfileManager.js'
 
 import type { OpenCodeScopedPreparedProfile } from './types.js'
 
@@ -35,7 +38,8 @@ async function fixture(overrides: OpenCodeProviderCatalogServiceDeps = {}) {
         runtimeInstanceId: `catalog-${attempt}`, profileRootKey: path.basename(profileRootPath) })
       return { purpose: 'provider-catalog', providerId: plan.providerId,
         projectPath: plan.projectPath, profileRootPath, binaryFingerprint: 'binary',
-        managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth' } as OpenCodeScopedPreparedProfile
+        managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth',
+        plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile
     },
     ensureHost: async () => ({ hostKey: 'fake-host', baseUrl: 'http://127.0.0.1:48003' }),
     releaseHost: async key => { releases.push(key) },
@@ -82,7 +86,7 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
     const f = await fixture({ prepareProfile: async plan => ({ purpose: 'provider-catalog',
       providerId: plan.providerId, projectPath: plan.projectPath, profileRootPath: '/missing/unowned-profile',
       binaryFingerprint: 'binary', managedConfigFingerprint: 'config',
-      selectedAuthBaselineFingerprint: 'auth' } as OpenCodeScopedPreparedProfile),
+      selectedAuthBaselineFingerprint: 'auth', plannedHostKey: 'fake-host' } as OpenCodeScopedPreparedProfile),
     fetchProviderCatalog: async () => { mutateInput(); return response() },
     clearTimer: (() => { throw new Error('post-commit timer finalizer fault') }) as typeof clearTimeout })
     const previous = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
@@ -174,5 +178,75 @@ describe.serial('OpenCodeProviderCatalogService native ownership', () => {
       }, readPersisted: async () => null, writePersisted: async () => {} })
     await f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox' })
     expect(publicationSawRelease).toBe(true)
+  })
+
+  test('passes the planned host key and bounds a never-settling error cleanup', async () => {
+    let expectedHostKey: string | undefined
+    const f = await fixture({ timeoutMs: 500,
+      allocateAttempt: () => ({ requestGeneration: 1,
+        attemptIdentity: `sha256:${'1'.repeat(64)}` }),
+      readPersisted: async () => null,
+      writePersisted: async () => {},
+      ensureHost: async input => {
+        expectedHostKey = input.expectedHostKey
+        return { hostKey: 'fake-host', baseUrl: 'http://127.0.0.1:48003' }
+      },
+      fetchProviderCatalog: async () => { throw new Error('fake catalog failure') },
+      releaseHost: async () => new Promise<never>(() => {}),
+    })
+    const started = performance.now()
+    await expect(f.service.loadCatalog({ providerId: 'deepinfra', projectPath: '/sandbox' }))
+      .rejects.toThrow('temporarily unavailable')
+    expect(expectedHostKey).toBe('fake-host')
+    expect(performance.now() - started).toBeLessThan(1_500)
+  })
+
+  test('production singleton cache miss reaches fake scoped startup with the planned key', async () => {
+    const profile: OpenCodeScopedPreparedProfile = { purpose: 'provider-catalog', providerId: 'deepinfra',
+      projectPath: '/sandbox/project', profileRootPath: '/fake/catalog-profile',
+      plannedHostKey: 'opencode-host-v2:planned', binaryFingerprint: 'binary',
+      managedConfigFingerprint: 'config', selectedAuthBaselineFingerprint: 'auth' } as never
+    const host = openCodeHostManager as unknown as Record<string, unknown>
+    const clientFactory = openCodeClientFactory as unknown as Record<string, unknown>
+    const profileManager = openCodeProfileManager as unknown as Record<string, unknown>
+    const originals = {
+      ensureScopedHost: host.ensureScopedHost,
+      releaseHost: host.releaseHost,
+      create: clientFactory.create,
+      capture: profileManager.captureCurrentScopedProfilePlan,
+      plan: profileManager.planScopedProfile,
+      prepare: profileManager.prepareScopedProfile,
+    }
+    let expectedHostKey: string | undefined
+    try {
+      host.ensureScopedHost = async (input: { expectedHostKey: string }) => {
+        expectedHostKey = input.expectedHostKey
+        return { hostKey: input.expectedHostKey, baseUrl: 'http://127.0.0.1:48003' }
+      }
+      host.releaseHost = async () => {}
+      clientFactory.create = () => ({ getProviderCatalog: async () => response('singleton-model') })
+      profileManager.captureCurrentScopedProfilePlan = async () => ({ fake: 'current' })
+      profileManager.planScopedProfile = () => ({ fake: 'plan' })
+      profileManager.prepareScopedProfile = async () => profile
+      const service = new OpenCodeProviderCatalogService({
+        timeoutMs: 2_000, ttlMs: 10_000, maxStaleMs: 60_000,
+        canonicalizeProjectPath: async value => value,
+        allocateAttempt: () => ({ requestGeneration: 1,
+          attemptIdentity: `sha256:${'1'.repeat(64)}` }),
+        readPersisted: async () => null,
+        writePersisted: async () => {},
+      })
+      const loaded = await service.loadCatalog({ providerId: 'deepinfra',
+        projectPath: '/sandbox/project' })
+      expect(loaded.catalog.models.map(model => model.id)).toEqual(['singleton-model'])
+      expect(expectedHostKey).toBe(profile.plannedHostKey)
+    } finally {
+      host.ensureScopedHost = originals.ensureScopedHost
+      host.releaseHost = originals.releaseHost
+      clientFactory.create = originals.create
+      profileManager.captureCurrentScopedProfilePlan = originals.capture
+      profileManager.planScopedProfile = originals.plan
+      profileManager.prepareScopedProfile = originals.prepare
+    }
   })
 })

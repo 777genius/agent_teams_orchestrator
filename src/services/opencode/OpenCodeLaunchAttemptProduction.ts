@@ -162,13 +162,15 @@ async function bounded<T>(operation: Promise<T>, deadlineAtMs: number, signal: A
 class OpenCodeProductionLaunchRuntime {
   private readonly authorizedPlans = new WeakMap<object, OpenCodeAuthorizedScopedProfilePlan>()
 
-  async authorize(command: Command): Promise<Command> {
+  async authorize(command: Command, controls: Readonly<{
+    signal: AbortSignal; deadlineAtMs: number; remainingMs(): number
+  }>): Promise<Command> {
     const authorization = await authorizeOpenCodeLaunchScopedProfile(
       openCodeProfileManager as unknown as OpenCodePlanScopedProfileManagerPort,
       {
         purpose: 'launch', providerId: command.request.launchAttempt.providerId,
         modelId: command.selectedModel, runtimeInstanceId: command.request.launchAttempt.attemptId,
-        projectPath: command.projectPath, abortSignal: command.signal,
+        projectPath: command.projectPath, abortSignal: controls.signal,
       },
     )
     const authorized = { ...command, effectiveProfilePlanDigest: authorization.effectivePlanDigest }

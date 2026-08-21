@@ -6840,6 +6840,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -6934,6 +6935,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -7176,6 +7178,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           projectWrites.push({ profileRootPath, modelId })
         },
@@ -7267,6 +7270,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           projectWrites.push({ profileRootPath, modelId })
         },
@@ -7340,6 +7344,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           writes.push({ profileRootPath, modelId })
         },
@@ -7642,6 +7647,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         setDefaultModel: async (profileRootPath, modelId) => {
           savedDefaults.push([profileRootPath, modelId])
         },

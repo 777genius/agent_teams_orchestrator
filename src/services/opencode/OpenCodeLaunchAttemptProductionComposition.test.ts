@@ -89,4 +89,21 @@ describe('OpenCode production launch composition', () => {
     await expect(bridge.execute(command())).resolves.toBe(output)
     expect(calls).toEqual(['plan', 'command-ledger', 'core'])
   })
+
+  test('a hanging authorization is bounded by the one outer absolute deadline', async () => {
+    const value = { ...command(), requestedBudgetMs: 40, outerRemainingBudgetMs: 40 }
+    let authorizationSignal: AbortSignal | undefined
+    const bridge = createOpenCodeLaunchAttemptProductionBridge({
+      authorize: async (_command, controls) => {
+        authorizationSignal = controls.signal
+        return new Promise<never>(() => {})
+      },
+      inspect: async () => { throw new Error('ledger must not run') },
+      executeAfterPreflight: async () => { throw new Error('effects must not run') },
+    })
+    const started = performance.now()
+    await expect(bridge.execute(value)).rejects.toThrow('absolute deadline')
+    expect(authorizationSignal?.aborted).toBe(true)
+    expect(performance.now() - started).toBeLessThan(500)
+  })
 })

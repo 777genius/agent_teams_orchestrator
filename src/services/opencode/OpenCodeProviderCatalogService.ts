@@ -80,9 +80,13 @@ export type OpenCodeProviderCatalogServiceDeps = {
   finalizePreparedProfile?: (profile: OpenCodeScopedPreparedProfile) => Promise<void>
   rollbackPreparedProfile?: (profile: OpenCodeScopedPreparedProfile) => Promise<void>
   ensureHost?: (input: { preparedProfile: OpenCodeScopedPreparedProfile
-    resolveConfigFingerprint: false; abortSignal?: AbortSignal }) => Promise<CatalogHost>
-  releaseHost?: (hostKey: string) => Promise<void>
-  fetchProviderCatalog?: (input: { baseUrl: string; abortSignal: AbortSignal }) => Promise<unknown>
+    expectedHostKey: string; abortSignal?: AbortSignal }) => Promise<CatalogHost>
+  releaseHost?: (hostKey: string, controls?: Readonly<{
+    abortSignal: AbortSignal; deadline: number
+  }>) => Promise<void>
+  fetchProviderCatalog?: (input: {
+    baseUrl: string; providerId: string; abortSignal: AbortSignal
+  }) => Promise<unknown>
   readPersisted?: (cacheKey: string) => Promise<unknown | null>
   writePersisted?: (cacheKey: string, value: unknown) => Promise<void>
   deletePersisted?: (cacheKey: string) => Promise<void>
@@ -373,12 +377,23 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     return value
   }
 
-  private async release(key: string): Promise<void> {
+  private async release(key: string, signal: AbortSignal, deadline: number): Promise<boolean> {
     const release = this.deps.releaseHost ?? (async (hostKey: string) => {
       const { openCodeHostManager } = await import('./OpenCodeHostManager.js')
       await openCodeHostManager.releaseHost(hostKey)
     })
-    await release(key).catch(() => undefined)
+    if (signal.aborted || performance.now() >= deadline) return false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), Math.max(0, deadline - performance.now()))
+      timer.unref?.()
+    })
+    try {
+      return await Promise.race([
+        release(key, { abortSignal: signal, deadline }).then(() => true, () => false),
+        timeout,
+      ])
+    } finally { if (timer) clearTimeout(timer) }
   }
 
   async loadCatalog(unsafeInput: OpenCodeProviderCatalogLoadInput): Promise<OpenCodeProviderCatalogLoadResult> {
@@ -387,6 +402,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
     // and project/provider canonicalization.
     const controller = new AbortController()
     const deadline = performance.now() + selected.timeoutMs
+    const cleanupReserveMs = Math.max(1, Math.min(1_000, Math.floor(selected.timeoutMs / 4)))
+    const workDeadline = deadline - cleanupReserveMs
     let authority: AuthorityAttempt | null = null
     let profile: OpenCodeScopedPreparedProfile | null = null
     let hostKey: string | null = null
@@ -404,7 +421,8 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       if (finalizeInFlight) return
       rejectDeadline?.(failure())
     }
-    const timer = (this.deps.setTimer ?? setTimeout)(expire, selected.timeoutMs)
+    let timer = (this.deps.setTimer ?? setTimeout)(expire,
+      Math.max(1, selected.timeoutMs - cleanupReserveMs))
     timer.unref?.()
     let externalAbort: (() => void) | null = null
     const within = <T>(operation: Promise<T>): Promise<T> => Promise.race([operation, deadlineFailure])
@@ -419,7 +437,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
       const requested = path.resolve(input.projectPath ?? process.cwd())
       const canonicalize = this.deps.canonicalizeProjectPath ?? canonicalizeOpenCodePassiveProjectPath
       const canonicalProjectPath = await within(canonicalize(requested, controller.signal))
-      if (controller.signal.aborted || performance.now() >= deadline) throw failure()
+      if (controller.signal.aborted || performance.now() >= workDeadline) throw failure()
       const startedAt = this.now()
       const scopeHash = hash(`${canonicalProjectPath}\0${providerId}`)
       authority = this.deps.authorityFactory?.({ deadline, signal: controller.signal })
@@ -451,7 +469,7 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         }, 30_000)
         leaseTimer.unref?.()
       }
-      if (controller.signal.aborted || performance.now() >= deadline) throw failure()
+      if (controller.signal.aborted || performance.now() >= workDeadline) throw failure()
       const identity = profileIdentity(profile, providerId, projectOf(profile, canonicalProjectPath))
       const boundIdentity = authorityIdentity(identity)
       const bound = await within(authority.bindAndRead(begun.generation, begun.attemptIdentity, boundIdentity))
@@ -479,15 +497,18 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         const { openCodeHostManager } = await import('./OpenCodeHostManager.js')
         return openCodeHostManager.ensureScopedHost(request)
       })
-      const host = await within(ensureHost({ preparedProfile: profile, resolveConfigFingerprint: false,
-        abortSignal: controller.signal }))
+      if (typeof profile.plannedHostKey !== 'string' || !profile.plannedHostKey.trim()) throw failure()
+      const host = await within(ensureHost({ preparedProfile: profile,
+        expectedHostKey: profile.plannedHostKey, abortSignal: controller.signal }))
       if (!host || typeof host.hostKey !== 'string' || typeof host.baseUrl !== 'string') throw failure()
       hostKey = host.hostKey
       const fetchCatalog = this.deps.fetchProviderCatalog ?? (async request => {
         const { openCodeClientFactory } = await import('./OpenCodeClientFactory.js')
-        return openCodeClientFactory.create(request.baseUrl, { signal: request.abortSignal }).getProviders()
+        return openCodeClientFactory.create(request.baseUrl, { signal: request.abortSignal })
+          .getProviderCatalog(request.providerId)
       })
-      const response = await within(fetchCatalog({ baseUrl: host.baseUrl, abortSignal: controller.signal }))
+      const response = await within(fetchCatalog({ baseUrl: host.baseUrl, providerId,
+        abortSignal: controller.signal }))
       clock = this.now(clock)
       // Authority generation is also the catalog candidate generation. No
       // per-key counter or sqlite_sequence can manufacture it.
@@ -506,10 +527,14 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
 
       // Host release and every fallible TS validation precede FINALIZE.
       const releaseKey = hostKey
+      if (!await this.release(releaseKey, controller.signal, workDeadline)) throw failure()
       hostKey = null
-      await within(this.release(releaseKey))
       if (controller.signal.aborted || performance.now() >= deadline) throw failure()
       finalizeInFlight = true
+      try { (this.deps.clearTimer ?? clearTimeout)(timer) } catch {}
+      timer = (this.deps.setTimer ?? setTimeout)(expire,
+        Math.max(1, deadline - performance.now()))
+      timer.unref?.()
       // The native client owns the reserved, exact-key recovery budget from
       // this point. Racing it with the caller/deadline promise could return
       // bounded stale while RESOLVE was proving a post-COMMIT result.
@@ -547,8 +572,13 @@ export class OpenCodeProviderCatalogService implements OpenCodeProviderCatalogPo
         try { inputSignal?.removeEventListener('abort', externalAbort) } catch {}
       }
       if (leaseTimer) { try { clearInterval(leaseTimer) } catch {} }
-      if (hostKey) await this.release(hostKey)
-      if (profile && !authority?.committed) scheduleProfileCleanup(profile)
+      if (hostKey && await this.release(hostKey, new AbortController().signal, deadline)) {
+        hostKey = null
+      }
+      // An uncertain host release keeps both the HostManager ownership and the
+      // attempt profile intact for bounded janitor/reconciliation. Deleting
+      // its live filesystem would falsely claim cleanup and strand the host.
+      if (profile && !authority?.committed && !hostKey) scheduleProfileCleanup(profile)
       if (authority?.committed) {
         void Promise.resolve().then(() => authority?.close()).catch(() => undefined)
       } else {

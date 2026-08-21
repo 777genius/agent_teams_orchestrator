@@ -147,6 +147,7 @@ type OpenCodeHostManagerDeps = {
   ) => Promise<VerifiedScopedBinary>
   beforePersistentRegistryWrite?: () => Promise<void>
   afterPersistentRegistryWrite?: () => Promise<void>
+  beforePersistentRegistryUnlink?: () => Promise<void>
   scopedTransportOwnerKey?: Buffer
   platform?: NodeJS.Platform
   windowsOwnerKeyProtection?: OpenCodeWindowsOwnerKeyProtection
@@ -1428,6 +1429,12 @@ export class OpenCodeHostManager {
   private readonly scopedStagingGenerations = new Map<string, symbol>()
   private activeRegistryDirectory: OpenCodeSafePublicationDirectory | null = null
   private durableScopedTransportOwnerKey: Buffer | null = null
+  private readonly pendingExitCleanups = new Map<string, Readonly<{
+    receipt: PersistentHostRegistryRecord
+    entry: ManagedHostEntry
+    lastError: string
+  }>>()
+  private readonly exitCleanupTasks = new Map<string, Promise<boolean>>()
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
 
@@ -1892,6 +1899,7 @@ export class OpenCodeHostManager {
   private async unlinkPersistentRegistryUnlocked(): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) return
+    await this.deps.beforePersistentRegistryUnlink?.()
     const unlinkFromDirectory = async (directory: OpenCodeSafePublicationDirectory) => {
       await unlink(directory.child(path.basename(registryPath))).catch(error => {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -2635,8 +2643,7 @@ export class OpenCodeHostManager {
       this.pendingHosts.delete(hostKey)
       const receipt = entry.createdDisposalReceipt
       if (receipt?.registryReceipt) {
-        void this.removePersistentHostByReceipt(hostKey, receipt.registryReceipt)
-          .catch(() => undefined)
+        this.schedulePersistentExitCleanup(hostKey, receipt.registryReceipt, entry)
       } else if (!receipt) {
         // Startup failed before a receipt could be published to a caller.
         void this.removePersistentHost(hostKey, entry.handle, entry.ownedByProcess)
@@ -2645,6 +2652,68 @@ export class OpenCodeHostManager {
       void this.cleanupOpenTuiTempArtifactsIfUnused(
         receipt?.profileTmpPath ?? entry.handle.profile.tmpPath,
       ).catch(() => undefined)
+    })
+  }
+
+  private schedulePersistentExitCleanup(
+    hostKey: string,
+    receipt: PersistentHostRegistryRecord,
+    entry: ManagedHostEntry,
+  ): void {
+    const immutableReceipt = immutableCanonicalPersistentHostRegistryRecord(receipt)
+    this.pendingExitCleanups.set(hostKey, { receipt: immutableReceipt, entry, lastError: 'pending' })
+    const task = this.retryPersistentExitCleanup(hostKey, 3).catch(error => {
+      const pending = this.pendingExitCleanups.get(hostKey)
+      if (pending) this.pendingExitCleanups.set(hostKey, { ...pending,
+        lastError: error instanceof Error ? error.message : String(error) })
+      return false
+    })
+      .finally(() => { this.exitCleanupTasks.delete(hostKey) })
+    this.exitCleanupTasks.set(hostKey, task)
+  }
+
+  private async retryPersistentExitCleanup(hostKey: string, attempts: number): Promise<boolean> {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const pending = this.pendingExitCleanups.get(hostKey)
+      if (!pending) return true
+      try {
+        await this.removePersistentHostByReceipt(hostKey, pending.receipt)
+        this.pendingExitCleanups.delete(hostKey)
+        return true
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.pendingExitCleanups.set(hostKey, { ...pending, lastError: message })
+        pending.entry.handle.diagnostics.push(
+          `persistent exit cleanup pending retry: ${isScopedPreparedProfile(pending.entry.handle.profile)
+            ? '[redacted]' : message}`,
+        )
+        if (attempt + 1 < attempts) {
+          try { await (this.deps.sleepMs ?? sleep)(Math.min(50, 5 * (attempt + 1))) }
+          catch (sleepError) {
+            this.pendingExitCleanups.set(hostKey, { ...pending,
+              lastError: sleepError instanceof Error ? sleepError.message : String(sleepError) })
+          }
+        }
+      }
+    }
+    return false
+  }
+
+  /** Observable bounded retry for exit cleanup that previously could not commit. */
+  async reconcilePendingExitCleanups(): Promise<Readonly<{
+    cleaned: number; pending: number; diagnostics: readonly string[]
+  }>> {
+    let cleaned = 0
+    for (const hostKey of Array.from(this.pendingExitCleanups.keys())) {
+      const existing = this.exitCleanupTasks.get(hostKey)
+      if (existing && await existing) cleaned += 1
+      else if (this.pendingExitCleanups.has(hostKey)
+        && await this.retryPersistentExitCleanup(hostKey, 3)) cleaned += 1
+    }
+    return Object.freeze({
+      cleaned,
+      pending: this.pendingExitCleanups.size,
+      diagnostics: Object.freeze(Array.from(this.pendingExitCleanups.values(), value => value.lastError)),
     })
   }
 

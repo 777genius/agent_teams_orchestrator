@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { constants, type BigIntStats, type Dirent } from 'node:fs'
-import { lstat, open, readFile, readdir, rename, rm } from 'node:fs/promises'
+import { constants, type BigIntStats, type Dir, type Dirent } from 'node:fs'
+import { lstat, open, opendir, readFile, rename, rm } from 'node:fs/promises'
 import path from 'node:path'
 
 export const OPENCODE_CATALOG_PROFILE_MANIFEST = '.catalog-attempt.json'
@@ -39,6 +39,7 @@ type ProcessObservation = Readonly<{
 type JanitorTestHooks = Readonly<{
   observeProcess?: (pid: number) => Promise<ProcessObservation>
   beforeProfileRevalidation?: (profileRootPath: string) => Promise<void>
+  observeDirectoryEntry?: (name: string) => void
 }>
 
 function parseLinuxProcessBirth(stat: string): string | null {
@@ -268,54 +269,37 @@ async function cleanupProfile(profileRootPath: string,
   }
 }
 
-type Cursor = Readonly<{ schema: 'opencode-catalog-janitor-cursor-v1'; after: string }>
+const directoryContinuations = new Map<string, Dir>()
 
-async function readCursor(root: string): Promise<string | null> {
+async function boundedFairEntries(
+  root: string,
+  observe?: (name: string) => void,
+): Promise<Dirent[]> {
+  let directory = directoryContinuations.get(root)
+  if (!directory) {
+    try { directory = await opendir(root, { bufferSize: Math.min(32, MAX_SCAN) }) }
+    catch { return [] }
+    directoryContinuations.set(root, directory)
+  }
+  const entries: Dirent[] = []
+  let inspected = 0
   try {
-    const cursorPath = path.join(root, CURSOR_NAME)
-    const named = await lstat(cursorPath, { bigint: true })
-    if (!named.isFile() || named.isSymbolicLink() || named.size > 1024n) return null
-    const handle = await open(cursorPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    try {
-      const held = await handle.stat({ bigint: true })
-      if (!held.isFile() || held.dev !== named.dev || held.ino !== named.ino || held.size > 1024n) return null
-      const parsed = JSON.parse(await handle.readFile('utf8')) as Partial<Cursor>
-      return parsed.schema === 'opencode-catalog-janitor-cursor-v1'
-        && typeof parsed.after === 'string' && parsed.after.length <= 512 ? parsed.after : null
-    } finally { await handle.close() }
-  } catch { return null }
-}
-
-async function writeCursor(root: string, after: string): Promise<void> {
-  const cursorPath = path.join(root, CURSOR_NAME)
-  const temporary = path.join(root, `.catalog-janitor-cursor-${randomUUID()}.tmp`)
-  try {
-    const handle = await open(temporary, 'wx', 0o600)
-    try {
-      const cursor: Cursor = { schema: 'opencode-catalog-janitor-cursor-v1', after }
-      await handle.writeFile(`${JSON.stringify(cursor)}\n`); await handle.sync()
-    } finally { await handle.close() }
-    await rename(temporary, cursorPath)
-    if (process.platform !== 'win32') {
-      const directory = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
-      try { await directory.sync() } finally { await directory.close() }
+    while (inspected < MAX_SCAN) {
+      const entry = await directory.read()
+      if (!entry) {
+        directoryContinuations.delete(root)
+        try { await directory.close() } catch {}
+        break
+      }
+      inspected += 1
+      observe?.(entry.name)
+      if (entry.name === CURSOR_NAME || entry.name.startsWith('.catalog-janitor-cursor-')) continue
+      entries.push(entry)
     }
-  } catch { await rm(temporary, { force: true }).catch(() => undefined) }
-}
-
-async function boundedFairEntries(root: string): Promise<Dirent[]> {
-  let all: Dirent[]
-  try { all = await readdir(root, { withFileTypes: true }) } catch { return [] }
-  all = all.filter(entry => entry.name !== CURSOR_NAME
-    && !entry.name.startsWith('.catalog-janitor-cursor-'))
-    .sort((left, right) => left.name.localeCompare(right.name))
-  if (all.length === 0) return []
-  const cursor = await readCursor(root)
-  const after = cursor === null ? 0 : all.findIndex(entry => entry.name > cursor)
-  const start = after < 0 ? 0 : after
-  const entries = Array.from({ length: Math.min(MAX_SCAN, all.length) },
-    (_, offset) => all[(start + offset) % all.length]!)
-  await writeCursor(root, entries.at(-1)!.name)
+  } catch {
+    directoryContinuations.delete(root)
+    try { await directory.close() } catch {}
+  }
   return entries
 }
 
@@ -328,7 +312,7 @@ export async function janitorOpenCodeCatalogProfiles(
   if (!path.isAbsolute(scopedProfilesRoot)
     || (protectedGeneration !== undefined
       && (!Number.isSafeInteger(protectedGeneration) || protectedGeneration < 1))) return 0
-  const entries = await boundedFairEntries(scopedProfilesRoot)
+  const entries = await boundedFairEntries(scopedProfilesRoot, testHooks.observeDirectoryEntry)
 
   const trash: Array<{ name: string; createdAt: number }> = []
   for (const entry of entries) {
