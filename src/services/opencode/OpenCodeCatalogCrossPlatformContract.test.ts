@@ -78,6 +78,8 @@ describe('native catalog cross-platform source contract', () => {
     expect(source).toContain('actual_ino != expected_ino')
     expect(source).toContain('actual_size != expected_size')
     expect(source).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE')
+    expect(source).toMatch(/Win32::Foundation::\{[^}]*GENERIC_READ/)
+    expect(source).not.toMatch(/Win32::Storage::FileSystem::\{[^}]*\bGENERIC_READ\b/)
   })
 
   test('Windows authority rejects reparse components and unverifiable non-local filesystems', async () => {
