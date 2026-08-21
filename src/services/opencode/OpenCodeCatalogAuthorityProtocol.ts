@@ -14,7 +14,10 @@ export type OpenCodeCatalogAuthorityIdentity = Readonly<{
   cache_key: string
 }>
 
-type RequestBase = Readonly<{ id: string }>
+// Relative monotonic budget captured immediately before the write. The native
+// process converts it to its own absolute monotonic deadline, avoiding any
+// assumption that JavaScript and Rust clocks share an epoch.
+type RequestBase = Readonly<{ id: string; wait_ms: number }>
 
 export type OpenCodeCatalogAuthorityRequest =
   | (RequestBase & Readonly<{ op: 'BEGIN_ATTEMPT'; started_at: number; scope_hash: string }>)

@@ -43,6 +43,20 @@ describe('native catalog cross-platform source contract', () => {
     expect(`${source}\n${vfs}`).not.toContain('/dev/fd')
   })
 
+  test('authority contention uses a per-request monotonic deadline on every platform', async () => {
+    const authority = await readFile('native/opencode-catalog-authority/src/main.rs', 'utf8')
+    const client = await readFile('src/services/opencode/OpenCodeCatalogAuthorityClient.ts', 'utf8')
+    const protocol = await readFile('src/services/opencode/OpenCodeCatalogAuthorityProtocol.ts', 'utf8')
+    expect(authority).toContain('sqlite3_busy_handler')
+    expect(authority).toContain('deadline_busy_handler')
+    expect(authority).toContain('backoff.min(state.deadline.saturating_duration_since(now))')
+    expect(authority).toContain('exec(db, "BEGIN IMMEDIATE")?')
+    expect(authority).not.toContain('sqlite3_busy_timeout(db.raw, 0)')
+    expect(client).toContain('wait_ms: Math.min(0xffff_ffff, Math.ceil(remaining))')
+    expect(client).toContain("reply.error === 'DEADLINE'")
+    expect(protocol).toContain('id: string; wait_ms: number')
+  })
+
   test('launcher enforces same-object Unix exec and locked Windows job launch', async () => {
     const source = await readFile('native/opencode-catalog-launcher/src/main.rs', 'utf8')
     expect(source).toContain('SYS_execveat')

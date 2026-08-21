@@ -5,13 +5,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { Database } from 'bun:sqlite'
 
-import { OpenCodeCatalogAuthorityClient, OpenCodeCatalogCommitUncertainError,
+import { OpenCodeCatalogAbortError, OpenCodeCatalogAuthorityClient, OpenCodeCatalogCommitUncertainError,
+  OpenCodeCatalogDeadlineError,
   type OpenCodeCatalogAuthorityLaunch } from './OpenCodeCatalogAuthorityClient.js'
 import type { OpenCodeCatalogAuthorityIdentity } from './OpenCodeCatalogAuthorityProtocol.js'
 
 const roots: string[] = []
 const clients = new Set<OpenCodeCatalogAuthorityClient>()
-setDefaultTimeout(20_000)
+setDefaultTimeout(60_000)
 async function cleanupFixtures() {
   const ownedClients = [...clients]; clients.clear()
   await Promise.allSettled(ownedClients.map(authority => authority.close()))
@@ -34,7 +35,7 @@ function envelopeFor(generation: number, attemptIdentity: string,
     catalog: { generation }, catalogEvidence: { requestGeneration: generation, attemptIdentity }, ...extra })
 }
 async function root() { const value = await mkdtemp(path.join(os.tmpdir(), 'catalog-authority-')); roots.push(value); return value }
-function client(cacheHome: string, timeout = 2_000, launch?: OpenCodeCatalogAuthorityLaunch) {
+function client(cacheHome: string, timeout = 10_000, launch?: OpenCodeCatalogAuthorityLaunch) {
   const controller = new AbortController()
   const authority = new OpenCodeCatalogAuthorityClient({ cacheHome,
     deadline: performance.now() + timeout, signal: controller.signal, launch })
@@ -109,6 +110,120 @@ async function seedExternalLegacy(cache: string, exact: OpenCodeCatalogAuthority
 }
 
 describe.serial('native v44307 catalog authority', () => {
+  test('warm authority serializes eight simultaneous clients for repeated rounds without leaks', async () => {
+    const cache = await root()
+    const warm = client(cache, 10_000)
+    expect((await warm.beginAttempt(0, sha('concurrency-warm'))).generation).toBe(1)
+    await warm.close()
+
+    const processes: Array<{ exited: Promise<number> }> = []
+    const trackedLaunch: OpenCodeCatalogAuthorityLaunch = input => {
+      const child = Bun.spawn({ cmd: [input.launcherPath, input.workerPath, input.cacheHome],
+        stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
+      processes.push(child)
+      return child as never
+    }
+    let expected = 2
+    for (let round = 0; round < 3; round += 1) {
+      const authorities = Array.from({ length: 8 }, () => client(cache, 15_000, trackedLaunch))
+      const begun = await Promise.all(authorities.map((authority, index) =>
+        authority.beginAttempt(round * 8 + index + 1, sha(`concurrency-${round}-${index}`))))
+      const generations = begun.map(value => value.generation).sort((a, b) => a - b)
+      expect(generations).toEqual(Array.from({ length: 8 }, (_, index) => expected + index))
+      expect(new Set(begun.map(value => value.attemptIdentity)).size).toBe(8)
+      expected += 8
+      await Promise.all(authorities.map(authority => authority.close()))
+    }
+    expect(await Promise.all(processes.map(process => process.exited)))
+      .toEqual(Array.from({ length: 24 }, () => 0))
+
+    const check = new Database(path.join(cache, 'opencode',
+      'provider-catalog-authority-v44307', 'authority.sqlite'), { readonly: true })
+    expect(check.query('SELECT generation FROM authority_state').get()).toEqual({ generation: 25 })
+    check.close()
+  })
+
+  test('a lock contender with a tiny deadline fails precisely and leaves later allocation healthy', async () => {
+    const cache = await root(); const warm = client(cache, 5_000)
+    expect((await warm.beginAttempt(0, sha('tiny-warm'))).generation).toBe(1)
+    await warm.close()
+    const dbPath = path.join(cache, 'opencode', 'provider-catalog-authority-v44307', 'authority.sqlite')
+    const blocker = new Database(dbPath)
+    blocker.exec('BEGIN IMMEDIATE')
+    const late = client(cache, 35)
+    const started = performance.now()
+    try {
+      await expect(late.beginAttempt(1, sha('tiny-contender')))
+        .rejects.toBeInstanceOf(OpenCodeCatalogDeadlineError)
+      expect(performance.now() - started).toBeLessThan(500)
+    } finally {
+      blocker.exec('ROLLBACK'); blocker.close()
+    }
+    const restart = client(cache, 5_000)
+    expect((await restart.beginAttempt(2, sha('tiny-restart'))).generation).toBe(2)
+    await restart.close()
+  })
+
+  test('post-COMMIT abort resolves exactly in repeated eight-client contention rounds', async () => {
+    const cache = await root(); let expectedGeneration = 1
+    for (let round = 0; round < 3; round += 1) {
+      const exact = identity(sha(`post-commit-contention-${round}`))
+      const controller = new AbortController()
+      const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
+        deadline: performance.now() + 15_000, signal: controller.signal,
+        launch: faultLaunch('stall:finalize-after-commit-before-reply') })
+      clients.add(authority)
+      const begun = await authority.beginAttempt(round, sha(`post-commit-contention-scope-${round}`))
+      expect(begun.generation).toBe(expectedGeneration)
+      await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)
+      const envelope = envelopeFor(begun.generation, begun.attemptIdentity, exact, { round })
+      const finalizing = authority.finalize(begun.generation, begun.attemptIdentity,
+        exact, envelope, round, round + 1)
+      const dbPath = path.join(cache, 'opencode',
+        'provider-catalog-authority-v44307', 'authority.sqlite')
+      const committedBy = performance.now() + 5_000
+      for (;;) {
+        try {
+          const check = new Database(dbPath, { readonly: true })
+          const committed = check.query('SELECT count(*) AS count FROM committed_result WHERE generation=?1')
+            .get(begun.generation) as { count: number }
+          check.close()
+          if (committed.count === 1) break
+        } catch {}
+        if (performance.now() >= committedBy) throw new Error('post-COMMIT fixture deadline')
+        await new Promise(resolve => setTimeout(resolve, 2))
+      }
+
+      const blocker = new Database(dbPath); blocker.exec('BEGIN IMMEDIATE')
+      const contenders = Array.from({ length: 8 }, (_, index) => {
+        const contender = client(cache, 12_000)
+        return { contender, begun: contender.beginAttempt(round * 8 + index + 100,
+          sha(`post-commit-contender-${round}-${index}`)) }
+      })
+      controller.abort()
+      await new Promise(resolve => setTimeout(resolve, 50))
+      blocker.exec('ROLLBACK'); blocker.close()
+      await expect(finalizing).resolves.toEqual({ committed: true, generation: begun.generation })
+      const allocations = await Promise.all(contenders.map(value => value.begun))
+      const generations = allocations.map(value => value.generation).sort((a, b) => a - b)
+      expect(generations).toEqual(Array.from({ length: 8 }, (_, index) =>
+        begun.generation + index + 1))
+      await Promise.all(contenders.map(value => value.contender.close()))
+      expectedGeneration += 9
+    }
+  })
+
+  test('abort and native deadline remain distinct client results', async () => {
+    const cache = await root(); const controller = new AbortController()
+    const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
+      deadline: performance.now() + 5_000, signal: controller.signal,
+      launch: faultLaunch('stall:begin-open') })
+    clients.add(authority)
+    const pending = authority.beginAttempt(0, sha('abort-distinction'))
+    controller.abort()
+    await expect(pending).rejects.toBeInstanceOf(OpenCodeCatalogAbortError)
+  })
+
   test.each(['failure', 'timeout'])('scoped fixture cleanup survives injected %s', async mode => {
     let fixture = ''
     const operation = withTemporaryAuthorityRoot(async temporary => {
