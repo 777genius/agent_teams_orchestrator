@@ -2998,6 +2998,16 @@ function gateProbeByObservedExecutionIdentity(input: {
   modelId: string
   probe: OpenCodeExecutionProbeResult
 }): OpenCodeExecutionProbeResult {
+  if (
+    input.probe.outcome === 'not_authenticated'
+    && input.probe.failureCode !== 'definitive_auth_rejected'
+  ) {
+    return {
+      ...input.probe,
+      outcome: 'unknown',
+      failureCode: input.probe.failureCode ?? 'uncertain_provider_rejection',
+    }
+  }
   const requiresExactIdentity = input.probe.outcome === 'available'
     || input.probe.failureCode === 'definitive_auth_rejected'
   if (!requiresExactIdentity || hasExactObservedExecutionIdentity(input)) {

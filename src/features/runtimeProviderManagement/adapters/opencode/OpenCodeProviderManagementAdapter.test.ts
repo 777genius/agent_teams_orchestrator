@@ -344,8 +344,17 @@ describe('OpenCodeProviderManagementAdapter', () => {
       projectPath: '/tmp/action-project', providerId: 'local', executionVerified: false,
     }])
 
+    probeResult = executionProbeResult('local/qwen', 'not_authenticated', 'HTTP 403 Forbidden')
+    delete probeResult.failureCode
+    const genericForbidden = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(genericForbidden.ok).toBe(true)
+    if (genericForbidden.ok) {
+      expect(genericForbidden.value.availability).toBe('unknown')
+    }
+
     for (const uncertain of [
-      { outcome: 'not_authenticated' as const, reason: 'HTTP 403 Forbidden', failureCode: undefined },
       { outcome: 'unavailable' as const, reason: 'rate limited', failureCode: undefined },
       { outcome: 'unknown' as const, reason: 'malformed response', failureCode: undefined },
       { outcome: 'unavailable' as const, reason: 'transport failed', failureCode: 'provider_endpoint_unreachable' as const },

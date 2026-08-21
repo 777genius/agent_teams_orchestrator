@@ -443,6 +443,16 @@ function enforceExactExecutionIdentity(
   result: OpenCodeExecutionProbeResult,
   selectedModel: string,
 ): OpenCodeExecutionProbeResult {
+  if (
+    result.outcome === 'not_authenticated'
+    && result.failureCode !== 'definitive_auth_rejected'
+  ) {
+    return {
+      ...result,
+      outcome: 'unknown',
+      failureCode: result.failureCode ?? 'uncertain_provider_rejection',
+    }
+  }
   const observedModel = result.observedProviderId && result.observedModelId
     ? `${result.observedProviderId}/${result.observedModelId}`
     : null
