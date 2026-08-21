@@ -32,6 +32,7 @@ import {
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
 import {
+  OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS,
   openCodeActiveStatusSnapshotPublisher,
   type OpenCodeActiveStatusPublisherPort,
 } from './OpenCodeActiveStatusSnapshotPublisher.js'
@@ -979,7 +980,10 @@ export class OpenCodeInventoryService {
     signal?: AbortSignal,
   ): Promise<void> {
     if (signal?.aborted) return
-    await this.activeStatusPublisher.publishInventory(snapshot, signal).catch(() => undefined)
+    await boundedBestEffortPublication(
+      publicationSignal => this.activeStatusPublisher.publishInventory(snapshot, publicationSignal),
+      signal,
+    )
   }
 
   clearCache(): void {
@@ -1311,6 +1315,28 @@ export class OpenCodeInventoryService {
     await this.publishAuthoritativeSnapshot(snapshot, options.abortSignal)
     return snapshot
   }
+}
+
+async function boundedBestEffortPublication(
+  publish: (signal: AbortSignal) => Promise<void>,
+  parent?: AbortSignal,
+): Promise<void> {
+  const controller = new AbortController()
+  const abort = () => controller.abort(parent?.reason)
+  parent?.addEventListener('abort', abort, { once: true })
+  if (parent?.aborted) abort()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<void>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort(new Error('Passive publication deadline exceeded'))
+      resolve()
+    }, OPEN_CODE_PASSIVE_PUBLICATION_DEADLINE_MS)
+    timer.unref?.()
+  })
+  const operation = Promise.resolve().then(() => publish(controller.signal)).catch(() => undefined)
+  await Promise.race([operation, deadline])
+  if (timer) clearTimeout(timer)
+  parent?.removeEventListener('abort', abort)
 }
 
 function skippedInventoryCompleteness(): OpenCodeInventoryCompleteness {

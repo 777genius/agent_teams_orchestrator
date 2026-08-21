@@ -109,9 +109,11 @@ export class OpenCodePassiveStatusProductionReader {
       handoff: OpenCodePassiveReadHandoff<string | null>,
     ) => {
       const cached = this.#lastSnapshots.get(projectScope)
-      // Injected adapters have no transaction identity spanning their separate
-      // ports; retain their historical cache semantics for contract tests.
-      if (!this.#transactionalStorage && cached) {
+      // A committed snapshot is authoritative historical evidence. Hand it off
+      // immediately while the direct ports independently attempt a fresh
+      // transaction. Timeout/transient failures can then degrade this history
+      // instead of synthesizing all-unknown status. It never grants readiness.
+      if (cached) {
         handoff(createOpenCodePassiveReadSuccess(cached.text, cached.value.capturedAt, Number.MAX_SAFE_INTEGER))
         return
       }

@@ -1,9 +1,12 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
+import { OpenCodeActiveStatusSnapshotPublisher } from '../../../../services/opencode/OpenCodeActiveStatusSnapshotPublisher.js'
+import { openCodePassiveDatabasePath } from '../../../../services/opencode/OpenCodePassiveSnapshotStore.js'
 import { normalizeOpenCodeScopedProviderCatalogResponse } from '../../../../services/opencode/OpenCodeLiveProviderNormalizer.js'
 import {
   getOpenCodeGlobalManagedPreferencesPath,
@@ -214,7 +217,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(catalogCalls).toBe(0)
   })
 
-  test('routes loadModels through the provider-scoped catalog port without legacy inventory or host calls', async () => {
+  test('routes catalog loading through canonical preferences after the attempt profile is gone', async () => {
     let catalogCalls = 0
     const statusUpdates: any[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
@@ -253,8 +256,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
         releaseHost: async () => {},
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
         read: async profileRootPath => {
-          expect(profileRootPath).toBe('/scoped/deepinfra')
+          expect(profileRootPath).toBe('/tmp/canonical-project-preferences')
           return {
             schemaVersion: 2,
             defaultModelId: null,
@@ -289,6 +293,46 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.models[0]).not.toHaveProperty('authority')
     expect(result.value.models[0]).not.toHaveProperty('providerResponse')
     expect(result.value.defaultModelId).toBeNull()
+  })
+
+  test('bounds passive SQLite publication while provider catalog loading still completes', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.adapter-passive-publication-lock-'))
+    const canonicalProject = '/canonical/publication-project'
+    let database: Database | null = null
+    try {
+      await new OpenCodeActiveStatusSnapshotPublisher({
+        rootDirectory: root,
+        canonicalizePath: async () => canonicalProject,
+        publicationDeadlineMs: 5_000,
+      }).publishProviderUpdate({ projectPath: canonicalProject, providerId: 'deepinfra', configured: true })
+      database = new Database(openCodePassiveDatabasePath(root))
+      database.exec('BEGIN IMMEDIATE')
+      const adapter = new OpenCodeProviderManagementAdapter({
+        providerCatalog: providerCatalog('deepinfra', { model: {} }, false),
+        activeStatusPublisher: new OpenCodeActiveStatusSnapshotPublisher({
+          rootDirectory: root,
+          canonicalizePath: async () => canonicalProject,
+          publicationDeadlineMs: 25,
+        }),
+        managedPreferences: {
+          resolveProjectRoot: () => '/canonical/preferences',
+          read: async () => ({ schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }),
+          readGlobal: async () => ({ schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null }),
+          setDefaultModel: async () => {},
+        },
+      })
+      const startedAt = performance.now()
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'deepinfra' })
+      expect(performance.now() - startedAt).toBeLessThan(500)
+      expect(result.ok).toBe(true)
+      if (result.ok) {
+        expect(result.value.models.map(model => model.modelId)).toEqual(['deepinfra/model'])
+        expect(result.value.diagnostics.join('\n')).toContain('Passive status publication')
+      }
+    } finally {
+      if (database) { try { database.exec('ROLLBACK') } catch {} database.close(false) }
+      await rm(root, { recursive: true, force: true })
+    }
   })
   test('returns a needs-setup view when OpenCode is missing', async () => {
     let ensureHostCalled = false
@@ -6196,6 +6240,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         'global-old-model': { status: 'deprecated' },
       }, false),
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
         read: async profileRootPath => {
           reads.push(`project:${profileRootPath}`)
           return {
@@ -6226,7 +6271,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       .toMatchObject({ default: true })
     expect(result.value.models.find(model => model.modelId === 'google/global-old-model'))
       .toBeUndefined()
-    expect(reads.some(value => value === 'project:/tmp/profile')).toBe(true)
+    expect(reads.some(value => value === 'project:/tmp/canonical-project-preferences')).toBe(true)
     expect(reads.some(value => value.startsWith('global:'))).toBe(true)
   })
 
@@ -6916,7 +6961,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(result.value.diagnostics).toContain(timeoutMessage)
   })
 
-  test('clears the project default and inherits the all-projects default without probing', async () => {
+  test('clears the canonical project default without probing or starting a host', async () => {
     const clearedProfiles: string[] = []
     let inventoryProbeCount = 0
     let executionProbeCount = 0
@@ -6968,6 +7013,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         },
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        readGlobal: async () => ({
+          schemaVersion: 2, defaultModelId: 'openrouter/base-model', modelLimitOverrides: {}, updatedAt: null,
+        }),
         clearProjectDefaultModel: async profileRootPath => {
           clearedProfiles.push(profileRootPath)
         },
@@ -6982,15 +7031,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(clearedProfiles).toEqual(['/tmp/profile'])
+    expect(clearedProfiles).toEqual(['/tmp/canonical-project-preferences'])
+    expect(inventoryProbeCount).toBe(0)
     expect(executionProbeCount).toBe(0)
     expect(result.value.projectDefaultModel).toBeNull()
-    expect(result.value.allProjectsDefaultModel).toBe('openrouter/base-model')
-    expect(result.value.defaultModel).toBe('openrouter/base-model')
-    expect(result.value.defaultModelSource).toBe('all_projects')
+    expect(result.value.diagnostics.join('\n')).toContain('without probing or provisioning')
   })
 
-  test('preserves an imported OpenCode config default when clear refresh times out', async () => {
+  test('clears the canonical project default without depending on a timeout summary', async () => {
     const clearedProfiles: string[] = []
     let probeCallCount = 0
     const timeoutMessage = 'OpenCode inventory probe timed out after 1ms'
@@ -7033,6 +7081,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/canonical-project-preferences',
+        readGlobal: async () => ({
+          schemaVersion: 2, defaultModelId: null, modelLimitOverrides: {}, updatedAt: null,
+        }),
         clearProjectDefaultModel: async profileRootPath => {
           clearedProfiles.push(profileRootPath)
         },
@@ -7047,12 +7099,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(clearedProfiles).toEqual(['/tmp/profile'])
+    expect(clearedProfiles).toEqual(['/tmp/canonical-project-preferences'])
+    expect(probeCallCount).toBe(0)
     expect(result.value.projectDefaultModel).toBeNull()
     expect(result.value.allProjectsDefaultModel).toBeNull()
-    expect(result.value.defaultModel).toBe('ollama/imported-model')
-    expect(result.value.defaultModelSource).toBe('opencode_config')
-    expect(result.value.diagnostics).toContain(timeoutMessage)
+    expect(result.value.diagnostics.join('\n')).toContain('without probing or provisioning')
   })
 
   test('rejects clearing a project default without a project path using the public error contract', async () => {
@@ -7988,6 +8039,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         }),
       },
       managedPreferences: {
+        resolveProjectRoot: () => '/tmp/profile',
         read: async profileRootPath => {
           expect(profileRootPath).toBe('/tmp/profile')
           return {

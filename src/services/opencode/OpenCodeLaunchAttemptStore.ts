@@ -380,10 +380,10 @@ export class OpenCodeLaunchFileJournalPersistence implements OpenCodeLaunchJourn
     const retained = platform === 'linux' || platform === 'darwin'
     const backend: NamespaceBackend = retained
       ? await RetainedDirectoryBackend.create(directory, identity, true)
-      : new TrustedRootPathBackend(directory, identity, true)
+      : new TrustedRootPathBackend(directory, identity, true, platform)
     const authorityBackend: NamespaceBackend = retained
       ? await RetainedDirectoryBackend.create(trustedRoot, trustedIdentity, false)
-      : new TrustedRootPathBackend(trustedRoot, trustedIdentity, false)
+      : new TrustedRootPathBackend(trustedRoot, trustedIdentity, false, platform)
     await this.testHooks.afterNamespaceAnchored?.()
     this.namespace = {
       backend, authorityBackend, marker,
@@ -492,6 +492,7 @@ class TrustedRootPathBackend implements NamespaceBackend {
     private readonly root: string,
     private readonly identity: { dev: number | bigint; ino: number | bigint },
     private readonly logicalNamespace: boolean,
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {}
   displayPath(name: string) { return join(this.root, name) }
   async verifyRoot() {
@@ -520,7 +521,7 @@ class TrustedRootPathBackend implements NamespaceBackend {
   async rename(from: string, to: string) { await this.verifyRoot(); await rename(this.displayPath(from), this.displayPath(to)) }
   async unlink(name: string) { await this.verifyRoot(); await unlink(this.displayPath(name)) }
   async rmdir(name: string) { await this.verifyRoot(); await rmdir(this.displayPath(name)) }
-  async syncDirectory(name = '.') { await this.verifyRoot(); await syncDirectory(this.displayPath(name)) }
+  async syncDirectory(name = '.') { await this.verifyRoot(); await syncDirectory(this.displayPath(name), this.platform) }
 }
 
 type NativeSymbols = ReturnType<typeof dlopen>
@@ -729,18 +730,40 @@ async function openNoFollowExclusive(backend: NamespaceBackend, name: string): P
   return handle
 }
 
-const UNSUPPORTED_DIRECTORY_SYNC = new Set(['EACCES', 'EBADF', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM'])
+export type OpenCodeDirectoryDurabilityErrorClassification = 'explicitly_unsupported' | 'durability_failure'
+
+export function classifyOpenCodeDirectoryDurabilityError(
+  platform: NodeJS.Platform,
+  code: string | undefined,
+): OpenCodeDirectoryDurabilityErrorClassification {
+  // Native Windows commonly reports EINVAL/ENOTSUP for directory fsync and
+  // EISDIR when its open primitive cannot produce a syncable directory handle.
+  // Access and permission failures are not capability signals: swallowing
+  // EACCES/EPERM would falsely report a durable namespace publication.
+  const explicitlyUnsupported = platform === 'win32'
+    ? new Set(['EINVAL', 'EISDIR', 'ENOTSUP'])
+    : new Set(['EINVAL', 'ENOTSUP'])
+  return code && explicitlyUnsupported.has(code)
+    ? 'explicitly_unsupported'
+    : 'durability_failure'
+}
+
 async function syncDirectory(
   directory: string,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<void> {
   let handle: Awaited<ReturnType<typeof open>>
   try { handle = await open(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0)) }
   catch (error) {
-    if (UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) return
+    if (classifyOpenCodeDirectoryDurabilityError(platform,
+      (error as NodeJS.ErrnoException).code) === 'explicitly_unsupported') return
     throw error
   }
   try { await handle.sync() }
-  catch (error) { if (!UNSUPPORTED_DIRECTORY_SYNC.has((error as NodeJS.ErrnoException).code ?? '')) throw error }
+  catch (error) {
+    if (classifyOpenCodeDirectoryDurabilityError(platform,
+      (error as NodeJS.ErrnoException).code) !== 'explicitly_unsupported') throw error
+  }
   finally { await handle.close().catch(() => undefined) }
 }
 
