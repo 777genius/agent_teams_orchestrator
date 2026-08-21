@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+case "$0" in
+  */*) LAUNCHER_DIR="${0%/*}" ;;
+  *) LAUNCHER_DIR="." ;;
+esac
+SCRIPT_DIR="$(CDPATH= cd -- "$LAUNCHER_DIR" && pwd)"
 TARGET="$SCRIPT_DIR/src/entrypoints/cli.tsx"
 
 augment_launcher_path() {
@@ -56,8 +60,37 @@ resolve_bun() {
   return 127
 }
 
+prepare_native_catalog() {
+  local cargo_bin=""
+  if [[ -n "${CARGO_HOME:-}" && -x "$CARGO_HOME/bin/cargo" ]]; then
+    cargo_bin="$CARGO_HOME/bin/cargo"
+  elif [[ -n "${HOME:-}" && -x "$HOME/.cargo/bin/cargo" ]]; then
+    cargo_bin="$HOME/.cargo/bin/cargo"
+  elif command -v cargo >/dev/null 2>&1; then
+    cargo_bin="$(command -v cargo)"
+  fi
+  if [[ -z "$cargo_bin" ]]; then
+    echo "Cargo was not found. Install Rust separately before preparing native catalog binaries." >&2
+    return 127
+  fi
+  local crate
+  for crate in opencode-catalog-authority opencode-catalog-launcher; do
+    "$cargo_bin" build --locked --offline --manifest-path "$SCRIPT_DIR/native/$crate/Cargo.toml"
+  done
+}
+
 augment_launcher_path
 normalize_source_node_env
+
+if [[ "${1-}" == "--prepare-native-catalog" ]]; then
+  if [[ "$#" -ne 1 ]]; then
+    echo "--prepare-native-catalog does not accept additional arguments." >&2
+    exit 2
+  fi
+  prepare_native_catalog
+  exit $?
+fi
+
 BUN_BIN="$(resolve_bun)" || exit $?
 
 if [[ "${1-}" == "runtime" && "${2-}" == "status" ]]; then

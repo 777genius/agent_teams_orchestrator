@@ -1,6 +1,6 @@
-import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
+import { afterAll, afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, copyFile, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -10,8 +10,17 @@ import { OpenCodeCatalogAuthorityClient, OpenCodeCatalogCommitUncertainError,
 import type { OpenCodeCatalogAuthorityIdentity } from './OpenCodeCatalogAuthorityProtocol.js'
 
 const roots: string[] = []
+const clients = new Set<OpenCodeCatalogAuthorityClient>()
 setDefaultTimeout(20_000)
-afterAll(async () => { for (const root of roots) await rm(root, { recursive: true, force: true }) })
+async function cleanupFixtures() {
+  const ownedClients = [...clients]; clients.clear()
+  await Promise.allSettled(ownedClients.map(authority => authority.close()))
+  const ownedRoots = roots.splice(0)
+  await Promise.all(ownedRoots.map(root => rm(root, { recursive: true, force: true })))
+  for (const root of ownedRoots) await expect(lstat(root)).rejects.toMatchObject({ code: 'ENOENT' })
+}
+afterEach(cleanupFixtures)
+afterAll(cleanupFixtures)
 
 function sha(value: string) { return createHash('sha256').update(value).digest('hex') }
 function identity(key = sha('key')): OpenCodeCatalogAuthorityIdentity {
@@ -27,8 +36,14 @@ function envelopeFor(generation: number, attemptIdentity: string,
 async function root() { const value = await mkdtemp(path.join(os.tmpdir(), 'catalog-authority-')); roots.push(value); return value }
 function client(cacheHome: string, timeout = 2_000, launch?: OpenCodeCatalogAuthorityLaunch) {
   const controller = new AbortController()
-  return new OpenCodeCatalogAuthorityClient({ cacheHome, deadline: performance.now() + timeout,
-    signal: controller.signal, launch })
+  const authority = new OpenCodeCatalogAuthorityClient({ cacheHome,
+    deadline: performance.now() + timeout, signal: controller.signal, launch })
+  clients.add(authority); return authority
+}
+async function withTemporaryAuthorityRoot<T>(work: (root: string) => Promise<T>): Promise<T> {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), 'catalog-authority-scoped-'))
+  try { return await work(temporary) }
+  finally { await rm(temporary, { recursive: true, force: true }) }
 }
 function faultLaunch(fault: string): OpenCodeCatalogAuthorityLaunch {
   return input => Bun.spawn({ cmd: [input.launcherPath, input.workerPath, input.cacheHome],
@@ -94,6 +109,17 @@ async function seedExternalLegacy(cache: string, exact: OpenCodeCatalogAuthority
 }
 
 describe.serial('native v44307 catalog authority', () => {
+  test.each(['failure', 'timeout'])('scoped fixture cleanup survives injected %s', async mode => {
+    let fixture = ''
+    const operation = withTemporaryAuthorityRoot(async temporary => {
+      fixture = temporary; await writeFile(path.join(temporary, 'owned'), 'fixture')
+      if (mode === 'failure') throw new Error('injected assertion failure')
+      await new Promise((_, reject) => setTimeout(() => reject(new Error('injected timeout')), 5))
+    })
+    await expect(operation).rejects.toThrow(mode)
+    await expect(lstat(fixture)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   test('a canceled intervening attempt permanently fences an older exact-key candidate', async () => {
     const cache = await root(); const x = identity(sha('x')); const y = identity(sha('y'))
     const a = client(cache); const ar = await a.beginAttempt(1, sha('scope-a')); await a.bindAndRead(ar.generation, ar.attemptIdentity, x)
@@ -151,6 +177,7 @@ describe.serial('native v44307 catalog authority', () => {
     const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
       deadline: performance.now() + 2_000, signal: controller.signal,
       launch: faultLaunch('stall:finalize-after-commit-before-reply') })
+    clients.add(authority)
     const begun = await authority.beginAttempt(1, sha('post-commit-abort-scope'))
     await authority.bindAndRead(begun.generation, begun.attemptIdentity, exact)
     const durable = envelopeFor(begun.generation, begun.attemptIdentity, exact, { durable: 'abort' })
@@ -242,6 +269,7 @@ describe.serial('native v44307 catalog authority', () => {
     const controller = new AbortController()
     const authority = new OpenCodeCatalogAuthorityClient({ cacheHome: cache,
       deadline: performance.now() + 2_000, signal: controller.signal, launch, launcherPath, workerPath })
+    clients.add(authority)
     while (!await Bun.file(`${gate}.entered`).exists()) await new Promise(resolve => setImmediate(resolve))
     await rename(workerPath, `${workerPath}.held`)
     await writeFile(workerPath, '#!/bin/sh\nexit 97\n'); await chmod(workerPath, 0o755)

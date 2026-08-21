@@ -2122,6 +2122,37 @@ fn sha256_hex(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    struct FixtureRoot {
+        path: std::path::PathBuf,
+        previous_directory: std::path::PathBuf,
+    }
+
+    impl FixtureRoot {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "catalog-authority-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            Self {
+                path,
+                previous_directory: std::env::current_dir().unwrap(),
+            }
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous_directory);
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn protocol_reader_rejects_oversize_before_unbounded_allocation() {
         let mut valid = std::io::Cursor::new(b"abc\nrest".as_slice());
@@ -2155,14 +2186,21 @@ mod tests {
     }
 
     #[test]
+    fn fixture_root_guard_cleans_after_injected_failure() {
+        let mut fixture_path = std::path::PathBuf::new();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture = FixtureRoot::new("guard-failure");
+            fixture_path = fixture.path.clone();
+            panic!("injected fixture failure");
+        }));
+        assert!(failed.is_err());
+        assert!(!fixture_path.exists());
+    }
+
+    #[test]
     fn retention_caps_catalog_admissions_and_audit_with_anchor() {
-        let root = std::env::temp_dir().join(format!(
-            "catalog-authority-retention-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
-        enter_root(root.to_str().unwrap()).unwrap();
+        let fixture = FixtureRoot::new("retention");
+        enter_root(fixture.path.to_str().unwrap()).unwrap();
         let db = open_db().unwrap();
         schema(&db).unwrap();
         assert_eq!(posix_vfs::retained_handle_count(), 2);

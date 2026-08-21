@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { constants, type BigIntStats, type Dirent } from 'node:fs'
-import { lstat, open, opendir, rename, rm } from 'node:fs/promises'
+import { lstat, open, readFile, readdir, rename, rm } from 'node:fs/promises'
 import path from 'node:path'
 
 export const OPENCODE_CATALOG_PROFILE_MANIFEST = '.catalog-attempt.json'
 const MAX_SCAN = 128
 const MAX_TRASH = 32
 const MAX_MANIFEST = 16 * 1024
+const CURSOR_NAME = '.catalog-janitor-cursor-v1'
 
 export type OpenCodeCatalogProfileCleanupReceipt = Readonly<{
   schema: 'opencode-catalog-profile-cleanup-v1'
@@ -28,7 +29,55 @@ type Manifest = Readonly<{
 }>
 
 const DEFAULT_LEASE_MS = 120_000
-const PROCESS_BIRTH_ID = randomUUID()
+const UNKNOWN_PROCESS_BIRTH_ID = `unknown:${randomUUID()}`
+
+type ProcessObservation = Readonly<{
+  state: 'live' | 'dead' | 'unknown'
+  birthId?: string
+}>
+
+type JanitorTestHooks = Readonly<{
+  observeProcess?: (pid: number) => Promise<ProcessObservation>
+  beforeProfileRevalidation?: (profileRootPath: string) => Promise<void>
+}>
+
+function parseLinuxProcessBirth(stat: string): string | null {
+  // comm is parenthesized and may itself contain spaces or parentheses. The
+  // final ')' is followed by field 3; starttime is field 22 (index 19 here).
+  const end = stat.lastIndexOf(')')
+  if (end < 0) return null
+  const fields = stat.slice(end + 1).trim().split(/\s+/)
+  const start = fields[19]
+  return start && /^[0-9]+$/.test(start) ? `linux-procfs:${start}` : null
+}
+
+async function observeProcess(pid: number): Promise<ProcessObservation> {
+  if (process.platform !== 'linux') return { state: 'unknown' }
+  try {
+    const birthId = parseLinuxProcessBirth(await readFile(`/proc/${pid}/stat`, 'utf8'))
+    return birthId ? { state: 'live', birthId } : { state: 'unknown' }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { state: 'dead' }
+      : { state: 'unknown' }
+  }
+}
+
+async function currentProcessBirthId(): Promise<string> {
+  const observed = await observeProcess(process.pid)
+  return observed.state === 'live' && observed.birthId
+    ? observed.birthId
+    : UNKNOWN_PROCESS_BIRTH_ID
+}
+
+function processIsNotProvenDead(manifest: Manifest, owner: ProcessObservation): boolean {
+  if (owner.state === 'unknown') return true
+  if (owner.state === 'dead') return false
+  // Random identities from older manifests and explicit unknown identities do
+  // not become evidence of PID reuse merely because a live PID differs.
+  return !manifest.processBirthId.startsWith('linux-procfs:')
+    || owner.birthId === manifest.processBirthId
+}
 
 function validManifest(value: unknown, root: string): value is Manifest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -46,7 +95,8 @@ function validManifest(value: unknown, root: string): value is Manifest {
     && typeof parsed.ownerPid === 'number' && Number.isSafeInteger(parsed.ownerPid)
     && parsed.ownerPid > 0
     && typeof parsed.processBirthId === 'string'
-    && /^[0-9a-f-]{16,64}$/i.test(parsed.processBirthId)
+    && parsed.processBirthId.length >= 8 && parsed.processBirthId.length <= 128
+    && /^(?:[a-z0-9][a-z0-9-]*:)?[a-z0-9-]+$/i.test(parsed.processBirthId)
     && (parsed.state === 'preparing' || parsed.state === 'ready' || parsed.state === 'closed')
     && typeof parsed.runtimeInstanceId === 'string'
     && parsed.runtimeInstanceId.length > 0 && parsed.runtimeInstanceId.length <= 256
@@ -81,7 +131,9 @@ export async function writeOpenCodeCatalogProfileManifest(input: Readonly<{
     heartbeatAt, leaseExpiresAt: input.leaseExpiresAt ?? heartbeatAt + DEFAULT_LEASE_MS,
     leaseId: existing?.leaseId ?? randomUUID(),
     ownerPid: existing?.ownerPid ?? input.ownerPid ?? process.pid,
-    processBirthId: existing?.processBirthId ?? input.processBirthId ?? PROCESS_BIRTH_ID,
+    processBirthId: existing?.processBirthId ?? input.processBirthId
+      ?? ((input.ownerPid ?? process.pid) === process.pid
+        ? await currentProcessBirthId() : UNKNOWN_PROCESS_BIRTH_ID),
     state: input.state ?? existing?.state ?? 'ready', runtimeInstanceId: input.runtimeInstanceId,
     profileRootKey: input.profileRootKey }
   if (!path.isAbsolute(input.profileRootPath) || !validManifest(manifest, input.profileRootPath)
@@ -139,6 +191,24 @@ function generationOf(manifest: Manifest): number | null {
 
 export async function cleanupOpenCodeCatalogProfile(profileRootPath: string,
   attemptOwnedProfileRootKey?: string): Promise<OpenCodeCatalogProfileCleanupReceipt> {
+  return cleanupProfile(profileRootPath, attemptOwnedProfileRootKey)
+}
+
+function sameDeletionLease(left: Manifest, right: Manifest): boolean {
+  return left.leaseId === right.leaseId
+    && left.heartbeatAt === right.heartbeatAt
+    && left.leaseExpiresAt === right.leaseExpiresAt
+    && left.state === right.state
+    && left.ownerPid === right.ownerPid
+    && left.processBirthId === right.processBirthId
+    && left.runtimeInstanceId === right.runtimeInstanceId
+}
+
+async function cleanupProfile(profileRootPath: string,
+  attemptOwnedProfileRootKey?: string,
+  expectedManifest?: Manifest,
+  observe: (pid: number) => Promise<ProcessObservation> = observeProcess,
+): Promise<OpenCodeCatalogProfileCleanupReceipt> {
   const parent = path.dirname(profileRootPath)
   const manifest = await readAttemptManifest(profileRootPath, parent)
   if (!manifest && (!attemptOwnedProfileRootKey
@@ -146,9 +216,35 @@ export async function cleanupOpenCodeCatalogProfile(profileRootPath: string,
     || !attemptOwnedProfileRootKey.includes('-catalog-'))) {
     return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'rejected' }
   }
+  if (expectedManifest) {
+    if (!manifest || !sameDeletionLease(expectedManifest, manifest)) {
+      return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'rejected' }
+    }
+    if (manifest.state !== 'closed') {
+      if (Date.now() < manifest.leaseExpiresAt) {
+        return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'rejected' }
+      }
+      const owner = await observe(manifest.ownerPid)
+      // A live matching birth identity is the same process. A live mismatched
+      // identity proves PID reuse. Permission failures, unsupported platforms,
+      // and unparsable OS data are unknown and can never authorize deletion.
+      if (processIsNotProvenDead(manifest, owner)) {
+        return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'rejected' }
+      }
+    }
+  }
   let before: BigIntStats
   try { before = await lstat(profileRootPath, { bigint: true }) } catch {
     return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'absent' }
+  }
+  if (expectedManifest) {
+    // This is the final asynchronous operation before rename. A heartbeat that
+    // renewed any lease field after the scan invalidates the deletion snapshot.
+    const finalManifest = await readAttemptManifest(profileRootPath, parent)
+    if (!finalManifest || !sameDeletionLease(expectedManifest, finalManifest)
+      || (finalManifest.state !== 'closed' && Date.now() < finalManifest.leaseExpiresAt)) {
+      return { schema: 'opencode-catalog-profile-cleanup-v1', profileRootPath, disposition: 'rejected' }
+    }
   }
   const trash = path.join(parent, `.catalog-trash-${randomUUID()}`)
   try {
@@ -172,22 +268,67 @@ export async function cleanupOpenCodeCatalogProfile(profileRootPath: string,
   }
 }
 
+type Cursor = Readonly<{ schema: 'opencode-catalog-janitor-cursor-v1'; after: string }>
+
+async function readCursor(root: string): Promise<string | null> {
+  try {
+    const cursorPath = path.join(root, CURSOR_NAME)
+    const named = await lstat(cursorPath, { bigint: true })
+    if (!named.isFile() || named.isSymbolicLink() || named.size > 1024n) return null
+    const handle = await open(cursorPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    try {
+      const held = await handle.stat({ bigint: true })
+      if (!held.isFile() || held.dev !== named.dev || held.ino !== named.ino || held.size > 1024n) return null
+      const parsed = JSON.parse(await handle.readFile('utf8')) as Partial<Cursor>
+      return parsed.schema === 'opencode-catalog-janitor-cursor-v1'
+        && typeof parsed.after === 'string' && parsed.after.length <= 512 ? parsed.after : null
+    } finally { await handle.close() }
+  } catch { return null }
+}
+
+async function writeCursor(root: string, after: string): Promise<void> {
+  const cursorPath = path.join(root, CURSOR_NAME)
+  const temporary = path.join(root, `.catalog-janitor-cursor-${randomUUID()}.tmp`)
+  try {
+    const handle = await open(temporary, 'wx', 0o600)
+    try {
+      const cursor: Cursor = { schema: 'opencode-catalog-janitor-cursor-v1', after }
+      await handle.writeFile(`${JSON.stringify(cursor)}\n`); await handle.sync()
+    } finally { await handle.close() }
+    await rename(temporary, cursorPath)
+    if (process.platform !== 'win32') {
+      const directory = await open(root, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0))
+      try { await directory.sync() } finally { await directory.close() }
+    }
+  } catch { await rm(temporary, { force: true }).catch(() => undefined) }
+}
+
+async function boundedFairEntries(root: string): Promise<Dirent[]> {
+  let all: Dirent[]
+  try { all = await readdir(root, { withFileTypes: true }) } catch { return [] }
+  all = all.filter(entry => entry.name !== CURSOR_NAME
+    && !entry.name.startsWith('.catalog-janitor-cursor-'))
+    .sort((left, right) => left.name.localeCompare(right.name))
+  if (all.length === 0) return []
+  const cursor = await readCursor(root)
+  const after = cursor === null ? 0 : all.findIndex(entry => entry.name > cursor)
+  const start = after < 0 ? 0 : after
+  const entries = Array.from({ length: Math.min(MAX_SCAN, all.length) },
+    (_, offset) => all[(start + offset) % all.length]!)
+  await writeCursor(root, entries.at(-1)!.name)
+  return entries
+}
+
 /** Bounded restart janitor. A generation is ordering evidence only, never a deletion lease. */
 export async function janitorOpenCodeCatalogProfiles(
   scopedProfilesRoot: string,
   protectedGeneration?: number,
+  testHooks: JanitorTestHooks = {},
 ): Promise<number> {
   if (!path.isAbsolute(scopedProfilesRoot)
     || (protectedGeneration !== undefined
       && (!Number.isSafeInteger(protectedGeneration) || protectedGeneration < 1))) return 0
-  const entries: Dirent[] = []
-  try {
-    const directory = await opendir(scopedProfilesRoot)
-    for await (const entry of directory) {
-      entries.push(entry)
-      if (entries.length >= MAX_SCAN) break
-    }
-  } catch { return 0 }
+  const entries = await boundedFairEntries(scopedProfilesRoot)
 
   const trash: Array<{ name: string; createdAt: number }> = []
   for (const entry of entries) {
@@ -254,10 +395,16 @@ export async function janitorOpenCodeCatalogProfiles(
     // closed state or an expired bounded lease authorizes restart cleanup.
     if (profile.manifest.state !== 'closed'
       && Date.now() < profile.manifest.leaseExpiresAt) continue
-    if (profile.manifest.state !== 'closed'
-      && profile.manifest.ownerPid === process.pid
-      && profile.manifest.processBirthId === PROCESS_BIRTH_ID) continue
-    const receipt = await cleanupOpenCodeCatalogProfile(profile.path)
+    const observe = testHooks.observeProcess ?? observeProcess
+    if (profile.manifest.state !== 'closed') {
+      const owner = await observe(profile.manifest.ownerPid)
+      if (processIsNotProvenDead(profile.manifest, owner)) continue
+    }
+    await testHooks.beforeProfileRevalidation?.(profile.path)
+    // cleanupProfile rereads the manifest, compares every renewable lease
+    // field, rechecks process identity, and performs no await between its final
+    // lstat and the atomic rename.
+    const receipt = await cleanupProfile(profile.path, undefined, profile.manifest, observe)
     if (receipt.disposition === 'removed') removed += 1
   }
   return removed
