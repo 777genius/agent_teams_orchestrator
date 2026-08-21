@@ -1,4 +1,5 @@
 import type {
+  ClearProjectDefaultModelInput,
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
   ConfigureProviderModelLimitsInput,
@@ -54,6 +55,9 @@ export interface ProviderManagementCommandPort {
   ): Promise<ProviderManagementResult<ProviderConnection>>
   setDefaultModel(
     input: SetDefaultModelInput,
+  ): Promise<ProviderManagementResult<ProviderManagementView>>
+  clearProjectDefaultModel(
+    input: ClearProjectDefaultModelInput,
   ): Promise<ProviderManagementResult<ProviderManagementView>>
   testModel(
     input: TestProviderModelInput,

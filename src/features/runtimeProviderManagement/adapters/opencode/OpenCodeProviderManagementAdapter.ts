@@ -58,6 +58,7 @@ import { OpenCodeRuntimeDeadline } from '../../../../services/opencode/OpenCodeR
 import {
   OPEN_CODE_MANAGED_MODEL_LIMIT_MAX_TOKENS,
   readOpenCodeGlobalManagedRuntimePreferences,
+  clearOpenCodeManagedDefaultModel,
   readOpenCodeManagedRuntimePreferences,
   setOpenCodeManagedDefaultModel,
   setOpenCodeManagedGlobalDefaultModel,
@@ -84,6 +85,7 @@ import type {
 } from '../../../../services/opencode/types.js'
 import { isRecommendedProvider, sortProviderConnections } from '../../domain/providerOrdering.js'
 import type {
+  ClearProjectDefaultModelInput,
   ConnectProviderApiKeyInput,
   ConnectProviderInput,
   ConfigureProviderModelLimitsInput,
@@ -227,6 +229,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   managedPreferences?: {
     read?(profileRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
     readGlobal?(dataRootPath: string): Promise<OpenCodeManagedRuntimePreferences>
+    clearProjectDefaultModel?(profileRootPath: string): Promise<unknown>
     setDefaultModel(profileRootPath: string, modelId: string): Promise<unknown>
     setAllProjectsDefaultModel?(modelId: string): Promise<unknown>
     setModelLimits?(
@@ -805,6 +808,31 @@ function applyManagedDefaultToInventory(
         ...profile.managedConfig,
         ...(effectiveManagedDefaultModelId ? { model: effectiveManagedDefaultModelId } : {}),
       },
+    },
+  }
+}
+
+function applyClearedProjectDefaultToInventory(
+  inventory: OpenCodeInventorySnapshot,
+): OpenCodeInventorySnapshot {
+  const profile = inventory.profile
+  if (!profile) {
+    return inventory
+  }
+  const effectiveManagedDefaultModelId = profile.allProjectsDefaultModelId ?? null
+  const effectiveDefaultModelId =
+    effectiveManagedDefaultModelId ?? profile.importedConfigDefaultModelId ?? null
+  const { model: _projectDefaultModel, ...managedConfigWithoutModel } = profile.managedConfig
+  return {
+    ...inventory,
+    profile: {
+      ...profile,
+      projectDefaultModelId: null,
+      effectiveManagedDefaultModelId,
+      effectiveManagedDefaultSource: effectiveManagedDefaultModelId ? 'all_projects' : null,
+      managedConfig: effectiveDefaultModelId
+        ? { ...managedConfigWithoutModel, model: effectiveDefaultModelId }
+        : managedConfigWithoutModel,
     },
   }
 }
@@ -3126,10 +3154,13 @@ export class OpenCodeProviderManagementAdapter
           ...configured,
           read: configured.read ?? readOpenCodeManagedRuntimePreferences,
           readGlobal: configured.readGlobal ?? readOpenCodeGlobalManagedRuntimePreferences,
+          clearProjectDefaultModel:
+            configured.clearProjectDefaultModel ?? clearOpenCodeManagedDefaultModel,
         }
       : {
         read: readOpenCodeManagedRuntimePreferences,
         readGlobal: readOpenCodeGlobalManagedRuntimePreferences,
+        clearProjectDefaultModel: clearOpenCodeManagedDefaultModel,
         setDefaultModel: setOpenCodeManagedDefaultModel,
         setModelLimits: setOpenCodeManagedModelLimits,
         setAllProjectsDefaultModel: (modelId: string) =>
@@ -4999,6 +5030,60 @@ export class OpenCodeProviderManagementAdapter
         }
       },
       { failureCode: 'model-test-failed', inventoryMode: 'profile' },
+    )
+  }
+
+  async clearProjectDefaultModel(
+    input: ClearProjectDefaultModelInput,
+  ): Promise<ProviderManagementResult<ProviderManagementView>> {
+    const projectPath = input.projectPath?.trim()
+    if (!projectPath) {
+      return providerManagementError(
+        'unsupported-action',
+        'A project path is required to clear its OpenCode default model',
+      )
+    }
+    return this.withManagedOpenCodeClient(
+      input.runtimeId,
+      projectPath,
+      async ({ inventory, inventoryService, host, client }) => {
+        const profile = inventory.profile
+        if (!profile) {
+          return providerManagementError(
+            'runtime-unhealthy',
+            'OpenCode managed profile is unavailable',
+          )
+        }
+
+        await this.getManagedPreferences().clearProjectDefaultModel(profile.profileRootPath)
+        this.invalidateDirectoryCache()
+        inventoryService.clearCache?.()
+
+        const refreshedInventory = await this.probeInventory(
+          inventoryService,
+          inventory.projectPath,
+          {
+            bypassCache: true,
+            mode: 'summary',
+          },
+        )
+        const refresh = useActionRefreshInventory(
+          inventory,
+          refreshedInventory,
+          applyClearedProjectDefaultToInventory,
+        )
+        const view = await readLiveView({
+          inventory: refresh.inventory,
+          host,
+          client,
+          diagnostics: refresh.inventory.diagnostics,
+        })
+        return {
+          ok: true,
+          value: appendViewDiagnostics(view, refresh.postViewDiagnostics),
+        }
+      },
+      { failureCode: 'runtime-unhealthy', inventoryMode: 'summary' },
     )
   }
 

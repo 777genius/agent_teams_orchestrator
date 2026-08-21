@@ -4413,6 +4413,17 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersSetDefault(opts);
   });
+  runtimeProviders.command('clear-project-default').description('Clear the project OpenCode default and inherit the next available default').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    projectPath: string;
+    compact?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersClearProjectDefault
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersClearProjectDefault(opts);
+  });
   runtimeProviders.command('configure-model-limits').description('Save and verify app-managed context limits for a configured local OpenCode model').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').requiredOption('--context-tokens <count>', 'Model context window', Number).requiredOption('--output-tokens <count>', 'Maximum model output', Number).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';
     provider: string;

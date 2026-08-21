@@ -383,6 +383,10 @@ export type SetDefaultModelInput = {
   scope?: RuntimeProviderDefaultScope
 } & ProjectScopedProviderManagementInput
 
+export type ClearProjectDefaultModelInput = {
+  runtimeId: ProviderManagementRuntimeId
+} & ProjectScopedProviderManagementInput
+
 export type TestProviderModelInput = {
   runtimeId: ProviderManagementRuntimeId
   providerId: string
