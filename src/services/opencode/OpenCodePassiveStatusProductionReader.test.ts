@@ -327,6 +327,66 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
     expect(new Set(seenScopes).size).toBe(2)
   })
 
+  test('keeps Windows missing project identity canonical across an alias and later creation', async () => {
+    const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' })
+    let created = false
+    const filesystem = {
+      realpath: async (value: string) => {
+        const normalized = path.win32.normalize(value).toLowerCase()
+        if (normalized === 'c:\\alias') return 'D:\\Real'
+        if (normalized === 'd:\\real') return 'D:\\Real'
+        if (created && (normalized === 'c:\\alias\\new-project'
+          || normalized === 'd:\\real\\new-project')) return 'D:\\Real\\New-Project'
+        throw missing()
+      },
+      lstat: async (value: string) => {
+        const normalized = path.win32.normalize(value).toLowerCase()
+        if (created && (normalized === 'c:\\alias\\new-project'
+          || normalized === 'd:\\real\\new-project')) return {}
+        throw missing()
+      },
+    }
+    const options = { platform: 'win32' as const, filesystem }
+    const signal = new AbortController().signal
+
+    const aliasBefore = await canonicalizeOpenCodePassiveProjectPath(
+      'C:\\Alias\\New-Project', signal, options,
+    )
+    const realBefore = await canonicalizeOpenCodePassiveProjectPath(
+      'D:\\Real\\New-Project', signal, options,
+    )
+    created = true
+    const aliasAfter = await canonicalizeOpenCodePassiveProjectPath(
+      'C:\\Alias\\New-Project', signal, options,
+    )
+
+    expect(aliasBefore).toBe('d:\\real\\new-project')
+    expect(realBefore).toBe(aliasBefore)
+    expect(aliasAfter).toBe(aliasBefore)
+  })
+
+  test('fails closed when a Windows alias ancestor changes during missing-path verification', async () => {
+    const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' })
+    let aliasReads = 0
+    await expect(canonicalizeOpenCodePassiveProjectPath(
+      'C:\\Alias\\Missing',
+      new AbortController().signal,
+      {
+        platform: 'win32',
+        filesystem: {
+          realpath: async value => {
+            const normalized = path.win32.normalize(value).toLowerCase()
+            if (normalized === 'c:\\alias') {
+              return ++aliasReads === 1 ? 'D:\\First' : 'D:\\Second'
+            }
+            throw missing()
+          },
+          lstat: async () => { throw missing() },
+        },
+      },
+    )).rejects.toMatchObject({ code: 'EAGAIN' })
+  })
+
   test('one deadline cancels hanging reads and fences a late producer callback', async () => {
     const clock = new FakePassiveClock(1_000)
     let release!: (value: string | null) => void

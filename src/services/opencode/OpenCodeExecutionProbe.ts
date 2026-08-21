@@ -379,6 +379,12 @@ export function classifyProbeFailure(params: {
   }
 }
 
+function isCursorAuxiliaryRecoveryEligible(
+  classified: ReturnType<typeof classifyProbeFailure>,
+): boolean {
+  return classified.outcome === 'unknown' && classified.failureCode == null
+}
+
 function getObservedAssistantModel(
   summary: OpenCodeSessionReconcileSummary,
 ): { providerId: string | null; modelId: string | null; scopedModelId: string | null } {
@@ -1810,7 +1816,8 @@ export class OpenCodeExecutionProbe {
                   || summary.latestAssistantPreview?.trim()
                   || null
                 if (!responseText) return null
-                return classifyProbeFailure({ message: responseText }).outcome === 'unknown'
+                const classified = classifyProbeFailure({ message: responseText })
+                return isCursorAuxiliaryRecoveryEligible(classified)
                   ? summary
                   : null
               })

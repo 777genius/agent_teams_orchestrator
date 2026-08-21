@@ -1247,6 +1247,87 @@ describe('OpenCodeExecutionProbe', () => {
     expect(nativeProbeCalls).toBe(2)
   })
 
+  test('does not let auxiliary Cursor failure recovery authorize ambiguous auth-like prose', async () => {
+    let statusCalls = 0
+    let nativeProbeCalls = 0
+    let resolveNativeFailure!: (failure: {
+      outcome: 'failure'
+      message: string
+      durationMs: number
+      exitCode: number
+    }) => void
+    const nativeFailure = new Promise<{
+      outcome: 'failure'
+      message: string
+      durationMs: number
+      exitCode: number
+    }>(resolve => { resolveNativeFailure = resolve })
+    const probe = new OpenCodeExecutionProbe({
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => {
+            statusCalls += 1
+            if (statusCalls === 1) return { 'session-1': 'retry' as const }
+            if (statusCalls === 2) {
+              resolveNativeFailure({
+                outcome: 'failure',
+                message: 'grpc_code=resource_exhausted error_code=upgrade',
+                durationMs: 12,
+                exitCode: 1,
+              })
+              return await new Promise<Record<string, OpenCodeSessionStatusInput>>(() => {})
+            }
+            return { 'session-1': 'idle' as const }
+          },
+          getSessionMessages: async () => [{
+            info: {
+              id: 'msg-assistant-auth-like',
+              role: 'assistant',
+              providerID: 'cursor-acp',
+              modelID: 'auto',
+              sessionID: 'session-1',
+              time: { created: 101, completed: 110 },
+            },
+            parts: [{ type: 'text', text: 'Invalid API key.' }],
+          }],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+      cursorNativeFailureProbe: {
+        probe: async () => ++nativeProbeCalls === 1 ? null : nativeFailure,
+      },
+      sleep: async () => {},
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'cursor-acp/auto',
+      projectPath: '/tmp/project',
+      bypassCache: true,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      failureCode: 'uncertain_provider_rejection',
+    })
+    expect(result.verifiedAt).toBeUndefined()
+    expect(result.diagnostics.join('\n')).not.toContain('original probe recovered')
+  })
+
   test('uses a nested terminal OpenCode retry error without a second Cursor request', async () => {
     let nativeProbeCalls = 0
     let messageCalls = 0

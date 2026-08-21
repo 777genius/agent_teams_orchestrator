@@ -498,32 +498,53 @@ function snapshotPath(rootDirectory: string, scope: `sha256:${string}`): string 
   return path.join(rootDirectory, 'snapshots', `${scope.slice('sha256:'.length)}.json`)
 }
 
-export async function canonicalizeOpenCodePassiveProjectPath(projectPath: string, signal: AbortSignal): Promise<string> {
+type PassiveProjectPathFilesystem = Readonly<{
+  realpath: (projectPath: string) => Promise<string>
+  lstat: (projectPath: string) => Promise<unknown>
+}>
+
+type PassiveProjectPathCanonicalizationOptions = Readonly<{
+  platform?: NodeJS.Platform
+  filesystem?: PassiveProjectPathFilesystem
+}>
+
+export async function canonicalizeOpenCodePassiveProjectPath(
+  projectPath: string,
+  signal: AbortSignal,
+  options: PassiveProjectPathCanonicalizationOptions = {},
+): Promise<string> {
   if (signal.aborted) throw new Error('cancelled')
+  const platform = options.platform ?? process.platform
+  const filesystem = options.filesystem ?? { realpath, lstat }
   const windowsPath = /^[a-zA-Z]:[\\/]/.test(projectPath) || projectPath.startsWith('\\\\')
   if (windowsPath) {
     const absolute = path.win32.resolve(projectPath)
-    if (process.platform !== 'win32') {
+    if (platform !== 'win32') {
       throw Object.assign(new Error('Windows project paths require Windows canonicalization'), { code: 'EINVAL' })
     }
     try {
-      const resolved = await realpath(absolute)
+      const resolved = await filesystem.realpath(absolute)
       if (signal.aborted) throw cancelledError()
       return normalizeWindowsProjectPath(resolved)
     } catch (error) {
       if (!isMissingFile(error)) throw error
-      await verifyStableMissingPath(absolute, signal, path.win32)
-      return normalizeWindowsProjectPath(absolute)
+      const verified = await verifyStableMissingPath(
+        absolute,
+        signal,
+        path.win32,
+        filesystem,
+      )
+      return normalizeWindowsProjectPath(verified)
     }
   }
   const absolute = path.resolve(projectPath)
   try {
-    const resolved = await realpath(absolute)
+    const resolved = await filesystem.realpath(absolute)
     if (signal.aborted) throw cancelledError()
     return resolved
   } catch (error) {
     if (!isMissingFile(error)) throw error
-    return verifyStableMissingPath(absolute, signal, path)
+    return verifyStableMissingPath(absolute, signal, path, filesystem)
   }
 }
 
@@ -531,10 +552,11 @@ async function verifyStableMissingPath(
   absolute: string,
   signal: AbortSignal,
   pathApi: typeof path | typeof path.win32,
+  filesystem: PassiveProjectPathFilesystem,
 ): Promise<string> {
   if (signal.aborted) throw cancelledError()
   try {
-    await lstat(absolute)
+    await filesystem.lstat(absolute)
     throw Object.assign(new Error('Project path changed while canonicalizing'), { code: 'EAGAIN' })
   } catch (error) {
     if (!isMissingFile(error)) throw error
@@ -549,14 +571,22 @@ async function verifyStableMissingPath(
     missingParts.unshift(pathApi.basename(cursor))
     cursor = parent
     try {
-      canonicalAncestor = await realpath(cursor)
+      canonicalAncestor = await filesystem.realpath(cursor)
     } catch (error) {
       if (!isMissingFile(error)) throw error
     }
   }
   if (signal.aborted) throw cancelledError()
+  const verifiedAncestor = await filesystem.realpath(cursor)
+  const normalizeIdentity = pathApi === path.win32
+    ? normalizeWindowsProjectPath
+    : pathApi.normalize
+  if (normalizeIdentity(verifiedAncestor) !== normalizeIdentity(canonicalAncestor)) {
+    throw Object.assign(new Error('Project ancestor changed while canonicalizing'), { code: 'EAGAIN' })
+  }
+  if (signal.aborted) throw cancelledError()
   try {
-    await lstat(absolute)
+    await filesystem.lstat(absolute)
     throw Object.assign(new Error('Project path changed while canonicalizing'), { code: 'EAGAIN' })
   } catch (error) {
     if (!isMissingFile(error)) throw error
