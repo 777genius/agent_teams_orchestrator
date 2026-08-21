@@ -178,9 +178,14 @@ function executionProbeResult(
   outcome: 'available' | 'unavailable' | 'not_authenticated' | 'unknown' = 'available',
   reason: string | null = null,
 ): OpenCodeExecutionProbeResult {
+  const separator = modelId.indexOf('/')
+  const observedProviderId = separator > 0 ? modelId.slice(0, separator) : null
+  const observedModelId = separator > 0 ? modelId.slice(separator + 1) : null
   return {
     providerId: 'opencode',
     modelId,
+    observedProviderId,
+    observedModelId,
     probePrompt: 'Output only the single word PONG.',
     expectedOutput: 'PONG',
     outcome,
@@ -193,6 +198,9 @@ function executionProbeResult(
     toolCallCount: 0,
     errorCount: outcome === 'available' ? 0 : 1,
     diagnostics: reason ? [reason] : [],
+    ...(outcome === 'not_authenticated'
+      ? { failureCode: 'definitive_auth_rejected' as const }
+      : {}),
   }
 }
 
@@ -206,6 +214,8 @@ function activeModelActionAdapter(input: {
   connected?: boolean
   configured?: boolean
   providerId?: string
+  setDefaultModel?: () => Promise<void>
+  setModelLimits?: () => Promise<void>
 }) {
   const providerId = input.providerId ?? 'local'
   const modelId = `${providerId}/qwen`
@@ -249,8 +259,8 @@ function activeModelActionAdapter(input: {
     managedPreferences: {
       resolveProjectRoot: () => '/tmp/profile',
       canonicalizeProjectIdentity: async projectPath => projectPath,
-      setDefaultModel: async () => {},
-      setModelLimits: async () => {},
+      setDefaultModel: input.setDefaultModel ?? (async () => {}),
+      setModelLimits: input.setModelLimits ?? (async () => {}),
     },
     activeStatusPublisher: {
       publishInventory: async () => {},
@@ -334,41 +344,119 @@ describe('OpenCodeProviderManagementAdapter', () => {
       projectPath: '/tmp/action-project', providerId: 'local', executionVerified: false,
     }])
 
+    probeResult = executionProbeResult('local/qwen', 'not_authenticated', 'HTTP 403 Forbidden')
+    delete probeResult.failureCode
+    const genericForbidden = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
+    expect(genericForbidden.ok).toBe(true)
+    if (genericForbidden.ok) {
+      expect(genericForbidden.value.availability).toBe('unknown')
+    }
+
     for (const uncertain of [
       { outcome: 'unavailable' as const, reason: 'rate limited', failureCode: undefined },
       { outcome: 'unknown' as const, reason: 'malformed response', failureCode: undefined },
       { outcome: 'unavailable' as const, reason: 'transport failed', failureCode: 'provider_endpoint_unreachable' as const },
       { outcome: 'unknown' as const, reason: 'probe timed out', failureCode: 'execution_timeout' as const },
     ]) {
-      probeResult = {
-        ...executionProbeResult('local/qwen', uncertain.outcome, uncertain.reason),
-        ...(uncertain.failureCode ? { failureCode: uncertain.failureCode } : {}),
-      }
+      const uncertainProbe = executionProbeResult(
+        'local/qwen', uncertain.outcome, uncertain.reason,
+      )
+      if (!uncertain.failureCode) delete uncertainProbe.failureCode
+      probeResult = uncertain.failureCode
+        ? { ...uncertainProbe, failureCode: uncertain.failureCode }
+        : uncertainProbe
       await adapter.testModel({
         runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
       })
     }
+
+    probeResult = {
+      ...executionProbeResult('local/qwen', 'not_authenticated', 'Invalid API key.'),
+      observedProviderId: 'fallback-provider',
+    }
+    await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
     expect(updates).toHaveLength(1)
   })
 
   test('does not publish success when probe evidence names a different model or provider', async () => {
     const updates: unknown[] = []
-    let observedModel = 'local/other'
+    let observedProviderId: string | null = 'local'
+    let observedModelId: string | null = 'other'
     const adapter = activeModelActionAdapter({
-      probe: () => executionProbeResult(observedModel),
+      probe: () => ({
+        ...executionProbeResult('local/qwen'),
+        observedProviderId,
+        observedModelId,
+      }),
       publishExecutionUpdate: async update => { updates.push(update) },
     })
 
     const wrongModel = await adapter.testModel({
       runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
     })
-    observedModel = 'other/qwen'
+    observedProviderId = 'other'
+    observedModelId = 'qwen'
     const wrongProvider = await adapter.testModel({
       runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
     })
+    observedProviderId = null
+    observedModelId = null
+    const missingIdentity = await adapter.testModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+    })
 
-    expect([wrongModel.ok, wrongProvider.ok]).toEqual([true, true])
+    expect([wrongModel.ok, wrongProvider.ok, missingIdentity.ok]).toEqual([true, true, true])
+    if (wrongModel.ok && wrongProvider.ok && missingIdentity.ok) {
+      expect([
+        wrongModel.value.availability,
+        wrongProvider.value.availability,
+        missingIdentity.value.availability,
+      ]).toEqual([
+        'unknown', 'unknown', 'unknown',
+      ])
+    }
     expect(updates).toEqual([])
+  })
+
+  test('does not persist defaults or limits when observed execution identity is missing or mismatched', async () => {
+    let defaultWrites = 0
+    let limitWrites = 0
+    let probeResult: OpenCodeExecutionProbeResult = {
+      ...executionProbeResult('local/qwen'),
+      observedProviderId: null,
+      observedModelId: null,
+    }
+    const adapter = activeModelActionAdapter({
+      probe: () => probeResult,
+      publishExecutionUpdate: async () => {},
+      setDefaultModel: async () => { defaultWrites += 1 },
+      setModelLimits: async () => { limitWrites += 1 },
+    })
+
+    const missingDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    probeResult = {
+      ...executionProbeResult('local/qwen'),
+      observedProviderId: 'fallback-provider',
+    }
+    const providerFallbackDefault = await adapter.setDefaultModel({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen', probe: true,
+    })
+    probeResult = { ...executionProbeResult('local/qwen'), observedModelId: 'fallback' }
+    const fallbackLimits = await adapter.configureModelLimits({
+      runtimeId: 'opencode', providerId: 'local', modelId: 'local/qwen',
+      contextTokens: 32_000, outputTokens: 8_000,
+    })
+
+    expect([missingDefault.ok, providerFallbackDefault.ok, fallbackLimits.ok]).toEqual([
+      false, false, false,
+    ])
+    expect({ defaultWrites, limitWrites }).toEqual({ defaultWrites: 0, limitWrites: 0 })
   })
 
   test('preserves successful model action semantics when execution publication fails', async () => {
@@ -7025,6 +7113,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         probeModel: async input => ({
           providerId: 'opencode',
           modelId: input.selectedModel,
+          observedProviderId: 'openrouter',
+          observedModelId: 'openai/gpt-oss-20b:free',
           probePrompt: 'Output only the single word PONG.',
           expectedOutput: 'PONG',
           outcome: 'available',
@@ -7977,6 +8067,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
           return {
             providerId: 'opencode',
             modelId: input.selectedModel,
+            observedProviderId: 'opencode',
+            observedModelId: 'nemotron-3-super-free',
             probePrompt: 'Output only the single word PONG.',
             expectedOutput: 'PONG',
             outcome: 'available',

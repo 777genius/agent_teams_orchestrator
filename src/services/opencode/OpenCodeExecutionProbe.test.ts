@@ -69,6 +69,46 @@ const host: OpenCodeHostHandle = {
   diagnostics: [],
 }
 
+async function probeTranscriptIdentity(input: {
+  providerID?: string
+  modelID?: string
+}) {
+  const probe = new OpenCodeExecutionProbe({
+    hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+    clientFactory: {
+      create: () => ({
+        getConfig: async () => { throw new Error('not used') },
+        getConfigProviders: async () => { throw new Error('not used') },
+        getProviders: async () => { throw new Error('not used') },
+        getProviderAuth: async () => { throw new Error('not used') },
+        listAgents: async () => { throw new Error('not used') },
+        getMcp: async () => { throw new Error('not used') },
+        createSession: async () => ({ id: 'session-identity' }),
+        getSession: async () => ({ id: 'session-identity' }),
+        getSessionStatus: async () => ({ 'session-identity': 'idle' as const }),
+        getSessionMessages: async () => [{
+          info: {
+            id: 'assistant-identity', role: 'assistant', sessionID: 'session-identity',
+            time: { created: 1, completed: 2 },
+            ...(input.providerID ? { providerID: input.providerID } : {}),
+            ...(input.modelID ? { modelID: input.modelID } : {}),
+          },
+          parts: [{ type: 'text', text: 'PONG' }],
+        }],
+        getPermissions: async () => [],
+        sendSessionMessage: async () => ({ info: {}, parts: [] }),
+        promptSessionAsync: async () => {},
+        abortSession: async () => true,
+      }),
+    },
+  })
+  return probe.probeModel({
+    selectedModel: 'opencode/big-pickle',
+    projectPath: '/tmp/project',
+    bypassCache: true,
+  })
+}
+
 test('keeps native subscription CLI probes above their hidden bootstrap context', () => {
   expect(resolveOpenCodeExecutionProbeContextTokens('cursor-acp/auto')).toBe(262_144)
   expect(resolveOpenCodeExecutionProbeContextTokens('kiro/auto')).toBe(262_144)
@@ -76,6 +116,29 @@ test('keeps native subscription CLI probes above their hidden bootstrap context'
 })
 
 describe('OpenCodeExecutionProbe', () => {
+  test('requires exact assistant provider/model transcript metadata for execution proof', async () => {
+    const exact = await probeTranscriptIdentity({
+      providerID: 'opencode', modelID: 'big-pickle',
+    })
+    const missing = await probeTranscriptIdentity({})
+    const providerFallback = await probeTranscriptIdentity({
+      providerID: 'openrouter', modelID: 'big-pickle',
+    })
+    const modelFallback = await probeTranscriptIdentity({
+      providerID: 'opencode', modelID: 'fallback-model',
+    })
+
+    expect(exact).toMatchObject({
+      outcome: 'available', observedProviderId: 'opencode', observedModelId: 'big-pickle',
+    })
+    for (const uncertain of [missing, providerFallback, modelFallback]) {
+      expect(uncertain).toMatchObject({
+        outcome: 'unknown', failureCode: 'execution_identity_unverified',
+      })
+      expect(uncertain.verifiedAt).toBeUndefined()
+    }
+  })
+
   test('classifies retired Google models as unavailable for the current account', () => {
     const message =
       'This model models/gemini-2.5-flash-lite is no longer available to new users.'
@@ -86,7 +149,7 @@ describe('OpenCodeExecutionProbe', () => {
     })
   })
 
-  test('classifies Cursor resource exhaustion as model unavailable', () => {
+  test('keeps Cursor resource exhaustion uncertain', () => {
     for (const message of [
       'grpc_code=resource_exhausted error_code=upgrade',
       'grpc_code=resource-exhausted error_code=upgrade',
@@ -102,17 +165,35 @@ describe('OpenCodeExecutionProbe', () => {
       'HTTP 403 Forbidden: grpc_code=RESOURCE_EXHAUSTED',
     ]) {
       expect(classifyProbeFailure({ message })).toEqual({
-        outcome: 'unavailable',
-        reason: message,
+        outcome: 'unknown', reason: message, failureCode: 'uncertain_provider_rejection',
       })
     }
     expect(classifyProbeFailure({ message: 'error_code=upgrade' }).outcome).toBe('unknown')
     expect(classifyProbeFailure({ message: '{"usage":{"input_tokens":429}}' }).outcome).toBe(
       'unknown',
     )
-    expect(classifyProbeFailure({ message: 'HTTP 403 Forbidden' }).outcome).toBe(
-      'not_authenticated',
-    )
+    for (const message of [
+      'HTTP 401 Unauthorized',
+      'HTTP 403 Forbidden',
+      'Forbidden by regional policy',
+      'Model entitlement denied',
+      'Request timed out',
+      'Transport closed',
+    ]) {
+      const classified = classifyProbeFailure({ message })
+      expect(classified.outcome).toBe('unknown')
+      expect(classified.reason).toBe(message)
+      if (/401|403|forbidden|entitlement|regional policy/i.test(message)) {
+        expect(classified.failureCode).toBe('uncertain_provider_rejection')
+      } else {
+        expect(classified.failureCode).toBeUndefined()
+      }
+    }
+    expect(classifyProbeFailure({ message: 'Invalid API key.' })).toEqual({
+      outcome: 'not_authenticated',
+      reason: 'Invalid API key.',
+      failureCode: 'definitive_auth_rejected',
+    })
   })
 
   test('marks model available when the durable assistant reply matches the expected probe output', async () => {
@@ -180,6 +261,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -210,6 +293,10 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.reason).toBeNull()
     expect(result.durableState).toBe('idle')
     expect(result.latestAssistantText).toBe('PONG')
+    expect(result).toMatchObject({
+      observedProviderId: 'opencode',
+      observedModelId: 'big-pickle',
+    })
     expect(promptAsyncCount).toBe(1)
     expect(promptAgent).toBe(OPEN_CODE_MODEL_PROBE_AGENT_NAME)
     expect(sendMessageCount).toBe(0)
@@ -531,9 +618,9 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
       })
 
-      expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
       expect(result.reason).toContain('RESOURCE_EXHAUSTED')
-      expect(result.failureCode).toBeUndefined()
+      expect(result.failureCode).toBe('uncertain_provider_rejection')
       expect(result.errorCount).toBe(1)
     })
   }
@@ -623,6 +710,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -723,6 +812,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'xai',
+                modelID: 'grok-4.3',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -836,8 +927,10 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
       })
 
-      expect(result.outcome).toBe('not_authenticated')
-      expect(result.reason).toContain('token refresh failed')
+      expect(result).toMatchObject({
+        outcome: 'unknown',
+        failureCode: 'execution_identity_unverified',
+      })
       await expect(Promise.all(
         [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
           readOpenCodeAuthCredential({ authPath, providerId: 'xai' }),
@@ -891,6 +984,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'ollama',
+                modelID: 'qwen2.5-coder:0.5b',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -941,6 +1036,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'cursor-acp',
+                modelID: 'auto',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
               },
@@ -1011,7 +1108,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('Cursor usage limit')
     expect(result.diagnostics.join('\n')).toContain(
       'assistant payload exposed a terminal provider failure',
@@ -1120,7 +1217,7 @@ describe('OpenCodeExecutionProbe', () => {
       }
     })()
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('resource_exhausted')
     expect(result.durableState).toBe('retrying')
     expect(result.diagnostics.join('\n')).toContain('native failure probe confirmed')
@@ -1137,7 +1234,7 @@ describe('OpenCodeExecutionProbe', () => {
       selectedModel: 'cursor-acp/auto',
       projectPath: '/tmp/project',
     })
-    expect(cachedResult.outcome).toBe('unavailable')
+    expect(cachedResult.outcome).toBe('unknown')
     expect(nativeProbeCalls).toBe(2)
   })
 
@@ -1195,7 +1292,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('RESOURCE_EXHAUSTED')
     expect(result.diagnostics.join('\n')).toContain('retry status exposed')
     expect(nativeProbeCalls).toBe(1)
@@ -1259,7 +1356,7 @@ describe('OpenCodeExecutionProbe', () => {
       bypassCache: true,
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('resource_exhausted')
     expect(result.durableState).toBe('retrying')
     expect(statusCalls).toBeGreaterThanOrEqual(3)
@@ -1312,7 +1409,7 @@ describe('OpenCodeExecutionProbe', () => {
         bypassCache: true,
       })
 
-      expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
       expect(result.reason).toContain('RESOURCE_EXHAUSTED')
       expect(result.diagnostics.join('\n')).toContain(`session ${source} request`)
     })
@@ -1352,6 +1449,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1433,7 +1532,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('resource_exhausted')
     expect(nativeProbeCalls).toBe(2)
   })
@@ -1466,6 +1565,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1526,11 +1627,13 @@ describe('OpenCodeExecutionProbe', () => {
           getSessionMessages: async () => [{
             info: {
               id: 'msg-assistant-1',
-              role: 'assistant',
-              sessionID: 'session-1',
-              time: { created: 101, completed: 110 },
-            },
-            parts: [{ type: 'text', text: 'PONG' }],
+                  role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
           }],
           getPermissions: async () => [],
           sendSessionMessage: async () => ({ info: { id: 'unused' }, parts: [] }),
@@ -1592,6 +1695,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
                 },
@@ -1671,7 +1776,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('Cursor usage limit')
     expect(result.diagnostics.join('\n')).toContain('native failure probe confirmed')
     expect(nativeFallbackCalls).toBe(1)
@@ -1719,7 +1824,7 @@ describe('OpenCodeExecutionProbe', () => {
       cursorNativePreflightBeforeHost: true,
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toContain('RESOURCE_EXHAUSTED')
     expect(prepareProfileCalls).toBe(1)
     expect(ensureHostCalls).toBe(0)
@@ -1761,7 +1866,7 @@ describe('OpenCodeExecutionProbe', () => {
       cursorNativePreflightOnly: true,
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(ensureHostCalls).toBe(0)
     expect(nativeProjectPath).not.toBeNull()
     await expect(stat(nativeProjectPath!)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -1833,7 +1938,7 @@ describe('OpenCodeExecutionProbe', () => {
     expect(ensureHostCalls).toBe(0)
   })
 
-  test('accepts native Cursor execution proof before creating an OpenCode session', async () => {
+  test('keeps native Cursor success uncertain without exact execution identity metadata', async () => {
     let createSessionCalls = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
@@ -1878,10 +1983,13 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('available')
-    expect(result.verifiedAt).toBeTruthy()
+    expect(result).toMatchObject({
+      outcome: 'unknown',
+      failureCode: 'execution_identity_unverified',
+    })
+    expect(result.verifiedAt).toBeUndefined()
     expect(result.diagnostics.join('\n')).toContain(
-      'native execution probe confirmed model availability',
+      'did not report exact provider/model metadata',
     )
     expect(createSessionCalls).toBe(0)
   })
@@ -1908,11 +2016,13 @@ describe('OpenCodeExecutionProbe', () => {
             {
               info: {
                 id: 'msg-assistant-1',
-                role: 'assistant',
-                sessionID: 'session-1',
-                time: { created: 101, completed: 110 },
-              },
-              parts: [{ type: 'text', text: 'PONG' }],
+                  role: 'assistant',
+                  providerID: 'cursor-acp',
+                  modelID: 'auto',
+                  sessionID: 'session-1',
+                  time: { created: 101, completed: 110 },
+                },
+                parts: [{ type: 'text', text: 'PONG' }],
             },
           ],
           getPermissions: async () => [],
@@ -1992,6 +2102,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'big-pickle',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2077,6 +2189,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'big-pickle',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2176,7 +2290,6 @@ describe('OpenCodeExecutionProbe', () => {
   })
 
   test.each([
-    'Token refresh failed: 401',
     'Invalid API key.',
     'API key not valid. Please pass a valid API key.',
     'API key is revoked',
@@ -2214,6 +2327,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-error',
                 role: 'assistant',
+                providerID: 'openai',
+                modelID: 'gpt-5.4-mini',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
                 error: {
@@ -2241,8 +2356,17 @@ describe('OpenCodeExecutionProbe', () => {
     })
 
     expect(result.outcome).toBe('not_authenticated')
+    expect(result.failureCode).toBe('definitive_auth_rejected')
     expect(result.reason).toContain(authFailure)
     expect(result.durableState).toBe('error')
+  })
+
+  test('keeps an ambiguous token refresh 401 uncertain', () => {
+    expect(classifyProbeFailure({ message: 'Token refresh failed: 401' })).toEqual({
+      outcome: 'unknown',
+      reason: 'Token refresh failed: 401',
+      failureCode: 'uncertain_provider_rejection',
+    })
   })
 
   test('surfaces stringified nested provider rate-limit errors while the session is retrying', async () => {
@@ -2318,7 +2442,7 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('unavailable')
+    expect(result.outcome).toBe('unknown')
     expect(result.reason).toBe('Rate limit exceeded. Please try again later.')
     expect(result.durableState).toBe('retrying')
     expect(result.diagnostics.join('\n')).toContain(
@@ -2364,6 +2488,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2431,6 +2557,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: 'msg-assistant-1',
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: 'msg-user-1',
                 sessionID: 'session-1',
                 time: { created: 101, completed: 110 },
@@ -2502,6 +2630,8 @@ describe('OpenCodeExecutionProbe', () => {
             info: {
               id: 'msg-assistant-1',
               role: 'assistant',
+              providerID: 'opencode',
+              modelID: 'minimax-m2.5-free',
               sessionID: `session-${createSessionCount}`,
               time: { created: 101, completed: 110 },
             },
@@ -2575,6 +2705,8 @@ describe('OpenCodeExecutionProbe', () => {
               info: {
                 id: `msg-assistant-${createSessionCount}`,
                 role: 'assistant',
+                providerID: 'opencode',
+                modelID: 'minimax-m2.5-free',
                 parentID: `msg-user-${createSessionCount}`,
                 sessionID: `session-${createSessionCount}`,
                 time: { created: 101, completed: 110 },
@@ -2667,6 +2799,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2772,6 +2906,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-1',
                   role: 'assistant',
+                  providerID: 'opencode',
+                  modelID: 'minimax-m2.5-free',
                   parentID: 'msg-user-1',
                   sessionID: 'session-1',
                   time: { created: 101, completed: 110 },
@@ -2901,6 +3037,8 @@ describe('OpenCodeExecutionProbe', () => {
                 info: {
                   id: 'msg-assistant-runtime-deadline',
                   role: 'assistant',
+                  providerID: 'ollama',
+                  modelID: 'gemma4:12b',
                   parentID: 'msg-user-runtime-deadline',
                   sessionID: 'session-runtime-deadline',
                   time: { created: 101, completed: 110 },

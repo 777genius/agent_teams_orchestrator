@@ -739,10 +739,17 @@ export type OpenCodeExecutionProbeFailureCode =
   | 'prompt_start_failed'
   | 'execution_timeout'
   | 'provider_endpoint_unreachable'
+  | 'definitive_auth_rejected'
+  | 'execution_identity_unverified'
+  | 'uncertain_provider_rejection'
 
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'
   modelId: string
+  /** Exact provider metadata reported by the assistant message, when present. */
+  observedProviderId?: string | null
+  /** Exact provider-local model metadata reported by the assistant message, when present. */
+  observedModelId?: string | null
   probePrompt: string
   expectedOutput: string
   outcome: OpenCodeExecutionProbeOutcome
