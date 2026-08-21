@@ -565,6 +565,83 @@ describe.serial('native v44307 catalog authority', () => {
     await restart.close()
   })
 
+  test.skipIf(process.platform !== 'win32')(
+    'Windows retries every root barrier after an interrupted component creation', async () => {
+      const cache = await root()
+      for (const attempt of ['first', 'second']) {
+        const interrupted = client(cache, 300, faultLaunch('exit:root-before-directory-sync'))
+        await expect(interrupted.beginAttempt(1, sha(`root-retry-${attempt}`))).rejects.toThrow()
+        expect(await Bun.file(path.join(cache, 'opencode')).exists()).toBe(true)
+        expect(await Bun.file(path.join(cache, 'opencode',
+          'provider-catalog-authority-v44307', '.root-durability-v1.pending')).exists()).toBe(true)
+      }
+      const recovered = client(cache)
+      expect((await recovered.beginAttempt(2, sha('root-retry-recovered'))).generation).toBe(1)
+      await recovered.close()
+    })
+
+  test.skipIf(process.platform !== 'win32')(
+    'Windows missing confirmation remains fail-closed until every root barrier recovers', async () => {
+      const cache = await root(); const initial = client(cache)
+      expect((await initial.beginAttempt(1, sha('root-marker-initial'))).generation).toBe(1)
+      await initial.close()
+      const confirmed = path.join(cache, 'opencode', 'provider-catalog-authority-v44307',
+        '.root-durability-v1.confirmed')
+      await rm(confirmed)
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const interrupted = client(cache, 300, faultLaunch('exit:root-before-directory-sync'))
+        await expect(interrupted.beginAttempt(2, sha(`root-marker-missing-${attempt}`))).rejects.toThrow()
+      }
+      const recovered = client(cache)
+      expect((await recovered.beginAttempt(3, sha('root-marker-missing-recovered'))).generation).toBe(2)
+      await recovered.close()
+    })
+
+  test.skipIf(process.platform !== 'win32')(
+    'Windows corrupt committed root state fails closed without allocating', async () => {
+      const cache = await root(); const initial = client(cache)
+      expect((await initial.beginAttempt(1, sha('root-state-initial'))).generation).toBe(1)
+      await initial.close()
+      await writeFile(path.join(cache, 'opencode', 'provider-catalog-authority-v44307',
+        '.root-durability-v1.confirmed'), 'corrupt')
+      const corrupt = client(cache, 500)
+      await expect(corrupt.beginAttempt(2, sha('root-state-corrupt'))).rejects.toThrow()
+      const check = new Database(path.join(cache, 'opencode',
+        'provider-catalog-authority-v44307', 'authority.sqlite'), { readonly: true })
+      expect(check.query('SELECT generation FROM authority_state').get()).toEqual({ generation: 1 })
+      check.close()
+    })
+
+  test.skipIf(process.platform !== 'win32')(
+    'Windows restart recovers a crash-partial confirmation only through every root barrier', async () => {
+      const cache = await root(); const interrupted = client(cache, 300,
+        faultLaunch('exit:root-during-confirmation-write'))
+      await expect(interrupted.beginAttempt(1, sha('root-confirmation-partial'))).rejects.toThrow()
+      const directory = path.join(cache, 'opencode', 'provider-catalog-authority-v44307')
+      expect(await Bun.file(path.join(directory, '.root-durability-v1.pending')).exists()).toBe(true)
+      expect((await Bun.file(path.join(directory, '.root-durability-v1.confirmed')).text()).length)
+        .toBe(16)
+      const barriersStillFaulted = client(cache, 300, faultLaunch('exit:root-before-directory-sync'))
+      await expect(barriersStillFaulted.beginAttempt(2, sha('root-confirmation-partial-retry')))
+        .rejects.toThrow()
+      const recovered = client(cache)
+      expect((await recovered.beginAttempt(3, sha('root-confirmation-partial-recovered'))).generation).toBe(1)
+      await recovered.close()
+    })
+
+  test.skipIf(process.platform !== 'win32')(
+    'Windows interrupted pending-state cleanup acknowledges no generation and recovers', async () => {
+      const cache = await root(); const interrupted = client(cache, 300,
+        faultLaunch('exit:root-before-state-cleanup'))
+      await expect(interrupted.beginAttempt(1, sha('root-cleanup-interrupted'))).rejects.toThrow()
+      const directory = path.join(cache, 'opencode', 'provider-catalog-authority-v44307')
+      expect(await Bun.file(path.join(directory, '.root-durability-v1.pending')).exists()).toBe(true)
+      expect(await Bun.file(path.join(directory, '.root-durability-v1.confirmed')).exists()).toBe(true)
+      const recovered = client(cache)
+      expect((await recovered.beginAttempt(2, sha('root-cleanup-recovered'))).generation).toBe(1)
+      await recovered.close()
+    })
+
   test.each(['journal-before-directory-sync', 'journal-after-directory-sync'])(
     'first rollback-journal barrier at %s permits no page-change acknowledgement', async phase => {
       const cache = await root(); const interrupted = client(cache, 300, faultLaunch(`exit:${phase}`))

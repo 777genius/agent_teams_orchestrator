@@ -37,7 +37,7 @@ describe('OpenCode catalog Windows authority security contract', () => {
     const handleMetadata = loop.indexOf('file.metadata()', open)
     const handleIdentity = loop.indexOf('windows_identity::file_identity(&file)', handleMetadata)
     const retain = loop.indexOf('held.push(WindowsRootComponent', handleIdentity)
-    const durabilitySync = loop.indexOf('sync_windows_directory_path(parent_path', retain)
+    const durabilityProtocol = loop.indexOf('confirm_windows_root(&target, &held)', retain)
 
     expect(loopStart).toBeGreaterThanOrEqual(0)
     expect(loop).not.toContain('symlink_metadata')
@@ -48,8 +48,40 @@ describe('OpenCode catalog Windows authority security contract', () => {
     expect(handleMetadata).toBeGreaterThan(open)
     expect(handleIdentity).toBeGreaterThan(handleMetadata)
     expect(retain).toBeGreaterThan(handleIdentity)
-    expect(durabilitySync).toBeGreaterThan(retain)
+    expect(durabilityProtocol).toBeGreaterThan(retain)
     expect(loop).toContain('.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)')
     expect(loop).not.toContain('FILE_SHARE_DELETE')
+  })
+
+  test('missing root confirmation persistently retries the complete parent barrier chain', async () => {
+    const source = await readFile(authorityPath, 'utf8')
+    const start = source.indexOf('fn confirm_windows_root')
+    const end = source.indexOf('#[cfg(windows)]\nfn validate_windows_root_components', start)
+    const protocol = source.slice(start, end)
+
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(protocol).toContain('WINDOWS_ROOT_PENDING')
+    expect(protocol).toContain('WINDOWS_ROOT_CONFIRMED')
+    expect(protocol).toMatch(/open_windows_state_file\(&confirmed_path, false\)/)
+    expect(protocol).toMatch(/held\.iter\(\)\.skip\(1\)/)
+    expect(protocol).toMatch(/fault\("root-before-directory-sync"\)[\s\S]*sync_windows_directory_path\(parent, "ROOT_SYNC"\)/)
+    expect(protocol).toMatch(/pending\.is_none\(\)[\s\S]*!expected\.starts_with\(&contents\)/)
+    expect(protocol.indexOf('create_windows_state_file(&confirmed_path')).toBeGreaterThan(
+      protocol.indexOf('held.iter().skip(1)'))
+    expect(protocol.lastIndexOf('remove_file(&pending_path)')).toBeGreaterThan(
+      protocol.indexOf('create_windows_state_file(&confirmed_path'))
+    expect(protocol).toContain('"ROOT_STATE_CLEANUP"')
+  })
+
+  test('root state is bounded, no-follow, identity-bound and retained without delete sharing', async () => {
+    const source = await readFile(authorityPath, 'utf8')
+    expect(source).toContain('const WINDOWS_ROOT_STATE_MAX: u64 = 128')
+    expect(source).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
+    expect(source).toMatch(/metadata\.len\(\) > WINDOWS_ROOT_STATE_MAX/)
+    expect(source).toMatch(/component\.volume\.to_be_bytes\(\)/)
+    expect(source).toMatch(/component\.index\.to_be_bytes\(\)/)
+    expect(source).toContain('WINDOWS_ROOT_MARKER')
+    expect(source).toMatch(/open_windows_state_file\(&confirmed_path, false\)/)
+    expect(source).toMatch(/expected\.is_some_and\(\|value\| contents != value\)/)
   })
 })
