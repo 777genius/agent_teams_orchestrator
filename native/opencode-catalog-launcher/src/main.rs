@@ -1,6 +1,19 @@
 //! Verifies and launches the packaged authority worker from the actual held
 //! executable object. There is intentionally no production pathname fallback.
 
+#[cfg(windows)]
+const WINDOWS_VOLUME_IDENTITY_UNVERIFIED: &str =
+    "OPENCODE_LAUNCH_WINDOWS_VOLUME_IDENTITY_UNVERIFIED";
+
+#[cfg(any(windows, test))]
+fn windows_filesystem_has_retained_identity(filesystem: &str) -> bool {
+    // The staged JS contract and BY_HANDLE_FILE_INFORMATION retain only the
+    // legacy 64-bit file index. NTFS supplies a stable identity in that form;
+    // ReFS requires FILE_ID_128 and must remain rejected until the complete
+    // staging and native comparison contract carries all 128 bits.
+    filesystem == "NTFS"
+}
+
 #[cfg(unix)]
 fn main() {
     use std::ffi::CString;
@@ -92,9 +105,9 @@ fn main() {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, OPEN_EXISTING,
+        CreateFileW, GetFileInformationByHandle, GetVolumeInformationByHandleW,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -207,6 +220,28 @@ fn main() {
     if unsafe { GetFileInformationByHandle(held, &mut before) } == 0
         || before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
+        std::process::exit(126)
+    }
+    let mut fs_name = [0u16; 32];
+    let volume_verified = unsafe {
+        GetVolumeInformationByHandleW(
+            held,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    } != 0;
+    let fs_name_end = fs_name
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(fs_name.len());
+    let filesystem = String::from_utf16_lossy(&fs_name[..fs_name_end]);
+    if !volume_verified || !windows_filesystem_has_retained_identity(&filesystem) {
+        eprintln!("{WINDOWS_VOLUME_IDENTITY_UNVERIFIED}");
         std::process::exit(126)
     }
     if let Some((expected_dev, expected_ino, expected_size)) = expected_object {
@@ -371,4 +406,21 @@ fn main() {
         unsafe { CloseHandle(handle) };
     }
     std::process::exit(code as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_filesystem_has_retained_identity;
+
+    #[test]
+    fn retained_windows_identity_accepts_ntfs() {
+        assert!(windows_filesystem_has_retained_identity("NTFS"));
+    }
+
+    #[test]
+    fn retained_windows_identity_rejects_refs_and_other_filesystems() {
+        for filesystem in ["ReFS", "refs", "FAT32", "exFAT", ""] {
+            assert!(!windows_filesystem_has_retained_identity(filesystem));
+        }
+    }
 }
