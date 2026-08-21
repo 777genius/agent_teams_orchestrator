@@ -5,7 +5,7 @@
 //! opens cannot write, delete, or replace the database or persistent journal
 //! while an authority worker performs a database operation.
 
-use super::{c, fault, sync_directory};
+use super::{fault, sync_directory, windows_identity};
 use libsqlite3_sys as sqlite;
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
@@ -64,12 +64,7 @@ fn identity(file: &File) -> Result<(u64, u64), c_int> {
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(sqlite::SQLITE_CANTOPEN);
     }
-    Ok((
-        metadata
-            .volume_serial_number()
-            .ok_or(sqlite::SQLITE_IOERR_FSTAT)? as u64,
-        metadata.file_index().ok_or(sqlite::SQLITE_IOERR_FSTAT)?,
-    ))
+    windows_identity::file_identity(file).map_err(|_| sqlite::SQLITE_IOERR_FSTAT)
 }
 
 pub(super) fn validate_named_files() -> Result<(), String> {
@@ -81,11 +76,17 @@ pub(super) fn validate_named_files() -> Result<(), String> {
             "DB_REPLACED"
         };
         let retained_identity = identity(retained).map_err(|_| replacement.to_string())?;
-        let metadata = std::fs::symlink_metadata(name).map_err(|_| replacement)?;
+        let named = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(name)
+            .map_err(|_| replacement)?;
+        let metadata = named.metadata().map_err(|_| replacement)?;
+        let named_identity = identity(&named).map_err(|_| replacement.to_string())?;
         if !metadata.is_file()
             || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || metadata.volume_serial_number().ok_or("DB_REPLACED")? as u64 != *volume
-            || metadata.file_index().ok_or("DB_REPLACED")? != *index
+            || named_identity != (*volume, *index)
             || retained_identity != (*volume, *index)
         {
             return Err(replacement.into());

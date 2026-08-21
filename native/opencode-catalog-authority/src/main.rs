@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 mod posix_vfs;
 #[cfg(windows)]
+mod windows_identity;
+#[cfg(windows)]
 mod windows_vfs;
 
 #[cfg(windows)]
@@ -514,10 +516,11 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetVolumeInformationW, DRIVE_FIXED, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetDriveTypeW, GetVolumeInformationW, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
         FILE_SHARE_WRITE,
     };
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
     let mut target = std::path::PathBuf::from(cache_home);
     if !target.is_absolute() {
         return Err("ROOT_NOT_ABSOLUTE".into());
@@ -573,12 +576,12 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
         return Err("ROOT_REPARSE".into());
     }
     let mut cursor = std::path::PathBuf::new();
+    let root_identity =
+        windows_identity::file_identity(&root_handle).map_err(|_| "ROOT_IDENTITY")?;
     let mut held = vec![WindowsRootComponent {
         path: root_path,
-        volume: root_metadata
-            .volume_serial_number()
-            .ok_or("ROOT_IDENTITY")? as u64,
-        index: root_metadata.file_index().ok_or("ROOT_IDENTITY")?,
+        volume: root_identity.0,
+        index: root_identity.1,
         handle: root_handle,
     }];
     for component in target.components() {
@@ -603,19 +606,15 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
             .open(&cursor)
             .map_err(|_| "ROOT_HANDLE")?;
         let opened = file.metadata().map_err(|_| "ROOT_HANDLE")?;
-        if !opened.is_dir()
-            || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || opened.volume_serial_number().ok_or("ROOT_IDENTITY")?
-                != metadata.volume_serial_number().ok_or("ROOT_IDENTITY")?
-            || opened.file_index().ok_or("ROOT_IDENTITY")?
-                != metadata.file_index().ok_or("ROOT_IDENTITY")?
-        {
+        let opened_identity =
+            windows_identity::file_identity(&file).map_err(|_| "ROOT_IDENTITY")?;
+        if !opened.is_dir() || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("ROOT_REPLACED".into());
         }
         held.push(WindowsRootComponent {
             path: cursor.clone(),
-            volume: opened.volume_serial_number().ok_or("ROOT_IDENTITY")? as u64,
-            index: opened.file_index().ok_or("ROOT_IDENTITY")?,
+            volume: opened_identity.0,
+            index: opened_identity.1,
             handle: file,
         });
     }
@@ -626,19 +625,30 @@ fn enter_root(cache_home: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn validate_windows_root() -> Result<(), String> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     for component in WINDOWS_ROOT_HANDLES.get().ok_or("ROOT_HANDLES")? {
         let held = component.handle.metadata().map_err(|_| "ROOT_REPLACED")?;
-        let named = std::fs::symlink_metadata(&component.path).map_err(|_| "ROOT_REPLACED")?;
+        let named_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&component.path)
+            .map_err(|_| "ROOT_REPLACED")?;
+        let named = named_handle.metadata().map_err(|_| "ROOT_REPLACED")?;
+        let held_identity =
+            windows_identity::file_identity(&component.handle).map_err(|_| "ROOT_REPLACED")?;
+        let named_identity =
+            windows_identity::file_identity(&named_handle).map_err(|_| "ROOT_REPLACED")?;
         if !held.is_dir()
             || !named.is_dir()
             || held.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || held.volume_serial_number().ok_or("ROOT_REPLACED")? as u64 != component.volume
-            || held.file_index().ok_or("ROOT_REPLACED")? != component.index
-            || named.volume_serial_number().ok_or("ROOT_REPLACED")? as u64 != component.volume
-            || named.file_index().ok_or("ROOT_REPLACED")? != component.index
+            || held_identity != (component.volume, component.index)
+            || named_identity != (component.volume, component.index)
         {
             return Err("ROOT_REPLACED".into());
         }
@@ -649,11 +659,13 @@ fn validate_windows_root() -> Result<(), String> {
 #[cfg(windows)]
 fn sync_windows_directory_path(path: &Path, error: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+        OPEN_EXISTING,
     };
     let encoded = path
         .as_os_str()
@@ -1465,23 +1477,17 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
     {
         return Err("LEGACY_REPARSE".into());
     }
-    let _directory = std::fs::OpenOptions::new()
+    let directory = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&directory_path)
         .map_err(|_| "LEGACY_HANDLE")?;
-    let opened_directory = _directory.metadata().map_err(|_| "LEGACY_HANDLE")?;
+    let opened_directory = directory.metadata().map_err(|_| "LEGACY_HANDLE")?;
+    let directory_identity =
+        windows_identity::file_identity(&directory).map_err(|_| "LEGACY_IDENTITY")?;
     if !opened_directory.is_dir()
         || opened_directory.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || opened_directory
-            .volume_serial_number()
-            .ok_or("LEGACY_IDENTITY")?
-            != directory_metadata
-                .volume_serial_number()
-                .ok_or("LEGACY_IDENTITY")?
-        || opened_directory.file_index().ok_or("LEGACY_IDENTITY")?
-            != directory_metadata.file_index().ok_or("LEGACY_IDENTITY")?
     {
         return Err("LEGACY_REPLACED".into());
     }
@@ -1500,10 +1506,8 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&path)
         .map_err(|_| "LEGACY_HANDLE")?;
-    let expected_identity = (
-        metadata.volume_serial_number().ok_or("LEGACY_IDENTITY")? as u64,
-        metadata.file_index().ok_or("LEGACY_IDENTITY")?,
-    );
+    let expected_identity =
+        windows_identity::file_identity(&file).map_err(|_| "LEGACY_IDENTITY")?;
     let encoded = c(&path.to_string_lossy())?;
     let mut raw = ptr::null_mut();
     let rc = unsafe {
@@ -1521,14 +1525,37 @@ fn import_external_legacy(authority: &Db) -> Result<(), String> {
         return Err("LEGACY_OPEN".into());
     }
     let legacy = Db::legacy(raw);
-    let reopened = std::fs::symlink_metadata(&path).map_err(|_| "LEGACY_REPLACED")?;
+    let reopened_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|_| "LEGACY_REPLACED")?;
+    let reopened = reopened_file.metadata().map_err(|_| "LEGACY_REPLACED")?;
+    let reopened_identity =
+        windows_identity::file_identity(&reopened_file).map_err(|_| "LEGACY_REPLACED")?;
     if reopened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || reopened.volume_serial_number().ok_or("LEGACY_REPLACED")? as u64 != expected_identity.0
-        || reopened.file_index().ok_or("LEGACY_REPLACED")? != expected_identity.1
+        || reopened_identity != expected_identity
     {
         return Err("LEGACY_REPLACED".into());
     }
-    let _held_legacy = file;
+    let reopened_directory = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&directory_path)
+        .map_err(|_| "LEGACY_REPLACED")?;
+    let reopened_directory_metadata = reopened_directory
+        .metadata()
+        .map_err(|_| "LEGACY_REPLACED")?;
+    if !reopened_directory_metadata.is_dir()
+        || reopened_directory_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || windows_identity::file_identity(&reopened_directory).map_err(|_| "LEGACY_REPLACED")?
+            != directory_identity
+    {
+        return Err("LEGACY_REPLACED".into());
+    }
+    let _held_legacy = (directory, file);
     let snapshot = legacy_snapshot(&legacy)?;
     drop(legacy);
     apply_external_legacy(authority, snapshot)

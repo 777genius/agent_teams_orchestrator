@@ -83,6 +83,7 @@ describe('native catalog cross-platform source contract', () => {
   test('Windows authority rejects reparse components and unverifiable non-local filesystems', async () => {
     const source = await readFile('native/opencode-catalog-authority/src/main.rs', 'utf8')
     const vfs = await readFile('native/opencode-catalog-authority/src/windows_vfs.rs', 'utf8')
+    const identity = await readFile('native/opencode-catalog-authority/src/windows_identity.rs', 'utf8')
     expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
     expect(source).toContain('FILE_FLAG_OPEN_REPARSE_POINT')
     expect(source).toContain('GetDriveTypeW')
@@ -102,6 +103,18 @@ describe('native catalog cross-platform source contract', () => {
     expect(vfs).toContain('JOURNAL_REPLACED')
     expect(vfs).toContain('Release the retained baselines only when the attempt closes')
     expect(vfs).not.toContain('FILE_SHARE_DELETE')
+    expect(identity).toContain('GetFileInformationByHandle')
+    expect(identity).toContain('BY_HANDLE_FILE_INFORMATION')
+    expect(identity).toContain('file.as_raw_handle()')
+    expect(identity).toContain('nFileIndexHigh as u64) << 32')
+    expect(source).toContain('Win32::System::WindowsProgramming::DRIVE_FIXED')
+    expect(source).toMatch(/Win32::Foundation::\{[^}]*GENERIC_READ,[^}]*GENERIC_WRITE,[^}]*INVALID_HANDLE_VALUE/)
+    expect(source).not.toMatch(/Win32::Storage::FileSystem::\{[^}]*\b(?:DRIVE_FIXED|GENERIC_READ|GENERIC_WRITE)\b/)
+    for (const unstable of ['.volume_serial_number()', '.file_index()']) {
+      expect(source).not.toContain(unstable)
+      expect(vfs).not.toContain(unstable)
+      expect(identity).not.toContain(unstable)
+    }
   })
 
   test('windows-sys 0.61.2 features cover the exact launcher and authority APIs', async () => {
@@ -120,7 +133,7 @@ describe('native catalog cross-platform source contract', () => {
     for (const symbol of ['CreateProcessW', 'STARTUPINFOEXW', 'PROC_THREAD_ATTRIBUTE_JOB_LIST',
       'CreateJobObjectW', 'SetInformationJobObject']) expect(launcher).toContain(symbol)
     for (const feature of ['Win32_Foundation', 'Win32_Security', 'Win32_Storage_FileSystem',
-      'Win32_System_IO']) expect(authorityToml).toContain(feature)
+      'Win32_System_IO', 'Win32_System_WindowsProgramming']) expect(authorityToml).toContain(feature)
     for (const symbol of ['CreateFileW', 'FlushFileBuffers', 'GENERIC_WRITE',
       'FILE_FLAG_BACKUP_SEMANTICS']) expect(authority).toContain(symbol)
   })
