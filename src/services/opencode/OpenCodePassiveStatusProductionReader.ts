@@ -346,7 +346,6 @@ export class OpenCodePassiveStatusProductionReader {
   }
 
   async #readCommitted(scope: `sha256:${string}`, _binary: boolean, signal: AbortSignal): Promise<LoadedSnapshot | null> {
-    if (this.#platform === 'win32') throw new Error('Passive transactional persistence is unsupported on native Windows')
     if (await openCodePassiveDatabaseExists(this.#rootDirectory)) {
       const selected = await readOpenCodePassiveSnapshot(this.#rootDirectory, scope, signal, {
         platform: this.#platform,
@@ -579,7 +578,6 @@ function normalizeWindowsProjectPath(projectPath: string): string {
 }
 
 export async function readBoundedSnapshotText(filePath: string, signal: AbortSignal): Promise<string | null> {
-  if (process.platform === 'win32') throw new Error('Passive transactional persistence is unsupported on native Windows')
   const isBinary = path.basename(filePath) === 'binary.snapshot.json'
   const rootPath = isBinary ? path.dirname(filePath) : path.dirname(path.dirname(filePath))
   try { await lstat(rootPath) }

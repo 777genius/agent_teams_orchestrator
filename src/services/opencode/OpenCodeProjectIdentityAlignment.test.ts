@@ -25,6 +25,22 @@ describe('OpenCode managed profile and preference identity alignment', () => {
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test('missing aliased projects derive the same shared profile/cache/preference key before creation', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-project-missing-key-'))
+    try {
+      const real = path.join(root, 'real')
+      const alias = path.join(root, 'alias')
+      await mkdir(real); await symlink(real, alias)
+      const canonical = path.join(real, 'nested', 'project')
+      const aliased = path.join(alias, 'nested', 'project')
+      const canonicalIdentity = await canonicalizeOpenCodeProjectIdentity(canonical, { allowMissing: true })
+      const aliasIdentity = await canonicalizeOpenCodeProjectIdentity(aliased, { allowMissing: true })
+      expect(aliasIdentity).toBe(canonicalIdentity)
+      expect(openCodeProjectIdentityKey(aliasIdentity)).toBe(openCodeProjectIdentityKey(canonicalIdentity))
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
   test('Windows case variants share a key through deterministic filesystem evidence', async () => {
     const stat = { dev: 9, ino: 17, isDirectory: () => true }
     const canonicalize = (value: string) => canonicalizeOpenCodeProjectIdentity(value, {

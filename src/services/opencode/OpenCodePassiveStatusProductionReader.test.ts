@@ -514,6 +514,26 @@ describeSupportedPersistence('OpenCode passive status production adapters', () =
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 
+  test('production Windows branch reads a committed native snapshot without read bypass injection', async () => {
+    const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-win-production-'))
+    try {
+      await new OpenCodePassiveStatusSnapshotWriter({ rootDirectory: root, platform: 'win32' })
+        .write(snapshot(), new AbortController().signal)
+      const reader = new OpenCodePassiveStatusProductionReader({
+        rootDirectory: root,
+        platform: 'win32',
+        now: () => 1_000,
+        canonicalizePath: async () => '/canonical/a',
+      })
+      const status = await reader.reader.read({
+        projectPath: 'C:\\project', providerIds: ['deepinfra'], timeoutMs: 1_000,
+      })
+      expect(status.binary.value).toEqual({ presence: 'present', version: '1.2.3' })
+      expect(status.providers[0].configured.value).toBe('configured')
+      expect(status.providers[0].executionVerified.value).toBe('verified')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  }, 15_000)
+
   test('returns the last committed transactional snapshot stale and degraded when refresh times out', async () => {
     const root = await mkdtemp(path.join(process.cwd(), '.opencode-passive-committed-timeout-'))
     let stall = false

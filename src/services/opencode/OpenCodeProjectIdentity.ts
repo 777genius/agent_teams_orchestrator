@@ -34,10 +34,12 @@ export async function canonicalizeOpenCodeProjectIdentity(
   }> = {},
 ): Promise<string> {
   throwIfAborted(options.signal)
-  const resolved = path.resolve(projectPath.trim())
-  if (!projectPath.trim()) throw new Error('OpenCode project path is empty')
-  const filesystem = options.filesystem ?? { realpath, lstat }
   const platform = options.platform ?? process.platform
+  const input = projectPath.trim()
+  if (!input) throw new Error('OpenCode project path is empty')
+  const pathApi = platform === 'win32' && isWindowsPath(input) ? path.win32 : path
+  const resolved = pathApi.resolve(input)
+  const filesystem = options.filesystem ?? { realpath, lstat }
   let canonical: string
   try {
     canonical = await abortable(filesystem.realpath(resolved), options.signal)
@@ -47,7 +49,11 @@ export async function canonicalizeOpenCodeProjectIdentity(
     // second durable identity for an already-named filesystem object.
     try { await abortable(filesystem.lstat(resolved), options.signal) }
     catch (metadataError) {
-      if (isMissing(metadataError)) return normalizeCanonicalPath(resolved, platform)
+      if (isMissing(metadataError)) {
+        return canonicalizeMissingProjectIdentity(
+          resolved, platform, pathApi, filesystem, options.signal,
+        )
+      }
       throw metadataError
     }
     throw error
@@ -67,6 +73,66 @@ export async function canonicalizeOpenCodeProjectIdentity(
   }
   throwIfAborted(options.signal)
   return canonicalIdentity
+}
+
+async function canonicalizeMissingProjectIdentity(
+  resolved: string,
+  platform: NodeJS.Platform,
+  pathApi: typeof path | typeof path.win32,
+  filesystem: Readonly<{
+    realpath(path: string): Promise<string>
+    lstat(path: string): Promise<{ dev: number; ino: number; isDirectory(): boolean }>
+  }>,
+  signal?: AbortSignal,
+): Promise<string> {
+  const suffix: string[] = []
+  const missingPaths: string[] = []
+  let cursor = resolved
+  let canonicalAncestor: string
+
+  for (;;) {
+    throwIfAborted(signal)
+    try {
+      canonicalAncestor = await abortable(filesystem.realpath(cursor), signal)
+      break
+    } catch (error) {
+      if (!isMissing(error)) throw error
+      // ENOENT from realpath may describe either an absent component or a
+      // broken symlink. Only the former is eligible for compatibility identity.
+      try {
+        await abortable(filesystem.lstat(cursor), signal)
+      } catch (metadataError) {
+        if (!isMissing(metadataError)) throw metadataError
+        const parent = pathApi.dirname(cursor)
+        if (parent === cursor) throw error
+        suffix.unshift(pathApi.basename(cursor))
+        missingPaths.unshift(cursor)
+        cursor = parent
+        continue
+      }
+      throw error
+    }
+  }
+
+  const first = await abortable(filesystem.lstat(canonicalAncestor), signal)
+  if (!first.isDirectory()) throw new Error('OpenCode project ancestor must be a directory')
+  const confirmed = await abortable(filesystem.realpath(cursor), signal)
+  const second = await abortable(filesystem.lstat(confirmed), signal)
+  if (normalizeCanonicalPath(canonicalAncestor, platform) !== normalizeCanonicalPath(confirmed, platform)
+    || first.dev !== second.dev || first.ino !== second.ino || !second.isDirectory()) {
+    throw new Error('OpenCode project path changed during canonicalization')
+  }
+  // The nearest missing component is the mutation boundary. If it appeared
+  // while the ancestor was inspected, it could now be a symlink and the
+  // appended suffix would no longer name the path we proved.
+  try {
+    await abortable(filesystem.lstat(missingPaths[0]!), signal)
+    throw new Error('OpenCode project path changed during canonicalization')
+  } catch (error) {
+    if (!isMissing(error)) throw error
+  }
+  throwIfAborted(signal)
+  return normalizeCanonicalPath(pathApi.join(canonicalAncestor, ...suffix), platform)
 }
 
 function normalizeCanonicalPath(value: string, platform: NodeJS.Platform): string {

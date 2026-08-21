@@ -190,6 +190,14 @@ describe('OpenCodeExecutionProbe', () => {
       }
     }
     expect(classifyProbeFailure({ message: 'Invalid API key.' })).toEqual({
+      outcome: 'unknown',
+      reason: 'Invalid API key.',
+      failureCode: 'uncertain_provider_rejection',
+    })
+    expect(classifyProbeFailure({
+      message: 'Invalid API key.',
+      structuredProviderError: { providerId: 'openai', selectedProviderId: 'openai' },
+    })).toEqual({
       outcome: 'not_authenticated',
       reason: 'Invalid API key.',
       failureCode: 'definitive_auth_rejected',
@@ -929,7 +937,7 @@ describe('OpenCodeExecutionProbe', () => {
 
       expect(result).toMatchObject({
         outcome: 'unknown',
-        failureCode: 'execution_identity_unverified',
+        failureCode: 'uncertain_provider_rejection',
       })
       await expect(Promise.all(
         [globalAuthPath, activeAuthPath, peerAuthPath].map(authPath =>
@@ -1014,7 +1022,7 @@ describe('OpenCodeExecutionProbe', () => {
     )
   })
 
-  test('does not treat a plain-text Cursor authentication error as execution proof', async () => {
+  test('keeps exact-provider completed assistant auth text uncertain', async () => {
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
         ensureHost: async () => host,
@@ -1060,7 +1068,8 @@ describe('OpenCodeExecutionProbe', () => {
       projectPath: '/tmp/project',
     })
 
-    expect(result.outcome).toBe('not_authenticated')
+    expect(result.outcome).toBe('unknown')
+    expect(result.failureCode).toBe('uncertain_provider_rejection')
     expect(result.reason).toContain('Authentication required')
   })
 

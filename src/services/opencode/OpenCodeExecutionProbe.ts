@@ -248,6 +248,16 @@ function normalizeFailureMessage(value: string): string {
   return trimmed
 }
 
+function isAuthRejectionFailureMessage(lower: string): boolean {
+  return (lower.includes('token refresh failed') && lower.includes('invalid_grant'))
+    || lower.includes('authentication required')
+    || lower.includes('not logged in')
+    || lower.includes('please run \'agent login\'')
+    || lower.includes('please run `kiro-cli login`')
+    || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
+    || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
+}
+
 function isUsageLimitFailureMessage(lower: string): boolean {
   return lower.includes('too many requests')
     || /\b(?:rate|usage)[\s_-]*limit(?:error)?\b/.test(lower)
@@ -299,6 +309,10 @@ function extractNestedErrorMessage(value: unknown, depth = 0): string | null {
 
 export function classifyProbeFailure(params: {
   message: string
+  structuredProviderError?: Readonly<{
+    providerId: string
+    selectedProviderId: string
+  }>
 }): Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason' | 'failureCode'> {
   const reason = normalizeFailureMessage(params.message)
   const lower = reason.toLowerCase()
@@ -313,19 +327,15 @@ export function classifyProbeFailure(params: {
     }
   }
 
-  if (
-    (lower.includes('token refresh failed') && lower.includes('invalid_grant'))
-    || lower.includes('authentication required')
-    || lower.includes('not logged in')
-    || lower.includes('please run \'agent login\'')
-    || lower.includes('please run `kiro-cli login`')
-    || /\binvalid[\s_-]+api[\s_-]*key\b/.test(lower)
-    || /\bapi[\s_-]*key\s+(?:is\s+)?(?:invalid|not\s+valid|expired|revoked)\b/.test(lower)
-  ) {
+  if (isAuthRejectionFailureMessage(lower)) {
+    const attributable = params.structuredProviderError != null
+      && params.structuredProviderError.providerId === params.structuredProviderError.selectedProviderId
     return {
-      outcome: 'not_authenticated',
+      outcome: attributable ? 'not_authenticated' : 'unknown',
       reason,
-      failureCode: 'definitive_auth_rejected',
+      failureCode: attributable
+        ? 'definitive_auth_rejected'
+        : 'uncertain_provider_rejection',
     }
   }
 
@@ -533,6 +543,7 @@ function buildCursorNativeExecutionOutcome(input: {
 function knownFailureMessagePriority(message: string | null): number {
   if (!message) return 0
   if (isUsageLimitFailureMessage(message.toLowerCase())) return 3
+  if (isAuthRejectionFailureMessage(message.toLowerCase())) return 2
   const classified = classifyProbeFailure({ message })
   if (classified.outcome === 'not_authenticated') return 2
   if (classified.outcome === 'unavailable') return 1
@@ -629,7 +640,10 @@ function failureMessageFromUnknown(value: unknown): string {
     ?? (value instanceof Error ? value.message : String(value))
 }
 
-function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['diagnostics'], rawMessages: OpenCodeMessage[]): string | null {
+function getLatestAssistantMessageError(
+  messages: OpenCodeExecutionProbeResult['diagnostics'],
+  rawMessages: OpenCodeMessage[],
+): { message: string; providerId: string | null } | null {
   for (let index = rawMessages.length - 1; index >= 0; index -= 1) {
     const candidate = rawMessages[index]
     const info = candidate.info
@@ -646,13 +660,16 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
       ?? extractNestedErrorMessage(error)
       ?? extractNestedErrorMessage(data)
     if (message) {
-      return message
+      return {
+        message,
+        providerId: typeof info.providerID === 'string' ? info.providerID.trim() || null : null,
+      }
     }
   }
 
   for (const diagnostic of messages) {
     if (diagnostic.includes('failed with')) {
-      return diagnostic
+      return { message: diagnostic, providerId: null }
     }
   }
 
@@ -2051,13 +2068,23 @@ export class OpenCodeExecutionProbe {
             messages,
           )
           const failureMessage =
-            latestAssistantError
+            latestAssistantError?.message
             ?? summary.latestAssistantPreview
             ?? summary.latestAssistantText
             ?? null
           const eagerFailure = failureMessage
             && (latestAssistantError || summary.durableState === 'retrying')
-            ? classifyProbeFailure({ message: failureMessage })
+            ? classifyProbeFailure({
+                message: failureMessage,
+                ...(latestAssistantError?.providerId
+                  ? {
+                      structuredProviderError: {
+                        providerId: latestAssistantError.providerId,
+                        selectedProviderId: parseProviderScopedModel(params.selectedModel).providerID,
+                      },
+                    }
+                  : {}),
+              })
             : null
           if (eagerFailure && (eagerFailure.outcome !== 'unknown' || eagerFailure.failureCode)) {
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
